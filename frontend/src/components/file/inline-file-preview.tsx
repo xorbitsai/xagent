@@ -130,6 +130,114 @@ function InlineImagePreview({
   )
 }
 
+function InlineAudioPreview({
+  source,
+  previewUrl,
+  filename,
+  openLabel,
+  loadErrorText,
+  className,
+}: {
+  source: InlineFilePreviewSource
+  previewUrl: string
+  filename: string
+  openLabel: string
+  loadErrorText: string
+  className?: string
+}) {
+  const apiUrl = getApiUrl()
+  const needsAuthenticatedFallback = Boolean(source.fileId?.includes('/'))
+  const [resolvedUrl, setResolvedUrl] = useState(
+    needsAuthenticatedFallback ? '' : previewUrl
+  )
+  const [loadError, setLoadError] = useState(false)
+
+  useEffect(() => {
+    let objectUrl: string | null = null
+    let isCancelled = false
+
+    setResolvedUrl(needsAuthenticatedFallback ? '' : previewUrl)
+    setLoadError(false)
+
+    const loadAuthenticatedAudio = async () => {
+      if (!needsAuthenticatedFallback || !source.fileId) return
+      try {
+        const response = await apiRequest(
+          `${apiUrl}/api/files/preview/${encodeURIComponent(source.fileId)}`,
+          {
+            cache: 'no-cache',
+            headers: {
+              'Cache-Control': 'no-cache',
+              Pragma: 'no-cache',
+            },
+          }
+        )
+        if (!response.ok) {
+          throw new Error(`Failed to load audio preview: ${response.status}`)
+        }
+        const blob = await response.blob()
+        if (isCancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setResolvedUrl(objectUrl)
+      } catch {
+        if (!isCancelled) {
+          setLoadError(true)
+        }
+      }
+    }
+
+    void loadAuthenticatedAudio()
+
+    return () => {
+      isCancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [apiUrl, needsAuthenticatedFallback, previewUrl, source.fileId])
+
+  return (
+    <div
+      className={cn(
+        'overflow-hidden rounded-md border border-border/50 bg-background',
+        className
+      )}
+      data-inline-file-preview-wrapper
+    >
+      <div className="flex items-center gap-2 border-b border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <FileText className="h-4 w-4 shrink-0" />
+        <span className="min-w-0 flex-1 truncate">{filename}</span>
+        {resolvedUrl ? (
+          <a
+            href={resolvedUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="shrink-0 text-foreground hover:underline"
+          >
+            {openLabel}
+          </a>
+        ) : null}
+      </div>
+      <div className="p-3">
+        {loadError ? (
+          <div className="text-xs text-muted-foreground">{loadErrorText}</div>
+        ) : resolvedUrl ? (
+          <audio
+            controls
+            preload="metadata"
+            src={resolvedUrl}
+            className="w-full"
+            aria-label={filename}
+            title={filename}
+          />
+        ) : (
+          <div className="flex h-14 items-center justify-center text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function InlineOfficeContent({
   kind,
   previewUrl,
@@ -299,6 +407,19 @@ export function InlineFilePreview({
         filename={filename}
         imageClassName={imageClassName}
         onFileClick={onFileClick}
+      />
+    )
+  }
+
+  if (kind === 'audio') {
+    return (
+      <InlineAudioPreview
+        source={resolvedSource}
+        previewUrl={previewUrl}
+        filename={filename}
+        openLabel={openLabel}
+        loadErrorText={loadErrorText}
+        className={className}
       />
     )
   }

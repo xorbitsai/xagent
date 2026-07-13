@@ -21,6 +21,7 @@ class FakeTTS(BaseTTS):
         self._abilities = abilities or ["tts", "text_to_speech"]
         self._voices = voices or []
         self.calls: list[dict[str, Any]] = []
+        self.clone_calls: list[dict[str, Any]] = []
         self.model_name = "fake-tts"
 
     async def synthesize(
@@ -67,6 +68,32 @@ class FakeTTS(BaseTTS):
 
     async def list_available_voices(self) -> list[dict[str, Any]]:
         return self._voices
+
+    async def clone_voice(
+        self,
+        *,
+        name: str,
+        reference_audio_files: list[str],
+        description: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        remove_background_noise: bool = False,
+    ) -> dict[str, Any]:
+        self.clone_calls.append(
+            {
+                "name": name,
+                "reference_audio_files": reference_audio_files,
+                "description": description,
+                "labels": labels,
+                "remove_background_noise": remove_background_noise,
+            }
+        )
+        return {
+            "voice_id": "persistent-voice",
+            "name": name,
+            "provider": self.provider_name,
+            "persistent": True,
+            "requires_verification": False,
+        }
 
 
 class ClosableTTS(FakeTTS):
@@ -229,6 +256,7 @@ def test_list_audio_models_includes_tts_voice_capabilities() -> None:
             "supports_voice_listing": True,
             "supports_voice_settings": True,
             "supports_voice_cloning": False,
+            "supports_persistent_voice_cloning": False,
             "supported_voice_settings": ["stability", "style"],
             "supported_provider_options": ["seed", "apply_text_normalization"],
         }
@@ -361,7 +389,7 @@ def test_filter_voice_model_metadata_handles_empty_configured_set() -> None:
     assert voices == [{"voice_id": "voice-1"}]
 
 
-async def test_list_tts_voices_reports_dynamic_supported_providers() -> None:
+async def test_list_tts_voices_rejects_model_from_other_provider() -> None:
     tool = AudioToolCore(
         tts_models={
             "voice-model": FakeTTS(
@@ -374,8 +402,9 @@ async def test_list_tts_voices_reports_dynamic_supported_providers() -> None:
 
     result = await tool.list_tts_voices(model_id="voice-model")
 
-    assert result["success"] is True
-    assert result["supported_providers"] == ["customvoice"]
+    assert result["success"] is False
+    assert result["supported"] is False
+    assert "provider is 'elevenlabs'" in result["error"]
 
 
 async def test_list_tts_voices_reports_unsupported_provider() -> None:
@@ -387,7 +416,7 @@ async def test_list_tts_voices_reports_unsupported_provider() -> None:
     assert result["success"] is False
     assert result["supported"] is False
     assert result["provider"] == "xinference"
-    assert "Currently supported providers:" in result["error"]
+    assert "provider is 'elevenlabs'" in result["error"]
     assert result["supported_providers"] == []
 
 
@@ -425,6 +454,156 @@ def test_synthesize_speech_schema_exposes_structured_options() -> None:
     assert "reference_audio" in schema_properties
     assert "voice_settings" in schema_properties
     assert "provider_options" in schema_properties
+
+    assert "Never invent" in synthesize_tool.description
+    assert "exact voice_id returned by list_tts_voices" in synthesize_tool.description
+    assert "en-male" not in synthesize_tool.description
+    assert "zh-female" not in synthesize_tool.description
+
+
+async def test_clone_tts_voice_returns_persistent_provider_voice_id() -> None:
+    tts = FakeTTS(
+        provider_name="elevenlabs",
+        abilities=["tts", "voice_cloning", "persistent_voice_cloning"],
+    )
+    tool = AudioToolCore(tts_models={"eleven_v3": tts})
+
+    result = await tool.clone_tts_voice(
+        name="Product narrator",
+        reference_audio_files=["first.mp3", "second.wav"],
+        provider="elevenlabs",
+        description="Narration voice",
+        labels={"language": "en"},
+        remove_background_noise=True,
+        model_id="eleven_v3",
+    )
+
+    assert result == {
+        "success": True,
+        "supported": True,
+        "voice_id": "persistent-voice",
+        "name": "Product narrator",
+        "provider": "elevenlabs",
+        "persistent": True,
+        "requires_verification": False,
+        "model_used": "eleven_v3",
+    }
+    assert tts.clone_calls == [
+        {
+            "name": "Product narrator",
+            "reference_audio_files": ["first.mp3", "second.wav"],
+            "description": "Narration voice",
+            "labels": {"language": "en"},
+            "remove_background_noise": True,
+        }
+    ]
+
+
+async def test_clone_tts_voice_rejects_other_provider_model() -> None:
+    elevenlabs = FakeTTS(
+        provider_name="elevenlabs",
+        abilities=["tts", "persistent_voice_cloning"],
+    )
+    xinference = FakeTTS(
+        provider_name="xinference",
+        abilities=["tts", "voice_cloning"],
+    )
+    tool = AudioToolCore(tts_models={"eleven_v3": elevenlabs, "index-tts": xinference})
+
+    result = await tool.clone_tts_voice(
+        name="Wrong provider",
+        reference_audio_files=["reference.wav"],
+        model_id="index-tts",
+    )
+
+    assert result["success"] is False
+    assert result["supported"] is False
+    assert "provider is 'elevenlabs'" in result["error"]
+    assert elevenlabs.clone_calls == []
+    assert xinference.clone_calls == []
+
+
+async def test_clone_tts_voice_selects_provider_not_default_tts() -> None:
+    elevenlabs = FakeTTS(
+        provider_name="elevenlabs",
+        abilities=["tts", "persistent_voice_cloning"],
+    )
+    xinference = FakeTTS(
+        provider_name="xinference",
+        abilities=["tts", "voice_cloning"],
+    )
+    tool = AudioToolCore(
+        tts_models={"index-tts": xinference, "eleven_v3": elevenlabs},
+        default_tts_model=xinference,
+    )
+
+    result = await tool.clone_tts_voice(
+        name="ElevenLabs voice",
+        reference_audio_files=["reference.wav"],
+    )
+
+    assert result["success"] is True
+    assert result["provider"] == "elevenlabs"
+    assert result["model_used"] == "eleven_v3"
+    assert len(elevenlabs.clone_calls) == 1
+    assert xinference.clone_calls == []
+
+
+def test_clone_tts_voice_tool_exposes_provider_enum() -> None:
+    elevenlabs_tool = AudioTool(
+        tts_models={
+            "eleven_v3": FakeTTS(
+                provider_name="elevenlabs",
+                abilities=["tts", "persistent_voice_cloning"],
+            )
+        }
+    )
+    other_provider_tool = AudioTool(
+        tts_models={
+            "other": FakeTTS(
+                provider_name="other",
+                abilities=["tts", "persistent_voice_cloning"],
+            )
+        }
+    )
+
+    elevenlabs_tools = {
+        candidate.name: candidate for candidate in elevenlabs_tool.get_tools()
+    }
+    other_tool_names = {candidate.name for candidate in other_provider_tool.get_tools()}
+
+    assert "clone_tts_voice" in elevenlabs_tools
+    assert "clone_tts_voice" not in other_tool_names
+    schema = elevenlabs_tools["clone_tts_voice"].args_type().model_json_schema()
+    assert set(schema["properties"]) == {
+        "name",
+        "reference_audio_files",
+        "provider",
+        "description",
+        "labels",
+        "remove_background_noise",
+        "model_id",
+    }
+    assert schema["properties"]["provider"]["const"] == "elevenlabs"
+
+
+def test_list_tts_voices_tool_exposes_provider_enum() -> None:
+    audio_tool = AudioTool(
+        tts_models={
+            "eleven_v3": FakeTTS(
+                provider_name="elevenlabs",
+                abilities=["tts", "voice_listing"],
+            )
+        }
+    )
+    list_tool = next(
+        candidate
+        for candidate in audio_tool.get_tools()
+        if candidate.name == "list_tts_voices"
+    )
+
+    schema = list_tool.args_type().model_json_schema()
+    assert schema["properties"]["provider"]["const"] == "elevenlabs"
 
 
 async def test_synthesize_speech_json_merges_default_and_segment_options() -> None:

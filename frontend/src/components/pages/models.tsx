@@ -21,10 +21,12 @@ import {
   CheckCircle2,
   Video,
   Volume2,
+  Music,
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ModelManagementDialog } from "./model-management-dialog"
 import { toast } from "@/components/ui/sonner"
+import { getProviderDisplayCapabilities } from "./model-display-capabilities"
 
 const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "audio"] as const
 const DEFAULT_MODEL_TAB = "llm"
@@ -533,14 +535,7 @@ export function ModelsPage() {
                   ? providerModels[0].model_name
                   : providerConfig.name
 
-                // Gather unique abilities across all models in this provider
-                const allAbilities = new Set<string>()
-                providerModels.forEach(m => {
-                  if (m.abilities) {
-                    m.abilities.forEach(a => allAbilities.add(a))
-                  }
-                })
-                const capabilities = Array.from(allAbilities)
+                const capabilities = getProviderDisplayCapabilities(providerModels, activeTab)
                 const labels: Record<string, string> = {
                   chat: t('models.abilities.chat'),
                   vision: t('models.abilities.vision'),
@@ -550,7 +545,9 @@ export function ModelsPage() {
                   generate: t('models.abilities.generate'),
                   edit: t('models.abilities.edit'),
                   asr: t('models.abilities.asr'),
-                  tts: t('models.abilities.tts')
+                  tts: t('models.abilities.tts'),
+                  sound_effect: t('models.abilities.sound_effect'),
+                  music: t('models.abilities.music')
                 }
                 const icons: Record<string, ReactNode> = {
                   chat: <Brain className="w-3 h-3 mr-1" />,
@@ -565,7 +562,9 @@ export function ModelsPage() {
                       : <ImageIcon className="w-3 h-3 mr-1" />,
                   edit: <Box className="w-3 h-3 mr-1" />,
                   asr: <Brain className="w-3 h-3 mr-1" />,
-                  tts: <Star className="w-3 h-3 mr-1" />
+                  tts: <Star className="w-3 h-3 mr-1" />,
+                  sound_effect: <Volume2 className="w-3 h-3 mr-1" />,
+                  music: <Music className="w-3 h-3 mr-1" />
                 }
 
                 // Check defaults

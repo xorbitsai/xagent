@@ -135,6 +135,23 @@ class AudioTool(AudioToolCore):
                 )
             )
 
+        if any(
+            self._get_tts_provider_name(model) == "elevenlabs"
+            and getattr(model, "supports_persistent_voice_cloning", False)
+            for model in voice_listing_models
+        ):
+            clone_tts_voice_description = self.CLONE_TTS_VOICE_DESCRIPTION.format(
+                "elevenlabs"
+            )
+            tools.append(
+                AudioFunctionTool(
+                    self.clone_tts_voice,
+                    name="clone_tts_voice",
+                    description=clone_tts_voice_description,
+                    owner=self,
+                )
+            )
+
         return tools
 
 

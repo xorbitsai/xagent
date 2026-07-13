@@ -13,13 +13,14 @@ import logging
 import uuid
 from inspect import isawaitable
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from ...file_ref import build_workspace_file_ref
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
 from .audio_tool_descriptions import (
+    CLONE_TTS_VOICE_DESCRIPTION,
     LIST_TTS_VOICES_DESCRIPTION,
     SYNTHESIZE_SPEECH_DESCRIPTION,
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
@@ -41,6 +42,7 @@ class AudioToolCore:
     SYNTHESIZE_SPEECH_DESCRIPTION = SYNTHESIZE_SPEECH_DESCRIPTION
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION = SYNTHESIZE_SPEECH_JSON_DESCRIPTION
     LIST_TTS_VOICES_DESCRIPTION = LIST_TTS_VOICES_DESCRIPTION
+    CLONE_TTS_VOICE_DESCRIPTION = CLONE_TTS_VOICE_DESCRIPTION
 
     def __init__(
         self,
@@ -496,15 +498,22 @@ class AudioToolCore:
                 return model_id
         return "default"
 
-    def _get_voice_listing_tts_model(
-        self, model_id: Optional[str] = None
+    def _get_provider_tts_model(
+        self,
+        *,
+        provider: str,
+        capability: str,
+        model_id: Optional[str] = None,
     ) -> tuple[Optional[BaseTTS], str]:
         if model_id:
-            tts_model = self._get_tts_model(model_id)
-            actual_model_id = (
-                model_id if model_id and model_id in self._tts_models else "default"
-            )
-            return tts_model, actual_model_id
+            tts_model = self._tts_models.get(model_id)
+            if (
+                tts_model is None
+                and self._default_tts_model is not None
+                and getattr(self._default_tts_model, "model_name", None) == model_id
+            ):
+                tts_model = self._default_tts_model
+            return tts_model, model_id
 
         candidates: list[BaseTTS] = []
         if self._default_tts_model is not None:
@@ -512,12 +521,12 @@ class AudioToolCore:
         candidates.extend(self._tts_models.values())
 
         for candidate in candidates:
-            if getattr(candidate, "supports_voice_listing", False):
+            if self._get_tts_provider_name(candidate) == provider and getattr(
+                candidate, capability, False
+            ):
                 return candidate, self._get_tts_model_id(candidate)
 
-        tts_model = self._get_tts_model()
-        actual_model_id = self._get_tts_model_id(tts_model) if tts_model else "default"
-        return tts_model, actual_model_id
+        return None, "default"
 
     def _resolve_audio_path(self, audio_input: str) -> str:
         """
@@ -763,7 +772,7 @@ class AudioToolCore:
 
         Args:
             text: Input text to synthesize
-            voice: Voice ID or name (optional)
+            voice: Provider-specific voice identifier (optional). Never invent it.
             language: Language code (optional)
             audio_format: Output audio format (default: 'mp3')
             sample_rate: Sample rate in Hz (optional)
@@ -809,7 +818,11 @@ class AudioToolCore:
             if sample_rate is not None:
                 synthesis_kwargs["sample_rate"] = sample_rate
             if reference_audio:
-                synthesis_kwargs["reference_audio"] = reference_audio
+                synthesis_kwargs["reference_audio"] = (
+                    self._resolve_audio_path(reference_audio)
+                    if self._workspace is not None
+                    else reference_audio
+                )
 
             # Synthesize the speech (async)
             result = await tts_model.synthesize(
@@ -946,6 +959,9 @@ class AudioToolCore:
                     "supports_voice_cloning": bool(
                         getattr(tts_model, "supports_voice_cloning", False)
                     ),
+                    "supports_persistent_voice_cloning": bool(
+                        getattr(tts_model, "supports_persistent_voice_cloning", False)
+                    ),
                     "supported_voice_settings": list(
                         getattr(tts_model, "supported_voice_settings", [])
                     ),
@@ -978,13 +994,15 @@ class AudioToolCore:
 
     async def list_tts_voices(
         self,
+        provider: Literal["elevenlabs"] = "elevenlabs",
         model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         List available TTS voices for providers that support dynamic voice lookup.
 
         Args:
-            model_id: Specific TTS model to use. Omit to use the default model.
+            provider: TTS voice provider. Currently only "elevenlabs".
+            model_id: Provider model configuration to use.
 
         Returns:
             Dictionary containing:
@@ -997,13 +1015,17 @@ class AudioToolCore:
         """
         supported_providers = self._get_voice_listing_supported_providers()
         try:
-            tts_model, actual_model_id = self._get_voice_listing_tts_model(model_id)
+            tts_model, actual_model_id = self._get_provider_tts_model(
+                provider=provider,
+                capability="supports_voice_listing",
+                model_id=model_id,
+            )
 
             if not tts_model:
                 return {
                     "success": False,
                     "supported": False,
-                    "error": "No available TTS models configured",
+                    "error": f"No {provider} TTS model is configured",
                     "voices": [],
                     "count": 0,
                     "model_used": actual_model_id,
@@ -1011,6 +1033,20 @@ class AudioToolCore:
                 }
 
             provider_name = self._get_tts_provider_name(tts_model)
+            if provider_name != provider:
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": (
+                        f"list_tts_voices provider is '{provider}', but model "
+                        f"'{actual_model_id}' uses provider '{provider_name}'."
+                    ),
+                    "voices": [],
+                    "count": 0,
+                    "provider": provider_name,
+                    "model_used": actual_model_id,
+                    "supported_providers": supported_providers,
+                }
             if not getattr(tts_model, "supports_voice_listing", False):
                 return {
                     "success": False,
@@ -1055,6 +1091,85 @@ class AudioToolCore:
                 "supported_providers": supported_providers,
             }
 
+    async def clone_tts_voice(
+        self,
+        name: str,
+        reference_audio_files: List[str],
+        provider: Literal["elevenlabs"] = "elevenlabs",
+        description: Optional[str] = None,
+        labels: Optional[Dict[str, str]] = None,
+        remove_background_noise: bool = False,
+        model_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a persistent voice clone with a configured provider account."""
+        try:
+            tts_model, actual_model_id = self._get_provider_tts_model(
+                provider=provider,
+                capability="supports_persistent_voice_cloning",
+                model_id=model_id,
+            )
+            if not tts_model:
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": f"No {provider} TTS model is configured",
+                    "provider": provider,
+                    "model_used": actual_model_id,
+                }
+
+            provider_name = self._get_tts_provider_name(tts_model)
+            if provider_name != provider:
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": (
+                        f"clone_tts_voice provider is '{provider}', but model "
+                        f"'{actual_model_id}' uses provider '{provider_name}'."
+                    ),
+                    "provider": provider_name,
+                    "model_used": actual_model_id,
+                }
+            if not getattr(tts_model, "supports_persistent_voice_cloning", False):
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": f"The configured {provider} client does not support persistent voice cloning",
+                    "provider": provider_name,
+                    "model_used": actual_model_id,
+                }
+
+            resolved_audio_files = [
+                self._resolve_audio_path(reference_audio)
+                if self._workspace is not None
+                else reference_audio
+                for reference_audio in reference_audio_files
+            ]
+            clone = await tts_model.clone_voice(
+                name=name,
+                reference_audio_files=resolved_audio_files,
+                description=description,
+                labels=labels,
+                remove_background_noise=remove_background_noise,
+            )
+            return {
+                "success": True,
+                "supported": True,
+                **clone,
+                "model_used": actual_model_id,
+            }
+        except Exception as e:
+            logger.error(f"Failed to clone TTS voice: {e}")
+            actual_model_id = (
+                model_id if model_id and model_id in self._tts_models else "default"
+            )
+            return {
+                "success": False,
+                "supported": True,
+                "error": str(e),
+                "provider": provider,
+                "model_used": actual_model_id,
+            }
+
     async def synthesize_speech_json(
         self,
         json_data: Optional[str | Dict[str, Any]] = None,
@@ -1088,7 +1203,7 @@ class AudioToolCore:
             reference_field: Field name containing reference audio ID (default: "reference_audio_id")
             voice_settings_field: Field name containing provider voice settings
             provider_options_field: Field name containing provider synthesis options
-            default_voice: Default voice for segments without voice specified
+            default_voice: Provider-specific voice identifier for segments without one
             default_language: Default language code (auto-detect if None)
             default_voice_settings: Default provider voice settings for all segments
             default_provider_options: Default provider synthesis options for all segments
@@ -1112,16 +1227,13 @@ class AudioToolCore:
                 "segments": [
                     {
                         "text": "你好世界",
-                        "voice": "zh-female",
                         "reference_audio_id": "ref_voice_1"
                     },
                     {
                         "text": "这是一个测试",
-                        "voice": "zh-male",
                         "reference_audio_id": "ref_voice_2"
                     }
                 ],
-                "default_voice": "zh-female",
                 "output_format": "mp3",
                 "sample_rate": 24000
             }
@@ -1130,8 +1242,8 @@ class AudioToolCore:
             >>> # Batch synthesis with voice cloning
             >>> data = {
             ...     "segments": [
-            ...         {"text": "你好", "voice": "zh-female", "reference_audio_id": "ref1"},
-            ...         {"text": "世界", "voice": "zh-male"}
+            ...         {"text": "你好", "reference_audio_id": "ref1"},
+            ...         {"text": "世界", "reference_audio_id": "ref2"}
             ...     ]
             ... }
             >>> result = await synthesize_speech_json(json_data=data)

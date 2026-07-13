@@ -341,12 +341,15 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
           const filePath = src.replace(/^file:/, '')
           const fileNameFromPath = filePath.split('/').pop() || filePath
           const fileName = title || alt || fileNameFromPath
+          const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+          const previewKind = preview?.previewKind ?? 'image'
           return (
             <InlineFilePreview
               source={{
                 fileId: resolveInlineFileId(filePath),
-                filename: fileName,
-                type: 'image',
+                filename: preview?.displayFilename ?? fileName,
+                type: previewKind,
+                mimeType: getInlineFilePreviewMimeType(previewKind),
               }}
               openLabel={t('files.previewDialog.buttons.open')}
               loadErrorText={t('files.previewDialog.errors.loadFailed')}

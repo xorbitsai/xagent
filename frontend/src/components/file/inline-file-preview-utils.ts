@@ -2,6 +2,7 @@ import { getFilePublicDownloadUrl, getFilePublicPreviewUrl } from '@/lib/utils'
 
 export type InlineFilePreviewKind =
   | 'image'
+  | 'audio'
   | 'presentation'
   | 'document'
   | 'spreadsheet'
@@ -25,6 +26,7 @@ export type PreviewUrlTrust = {
 
 const PREVIEWABLE_KINDS = new Set<PreviewableInlineFileKind>([
   'image',
+  'audio',
   'presentation',
   'document',
   'spreadsheet',
@@ -58,7 +60,7 @@ export const INLINE_FILE_PREVIEW_MIME_BY_KIND: Partial<
 export const getInlineFilePreviewMimeType = (
   kind: InlineFilePreviewKind
 ): string | undefined => {
-  if (kind === 'file' || kind === 'image') return undefined
+  if (kind === 'file' || kind === 'image' || kind === 'audio') return undefined
   return INLINE_FILE_PREVIEW_MIME_BY_KIND[kind]
 }
 
@@ -75,6 +77,7 @@ export const getInlineFilePreviewKind = (
   const mimeType = source.mimeType?.toLowerCase() || ''
 
   if (type === 'image') return 'image'
+  if (type === 'audio') return 'audio'
   if (type === 'presentation') {
     // An explicit ``type: 'presentation'`` artifact must still be
     // cross-checked: pptxviewjs only supports OOXML .pptx, so a
@@ -104,6 +107,7 @@ export const getInlineFilePreviewKind = (
   if (type === 'spreadsheet') return 'spreadsheet'
 
   if (mimeType.startsWith('image/')) return 'image'
+  if (mimeType.startsWith('audio/')) return 'audio'
   if (PRESENTATION_MIME_TYPES.has(mimeType) || mimeType.includes('presentationml')) {
     return 'presentation'
   }
@@ -113,6 +117,7 @@ export const getInlineFilePreviewKind = (
   }
 
   if (/\.(jpg|jpeg|png|gif|webp|svg)$/.test(filename)) return 'image'
+  if (/\.(mp3|wav|ogg|opus|flac|m4a|aac)$/.test(filename)) return 'audio'
   // Only OOXML .pptx is previewable inline — see PRESENTATION_MIME_TYPES
   // comment. Legacy .ppt falls through to the generic 'file' kind.
   if (filename.endsWith('.pptx')) return 'presentation'

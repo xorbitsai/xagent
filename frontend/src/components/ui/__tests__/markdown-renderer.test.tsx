@@ -208,6 +208,29 @@ describe('MarkdownRenderer', () => {
     })
   })
 
+  it('corrects legacy-path image markdown for mp3 files to a playable audio blob', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['audio-bytes'], { type: 'audio/mpeg' }),
+    })
+    const content =
+      '![xagent_061_podcast.mp3](file:output/xagent_061_podcast.mp3)'
+    render(<MarkdownRenderer content={content} />)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/output%2Fxagent_061_podcast.mp3',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+    const audio = await screen.findByLabelText('xagent_061_podcast.mp3')
+    expect(audio.getAttribute('src')).toMatch(/^blob:/)
+    expect(screen.getByRole('link', { name: 'Open' }).getAttribute('href')).toMatch(
+      /^blob:/
+    )
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+  })
+
   it('prefers link label over generic file id when determining preview kind', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

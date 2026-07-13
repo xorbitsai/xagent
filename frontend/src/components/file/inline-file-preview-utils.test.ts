@@ -31,6 +31,8 @@ describe('inline-file-preview-utils', () => {
     ).toBe('document')
     expect(getInlineFilePreviewKind({ filename: 'data.xlsx' })).toBe('spreadsheet')
     expect(getInlineFilePreviewKind({ filename: 'chart.png' })).toBe('image')
+    expect(getInlineFilePreviewKind({ filename: 'podcast.mp3' })).toBe('audio')
+    expect(getInlineFilePreviewKind({ mimeType: 'audio/mpeg' })).toBe('audio')
   })
 
   it('classifies .pptx (OOXML) as inline-previewable presentation', () => {
@@ -236,6 +238,7 @@ describe('inline-file-preview-utils', () => {
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     )
     expect(getInlineFilePreviewMimeType('image')).toBeUndefined()
+    expect(getInlineFilePreviewMimeType('audio')).toBeUndefined()
     expect(getInlineFilePreviewMimeType('file')).toBeUndefined()
   })
 })

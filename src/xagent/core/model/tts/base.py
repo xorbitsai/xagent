@@ -47,7 +47,8 @@ class BaseTTS(ABC):
 
         Args:
             text: Input text to synthesize
-            voice: Voice ID or name (e.g., 'zh-android', 'zh-female')
+            voice: Provider-specific voice identifier. Call the provider's voice
+                listing API when available; never invent an identifier.
             language: Language code (e.g., 'zh', 'en')
             format: Output audio format (e.g., 'mp3', 'wav', 'pcm')
             sample_rate: Sample rate in Hz (e.g., 22050, 24000, 48000)
@@ -79,6 +80,11 @@ class BaseTTS(ABC):
         return "voice_cloning" in self.abilities
 
     @property
+    def supports_persistent_voice_cloning(self) -> bool:
+        """Check if model can create reusable provider-side voice IDs."""
+        return "persistent_voice_cloning" in self.abilities
+
+    @property
     def supports_voice_listing(self) -> bool:
         """Check if model can list available voices dynamically."""
         return "voice_listing" in self.abilities
@@ -102,4 +108,18 @@ class BaseTTS(ABC):
         """List available voices for providers that support dynamic voice lookup."""
         raise NotImplementedError(
             f"{self.provider_name} TTS does not support dynamic voice listing"
+        )
+
+    async def clone_voice(
+        self,
+        *,
+        name: str,
+        reference_audio_files: list[str],
+        description: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        remove_background_noise: bool = False,
+    ) -> dict[str, Any]:
+        """Create a persistent provider-side voice clone."""
+        raise NotImplementedError(
+            f"{self.provider_name} TTS does not support persistent voice cloning"
         )

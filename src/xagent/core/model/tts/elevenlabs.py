@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import mimetypes
 import os
+import uuid
 from collections.abc import Iterable
 from inspect import isawaitable
+from pathlib import Path
 from typing import Any, Optional, Union
 
 from ...utils.security import redact_sensitive_text
@@ -101,6 +106,8 @@ class ElevenLabsTTS(BaseTTS):
         self.sample_rate = _sample_rate_from_output_format(self.output_format)
         self._client: Any = None
         self._async_client: Any = None
+        self._cloned_voice_ids: dict[str, str] = {}
+        self._voice_clone_lock = asyncio.Lock()
 
     @staticmethod
     def _create_client(api_key: Optional[str], base_url: Optional[str] = None) -> Any:
@@ -225,11 +232,31 @@ class ElevenLabsTTS(BaseTTS):
             close()
 
     async def aclose(self) -> None:
-        """Close any cached ElevenLabs SDK clients."""
+        """Delete temporary voice clones and close cached ElevenLabs SDK clients."""
         client = self._client
         async_client = self._async_client
         self._client = None
         self._async_client = None
+
+        if async_client is not None and self._cloned_voice_ids:
+            deleted_voice_ids: set[str] = set()
+            for voice_id in set(self._cloned_voice_ids.values()):
+                try:
+                    await async_client.voices.delete(voice_id)
+                    deleted_voice_ids.add(voice_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to delete temporary ElevenLabs voice clone %s: %s",
+                        voice_id,
+                        redact_sensitive_text(str(exc)),
+                    )
+            if deleted_voice_ids:
+                self._cloned_voice_ids = {
+                    cache_key: voice_id
+                    for cache_key, voice_id in self._cloned_voice_ids.items()
+                    if voice_id not in deleted_voice_ids
+                }
+
         await self._close_client(async_client)
         await self._close_client(client)
 
@@ -340,6 +367,116 @@ class ElevenLabsTTS(BaseTTS):
 
         return normalized_languages or None
 
+    @staticmethod
+    def _reference_audio_file(reference_audio: Any) -> tuple[str, bytes, str]:
+        if not isinstance(reference_audio, (str, os.PathLike)):
+            raise ValueError(
+                "ElevenLabs reference_audio must be a local audio file path"
+            )
+
+        audio_path = Path(reference_audio).expanduser()
+        if not audio_path.is_file():
+            raise ValueError(
+                f"ElevenLabs reference audio file does not exist: {audio_path}"
+            )
+
+        audio = audio_path.read_bytes()
+        if not audio:
+            raise ValueError("ElevenLabs reference audio file must not be empty")
+
+        mime_type = (
+            mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+        )
+        resolved_path = str(audio_path.resolve())
+        stat = audio_path.stat()
+        cache_key = f"{resolved_path}:{stat.st_size}:{stat.st_mtime_ns}"
+        return cache_key, audio, mime_type
+
+    async def _get_or_create_cloned_voice(self, reference_audio: Any) -> str:
+        cache_key, audio, mime_type = self._reference_audio_file(reference_audio)
+        cached_voice_id = self._cloned_voice_ids.get(cache_key)
+        if cached_voice_id:
+            return cached_voice_id
+
+        async with self._voice_clone_lock:
+            cached_voice_id = self._cloned_voice_ids.get(cache_key)
+            if cached_voice_id:
+                return cached_voice_id
+
+            audio_path = Path(reference_audio)
+            clone_name = f"xagent-{audio_path.stem[:40]}-{uuid.uuid4().hex[:8]}"
+            client = self._ensure_async_client()
+            response = await client.voices.ivc.create(
+                name=clone_name,
+                files=[(audio_path.name, audio, mime_type)],
+            )
+            voice_id = _get_field(response, "voice_id", "id")
+            if not voice_id:
+                raise RuntimeError("ElevenLabs voice cloning returned no voice ID")
+
+            normalized_voice_id = str(voice_id)
+            self._cloned_voice_ids[cache_key] = normalized_voice_id
+            return normalized_voice_id
+
+    async def clone_voice(
+        self,
+        *,
+        name: str,
+        reference_audio_files: list[str],
+        description: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        remove_background_noise: bool = False,
+    ) -> dict[str, Any]:
+        """Create a persistent ElevenLabs Instant Voice Clone."""
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("ElevenLabs voice clone name must not be empty")
+        if not reference_audio_files:
+            raise ValueError("At least one reference audio file is required")
+
+        files: list[tuple[str, bytes, str]] = []
+        for reference_audio in reference_audio_files:
+            _, audio, mime_type = self._reference_audio_file(reference_audio)
+            files.append((Path(reference_audio).name, audio, mime_type))
+
+        request_kwargs: dict[str, Any] = {
+            "name": normalized_name,
+            "files": files,
+        }
+        if description is not None:
+            request_kwargs["description"] = description
+        if labels is not None:
+            # SDK 2.0 accepted only a serialized labels object, while newer
+            # releases also accept a mapping. A JSON string works across both.
+            request_kwargs["labels"] = json.dumps(labels)
+        if remove_background_noise:
+            request_kwargs["remove_background_noise"] = True
+
+        client = self._ensure_async_client()
+        try:
+            response = await client.voices.ivc.create(**request_kwargs)
+        except Exception as exc:
+            redacted_error = redact_sensitive_text(str(exc))
+            logger.error("ElevenLabs voice cloning failed: %s", redacted_error)
+            raise RuntimeError(
+                f"ElevenLabs voice cloning failed: {redacted_error}"
+            ) from exc
+
+        voice_id = _get_field(response, "voice_id", "id")
+        if not voice_id:
+            raise RuntimeError("ElevenLabs voice cloning returned no voice ID")
+
+        result: dict[str, Any] = {
+            "voice_id": str(voice_id),
+            "name": normalized_name,
+            "provider": self.provider_name,
+            "persistent": True,
+        }
+        requires_verification = _get_field(response, "requires_verification")
+        if requires_verification is not None:
+            result["requires_verification"] = bool(requires_verification)
+        return result
+
     async def synthesize(
         self,
         text: str,
@@ -350,6 +487,7 @@ class ElevenLabsTTS(BaseTTS):
         verbose: bool = False,
         **kwargs: Any,
     ) -> Union[bytes, TTSResult]:
+        reference_audio = kwargs.pop("reference_audio", None)
         voice_id = voice or self.voice
         final_output_format = self._resolve_output_format(
             format or self.output_format, sample_rate or self.sample_rate
@@ -374,6 +512,8 @@ class ElevenLabsTTS(BaseTTS):
 
         client = self._ensure_async_client()
         try:
+            if reference_audio:
+                voice_id = await self._get_or_create_cloned_voice(reference_audio)
             response = client.text_to_speech.convert(
                 text=text,
                 voice_id=voice_id,
@@ -392,6 +532,19 @@ class ElevenLabsTTS(BaseTTS):
                 chunks.append(self._coerce_audio_bytes(chunk))
             audio = b"".join(chunks)
         except Exception as exc:
+            error_text = str(exc)
+            if (
+                "invalid_uid" in error_text
+                or "invalid ID has been received" in error_text
+            ):
+                message = (
+                    "ElevenLabs rejected the provided voice ID. ElevenLabs voice IDs "
+                    "are account-specific opaque values: call list_tts_voices or "
+                    "clone_tts_voice and use an exact returned voice_id, or omit voice "
+                    "to use the configured default."
+                )
+                logger.error("ElevenLabs TTS failed: %s", message)
+                raise RuntimeError(message) from exc
             redacted_error = redact_sensitive_text(str(exc))
             logger.error(
                 "ElevenLabs TTS failed: %s",
@@ -426,6 +579,8 @@ class ElevenLabsTTS(BaseTTS):
             "audio_generation",
             "multilingual",
             "multiple_voices",
+            "voice_cloning",
+            "persistent_voice_cloning",
             "voice_listing",
             "voice_settings",
             "real_time",
@@ -486,9 +641,12 @@ class ElevenLabsTTS(BaseTTS):
                 "voice_id": str(voice_id),
                 "provider": "elevenlabs",
             }
+            category = _get_field(raw_voice, "category")
+            if category:
+                voice_info["category"] = str(category).lower()
+
             for field_name in (
                 "name",
-                "category",
                 "description",
                 "preview_url",
                 "labels",

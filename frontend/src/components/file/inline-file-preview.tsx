@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { FileText, Loader2 } from 'lucide-react'
+import { FileText, Loader2, Volume2 } from 'lucide-react'
 
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
 import { ExcelPreviewRenderer } from '@/components/file/excel-preview-renderer'
@@ -135,32 +135,26 @@ function InlineAudioPreview({
   previewUrl,
   filename,
   openLabel,
-  loadErrorText,
   className,
 }: {
   source: InlineFilePreviewSource
   previewUrl: string
   filename: string
   openLabel: string
-  loadErrorText: string
   className?: string
 }) {
   const apiUrl = getApiUrl()
-  const needsAuthenticatedFallback = Boolean(source.fileId?.includes('/'))
-  const [resolvedUrl, setResolvedUrl] = useState(
-    needsAuthenticatedFallback ? '' : previewUrl
-  )
-  const [loadError, setLoadError] = useState(false)
+  const shouldFallback = Boolean(source.fileId)
+  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
 
   useEffect(() => {
     let objectUrl: string | null = null
     let isCancelled = false
 
-    setResolvedUrl(needsAuthenticatedFallback ? '' : previewUrl)
-    setLoadError(false)
+    setResolvedUrl(shouldFallback ? '' : previewUrl)
 
     const loadAuthenticatedAudio = async () => {
-      if (!needsAuthenticatedFallback || !source.fileId) return
+      if (!shouldFallback || !source.fileId) return
       try {
         const response = await apiRequest(
           `${apiUrl}/api/files/preview/${encodeURIComponent(source.fileId)}`,
@@ -172,8 +166,10 @@ function InlineAudioPreview({
             },
           }
         )
+        if (isCancelled) return
         if (!response.ok) {
-          throw new Error(`Failed to load audio preview: ${response.status}`)
+          setResolvedUrl(previewUrl)
+          return
         }
         const blob = await response.blob()
         if (isCancelled) return
@@ -181,7 +177,7 @@ function InlineAudioPreview({
         setResolvedUrl(objectUrl)
       } catch {
         if (!isCancelled) {
-          setLoadError(true)
+          setResolvedUrl(previewUrl)
         }
       }
     }
@@ -192,7 +188,7 @@ function InlineAudioPreview({
       isCancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [apiUrl, needsAuthenticatedFallback, previewUrl, source.fileId])
+  }, [apiUrl, previewUrl, shouldFallback, source.fileId])
 
   return (
     <div
@@ -203,7 +199,7 @@ function InlineAudioPreview({
       data-inline-file-preview-wrapper
     >
       <div className="flex items-center gap-2 border-b border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        <FileText className="h-4 w-4 shrink-0" />
+        <Volume2 className="h-4 w-4 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{filename}</span>
         {resolvedUrl ? (
           <a
@@ -217,9 +213,7 @@ function InlineAudioPreview({
         ) : null}
       </div>
       <div className="p-3">
-        {loadError ? (
-          <div className="text-xs text-muted-foreground">{loadErrorText}</div>
-        ) : resolvedUrl ? (
+        {resolvedUrl ? (
           <audio
             controls
             preload="metadata"
@@ -418,7 +412,6 @@ export function InlineFilePreview({
         previewUrl={previewUrl}
         filename={filename}
         openLabel={openLabel}
-        loadErrorText={loadErrorText}
         className={className}
       />
     )

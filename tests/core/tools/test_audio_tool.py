@@ -420,6 +420,16 @@ async def test_list_tts_voices_reports_unsupported_provider() -> None:
     assert result["supported_providers"] == []
 
 
+async def test_list_tts_voices_reports_missing_elevenlabs_model() -> None:
+    result = await AudioToolCore().list_tts_voices()
+
+    assert result["success"] is False
+    assert result["supported"] is False
+    assert result["error"] == "No elevenlabs TTS model is configured"
+    assert result["voices"] == []
+    assert result["model_used"] == "default"
+
+
 def test_list_tts_voices_tool_visible_only_for_voice_listing_provider() -> None:
     unsupported_tool = AudioTool(
         tts_models={"chat-tts": FakeTTS(provider_name="xinference", abilities=["tts"])}
@@ -521,6 +531,21 @@ async def test_clone_tts_voice_rejects_other_provider_model() -> None:
     assert "provider is 'elevenlabs'" in result["error"]
     assert elevenlabs.clone_calls == []
     assert xinference.clone_calls == []
+
+
+async def test_clone_tts_voice_reports_missing_elevenlabs_model() -> None:
+    result = await AudioToolCore().clone_tts_voice(
+        name="Missing provider",
+        reference_audio_files=["reference.wav"],
+    )
+
+    assert result == {
+        "success": False,
+        "supported": False,
+        "error": "No elevenlabs TTS model is configured",
+        "provider": "elevenlabs",
+        "model_used": "default",
+    }
 
 
 async def test_clone_tts_voice_selects_provider_not_default_tts() -> None:

@@ -214,6 +214,14 @@ async def test_synthesize_clones_reference_audio_and_reuses_voice(
 ) -> None:
     reference_audio = tmp_path / "reference.wav"
     reference_audio.write_bytes(b"reference-audio")
+    original_read_bytes = Path.read_bytes
+    read_paths: list[Path] = []
+
+    def read_bytes(path: Path) -> bytes:
+        read_paths.append(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
     create = AsyncMock(return_value=SimpleNamespace(voice_id="cloned-voice"))
 
     async def convert(**kwargs: object):
@@ -245,6 +253,7 @@ async def test_synthesize_clones_reference_audio_and_reuses_voice(
     call = create.await_args.kwargs
     assert call["name"].startswith("xagent-reference-")
     assert call["files"] == [("reference.wav", b"reference-audio", "audio/x-wav")]
+    assert read_paths == [reference_audio]
 
 
 async def test_synthesize_rejects_missing_reference_audio() -> None:
@@ -316,6 +325,31 @@ async def test_aclose_waits_for_inflight_temporary_voice_clone(
     await close_task
 
     delete.assert_awaited_once_with("inflight-voice")
+    assert tts._cloned_voice_ids == {}
+
+
+async def test_aclose_retries_failed_temporary_voice_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_delete = AsyncMock(side_effect=RuntimeError("temporary network error"))
+    first_client = SimpleNamespace(voices=SimpleNamespace(delete=first_delete))
+    retry_delete = AsyncMock()
+    retry_client = SimpleNamespace(voices=SimpleNamespace(delete=retry_delete))
+    monkeypatch.setattr(
+        ElevenLabsTTS,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: retry_client),
+    )
+
+    tts = ElevenLabsTTS(api_key="test-key")
+    tts._async_client = first_client
+    tts._cloned_voice_ids = {"reference": "voice-to-retry"}
+
+    await tts.aclose()
+    assert tts._cloned_voice_ids == {"reference": "voice-to-retry"}
+
+    await tts.aclose()
+    retry_delete.assert_awaited_once_with("voice-to-retry")
     assert tts._cloned_voice_ids == {}
 
 

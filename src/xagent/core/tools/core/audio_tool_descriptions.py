@@ -97,7 +97,7 @@ Parameters:
 - language (optional): language code (e.g., 'zh', 'en', 'yue'). Auto-detected from text if not specified.
 - audio_format (optional): audio output format (e.g., 'mp3', 'wav', 'pcm'). Default: 'mp3'
 - sample_rate (optional): sample rate in Hz when the provider/model supports it.
-- reference_audio (optional): reference audio file path or workspace file ID for voice cloning (if supported by model). ElevenLabs creates a temporary Instant Voice Clone, reuses it within the task, and deletes it during task cleanup.
+- reference_audio (optional): reference audio file path or workspace file ID for voice cloning (if supported by model). When provided, it takes precedence over voice. ElevenLabs creates a temporary Instant Voice Clone, reuses it within the task, and deletes it during task cleanup.
 - voice_settings (optional): provider-specific voice shaping object. Use only with models that advertise supports_voice_settings in list_audio_models.
 - provider_options (optional): provider-specific synthesis options. Use list_audio_models to inspect supported_provider_options.
 - model_id (optional): specific TTS model to use. Omit to use the default model marked with ⭐[DEFAULT].

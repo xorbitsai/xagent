@@ -193,15 +193,43 @@ describe('InlineFilePreview', () => {
     })
   })
 
-  it('renders audio files with native playback controls', () => {
+  it('loads managed audio files through authenticated preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['audio-bytes'], { type: 'audio/mpeg' }),
+    })
+
     render(
       <InlineFilePreview
         source={{ type: 'audio', fileId: 'audio-file-id', filename: 'podcast.mp3' }}
       />
     )
 
-    const audio = screen.getByLabelText('podcast.mp3')
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/audio-file-id',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const audio = await screen.findByLabelText('podcast.mp3')
     expect(audio.tagName.toLowerCase()).toBe('audio')
+    expect(audio.getAttribute('src')).toMatch(/^blob:/)
+    expect(screen.getByRole('link', { name: 'Open' }).getAttribute('href')).toMatch(
+      /^blob:/
+    )
+  })
+
+  it('falls back to the public audio preview when authenticated loading fails', async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 401 })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'audio', fileId: 'audio-file-id', filename: 'podcast.mp3' }}
+      />
+    )
+
+    const audio = await screen.findByLabelText('podcast.mp3')
     expect(audio).toHaveAttribute(
       'src',
       'http://api.local/api/files/public/preview/audio-file-id'

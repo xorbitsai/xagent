@@ -236,6 +236,20 @@ class ElevenLabsTTS(BaseTTS):
         async with self._voice_clone_lock:
             client = self._client
             async_client = self._async_client
+            if (
+                async_client is None
+                and self._cloned_voice_ids
+                and self.api_key is not None
+            ):
+                try:
+                    async_client = self._create_async_client(
+                        self.api_key, self.base_url
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to create ElevenLabs client for temporary voice cleanup: %s",
+                        redact_sensitive_text(str(exc)),
+                    )
             self._client = None
             self._async_client = None
 
@@ -369,7 +383,7 @@ class ElevenLabsTTS(BaseTTS):
         return normalized_languages or None
 
     @staticmethod
-    def _reference_audio_file(reference_audio: Any) -> tuple[str, bytes, str]:
+    def _reference_audio_metadata(reference_audio: Any) -> tuple[Path, str, str]:
         if not isinstance(reference_audio, (str, os.PathLike)):
             raise ValueError(
                 "ElevenLabs reference_audio must be a local audio file path"
@@ -381,20 +395,31 @@ class ElevenLabsTTS(BaseTTS):
                 f"ElevenLabs reference audio file does not exist: {audio_path}"
             )
 
-        audio = audio_path.read_bytes()
-        if not audio:
+        stat = audio_path.stat()
+        if stat.st_size == 0:
             raise ValueError("ElevenLabs reference audio file must not be empty")
 
         mime_type = (
             mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
         )
         resolved_path = str(audio_path.resolve())
-        stat = audio_path.stat()
         cache_key = f"{resolved_path}:{stat.st_size}:{stat.st_mtime_ns}"
+        return audio_path, cache_key, mime_type
+
+    @classmethod
+    def _reference_audio_file(cls, reference_audio: Any) -> tuple[str, bytes, str]:
+        audio_path, cache_key, mime_type = cls._reference_audio_metadata(
+            reference_audio
+        )
+        audio = audio_path.read_bytes()
+        if not audio:
+            raise ValueError("ElevenLabs reference audio file must not be empty")
         return cache_key, audio, mime_type
 
     async def _get_or_create_cloned_voice(self, reference_audio: Any) -> str:
-        cache_key, audio, mime_type = self._reference_audio_file(reference_audio)
+        audio_path, cache_key, mime_type = self._reference_audio_metadata(
+            reference_audio
+        )
         cached_voice_id = self._cloned_voice_ids.get(cache_key)
         if cached_voice_id:
             return cached_voice_id
@@ -404,7 +429,9 @@ class ElevenLabsTTS(BaseTTS):
             if cached_voice_id:
                 return cached_voice_id
 
-            audio_path = Path(reference_audio)
+            audio = audio_path.read_bytes()
+            if not audio:
+                raise ValueError("ElevenLabs reference audio file must not be empty")
             clone_name = f"xagent-{audio_path.stem[:40]}-{uuid.uuid4().hex[:8]}"
             client = self._ensure_async_client()
             response = await client.voices.ivc.create(

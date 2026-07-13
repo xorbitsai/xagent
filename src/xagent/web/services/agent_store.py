@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy.orm import Session
 
@@ -288,7 +288,9 @@ class AgentStore:
         self.db.commit()
         self.db.refresh(agent)
         # add_agent already stamped agent.team_id from the resolved scope.
-        invalidate_agent_cache(user_id, int(agent.id), agent.team_id)
+        invalidate_agent_cache(
+            user_id, int(agent.id), cast("int | None", agent.team_id)
+        )
         return agent
 
     def add_agent(
@@ -366,7 +368,9 @@ class AgentStore:
 
         if "visibility" in updates:
             _assert_can_set_visibility(
-                team_scope, updates.get("visibility"), agent.visibility
+                team_scope,
+                updates.get("visibility"),
+                cast("str | None", agent.visibility),
             )
 
         unknown_fields = set(updates) - _AGENT_UPDATE_FIELDS

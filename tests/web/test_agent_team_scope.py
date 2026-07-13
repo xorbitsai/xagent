@@ -3,6 +3,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import operators
 from sqlalchemy.sql.elements import BinaryExpression, BooleanClauseList
+
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
 from xagent.web.models.user import User

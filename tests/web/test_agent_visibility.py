@@ -1,6 +1,7 @@
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
 
@@ -274,9 +275,9 @@ def test_list_accessible_agents_hides_published_admins_only_from_member(
 ):
     """#4: a published admins-only agent must not surface via the policy path."""
     from xagent.web.models.agent import AgentStatus
+    from xagent.web.services import workforce_access
     from xagent.web.services.agent_access import list_accessible_agents
     from xagent.web.services.agent_store import AgentStore
-    from xagent.web.services import workforce_access
 
     admin, member = team_of_admin_and_member
     store = AgentStore(db)

@@ -9,7 +9,7 @@ and whether that user is a team admin.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -39,7 +39,7 @@ def get_agent_team_scope(
     """Return the caller's team scope, or ``None`` when unscoped."""
     if _agent_team_scope_hook is None or user_id is None:
         return None
-    return _agent_team_scope_hook(db, user_id)
+    return cast(Optional[AgentTeamScope], _agent_team_scope_hook(db, user_id))
 
 
 def team_id_of(scope: Optional[AgentTeamScope]) -> Optional[int]:

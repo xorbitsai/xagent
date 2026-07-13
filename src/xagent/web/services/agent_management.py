@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -194,7 +194,9 @@ class AgentManagementService:
             raise KeyRotationConflict(str(exc)) from exc
 
         self.db.refresh(agent)
-        invalidate_agent_cache(user_id, int(agent.id), agent.team_id)
+        invalidate_agent_cache(
+            user_id, int(agent.id), cast("int | None", agent.team_id)
+        )
 
         key_resp: APIKeyGenerateResponse | None = None
         if staged_key is not None:

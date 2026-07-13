@@ -15,6 +15,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import {
   DefaultModelType,
   getProviderModels,
+  isBuiltinModel,
   ProviderModel,
   removeUserDefaultModel,
   setUserDefaultModel
@@ -765,7 +766,7 @@ export function ModelManagementDialog({
                                 {tDynamic(`models.defaults.${type}`, type.replace(/_/g, " "))}
                               </Badge>
                             ))}
-                            {!model.is_owner && (
+                            {!model.is_owner && !isBuiltinModel(model) && (
                               <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
                                 {t('models.defaults.shared_from_others')}
                               </Badge>
@@ -782,7 +783,11 @@ export function ModelManagementDialog({
                                 </Badge>
                               )
                               })}
-                            {model.is_shared && model.is_owner && (
+                            {isBuiltinModel(model) ? (
+                              <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal bg-amber-500/10 text-amber-600">
+                                {t('models.defaults.builtin')}
+                              </Badge>
+                            ) : model.is_shared && model.is_owner && (
                               <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
                                 {t('models.defaults.shared')}
                               </Badge>
@@ -1341,12 +1346,16 @@ export function ModelManagementDialog({
                   <div className="border rounded-md p-4 bg-muted/20">
                     <div className="font-medium flex items-center gap-2 flex-wrap">
                       <span>{defaultTargetModel.model_name}</span>
-                      {!defaultTargetModel.is_owner && (
+                      {!defaultTargetModel.is_owner && !isBuiltinModel(defaultTargetModel) && (
                         <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
                           {t('models.defaults.shared_from_others')}
                         </Badge>
                       )}
-                      {defaultTargetModel.is_shared && defaultTargetModel.is_owner && (
+                      {isBuiltinModel(defaultTargetModel) ? (
+                        <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal bg-amber-500/10 text-amber-600">
+                          {t('models.defaults.builtin')}
+                        </Badge>
+                      ) : defaultTargetModel.is_shared && defaultTargetModel.is_owner && (
                         <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
                           {t('models.defaults.shared')}
                         </Badge>

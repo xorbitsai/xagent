@@ -1612,6 +1612,7 @@ Build when you need.`,
       rerank: "Rerank Model",
       shared: "Shared",
       shared_from_others: "Public Model",
+      builtin: "Built-in",
     },
     card: {
       owner: "Owner",

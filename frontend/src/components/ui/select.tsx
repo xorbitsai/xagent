@@ -13,6 +13,7 @@ export interface SelectOption {
   isSmallFast?: boolean
   isVisual?: boolean
   isCompact?: boolean
+  isBuiltin?: boolean
   actionIcon?: React.ReactNode
   onAction?: (e: React.MouseEvent) => void
 }
@@ -111,8 +112,11 @@ export function Select({
           {selectedOption ? (
             <div className="flex items-center gap-2 min-w-0 flex-1">
               <span className="font-medium truncate">{selectedOption.label}</span>
-              {(selectedOption.isDefault || selectedOption.isSmallFast || selectedOption.isVisual || selectedOption.isCompact) && (
+              {(selectedOption.isBuiltin || selectedOption.isDefault || selectedOption.isSmallFast || selectedOption.isVisual || selectedOption.isCompact) && (
                 <div className="flex gap-1 flex-shrink-0">
+                  {selectedOption.isBuiltin && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600">{t('models.defaults.builtin')}</span>
+                  )}
                   {selectedOption.isDefault && (
                     <span className="text-xs px-1.5 py-0.5 rounded bg-primary/10 text-primary">Default</span>
                   )}
@@ -158,8 +162,11 @@ export function Select({
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 min-w-0 flex-1">
                       <span className="font-medium truncate">{option.label}</span>
-                      {(option.isDefault || option.isSmallFast || option.isVisual || option.isCompact) && (
+                      {(option.isBuiltin || option.isDefault || option.isSmallFast || option.isVisual || option.isCompact) && (
                         <div className="flex gap-1 flex-shrink-0">
+                          {option.isBuiltin && (
+                            <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600">{t('models.defaults.builtin')}</span>
+                          )}
                           {option.isDefault && (
                             <span className="text-xs px-1.5 py-0.5 rounded bg-primary/10 text-primary">Default</span>
                           )}

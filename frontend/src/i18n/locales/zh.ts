@@ -1612,6 +1612,7 @@ Build when you need.`,
       rerank: "重排序模型",
       shared: "已分享",
       shared_from_others: "公共模型",
+      builtin: "内置模型",
     },
     card: {
       owner: "我的模型",

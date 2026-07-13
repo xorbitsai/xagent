@@ -41,6 +41,12 @@ export interface Model {
   updated_at: string;
 }
 
+// Platform (built-in) models are seeded by xagent cloud with a `platform/`
+// model-id prefix. Central home for that convention so it can't drift across
+// call sites. Inert for OSS, where no model carries the prefix.
+export const isBuiltinModel = (model: { model_id?: string | null }): boolean =>
+  Boolean(model.model_id?.startsWith("platform/"));
+
 export interface UserDefaultModel {
   id: number;
   user_id: number;

@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge"
 import { Settings, X, Loader2, ArrowRight } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import { isBuiltinModel } from "@/lib/models"
 import { useAuth } from "@/contexts/auth-context"
 import { Select } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
@@ -61,6 +62,13 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
     memorySimilarityThreshold: currentConfig?.memorySimilarityThreshold ?? 1.5
   })
   const { t } = useI18n()
+
+  // Platform (built-in) models show a locale-aware badge next to the name
+  // (isBuiltinModel); their seeded "Built-in" placeholder is then kept out of
+  // the option detail line, while a real description (if one is ever added)
+  // still shows since the badge already conveys built-in.
+  const modelDesc = (m: Model): string | undefined =>
+    isBuiltinModel(m) && m.description?.toLowerCase() === "built-in" ? undefined : m.description
 
   // Fetch models when dialog opens
   useEffect(() => {
@@ -216,7 +224,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                     options={models.map(m => ({
                       value: m.model_id,
                       label: m.model_name,
-                      description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider}) [${m.model_id}]`,
+                      description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider}) [${m.model_id}]`,
+                      isBuiltin: isBuiltinModel(m),
                       isDefault: m.is_default,
                       isSmallFast: m.is_small_fast,
                       isVisual: m.is_visual
@@ -241,7 +250,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider}) [${m.model_id}]${m.is_small_fast ? t('agent.configDialog.modelSelect.smallFast.options.tagFast') : ''}`,
+                        description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider}) [${m.model_id}]${m.is_small_fast ? t('agent.configDialog.modelSelect.smallFast.options.tagFast') : ''}`,
+                        isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
                         isVisual: m.is_visual
@@ -267,7 +277,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})[${m.model_id}]${m.is_visual ? t('agent.configDialog.modelSelect.visual.options.tagVisual') : ''}`,
+                        description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider})[${m.model_id}]${m.is_visual ? t('agent.configDialog.modelSelect.visual.options.tagVisual') : ''}`,
+                        isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
                         isVisual: m.is_visual
@@ -293,7 +304,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${m.description ? ' - ' + m.description : ''} (${m.model_provider})[${m.model_id}]${m.is_compact ? t('agent.configDialog.modelSelect.compact.options.tagCompact') : ''}`,
+                        description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider})[${m.model_id}]${m.is_compact ? t('agent.configDialog.modelSelect.compact.options.tagCompact') : ''}`,
+                        isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
                         isVisual: m.is_visual,

@@ -2447,6 +2447,13 @@ Build when you need.`,
         add: "+ Add Prompt",
         delete: "Delete",
       },
+      visibility: {
+        label: "Visibility",
+        desc: "Control who in your team can see and use this agent",
+        team: "Team — all members can view & use",
+        admins: "Admins only — only team admins",
+        adminsHint: "Only team admins can choose this.",
+      },
       chat: {
         title: "{appName} Assistant",
         subtitle: "Chat to configure your agent",

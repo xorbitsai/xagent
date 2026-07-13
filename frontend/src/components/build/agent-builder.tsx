@@ -20,7 +20,14 @@ import { createFileChipHTML } from "@/components/chat/FileChip"
 import { MultiSelect } from "@/components/ui/multi-select"
 import { useFileMention } from "@/hooks/use-file-mention"
 import { FileMentionDropdown } from "@/components/chat/FileMentionDropdown"
-import { Select } from "@/components/ui/select"
+import {
+  Select,
+  SelectRadix,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select"
 import {
   InfoTooltip,
 } from "@/components/ui/tooltip"
@@ -109,7 +116,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
   const { t, locale } = useI18n()
   const { apps: officialApps, getAppIcon, refresh: refreshMcpApps } = useMcpApps()
-  const { user } = useAuth()
+  const { user, inTeam, teamRole } = useAuth()
+  // inTeam gates the whole control (standard xagent has no teams);
+  // canSetAdminsOnly gates the "admins" option to team admins.
+  const canSetAdminsOnly = teamRole === "admin"
   // Set once loadAgent decides to load an owner-scoped MCP list for an admin
   // cross-user view, so the mount-time self-scoped fetch won't clobber it.
   const ownerScopedMcpRef = useRef(false)
@@ -126,6 +136,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [instructions, setInstructions] = useState("")
   const [executionMode, setExecutionMode] = useState("balanced") // "flash", "balanced", "think"
   const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([])
+  const [visibility, setVisibility] = useState<"team" | "admins">("team")
   const [modelConfig, setModelConfig] = useState<AgentModelConfig>({
     general: null,
     small_fast: null,
@@ -596,6 +607,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setInstructions(agent.instructions || "")
           setExecutionMode(agent.execution_mode || "balanced")
           setSuggestedPrompts(agent.suggested_prompts || [])
+          setVisibility(agent.visibility === "admins" ? "admins" : "team")
           setSelectedKbs(agent.knowledge_bases || [])
           setSelectedSkills(agent.skills || [])
 
@@ -1047,6 +1059,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           instructions: instructions.trim() || undefined,
           execution_mode: executionMode,
           suggested_prompts: suggestedPrompts.filter(p => p.trim()),
+          visibility,
           models: modelConfig,
           knowledge_bases: selectedKbs,
           skills: selectedSkills,
@@ -2165,6 +2178,32 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             </Button>
           </div>
         </div>
+
+        {/* Visibility (SaaS team context only) */}
+        {inTeam && (
+          <div className="space-y-2">
+            <Label>{t("builds.configForm.visibility.label")}</Label>
+            <div className="text-xs text-muted-foreground mb-2">
+              {t("builds.configForm.visibility.desc")}
+            </div>
+            <SelectRadix value={visibility} onValueChange={(v) => setVisibility(v as "team" | "admins")}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="team">{t("builds.configForm.visibility.team")}</SelectItem>
+                <SelectItem value="admins" disabled={!canSetAdminsOnly}>
+                  {t("builds.configForm.visibility.admins")}
+                </SelectItem>
+              </SelectContent>
+            </SelectRadix>
+            {!canSetAdminsOnly && (
+              <div className="text-xs text-muted-foreground">
+                {t("builds.configForm.visibility.adminsHint")}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </fieldset>
     </div>

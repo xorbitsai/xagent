@@ -17,12 +17,17 @@ import {
 
 type User = AuthCacheUser
 
+type TeamRole = "admin" | "member" | null
+
 interface AuthContextType {
   user: User | null
   isAuthenticated: boolean
   token: string | null
   refreshToken: string | null
   isLoading: boolean
+  // SaaS team context; on standard xagent (no teams / my-team 404) inTeam=false, teamRole=null.
+  inTeam: boolean
+  teamRole: TeamRole
   login: (username: string, password: string) => Promise<boolean>
   logout: () => void
   checkAuth: () => Promise<boolean>
@@ -37,6 +42,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [refreshToken, setRefreshToken] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [lastCheckTime, setLastCheckTime] = useState(0)
+  const [inTeam, setInTeam] = useState(false)
+  const [teamRole, setTeamRole] = useState<TeamRole>(null)
   const refreshAccessTokenRef = useRef<() => Promise<boolean>>(async () => false)
 
   // Timer for active token refresh
@@ -137,6 +144,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
     return () => window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
   }, [])
+
+  // Resolve SaaS team role once we have a session. my-team 404 / any failure =>
+  // standard xagent with no team concept; keep inTeam=false, teamRole=null.
+  useEffect(() => {
+    if (!token) {
+      setInTeam(false)
+      setTeamRole(null)
+      return
+    }
+    let active = true
+    ;(async () => {
+      try {
+        const res = await apiRequest(`${getApiUrl()}/api/teams/my-team`)
+        if (!active || !res.ok) return
+        const team = await res.json()
+        if (!active) return
+        setInTeam(true)
+        setTeamRole(team?.team_role === "admin" ? "admin" : "member")
+      } catch {
+        // no team context; keep defaults
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [token])
 
   const login = async (username: string, password: string): Promise<boolean> => {
     try {
@@ -299,6 +332,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     token,
     refreshToken,
     isLoading,
+    inTeam,
+    teamRole,
     login,
     logout,
     checkAuth,

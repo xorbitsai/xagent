@@ -2447,6 +2447,13 @@ Build when you need.`,
         add: "+ 添加提示词",
         delete: "删除",
       },
+      visibility: {
+        label: "可见性",
+        desc: "控制团队中谁可以看到并使用此 Agent",
+        team: "团队全体可见",
+        admins: "仅团队管理员可见",
+        adminsHint: "仅团队管理员可设置此项",
+      },
       chat: {
         title: "{appName} 助手",
         subtitle: "通过对话配置你的 Agent",

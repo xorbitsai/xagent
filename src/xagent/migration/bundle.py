@@ -26,7 +26,6 @@ class SkillItem:
     source_path: str
     description: str = ""
     slug: str | None = None
-    version: str | None = None
 
 
 @dataclass
@@ -38,7 +37,6 @@ class PersonaItem:
     """
 
     instructions: str
-    source_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -47,17 +45,15 @@ class ScheduleItem:
 
     ``cron_expression`` is a standard 5-field cron string when the source used
     one; ``interval_seconds`` is the fallback when only an interval is known.
-    ``natural_language`` carries an unparsed HEARTBEAT.md line so the loader can
-    ask an LLM to derive a schedule (see loaders); it is mutually informative
-    with the parsed fields, not exclusive.
+    ``natural_language`` carries an unparsed HEARTBEAT.md line; the loader
+    cannot turn it into a trigger yet, so it archives such items with a
+    heartbeat-specific reason for manual re-creation (see loaders).
     """
 
     name: str
     prompt: str
     cron_expression: str | None = None
     interval_seconds: int | None = None
-    timezone: str | None = None
-    deliver: str | None = None
     natural_language: str | None = None
     source_path: str = ""
 

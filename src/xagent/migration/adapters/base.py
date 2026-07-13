@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from ..bundle import MigrationBundle, SkillItem
 
@@ -33,9 +34,13 @@ class SourceAdapter:
 
 
 def read_text(path: Path) -> str:
-    """Read a text file, tolerating undecodable bytes, or ``""`` if absent."""
+    """Read a text file, tolerating undecodable bytes, or ``""`` if absent.
+
+    ``utf-8-sig`` strips a leading BOM (common in files written on Windows),
+    which would otherwise make ``json.loads`` reject an entire config file.
+    """
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return path.read_text(encoding="utf-8-sig", errors="replace")
     except (OSError, UnicodeError):
         return ""
 
@@ -60,12 +65,25 @@ def collect_skill_dirs(*roots: Path) -> dict[str, Path]:
 
 
 def load_skill_dir(name: str, skill_dir: Path) -> SkillItem | None:
-    """Load a skill directory into a :class:`SkillItem`, or ``None`` if unreadable."""
+    """Load a skill directory into a :class:`SkillItem`, or ``None`` if unreadable.
+
+    Symlinks (and anything resolving outside the skill directory) are skipped
+    so a stray link cannot pull external files into the bundle; hidden
+    dot-entries are skipped because the personal-skill writer rejects them.
+    """
     files: dict[str, bytes] = {}
+    root = skill_dir.resolve()
     for file_path in sorted(skill_dir.rglob("*")):
-        if not file_path.is_file():
+        if file_path.is_symlink() or not file_path.is_file():
+            continue
+        try:
+            if not file_path.resolve().is_relative_to(root):
+                continue
+        except OSError:
             continue
         rel = str(file_path.relative_to(skill_dir)).replace("\\", "/")
+        if any(part.startswith(".") for part in rel.split("/")):
+            continue
         try:
             files[rel] = file_path.read_bytes()
         except OSError:
@@ -79,6 +97,28 @@ def load_skill_dir(name: str, skill_dir: Path) -> SkillItem | None:
         source_path=str(skill_dir),
         description=description,
     )
+
+
+def normalize_cron_entries(data: Any) -> list[Any]:
+    """Normalize a cron config value into a flat list of job entries.
+
+    Sources store jobs either as a bare list, or as a dict with a ``jobs``
+    list, or as a dict keyed by job name.
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        jobs = data.get("jobs")
+        return jobs if isinstance(jobs, list) else list(data.values())
+    return []
+
+
+def parse_interval_seconds(entry: dict[str, Any]) -> int | None:
+    """Extract a positive integer interval from a cron entry, if present."""
+    value = entry.get("interval_seconds") or entry.get("intervalSeconds")
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
 
 
 def _skill_description(skill_md: bytes) -> str:

@@ -19,7 +19,6 @@ Personal cross-project skills also live in ``~/.agents/skills/``.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -29,45 +28,86 @@ from ..bundle import (
     PersonaItem,
     ScheduleItem,
 )
-from .base import SourceAdapter, collect_skill_dirs, load_skill_dir, read_text
+from .base import (
+    SourceAdapter,
+    collect_skill_dirs,
+    load_skill_dir,
+    normalize_cron_entries,
+    parse_interval_seconds,
+    read_text,
+)
 
 # Workspace docs that Hermes archives for manual review; we do the same rather
 # than guess at a mapping. SOUL/IDENTITY are handled as persona instead.
 _ARCHIVE_DOCS = ("TOOLS.md", "BOOTSTRAP.md", "AGENTS.md")
 
 
-def _parse_jsonish(text: str) -> dict[str, Any]:
+def _parse_jsonish(text: str) -> dict[str, Any] | None:
     """Parse JSON, tolerating the JSON5-isms OpenClaw permits.
 
     OpenClaw's ``openclaw.json`` is JSON5 (comments, trailing commas). We try
-    strict JSON first, then fall back to the optional ``json5`` package, then a
-    minimal cleanup pass. Returns ``{}`` on total failure so a malformed config
-    degrades to "nothing to migrate" rather than crashing the run.
+    strict JSON first, then strip those extensions and retry. Returns ``None``
+    when the text cannot be parsed into a dict at all, so the caller can warn
+    instead of silently migrating nothing.
     """
     text = text.strip()
     if not text:
         return {}
-    try:
-        result = json.loads(text)
-        return result if isinstance(result, dict) else {}
-    except json.JSONDecodeError:
-        pass
-    try:
-        import json5  # type: ignore
+    for candidate in (text, _strip_json5(text)):
+        try:
+            result = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        return result if isinstance(result, dict) else None
+    return None
 
-        result = json5.loads(text)
-        return result if isinstance(result, dict) else {}
-    except Exception:
-        pass
-    # Last resort: strip // and /* */ comments and trailing commas.
-    stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    stripped = re.sub(r"(?m)//.*$", "", stripped)
-    stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)
-    try:
-        result = json.loads(stripped)
-        return result if isinstance(result, dict) else {}
-    except json.JSONDecodeError:
-        return {}
+
+def _strip_json5(text: str) -> str:
+    """Drop // and /* */ comments and trailing commas, respecting strings.
+
+    A naive regex strip would also eat ``//`` inside string values (e.g. a URL
+    in the agent name) and corrupt the document, so this walks the text with a
+    quote-state flag and only touches content outside double-quoted strings.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and text[i + 1 : i + 2] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and text[i + 1 : i + 2] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if ch in "}]":
+            # Trailing comma: drop a comma emitted just before this bracket.
+            j = len(out) - 1
+            while j >= 0 and out[j] in " \t\r\n":
+                j -= 1
+            if j >= 0 and out[j] == ",":
+                del out[j]
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _dig(config: dict[str, Any], *path: str) -> Any:
@@ -92,6 +132,12 @@ class OpenClawAdapter(SourceAdapter):
         bundle = MigrationBundle(source=self.key, source_root=str(root))
 
         config = _parse_jsonish(read_text(root / "openclaw.json"))
+        if config is None:
+            config = {}
+            bundle.warnings.append(
+                "Could not parse openclaw.json; the agent name and cron jobs "
+                "from it were skipped."
+            )
 
         bundle.agent_name = self._agent_name(config)
         bundle.persona = self._persona(workspace)
@@ -108,16 +154,13 @@ class OpenClawAdapter(SourceAdapter):
 
     def _persona(self, workspace: Path) -> PersonaItem | None:
         parts: list[str] = []
-        sources: list[str] = []
         for filename in ("SOUL.md", "IDENTITY.md"):
-            path = workspace / filename
-            text = read_text(path).strip()
+            text = read_text(workspace / filename).strip()
             if text:
                 parts.append(text)
-                sources.append(str(path))
         if not parts:
             return None
-        return PersonaItem(instructions="\n\n".join(parts), source_paths=sources)
+        return PersonaItem(instructions="\n\n".join(parts))
 
     def _skills(self, root: Path, workspace: Path) -> list:
         # Highest precedence first, matching OpenClaw's own ordering.
@@ -141,32 +184,18 @@ class OpenClawAdapter(SourceAdapter):
         schedules: list[ScheduleItem] = []
 
         # 1. Structured cron entries in openclaw.json.
-        cron = config.get("cron")
-        entries: list[Any] = []
-        if isinstance(cron, list):
-            entries = cron
-        elif isinstance(cron, dict):
-            jobs = cron.get("jobs")
-            entries = jobs if isinstance(jobs, list) else list(cron.values())
+        entries = normalize_cron_entries(config.get("cron"))
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 continue
             prompt = entry.get("prompt") or entry.get("task") or ""
             expr = entry.get("schedule") or entry.get("cron") or entry.get("expression")
-            interval = entry.get("interval_seconds") or entry.get("intervalSeconds")
-            interval_seconds = (
-                int(interval) if isinstance(interval, int) and interval > 0 else None
-            )
             schedules.append(
                 ScheduleItem(
                     name=str(entry.get("name") or f"openclaw-cron-{index + 1}"),
                     prompt=str(prompt),
                     cron_expression=str(expr) if expr else None,
-                    interval_seconds=interval_seconds,
-                    timezone=(
-                        str(entry["timezone"]) if entry.get("timezone") else None
-                    ),
-                    deliver=str(entry["deliver"]) if entry.get("deliver") else None,
+                    interval_seconds=parse_interval_seconds(entry),
                     source_path="openclaw.json:cron",
                 )
             )

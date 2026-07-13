@@ -3,7 +3,9 @@
 Hermes layout (see hermes-agent.nousresearch.com/docs):
 
     ~/.hermes/
-        config.yaml            model, agent, tts, mcp_servers, ...
+        config.yaml            read for the agent name only; its other keys
+                               (model, tts, mcp_servers, ...) are runtime
+                               settings with no xagent equivalent
         SOUL.md                persona
         memories/              MEMORY.md USER.md
         skills/                skill dirs (agentskills.io standard SKILL.md)
@@ -19,8 +21,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from ..bundle import MigrationBundle, PersonaItem, ScheduleItem
-from .base import SourceAdapter, collect_skill_dirs, load_skill_dir, read_text
+from .base import (
+    SourceAdapter,
+    collect_skill_dirs,
+    load_skill_dir,
+    normalize_cron_entries,
+    parse_interval_seconds,
+    read_text,
+)
 
 
 class HermesAdapter(SourceAdapter):
@@ -33,18 +44,34 @@ class HermesAdapter(SourceAdapter):
         root = self.root
         bundle = MigrationBundle(source=self.key, source_root=str(root))
 
-        bundle.agent_name = "Hermes Agent"
+        bundle.agent_name = self._agent_name(root)
         bundle.persona = self._persona(root)
         bundle.skills = self._skills(root)
         bundle.schedules = self._schedules(root, bundle)
         return bundle
 
+    def _agent_name(self, root: Path) -> str:
+        """Agent name from config.yaml (``agent.name`` or top-level ``name``)."""
+        text = read_text(root / "config.yaml")
+        if text.strip():
+            try:
+                config = yaml.safe_load(text)
+            except yaml.YAMLError:
+                config = None
+            if isinstance(config, dict):
+                agent = config.get("agent")
+                name = agent.get("name") if isinstance(agent, dict) else None
+                if not (isinstance(name, str) and name.strip()):
+                    name = config.get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+        return "Hermes Agent"
+
     def _persona(self, root: Path) -> PersonaItem | None:
-        path = root / "SOUL.md"
-        text = read_text(path).strip()
+        text = read_text(root / "SOUL.md").strip()
         if not text:
             return None
-        return PersonaItem(instructions=text, source_paths=[str(path)])
+        return PersonaItem(instructions=text)
 
     def _skills(self, root: Path) -> list:
         dirs = collect_skill_dirs(root / "skills")
@@ -67,13 +94,7 @@ class HermesAdapter(SourceAdapter):
             bundle.warnings.append(f"Could not parse {jobs_path}; skipping cron jobs.")
             return []
 
-        if isinstance(data, dict):
-            jobs = data.get("jobs")
-            entries = jobs if isinstance(jobs, list) else list(data.values())
-        elif isinstance(data, list):
-            entries = data
-        else:
-            entries = []
+        entries = normalize_cron_entries(data)
 
         schedules: list[ScheduleItem] = []
         for index, entry in enumerate(entries):
@@ -85,17 +106,8 @@ class HermesAdapter(SourceAdapter):
                     name=str(entry.get("name") or f"hermes-cron-{index + 1}"),
                     prompt=str(entry.get("prompt") or ""),
                     cron_expression=str(expr) if expr else None,
-                    interval_seconds=self._interval(entry),
-                    timezone=str(entry["timezone"]) if entry.get("timezone") else None,
-                    deliver=str(entry["deliver"]) if entry.get("deliver") else None,
+                    interval_seconds=parse_interval_seconds(entry),
                     source_path=str(jobs_path),
                 )
             )
         return schedules
-
-    @staticmethod
-    def _interval(entry: dict[str, Any]) -> int | None:
-        value = entry.get("interval_seconds") or entry.get("intervalSeconds")
-        if isinstance(value, int) and value > 0:
-            return value
-        return None

@@ -73,9 +73,13 @@ def write_archive(bundle: MigrationBundle, archive_dir: Path) -> list[str]:
     for index, item in enumerate(bundle.archived):
         safe = _safe_name(item.name) or f"item-{index + 1}"
         out_path = archive_dir / safe
-        # Avoid clobbering same-named archived items (e.g. two "TOOLS.md").
-        if out_path.exists():
-            out_path = archive_dir / f"{index + 1}-{safe}"
+        # Avoid clobbering same-named archived items (e.g. two "TOOLS.md"),
+        # re-checking each fallback since item names may themselves collide
+        # with a generated "N-name".
+        counter = 2
+        while out_path.exists():
+            out_path = archive_dir / f"{counter}-{safe}"
+            counter += 1
         try:
             out_path.write_bytes(item.content or b"")
             written.append(str(out_path))
@@ -83,9 +87,14 @@ def write_archive(bundle: MigrationBundle, archive_dir: Path) -> list[str]:
             continue
         reasons.append(f"{out_path.name}\t<- {item.source_path}\n  {item.reason}")
     if reasons:
-        (archive_dir / "REASON.txt").write_text(
-            "\n".join(reasons) + "\n", encoding="utf-8"
-        )
+        # By now the DB import has already committed; a full disk or bad
+        # permissions here must not abort the run after the fact.
+        try:
+            (archive_dir / "REASON.txt").write_text(
+                "\n".join(reasons) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
     return written
 
 

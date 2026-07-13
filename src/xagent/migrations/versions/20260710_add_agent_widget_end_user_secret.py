@@ -1,7 +1,7 @@
 """add agent widget end-user signing secret
 
 Revision ID: 20260710_add_widget_end_user_secret
-Revises: 20260711_add_trace_events_task_idx
+Revises: 20260711_task_commands
 Create Date: 2026-07-10 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260710_add_widget_end_user_secret"
-down_revision: Union[str, tuple[str, str], None] = "20260711_add_trace_events_task_idx"
+down_revision: Union[str, tuple[str, str], None] = "20260711_task_commands"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

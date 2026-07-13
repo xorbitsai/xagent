@@ -212,6 +212,39 @@ def test_auth_requires_either_guest_id_or_end_user_id() -> None:
     assert resp.status_code == 422, resp.text
 
 
+def test_empty_string_end_user_id_falls_back_to_the_guest_id_field() -> None:
+    """An empty string is falsy in Python, so it must be treated the same as
+    end_user_id being absent entirely -- falling back to the unsigned
+    guest_id field -- rather than either erroring or requiring a signature
+    for an empty identity."""
+    owner_headers = _admin_headers()
+    owner_id = _user_id_from(owner_headers)
+    agent_id = _create_widget_agent(owner_id)
+
+    resp = _widget_auth(agent_id=agent_id, end_user_id="", guest_id="guest-abc")
+    assert resp.status_code == 200, resp.text
+
+
+def test_whitespace_only_end_user_id_is_treated_as_a_literal_identity() -> None:
+    """Unlike an empty string, a non-empty whitespace-only string is truthy
+    in Python and must go through the same signature verification as any
+    other end_user_id -- it is not special-cased as "blank"."""
+    owner_headers = _admin_headers()
+    owner_id = _user_id_from(owner_headers)
+    agent_id = _create_widget_agent(owner_id)
+    secret = _get_end_user_secret(owner_headers, agent_id)
+
+    # No signature for the whitespace identity: rejected like any other.
+    resp = _widget_auth(agent_id=agent_id, end_user_id="   ")
+    assert resp.status_code == 403, resp.text
+
+    # Correctly signed, it succeeds like any other literal identity.
+    resp = _widget_auth(
+        agent_id=agent_id, end_user_id="   ", end_user_signature=_sign(secret, "   ")
+    )
+    assert resp.status_code == 200, resp.text
+
+
 def test_raw_guest_id_cannot_forge_into_the_verified_namespace() -> None:
     """A client cannot bypass signing by directly setting guest_id to the
     reserved "verified_end_user:" prefix the backend uses internally to mark

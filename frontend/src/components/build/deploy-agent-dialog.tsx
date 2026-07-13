@@ -208,15 +208,28 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     })
   }
 
-  const handleCopyApiSnippet = async () => {
-    if (await copyToClipboard(apiSnippets[apiTab])) {
-      setCopiedSnippet(true)
-      toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-      setTimeout(() => setCopiedSnippet(false), 2000)
+  const copyWithFeedback = async (
+    value: string,
+    setCopied: (copied: boolean) => void,
+    successMessage: string,
+    errorMessage: string,
+  ) => {
+    if (await copyToClipboard(value)) {
+      setCopied(true)
+      toast.success(successMessage)
+      setTimeout(() => setCopied(false), 2000)
     } else {
-      toast.error(t("deploy_agent.messages.copy_failed") || "Failed to copy to clipboard")
+      toast.error(errorMessage)
     }
   }
+
+  const handleCopyApiSnippet = () =>
+    copyWithFeedback(
+      apiSnippets[apiTab],
+      setCopiedSnippet,
+      t("deploy_agent.messages.copied") || "Copied to clipboard",
+      t("deploy_agent.messages.copy_failed") || "Failed to copy to clipboard",
+    )
 
   const handleUpdateWidgetConfig = async (
     updates: { widget_enabled?: boolean, allowed_domains?: string[] },
@@ -267,15 +280,14 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     void handleUpdateWidgetConfig({ allowed_domains: currentDomains.filter(d => d !== domain) })
   }
 
-  const handleCopyWidgetKey = async () => {
+  const handleCopyWidgetKey = () => {
     if (!widgetKey) return
-    if (await copyToClipboard(widgetKey)) {
-      setCopiedWidgetKey(true)
-      toast.success(t("common.copied") || "Copied to clipboard")
-      setTimeout(() => setCopiedWidgetKey(false), 2000)
-    } else {
-      toast.error(t("appWidget.messages.copyFailed"))
-    }
+    return copyWithFeedback(
+      widgetKey,
+      setCopiedWidgetKey,
+      t("common.copied") || "Copied to clipboard",
+      t("appWidget.messages.copyFailed"),
+    )
   }
 
   const handleRotateWidgetKey = async () => {
@@ -299,28 +311,26 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     }
   }
 
-  const handleCopySnippet = async () => {
+  const handleCopySnippet = () => {
     if (!deployAgent) return
     const snippet = buildWidgetSnippet(widgetKey ?? "", appOrigin)
     if (!snippet) return
-    if (await copyToClipboard(snippet)) {
-      setCopiedSnippet(true)
-      toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-      setTimeout(() => setCopiedSnippet(false), 2000)
-    } else {
-      toast.error(t("appWidget.messages.copyFailed"))
-    }
+    return copyWithFeedback(
+      snippet,
+      setCopiedSnippet,
+      t("deploy_agent.messages.copied") || "Copied to clipboard",
+      t("appWidget.messages.copyFailed"),
+    )
   }
 
-  const handleCopyEndUserSecret = async () => {
+  const handleCopyEndUserSecret = () => {
     if (!endUserSecret) return
-    if (await copyToClipboard(endUserSecret)) {
-      setCopiedEndUserSecret(true)
-      toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-      setTimeout(() => setCopiedEndUserSecret(false), 2000)
-    } else {
-      toast.error(t("appWidget.messages.copyFailed"))
-    }
+    return copyWithFeedback(
+      endUserSecret,
+      setCopiedEndUserSecret,
+      t("deploy_agent.messages.copied") || "Copied to clipboard",
+      t("appWidget.messages.copyFailed"),
+    )
   }
 
   const handleRotateEndUserSecret = async () => {
@@ -344,15 +354,14 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     }
   }
 
-  const handleCopyShareLink = async () => {
+  const handleCopyShareLink = () => {
     if (!shareUrl) return
-    if (await copyToClipboard(shareUrl)) {
-      setCopiedShareLink(true)
-      toast.success(t("deploy_agent.messages.link_copied") || "Link copied to clipboard")
-      setTimeout(() => setCopiedShareLink(false), 2000)
-    } else {
-      toast.error(t("appWidget.messages.copyFailed"))
-    }
+    return copyWithFeedback(
+      shareUrl,
+      setCopiedShareLink,
+      t("deploy_agent.messages.link_copied") || "Link copied to clipboard",
+      t("appWidget.messages.copyFailed"),
+    )
   }
 
   const handleEnableShare = async () => {

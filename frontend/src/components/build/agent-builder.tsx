@@ -1790,6 +1790,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             }}
             options={kbOptions}
             placeholder={t("builds.configForm.knowledgeBase.placeholder")}
+            disabled={readOnly}
           />
         </div>
 
@@ -1825,6 +1826,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               onValuesChange={setSelectedSkills}
               options={skillOptions}
               placeholder={t("builds.configForm.skills.placeholder")}
+              disabled={readOnly}
             />
           ) : (
             <div className="text-sm text-muted-foreground">
@@ -1865,6 +1867,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               onValuesChange={setSelectedToolCategories}
               options={toolCategoryOptions}
               placeholder={t("builds.configForm.tools.placeholder")}
+              disabled={readOnly}
             />
           ) : (
             <div className="text-sm text-muted-foreground">

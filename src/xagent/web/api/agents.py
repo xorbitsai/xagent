@@ -39,6 +39,7 @@ from ..services.agent_management import (
 from ..services.agent_store import AgentStore, new_widget_key
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
+from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
 
@@ -575,15 +576,16 @@ async def get_agent(
         if response is None:
             # Owner path missed. Admins may read any agent; other users may read
             # agents shared to them read-only via policy (e.g. workforce policies)
-            # — those are the same agents the list endpoint now links to.
-            if is_admin_user(current_user) or any(
-                int(item.agent.id) == agent_id
-                for item in list_accessible_agents(
-                    db, current_user, purpose="agent_list"
-                )
-            ):
+            # — the same agents the list endpoint now links to. Check the policy
+            # id set directly instead of materializing every accessible agent.
+            if is_admin_user(current_user):
                 response = store.get_agent_response_for_admin(agent_id)
                 readonly = response is not None
+            else:
+                visible_ids = get_visible_agent_ids(db, current_user, "agent_list")
+                if visible_ids and agent_id in visible_ids:
+                    response = store.get_agent_response_for_admin(agent_id)
+                    readonly = response is not None
         if response is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         result = AgentResponse.model_validate(response)

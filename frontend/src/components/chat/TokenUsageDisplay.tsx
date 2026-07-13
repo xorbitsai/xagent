@@ -27,35 +27,40 @@ interface ModelTokenUsage {
   output_tokens: number;
 }
 
-const compactTokenFormatters: Record<Locale, Intl.NumberFormat> = {
-  en: new Intl.NumberFormat('en', {
-    notation: 'compact',
-    compactDisplay: 'short',
-    maximumFractionDigits: 2,
-  }),
-  zh: new Intl.NumberFormat('zh', {
-    notation: 'compact',
-    compactDisplay: 'short',
-    maximumFractionDigits: 2,
-  }),
-};
-const exactTokenFormatters: Record<Locale, Intl.NumberFormat> = {
-  en: new Intl.NumberFormat('en'),
-  zh: new Intl.NumberFormat('zh'),
-};
+// Build formatters lazily per locale so this file stays valid regardless of the
+// locale set (the SaaS overlay adds more locales than the standalone build).
+const compactTokenFormatters = new Map<Locale, Intl.NumberFormat>();
+const exactTokenFormatters = new Map<Locale, Intl.NumberFormat>();
+
+function getFormatter(
+  cache: Map<Locale, Intl.NumberFormat>,
+  locale: Locale,
+  options?: Intl.NumberFormatOptions,
+): Intl.NumberFormat {
+  let formatter = cache.get(locale);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(locale, options);
+    cache.set(locale, formatter);
+  }
+  return formatter;
+}
 
 function normalizeTokenCount(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
 }
 
 export function formatTokenCount(value: number, locale: Locale = 'en'): string {
-  return compactTokenFormatters[locale]
+  return getFormatter(compactTokenFormatters, locale, {
+    notation: 'compact',
+    compactDisplay: 'short',
+    maximumFractionDigits: 2,
+  })
     .format(normalizeTokenCount(value))
     .toLowerCase();
 }
 
 export function formatExactTokenCount(value: number, locale: Locale = 'en'): string {
-  return exactTokenFormatters[locale].format(normalizeTokenCount(value));
+  return getFormatter(exactTokenFormatters, locale).format(normalizeTokenCount(value));
 }
 
 export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDisplayProps) {

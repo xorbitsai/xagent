@@ -148,9 +148,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Resolve SaaS team role once we have a session. my-team 404 / any failure =>
   // standard xagent with no team concept; keep inTeam=false, teamRole=null.
   useEffect(() => {
+    // Reset first so a token change / failed or non-team response never leaves
+    // a previous user's team context behind.
+    setInTeam(false)
+    setTeamRole(null)
     if (!token) {
-      setInTeam(false)
-      setTeamRole(null)
       return
     }
     let active = true

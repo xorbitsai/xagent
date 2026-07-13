@@ -234,7 +234,10 @@ def agent_list_key(
     user_id: int, team_id: int | None = None, is_team_admin: bool = False
 ) -> str:
     if team_id is not None:
-        return f"agent:list:team:{team_id}:{'a' if is_team_admin else 'm'}"
+        # user_id is part of the key: owned_agent_clause still matches a user's
+        # own legacy (team_id IS NULL) agents, so the result set is user-specific
+        # and must never be served from a key shared across team members.
+        return f"agent:list:team:{team_id}:{user_id}:{'a' if is_team_admin else 'm'}"
     return f"agent:list:{user_id}"
 
 
@@ -245,8 +248,12 @@ def agent_detail_key(
     is_team_admin: bool = False,
 ) -> str:
     if team_id is not None:
+        # user_id in the key: see agent_list_key -- a user's own legacy
+        # (team_id IS NULL) agents are visible only to them, so the detail
+        # cache must be per-user even within a team.
         return (
-            f"agent:detail:team:{team_id}:{'a' if is_team_admin else 'm'}:{agent_id}"
+            f"agent:detail:team:{team_id}:{user_id}:"
+            f"{'a' if is_team_admin else 'm'}:{agent_id}"
         )
     return f"agent:detail:{user_id}:{agent_id}"
 

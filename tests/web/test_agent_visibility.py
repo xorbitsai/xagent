@@ -83,10 +83,29 @@ def test_team_list_key_splits_by_role():
     from xagent.web.services import hot_path_cache as hpc
 
     assert hpc.agent_list_key(7) == "agent:list:7"
-    assert hpc.agent_list_key(7, team_id=42, is_team_admin=True) == "agent:list:team:42:a"
     assert (
-        hpc.agent_list_key(7, team_id=42, is_team_admin=False) == "agent:list:team:42:m"
+        hpc.agent_list_key(7, team_id=42, is_team_admin=True)
+        == "agent:list:team:42:7:a"
     )
+    assert (
+        hpc.agent_list_key(7, team_id=42, is_team_admin=False)
+        == "agent:list:team:42:7:m"
+    )
+
+
+def test_team_cache_keys_are_per_user():
+    # owned_agent_clause still matches a user's own legacy (team_id IS NULL)
+    # agents, so two users in the same team + role must get DIFFERENT cache
+    # keys -- otherwise one member's private agents leak to another on a hit.
+    from xagent.web.services import hot_path_cache as hpc
+
+    assert hpc.agent_list_key(1, team_id=9, is_team_admin=False) != hpc.agent_list_key(
+        2, team_id=9, is_team_admin=False
+    )
+    assert hpc.agent_detail_key(1, 5, team_id=9) != hpc.agent_detail_key(
+        2, 5, team_id=9
+    )
+    assert ":1:" in hpc.agent_list_key(1, team_id=9)
 
 
 @pytest.fixture

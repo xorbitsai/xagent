@@ -75,12 +75,15 @@ def test_cache_keys_are_team_scoped_when_scope_present():
     from xagent.web.services import hot_path_cache as hpc
 
     assert hpc.agent_list_key(7) == "agent:list:7"
-    assert hpc.agent_list_key(7, team_id=42, is_team_admin=True) == "agent:list:team:42:a"
+    assert (
+        hpc.agent_list_key(7, team_id=42, is_team_admin=True)
+        == "agent:list:team:42:7:a"
+    )
     assert hpc.agent_detail_key(7, 5) == "agent:detail:7:5"
-    assert hpc.agent_detail_key(7, 5, team_id=42) == "agent:detail:team:42:m:5"
+    assert hpc.agent_detail_key(7, 5, team_id=42) == "agent:detail:team:42:7:m:5"
     assert (
         hpc.agent_detail_key(7, 5, team_id=42, is_team_admin=True)
-        == "agent:detail:team:42:a:5"
+        == "agent:detail:team:42:7:a:5"
     )
 
 

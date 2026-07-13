@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Code2 } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Code2, Eye } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -153,6 +153,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [showAIAssistant, setShowAIAssistant] = useState(false)
   const [configSynced, setConfigSynced] = useState(false)
   const [notFound, setNotFound] = useState(false)
+  // Admin viewing another user's agent: writes are owner-only, so the whole
+  // builder is locked and Save/Publish/AI-assistant are hidden (#783 follow-up).
+  const [readOnly, setReadOnly] = useState(false)
   const isFirstRender = useRef(true)
   const modelSectionRef = useRef<HTMLDivElement>(null)
 
@@ -586,6 +589,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const agent = await response.json()
           if (!active) return
           setOriginalData(agent)
+          setReadOnly(agent.can_edit === false)
           setName(agent.name || "")
           setDescription(agent.description || "")
           setInstructions(agent.instructions || "")
@@ -1341,55 +1345,65 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           <p className="text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
         </div>
         <div className="flex max-w-full flex-wrap items-center gap-2 xl:gap-4">
-          <Button
-            variant="outline"
-            className={cn(
-              "flex items-center gap-2 transition-colors",
-              showAIAssistant
-                ? "bg-primary/10 text-primary border-primary/20 hover:bg-primary/20 hover:text-primary"
-                : "text-muted-foreground hover:text-foreground"
-            )}
-            onClick={() => setShowAIAssistant(!showAIAssistant)}
-          >
-            <Bot className="h-4 w-4" />
-            {t("builds.editor.aiAssistant", { appName: branding.appName })}
-          </Button>
-
-          <Button
-            onClick={handleCreate}
-            disabled={isCreating || loadingAgent || (isEditMode && !isDirty)}
-          >
-            {isCreating
-              ? isEditMode
-                ? t("builds.editor.header.updating")
-                : t("builds.editor.header.creating")
-              : isEditMode
-                ? t("builds.editor.header.update")
-                : t("builds.editor.header.create")}
-          </Button>
-
-          {isEditMode && (
-            originalData?.status === "published" ? (
+          {readOnly ? (
+            <div className="flex items-center gap-2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-400">
+              <Eye className="h-4 w-4" />
+              {t("builds.editor.header.readOnly")}
+            </div>
+          ) : (
+            <>
               <Button
                 variant="outline"
-                onClick={handleUnpublish}
-                disabled={isCreating || loadingAgent}
+                className={cn(
+                  "flex items-center gap-2 transition-colors",
+                  showAIAssistant
+                    ? "bg-primary/10 text-primary border-primary/20 hover:bg-primary/20 hover:text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+                onClick={() => setShowAIAssistant(!showAIAssistant)}
               >
-                {t("builds.editor.header.unpublish")}
+                <Bot className="h-4 w-4" />
+                {t("builds.editor.aiAssistant", { appName: branding.appName })}
               </Button>
-            ) : (
+
               <Button
-                variant="secondary"
-                onClick={handlePublish}
-                disabled={isCreating || loadingAgent || isDirty}
+                onClick={handleCreate}
+                disabled={isCreating || loadingAgent || (isEditMode && !isDirty)}
               >
-                {t("builds.editor.header.publish")}
+                {isCreating
+                  ? isEditMode
+                    ? t("builds.editor.header.updating")
+                    : t("builds.editor.header.creating")
+                  : isEditMode
+                    ? t("builds.editor.header.update")
+                    : t("builds.editor.header.create")}
               </Button>
-            )
+
+              {isEditMode && (
+                originalData?.status === "published" ? (
+                  <Button
+                    variant="outline"
+                    onClick={handleUnpublish}
+                    disabled={isCreating || loadingAgent}
+                  >
+                    {t("builds.editor.header.unpublish")}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="secondary"
+                    onClick={handlePublish}
+                    disabled={isCreating || loadingAgent || isDirty}
+                  >
+                    {t("builds.editor.header.publish")}
+                  </Button>
+                )
+              )}
+            </>
           )}
         </div>
       </div>
 
+      <fieldset disabled={readOnly} className="contents">
       <div className="rounded-xl border border-primary/15 bg-primary/5 px-4 py-4">
         <div className="mb-3 text-sm font-semibold text-primary">
           {t("builds.editor.stepGuide.title")}
@@ -1528,7 +1542,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             >
               <div
                 ref={instructionsRef}
-                contentEditable={!isOptimizing}
+                contentEditable={!isOptimizing && !readOnly}
                 className="h-[220px] min-h-[150px] max-h-[520px] w-full rounded-md bg-transparent px-3 py-2 font-mono text-sm outline-none overflow-y-auto resize-y break-words whitespace-pre-wrap text-left"
                 onInput={handleInstructionsInput}
                 onKeyDown={fileMention.handleKeyDown}
@@ -2143,6 +2157,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
         </div>
       </div>
+    </fieldset>
     </div>
   )
 
@@ -2203,7 +2218,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     <div className="flex h-full flex-col overflow-hidden">
       <div className="flex-1 min-h-0 w-full overflow-y-auto md:overflow-hidden">
         <ResizableThreeColumnLayout
-          showLeftPanel={showAIAssistant}
+          showLeftPanel={showAIAssistant && !readOnly}
           leftPanel={<AgentBuilderChat
             agentConfig={{
               id: localAgentId ? parseInt(localAgentId) : undefined,

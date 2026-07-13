@@ -121,6 +121,11 @@ class AgentResponse(BaseModel):
     allowed_domains: List[str]
     share_enabled: bool
     share_updated_at: Optional[str]
+    # False when an admin is viewing another user's agent read-only (#783 follow-up):
+    # writes stay owner-only, so the builder disables editing instead of letting a
+    # save fail with "Agent not found".
+    readonly: bool = False
+    can_edit: bool = True
 
 
 class AgentListItem(BaseModel):
@@ -566,11 +571,17 @@ async def get_agent(
     try:
         store = AgentStore(db)
         response = store.get_agent_response(int(current_user.id), agent_id)
+        readonly = False
         if response is None and is_admin_user(current_user):
             response = store.get_agent_response_for_admin(agent_id)
+            readonly = response is not None
         if response is None:
             raise HTTPException(status_code=404, detail="Agent not found")
-        return AgentResponse.model_validate(response)
+        result = AgentResponse.model_validate(response)
+        if readonly:
+            result.readonly = True
+            result.can_edit = False
+        return result
 
     except HTTPException:
         raise

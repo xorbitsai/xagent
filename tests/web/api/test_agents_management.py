@@ -1459,7 +1459,18 @@ def test_admin_can_read_other_users_agent_detail():
 
     resp = client.get(f"/api/agents/{agent_id}", headers=admin)
     assert resp.status_code == 200, resp.text
-    assert "mcp:foo" in resp.json()["tool_categories"]
+    body = resp.json()
+    assert "mcp:foo" in body["tool_categories"]
+    # Admin sees it read-only: writes stay owner-only, so the builder must lock
+    # instead of letting a save fail with "Agent not found".
+    assert body["readonly"] is True
+    assert body["can_edit"] is False
+
+    # The owner still gets an editable detail.
+    owner_resp = client.get(f"/api/agents/{agent_id}", headers=bob)
+    assert owner_resp.status_code == 200, owner_resp.text
+    assert owner_resp.json()["readonly"] is False
+    assert owner_resp.json()["can_edit"] is True
 
 
 def test_non_admin_cannot_read_other_users_agent_detail():

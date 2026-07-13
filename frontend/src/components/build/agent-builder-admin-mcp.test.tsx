@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, render, waitFor } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 // Exercises the admin cross-user MCP-list path in AgentBuilder's edit-mode
@@ -114,7 +114,7 @@ import { AgentBuilder } from "./agent-builder"
 
 const AGENT_ID = "5"
 
-function agentResponse(ownerId: number) {
+function agentResponse(ownerId: number, canEdit = true) {
   return {
     id: Number(AGENT_ID),
     user_id: ownerId,
@@ -135,13 +135,18 @@ function agentResponse(ownerId: number) {
     allowed_domains: [],
     share_enabled: false,
     share_updated_at: null,
+    readonly: !canEdit,
+    can_edit: canEdit,
   }
 }
 
 // Base handler for the mount-time fetchData resources + agent detail. `ownerId`
 // controls who owns the loaded agent; `agentPromise` lets a test defer the agent
 // response to drive the mid-flight teardown case.
-function installApi(ownerId: number, opts: { agentPromise?: Promise<Response> } = {}) {
+function installApi(
+  ownerId: number,
+  opts: { agentPromise?: Promise<Response>; canEdit?: boolean } = {}
+) {
   apiRequestMock.mockImplementation((url: string) => {
     if (url.endsWith("/api/kb/collections"))
       return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
@@ -157,7 +162,11 @@ function installApi(ownerId: number, opts: { agentPromise?: Promise<Response> } 
       return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
     if (url.endsWith(`/api/agents/${AGENT_ID}`))
       return opts.agentPromise ??
-        Promise.resolve(new Response(JSON.stringify(agentResponse(ownerId)), { status: 200 }))
+        Promise.resolve(
+          new Response(JSON.stringify(agentResponse(ownerId, opts.canEdit ?? true)), {
+            status: 200,
+          })
+        )
     // Both the mount-time (no user_id) and owner-scoped (?user_id=) MCP fetches.
     if (url.includes("/api/mcp/servers"))
       return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
@@ -192,6 +201,18 @@ describe("AgentBuilder admin cross-user MCP list", () => {
 
     await waitFor(() => expect(mcpCalls()).toContain("http://api.local/api/mcp/servers"))
     expect(mcpCalls().some((u) => u.includes("user_id="))).toBe(false)
+  })
+
+  it("locks the builder read-only and hides Save when can_edit is false", async () => {
+    installApi(99, { canEdit: false }) // admin opening a read-only agent
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    // Read-only badge appears once the agent detail loads.
+    await screen.findByText("builds.editor.header.readOnly")
+    // The Save/Publish buttons are gone, so there's no "edits but save fails" trap.
+    expect(screen.queryByText("builds.editor.header.update")).toBeNull()
+    expect(screen.queryByText("builds.editor.header.create")).toBeNull()
+    expect(screen.queryByText("builds.editor.header.publish")).toBeNull()
   })
 
   it("does not fire the owner-scoped fetch if unmounted before the agent load resolves", async () => {

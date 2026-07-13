@@ -157,6 +157,24 @@ def _single_tool_schema(name: str = "select_execution_pattern") -> list[dict]:
     ]
 
 
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [None],
+        ["invalid"],
+        [{}],
+        [{"function": None}],
+    ],
+)
+def test_openrouter_deepseek_preserves_required_for_malformed_single_tool(
+    tools,
+):
+    assert (
+        openrouter_module._force_single_required_deepseek_tool(tools, "required")
+        == "required"
+    )
+
+
 @pytest.mark.asyncio
 async def test_openrouter_official_provider_pinning_disabled_by_default(
     mock_chat_completion, mocker, monkeypatch

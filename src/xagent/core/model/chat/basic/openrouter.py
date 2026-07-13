@@ -75,13 +75,16 @@ def _strip_assistant_tool_call_prefixes(
 
 
 def _force_single_required_deepseek_tool(
-    tools: Optional[List[Dict[str, Any]]],
+    tools: Optional[List[Any]],
     tool_choice: Optional[str | Dict[str, Any]],
 ) -> Optional[str | Dict[str, Any]]:
     """Turn DeepSeek's ambiguous single-tool requirement into a named choice."""
     if tool_choice != "required" or not tools or len(tools) != 1:
         return tool_choice
-    function = tools[0].get("function")
+    tool = tools[0]
+    if not isinstance(tool, dict):
+        return tool_choice
+    function = tool.get("function")
     if not isinstance(function, dict):
         return tool_choice
     name = function.get("name")

@@ -16,6 +16,7 @@ vi.mock("@/lib/utils", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
+    locale: "en",
     t: (key: string, vars?: Record<string, string | number>) => {
       const message = {
         "chatPage.tokenUsage.input": "Input tokens",
@@ -27,6 +28,7 @@ vi.mock("@/contexts/i18n-context", () => ({
         "chatPage.tokenUsage.byModel": "Usage by model",
         "chatPage.tokenUsage.model": "Model",
         "chatPage.tokenUsage.unknownModel": "Unknown model",
+        "chatPage.tokenUsage.unattributed": "Unattributed",
       }[key] ?? key
       return vars?.count !== undefined
         ? message.replace("{count}", String(vars.count))
@@ -55,7 +57,16 @@ describe("TokenUsageDisplay", () => {
     expect(formatTokenCount(37_499)).toBe("37.5k")
     expect(formatTokenCount(2_755_525)).toBe("2.76m")
     expect(formatExactTokenCount(2_755_525)).toBe("2,755,525")
+    expect(formatTokenCount(2_755_525, "zh")).toBe("275.55万")
   })
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
+    "normalizes invalid token count %s to zero",
+    (value) => {
+      expect(formatTokenCount(value)).toBe("0")
+      expect(formatExactTokenCount(value)).toBe("0")
+    },
+  )
 
   it("shows aggregate counts and exposes each model in a popover", async () => {
     apiRequestMock.mockResolvedValue(
@@ -133,11 +144,41 @@ describe("TokenUsageDisplay", () => {
 
     render(<TokenUsageDisplay taskId={8} isRunning={false} />)
 
-    const modelsButton = await screen.findByRole("button", { name: /1 model/ })
-    expect(modelsButton).toHaveTextContent("1 model")
+    const modelsButton = await screen.findByRole("button", { name: /^1 model$/ })
+    expect(modelsButton).toHaveAccessibleName("1 model")
+    expect(screen.queryByRole("button", { name: "1 models" })).not.toBeInTheDocument()
     fireEvent.click(modelsButton)
 
     expect(await screen.findByText("Unknown model")).toBeInTheDocument()
+  })
+
+  it("labels name-only model usage as unattributed", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 30,
+          output_tokens: 0,
+          total_tokens: 30,
+          llm_calls: 1,
+          model_usage: [
+            {
+              model_id: "",
+              model_name: "shared-name",
+              input_tokens: 30,
+              output_tokens: 0,
+              total_tokens: 30,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={10} isRunning={false} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /^1 model$/ }))
+    expect(await screen.findByText("shared-name")).toBeInTheDocument()
+    expect(screen.getByText("Unattributed")).toBeInTheDocument()
   })
 
   it.each([undefined, []])(

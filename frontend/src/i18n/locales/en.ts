@@ -278,6 +278,7 @@ const en = {
       byModel: "Usage by model",
       model: "Model",
       unknownModel: "Unknown model",
+      unattributed: "Unattributed",
     },
     contextUsage: {
       tooltip: "Context window {pct}% ({used}/{total} tokens)",

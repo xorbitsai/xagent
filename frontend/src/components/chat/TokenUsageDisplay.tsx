@@ -3,7 +3,7 @@ import React, { useEffect, useState } from 'react';
 import { getApiUrl } from '@/lib/utils';
 import { apiRequest } from '@/lib/api-wrapper';
 import { ChevronDown, Sparkles } from 'lucide-react';
-import { useI18n } from '@/contexts/i18n-context';
+import { useI18n, type Locale } from '@/contexts/i18n-context';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 
 interface TokenUsageDisplayProps {
@@ -28,26 +28,40 @@ interface ModelTokenUsage {
   total_tokens: number;
 }
 
-const compactTokenFormatter = new Intl.NumberFormat('en-US', {
-  notation: 'compact',
-  compactDisplay: 'short',
-  maximumFractionDigits: 2,
-});
-const exactTokenFormatter = new Intl.NumberFormat('en-US');
+const compactTokenFormatters: Record<Locale, Intl.NumberFormat> = {
+  en: new Intl.NumberFormat('en', {
+    notation: 'compact',
+    compactDisplay: 'short',
+    maximumFractionDigits: 2,
+  }),
+  zh: new Intl.NumberFormat('zh', {
+    notation: 'compact',
+    compactDisplay: 'short',
+    maximumFractionDigits: 2,
+  }),
+};
+const exactTokenFormatters: Record<Locale, Intl.NumberFormat> = {
+  en: new Intl.NumberFormat('en'),
+  zh: new Intl.NumberFormat('zh'),
+};
 
-export function formatTokenCount(value: number): string {
-  const normalized = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
-  return compactTokenFormatter.format(normalized).toLowerCase();
+function normalizeTokenCount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
 }
 
-export function formatExactTokenCount(value: number): string {
-  const normalized = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
-  return exactTokenFormatter.format(normalized);
+export function formatTokenCount(value: number, locale: Locale = 'en'): string {
+  return compactTokenFormatters[locale]
+    .format(normalizeTokenCount(value))
+    .toLocaleLowerCase(locale);
+}
+
+export function formatExactTokenCount(value: number, locale: Locale = 'en'): string {
+  return exactTokenFormatters[locale].format(normalizeTokenCount(value));
 }
 
 export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDisplayProps) {
   const [usage, setUsage] = useState<TokenUsage | null>(null);
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
 
   useEffect(() => {
     if (!taskId) return;
@@ -93,8 +107,8 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
     <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
       <span className="flex items-center gap-1.5 whitespace-nowrap">
         <Sparkles className="w-4 h-4 text-indigo-500" />
-        <span className="font-medium text-foreground" title={formatExactTokenCount(usage.input_tokens)}>
-          {formatTokenCount(usage.input_tokens)}
+        <span className="font-medium text-foreground" title={formatExactTokenCount(usage.input_tokens, locale)}>
+          {formatTokenCount(usage.input_tokens, locale)}
         </span>
         <span
           className="text-muted-foreground"
@@ -104,8 +118,8 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
         </span>
       </span>
       <span className="flex items-center gap-1.5 whitespace-nowrap">
-        <span className="font-medium text-foreground" title={formatExactTokenCount(usage.output_tokens)}>
-          {formatTokenCount(usage.output_tokens)}
+        <span className="font-medium text-foreground" title={formatExactTokenCount(usage.output_tokens, locale)}>
+          {formatTokenCount(usage.output_tokens, locale)}
         </span>
         <span
           className="text-muted-foreground"
@@ -147,8 +161,8 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
               <span className="text-right text-muted-foreground">
                 {t('chatPage.tokenUsage.outputShort')}
               </span>
-              {usage.model_usage.map((model) => (
-                <React.Fragment key={`${model.model_id}:${model.model_name}`}>
+              {usage.model_usage.map((model, index) => (
+                <React.Fragment key={JSON.stringify([model.model_id, model.model_name, index])}>
                   <span className="min-w-0" title={model.model_name || model.model_id}>
                     <span className="block truncate font-medium">
                       {model.model_name || model.model_id || t('chatPage.tokenUsage.unknownModel')}
@@ -158,12 +172,17 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                         {model.model_id}
                       </span>
                     )}
+                    {!model.model_id && model.model_name && (
+                      <span className="block truncate text-[10px] text-muted-foreground">
+                        {t('chatPage.tokenUsage.unattributed')}
+                      </span>
+                    )}
                   </span>
-                  <span className="text-right tabular-nums" title={formatExactTokenCount(model.input_tokens)}>
-                    {formatTokenCount(model.input_tokens)}
+                  <span className="text-right tabular-nums" title={formatExactTokenCount(model.input_tokens, locale)}>
+                    {formatTokenCount(model.input_tokens, locale)}
                   </span>
-                  <span className="text-right tabular-nums" title={formatExactTokenCount(model.output_tokens)}>
-                    {formatTokenCount(model.output_tokens)}
+                  <span className="text-right tabular-nums" title={formatExactTokenCount(model.output_tokens, locale)}>
+                    {formatTokenCount(model.output_tokens, locale)}
                   </span>
                 </React.Fragment>
               ))}

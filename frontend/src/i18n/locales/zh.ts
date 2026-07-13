@@ -278,6 +278,7 @@ const zh = {
       byModel: "各模型用量",
       model: "模型",
       unknownModel: "未知模型",
+      unattributed: "未归属",
     },
     contextUsage: {
       tooltip: "上下文窗口 {pct}%（{used}/{total} tokens）",

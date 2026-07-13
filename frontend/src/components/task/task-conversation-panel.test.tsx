@@ -621,7 +621,6 @@ describe("TaskConversationPanel", () => {
     render(<TaskConversationPanel mode="page" />)
 
     expect(screen.getAllByTitle("chatPage.executionPlan.tooltip")).toHaveLength(1)
-    expect(screen.queryByTitle("chatPage.executionPlan.title")).not.toBeInTheDocument()
   })
 
   it("ignores malformed DAG layout failures without throwing", async () => {

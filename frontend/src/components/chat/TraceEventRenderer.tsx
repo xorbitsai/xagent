@@ -149,6 +149,16 @@ interface TraceEventRendererProps {
   onOpenExecutionPlan?: () => void;
 }
 
+function isDagExecutionEvent(event: TraceEvent): boolean {
+  const eventType = event.event_type || '';
+  return eventType === 'dag_execution'
+    || eventType === 'dag_execute_start'
+    || eventType === 'dag_execute_end'
+    || eventType === 'dag_plan_start'
+    || eventType === 'dag_plan_end'
+    || eventType.startsWith('dag_step_');
+}
+
 function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> {
   if (event.data && typeof event.data === 'object') {
     return event.data;
@@ -1378,21 +1388,11 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: 
     return null;
   }, [events]);
 
-  const hasExecutionPlan = useMemo(
-    () => events.some((event) => {
-      const eventType = event.event_type || '';
-      return eventType === 'dag_execution'
-        || eventType === 'dag_execute_start'
-        || eventType === 'dag_execute_end'
-        || eventType === 'dag_plan_start'
-        || eventType === 'dag_plan_end'
-        || eventType.startsWith('dag_step_');
-    }),
-    [events],
-  );
+  const hasExecutionPlan = useMemo(() => events.some(isDagExecutionEvent), [events]);
 
   const executionPlanStepCount = useMemo(() => {
     for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (!isDagExecutionEvent(events[index])) continue;
       const data = events[index].data;
       if (!data || typeof data !== 'object') continue;
 

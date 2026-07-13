@@ -545,7 +545,7 @@ export default function BuildsPage() {
                             ) : (
                               <Button
                                 variant="outline"
-                                className="px-4"
+                                className={canRunAgent(agent) ? "px-4" : "flex-1 w-full"}
                                 onClick={() => router.push(`/build/${agent.id}`)}
                               >
                                 <Settings2 className="mr-1.5 h-4 w-4" />

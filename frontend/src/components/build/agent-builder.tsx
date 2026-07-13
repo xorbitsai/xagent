@@ -1404,7 +1404,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
       </div>
 
-      <fieldset disabled={readOnly} className="contents">
+      {/* Step guide stays interactive in read-only mode: it only scrolls. */}
       <div className="rounded-xl border border-primary/15 bg-primary/5 px-4 py-4">
         <div className="mb-3 text-sm font-semibold text-primary">
           {t("builds.editor.stepGuide.title")}
@@ -1451,6 +1451,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
       )}
 
+      <fieldset disabled={readOnly} className="contents">
       <div className="space-y-6">
         {/* Logo Upload */}
         <div className="space-y-2">

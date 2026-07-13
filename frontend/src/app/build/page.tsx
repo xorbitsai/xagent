@@ -511,16 +511,14 @@ export default function BuildsPage() {
                       <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
                         {agent.status === 'published' ? (
                           <>
-                            {canRunAgent(agent) && (
-                              <Button
-                                variant="default"
-                                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
-                                onClick={() => router.push(getAgentChatHref(agent))}
-                              >
-                                <MessageSquare className="mr-1.5 h-4 w-4" />
-                                {t('builds.list.actions.chat')}
-                              </Button>
-                            )}
+                            <Button
+                              variant="default"
+                              className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
+                              onClick={() => router.push(getAgentChatHref(agent))}
+                            >
+                              <MessageSquare className="mr-1.5 h-4 w-4" />
+                              {t('builds.list.actions.chat')}
+                            </Button>
                             {canEditAgent(agent) ? (
                               <>
                                 <Button

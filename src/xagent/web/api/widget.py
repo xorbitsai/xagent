@@ -305,8 +305,13 @@ def _resolve_authenticated_guest_id(agent: Agent, request: WidgetAuthRequest) ->
             request.end_user_id.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+        # hmac.compare_digest rejects str arguments containing non-ASCII
+        # characters with a TypeError rather than returning False; a
+        # client-supplied signature has no charset restriction, so encode
+        # both sides to bytes to compare arbitrary input safely.
         if not hmac.compare_digest(
-            expected_signature, request.end_user_signature or ""
+            expected_signature.encode("utf-8"),
+            (request.end_user_signature or "").encode("utf-8"),
         ):
             raise HTTPException(status_code=403, detail="Invalid end-user signature")
         return f"{VERIFIED_END_USER_GUEST_ID_PREFIX}{request.end_user_id}"

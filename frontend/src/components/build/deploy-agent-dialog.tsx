@@ -299,14 +299,17 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     }
   }
 
-  const handleCopySnippet = () => {
+  const handleCopySnippet = async () => {
     if (!deployAgent) return
     const snippet = buildWidgetSnippet(widgetKey ?? "", appOrigin)
     if (!snippet) return
-    navigator.clipboard.writeText(snippet)
-    setCopiedSnippet(true)
-    toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-    setTimeout(() => setCopiedSnippet(false), 2000)
+    if (await copyToClipboard(snippet)) {
+      setCopiedSnippet(true)
+      toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
+      setTimeout(() => setCopiedSnippet(false), 2000)
+    } else {
+      toast.error(t("appWidget.messages.copyFailed"))
+    }
   }
 
   const handleCopyEndUserSecret = async () => {
@@ -341,12 +344,15 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     }
   }
 
-  const handleCopyShareLink = () => {
+  const handleCopyShareLink = async () => {
     if (!shareUrl) return
-    navigator.clipboard.writeText(shareUrl)
-    setCopiedShareLink(true)
-    toast.success(t("deploy_agent.messages.link_copied") || "Link copied to clipboard")
-    setTimeout(() => setCopiedShareLink(false), 2000)
+    if (await copyToClipboard(shareUrl)) {
+      setCopiedShareLink(true)
+      toast.success(t("deploy_agent.messages.link_copied") || "Link copied to clipboard")
+      setTimeout(() => setCopiedShareLink(false), 2000)
+    } else {
+      toast.error(t("appWidget.messages.copyFailed"))
+    }
   }
 
   const handleEnableShare = async () => {
@@ -652,7 +658,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                     variant="secondary"
                     size="icon"
                     className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
-                    onClick={handleCopySnippet}
+                    onClick={() => void handleCopySnippet()}
                     title={t("deploy_agent.embed_snippet.copy_btn") || "Copy Snippet"}
                   >
                     {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
@@ -772,7 +778,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                       <Label className="text-sm">{t("deploy_agent.share_link.public_url") || "Public URL"}</Label>
                       <div className="flex gap-2">
                         <Input readOnly value={shareUrl} className="flex-1" />
-                        <Button variant="secondary" onClick={handleCopyShareLink} disabled={isUpdatingShare}>
+                        <Button variant="secondary" onClick={() => void handleCopyShareLink()} disabled={isUpdatingShare}>
                           {copiedShareLink ? <Check className="h-4 w-4 mr-1 text-green-500" /> : <Copy className="h-4 w-4 mr-1" />}
                           {t("common.copy") || "Copy"}
                         </Button>

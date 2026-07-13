@@ -5,7 +5,7 @@ import os
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -899,6 +899,59 @@ async def disable_agent_share_link(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+_WidgetSecretResponseT = TypeVar("_WidgetSecretResponseT", bound=BaseModel)
+
+
+def _get_or_rotate_widget_secret(
+    *,
+    db: Session,
+    current_user: User,
+    agent_id: int,
+    field_name: str,
+    build_response: Callable[[Agent], _WidgetSecretResponseT],
+    rotate: bool,
+    error_context: str,
+) -> _WidgetSecretResponseT:
+    """Shared owned-agent lookup + generate-or-rotate flow behind the
+    widget-key and widget-end-user-secret endpoints: same 404/500 handling
+    and lazy-generate-on-read semantics, differing only in which column is
+    written and how the response is shaped."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if rotate or not getattr(agent, field_name):
+            agent = store.update_agent_fields(
+                user_id, agent_id, {field_name: new_widget_secret()}
+            )
+            if agent is None:
+                raise HTTPException(status_code=404, detail="Agent not found")
+        return build_response(agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to {error_context} for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _widget_key_response(agent: Agent) -> AgentWidgetKeyResponse:
+    return AgentWidgetKeyResponse(
+        agent_id=int(agent.id),
+        widget_enabled=bool(agent.widget_enabled),
+        widget_key=str(agent.widget_key),
+    )
+
+
+def _widget_end_user_secret_response(agent: Agent) -> AgentWidgetEndUserSecretResponse:
+    return AgentWidgetEndUserSecretResponse(
+        agent_id=int(agent.id),
+        widget_end_user_secret=str(agent.widget_end_user_secret),
+    )
+
+
 @router.get("/{agent_id}/widget-key", response_model=AgentWidgetKeyResponse)
 async def get_agent_widget_key(
     agent_id: int,
@@ -906,29 +959,15 @@ async def get_agent_widget_key(
     db: Session = Depends(get_db),
 ) -> AgentWidgetKeyResponse:
     """Return the owner-only widget embed key, generating one if missing."""
-    try:
-        store = AgentStore(db)
-        user_id = int(current_user.id)
-        agent = store.get_owned_agent(user_id, agent_id)
-        if agent is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        if not agent.widget_key:
-            agent = store.update_agent_fields(
-                user_id, agent_id, {"widget_key": new_widget_secret()}
-            )
-            if agent is None:
-                raise HTTPException(status_code=404, detail="Agent not found")
-        return AgentWidgetKeyResponse(
-            agent_id=int(agent.id),
-            widget_enabled=bool(agent.widget_enabled),
-            widget_key=str(agent.widget_key),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get widget key for agent {agent_id}: {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    return _get_or_rotate_widget_secret(
+        db=db,
+        current_user=current_user,
+        agent_id=agent_id,
+        field_name="widget_key",
+        build_response=_widget_key_response,
+        rotate=False,
+        error_context="get widget key",
+    )
 
 
 @router.post("/{agent_id}/widget-key/rotate", response_model=AgentWidgetKeyResponse)
@@ -938,27 +977,15 @@ async def rotate_agent_widget_key(
     db: Session = Depends(get_db),
 ) -> AgentWidgetKeyResponse:
     """Rotate the widget embed key, invalidating already-deployed snippets."""
-    try:
-        store = AgentStore(db)
-        user_id = int(current_user.id)
-        if store.get_owned_agent(user_id, agent_id) is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        agent = store.update_agent_fields(
-            user_id, agent_id, {"widget_key": new_widget_secret()}
-        )
-        if agent is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        return AgentWidgetKeyResponse(
-            agent_id=int(agent.id),
-            widget_enabled=bool(agent.widget_enabled),
-            widget_key=str(agent.widget_key),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to rotate widget key for agent {agent_id}: {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    return _get_or_rotate_widget_secret(
+        db=db,
+        current_user=current_user,
+        agent_id=agent_id,
+        field_name="widget_key",
+        build_response=_widget_key_response,
+        rotate=True,
+        error_context="rotate widget key",
+    )
 
 
 @router.get(
@@ -974,30 +1001,15 @@ async def get_agent_widget_end_user_secret(
     generating one if missing. Use this secret server-side, on the embedding
     site, to sign each end user's id -- never expose it in the embed snippet
     or any client-side code."""
-    try:
-        store = AgentStore(db)
-        user_id = int(current_user.id)
-        agent = store.get_owned_agent(user_id, agent_id)
-        if agent is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        if not agent.widget_end_user_secret:
-            agent = store.update_agent_fields(
-                user_id,
-                agent_id,
-                {"widget_end_user_secret": new_widget_secret()},
-            )
-            if agent is None:
-                raise HTTPException(status_code=404, detail="Agent not found")
-        return AgentWidgetEndUserSecretResponse(
-            agent_id=int(agent.id),
-            widget_end_user_secret=str(agent.widget_end_user_secret),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get widget end-user secret for agent {agent_id}: {e}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    return _get_or_rotate_widget_secret(
+        db=db,
+        current_user=current_user,
+        agent_id=agent_id,
+        field_name="widget_end_user_secret",
+        build_response=_widget_end_user_secret_response,
+        rotate=False,
+        error_context="get widget end-user secret",
+    )
 
 
 @router.post(
@@ -1011,30 +1023,15 @@ async def rotate_agent_widget_end_user_secret(
 ) -> AgentWidgetEndUserSecretResponse:
     """Rotate the end-user signing secret, invalidating signatures computed
     with the previous value."""
-    try:
-        store = AgentStore(db)
-        user_id = int(current_user.id)
-        if store.get_owned_agent(user_id, agent_id) is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        agent = store.update_agent_fields(
-            user_id,
-            agent_id,
-            {"widget_end_user_secret": new_widget_secret()},
-        )
-        if agent is None:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        return AgentWidgetEndUserSecretResponse(
-            agent_id=int(agent.id),
-            widget_end_user_secret=str(agent.widget_end_user_secret),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(
-            f"Failed to rotate widget end-user secret for agent {agent_id}: {e}"
-        )
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    return _get_or_rotate_widget_secret(
+        db=db,
+        current_user=current_user,
+        agent_id=agent_id,
+        field_name="widget_end_user_secret",
+        build_response=_widget_end_user_secret_response,
+        rotate=True,
+        error_context="rotate widget end-user secret",
+    )
 
 
 @router.post("/{agent_id}/logo", response_model=dict)

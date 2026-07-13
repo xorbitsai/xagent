@@ -275,4 +275,40 @@ describe("DeployAgentDialog embed view", () => {
       allowed_domains: ["example.com", "new-domain.com"],
     })
   })
+
+  it("rejects an invalid domain without calling the update endpoint", async () => {
+    renderDialog()
+    await openEmbedView()
+
+    const input = await screen.findByPlaceholderText("deploy_agent.access_control.domain_placeholder")
+    fireEvent.change(input, { target: { value: "https://not-a-bare-host.com/path" } })
+    fireEvent.click(screen.getByText("deploy_agent.access_control.add_btn"))
+
+    expect(toastErrorMock).toHaveBeenCalledWith("appWidget.dialog.invalidDomain")
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      "http://api.local/api/agents/42",
+      expect.objectContaining({ method: "PUT" }),
+    )
+  })
+
+  it("removes an allowed domain through the agent update endpoint", async () => {
+    renderDialog()
+    await openEmbedView()
+
+    await screen.findByText("example.com")
+    fireEvent.click(screen.getByText("×"))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/agents/42",
+        expect.objectContaining({ method: "PUT" }),
+      )
+    })
+    const updateCall = apiRequestMock.mock.calls.find(
+      ([url, options]) => url === "http://api.local/api/agents/42" && options?.method === "PUT",
+    )
+    expect(JSON.parse(updateCall?.[1]?.body as string)).toMatchObject({
+      allowed_domains: [],
+    })
+  })
 })

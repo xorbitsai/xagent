@@ -239,6 +239,63 @@ def test_end_user_id_without_a_configured_secret_is_rejected() -> None:
     assert resp.status_code == 403, resp.text
 
 
+def test_non_ascii_signature_is_rejected_not_a_server_error() -> None:
+    """hmac.compare_digest raises TypeError on str arguments containing
+    non-ASCII characters rather than returning False. end_user_signature has
+    no charset restriction (only max_length=128), so a client can send one --
+    this must still resolve to a clean 403, not an unhandled 500."""
+    owner_headers = _admin_headers()
+    owner_id = _user_id_from(owner_headers)
+    agent_id = _create_widget_agent(owner_id)
+    _get_end_user_secret(owner_headers, agent_id)
+
+    resp = _widget_auth(
+        agent_id=agent_id, end_user_id="user-1", end_user_signature="ü" * 20
+    )
+    assert resp.status_code == 403, resp.text
+
+
+def test_over_length_end_user_id_is_rejected_by_request_validation() -> None:
+    owner_headers = _admin_headers()
+    owner_id = _user_id_from(owner_headers)
+    agent_id = _create_widget_agent(owner_id)
+    _get_end_user_secret(owner_headers, agent_id)
+
+    resp = _widget_auth(
+        agent_id=agent_id,
+        end_user_id="x" * 257,
+        end_user_signature="a" * 64,
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_end_user_id_takes_precedence_over_guest_id_when_both_are_sent() -> None:
+    """If a caller sends both fields, the signed identity must win -- a
+    client should never be able to smuggle in an unverified guest_id by also
+    attaching a (possibly unrelated) valid end_user_id/signature pair."""
+    owner_headers = _admin_headers()
+    owner_id = _user_id_from(owner_headers)
+    agent_id = _create_widget_agent(owner_id)
+    secret = _get_end_user_secret(owner_headers, agent_id)
+
+    signed = _widget_headers(
+        agent_id=agent_id,
+        end_user_id="tenant_42:user_007",
+        end_user_signature=_sign(secret, "tenant_42:user_007"),
+        guest_id="some-other-unrelated-value",
+    )
+    task_id = _create_widget_task(signed)
+
+    # Resuming with just the signed identity (no guest_id at all) must find
+    # the same task, proving the stored identity was the signed one.
+    resumed = _widget_headers(
+        agent_id=agent_id,
+        end_user_id="tenant_42:user_007",
+        end_user_signature=_sign(secret, "tenant_42:user_007"),
+    )
+    assert _latest_task_id(resumed) == task_id
+
+
 def test_rotating_the_end_user_secret_invalidates_old_signatures() -> None:
     owner_headers = _admin_headers()
     owner_id = _user_id_from(owner_headers)

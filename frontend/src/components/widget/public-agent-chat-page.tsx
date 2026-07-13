@@ -46,7 +46,11 @@ function getOrCreateDirectFallbackGuestId(): string {
   const STORAGE_KEY = "xagent_direct_guest_id"
   let stored = window.localStorage.getItem(STORAGE_KEY)
   if (!stored) {
-    stored = "direct_" + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15)
+    // crypto.randomUUID needs a secure context; fall back to Math.random for
+    // http:// dev/test embeds where it's unavailable.
+    stored = typeof crypto !== "undefined" && crypto.randomUUID
+      ? `direct_${crypto.randomUUID()}`
+      : "direct_" + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15)
     window.localStorage.setItem(STORAGE_KEY, stored)
   }
   return stored

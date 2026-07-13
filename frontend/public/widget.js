@@ -119,6 +119,14 @@
   var endUserId = (scriptTag.getAttribute('data-end-user-id') || '').trim();
   var endUserSignature = (scriptTag.getAttribute('data-end-user-signature') || '').trim();
   var guestId = null;
+  if (endUserId && endUserId.length > 256) {
+    // Silently truncating would still send the truncated id, but the
+    // embedding server signed the FULL id -- the signature would no longer
+    // match it, surfacing as a confusing "Invalid end-user signature" error
+    // instead of an actionable one here.
+    console.error('Xagent Widget: data-end-user-id exceeds 256 characters; ignoring it and falling back to an anonymous session.');
+    endUserId = '';
+  }
   if (endUserId && !endUserSignature) {
     console.error('Xagent Widget: data-end-user-id was provided without data-end-user-signature; ignoring it and falling back to an anonymous session. Sign end_user_id server-side with the agent\'s end-user secret (see App Widget settings).');
     endUserId = '';
@@ -145,7 +153,7 @@
     // means the embedded widget has no credential to fall back on.
     var url = host + '/widget/chat/' + token;
     if (endUserId) {
-      url += '?end_user_id=' + encodeURIComponent(endUserId.substring(0, 256))
+      url += '?end_user_id=' + encodeURIComponent(endUserId)
         + '&end_user_signature=' + encodeURIComponent(endUserSignature);
     } else {
       url += '?guest_id=' + encodeURIComponent(guestId);

@@ -3201,6 +3201,7 @@ Build when you need.`,
       widget_enabled_desc: "允许外部访问此 Widget 组件。",
       allowed_domains: "允许的域名",
       allowed_domains_desc: "限制 Widget 只能在特定的域名上被访问。使用 * 代表所有域名。",
+      allowed_domains_security_note: "允许的域名仅为浏览器层面的限制，并不能防御非浏览器客户端。真正的访问凭证是 Widget 密钥——请妥善保管，泄露后请重新生成。",
       domain_placeholder: "例如 example.com",
       add_btn: "添加",
       no_domains: "尚未配置域名。除非添加 *，否则 Widget 将拦截所有外部请求。"

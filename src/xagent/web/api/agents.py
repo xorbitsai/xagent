@@ -36,11 +36,7 @@ from ..services.agent_management import (
     DuplicateAgentNameError,
     TemplateNotFoundError,
 )
-from ..services.agent_store import (
-    AgentStore,
-    new_widget_end_user_secret,
-    new_widget_key,
-)
+from ..services.agent_store import AgentStore, new_widget_secret
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
 from ..tools.config import WebToolConfig
@@ -657,7 +653,7 @@ async def update_agent(
             # Widget-enabled agents always carry an embed credential; heal
             # rows that predate the widget_key column.
             if agent_data.widget_enabled and not agent.widget_key:
-                updates["widget_key"] = new_widget_key()
+                updates["widget_key"] = new_widget_secret()
         if agent_data.allowed_domains is not None:
             updates["allowed_domains"] = agent_data.allowed_domains
 
@@ -918,7 +914,7 @@ async def get_agent_widget_key(
             raise HTTPException(status_code=404, detail="Agent not found")
         if not agent.widget_key:
             agent = store.update_agent_fields(
-                user_id, agent_id, {"widget_key": new_widget_key()}
+                user_id, agent_id, {"widget_key": new_widget_secret()}
             )
             if agent is None:
                 raise HTTPException(status_code=404, detail="Agent not found")
@@ -948,7 +944,7 @@ async def rotate_agent_widget_key(
         if store.get_owned_agent(user_id, agent_id) is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         agent = store.update_agent_fields(
-            user_id, agent_id, {"widget_key": new_widget_key()}
+            user_id, agent_id, {"widget_key": new_widget_secret()}
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -988,7 +984,7 @@ async def get_agent_widget_end_user_secret(
             agent = store.update_agent_fields(
                 user_id,
                 agent_id,
-                {"widget_end_user_secret": new_widget_end_user_secret()},
+                {"widget_end_user_secret": new_widget_secret()},
             )
             if agent is None:
                 raise HTTPException(status_code=404, detail="Agent not found")
@@ -1023,7 +1019,7 @@ async def rotate_agent_widget_end_user_secret(
         agent = store.update_agent_fields(
             user_id,
             agent_id,
-            {"widget_end_user_secret": new_widget_end_user_secret()},
+            {"widget_end_user_secret": new_widget_secret()},
         )
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")

@@ -46,14 +46,15 @@ def clean_tool_categories(categories: Any) -> list[str]:
     return [c for c in (ensure_list(categories) or []) if c != "other"]
 
 
-def new_widget_key() -> str:
-    """Generate an unguessable widget embed credential for an agent."""
-    return secrets.token_urlsafe(32)
+def new_widget_secret() -> str:
+    """Generate an unguessable per-agent widget secret.
 
-
-def new_widget_end_user_secret() -> str:
-    """Generate the HMAC secret used to verify signed end-user identity
-    claims. Owner-only: never returned by the embed-ticket/auth flow."""
+    Used for both the widget embed key (widget_key -- public, distributed in
+    the embed snippet) and the end-user signing secret
+    (widget_end_user_secret -- owner-only, never returned by the
+    embed-ticket/auth flow). Same generation, different trust boundaries by
+    which column/endpoint exposes the result.
+    """
     return secrets.token_urlsafe(32)
 
 
@@ -256,7 +257,7 @@ class AgentStore:
             published_at = datetime.now(timezone.utc)
         # Widget-enabled agents always carry an embed credential; agents
         # created disabled get one when the widget is first enabled.
-        widget_key = new_widget_key() if widget_enabled else None
+        widget_key = new_widget_secret() if widget_enabled else None
         agent = Agent(
             user_id=user_id,
             name=name,

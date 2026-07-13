@@ -309,12 +309,15 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     setTimeout(() => setCopiedSnippet(false), 2000)
   }
 
-  const handleCopyEndUserSecret = () => {
+  const handleCopyEndUserSecret = async () => {
     if (!endUserSecret) return
-    navigator.clipboard.writeText(endUserSecret)
-    setCopiedEndUserSecret(true)
-    toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-    setTimeout(() => setCopiedEndUserSecret(false), 2000)
+    if (await copyToClipboard(endUserSecret)) {
+      setCopiedEndUserSecret(true)
+      toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
+      setTimeout(() => setCopiedEndUserSecret(false), 2000)
+    } else {
+      toast.error(t("appWidget.messages.copyFailed"))
+    }
   }
 
   const handleRotateEndUserSecret = async () => {
@@ -596,6 +599,9 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                       <div className="text-sm text-muted-foreground">
                         {t("deploy_agent.access_control.allowed_domains_desc") || "Restrict widget access to specific domains. Use * for any domain."}
                       </div>
+                      <div className="text-xs text-muted-foreground">
+                        {t("deploy_agent.access_control.allowed_domains_security_note") || "Allowed domains are a browser-level restriction only, not a security boundary against non-browser clients. The widget key is the real access gate — keep it private and regenerate it if it leaks."}
+                      </div>
                     </div>
                     <div className="flex items-center gap-2">
                       <Input
@@ -659,7 +665,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                 open={showAdvancedWidgetOptions}
                 onToggle={(e) => setShowAdvancedWidgetOptions((e.target as HTMLDetailsElement).open)}
               >
-                <summary className="flex items-center gap-1 cursor-pointer text-sm text-muted-foreground font-medium hover:text-black list-none [&::-webkit-details-marker]:hidden">
+                <summary className="flex items-center gap-1 cursor-pointer text-sm text-muted-foreground font-medium hover:text-foreground list-none [&::-webkit-details-marker]:hidden">
                   <ChevronRight className="w-4 h-4 transition-transform group-open:rotate-90" />
                   {t("deploy_agent.embed_snippet.advanced_toggle") || "Advanced options (custom identity, key rotation)"}
                 </summary>
@@ -716,7 +722,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                         type="button"
                         variant="secondary"
                         size="icon"
-                        onClick={handleCopyEndUserSecret}
+                        onClick={() => void handleCopyEndUserSecret()}
                         disabled={!endUserSecret}
                         title={t("appWidget.dialog.copyEndUserSecret")}
                         className="h-9 w-9 shrink-0"

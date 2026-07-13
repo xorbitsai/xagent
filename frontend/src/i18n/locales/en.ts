@@ -3201,6 +3201,7 @@ Build when you need.`,
       widget_enabled_desc: "Allow this widget to be accessed externally.",
       allowed_domains: "Allowed Domains",
       allowed_domains_desc: "Restrict widget access to specific domains. Use * for any domain.",
+      allowed_domains_security_note: "Allowed domains are a browser-level restriction only, not a security boundary against non-browser clients. The widget key is the real access gate — keep it private and regenerate it if it leaks.",
       domain_placeholder: "e.g. example.com",
       add_btn: "Add",
       no_domains: "No domains configured. Widget will block all requests unless * is added."

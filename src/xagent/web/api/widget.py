@@ -55,7 +55,7 @@ WIDGET_CREDENTIAL_REQUIRED_DETAIL = (
 )
 
 # Namespace for guest_ids backed by a verified end-user identity (see
-# _resolve_verified_guest_id). Reserved so a client can never forge a
+# _resolve_authenticated_guest_id). Reserved so a client can never forge a
 # "verified" guest_id for someone else's end_user_id without producing a
 # valid HMAC signature for it -- request validation rejects any
 # client-supplied guest_id that starts with this prefix outright.
@@ -68,7 +68,7 @@ class WidgetAuthRequest(BaseModel):
     # verification -- knowledge of this high-entropy value is itself the only
     # "credential" it ever carried. Reserved-prefix values are rejected below
     # since only a verified end_user_id may produce one (see
-    # _resolve_verified_guest_id).
+    # _resolve_authenticated_guest_id).
     guest_id: Optional[str] = Field(default=None, max_length=256)
     # A real end-user identity from the embedding page (data-end-user-id),
     # scoped to a specific user/tenant rather than an anonymous browser. Must
@@ -275,6 +275,14 @@ def _resolve_authenticated_guest_id(agent: Agent, request: WidgetAuthRequest) ->
     before, except it may never itself forge into the reserved "verified"
     namespace: that would let a request skip signing by simply omitting
     end_user_id and passing the target guest_id directly.
+
+    Known limitation: the signature is a static, non-expiring credential for
+    a given end_user_id (no timestamp/nonce binding) and travels in the
+    iframe URL/query string. A leaked (end_user_id, signature) pair is a
+    standing impersonation token until the owner rotates
+    widget_end_user_secret -- which invalidates every end-user's signature
+    at once, not just the leaked one. Acceptable v1 tradeoff; revisit with an
+    expiry embedded in the signed payload if per-user revocation is needed.
     """
     if not request.guest_id and not request.end_user_id:
         raise HTTPException(

@@ -65,11 +65,13 @@ def test_create_base_llm_stamps_model_id():
         model_provider="deepseek",
         model_name="deepseek-v4-flash",
         api_key="test-api-key",
+        max_retries=3,
     )
     llm = create_base_llm(config)
     # The retry wrapper delegates attribute access to the inner LLM.
     assert llm._inner.model_id == "deepseek-plat-abc"
     assert llm.model_id == "deepseek-plat-abc"
+    assert llm._retry_wrapper.max_retries == 3
 
 
 def test_add_token_usage_records_model_id():

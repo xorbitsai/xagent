@@ -2,7 +2,9 @@ import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .....config import get_openrouter_official_providers_only
+from ..exceptions import LLMRetryableError
 from ..timeout_config import TimeoutConfig
+from ..tool_protocol import TOOL_PROTOCOL_ERROR_KEY, get_tool_protocol_error
 from ..types import StreamChunk
 from .deepseek_tool_protocol import (
     adapt_deepseek_stream,
@@ -94,6 +96,15 @@ def _force_single_required_deepseek_tool(
         "type": "function",
         "function": {"name": name},
     }
+
+
+def _deepseek_tool_protocol_retry_error(response: Any) -> LLMRetryableError | None:
+    error = get_tool_protocol_error(response)
+    if error is None:
+        return None
+    code = str(error.get("code") or "invalid_tool_protocol")
+    message = str(error.get("message") or "DeepSeek returned an invalid tool call.")
+    return LLMRetryableError(f"DeepSeek tool protocol error ({code}): {message}")
 
 
 class OpenRouterLLM(OpenAILLM):
@@ -191,7 +202,11 @@ class OpenRouterLLM(OpenAILLM):
 
         if not self._uses_deepseek_tool_protocol:
             return response
-        return normalize_deepseek_response(response, tools=tools)
+        response = normalize_deepseek_response(response, tools=tools)
+        retry_error = _deepseek_tool_protocol_retry_error(response)
+        if retry_error is not None:
+            raise retry_error
+        return response
 
     async def _stream_chat_with_prefix_retry(
         self,
@@ -274,7 +289,33 @@ class OpenRouterLLM(OpenAILLM):
             async for chunk in stream:
                 yield chunk
             return
-        async for chunk in adapt_deepseek_stream(stream, tools=tools):
+        adapted_stream = adapt_deepseek_stream(stream, tools=tools)
+
+        # A named tool choice cannot validly finish as assistant text. Buffer
+        # this narrow stream until DeepSeek's tool protocol has been validated,
+        # so a malformed serialized call raises before any chunk escapes and the
+        # shared LLM retry wrapper can safely replay the request.
+        if isinstance(tool_choice, dict):
+            buffered_chunks: list[StreamChunk] = []
+            async for chunk in adapted_stream:
+                if chunk.is_protocol_error():
+                    retry_error = _deepseek_tool_protocol_retry_error(
+                        {TOOL_PROTOCOL_ERROR_KEY: chunk.protocol_error}
+                    )
+                    if retry_error is not None:
+                        raise retry_error
+                buffered_chunks.append(chunk)
+            for chunk in buffered_chunks:
+                yield chunk
+            return
+
+        async for chunk in adapted_stream:
+            if chunk.is_protocol_error():
+                retry_error = _deepseek_tool_protocol_retry_error(
+                    {TOOL_PROTOCOL_ERROR_KEY: chunk.protocol_error}
+                )
+                if retry_error is not None:
+                    raise retry_error
             yield chunk
 
     def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:

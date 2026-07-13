@@ -8,7 +8,7 @@ import openai
 from openai import AsyncOpenAI
 
 from ....utils.security import redact_sensitive_text
-from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
@@ -486,7 +486,7 @@ class OpenAICompatibleLLM(BaseLLM):
                         "raw": resp.model_dump(),
                     }
                 # If there are no tool calls and no content, this is an error
-                raise RuntimeError(
+                raise LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                 )
 
@@ -540,6 +540,9 @@ class OpenAICompatibleLLM(BaseLLM):
                         result = _process_response(response)
 
             return result
+
+        except LLMRetryableError:
+            raise
 
         except openai.BadRequestError as e:
             # Handle bad request errors
@@ -802,7 +805,7 @@ class OpenAICompatibleLLM(BaseLLM):
                         "raw": response.model_dump(),
                     }
                 # If there are no tool calls and no content, this is an error
-                raise RuntimeError(
+                raise LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                 )
 
@@ -815,6 +818,9 @@ class OpenAICompatibleLLM(BaseLLM):
                 text_result["reasoning_content"] = reasoning_content
                 text_result["reasoning"] = reasoning_content
             return text_result
+
+        except LLMRetryableError:
+            raise
 
         except openai.APITimeoutError as e:
             # Handle timeout errors

@@ -7,12 +7,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
     _format_openai_error,
 )
-from xagent.core.model.chat.exceptions import LLMRetryableError
+from xagent.core.model.chat.error import retry_on
+from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
+from xagent.core.retry.strategy import FixedDelay
+from xagent.core.retry.wrapper import create_retry_wrapper
 
 
 class TestOpenAILLM:
@@ -679,9 +683,10 @@ class TestOpenAILLM:
 
         llm = OpenAILLM(**openai_llm_config)
 
-        # Should raise RuntimeError when content is None and no tool calls
+        # The shared model wrapper retries this transient provider response.
         with pytest.raises(
-            RuntimeError, match="LLM returned None content and no tool calls"
+            LLMEmptyContentError,
+            match="LLM returned None content and no tool calls",
         ):
             await llm.chat([{"role": "user", "content": "Hello"}])
 
@@ -711,11 +716,57 @@ class TestOpenAILLM:
 
         llm = OpenAILLM(**openai_llm_config)
 
-        # Should raise RuntimeError when content is empty and no tool calls
+        # The shared model wrapper retries this transient provider response.
         with pytest.raises(
-            RuntimeError, match="LLM returned empty content and no tool calls"
+            LLMEmptyContentError,
+            match="LLM returned empty content and no tool calls",
         ):
             await llm.chat([{"role": "user", "content": "Hello"}])
+
+    @pytest.mark.asyncio
+    async def test_empty_content_uses_shared_retry(
+        self,
+        openai_llm_config,
+        mock_chat_completion,
+        mocker,
+    ):
+        empty_message = SimpleNamespace(
+            content="",
+            tool_calls=None,
+            reasoning_content=None,
+        )
+        empty_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=empty_message,
+                )
+            ],
+            usage=None,
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            empty_response,
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        inner = OpenAILLM(**openai_llm_config)
+        llm = create_retry_wrapper(
+            inner,
+            BaseLLM,  # type: ignore[type-abstract]
+            retry_methods={"chat"},
+            strategy=FixedDelay(delay_ms=0),
+            max_retries=2,
+            retry_on=retry_on,
+        )
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
 
     @pytest.mark.asyncio
     async def test_empty_content_falls_back_to_reasoning_content(

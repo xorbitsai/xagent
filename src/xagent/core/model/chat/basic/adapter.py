@@ -166,5 +166,6 @@ def create_base_llm(
         llm,
         BaseLLM,  # type: ignore[type-abstract]
         retry_methods={"chat", "vision_chat", "stream_chat"},
+        max_retries=model.max_retries,
         retry_on=retry_on,
     )

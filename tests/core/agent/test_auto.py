@@ -596,7 +596,7 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert "Simplified Chinese" in decision_prompt
     assert "Traditional Chinese" in decision_prompt
     assert "do not use generic Chinese" in decision_prompt
-    assert "Available tool names" not in decision_prompt
+    assert "Available execution tool names" not in decision_prompt
     tool_schema = llm.calls[0]["tools"][0]["function"]
     assert "answer argument is mandatory" in tool_schema["description"]
     response_language_schema = tool_schema["parameters"]["properties"][
@@ -782,7 +782,7 @@ async def test_auto_pattern_does_not_stream_non_final_decision() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_decision_prompt_does_not_expose_execution_tool_names() -> None:
+async def test_auto_decision_prompt_exposes_execution_tool_names() -> None:
     llm = FakeLLM([decision_tool_response("react", "Needs an execution tool.")])
     child = CapturingChildPattern()
     pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
@@ -796,7 +796,8 @@ async def test_auto_decision_prompt_does_not_expose_execution_tool_names() -> No
                 "description": "List knowledge bases",
                 "parameters": {"type": "object", "properties": {}},
             },
-        }
+        },
+        FakeSearchTool(),
     ]
 
     result = await pattern.run(
@@ -812,8 +813,11 @@ async def test_auto_decision_prompt_does_not_expose_execution_tool_names() -> No
         DECISION_TOOL_NAME
     ]
     decision_prompt = decision_call["messages"][-1]["content"]
-    assert "1 execution tools are available" in decision_prompt
-    assert "list_knowledge_bases" not in decision_prompt
+    assert "2 execution tools are available" in decision_prompt
+    assert (
+        "Available execution tool names: list_knowledge_bases, zhipu_web_search."
+        in decision_prompt
+    )
 
 
 @pytest.mark.asyncio

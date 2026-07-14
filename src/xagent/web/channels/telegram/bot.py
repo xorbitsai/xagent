@@ -25,6 +25,11 @@ from ...models.uploaded_file import UploadedFile
 from ...models.user import User
 from ...services.chat_history_service import persist_user_message
 from ...services.execution_result_projection import project_execution_result_for_channel
+from ...services.file_turn import (
+    append_uploaded_files_context,
+    build_uploaded_files_context,
+    normalize_attachments_for_persistence,
+)
 from ...services.managed_task_lease import (
     ManagedTaskLease,
     claim_managed_task_lease,
@@ -714,6 +719,8 @@ class TelegramBotInstance:
                     return
 
                 uploaded_info: list[dict[str, Any]] = []
+                persisted_attachments: list[dict[str, Any]] = []
+                execution_text = text
                 if files:
                     uploaded_info = await self._download_and_register_files(
                         files=files,
@@ -727,6 +734,9 @@ class TelegramBotInstance:
                             "Telegram voice input was not downloaded"
                         )
                     if uploaded_info:
+                        persisted_attachments = normalize_attachments_for_persistence(
+                            uploaded_info
+                        )
                         voice_transcripts: dict[str, str] = {}
                         if voice_file_ids:
                             voice_transcripts = (
@@ -744,6 +754,11 @@ class TelegramBotInstance:
                             voice_transcripts,
                         )
                         voice_file_id_set = set(voice_file_ids)
+                        voice_uploaded_info = [
+                            info
+                            for info in uploaded_info
+                            if str(info.get("telegram_file_id")) in voice_file_id_set
+                        ]
                         regular_uploaded_info = [
                             info
                             for info in uploaded_info
@@ -758,6 +773,10 @@ class TelegramBotInstance:
                             text += f"\n\n{' '.join(file_info_list)}"
                         elif file_info_list:
                             text = " ".join(file_info_list)
+                        execution_text = append_uploaded_files_context(
+                            text,
+                            build_uploaded_files_context(voice_uploaded_info),
+                        )
                         if is_new_task:
                             task.description = text  # type: ignore
                             if voice_file_ids or not task.title:
@@ -771,6 +790,8 @@ class TelegramBotInstance:
                         context["uploaded_files"] = [
                             str(info["path"]) for info in uploaded_info
                         ]
+                        context["files"] = persisted_attachments
+                        context["display_message"] = text
 
                 if self._consume_user_stop_request(user_id):
                     apply_task_control_transition(
@@ -787,6 +808,7 @@ class TelegramBotInstance:
                     task_id=int(task.id),  # type: ignore
                     user_id=int(user.id),  # type: ignore
                     content=text,
+                    attachments=persisted_attachments or None,
                     turn_id=message_turn_id,
                 )
 
@@ -826,7 +848,7 @@ class TelegramBotInstance:
                             user_id,
                             agent_manager.execute_task(
                                 agent_service=agent_service,
-                                task=text,
+                                task=execution_text,
                                 context=context,
                                 task_id=actual_task_id,
                                 tracking_task_id=str(task.id),

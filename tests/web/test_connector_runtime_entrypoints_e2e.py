@@ -21,6 +21,7 @@ from xagent.web.api.widget import widget_router
 from xagent.web.channels.feishu.bot import FeishuBotInstance
 from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
@@ -710,10 +711,6 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
             _restore_telegram_task_context,
         )
         monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.persist_user_message",
-            lambda **_kwargs: None,
-        )
-        monkeypatch.setattr(
             "xagent.web.channels.telegram.bot.persist_telegram_assistant_turn",
             lambda **_kwargs: None,
         )
@@ -787,7 +784,8 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
 
         assert len(agent_manager.execute_calls) == 1
         execute_call = agent_manager.execute_calls[0]
-        assert execute_call["task"] == "今晚有世界杯比赛吗？"
+        assert execute_call["task"].startswith("今晚有世界杯比赛吗？")
+        assert "voice.oga: file_id=workspace-file-id" in execute_call["task"]
         assert execute_call["context"]["file_info"] == [
             {
                 "file_id": "workspace-file-id",
@@ -801,6 +799,16 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
         assert execute_call["context"]["uploaded_files"] == [
             "/workspace/input/voice.oga"
         ]
+        expected_attachments = [
+            {
+                "file_id": "workspace-file-id",
+                "name": "voice.oga",
+                "size": 123,
+                "type": "audio/ogg",
+            }
+        ]
+        assert execute_call["context"]["files"] == expected_attachments
+        assert execute_call["context"]["display_message"] == "今晚有世界杯比赛吗？"
         assert asr_model.closed is True
 
         task = (
@@ -809,5 +817,15 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
             .one_or_none()
         )
         assert task is not None
+        user_message = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task.id,
+                TaskChatMessage.role == "user",
+            )
+            .one()
+        )
+        assert user_message.content == "今晚有世界杯比赛吗？"
+        assert user_message.attachments == expected_attachments
     finally:
         db.close()

@@ -924,9 +924,11 @@ class AutoPattern(AgentPattern):
         current_request: str = "",
     ) -> str:
         tool_count = len(tools)
+        tool_names = self._execution_tool_names(tools)
         tool_capability_summary = (
             f"{tool_count} execution tools are available to the downstream "
-            "execution pattern."
+            "execution pattern. Available execution tool names: "
+            f"{', '.join(tool_names) or '(unavailable)'}."
             if tool_count
             else "No execution tools are available to the downstream execution pattern."
         )
@@ -992,6 +994,33 @@ class AutoPattern(AgentPattern):
             "this routing decision; only call the routing tool provided in this "
             "request."
         )
+
+    @staticmethod
+    def _execution_tool_names(tools: list[Any]) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for tool in tools:
+            name: Any = None
+            if isinstance(tool, dict):
+                function = tool.get("function")
+                if isinstance(function, dict):
+                    name = function.get("name")
+                if not name:
+                    name = tool.get("name")
+            else:
+                metadata = getattr(tool, "metadata", None)
+                if metadata is not None:
+                    name = getattr(metadata, "name", None)
+                if not name:
+                    name = getattr(tool, "name", None)
+                if not name:
+                    name = getattr(tool, "__name__", None)
+
+            normalized = str(name or "").strip()
+            if normalized and normalized not in seen:
+                names.append(normalized)
+                seen.add(normalized)
+        return names
 
     def _decision_tool_schema(self) -> dict[str, Any]:
         return {

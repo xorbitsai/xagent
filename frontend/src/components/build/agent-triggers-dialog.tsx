@@ -24,7 +24,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select } from "@/components/ui/select"
@@ -671,18 +671,18 @@ export function AgentTriggersDialog({
       <div
         key={type}
         className={cn(
-          "group flex w-full items-center gap-4 rounded-lg border bg-background p-4 text-left transition-colors",
+          "group flex w-full items-center gap-3.5 rounded-xl border bg-background p-3.5 text-left transition-colors",
           "hover:border-primary/50 hover:bg-muted/30",
           isEnabled && "border-primary/40 bg-primary/[0.03]",
         )}
       >
         <button
           type="button"
-          className="flex min-w-0 flex-1 items-center gap-4 text-left"
+          className="flex min-w-0 flex-1 items-center gap-3.5 text-left"
           onClick={() => openType(type)}
         >
-          <div className={cn("flex h-10 w-10 shrink-0 items-center justify-center rounded-lg", iconClass)}>
-            {renderTypeIcon(type, "h-5 w-5")}
+          <div className={cn("flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-lg", iconClass)}>
+            {renderTypeIcon(type, "h-4 w-4")}
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -765,6 +765,7 @@ export function AgentTriggersDialog({
           variant="outline"
           size="sm"
           onClick={() => beginCreateForType(activeType)}
+          className="border-dashed border-primary/45 bg-primary/5 text-primary hover:border-primary hover:bg-primary/10"
         >
           <Plus className="mr-1.5 h-4 w-4" />
           {t("triggers.actions.addAnother")}
@@ -1142,6 +1143,12 @@ export function AgentTriggersDialog({
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           {activeType ? renderDetail() : renderOverview()}
         </div>
+
+        {!activeType && (
+          <DialogFooter className="border-t px-5 py-4">
+            <Button onClick={() => closeDialog(false)}>{t("common.done")}</Button>
+          </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
   )

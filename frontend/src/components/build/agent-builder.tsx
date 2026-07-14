@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Code2, Eye } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -48,9 +48,8 @@ import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches } from "@/lib
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
+import { AgentFlowView } from "./agent-flow-view"
 import { AgentTrigger, AgentTriggerType, listAgentTriggers } from "@/lib/agent-triggers-api"
-import { AgentWidgetSettingsDialog } from "./agent-widget-settings-dialog"
-import { updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 interface KnowledgeBase {
   name: string
@@ -156,12 +155,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [isKbModalOpen, setIsKbModalOpen] = useState(false)
   const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
   const [isTriggersDialogOpen, setIsTriggersDialogOpen] = useState(false)
-  const [isWidgetSettingsOpen, setIsWidgetSettingsOpen] = useState(false)
-  const [isWidgetUpdating, setIsWidgetUpdating] = useState(false)
   const [triggerDialogInitialType, setTriggerDialogInitialType] = useState<AgentTriggerType | null>(null)
   const [triggerSummary, setTriggerSummary] = useState<AgentTrigger[]>([])
-  const [triggerSummaryLoading, setTriggerSummaryLoading] = useState(false)
   const [showAIAssistant, setShowAIAssistant] = useState(false)
+  const [viewMode, setViewMode] = useState<"config" | "flow">("config")
   const [configSynced, setConfigSynced] = useState(false)
   const [notFound, setNotFound] = useState(false)
   // Admin viewing another user's agent: writes are owner-only, so the whole
@@ -200,13 +197,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       return
     }
 
-    setTriggerSummaryLoading(true)
     try {
       setTriggerSummary(await listAgentTriggers(localAgentId))
     } catch (error) {
       console.error("Failed to load trigger summary:", error)
-    } finally {
-      setTriggerSummaryLoading(false)
     }
   }, [localAgentId])
 
@@ -229,37 +223,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
     return stats
   }, [triggerSummary])
-
-  const appWidgetConfig = useMemo(() => {
-    const source = originalData ?? createdAgent
-    return {
-      widget_enabled: Boolean(source?.widget_enabled),
-      allowed_domains: Array.isArray(source?.allowed_domains) ? source.allowed_domains : [],
-    }
-  }, [createdAgent, originalData])
-
-  const mergeWidgetAgentData = useCallback((updatedAgent: Record<string, unknown>) => {
-    setOriginalData((current: any) => current ? { ...current, ...updatedAgent } : updatedAgent)
-    setCreatedAgent((current: any) => current ? { ...current, ...updatedAgent } : current)
-  }, [])
-
-  const handleWidgetEnabledChange = useCallback(async (checked: boolean) => {
-    if (!localAgentId) return
-    setIsWidgetUpdating(true)
-    try {
-      const updatedAgent = await updateAgentWidgetConfig(
-        localAgentId,
-        { widget_enabled: checked },
-        t("appWidget.messages.updateFailed"),
-      )
-      mergeWidgetAgentData(updatedAgent)
-      toast.success(t("appWidget.messages.updated"))
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : t("appWidget.messages.updateFailed"))
-    } finally {
-      setIsWidgetUpdating(false)
-    }
-  }, [localAgentId, mergeWidgetAgentData, t])
 
   const gmailConnection = useMemo(() => {
     const gmailApp = findMatchingMcpApp(officialApps, "gmail")
@@ -1350,6 +1313,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
   }
 
+  const generalModelLabel = models.find((m) => m.id === modelConfig.general)?.model_name || "—"
+
+  const connectorDisplayNames = selectedMcpServers.map((serverName) => {
+    const connectedServer = findMatchingMcpServer(mcpServers, serverName)
+    const matchingApp = findMatchingMcpApp(officialApps, serverName)
+    return connectedServer?.name || matchingApp?.name || serverName
+  })
+
+  const flowTriggerRows = ([
+    { type: "webhook", titleKey: "triggers.cards.webhook.title", descKey: "triggers.cards.webhook.description" },
+    { type: "scheduled", titleKey: "triggers.cards.scheduled.title", descKey: "triggers.cards.scheduled.description" },
+    { type: "gmail", titleKey: "triggers.cards.gmail.title", descKey: "triggers.cards.gmail.description" },
+  ] as const)
+    .filter((item) => triggerStats[item.type].enabled > 0)
+    .map((item) => ({ key: item.type as string, label: t(item.titleKey), description: t(item.descKey) }))
+
   const LeftPanel = (
     <div className="p-6 space-y-8 min-h-full bg-card/50">
       {/* Header moved to middle panel */}
@@ -1358,7 +1337,34 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           <h1 className="mb-1 text-3xl font-bold break-words">{name || t("builds.editor.header.title")}</h1>
           <p className="text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
         </div>
-        <div className="flex max-w-full flex-wrap items-center gap-2 xl:gap-4">
+        <div
+          className="inline-flex shrink-0 items-center gap-0.5 rounded-lg border bg-muted p-0.5"
+          title={t("builds.editor.flow.hintBar")}
+        >
+          <button
+            type="button"
+            onClick={() => setViewMode("config")}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+              viewMode === "config" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Settings2 className="h-3 w-3" />
+            {t("builds.editor.viewTabs.configure")}
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("flow")}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+              viewMode === "flow" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Workflow className="h-3 w-3" />
+            {t("builds.editor.viewTabs.flow")}
+          </button>
+        </div>
+        <div className="flex max-w-full flex-1 flex-wrap items-center justify-end gap-2 xl:gap-4">
           {readOnly ? (
             <div className="flex items-center gap-2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-400">
               <Eye className="h-4 w-4" />
@@ -1417,45 +1423,47 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
       </div>
 
-      {/* Step guide stays interactive in read-only mode: it only scrolls. */}
-      <div className="rounded-xl border border-primary/15 bg-primary/5 px-4 py-4">
-        <div className="mb-3 text-sm font-semibold text-primary">
-          {t("builds.editor.stepGuide.title")}
-        </div>
-        <div className="overflow-x-auto pb-1">
-          <div className="flex min-w-max items-center gap-3">
-            {buildSteps.map((step, index) => (
-              <React.Fragment key={step.key}>
-                <button
-                  type="button"
-                  className={cn(
-                    "flex items-center gap-3 rounded-md transition-colors",
-                    step.key === "configure" && "cursor-pointer hover:bg-primary/5 px-1 py-1"
-                  )}
-                  onClick={step.key === "configure" ? scrollToModelSection : undefined}
-                >
-                  <div
+      {/* Step guide stays interactive in read-only mode: it only scrolls. Only relevant to the Configure form. */}
+      {viewMode === "config" && (
+        <div className="rounded-xl border border-primary/15 bg-primary/5 px-4 py-4">
+          <div className="mb-3 text-sm font-semibold text-primary">
+            {t("builds.editor.stepGuide.title")}
+          </div>
+          <div className="overflow-x-auto pb-1">
+            <div className="flex min-w-max items-center gap-3">
+              {buildSteps.map((step, index) => (
+                <React.Fragment key={step.key}>
+                  <button
+                    type="button"
                     className={cn(
-                      "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-xs font-semibold",
-                      getStepStatusClasses(step.status)
+                      "flex items-center gap-3 rounded-md transition-colors",
+                      step.key === "configure" && "cursor-pointer hover:bg-primary/5 px-1 py-1"
                     )}
+                    onClick={step.key === "configure" ? scrollToModelSection : undefined}
                   >
-                    {step.status === "complete" ? <Check className="h-4 w-4" /> : index + 1}
-                  </div>
-                  <span className={cn("text-sm font-medium whitespace-nowrap", getStepLabelClasses(step.status))}>
-                    {step.label}
-                  </span>
-                </button>
-                {index < buildSteps.length - 1 && (
-                  <div className={cn("h-px min-w-10 flex-1", getStepConnectorClasses(step.status))} />
-                )}
-              </React.Fragment>
-            ))}
+                    <div
+                      className={cn(
+                        "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-xs font-semibold",
+                        getStepStatusClasses(step.status)
+                      )}
+                    >
+                      {step.status === "complete" ? <Check className="h-4 w-4" /> : index + 1}
+                    </div>
+                    <span className={cn("text-sm font-medium whitespace-nowrap", getStepLabelClasses(step.status))}>
+                      {step.label}
+                    </span>
+                  </button>
+                  {index < buildSteps.length - 1 && (
+                    <div className={cn("h-px min-w-10 flex-1", getStepConnectorClasses(step.status))} />
+                  )}
+                </React.Fragment>
+              ))}
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
-      {shouldShowCompletedBanner && (
+      {viewMode === "config" && shouldShowCompletedBanner && (
         <div className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700 dark:border-green-900/40 dark:bg-green-900/20 dark:text-green-400">
           <div className="flex items-center gap-2">
             <Check className="h-4 w-4 shrink-0" />
@@ -1464,7 +1472,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
       )}
 
-      <fieldset disabled={readOnly} className="contents">
+      <fieldset disabled={readOnly} className={viewMode === "flow" ? "hidden" : "contents"}>
       <div className="space-y-6">
         {/* Logo Upload */}
         <div className="space-y-2">
@@ -1903,166 +1911,79 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           )}
         </div>
 
-        <div className={cn(
-          "space-y-2 rounded-lg border bg-card/40 p-2.5",
-          (triggerSummary.some((trigger) => trigger.enabled) || appWidgetConfig.widget_enabled) && "border-primary/70",
-        )}>
-          <div className="flex flex-wrap items-center justify-between gap-3 px-0.5">
+        {triggerSummary.some((trigger) => trigger.enabled) && (
+          <div className="space-y-2">
             <div className="flex items-center gap-1.5">
               <Label>{t("triggers.builder.title")}</Label>
-              <InfoTooltip content={localAgentId ? t("triggers.builder.tooltip") : t("triggers.builder.saveFirst")} />
+              <InfoTooltip content={t("triggers.builder.tooltip")} />
             </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                setTriggerDialogInitialType(null)
-                setIsTriggersDialogOpen(true)
-              }}
-              disabled={!localAgentId}
-              className="h-7 shrink-0 px-2 text-xs text-primary"
-            >
-              <Zap className="mr-1 h-3.5 w-3.5" />
-              {t("triggers.builder.open")}
-            </Button>
-          </div>
-
-          <div className="grid gap-2 sm:grid-cols-2">
-            {([
-              {
-                type: "webhook" as const,
-                icon: Webhook,
-                title: t("triggers.cards.webhook.title"),
-                description: t("triggers.cards.webhook.description"),
-                iconClass: "bg-fuchsia-50 text-fuchsia-600 dark:bg-fuchsia-950/40 dark:text-fuchsia-300",
-              },
-              {
-                type: "scheduled" as const,
-                icon: CalendarClock,
-                title: t("triggers.cards.scheduled.title"),
-                description: t("triggers.cards.scheduled.description"),
-                iconClass: "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300",
-              },
-              {
-                type: "gmail" as const,
-                icon: Mail,
-                title: t("triggers.cards.gmail.title"),
-                description: t("triggers.cards.gmail.description"),
-                iconClass: "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300",
-              },
-            ]).map((item) => {
-              const stat = triggerStats[item.type]
-              const enabled = stat.enabled > 0
-              return (
-                <div
-                  key={item.type}
-                  className={cn(
-                    "flex min-w-0 items-center gap-2 rounded-md border bg-background px-2.5 py-2 text-left transition-colors",
-                    enabled && "border-primary/40 bg-primary/[0.03]",
-                    !localAgentId && "opacity-60",
-                  )}
-                >
-                  <button
-                    type="button"
-                    disabled={!localAgentId}
-                    onClick={() => {
-                      setTriggerDialogInitialType(item.type)
-                      setIsTriggersDialogOpen(true)
-                    }}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:cursor-not-allowed"
-                  >
-                  <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded", item.iconClass)}>
-                    <item.icon className="h-4 w-4" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">{item.title}</span>
-                      {triggerSummaryLoading ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-                      ) : enabled ? (
-                        <span className="rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
-                          {t("triggers.cards.activeCount", { count: stat.enabled })}
-                        </span>
-                      ) : null}
+            <div className="grid gap-2 sm:grid-cols-2">
+              {([
+                {
+                  type: "webhook" as const,
+                  icon: Webhook,
+                  title: t("triggers.cards.webhook.title"),
+                  iconClass: "bg-fuchsia-50 text-fuchsia-600 dark:bg-fuchsia-950/40 dark:text-fuchsia-300",
+                },
+                {
+                  type: "scheduled" as const,
+                  icon: CalendarClock,
+                  title: t("triggers.cards.scheduled.title"),
+                  iconClass: "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300",
+                },
+                {
+                  type: "gmail" as const,
+                  icon: Mail,
+                  title: t("triggers.cards.gmail.title"),
+                  iconClass: "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300",
+                },
+              ])
+                .filter((item) => triggerStats[item.type].enabled > 0)
+                .map((item) => {
+                  const stat = triggerStats[item.type]
+                  const openDialog = () => {
+                    setTriggerDialogInitialType(item.type)
+                    setIsTriggersDialogOpen(true)
+                  }
+                  return (
+                    <div
+                      key={item.type}
+                      className="flex min-w-0 items-center gap-2 rounded-md border border-primary/40 bg-primary/[0.03] px-2.5 py-2 text-left"
+                    >
+                      <button
+                        type="button"
+                        onClick={openDialog}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      >
+                        <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded", item.iconClass)}>
+                          <item.icon className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-sm font-medium">{item.title}</span>
+                            <span className="rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                              {t("triggers.cards.activeCount", { count: stat.enabled })}
+                            </span>
+                          </div>
+                        </div>
+                      </button>
+                      <Switch checked onCheckedChange={openDialog} className="scale-75" />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={openDialog}
+                        className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                        title={t("triggers.builder.configure")}
+                      >
+                        <Settings2 className="h-3.5 w-3.5" />
+                      </Button>
                     </div>
-                    <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                      {item.description}
-                    </div>
-                  </div>
-                  </button>
-                  <Switch
-                    checked={enabled}
-                    disabled={!localAgentId}
-                    onCheckedChange={() => {
-                      setTriggerDialogInitialType(item.type)
-                      setIsTriggersDialogOpen(true)
-                    }}
-                    className="scale-75"
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    disabled={!localAgentId}
-                    onClick={() => {
-                      setTriggerDialogInitialType(item.type)
-                      setIsTriggersDialogOpen(true)
-                    }}
-                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                    title={t("triggers.builder.configure")}
-                  >
-                    <Settings2 className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              )
-            })}
-            <div
-              className={cn(
-                "flex min-w-0 items-center gap-2 rounded-md border bg-background px-2.5 py-2 text-left transition-colors",
-                appWidgetConfig.widget_enabled && "border-primary/40 bg-primary/[0.03]",
-                !localAgentId && "opacity-60",
-              )}
-            >
-              <button
-                type="button"
-                disabled={!localAgentId}
-                onClick={() => setIsWidgetSettingsOpen(true)}
-                className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:cursor-not-allowed"
-              >
-                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-sky-50 text-sky-700 dark:bg-sky-950/40 dark:text-sky-300">
-                  <Code2 className="h-4 w-4" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-sm font-medium">{t("appWidget.builder.title")}</span>
-                  </div>
-                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                    {localAgentId ? t("appWidget.builder.description") : t("appWidget.builder.saveFirst")}
-                  </div>
-                </div>
-              </button>
-              <Switch
-                aria-label={t("appWidget.builder.toggle")}
-                checked={appWidgetConfig.widget_enabled}
-                disabled={!localAgentId || isWidgetUpdating}
-                onCheckedChange={(checked) => void handleWidgetEnabledChange(checked)}
-                className="scale-75"
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                disabled={!localAgentId}
-                onClick={() => setIsWidgetSettingsOpen(true)}
-                className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                title={t("appWidget.builder.configure")}
-              >
-                <Settings2 className="h-3.5 w-3.5" />
-              </Button>
+                  )
+                })}
             </div>
           </div>
-        </div>
+        )}
 
         <div className={getConfigSectionClasses(shouldHighlightConnectorSection)}>
           <div className="flex items-center gap-1.5">
@@ -2123,17 +2044,35 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 </div>
               )
             })}
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setIsConnectMcpOpen(true)}
-              className="w-auto self-start text-blue-600 border-blue-200 hover:bg-blue-50"
-            >
-              <PlusCircle className="h-4 w-4 mr-2" />
-              {t('tools.mcp.dialog.connector')}
-            </Button>
           </div>
+        </div>
+
+        {/* Connector + Triggers — shared integration buttons row */}
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setIsConnectMcpOpen(true)}
+            className="h-7 border-dashed border-primary/45 bg-primary/5 px-2 text-xs text-primary hover:border-primary hover:bg-primary/10"
+          >
+            <PlusCircle className="mr-1 h-3.5 w-3.5" />
+            {t('tools.mcp.dialog.connector')}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setTriggerDialogInitialType(null)
+              setIsTriggersDialogOpen(true)
+            }}
+            disabled={!localAgentId}
+            className="h-7 border-dashed border-primary/45 bg-primary/5 px-2 text-xs text-primary hover:border-primary hover:bg-primary/10"
+          >
+            <Zap className="mr-1 h-3.5 w-3.5" />
+            {t("triggers.builder.open")}
+          </Button>
         </div>
 
         {/* Suggested Prompts */}
@@ -2206,6 +2145,41 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         )}
       </div>
     </fieldset>
+
+      {viewMode === "flow" && (
+        <div className="flex flex-col overflow-hidden rounded-xl border bg-background" style={{ height: "min(76vh, 980px)" }}>
+          <AgentFlowView
+            name={name}
+            modelLabel={generalModelLabel}
+            executionMode={executionMode as "flash" | "balanced" | "think"}
+            instructions={instructions}
+            onInstructionsChange={setInstructions}
+            readOnly={readOnly}
+            kbSelected={selectedKbs}
+            kbOptions={kbOptions}
+            onKbChange={(values) => {
+              setSelectedKbs(values)
+              if (values.length > 0 && !selectedToolCategories.includes("knowledge")) {
+                setSelectedToolCategories((prev) => [...prev, "knowledge"])
+              }
+            }}
+            skillsSelected={selectedSkills}
+            skillOptions={skillOptions}
+            onSkillsChange={setSelectedSkills}
+            toolsSelected={selectedToolCategories}
+            toolOptions={toolCategoryOptions}
+            onToolsChange={setSelectedToolCategories}
+            connectorNames={connectorDisplayNames}
+            onOpenConnectors={() => setIsConnectMcpOpen(true)}
+            triggerRows={flowTriggerRows}
+            onOpenTriggers={() => {
+              setTriggerDialogInitialType(null)
+              setIsTriggersDialogOpen(true)
+            }}
+            promptCount={suggestedPrompts.length}
+          />
+        </div>
+      )}
     </div>
   )
 
@@ -2359,15 +2333,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setIsTriggersDialogOpen(false)
           setIsConnectMcpOpen(true)
         }}
-      />
-
-      <AgentWidgetSettingsDialog
-        agentId={localAgentId ? Number(localAgentId) : null}
-        agentName={name}
-        open={isWidgetSettingsOpen}
-        onOpenChange={setIsWidgetSettingsOpen}
-        widgetConfig={appWidgetConfig}
-        onWidgetConfigUpdated={mergeWidgetAgentData}
       />
 
       {state.filePreview.isOpen && (

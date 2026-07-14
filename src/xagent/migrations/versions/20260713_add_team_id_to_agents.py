@@ -1,7 +1,7 @@
 """Add team_id scope column to agents
 
 Revision ID: 20260713_add_team_id_to_agents
-Revises: 20260711_task_commands
+Revises: 20260713_mcp_oauth_dcr
 Create Date: 2026-07-13
 """
 
@@ -10,7 +10,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision = "20260713_add_team_id_to_agents"
-down_revision = "20260711_task_commands"
+down_revision = "20260713_mcp_oauth_dcr"
 branch_labels = None
 depends_on = None
 

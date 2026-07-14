@@ -12,6 +12,7 @@ from xagent.web.models.agent import (
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce
+from .agent_team_scope import get_agent_team_scope, owns_agent
 
 
 class WorkforcePolicy:
@@ -72,10 +73,10 @@ class WorkforcePolicy:
         workforce: Workforce,
         agent: Agent,
     ) -> bool:
-        del db
+        scope = get_agent_team_scope(db, int(user.id))
         return bool(
             int(workforce.owner_user_id) == int(user.id)
-            and int(agent.user_id) == int(user.id)
+            and owns_agent(agent, int(user.id), scope)
         )
 
     def after_workforce_run_created(
@@ -198,7 +199,8 @@ def ensure_agent_access(
         raise HTTPException(status_code=404, detail="Agent not found")
     if is_workforce_generated_manager_agent(agent):
         raise HTTPException(status_code=404, detail="Agent not found")
-    if user.is_admin or int(agent.user_id) == int(user.id):
+    scope = get_agent_team_scope(db, int(user.id))
+    if user.is_admin or owns_agent(agent, int(user.id), scope):
         if require_published and agent.status != AgentStatus.PUBLISHED:
             raise HTTPException(
                 status_code=400,

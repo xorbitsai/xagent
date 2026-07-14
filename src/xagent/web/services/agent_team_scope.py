@@ -47,6 +47,20 @@ def team_id_of(scope: Optional[AgentTeamScope]) -> Optional[int]:
     return scope.team_id if scope is not None else None
 
 
+def owns_agent(agent: Agent, user_id: int, scope: Optional[AgentTeamScope]) -> bool:
+    """Per-agent (in-memory) mirror of :func:`owned_agent_clause`.
+
+    Use this wherever a single loaded ``Agent`` is authorized/serialized so the
+    workforce gates and ownership serialization stay in lockstep with the list
+    query. Keep the branches identical to ``owned_agent_clause``.
+    """
+    if scope is None or agent.team_id is None:
+        return int(agent.user_id) == int(user_id)
+    if int(agent.team_id) != int(scope.team_id):
+        return False
+    return bool(scope.is_team_admin or agent.visibility == "team")
+
+
 def owned_agent_clause(
     user_id: int, scope: Optional[AgentTeamScope]
 ) -> ColumnElement[bool]:

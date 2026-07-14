@@ -19,6 +19,11 @@ from ..services.agent_access import (
     accessible_agent_permissions,
     list_accessible_published_agent_items,
 )
+from ..services.agent_team_scope import (
+    AgentTeamScope,
+    get_agent_team_scope,
+    owns_agent,
+)
 from ..services.workforce_access import (
     can_create_workforce,
     ensure_agent_access,
@@ -120,7 +125,11 @@ def _serialize_datetime(value: Any) -> str | None:
     return value.isoformat() if value else None
 
 
-def _serialize_agent(agent: Agent, user: User | None = None) -> dict[str, Any]:
+def _serialize_agent(
+    agent: Agent,
+    user: User | None = None,
+    scope: AgentTeamScope | None = None,
+) -> dict[str, Any]:
     item = {
         "id": agent.id,
         "name": agent.name,
@@ -131,7 +140,7 @@ def _serialize_agent(agent: Agent, user: User | None = None) -> dict[str, Any]:
     if user is None:
         return item
 
-    is_owner = int(agent.user_id) == int(user.id)
+    is_owner = owns_agent(agent, int(user.id), scope)
     is_generated_manager = is_workforce_generated_manager_agent(agent)
     can_edit = is_owner and not is_generated_manager
     item.update(
@@ -162,11 +171,13 @@ def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
 
 
 def _serialize_worker(
-    worker: WorkforceAgent, user: User | None = None
+    worker: WorkforceAgent,
+    user: User | None = None,
+    scope: AgentTeamScope | None = None,
 ) -> dict[str, Any]:
     return {
         "id": worker.id,
-        "agent": _serialize_agent(worker.agent, user),
+        "agent": _serialize_agent(worker.agent, user, scope),
         "alias": worker.alias,
         "assignment_instructions": worker.assignment_instructions,
         "source_type": worker.source_type,
@@ -180,17 +191,20 @@ def _serialize_worker(
 
 
 def _serialize_workforce_detail(
-    workforce: Workforce, user: User | None = None
+    workforce: Workforce,
+    user: User | None = None,
+    scope: AgentTeamScope | None = None,
 ) -> dict[str, Any]:
     return {
         "id": workforce.id,
         "name": workforce.name,
         "description": workforce.description,
         "status": workforce.status,
-        "manager": _serialize_agent(workforce.manager_agent, user),
+        "manager": _serialize_agent(workforce.manager_agent, user, scope),
         "manager_instructions": workforce.manager_instructions,
         "workers": [
-            _serialize_worker(worker, user) for worker in _sorted_workers(workforce)
+            _serialize_worker(worker, user, scope)
+            for worker in _sorted_workers(workforce)
         ],
         "canvas_layout": workforce.canvas_layout,
         "scope_type": workforce.scope_type,
@@ -428,7 +442,9 @@ async def create_workforce(
         db.rollback()
         raise
 
-    return _serialize_workforce_detail(_reload_workforce(db, workforce), user)
+    return _serialize_workforce_detail(
+        _reload_workforce(db, workforce), user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.post("/from-prompt")
@@ -439,7 +455,9 @@ async def create_workforce_from_prompt_endpoint(
 ) -> dict[str, Any]:
     result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
     workforce = _reload_workforce(db, result.workforce)
-    return _serialize_workforce_detail(workforce, user)
+    return _serialize_workforce_detail(
+        workforce, user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.get("/agent-options")
@@ -469,7 +487,9 @@ async def get_workforce(
         _load_workforce(db, workforce_id),
         action="view",
     )
-    return _serialize_workforce_detail(workforce, user)
+    return _serialize_workforce_detail(
+        workforce, user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.patch("/{workforce_id}")
@@ -531,7 +551,9 @@ async def update_workforce(
         db.rollback()
         raise
 
-    return _serialize_workforce_detail(_reload_workforce(db, workforce), user)
+    return _serialize_workforce_detail(
+        _reload_workforce(db, workforce), user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.delete("/{workforce_id}")
@@ -573,7 +595,9 @@ async def publish_workforce(
         db.rollback()
         raise
 
-    return _serialize_workforce_detail(_reload_workforce(db, workforce), user)
+    return _serialize_workforce_detail(
+        _reload_workforce(db, workforce), user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.post("/{workforce_id}/unpublish")
@@ -591,7 +615,9 @@ async def unpublish_workforce(
     _ensure_publish_state_mutable(workforce)
     cast(Any, workforce).status = "draft"
     db.commit()
-    return _serialize_workforce_detail(_reload_workforce(db, workforce), user)
+    return _serialize_workforce_detail(
+        _reload_workforce(db, workforce), user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.post("/{workforce_id}/agents")
@@ -627,7 +653,7 @@ async def add_workforce_agent(
         raise
 
     db.refresh(worker)
-    return _serialize_worker(worker, user)
+    return _serialize_worker(worker, user, get_agent_team_scope(db, int(user.id)))
 
 
 @router.patch("/{workforce_id}/agents/{member_id}")
@@ -674,7 +700,7 @@ async def update_workforce_agent(
         raise
 
     db.refresh(worker)
-    return _serialize_worker(worker, user)
+    return _serialize_worker(worker, user, get_agent_team_scope(db, int(user.id)))
 
 
 @router.delete("/{workforce_id}/agents/{member_id}")

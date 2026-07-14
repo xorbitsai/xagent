@@ -72,6 +72,37 @@ def test_owned_clause_shape():
     assert "team_id" in str(team) and "user_id" in str(team)
 
 
+def _agent(user_id, team_id=None, visibility="team"):
+    return Agent(user_id=user_id, team_id=team_id, visibility=visibility)
+
+
+def test_owns_agent_mirrors_owned_clause_branches():
+    admin = AgentTeamScope(team_id=100, is_team_admin=True)
+    member = AgentTeamScope(team_id=100, is_team_admin=False)
+
+    # No scope: pure user_id equality.
+    assert ats.owns_agent(_agent(7), 7, None) is True
+    assert ats.owns_agent(_agent(9), 7, None) is False
+
+    # Legacy row (no team) resolves via its own user_id even under a scope.
+    assert ats.owns_agent(_agent(7, team_id=None), 7, member) is True
+    assert ats.owns_agent(_agent(9, team_id=None), 7, member) is False
+
+    # Team admin owns every team agent regardless of visibility.
+    assert ats.owns_agent(_agent(9, team_id=100, visibility="admins"), 7, admin) is True
+
+    # Non-admin teammate owns team-visible agents only...
+    assert ats.owns_agent(_agent(9, team_id=100, visibility="team"), 7, member) is True
+    # ...and loses access once an admin flips it to admins-only (the workforce
+    # bypass the raw user_id check used to leave open for the creator).
+    assert (
+        ats.owns_agent(_agent(7, team_id=100, visibility="admins"), 7, member) is False
+    )
+
+    # Foreign team never owned.
+    assert ats.owns_agent(_agent(9, team_id=200, visibility="team"), 7, member) is False
+
+
 def test_cache_keys_are_team_scoped_when_scope_present():
     from xagent.web.services import hot_path_cache as hpc
 

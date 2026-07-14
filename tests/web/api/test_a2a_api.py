@@ -60,7 +60,8 @@ def _create_published_agent_with_key() -> tuple[int, str]:
     return agent_id, key_response.json()["full_key"]
 
 
-def test_agent_card_exposes_published_agent() -> None:
+def test_agent_card_exposes_published_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
     headers = _admin_headers()
     agent_id = _create_agent(headers)
     _publish_agent(headers, agent_id)
@@ -89,6 +90,22 @@ def test_agent_card_exposes_published_agent() -> None:
     }
     assert body["securityRequirements"] == [{"schemes": {"xagentAgentApiKey": {}}}]
     assert body["skills"][0]["examples"] == ["Summarize this"]
+
+
+def test_agent_card_uses_public_api_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", " https://sg.cloud.xagent.co/ ")
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    _publish_agent(headers, agent_id)
+
+    response = client.get(f"/api/a2a/agents/{agent_id}/.well-known/agent-card.json")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["supportedInterfaces"][0]["url"] == (
+        f"https://sg.cloud.xagent.co/api/a2a/agents/{agent_id}"
+    )
 
 
 def test_agent_card_hides_draft_agent() -> None:

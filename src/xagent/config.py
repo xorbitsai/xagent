@@ -711,15 +711,15 @@ def get_gmail_registration_timeout_seconds() -> int:
 
 
 def get_public_api_base_url() -> str | None:
-    """Public base URL of the backend API for provider callbacks.
+    """Public base URL of the backend API for advertised routes and callbacks.
 
     Priority:
         1. XAGENT_PUBLIC_API_BASE_URL environment variable
         2. None (consumers apply their own compatibility or validation policy)
 
     Deliberately separate from XAGENT_APP_BASE_URL (the frontend URL used in
-    e.g. password-reset emails): provider callback URLs should normally use
-    the public backend origin.
+    e.g. password-reset emails): externally advertised API and provider callback
+    URLs should normally use the public backend origin.
     """
     value = (os.getenv(PUBLIC_API_BASE_URL) or "").strip()
     return value.rstrip("/") or None

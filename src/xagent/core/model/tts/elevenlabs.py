@@ -505,6 +505,22 @@ class ElevenLabsTTS(BaseTTS):
             result["requires_verification"] = bool(requires_verification)
         return result
 
+    async def delete_voice(self, voice_id: str) -> None:
+        """Delete a persistent voice from the configured ElevenLabs account."""
+        normalized_voice_id = voice_id.strip()
+        if not normalized_voice_id:
+            raise ValueError("ElevenLabs voice ID must not be empty")
+
+        client = self._ensure_async_client()
+        try:
+            await client.voices.delete(normalized_voice_id)
+        except Exception as exc:
+            redacted_error = redact_sensitive_text(str(exc))
+            logger.error("ElevenLabs voice deletion failed: %s", redacted_error)
+            raise RuntimeError(
+                f"ElevenLabs voice deletion failed: {redacted_error}"
+            ) from exc
+
     async def synthesize(
         self,
         text: str,

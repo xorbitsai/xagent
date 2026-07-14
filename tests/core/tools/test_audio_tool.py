@@ -22,6 +22,7 @@ class FakeTTS(BaseTTS):
         self._voices = voices or []
         self.calls: list[dict[str, Any]] = []
         self.clone_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[str] = []
         self.model_name = "fake-tts"
 
     async def synthesize(
@@ -94,6 +95,9 @@ class FakeTTS(BaseTTS):
             "persistent": True,
             "requires_verification": False,
         }
+
+    async def delete_voice(self, voice_id: str) -> None:
+        self.delete_calls.append(voice_id)
 
 
 class ClosableTTS(FakeTTS):
@@ -574,7 +578,31 @@ async def test_clone_tts_voice_selects_provider_not_default_tts() -> None:
     assert xinference.clone_calls == []
 
 
-def test_clone_tts_voice_tool_exposes_provider_enum() -> None:
+async def test_delete_tts_voice_deletes_persistent_provider_voice() -> None:
+    tts = FakeTTS(
+        provider_name="elevenlabs",
+        abilities=["tts", "persistent_voice_cloning"],
+    )
+    tool = AudioToolCore(tts_models={"eleven_v3": tts})
+
+    result = await tool.delete_tts_voice(
+        voice_id=" persistent-voice ",
+        provider="elevenlabs",
+        model_id="eleven_v3",
+    )
+
+    assert result == {
+        "success": True,
+        "supported": True,
+        "deleted": True,
+        "voice_id": "persistent-voice",
+        "provider": "elevenlabs",
+        "model_used": "eleven_v3",
+    }
+    assert tts.delete_calls == ["persistent-voice"]
+
+
+def test_persistent_voice_tools_expose_provider_enum() -> None:
     elevenlabs_tool = AudioTool(
         tts_models={
             "eleven_v3": FakeTTS(
@@ -598,7 +626,9 @@ def test_clone_tts_voice_tool_exposes_provider_enum() -> None:
     other_tool_names = {candidate.name for candidate in other_provider_tool.get_tools()}
 
     assert "clone_tts_voice" in elevenlabs_tools
+    assert "delete_tts_voice" in elevenlabs_tools
     assert "clone_tts_voice" not in other_tool_names
+    assert "delete_tts_voice" not in other_tool_names
     schema = elevenlabs_tools["clone_tts_voice"].args_type().model_json_schema()
     assert set(schema["properties"]) == {
         "name",
@@ -610,6 +640,10 @@ def test_clone_tts_voice_tool_exposes_provider_enum() -> None:
         "model_id",
     }
     assert schema["properties"]["provider"]["const"] == "elevenlabs"
+
+    delete_schema = elevenlabs_tools["delete_tts_voice"].args_type().model_json_schema()
+    assert set(delete_schema["properties"]) == {"voice_id", "provider", "model_id"}
+    assert delete_schema["properties"]["provider"]["const"] == "elevenlabs"
 
 
 def test_list_tts_voices_tool_exposes_provider_enum() -> None:

@@ -135,11 +135,12 @@ class AudioTool(AudioToolCore):
                 )
             )
 
-        if any(
+        supports_persistent_elevenlabs_voices = any(
             self._get_tts_provider_name(model) == "elevenlabs"
             and getattr(model, "supports_persistent_voice_cloning", False)
             for model in voice_listing_models
-        ):
+        )
+        if supports_persistent_elevenlabs_voices:
             clone_tts_voice_description = self.CLONE_TTS_VOICE_DESCRIPTION.format(
                 "elevenlabs"
             )
@@ -148,6 +149,17 @@ class AudioTool(AudioToolCore):
                     self.clone_tts_voice,
                     name="clone_tts_voice",
                     description=clone_tts_voice_description,
+                    owner=self,
+                )
+            )
+            delete_tts_voice_description = self.DELETE_TTS_VOICE_DESCRIPTION.format(
+                "elevenlabs"
+            )
+            tools.append(
+                AudioFunctionTool(
+                    self.delete_tts_voice,
+                    name="delete_tts_voice",
+                    description=delete_tts_voice_description,
                     owner=self,
                 )
             )

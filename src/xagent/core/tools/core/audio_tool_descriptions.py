@@ -253,3 +253,25 @@ Important:
 - The voice remains in the selected ElevenLabs account after the task ends. It is not deleted during tool teardown.
 - For ElevenLabs Instant Voice Cloning, prefer approximately 1-2 minutes of clear, consistent, single-speaker audio without background noise or reverb.
 """.strip()
+
+# Description for delete_tts_voice tool
+DELETE_TTS_VOICE_DESCRIPTION = """
+Permanently delete a voice from the configured provider account.
+
+Currently supported providers: {}.
+
+Parameters:
+- voice_id (required): Exact provider voice ID returned by list_tts_voices or clone_tts_voice.
+- provider (optional): Voice provider. Currently the only supported value is "elevenlabs".
+- model_id (optional): Provider TTS configuration whose API key and base URL should be used. Omit to select the first configured model for provider.
+
+Output:
+- deleted: True when the provider accepted the deletion.
+- voice_id: Deleted provider voice ID.
+- provider: Provider account from which the voice was deleted.
+- model_used: TTS configuration used for the provider request.
+
+Important:
+- This operation is irreversible. Only call it when the user explicitly asks to delete the voice.
+- The voice ID belongs to a specific provider account. Select the same provider configuration that created or listed it.
+""".strip()

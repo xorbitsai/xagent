@@ -123,3 +123,9 @@ class BaseTTS(ABC):
         raise NotImplementedError(
             f"{self.provider_name} TTS does not support persistent voice cloning"
         )
+
+    async def delete_voice(self, voice_id: str) -> None:
+        """Delete a persistent provider-side voice."""
+        raise NotImplementedError(
+            f"{self.provider_name} TTS does not support persistent voice deletion"
+        )

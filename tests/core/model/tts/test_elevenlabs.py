@@ -409,6 +409,30 @@ async def test_clone_voice_creates_persistent_voice_without_cleanup(
     delete.assert_not_awaited()
 
 
+async def test_delete_voice_deletes_persistent_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delete = AsyncMock()
+    fake_client = SimpleNamespace(voices=SimpleNamespace(delete=delete))
+    monkeypatch.setattr(
+        ElevenLabsTTS,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    tts = ElevenLabsTTS(api_key="test-key")
+    await tts.delete_voice(" persistent-voice ")
+
+    delete.assert_awaited_once_with("persistent-voice")
+
+
+async def test_delete_voice_rejects_empty_voice_id() -> None:
+    tts = ElevenLabsTTS(api_key="test-key")
+
+    with pytest.raises(ValueError, match="voice ID must not be empty"):
+        await tts.delete_voice("  ")
+
+
 async def test_synthesize_redacts_sensitive_sdk_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

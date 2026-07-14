@@ -21,6 +21,7 @@ from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
 from .audio_tool_descriptions import (
     CLONE_TTS_VOICE_DESCRIPTION,
+    DELETE_TTS_VOICE_DESCRIPTION,
     LIST_TTS_VOICES_DESCRIPTION,
     SYNTHESIZE_SPEECH_DESCRIPTION,
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
@@ -43,6 +44,7 @@ class AudioToolCore:
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION = SYNTHESIZE_SPEECH_JSON_DESCRIPTION
     LIST_TTS_VOICES_DESCRIPTION = LIST_TTS_VOICES_DESCRIPTION
     CLONE_TTS_VOICE_DESCRIPTION = CLONE_TTS_VOICE_DESCRIPTION
+    DELETE_TTS_VOICE_DESCRIPTION = DELETE_TTS_VOICE_DESCRIPTION
 
     def __init__(
         self,
@@ -1165,6 +1167,73 @@ class AudioToolCore:
             return {
                 "success": False,
                 "supported": True,
+                "error": str(e),
+                "provider": provider,
+                "model_used": actual_model_id,
+            }
+
+    async def delete_tts_voice(
+        self,
+        voice_id: str,
+        provider: Literal["elevenlabs"] = "elevenlabs",
+        model_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Permanently delete a voice from a configured provider account."""
+        try:
+            tts_model, actual_model_id = self._get_provider_tts_model(
+                provider=provider,
+                capability="supports_persistent_voice_cloning",
+                model_id=model_id,
+            )
+            if not tts_model:
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": f"No {provider} TTS model is configured",
+                    "provider": provider,
+                    "model_used": actual_model_id,
+                }
+
+            provider_name = self._get_tts_provider_name(tts_model)
+            if provider_name != provider:
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": (
+                        f"delete_tts_voice provider is '{provider}', but model "
+                        f"'{actual_model_id}' uses provider '{provider_name}'."
+                    ),
+                    "provider": provider_name,
+                    "model_used": actual_model_id,
+                }
+            if not getattr(tts_model, "supports_persistent_voice_cloning", False):
+                return {
+                    "success": False,
+                    "supported": False,
+                    "error": f"The configured {provider} client does not support persistent voice deletion",
+                    "provider": provider_name,
+                    "model_used": actual_model_id,
+                }
+
+            normalized_voice_id = voice_id.strip()
+            await tts_model.delete_voice(normalized_voice_id)
+            return {
+                "success": True,
+                "supported": True,
+                "deleted": True,
+                "voice_id": normalized_voice_id,
+                "provider": provider_name,
+                "model_used": actual_model_id,
+            }
+        except Exception as e:
+            logger.error(f"Failed to delete TTS voice: {e}")
+            actual_model_id = (
+                model_id if model_id and model_id in self._tts_models else "default"
+            )
+            return {
+                "success": False,
+                "supported": True,
+                "deleted": False,
                 "error": str(e),
                 "provider": provider,
                 "model_used": actual_model_id,

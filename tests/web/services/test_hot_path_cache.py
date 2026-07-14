@@ -4,9 +4,12 @@ from xagent.web.services import hot_path_cache
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
     RedisJsonCache,
+    agent_detail_key,
+    agent_list_key,
     cache_delete_prefix,
     cache_get,
     cache_set,
+    invalidate_agent_cache,
     set_cache_backend_for_testing,
 )
 
@@ -39,6 +42,25 @@ def test_delete_prefix_only_removes_matching_keys() -> None:
     assert cache_get("model:list:1") is None
     assert cache_get("model:defaults:1") is None
     assert cache_get("agent:list:1") == {"hit": True}
+
+
+def test_team_agent_write_invalidates_every_member_cache() -> None:
+    # Team keys are per-member; a write by member A must also drop member B's
+    # cached list/detail so a visibility change can't linger.
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    team_id = 100
+    a_list = agent_list_key(1, team_id, False)
+    b_list = agent_list_key(2, team_id, False)
+    b_detail = agent_detail_key(2, 5, team_id, False)
+    cache_set(a_list, {"hit": True}, ttl_seconds=30)
+    cache_set(b_list, {"hit": True}, ttl_seconds=30)
+    cache_set(b_detail, {"hit": True}, ttl_seconds=30)
+
+    invalidate_agent_cache(1, agent_id=5, team_id=team_id)
+
+    assert cache_get(a_list) is None
+    assert cache_get(b_list) is None
+    assert cache_get(b_detail) is None
 
 
 def test_redis_delete_prefix_deletes_in_batches(monkeypatch) -> None:

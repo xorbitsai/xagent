@@ -299,20 +299,18 @@ def invalidate_agent_cache(
     user_id: int, agent_id: int | None = None, team_id: int | None = None
 ) -> None:
     if team_id is not None:
-        cache_delete(
-            agent_list_key(user_id, team_id, True),
-            agent_list_key(user_id, team_id, False),
-        )
-    else:
-        cache_delete(agent_list_key(user_id))
+        # Team keys are per-member (see agent_list_key): a write by one member
+        # changes what every teammate may see (e.g. flipping visibility to
+        # admins-only), so nuke the whole team namespace rather than just the
+        # caller's variants. ponytail: prefix-nuke over-invalidates other agents'
+        # detail entries; enumerate members if write churn ever becomes hot.
+        cache_delete_prefix(f"agent:list:team:{team_id}:")
+        if agent_id is not None:
+            cache_delete_prefix(f"agent:detail:team:{team_id}:")
+        return
+    cache_delete(agent_list_key(user_id))
     if agent_id is not None:
-        if team_id is not None:
-            cache_delete(
-                agent_detail_key(user_id, agent_id, team_id, True),
-                agent_detail_key(user_id, agent_id, team_id, False),
-            )
-        else:
-            cache_delete(agent_detail_key(user_id, agent_id))
+        cache_delete(agent_detail_key(user_id, agent_id))
 
 
 def invalidate_model_cache(user_id: int | None = None) -> None:

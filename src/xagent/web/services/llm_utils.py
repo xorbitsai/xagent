@@ -1128,6 +1128,7 @@ def _load_agent_for_task_runtime(
     )
     from ..models.user import User
     from .agent_access import list_accessible_published_agents
+    from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 
     task_agent_id = getattr(task_row, "agent_id", None)
     if task_agent_id is None:
@@ -1140,8 +1141,21 @@ def _load_agent_for_task_runtime(
         if workforce is not None and workforce.manager_agent_id == task_agent_id:
             return agent
         return None
-    if int(agent.user_id) == int(task_row.user_id):
-        return agent
+    # Team-scoped ownership keyed on the task owner: a teammate's task may run
+    # a team-visible agent; admins-only stays hidden from non-admins.
+    task_user_id = int(task_row.user_id)
+    owned = (
+        session.query(Agent)
+        .filter(
+            Agent.id == task_agent_id,
+            owned_agent_clause(
+                task_user_id, get_agent_team_scope(session, task_user_id)
+            ),
+        )
+        .first()
+    )
+    if owned is not None:
+        return owned
     if workforce is not None and workforce.manager_agent_id == task_agent_id:
         return agent
     if getattr(agent.status, "value", agent.status) != AgentStatus.PUBLISHED.value:

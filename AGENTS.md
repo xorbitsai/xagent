@@ -133,7 +133,6 @@ Xagent has two categories of tools:
 
 **Web & Search Tools** (`src/xagent/core/tools/core/`):
 - `web_search` - Generic web search
-- `image_web_search` - Image search functionality
 - `zhipu_web_search` - Zhipu search integration
 - `web_crawler` - Web crawling and content extraction
 

@@ -1272,11 +1272,14 @@ class AgentServiceManager:
                 "agent tools"
             )
         elif agent_config and agent_config.get("preview_agent_id"):
+            preview_user_id = int(task.user_id)
             current_agent = (
                 db.query(Agent)
                 .filter(
                     Agent.id == agent_config["preview_agent_id"],
-                    Agent.user_id == task.user_id,
+                    owned_agent_clause(
+                        preview_user_id, get_agent_team_scope(db, preview_user_id)
+                    ),
                 )
                 .first()
             )
@@ -1824,11 +1827,15 @@ class AgentServiceManager:
                         raise ValueError(
                             f"Task {task_id} missing while resolving preview agent"
                         )
+                    preview_user_id = int(task.user_id)
                     current_agent = (
                         db.query(Agent)
                         .filter(
                             Agent.id == agent_config["preview_agent_id"],
-                            Agent.user_id == task.user_id,
+                            owned_agent_clause(
+                                preview_user_id,
+                                get_agent_team_scope(db, preview_user_id),
+                            ),
                         )
                         .first()
                     )

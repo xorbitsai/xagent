@@ -124,7 +124,13 @@ def _apply_agent_visibility_filters(
     user_id: int,
     allowed_agent_ids: Optional[list[int]],
     allow_cross_user_agent_ids: bool,
+    db: Any,
 ) -> Any | None:
+    from .....web.services.agent_team_scope import (
+        get_agent_team_scope,
+        owned_agent_clause,
+    )
+
     normalized_allowed_agent_ids = _normalize_agent_ids(allowed_agent_ids)
     if normalized_allowed_agent_ids is not None:
         if not normalized_allowed_agent_ids:
@@ -132,9 +138,12 @@ def _apply_agent_visibility_filters(
         query = query.filter(agent_model.id.in_(normalized_allowed_agent_ids))
 
     # Cross-user execution is only valid for explicit allowlists. Global
-    # discovery and direct execution remain owner-scoped.
+    # discovery and direct execution stay scoped to what the user owns, which
+    # under a team scope means team-visible agents (admins-only stay hidden).
     if not allow_cross_user_agent_ids or normalized_allowed_agent_ids is None:
-        query = query.filter(agent_model.user_id == user_id)
+        query = query.filter(
+            owned_agent_clause(user_id, get_agent_team_scope(db, user_id))
+        )
 
     query = _exclude_private_workforce_manager_agents(query, agent_model)
 
@@ -150,9 +159,14 @@ def _exclude_private_workforce_manager_agents(query: Any, agent_model: Any) -> A
 
 
 def _apply_owned_agent_tool_filters(
-    query: Any, agent_model: Any, *, user_id: int
+    query: Any, agent_model: Any, *, user_id: int, db: Any
 ) -> Any:
-    query = query.filter(agent_model.user_id == user_id)
+    from .....web.services.agent_team_scope import (
+        get_agent_team_scope,
+        owned_agent_clause,
+    )
+
+    query = query.filter(owned_agent_clause(user_id, get_agent_team_scope(db, user_id)))
     query = _exclude_private_workforce_manager_agents(query, agent_model)
     return query
 
@@ -963,6 +977,7 @@ class UpdateAgentTool(AbstractBaseTool):
                     query,
                     Agent,
                     user_id=self._user_id,
+                    db=db,
                 )
                 agent = query.first()
 
@@ -1004,6 +1019,7 @@ class UpdateAgentTool(AbstractBaseTool):
                         ),
                         Agent,
                         user_id=self._user_id,
+                        db=db,
                     ).first()
                     if existing:
                         return UpdateAgentToolResult(
@@ -1245,6 +1261,7 @@ class ListAgentsTool(AbstractBaseTool):
                     db.query(Agent),
                     Agent,
                     user_id=self._user_id,
+                    db=db,
                 )
 
                 # Apply status filter if provided
@@ -1721,6 +1738,7 @@ class AgentTool(AbstractBaseTool):
                     user_id=self._user_id,
                     allowed_agent_ids=self._target_allowed_agent_ids,
                     allow_cross_user_agent_ids=self._target_allow_cross_user_agent_ids,
+                    db=db,
                 )
                 agent = agent.first() if agent is not None else None
 
@@ -2001,6 +2019,7 @@ def get_published_agents_tools(
                     user_id=user_id,
                     allowed_agent_ids=normalized_injected_agent_ids,
                     allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+                    db=db,
                 )
                 if query is None:
                     return []
@@ -2011,13 +2030,17 @@ def get_published_agents_tools(
                 query = db.query(Agent).filter(
                     Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
                 )
-                query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
+                query = _apply_owned_agent_tool_filters(
+                    query, Agent, user_id=user_id, db=db
+                )
             else:
                 # Only PUBLISHED agents
                 query = db.query(Agent).filter(
                     Agent.status == "published",
                 )
-                query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
+                query = _apply_owned_agent_tool_filters(
+                    query, Agent, user_id=user_id, db=db
+                )
 
             # Exclude the active delegation stack to prevent recursive self-calls.
             if excluded_agent_ids:
@@ -2045,6 +2068,7 @@ def get_published_agents_tools(
                         ),
                         Agent,
                         user_id=user_id,
+                        db=db,
                     ).all()
                     # Merge without duplicates
                     existing_ids = {agent.id for agent in agents}

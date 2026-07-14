@@ -431,7 +431,8 @@ class TelegramBotInstance:
                     "Telegram voice transcription failed"
                 ) from exc
 
-            transcript = str(result).strip()
+            raw_text = getattr(result, "text", result)
+            transcript = str(raw_text).strip()
             if not transcript:
                 raise TelegramVoiceTranscriptionError(
                     "Telegram voice transcription returned empty text"
@@ -460,7 +461,7 @@ class TelegramBotInstance:
     async def _close_voice_asr_model(asr_model: Any) -> None:
         from inspect import isawaitable
 
-        close = getattr(asr_model, "aclose", None)
+        close = getattr(asr_model, "aclose", None) or getattr(asr_model, "close", None)
         if not callable(close):
             return
         try:

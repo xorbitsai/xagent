@@ -125,6 +125,48 @@ async def test_transcribe_uploaded_voice_files_uses_registered_input_file() -> N
 
 
 @pytest.mark.asyncio
+async def test_transcribe_uploaded_voice_files_extracts_result_text() -> None:
+    bot = make_bot()
+
+    class ResultASR:
+        async def transcribe(
+            self, *, audio: str, format: str | None = None
+        ) -> SimpleNamespace:
+            return SimpleNamespace(text="今晚有世界杯比赛吗？")
+
+    transcripts = await bot._transcribe_uploaded_voice_files(
+        ["voice-file-id"],
+        [
+            {
+                "telegram_file_id": "voice-file-id",
+                "name": "voice.oga",
+                "path": "/workspace/input/voice.oga",
+                "type": "audio/ogg",
+            }
+        ],
+        ResultASR(),
+    )
+
+    assert transcripts == {"voice-file-id": "今晚有世界杯比赛吗？"}
+
+
+@pytest.mark.asyncio
+async def test_close_voice_asr_model_supports_sync_close() -> None:
+    class SyncClosableASR:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    asr = SyncClosableASR()
+
+    await TelegramBotInstance._close_voice_asr_model(asr)
+
+    assert asr.closed is True
+
+
+@pytest.mark.asyncio
 async def test_transcribe_uploaded_voice_files_rejects_empty_result() -> None:
     bot = make_bot()
 

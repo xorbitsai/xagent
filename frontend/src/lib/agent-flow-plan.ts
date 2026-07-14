@@ -47,9 +47,15 @@ function writeExplicitPlan(base: string, texts: string[]): string {
   return (trimmed ? trimmed + "\n\n" : "") + "Plan:\n" + texts.map((t, i) => `${i + 1}. ${t}`).join("\n")
 }
 
-function renumber(lines: string[]): string[] {
+// Only renumber lines known to belong to the plan (from the caller's own
+// step-index bookkeeping) rather than re-scanning the whole text with a
+// second regex pass — the instructions may contain unrelated numbered
+// lines outside the plan that happen to match the same shape.
+function renumber(lines: string[], stepLineIndices: number[]): string[] {
+  const indices = new Set(stepLineIndices)
   let n = 1
-  return lines.map((l) => {
+  return lines.map((l, i) => {
+    if (!indices.has(i)) return l
     const m = l.match(/^(\s*)\d+\s*([.)])\s+(.+)$/)
     return m ? `${m[1]}${n++}${m[2]} ${m[3]}` : l
   })
@@ -81,8 +87,16 @@ export function deletePlanStep(instructions: string, idx: number): string {
   if (plan.explicit) {
     const lines = instructions.split("\n")
     const s = plan.steps[idx]
-    if (s && s.lineIdx !== null) lines.splice(s.lineIdx, 1)
-    return renumber(lines).join("\n")
+    if (s && s.lineIdx !== null) {
+      const removedLineIdx = s.lineIdx
+      lines.splice(removedLineIdx, 1)
+      const remainingLineIndices = plan.steps
+        .filter((_, i) => i !== idx)
+        .map((step) => (step.lineIdx === null ? null : step.lineIdx > removedLineIdx ? step.lineIdx - 1 : step.lineIdx))
+        .filter((lineIdx): lineIdx is number => lineIdx !== null)
+      return renumber(lines, remainingLineIndices).join("\n")
+    }
+    return lines.join("\n")
   }
   const texts = plan.steps.map((s) => s.text)
   texts.splice(idx, 1)

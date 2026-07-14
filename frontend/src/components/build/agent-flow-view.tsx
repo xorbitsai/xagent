@@ -185,8 +185,10 @@ export function AgentFlowView({
       if (innerRafId !== undefined) cancelAnimationFrame(innerRafId)
     }
     // Re-measure whenever anything that changes node size/position renders.
+    // `instructions` covers step text edits that reflow the Agent node's
+    // height (shifting Output below it) without changing the step count.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recomputeConnectors, plan.steps.length, kbSelected.length, skillsSelected.length, toolsSelected.length, connectorNames.length, triggerRows.length, promptCount, name, modelLabel, executionMode])
+  }, [recomputeConnectors, instructions, plan.steps.length, kbSelected.length, skillsSelected.length, toolsSelected.length, connectorNames.length, triggerRows.length, promptCount, name, modelLabel, executionMode])
 
   useEffect(() => {
     const el = containerRef.current

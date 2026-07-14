@@ -28,9 +28,11 @@ export function parseInstructionSteps(text: string): ParsedPlan {
     return { steps, explicit: true }
   }
 
-  const sentences = text
-    .replace(/\n+/g, " ")
-    .split(/(?<=[.!?])\s+/)
+  // Avoid a lookbehind assertion here — unsupported on Safari < 16.4/macOS < 13.3
+  // and would throw a SyntaxError on load in older browsers. Extract each
+  // punctuation-terminated (or end-of-string-terminated) run instead of
+  // splitting after the punctuation.
+  const sentences = (text.replace(/\n+/g, " ").match(/[^.!?]+(?:[.!?]+|$)/g) || [])
     .map((s) => s.trim())
     .filter((s) => s.length >= 15 && s.length <= 160)
 

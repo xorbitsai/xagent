@@ -176,8 +176,14 @@ export function AgentFlowView({
 
   useLayoutEffect(() => {
     recomputeConnectors()
-    const raf = requestAnimationFrame(() => requestAnimationFrame(recomputeConnectors))
-    return () => cancelAnimationFrame(raf)
+    let innerRafId: number | undefined
+    const outerRafId = requestAnimationFrame(() => {
+      innerRafId = requestAnimationFrame(recomputeConnectors)
+    })
+    return () => {
+      cancelAnimationFrame(outerRafId)
+      if (innerRafId !== undefined) cancelAnimationFrame(innerRafId)
+    }
     // Re-measure whenever anything that changes node size/position renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recomputeConnectors, plan.steps.length, kbSelected.length, skillsSelected.length, toolsSelected.length, connectorNames.length, triggerRows.length, promptCount, name, modelLabel, executionMode])
@@ -256,8 +262,22 @@ export function AgentFlowView({
   // ── Plan step inline editing ──────────────────────────────────
   const [editingStepIdx, setEditingStepIdx] = useState<number | null>(null)
   const [stepDraft, setStepDraft] = useState("")
+  // Move/reorder/remove buttons fire on the same step (or shift indices for
+  // others) while a step is being edited. Their mousedown blurs the <input>
+  // first, which would otherwise commit a stale edit right before the
+  // button's own onClick applies a move/delete against the same stale
+  // `instructions` snapshot — silently discarding whichever change lands
+  // second. Suppress the blur-triggered commit when a structural action is
+  // about to run instead of trying to reconcile the two.
+  const ignoreBlurRef = useRef(false)
 
   const commitStep = (idx: number, save: boolean) => {
+    if (editingStepIdx !== idx) return
+    if (ignoreBlurRef.current) {
+      ignoreBlurRef.current = false
+      setEditingStepIdx(null)
+      return
+    }
     const orig = plan.steps[idx]?.text ?? ""
     const value = stepDraft.trim()
     if (save && value && value !== orig) {
@@ -521,8 +541,12 @@ export function AgentFlowView({
                       <button
                         type="button"
                         title={t("builds.editor.flow.agent.moveUp")}
+                        onMouseDown={() => {
+                          ignoreBlurRef.current = true
+                        }}
                         onClick={(e) => {
                           e.stopPropagation()
+                          ignoreBlurRef.current = false
                           onInstructionsChange(movePlanStep(instructions, idx, -1))
                         }}
                         className="flex h-[18px] w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -532,8 +556,12 @@ export function AgentFlowView({
                       <button
                         type="button"
                         title={t("builds.editor.flow.agent.moveDown")}
+                        onMouseDown={() => {
+                          ignoreBlurRef.current = true
+                        }}
                         onClick={(e) => {
                           e.stopPropagation()
+                          ignoreBlurRef.current = false
                           onInstructionsChange(movePlanStep(instructions, idx, 1))
                         }}
                         className="flex h-[18px] w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -543,8 +571,12 @@ export function AgentFlowView({
                       <button
                         type="button"
                         title={t("builds.editor.flow.agent.removeStep")}
+                        onMouseDown={() => {
+                          ignoreBlurRef.current = true
+                        }}
                         onClick={(e) => {
                           e.stopPropagation()
+                          ignoreBlurRef.current = false
                           onInstructionsChange(deletePlanStep(instructions, idx))
                         }}
                         className="flex h-[18px] w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"

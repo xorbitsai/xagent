@@ -1769,7 +1769,11 @@ async def test_llm_plan_generator_filters_unknown_suggested_tools() -> None:
                 {
                     "id": "draft",
                     "task": "Draft answer",
-                    "tool_names": ["calculator", "poster-design", "missing_tool"],
+                    "tool_names": [
+                        "calculator",
+                        "presentation-generator",
+                        "missing_tool",
+                    ],
                 },
             ]
         )

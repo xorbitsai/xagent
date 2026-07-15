@@ -26,18 +26,16 @@ class SkillSelector:
 1. **Understand the task type FIRST**
    - Match the user's requested final artifact, not adjacent implementation details.
    - Is this a presentation/slide/PPTX/deck? → Select a presentation skill only when the user explicitly asks for that artifact.
-   - Is this a poster/image/banner/visual asset? → Prefer a visual/poster/image skill; do NOT select a presentation/document skill just because it can contain images.
-   - Is this a document/report? → Do NOT select poster-design
-   - Is this a web page? → Do NOT select poster-design
+   - Is this a document/report? → Select only a matching document/report skill.
+   - Is this a web page? → Select only a matching web-building skill.
    - Does a skill require a specific source scope (knowledge base, uploaded files, provided documents, repository, private data, etc.)? → Select it only when the user explicitly names or provides that source scope
    - Is this public web research, recent/latest/current news, or open-ended factual discovery? → Do NOT select a source-bound skill unless the user explicitly scopes the task to that source
    - Is this about creating an agent, chatbot, or assistant? → Consider agent-builder
 
 2. **Check for NEGATIVE signals**
-   - If user wants "slide", "presentation", "deck" → Reject poster-design
-   - If user wants "image", "poster", "banner", "illustration", "visual", or "graphic" without asking for slides/PPTX → Reject presentation skills
-   - If user wants "document", "report" → Reject poster-design
-   - If user wants "web page", "landing page" → Reject poster-design
+   - If user wants "slide", "presentation", "deck" → Reject non-presentation skills
+   - If user wants "document", "report" → Reject non-document skills
+   - If user wants "web page", "landing page" → Reject non-web skills
    - If user wants "code", "script" → Reject all non-coding skills
    - If user wants "create agent", "build chatbot", "create ai assistant" → Reject all non-agent-creation skills
    - If user asks for "recent", "latest", "current", "today", news, public incidents, or web facts without an explicit private/source scope → Reject skills that are limited to private/source-bound evidence
@@ -55,14 +53,13 @@ class SkillSelector:
 
 | User Task | Wrong Skill | Why |
 |-----------|-------------|-----|
-| "Create a presentation slide" | poster-design | User wants slides, not poster |
-| "Write a marketing report" | poster-design | User wants document, not visual |
-| "Generate HTML landing page" | poster-design | User wants web page, not poster |
+| "Write a marketing report" | presentation skill | User wants a document, not slides |
+| "Generate HTML landing page" | document/presentation skill | User wants a web page |
 | "Fix this Python bug" | any non-coding skill | Task requires coding, not other skills |
 
 ## Decision Process
 
-1. Identify the CORE OUTPUT TYPE (slide/poster/document/code/etc)
+1. Identify the requested final artifact and output type
 2. Check if any skill is DESIGNED for that output type
 3. Check the skill's output contract against the requested artifact
 4. Verify there are NO conflicting signals
@@ -390,7 +387,6 @@ If no skill is directly relevant, return selected: false."""
 ## Important
 - Analyze the TRUE INTENT, not just keyword matches
 - Consider the OUTPUT TYPE the user wants and reject skills whose output contract conflicts with it
-- Presentation skills require an explicit request for slides, a deck, PPT, PPTX, or editing/reading a presentation file. Do not choose them for standalone images, posters, banners, illustrations, or visual assets.
 - Check for NEGATIVE signals before selecting
 - For any skill that relies on a particular source scope, select it only when the user explicitly scopes the answer to that source (for example a knowledge base, uploaded/provided documents, repository, or internal/private data). Do not select source-bound skills for public web research or recent/latest/current facts.
 

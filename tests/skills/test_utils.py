@@ -298,5 +298,6 @@ class TestSkillManagerIntegration:
 
         # Should load builtin skills
         skills = asyncio.run(manager.list_skills())
-        # At minimum, should have some builtin skills (evidence-based-rag, poster-design, presentation-generator)
+        # At minimum, should have builtins such as evidence-based-rag,
+        # presentation-generator, and agent-builder.
         assert len(skills) >= 3

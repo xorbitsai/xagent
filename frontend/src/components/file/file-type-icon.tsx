@@ -104,6 +104,7 @@ export const getFileVisualKind = (
   if (mime.startsWith("image/")) return "image"
   if (mime.startsWith("video/")) return "video"
   if (mime.startsWith("audio/")) return "audio"
+  // Keep specific OpenXML MIME checks above the generic "document" branch.
   if (mime.includes("spreadsheet") || mime.includes("excel") || mime === "text/csv") {
     return "spreadsheet"
   }

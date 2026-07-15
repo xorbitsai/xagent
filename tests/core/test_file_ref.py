@@ -10,6 +10,10 @@ from xagent.core.file_ref import (
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
+        (None, None),
+        ("", None),
+        ("file:", None),
+        ("file://", None),
         (
             "file:355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
             "355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
@@ -27,12 +31,15 @@ from xagent.core.file_ref import (
         ("https://example.com/photo.jpg", None),
     ],
 )
-def test_parse_file_id_ref(value: str, expected: str | None) -> None:
+def test_parse_file_id_ref(value: str | None, expected: str | None) -> None:
     assert parse_file_id_ref(value) == expected
 
 
 def test_build_file_id_ref_uses_canonical_form() -> None:
-    assert build_file_id_ref("legacy id") == "file:legacy%20id"
+    result = build_file_id_ref("legacy id")
+
+    assert result == "file:legacy%20id"
+    assert parse_file_id_ref(result) == "legacy id"
 
 
 def test_build_file_ref_uses_canonical_file_id_ref() -> None:

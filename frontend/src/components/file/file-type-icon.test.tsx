@@ -12,6 +12,21 @@ describe("getFileVisualKind", () => {
     expect(getFileVisualKind("opaque-name", "audio/mpeg")).toBe("audio")
   })
 
+  it("checks specific OpenXML MIME types before generic documents", () => {
+    expect(
+      getFileVisualKind(
+        "opaque-name",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      )
+    ).toBe("spreadsheet")
+    expect(
+      getFileVisualKind(
+        "opaque-name",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+      )
+    ).toBe("presentation")
+  })
+
   it("falls back to filename extensions", () => {
     expect(getFileVisualKind("report.xlsx")).toBe("spreadsheet")
     expect(getFileVisualKind("archive.tar.gz")).toBe("archive")

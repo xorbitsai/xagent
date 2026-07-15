@@ -219,29 +219,33 @@ class TestVisionToolUnderstandImages:
         assert result.images_processed == 1
 
     @pytest.mark.asyncio
-    async def test_understand_legacy_file_id_ref_with_workspace(
-        self, vision_tool_with_workspace, mock_workspace
+    @pytest.mark.parametrize(
+        "file_ref",
+        [
+            "file:355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
+            "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
+        ],
+    )
+    async def test_understand_file_id_ref_with_workspace(
+        self, vision_tool_with_workspace, mock_workspace, file_ref
     ):
         image_path = mock_workspace.resolve_path_with_search("existing_image.jpg")
         mock_workspace.resolve_path_with_search.reset_mock()
 
         def resolve_file_ref(value: str) -> Path:
-            if value == "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e":
+            if value == file_ref:
                 return image_path
             raise FileNotFoundError(value)
 
         mock_workspace.resolve_path_with_search.side_effect = resolve_file_ref
 
         result = await vision_tool_with_workspace.understand_images(
-            "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
-            "What is this?",
+            file_ref, "What is this?"
         )
 
         assert result.success is True
         assert result.images_processed == 1
-        mock_workspace.resolve_path_with_search.assert_called_once_with(
-            "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e"
-        )
+        mock_workspace.resolve_path_with_search.assert_called_once_with(file_ref)
 
     @pytest.mark.asyncio
     async def test_understand_multiple_image_paths_with_workspace(

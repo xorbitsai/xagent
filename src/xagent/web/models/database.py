@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Generator
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
@@ -34,6 +34,27 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
+# Flushed-but-uncommitted changes leave ``new``/``dirty``/``deleted`` empty
+# while the transaction still holds unpersisted DML, so those collections
+# alone cannot prove a transaction is safe to roll back. Track flushes on
+# every Session via class-level listeners; the flag lives in ``session.info``
+# and is cleared once the transaction actually ends. ``Session.close()``
+# without commit/rollback may leave the flag set — that fails closed (the
+# helper just keeps the connection), never toward data loss.
+_HAS_FLUSHED_KEY = "xagent_has_flushed"
+
+
+@event.listens_for(Session, "after_flush")
+def _mark_session_flushed(session: Session, _flush_context: Any) -> None:
+    session.info[_HAS_FLUSHED_KEY] = True
+
+
+@event.listens_for(Session, "after_commit")
+@event.listens_for(Session, "after_rollback")
+def _clear_session_flushed(session: Session) -> None:
+    session.info[_HAS_FLUSHED_KEY] = False
+
+
 def release_db_connection_if_clean(db: Session | None) -> bool:
     """Return ``db``'s pooled connection by ending its (read-only) transaction.
 
@@ -45,14 +66,17 @@ def release_db_connection_if_clean(db: Session | None) -> bool:
     and transparently re-acquires a connection on its next query.
 
     Only rolls back when the session has no pending ORM changes
-    (new/dirty/deleted), so nothing uncommitted is ever discarded. Callers
-    must not rely on it having released (hence the bool return): a session
-    with pending writes keeps its connection.
+    (new/dirty/deleted) and nothing was flushed in the current transaction,
+    so nothing uncommitted is ever discarded. Callers must not rely on it
+    having released (hence the bool return): a session with pending or
+    flushed writes keeps its connection.
     """
     if db is None:
         return False
     try:
         if db.new or db.dirty or db.deleted:
+            return False
+        if db.info.get(_HAS_FLUSHED_KEY, False):
             return False
         if not db.in_transaction():
             return True

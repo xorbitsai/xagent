@@ -44,6 +44,25 @@ def test_keeps_pending_writes():
     assert db.query(Item).count() == 1
 
 
+def test_keeps_flushed_but_uncommitted_changes():
+    """flush() empties new/dirty/deleted while the transaction still holds
+    unpersisted DML; the helper must not roll that back."""
+    db = _make_session()
+    db.add(Item(name="one"))
+    db.flush()
+    assert not (db.new or db.dirty or db.deleted)
+
+    assert release_db_connection_if_clean(db) is False
+
+    db.commit()
+    assert db.query(Item).count() == 1
+
+    # After the commit the flush flag is cleared: a fresh read-only
+    # transaction is releasable again.
+    db.query(Item).all()
+    assert release_db_connection_if_clean(db) is True
+
+
 def test_keeps_flushed_dirty_changes():
     db = _make_session()
     db.add(Item(name="one"))

@@ -142,9 +142,10 @@ def _get_adhoc_engine():  # type: ignore[no-untyped-def]
     global _adhoc_engine, _adhoc_engine_url
 
     database_url = get_database_url()
-    if _adhoc_engine is not None and _adhoc_engine_url == database_url:
-        return _adhoc_engine
-
+    # Check-and-swap runs entirely under the lock: a lock-free fast path
+    # could read a torn (engine, url) pair mid-swap and hand out an engine
+    # that is about to be disposed. This function is not on a hot path —
+    # correctness over the micro-optimization.
     with _adhoc_engine_lock:
         if _adhoc_engine is None or _adhoc_engine_url != database_url:
             old_engine = _adhoc_engine
@@ -161,7 +162,7 @@ def _get_adhoc_engine():  # type: ignore[no-untyped-def]
             _adhoc_engine_url = database_url
             if old_engine is not None:
                 old_engine.dispose()
-    return _adhoc_engine
+        return _adhoc_engine
 
 
 def create_db_session() -> Session:

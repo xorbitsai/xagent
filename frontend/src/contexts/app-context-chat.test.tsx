@@ -434,6 +434,64 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("does not append an acknowledged optimistic message after switching tasks", async () => {
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({
+              client_message_id: "turn-switch",
+              turn_id: "turn-switch",
+            })
+        })
+    )
+
+    let send: (() => Promise<void>) | undefined
+    let switchTask: (() => void) | undefined
+    function SwitchingTaskProbe() {
+      const { sendMessage, setTaskId } = useApp()
+      send = () =>
+        sendMessage("Message for task one", {
+          clientMessageId: "turn-switch",
+        })
+      switchTask = () => setTaskId(2, { navigate: false })
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SwitchingTaskProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = send?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    act(() => {
+      switchTask?.()
+    })
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+
+    const messages = JSON.parse(
+      screen.getByTestId("messages").textContent || "[]"
+    ) as Array<{ content: string }>
+    expect(messages).toEqual([])
+  })
+
   it("shows the sender's message live when a new task's run dies before tracing", async () => {
     // A run refused at the quota gate returns before agent tracing starts, so
     // the live user_message trace event is never emitted. The sender's bubble

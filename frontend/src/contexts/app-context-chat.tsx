@@ -4392,7 +4392,13 @@ export function AppProvider({
     // invisible until a reload replays the persisted transcript row. The
     // reducer reconciles by turn id / content, keeping the persisted event
     // when it already arrived and replacing this copy when it arrives later.
-    const addOptimisticUserMessage = () => {
+    const addOptimisticUserMessage = (intendedTaskId: number) => {
+      // Delivery acknowledgement can arrive after the user has navigated to a
+      // different task. Never append this turn to whichever task happens to be
+      // active when the async send resumes.
+      if (stateRef.current.taskId !== intendedTaskId) {
+        return
+      }
       let content: React.ReactNode = message
       if (files && files.length > 0) {
         content = (
@@ -4427,7 +4433,7 @@ export function AppProvider({
         force: config?.force,
         clientMessageId,
       })
-      addOptimisticUserMessage()
+      addOptimisticUserMessage(targetTaskId)
       return
     }
 
@@ -4585,7 +4591,7 @@ export function AppProvider({
             force: config?.force,
             clientMessageId,
           })
-          addOptimisticUserMessage()
+          addOptimisticUserMessage(newTaskId)
         } else {
           const parsed = await parseApiResponse(response)
           const errorMessage = getApiErrorMessage(
@@ -4624,7 +4630,7 @@ export function AppProvider({
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
       }
 
-      addOptimisticUserMessage()
+      addOptimisticUserMessage(state.taskId)
     }
   }, [state.taskId, sendChatMessage, wsExecuteTask, state.currentTask?.status, queuePendingMessage])
 

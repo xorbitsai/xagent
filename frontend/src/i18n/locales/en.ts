@@ -3295,7 +3295,9 @@ Build when you need.`,
     embed_snippet: {
       title: "Embed Snippet",
       desc: "Copy and paste this script tag into the <body> of your website.",
-      copy_btn: "Copy Snippet"
+      copy_btn: "Copy Snippet",
+      rotate_key_btn: "Rotate Key",
+      rotating_key: "Rotating…"
     },
     share_link: {
       title: "Share Link",
@@ -3316,7 +3318,8 @@ Build when you need.`,
       share_enabled: "Share link generated",
       share_rotated: "Share link rotated",
       share_disabled: "Share link disabled",
-      share_failed: "Share link action failed"
+      share_failed: "Share link action failed",
+      widget_key_rotated: "Widget key rotated"
     },
     api_panel: {
       title: "Call this agent via REST API",

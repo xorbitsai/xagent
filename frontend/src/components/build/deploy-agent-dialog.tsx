@@ -18,7 +18,7 @@ import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
 import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
-import { buildWidgetSnippet, fetchAgentWidgetKey, isValidAllowedDomain, normalizeAllowedDomain, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
+import { buildWidgetSnippet, fetchAgentWidgetKey, isValidAllowedDomain, normalizeAllowedDomain, rotateAgentWidgetKey, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 export interface Agent {
   id: number
@@ -63,6 +63,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   const [copiedSnippet, setCopiedSnippet] = useState(false)
   const [copiedShareLink, setCopiedShareLink] = useState(false)
   const [isUpdatingWidget, setIsUpdatingWidget] = useState(false)
+  const [isRotatingWidgetKey, setIsRotatingWidgetKey] = useState(false)
   const [isUpdatingShare, setIsUpdatingShare] = useState(false)
   const [isLoadingShareLink, setIsLoadingShareLink] = useState(false)
   const [shareLink, setShareLink] = useState<ShareLinkResponse | null>(null)
@@ -245,6 +246,22 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     setCopiedSnippet(true)
     toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
     setTimeout(() => setCopiedSnippet(false), 2000)
+  }
+
+  const handleRotateWidgetKey = async () => {
+    if (!deployAgent) return
+    try {
+      setIsRotatingWidgetKey(true)
+      const fallback = t("appWidget.messages.widgetKeyLoadFailed") || "Failed to rotate widget key"
+      const state = await rotateAgentWidgetKey(deployAgent.id, fallback)
+      setWidgetKey(state.widget_key)
+      toast.success(t("deploy_agent.messages.widget_key_rotated") || "Widget key rotated")
+    } catch (err) {
+      console.error(err)
+      toast.error(err instanceof Error ? err.message : t("appWidget.messages.widgetKeyLoadFailed") || "Failed to rotate widget key")
+    } finally {
+      setIsRotatingWidgetKey(false)
+    }
   }
 
   const handleCopyShareLink = () => {
@@ -540,7 +557,20 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
             </div>
 
             <div className="space-y-2">
-              <div className="font-medium">{t("deploy_agent.embed_snippet.title") || "Embed Snippet"}</div>
+              <div className="flex items-center justify-between">
+                <div className="font-medium">{t("deploy_agent.embed_snippet.title") || "Embed Snippet"}</div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleRotateWidgetKey()}
+                  disabled={isRotatingWidgetKey || !widgetKey}
+                  title={t("deploy_agent.embed_snippet.rotate_key_btn") || "Rotate Widget Key"}
+                >
+                  {isRotatingWidgetKey
+                    ? t("deploy_agent.embed_snippet.rotating_key") || "Rotating…"
+                    : t("deploy_agent.embed_snippet.rotate_key_btn") || "Rotate Key"}
+                </Button>
+              </div>
               <div className="text-sm text-muted-foreground">
                 {t("deploy_agent.embed_snippet.desc") || "Copy and paste this script tag into the <body> of your website."}
               </div>

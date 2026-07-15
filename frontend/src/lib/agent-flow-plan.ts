@@ -28,13 +28,18 @@ export function parseInstructionSteps(text: string): ParsedPlan {
     return { steps, explicit: true }
   }
 
+  // Strip any leading list markers (e.g. "- ", "* ") before extracting sentences
+  // so a lone bullet like "- Be concise and professional" doesn't leak its marker.
+  const cleaned = text.replace(/^[-*•]\s+/gm, "")
+
   // Avoid a lookbehind assertion here — unsupported on Safari < 16.4/macOS < 13.3
   // and would throw a SyntaxError on load in older browsers. Extract each
   // punctuation-terminated (or end-of-string-terminated) run instead of
   // splitting after the punctuation.
-  const sentences = (text.replace(/\n+/g, " ").match(/[^.!?]+(?:[.!?]+|$)/g) || [])
+  // Upper bound raised to 400 so long-but-reasonable sentences are still shown.
+  const sentences = (cleaned.replace(/\n+/g, " ").match(/[^.!?]+(?:[.!?]+|$)/g) || [])
     .map((s) => s.trim())
-    .filter((s) => s.length >= 15 && s.length <= 160)
+    .filter((s) => s.length >= 15 && s.length <= 400)
 
   return {
     steps: sentences.slice(0, 3).map((s) => ({ text: s.replace(/[.!?]+$/, ""), lineIdx: null, prefix: null })),
@@ -42,9 +47,23 @@ export function parseInstructionSteps(text: string): ParsedPlan {
   }
 }
 
-function writeExplicitPlan(base: string, texts: string[]): string {
-  const trimmed = base.trim()
-  return (trimmed ? trimmed + "\n\n" : "") + "Plan:\n" + texts.map((t, i) => `${i + 1}. ${t}`).join("\n")
+// Write an explicit numbered plan. The result replaces the instructions entirely
+// rather than appending a Plan: block to the original prose — appending would
+// duplicate content already present in the source and silently drop any
+// sentences beyond the 3-step display limit.
+function writeExplicitPlan(texts: string[]): string {
+  return "Plan:\n" + texts.map((t, i) => `${i + 1}. ${t}`).join("\n")
+}
+
+// Extract ALL qualifying sentences from prose text with no slice cap, used
+// when materializing an inferred plan to explicit. Using the same lower-bound
+// filter as parseInstructionSteps but no upper bound ensures we don't truncate
+// content that the display limit hid from the user.
+function inferSentences(text: string): string[] {
+  const cleaned = text.replace(/^[-*•]\s+/gm, "")
+  return (cleaned.replace(/\n+/g, " ").match(/[^.!?]+(?:[.!?]+|$)/g) || [])
+    .map((s) => s.trim().replace(/[.!?]+$/, ""))
+    .filter((s) => s.length >= 15)
 }
 
 // Only renumber lines known to belong to the plan (from the caller's own
@@ -81,9 +100,13 @@ export function updatePlanStep(instructions: string, idx: number, newText: strin
     if (s && s.lineIdx !== null && s.prefix !== null) lines[s.lineIdx] = s.prefix + newText
     return lines.join("\n")
   }
-  const texts = plan.steps.map((s) => s.text)
-  texts[idx] = newText
-  return writeExplicitPlan(instructions, texts)
+  // NOTE: continuation lines (indented detail below a step marker) are not
+  // modelled — each step tracks only its marker line. Multi-line steps will
+  // desync on move/edit/delete until the data model is extended to line ranges.
+  const texts = inferSentences(instructions)
+  if (texts.length) texts[idx] = newText
+  else return writeExplicitPlan([newText])
+  return writeExplicitPlan(texts)
 }
 
 export function deletePlanStep(instructions: string, idx: number): string {
@@ -102,9 +125,9 @@ export function deletePlanStep(instructions: string, idx: number): string {
     }
     return lines.join("\n")
   }
-  const texts = plan.steps.map((s) => s.text)
+  const texts = inferSentences(instructions)
   texts.splice(idx, 1)
-  return writeExplicitPlan(instructions, texts)
+  return writeExplicitPlan(texts)
 }
 
 export function movePlanStep(instructions: string, idx: number, dir: -1 | 1): string {
@@ -121,11 +144,12 @@ export function movePlanStep(instructions: string, idx: number, dir: -1 | 1): st
     }
     return lines.join("\n")
   }
-  const texts = plan.steps.map((s) => s.text)
+  const texts = inferSentences(instructions)
+  if (j < 0 || j >= texts.length) return instructions
   const tmp = texts[idx]
   texts[idx] = texts[j]
   texts[j] = tmp
-  return writeExplicitPlan(instructions, texts)
+  return writeExplicitPlan(texts)
 }
 
 export function addPlanStep(instructions: string, placeholder: string): string {
@@ -138,5 +162,6 @@ export function addPlanStep(instructions: string, placeholder: string): string {
     }
     return lines.join("\n")
   }
-  return writeExplicitPlan(instructions, [...plan.steps.map((s) => s.text), placeholder])
+  const texts = inferSentences(instructions)
+  return writeExplicitPlan([...texts, placeholder])
 }

@@ -3295,7 +3295,9 @@ Build when you need.`,
     embed_snippet: {
       title: "引入代码",
       desc: "复制此 script 标签并将其粘贴到网站的 <body> 标签中。",
-      copy_btn: "复制代码"
+      copy_btn: "复制代码",
+      rotate_key_btn: "轮换 Key",
+      rotating_key: "轮换中…"
     },
     share_link: {
       title: "分享链接",
@@ -3316,7 +3318,8 @@ Build when you need.`,
       share_enabled: "分享链接已生成",
       share_rotated: "分享链接已重置",
       share_disabled: "分享链接已关闭",
-      share_failed: "分享链接操作失败"
+      share_failed: "分享链接操作失败",
+      widget_key_rotated: "Widget Key 已轮换"
     },
     api_panel: {
       title: "通过 REST API 调用此 Agent",

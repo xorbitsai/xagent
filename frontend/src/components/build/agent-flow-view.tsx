@@ -275,7 +275,7 @@ export function AgentFlowView({
   // about to run instead of trying to reconcile the two.
   const ignoreBlurRef = useRef(false)
 
-  const commitStep = (idx: number, save: boolean) => {
+  const commitStep = (idx: number) => {
     if (editingStepIdx !== idx) return
     if (ignoreBlurRef.current) {
       ignoreBlurRef.current = false
@@ -284,7 +284,7 @@ export function AgentFlowView({
     }
     const orig = plan.steps[idx]?.text ?? ""
     const value = stepDraft.trim()
-    if (save && value && value !== orig) {
+    if (value && value !== orig) {
       onInstructionsChange(updatePlanStep(instructions, idx, value))
     }
     setEditingStepIdx(null)
@@ -540,7 +540,7 @@ export function AgentFlowView({
                         autoFocus
                         value={stepDraft}
                         onChange={(e) => setStepDraft(e.target.value)}
-                        onBlur={() => commitStep(idx, true)}
+                        onBlur={() => commitStep(idx)}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") {
                             e.preventDefault()
@@ -557,7 +557,7 @@ export function AgentFlowView({
                     ) : (
                       <div className="min-w-0 flex-1 break-words text-[11.5px] leading-relaxed">{step.text}</div>
                     )}
-                    {!readOnly && <div className="absolute -top-[11px] right-1.5 z-[2] hidden gap-px rounded-md border bg-card p-px shadow-sm group-hover:inline-flex">
+                    {!readOnly && editingStepIdx === null && <div className="absolute -top-[11px] right-1.5 z-[2] hidden gap-px rounded-md border bg-card p-px shadow-sm group-hover:inline-flex">
                       <button
                         type="button"
                         title={t("builds.editor.flow.agent.moveUp")}

@@ -56,6 +56,7 @@ export interface AgentFlowViewProps {
   instructions: string
   onInstructionsChange: (value: string) => void
   readOnly?: boolean
+  maxInstructionsLength?: number
 
   kbSelected: string[]
   kbOptions: FlowOption[]
@@ -91,6 +92,7 @@ export function AgentFlowView({
   instructions,
   onInstructionsChange,
   readOnly,
+  maxInstructionsLength,
   kbSelected,
   kbOptions,
   onKbChange,
@@ -298,9 +300,17 @@ export function AgentFlowView({
     const placeholder = t("builds.editor.flow.agent.newStep")
     const next = addPlanStep(instructions, placeholder)
     onInstructionsChange(next)
+    // Seed the editor directly from the newly parsed plan rather than
+    // going through startEditStep, which closes over the pre-add `plan`
+    // and would initialize stepDraft from the stale snapshot.
     requestAnimationFrame(() => {
       const newPlan = parseInstructionSteps(next)
-      startEditStep(newPlan.steps.length - 1)
+      const newIdx = newPlan.steps.length - 1
+      const newStep = newPlan.steps[newIdx]
+      if (newStep) {
+        setStepDraft(newStep.text)
+        setEditingStepIdx(newIdx)
+      }
     })
   }
 
@@ -314,7 +324,8 @@ export function AgentFlowView({
   }
 
   const saveInstructionsPopover = () => {
-    onInstructionsChange(instructionsDraft)
+    const value = maxInstructionsLength ? instructionsDraft.slice(0, maxInstructionsLength) : instructionsDraft
+    onInstructionsChange(value)
     setInstructionsPopoverOpen(false)
   }
 
@@ -511,7 +522,10 @@ export function AgentFlowView({
                     key={idx}
                     data-plan-step
                     onClick={() => editingStepIdx !== idx && startEditStep(idx)}
-                    className="group relative flex cursor-text items-start gap-2 rounded-lg border bg-background px-2 py-1.5 transition-colors hover:border-primary/40"
+                    className={cn(
+                      "group relative flex items-start gap-2 rounded-lg border bg-background px-2 py-1.5 transition-colors hover:border-primary/40",
+                      readOnly ? "cursor-default" : "cursor-text",
+                    )}
                   >
                     <div
                       className={cn(
@@ -530,16 +544,20 @@ export function AgentFlowView({
                         onKeyDown={(e) => {
                           if (e.key === "Enter") {
                             e.preventDefault()
-                            commitStep(idx, true)
+                            e.currentTarget.blur()
                           }
-                          if (e.key === "Escape") commitStep(idx, false)
+                          if (e.key === "Escape") {
+                            e.preventDefault()
+                            ignoreBlurRef.current = true
+                            setEditingStepIdx(null)
+                          }
                         }}
                         className="min-w-0 flex-1 border-none bg-transparent p-0 text-[11.5px] leading-relaxed text-foreground outline-none"
                       />
                     ) : (
                       <div className="min-w-0 flex-1 break-words text-[11.5px] leading-relaxed">{step.text}</div>
                     )}
-                    <div className="absolute -top-[11px] right-1.5 z-[2] hidden gap-px rounded-md border bg-card p-px shadow-sm group-hover:inline-flex">
+                    {!readOnly && <div className="absolute -top-[11px] right-1.5 z-[2] hidden gap-px rounded-md border bg-card p-px shadow-sm group-hover:inline-flex">
                       <button
                         type="button"
                         title={t("builds.editor.flow.agent.moveUp")}
@@ -585,7 +603,7 @@ export function AgentFlowView({
                       >
                         <X className="h-2.5 w-2.5" />
                       </button>
-                    </div>
+                    </div>}
                   </div>
                 ))}
                 </div>

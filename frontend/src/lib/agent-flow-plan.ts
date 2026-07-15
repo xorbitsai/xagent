@@ -51,13 +51,17 @@ function writeExplicitPlan(base: string, texts: string[]): string {
 // step-index bookkeeping) rather than re-scanning the whole text with a
 // second regex pass — the instructions may contain unrelated numbered
 // lines outside the plan that happen to match the same shape.
+// Handles both "1. text" / "1) text" and "Step 1: text" / "Step 1. text" formats.
 function renumber(lines: string[], stepLineIndices: number[]): string[] {
   const indices = new Set(stepLineIndices)
   let n = 1
   return lines.map((l, i) => {
     if (!indices.has(i)) return l
-    const m = l.match(/^(\s*)\d+\s*([.)])\s+(.+)$/)
-    return m ? `${m[1]}${n++}${m[2]} ${m[3]}` : l
+    let m = l.match(/^(\s*)(step\s*)\d+(\s*[:.)\-]\s+)(.+)$/i)
+    if (m) return `${m[1]}${m[2]}${n++}${m[3]}${m[4]}`
+    m = l.match(/^(\s*)\d+(\s*[.)]\s+)(.+)$/)
+    if (m) return `${m[1]}${n++}${m[2]}${m[3]}`
+    return l
   })
 }
 

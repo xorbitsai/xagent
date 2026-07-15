@@ -1313,21 +1313,32 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
   }
 
-  const generalModelLabel = models.find((m) => m.id === modelConfig.general)?.model_name || "—"
+  const generalModelLabel = useMemo(
+    () => models.find((m) => m.id === modelConfig.general)?.model_name || "—",
+    [models, modelConfig.general],
+  )
 
-  const connectorDisplayNames = selectedMcpServers.map((serverName) => {
-    const connectedServer = findMatchingMcpServer(mcpServers, serverName)
-    const matchingApp = findMatchingMcpApp(officialApps, serverName)
-    return connectedServer?.name || matchingApp?.name || serverName
-  })
+  const connectorDisplayNames = useMemo(
+    () =>
+      selectedMcpServers.map((serverName) => {
+        const connectedServer = findMatchingMcpServer(mcpServers, serverName)
+        const matchingApp = findMatchingMcpApp(officialApps, serverName)
+        return connectedServer?.name || matchingApp?.name || serverName
+      }),
+    [selectedMcpServers, mcpServers, officialApps],
+  )
 
-  const flowTriggerRows = ([
-    { type: "webhook", titleKey: "triggers.cards.webhook.title", descKey: "triggers.cards.webhook.description" },
-    { type: "scheduled", titleKey: "triggers.cards.scheduled.title", descKey: "triggers.cards.scheduled.description" },
-    { type: "gmail", titleKey: "triggers.cards.gmail.title", descKey: "triggers.cards.gmail.description" },
-  ] as const)
-    .filter((item) => triggerStats[item.type].enabled > 0)
-    .map((item) => ({ key: item.type as string, label: t(item.titleKey), description: t(item.descKey) }))
+  const flowTriggerRows = useMemo(
+    () =>
+      ([
+        { type: "webhook", titleKey: "triggers.cards.webhook.title", descKey: "triggers.cards.webhook.description" },
+        { type: "scheduled", titleKey: "triggers.cards.scheduled.title", descKey: "triggers.cards.scheduled.description" },
+        { type: "gmail", titleKey: "triggers.cards.gmail.title", descKey: "triggers.cards.gmail.description" },
+      ] as const)
+        .filter((item) => triggerStats[item.type].enabled > 0)
+        .map((item) => ({ key: item.type as string, label: t(item.titleKey), description: t(item.descKey) })),
+    [triggerStats, t],
+  )
 
   const LeftPanel = (
     <div className="p-6 space-y-8 min-h-full bg-card/50">
@@ -2155,6 +2166,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             instructions={instructions}
             onInstructionsChange={setInstructions}
             readOnly={readOnly}
+            maxInstructionsLength={MAX_INSTRUCTIONS_LENGTH}
             kbSelected={selectedKbs}
             kbOptions={kbOptions}
             onKbChange={(values) => {

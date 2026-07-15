@@ -1,6 +1,6 @@
 """Tests for release_db_connection_if_clean (issue #889)."""
 
-from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy import Column, Integer, String, create_engine, insert, text, update
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from xagent.web.models.database import release_db_connection_if_clean
@@ -59,6 +59,48 @@ def test_keeps_flushed_but_uncommitted_changes():
 
     # After the commit the flush flag is cleared: a fresh read-only
     # transaction is releasable again.
+    db.query(Item).all()
+    assert release_db_connection_if_clean(db) is True
+
+
+def test_keeps_core_dml_insert():
+    """Core DML via Session.execute() never touches new/dirty/deleted and
+    emits no after_flush; the do_orm_execute listener must catch it."""
+    db = _make_session()
+    db.execute(insert(Item).values(name="core"))
+    assert not (db.new or db.dirty or db.deleted)
+
+    assert release_db_connection_if_clean(db) is False
+
+    db.commit()
+    assert db.query(Item).count() == 1
+
+
+def test_keeps_core_dml_update():
+    db = _make_session()
+    db.add(Item(name="one"))
+    db.commit()
+
+    db.execute(update(Item).values(name="core-updated"))
+    assert release_db_connection_if_clean(db) is False
+
+    db.commit()
+    assert db.query(Item).first().name == "core-updated"
+
+
+def test_keeps_textual_statements_conservatively():
+    """text() statements can't be proven read-only; the helper must keep the
+    connection even for a textual SELECT."""
+    db = _make_session()
+    db.execute(text("UPDATE items SET name = 'via-text'"))
+    assert release_db_connection_if_clean(db) is False
+    db.commit()
+
+    db.execute(text("SELECT 1"))
+    assert release_db_connection_if_clean(db) is False
+    db.rollback()
+
+    # A provable ORM SELECT after the rollback is releasable again.
     db.query(Item).all()
     assert release_db_connection_if_clean(db) is True
 

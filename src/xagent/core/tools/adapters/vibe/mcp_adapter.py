@@ -9,6 +9,7 @@ import inspect
 import logging
 import os
 import re
+import weakref
 from collections.abc import Coroutine, Iterator
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
@@ -1097,12 +1098,44 @@ async def _load_direct_mcp_tools(
     return agent_tools
 
 
+# Hard cap on concurrent (including abandoned) initializations per server.
+# The timeout below bounds the CALLER's wait but not the underlying task:
+# a cancellation-resistant cleanup keeps its transport/socket alive after
+# the caller has moved on. Without a per-server bound, a burst of tasks
+# against one hung server accumulates abandoned loads (and CLOSE-WAIT
+# sockets) without limit — the gate slot is only released when the load
+# task actually finishes, so abandoned loads keep counting against the cap
+# and later callers fail fast instead of opening yet another transport.
+_MAX_INFLIGHT_LOADS_PER_SERVER = 4
+
+# Semaphores are bound to an event loop; key by loop (weakly, so a
+# discarded loop doesn't pin its gates) then by server name. Web and
+# Celery processes each get their own gates.
+_server_load_gates: "weakref.WeakKeyDictionary[Any, Dict[str, asyncio.Semaphore]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_server_load_gate(server_name: str) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    gates = _server_load_gates.get(loop)
+    if gates is None:
+        gates = {}
+        _server_load_gates[loop] = gates
+    gate = gates.get(server_name)
+    if gate is None:
+        gate = asyncio.Semaphore(_MAX_INFLIGHT_LOADS_PER_SERVER)
+        gates[server_name] = gate
+    return gate
+
+
 async def _load_server_tools_bounded(
     server_name: str,
     load_coro: "Coroutine[Any, Any, list[AbstractBaseTool]]",
     timeout_seconds: int,
 ) -> list[AbstractBaseTool]:
-    """Run one server's tool load with a hard wall-clock bound.
+    """Run one server's tool load with a hard wall-clock bound and a
+    per-server in-flight cap.
 
     ``asyncio.wait_for`` alone is not a hard bound: it awaits the cancelled
     task's cleanup, and a hung streamable-HTTP server can stall inside the
@@ -1112,12 +1145,44 @@ async def _load_server_tools_bounded(
     completes; the abandoned task is logged and its eventual exception is
     consumed by a done-callback so it never surfaces as "exception was never
     retrieved".
+
+    The per-server gate bounds the resource side: at most
+    ``_MAX_INFLIGHT_LOADS_PER_SERVER`` load tasks (live or abandoned) exist
+    per server per event loop. Callers that cannot get a slot within their
+    timeout budget fail fast without creating a transport. The acquire and
+    the load share one deadline, so the end-to-end caller bound is
+    unchanged.
     """
+    gate = _get_server_load_gate(server_name)
+
     if timeout_seconds <= 0:
-        return await load_coro
+        # Timeout disabled: still bound the fan-out, waiting as long as
+        # needed for a slot.
+        async with gate:
+            return await load_coro
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout_seconds)
+    except (asyncio.TimeoutError, TimeoutError):
+        # Never started: close the coroutine so it doesn't warn about
+        # being un-awaited, and don't touch the gate (nothing acquired).
+        load_coro.close()
+        raise TimeoutError(
+            f"MCP server {server_name}: no initialization slot freed within "
+            f"{timeout_seconds}s ({_MAX_INFLIGHT_LOADS_PER_SERVER} loads "
+            "already in flight, possibly abandoned by earlier timeouts); "
+            "skipping without opening another connection"
+        ) from None
 
     task = asyncio.ensure_future(load_coro)
-    done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+    # Release the slot only when the task truly finishes — an abandoned
+    # (cancellation-resistant) load keeps counting against the cap.
+    task.add_done_callback(lambda _t: gate.release())
+
+    remaining = max(0.0, deadline - loop.time())
+    done, _pending = await asyncio.wait({task}, timeout=remaining)
     if task in done:
         return task.result()
 

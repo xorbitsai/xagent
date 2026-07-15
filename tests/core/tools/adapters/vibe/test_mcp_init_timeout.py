@@ -82,6 +82,55 @@ async def test_bounded_load_returns_even_when_cleanup_hangs():
 
 
 @pytest.mark.asyncio
+async def test_burst_larger_than_gate_does_not_fan_out(monkeypatch):
+    """A burst of concurrent loads for the same hung server must not create
+    more underlying load tasks (transports/sockets) than the per-server cap:
+    callers beyond the cap fail fast at the gate without starting a load."""
+    monkeypatch.setattr(mcp_adapter_module, "_MAX_INFLIGHT_LOADS_PER_SERVER", 2)
+
+    started_loads = 0
+    release_cleanup = asyncio.Event()
+
+    async def uncancellable_load():
+        nonlocal started_loads
+        started_loads += 1
+        try:
+            await asyncio.Event().wait()
+        finally:
+            while not release_cleanup.is_set():
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    continue
+        return []  # pragma: no cover
+
+    async def one_caller():
+        with pytest.raises(TimeoutError):
+            await _load_server_tools_bounded("burst-server", uncancellable_load(), 1)
+
+    began = time.monotonic()
+    await asyncio.gather(*(one_caller() for _ in range(6)))
+    elapsed = time.monotonic() - began
+
+    # Every caller returned within its own bound...
+    assert elapsed < 5
+    # ...but only cap-many loads (transports) ever started; the abandoned
+    # ones keep holding their slots so the other four callers failed fast
+    # at the gate.
+    assert started_loads == 2
+
+    # A follow-up caller while both slots are still held by abandoned loads
+    # also fails fast without starting a load.
+    with pytest.raises(TimeoutError):
+        await _load_server_tools_bounded("burst-server", uncancellable_load(), 1)
+    assert started_loads == 2
+
+    # Let the abandoned tasks finish so loop teardown doesn't hang.
+    release_cleanup.set()
+    await asyncio.sleep(0.2)
+
+
+@pytest.mark.asyncio
 async def test_bounded_load_disabled_with_zero_timeout():
     async def quick_load():
         return ["tool"]

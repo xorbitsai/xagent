@@ -34,25 +34,42 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-# Flushed-but-uncommitted changes leave ``new``/``dirty``/``deleted`` empty
-# while the transaction still holds unpersisted DML, so those collections
-# alone cannot prove a transaction is safe to roll back. Track flushes on
-# every Session via class-level listeners; the flag lives in ``session.info``
-# and is cleared once the transaction actually ends. ``Session.close()``
-# without commit/rollback may leave the flag set — that fails closed (the
-# helper just keeps the connection), never toward data loss.
-_HAS_FLUSHED_KEY = "xagent_has_flushed"
+# ``new``/``dirty``/``deleted`` alone cannot prove a transaction is safe to
+# roll back: an ORM flush empties them while the DML is still uncommitted,
+# and Core/bulk DML through ``Session.execute()`` never touches them at all.
+# Track "this transaction may have written" on every Session via class-level
+# listeners:
+#
+#   - ``after_flush`` — ORM unit-of-work writes;
+#   - ``do_orm_execute`` — every ``Session.execute()`` statement. Anything
+#     that is not provably a SELECT (Core insert/update/delete, ``text()``
+#     of any kind) sets the flag, deliberately conservative: an unrecognized
+#     statement keeps the connection rather than risking a rollback of work.
+#
+# The flag lives in ``session.info`` and is cleared once the transaction
+# actually ends. ``Session.close()`` without commit/rollback may leave it
+# set — that fails closed (the helper just keeps the connection), never
+# toward data loss. Out of contract: DML issued directly on
+# ``session.connection()`` bypasses session events; don't do that on
+# sessions handed to this helper.
+_MAY_HAVE_WRITTEN_KEY = "xagent_txn_may_have_written"
 
 
 @event.listens_for(Session, "after_flush")
 def _mark_session_flushed(session: Session, _flush_context: Any) -> None:
-    session.info[_HAS_FLUSHED_KEY] = True
+    session.info[_MAY_HAVE_WRITTEN_KEY] = True
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _mark_session_statement(orm_execute_state: Any) -> None:
+    if not orm_execute_state.is_select:
+        orm_execute_state.session.info[_MAY_HAVE_WRITTEN_KEY] = True
 
 
 @event.listens_for(Session, "after_commit")
 @event.listens_for(Session, "after_rollback")
 def _clear_session_flushed(session: Session) -> None:
-    session.info[_HAS_FLUSHED_KEY] = False
+    session.info[_MAY_HAVE_WRITTEN_KEY] = False
 
 
 def release_db_connection_if_clean(db: Session | None) -> bool:
@@ -66,17 +83,18 @@ def release_db_connection_if_clean(db: Session | None) -> bool:
     and transparently re-acquires a connection on its next query.
 
     Only rolls back when the session has no pending ORM changes
-    (new/dirty/deleted) and nothing was flushed in the current transaction,
-    so nothing uncommitted is ever discarded. Callers must not rely on it
-    having released (hence the bool return): a session with pending or
-    flushed writes keeps its connection.
+    (new/dirty/deleted) and the current transaction executed nothing but
+    SELECTs through the session (see ``_MAY_HAVE_WRITTEN_KEY`` above), so
+    nothing uncommitted is ever discarded. Callers must not rely on it
+    having released (hence the bool return): a session that may have
+    written keeps its connection.
     """
     if db is None:
         return False
     try:
         if db.new or db.dirty or db.deleted:
             return False
-        if db.info.get(_HAS_FLUSHED_KEY, False):
+        if db.info.get(_MAY_HAVE_WRITTEN_KEY, False):
             return False
         if not db.in_transaction():
             return True

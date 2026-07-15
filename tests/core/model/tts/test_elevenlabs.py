@@ -136,6 +136,15 @@ async def test_synthesize_pronunciation_aliases_are_non_cascading_and_longest_fi
     assert convert_calls[0]["text"] == "The UN welcomed Cloffton."
 
 
+def test_pronunciation_aliases_skip_partial_ascii_word_matches() -> None:
+    result = ElevenLabsTTS._apply_pronunciation_aliases(
+        "RUN, UN, FUN, UNwelcomed, and (UN).",
+        {"UN": "United Nations"},
+    )
+
+    assert result == ("RUN, United Nations, FUN, UNwelcomed, and (United Nations).")
+
+
 @pytest.mark.parametrize(
     ("aliases", "error"),
     [

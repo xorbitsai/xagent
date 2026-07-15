@@ -247,7 +247,20 @@ class ElevenLabsTTS(BaseTTS):
         # alias is never processed by a later rule. Prefer longer phrases when
         # rules overlap, which keeps phrase-level corrections deterministic.
         source_phrases = sorted(normalized_aliases, key=len, reverse=True)
-        pattern = re.compile("|".join(re.escape(source) for source in source_phrases))
+        escaped_sources: list[str] = []
+        for source in source_phrases:
+            escaped = re.escape(source)
+            # Guard ASCII word-like edges against partial matches such as
+            # replacing "UN" inside "RUN". Do not use Unicode ``\w`` here:
+            # it treats CJK characters as word characters and would prevent
+            # aliases from matching inside unspaced text.
+            if source[0].isascii() and (source[0].isalnum() or source[0] == "_"):
+                escaped = rf"(?<![A-Za-z0-9_]){escaped}"
+            if source[-1].isascii() and (source[-1].isalnum() or source[-1] == "_"):
+                escaped = rf"{escaped}(?![A-Za-z0-9_])"
+            escaped_sources.append(escaped)
+
+        pattern = re.compile("|".join(escaped_sources))
         return pattern.sub(
             lambda match: normalized_aliases[match.group(0)],
             text,

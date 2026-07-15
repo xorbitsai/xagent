@@ -33,6 +33,26 @@ def test_create_db_session_reuses_one_engine(tmp_path, monkeypatch):
         db2.close()
 
 
+def test_non_sqlite_engine_uses_configured_pool(monkeypatch):
+    """The ad-hoc engine is a SECOND pool in the process; it must honor the
+    same XAGENT_DB_POOL_* tunables as the shared web engine. create_all is
+    stubbed out so no live PostgreSQL is needed — the assertions only
+    concern engine/pool construction."""
+    pytest.importorskip("psycopg2")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:1/nowhere")
+    monkeypatch.setenv("XAGENT_DB_POOL_SIZE", "3")
+    monkeypatch.setenv("XAGENT_DB_MAX_OVERFLOW", "7")
+    monkeypatch.setenv("XAGENT_DB_POOL_TIMEOUT_SECONDS", "11")
+    monkeypatch.setattr(
+        storage_manager.Base.metadata, "create_all", lambda *a, **k: None
+    )
+
+    engine = storage_manager._get_adhoc_engine()
+    assert engine.pool.size() == 3
+    assert engine.pool._max_overflow == 7
+    assert engine.pool._timeout == 11
+
+
 def test_engine_swaps_when_database_url_changes(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/a.db")
     db1 = storage_manager.create_db_session()

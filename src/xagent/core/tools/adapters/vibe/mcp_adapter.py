@@ -1116,6 +1116,13 @@ _server_load_gates: "weakref.WeakKeyDictionary[Any, Dict[str, asyncio.Semaphore]
 )
 
 
+# Strong references to in-flight/abandoned load tasks. The event loop only
+# keeps weak references to tasks; if GC collected a still-pending task its
+# done-callback — which releases the gate slot — would never fire. Tasks
+# remove themselves on completion.
+_active_load_tasks: "set[asyncio.Task[Any]]" = set()
+
+
 def _get_server_load_gate(server_name: str) -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     gates = _server_load_gates.get(loop)
@@ -1181,7 +1188,9 @@ async def _load_server_tools_bounded(
             f"MCP server {server_name}: no initialization slot freed within "
             f"{timeout_seconds}s ({_MAX_INFLIGHT_LOADS_PER_SERVER} loads "
             "already in flight, possibly abandoned by earlier timeouts); "
-            "skipping without opening another connection"
+            "skipping without opening another connection. Slots free when "
+            "those loads finish; if the server is permanently hung they "
+            "recover only on process restart"
         ) from None
     except asyncio.CancelledError:
         # Caller cancelled while queued at the gate: the load never
@@ -1190,9 +1199,16 @@ async def _load_server_tools_bounded(
         raise
 
     task = asyncio.ensure_future(load_coro)
-    # Release the slot only when the task truly finishes — an abandoned
-    # (cancellation-resistant) load keeps counting against the cap.
-    task.add_done_callback(lambda _t: gate.release())
+    # Keep a strong reference until completion, then release the slot only
+    # when the task truly finishes — an abandoned (cancellation-resistant)
+    # load keeps counting against the cap.
+    _active_load_tasks.add(task)
+
+    def _on_task_done(t: "asyncio.Task[Any]") -> None:
+        _active_load_tasks.discard(t)
+        gate.release()
+
+    task.add_done_callback(_on_task_done)
 
     def _consume_result(t: "asyncio.Task[Any]") -> None:
         if t.cancelled():

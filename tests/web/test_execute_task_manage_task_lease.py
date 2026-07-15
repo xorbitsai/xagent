@@ -214,6 +214,9 @@ async def test_execute_task_surfaces_mid_run_quota_reason(db_session) -> None:
     assert result["success"] is False
     assert result["output"] == reason
     assert result["error"] == reason
+    # A mid-run interrupt is always the quota checker, so the result carries the
+    # code (matching the start gate) to drive the app-layer dialog.
+    assert result["error_code"] == "quota_exceeded"
 
 
 @pytest.mark.asyncio

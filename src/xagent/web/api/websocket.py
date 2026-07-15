@@ -1464,14 +1464,19 @@ async def execute_task_background(
         if normalized_outputs:
             result["file_outputs"] = normalized_outputs
 
-        # Get AI response
+        # Get AI response. A failed turn has no assistant reply, so it must not
+        # inherit the "Task completed" success sentinel: the frontend reads
+        # `output` as the failure reason, so the sentinel would render (and
+        # persist) a misleading "Task completed" bubble on a failed task. Fall
+        # back to the sentinel only when the turn actually succeeded.
+        default_response = "Task completed" if result.get("success", False) else ""
         chat_response = result.get("chat_response")
         if isinstance(chat_response, dict):
             ai_response = chat_response.get("message") or result.get(
-                "output", "Task completed"
+                "output", default_response
             )
         else:
-            ai_response = result.get("output", "Task completed")
+            ai_response = result.get("output", default_response)
 
         # Rewrite file links to file_id
         ai_response = _rewrite_file_links_to_file_id(
@@ -2117,6 +2122,9 @@ async def execute_resume_background(
                     "status": "quota_exceeded",
                     "output": _quota_reason,
                     "error": _quota_reason,
+                    # A mid-run interrupt is always the quota checker, so forward
+                    # the code the way the start gate does (see chat.py).
+                    "error_code": "quota_exceeded",
                 }
 
         status = str(result.get("status") or "")
@@ -2260,6 +2268,10 @@ async def execute_resume_background(
                 "output": output,
                 "file_outputs": normalized_outputs,
                 "success": success,
+                # Forward the coded reason so a mid-run quota interrupt on a
+                # resumed run pops the same dialog as the start-gate path.
+                "error_code": result.get("error_code"),
+                "error_details": result.get("error_details"),
                 **control_event_state,
                 "metadata": result.get("metadata", {}),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
@@ -4394,6 +4406,11 @@ async def handle_execute_task(
                     "status": task.status.value,
                     "result": result.get("output", ""),
                     "output": result.get("output", ""),
+                    # Same coded-reason forwarding as the primary completion
+                    # broadcast, so a coded failure on this path (e.g. a mid-run
+                    # quota interrupt) still reaches the app-layer dialog.
+                    "error_code": result.get("error_code"),
+                    "error_details": result.get("error_details"),
                     "chat_response": result.get("chat_response"),
                     "metadata": result.get("metadata", {}),
                     "file_outputs": file_outputs,  # Add file output info

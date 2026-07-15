@@ -3978,22 +3978,25 @@ export function AppProvider({
 
         if (!taskData.success) {
           // error_details carries the structured reason ({code, ..., message});
-          // fall back to its message when the terminal event omits output/result,
-          // so the reason still shows instead of an empty turn degrading to
-          // "unknown error".
+          // fall back to its message when the terminal event omits output. The
+          // broadcast always sets `result` === `output`, so `result` is not a
+          // distinct source and is intentionally not consulted here.
           const failureReason =
             getString(taskData.output) ||
-            getString(taskData.result) ||
             getString(taskData.errorDetails?.message)
           // Coded failures (e.g. a quota-gate refusal) also notify the app
           // layer so it can surface them richly (see task-error-events). Stock
           // xagent has a no-op controller and only an app layer ever sets a code.
+          // Not gated on failureReason: the coded dialog carries its own copy
+          // and must still fire when the reason is empty. Tag it with the
+          // event's own task id (not the currently-viewed one) so a dialog
+          // cannot be attributed to the wrong task under a task-switch race.
           if (taskData.errorCode) {
             emitTaskError({
               code: taskData.errorCode,
               details: taskData.errorDetails,
               message: failureReason,
-              taskId: currentState.taskId ?? null,
+              taskId: controlEnvelope.taskId ?? currentState.taskId ?? null,
             })
           }
           // Surface the reason live as a failed assistant message so the

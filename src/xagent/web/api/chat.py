@@ -2230,6 +2230,11 @@ class AgentServiceManager:
                         error_code = gate_reason.get("code")
                         error_details = dict(gate_reason)
                     else:
+                        # Legacy/plain-string path: a hook that returns a bare
+                        # message (the pre-structured shape) is assumed to be a
+                        # quota refusal. The only shipped hook returns a Mapping,
+                        # so this stays for back-compat with string-returning
+                        # app layers.
                         reason_message = str(gate_reason)
                         error_code = "quota_exceeded"
                         error_details = None
@@ -2338,6 +2343,10 @@ class AgentServiceManager:
                         "status": "quota_exceeded",
                         "output": quota_reason,
                         "error": quota_reason,
+                        # A mid-run interrupt is always the quota checker, so the
+                        # code is known even though the reason is a plain string.
+                        # Match the start gate so the client pops the same dialog.
+                        "error_code": "quota_exceeded",
                     }
 
             logger.info("=== Task executed successfully, updating title if needed ===")

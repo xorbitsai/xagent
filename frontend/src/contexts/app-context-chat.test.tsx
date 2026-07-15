@@ -779,6 +779,44 @@ describe("AppProvider websocket message routing", () => {
     window.removeEventListener(TASK_ERROR_EVENT, listener)
   })
 
+  it("tags the coded-error event with the event's own task id, not the viewed one", async () => {
+    // SeedExistingTask puts the viewer on task 1. A terminal event for a
+    // different task (99) must attribute its dialog to 99 — using the
+    // currently-viewed id would pop the dialog against the wrong task under a
+    // reconnect/task-switch race.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const events: TaskErrorEventDetail[] = []
+    const listener = (e: Event) => events.push((e as CustomEvent<TaskErrorEventDetail>).detail)
+    window.addEventListener(TASK_ERROR_EVENT, listener)
+
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task: { id: 99, status: "failed" },
+        success: false,
+        error_code: "quota_exceeded",
+        error_details: { code: "quota_exceeded", limit: 0 },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(events).toHaveLength(1)
+    })
+    expect(events[0].taskId).toBe(99)
+
+    window.removeEventListener(TASK_ERROR_EVENT, listener)
+  })
+
   it("ignores out-of-order and semantically stale task state events", async () => {
     render(
       <AppProvider token="token">

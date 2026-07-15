@@ -6,12 +6,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
 
-from ...config import (
-    get_database_url,
-    get_db_max_overflow,
-    get_db_pool_size,
-    get_db_pool_timeout_seconds,
-)
+from ...config import get_database_url, get_db_pool_kwargs
 from ...db.sqlite import apply_sqlite_concurrency_pragmas
 
 _SessionLocal: sessionmaker[Session] | None = None
@@ -186,11 +181,7 @@ def init_db(db_url: str | None = None) -> None:
         _engine = create_engine(
             database_url,
             poolclass=QueuePool,
-            pool_size=get_db_pool_size(),
-            max_overflow=get_db_max_overflow(),
-            pool_timeout=get_db_pool_timeout_seconds(),
-            pool_recycle=3600,  # Recycle connections after 1 hour
-            pool_pre_ping=True,  # Verify connections before using
+            **get_db_pool_kwargs(),
         )
 
     # Create session factory

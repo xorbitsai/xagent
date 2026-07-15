@@ -14,9 +14,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 # Alias to avoid naming conflict with this module's get_storage_root()
 from ...config import (
     get_database_url,
-    get_db_max_overflow,
-    get_db_pool_size,
-    get_db_pool_timeout_seconds,
+    get_db_pool_kwargs,
     get_default_sqlite_db_path,
 )
 from ...config import get_storage_root as get_config_storage_root
@@ -166,14 +164,7 @@ def _get_adhoc_engine():  # type: ignore[no-untyped-def]
                 # pool in the same process: worst case per process is
                 # 2 x (pool_size + max_overflow) against the database's
                 # max_connections (see example.env).
-                engine = create_engine(
-                    database_url,
-                    pool_size=get_db_pool_size(),
-                    max_overflow=get_db_max_overflow(),
-                    pool_timeout=get_db_pool_timeout_seconds(),
-                    pool_recycle=3600,
-                    pool_pre_ping=True,
-                )
+                engine = create_engine(database_url, **get_db_pool_kwargs())
             Base.metadata.create_all(engine)
             _adhoc_engine = engine
             _adhoc_engine_url = database_url

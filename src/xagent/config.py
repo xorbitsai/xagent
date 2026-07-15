@@ -1395,6 +1395,26 @@ def get_db_pool_timeout_seconds() -> int:
     return _get_positive_int_env(DB_POOL_TIMEOUT_SECONDS, 30)
 
 
+def get_db_pool_kwargs() -> dict[str, Any]:
+    """Shared SQLAlchemy pool kwargs for every pooled (non-SQLite) engine.
+
+    Single source for the pool sizing/health knobs so the shared web engine
+    and the ad-hoc storage engine cannot drift apart. Note the same values
+    apply to EACH engine that uses them: a process running both holds up to
+    2 x (pool_size + max_overflow) connections (see example.env).
+
+    Returns:
+        Keyword arguments for :func:`sqlalchemy.create_engine`.
+    """
+    return {
+        "pool_size": get_db_pool_size(),
+        "max_overflow": get_db_max_overflow(),
+        "pool_timeout": get_db_pool_timeout_seconds(),
+        "pool_recycle": 3600,  # Recycle connections after 1 hour
+        "pool_pre_ping": True,  # Verify connections before using
+    }
+
+
 def get_mcp_tool_init_timeout_seconds() -> int:
     """Get the per-server timeout for MCP tool initialization, in seconds.
 

@@ -1,7 +1,9 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram import types
 
 from xagent.web.channels.telegram.bot import (
     TelegramBotInstance,
@@ -85,6 +87,59 @@ def test_compose_prompt_text_replaces_voice_with_transcript_in_message_order() -
 )
 def test_audio_format_from_file_info(file_info: dict[str, str], expected: str) -> None:
     assert TelegramBotInstance._audio_format_from_file_info(file_info) == expected
+
+
+@pytest.mark.parametrize(
+    ("telegram_file", "target_path", "expected"),
+    [
+        (
+            types.Voice(
+                file_id="voice-id",
+                file_unique_id="voice-unique-id",
+                duration=1,
+                mime_type="audio/ogg",
+            ),
+            Path("voice.bin"),
+            "audio/ogg",
+        ),
+        (
+            SimpleNamespace(mime_type="application/pdf"),
+            Path("report.jpg"),
+            "image/jpeg",
+        ),
+        (
+            SimpleNamespace(mime_type="application/pdf"),
+            Path("report.bin"),
+            "application/pdf",
+        ),
+    ],
+)
+def test_mime_type_for_telegram_file(
+    telegram_file: object,
+    target_path: Path,
+    expected: str,
+) -> None:
+    assert (
+        TelegramBotInstance._mime_type_for_telegram_file(
+            telegram_file,
+            target_path,
+        )
+        == expected
+    )
+
+
+def test_display_message_for_user_hides_runtime_file_links() -> None:
+    assert (
+        TelegramBotInstance._display_message_for_user(
+            "Please summarize this document",
+            has_files=True,
+        )
+        == "Please summarize this document"
+    )
+    assert (
+        TelegramBotInstance._display_message_for_user("", has_files=True)
+        == "Uploaded file(s)"
+    )
 
 
 @pytest.mark.asyncio

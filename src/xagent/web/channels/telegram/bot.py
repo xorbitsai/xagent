@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import mimetypes
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Coroutine, Dict, Optional, cast
@@ -389,6 +390,24 @@ class TelegramBotInstance:
             return "ogg"
         return suffix or None
 
+    @staticmethod
+    def _mime_type_for_telegram_file(file_input: Any, target_path: Path) -> str:
+        declared_mime_type = getattr(file_input, "mime_type", None)
+        guessed_mime_type, _ = mimetypes.guess_type(str(target_path))
+        if isinstance(file_input, types.Voice) and declared_mime_type:
+            return str(declared_mime_type)
+        if guessed_mime_type and guessed_mime_type != "application/octet-stream":
+            return guessed_mime_type
+        return str(
+            declared_mime_type or guessed_mime_type or "application/octet-stream"
+        )
+
+    @staticmethod
+    def _display_message_for_user(message: str, has_files: bool) -> str:
+        if message.strip():
+            return message
+        return "Uploaded file(s)" if has_files else message
+
     async def _transcribe_uploaded_voice_files(
         self,
         voice_file_ids: list[str],
@@ -479,9 +498,6 @@ class TelegramBotInstance:
         user_id: int,
         db: Session,
     ) -> list:
-        import mimetypes
-        from pathlib import Path
-
         from ...services.uploaded_file_store import UploadedFileStore
 
         uploaded_files_info: list[dict] = []
@@ -529,11 +545,7 @@ class TelegramBotInstance:
 
                 await self.bot.download_file(tg_file.file_path, destination=target_path)
 
-                mime_type = getattr(f, "mime_type", None)
-                if not mime_type:
-                    mime_type, _ = mimetypes.guess_type(str(target_path))
-                if not mime_type:
-                    mime_type = "application/octet-stream"
+                mime_type = self._mime_type_for_telegram_file(f, target_path)
 
                 file_size = getattr(f, "file_size", None) or target_path.stat().st_size
 
@@ -722,6 +734,7 @@ class TelegramBotInstance:
                 uploaded_info: list[dict[str, Any]] = []
                 persisted_attachments: list[dict[str, Any]] = []
                 execution_text = text
+                display_message = text
                 if files:
                     uploaded_info = await self._download_and_register_files(
                         files=files,
@@ -753,6 +766,10 @@ class TelegramBotInstance:
                         text = self._compose_prompt_text(
                             message_contents,
                             voice_transcripts,
+                        )
+                        display_message = self._display_message_for_user(
+                            text,
+                            bool(uploaded_info),
                         )
                         voice_file_id_set = set(voice_file_ids)
                         voice_uploaded_info = [
@@ -792,7 +809,7 @@ class TelegramBotInstance:
                             str(info["path"]) for info in uploaded_info
                         ]
                         context["files"] = persisted_attachments
-                        context["display_message"] = text
+                        context["display_message"] = display_message
 
                 if self._consume_user_stop_request(user_id):
                     apply_task_control_transition(
@@ -808,7 +825,7 @@ class TelegramBotInstance:
                     db=db,
                     task_id=int(task.id),  # type: ignore
                     user_id=int(user.id),  # type: ignore
-                    content=text,
+                    content=display_message,
                     attachments=persisted_attachments or None,
                     turn_id=message_turn_id,
                 )

@@ -172,6 +172,116 @@ def _task(task_id: int) -> Task:
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("scenario", "expected_message"),
+    [
+        (
+            "no_asr",
+            "I couldn't understand that voice message because no speech "
+            "recognition model is configured. Configure an ASR model or send "
+            "the request as text.",
+        ),
+        (
+            "missing_download",
+            "I couldn't transcribe that voice message. Please try again or send "
+            "the request as text.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_telegram_voice_errors_are_reported_to_user(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_message: str,
+) -> None:
+    _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        channel = UserChannel(
+            user_id=user.id,
+            channel_type="telegram",
+            channel_name=f"Telegram voice {scenario}",
+            config={},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        db.refresh(channel)
+
+        agent_manager = _FakeAgentManager()
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.get_agent_manager",
+            lambda: agent_manager,
+        )
+
+        async def _restore_telegram_task_context(
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.restore_telegram_task_context",
+            _restore_telegram_task_context,
+        )
+
+        class _FakeASR:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        asr_model = _FakeASR()
+        voice = SimpleNamespace(file_id="telegram-voice-id")
+        bot = object.__new__(TelegramBotInstance)
+        bot.channel_id = int(channel.id)
+        bot.channel_name = f"Telegram voice {scenario}"
+        bot.active_tasks = {}
+        bot.bot = object()
+        bot.user_preparing_executions = set()
+        bot.user_stop_events = {}
+        bot.user_active_executions = {}
+        bot._save_active_tasks = lambda: None
+        bot._clear_user_stop_request = lambda _user_id: None
+        bot._consume_user_stop_request = lambda _user_id: False
+        bot._resolve_voice_asr_model = (
+            (lambda _db, _user: None)
+            if scenario == "no_asr"
+            else (lambda _db, _user: asr_model)
+        )
+
+        async def _extract_message_content(_message: Any) -> tuple[str, list[Any]]:
+            return "", [voice]
+
+        async def _download_and_register_files(**_kwargs: Any) -> list[dict[str, Any]]:
+            return []
+
+        bot._extract_message_content = _extract_message_content
+        bot._download_and_register_files = _download_and_register_files
+
+        answers: list[str] = []
+
+        class _TelegramMessage:
+            from_user = SimpleNamespace(id=123)
+            chat = SimpleNamespace(id=456)
+            voice = SimpleNamespace(file_id="telegram-voice-id")
+
+            async def answer(self, text: str, **_kwargs: Any) -> SimpleNamespace:
+                answers.append(text)
+                return SimpleNamespace(message_id=1)
+
+        await bot._process_user_messages_batch(123, [_TelegramMessage()])
+
+        assert answers == [expected_message]
+        if scenario == "missing_download":
+            assert asr_model.closed is True
+    finally:
+        db.close()
+
+
 def _context_row_count(task_id: int) -> int:
     db = _db_session()
     try:

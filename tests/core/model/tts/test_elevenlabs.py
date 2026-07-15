@@ -433,6 +433,33 @@ async def test_delete_voice_rejects_empty_voice_id() -> None:
         await tts.delete_voice("  ")
 
 
+async def test_delete_voice_redacts_sensitive_sdk_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delete = AsyncMock(
+        side_effect=RuntimeError(
+            "request failed api_key=sk-elevenlabs-secret123 "
+            "Authorization: Bearer bearer-secret456"
+        )
+    )
+    fake_client = SimpleNamespace(voices=SimpleNamespace(delete=delete))
+    monkeypatch.setattr(
+        ElevenLabsTTS,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    tts = ElevenLabsTTS(api_key="test-key")
+    with pytest.raises(RuntimeError) as exc_info:
+        await tts.delete_voice("persistent-voice")
+
+    message = str(exc_info.value)
+    assert "sk-elevenlabs-secret123" not in message
+    assert "bearer-secret456" not in message
+    assert "api_key=***t123" in message
+    assert "Authorization: Bearer ***t456" in message
+
+
 async def test_synthesize_redacts_sensitive_sdk_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -602,6 +602,48 @@ async def test_delete_tts_voice_deletes_persistent_provider_voice() -> None:
     assert tts.delete_calls == ["persistent-voice"]
 
 
+async def test_delete_tts_voice_rejects_other_provider_model() -> None:
+    elevenlabs = FakeTTS(
+        provider_name="elevenlabs",
+        abilities=["tts", "persistent_voice_cloning"],
+    )
+    xinference = FakeTTS(
+        provider_name="xinference",
+        abilities=["tts", "persistent_voice_cloning"],
+    )
+    tool = AudioToolCore(tts_models={"eleven_v3": elevenlabs, "other": xinference})
+
+    result = await tool.delete_tts_voice(
+        voice_id="persistent-voice",
+        model_id="other",
+    )
+
+    assert result["success"] is False
+    assert result["supported"] is False
+    assert "provider is 'elevenlabs'" in result["error"]
+    assert elevenlabs.delete_calls == []
+    assert xinference.delete_calls == []
+
+
+async def test_delete_tts_voice_rejects_unsupported_model() -> None:
+    tts = FakeTTS(provider_name="elevenlabs", abilities=["tts"])
+    tool = AudioToolCore(tts_models={"eleven_v3": tts})
+
+    result = await tool.delete_tts_voice(
+        voice_id="persistent-voice",
+        model_id="eleven_v3",
+    )
+
+    assert result == {
+        "success": False,
+        "supported": False,
+        "error": "The configured elevenlabs client does not support persistent voice deletion",
+        "provider": "elevenlabs",
+        "model_used": "eleven_v3",
+    }
+    assert tts.delete_calls == []
+
+
 def test_persistent_voice_tools_expose_provider_enum() -> None:
     elevenlabs_tool = AudioTool(
         tts_models={

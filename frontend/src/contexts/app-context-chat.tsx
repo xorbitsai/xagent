@@ -4004,7 +4004,7 @@ export function AppProvider({
           const lastMessage = currentState.messages[currentState.messages.length - 1]
           const lastContent =
             typeof lastMessage?.content === "string" ? lastMessage.content : ""
-          if (failureReason && !lastContent.includes(failureReason)) {
+          if (failureReason && lastContent !== failureReason) {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {

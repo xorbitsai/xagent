@@ -599,6 +599,68 @@ describe("AppProvider websocket message routing", () => {
     expect(failureBubble?.content).toBe(quotaReason)
   })
 
+  it("does not suppress a failure reason contained within the user's message", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        data: {
+          event_id: "user-event-with-reason",
+          event_type: "user_message",
+          data: {
+            message: "Why did this quota failure happen?",
+            turn_id: "turn-with-reason",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Why did this quota failure happen?"
+      )
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task: { id: 1, status: "failed" },
+        success: false,
+        output: "quota failure",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ role: string; content: string; isResult?: boolean }>
+      expect(messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: "assistant",
+            content: "quota failure",
+            isResult: true,
+          }),
+        ])
+      )
+    })
+  })
+
   it("emits a coded-error event for the app layer and still shows the reason", async () => {
     render(
       <AppProvider token="token">

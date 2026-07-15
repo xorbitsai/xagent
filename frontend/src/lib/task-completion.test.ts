@@ -65,4 +65,17 @@ describe("task-completion", () => {
     expect(payload.status).toBe("completed")
     expect(payload.success).toBe(true)
   })
+
+  it.each([null, "invalid", ["invalid"]])(
+    "rejects malformed error details: %j",
+    (errorDetails) => {
+      const payload = normalizeTaskCompletedMessage({
+        type: "task_completed",
+        success: false,
+        error_details: errorDetails,
+      })
+
+      expect(payload.errorDetails).toBeUndefined()
+    }
+  )
 })

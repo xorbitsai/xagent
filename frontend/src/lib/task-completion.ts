@@ -73,7 +73,9 @@ export const normalizeTaskCompletedMessage = (
     metadata: payload.metadata,
     errorCode: typeof payload.error_code === "string" ? payload.error_code : undefined,
     errorDetails:
-      payload.error_details && typeof payload.error_details === "object"
+      payload.error_details &&
+      typeof payload.error_details === "object" &&
+      !Array.isArray(payload.error_details)
         ? (payload.error_details as Record<string, unknown>)
         : undefined,
   }

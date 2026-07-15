@@ -171,6 +171,45 @@ async def test_caller_cancellation_cancels_child_and_frees_slot(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_seconds", [0, 30])
+async def test_cancel_while_queued_at_gate_closes_unstarted_coro(
+    monkeypatch, timeout_seconds
+):
+    """Cancelling a caller that is still waiting for a gate slot must close
+    the never-started load coroutine (no 'was never awaited' at GC), in both
+    the timed and the timeout-disabled branches."""
+    import inspect as inspect_mod
+
+    monkeypatch.setattr(mcp_adapter_module, "_MAX_INFLIGHT_LOADS_PER_SERVER", 1)
+    server = f"queued-cancel-{timeout_seconds}"
+
+    release_holder = asyncio.Event()
+
+    async def slot_holder_load():
+        await release_holder.wait()
+        return []
+
+    holder = asyncio.create_task(
+        _load_server_tools_bounded(server, slot_holder_load(), 30)
+    )
+    await asyncio.sleep(0.05)  # holder occupies the single slot
+
+    queued_coro = slot_holder_load()
+    queued = asyncio.create_task(
+        _load_server_tools_bounded(server, queued_coro, timeout_seconds)
+    )
+    await asyncio.sleep(0.05)  # queued caller is waiting at the gate
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+
+    assert inspect_mod.getcoroutinestate(queued_coro) == "CORO_CLOSED"
+
+    release_holder.set()
+    assert await holder == []
+
+
+@pytest.mark.asyncio
 async def test_bounded_load_disabled_with_zero_timeout():
     async def quick_load():
         return ["tool"]

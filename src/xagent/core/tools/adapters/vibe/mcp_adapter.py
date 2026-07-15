@@ -1157,9 +1157,17 @@ async def _load_server_tools_bounded(
 
     if timeout_seconds <= 0:
         # Timeout disabled: still bound the fan-out, waiting as long as
-        # needed for a slot.
-        async with gate:
+        # needed for a slot. Cancellation while waiting must close the
+        # never-started coroutine or it warns "was never awaited" at GC.
+        try:
+            await gate.acquire()
+        except asyncio.CancelledError:
+            load_coro.close()
+            raise
+        try:
             return await load_coro
+        finally:
+            gate.release()
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
@@ -1175,6 +1183,11 @@ async def _load_server_tools_bounded(
             "already in flight, possibly abandoned by earlier timeouts); "
             "skipping without opening another connection"
         ) from None
+    except asyncio.CancelledError:
+        # Caller cancelled while queued at the gate: the load never
+        # started, so just close the coroutine and let the cancel out.
+        load_coro.close()
+        raise
 
     task = asyncio.ensure_future(load_coro)
     # Release the slot only when the task truly finishes — an abandoned

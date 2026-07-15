@@ -374,6 +374,14 @@ class ToolFactory:
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:
+            # The override/allowlist loads above may have re-opened a read
+            # transaction on the config session after the MCP creator's
+            # release; workspace setup below awaits sandbox exec (external
+            # I/O), so release the pooled connection again first
+            # (issue #889).
+            release = getattr(config, "release_db_connection", None)
+            if callable(release):
+                release()
             workspace = ToolFactory._create_workspace(config.get_workspace_config())
             if workspace is not None:
                 from .sandboxed_tool.sandboxed_tool_wrapper import (

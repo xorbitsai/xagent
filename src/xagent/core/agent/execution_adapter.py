@@ -13,6 +13,10 @@ from .tracing import TraceEventCallback
 
 logger = logging.getLogger(__name__)
 
+INTERRUPTED_USER_MESSAGE = (
+    "The previous run was stopped. You can send another message to continue."
+)
+
 
 @dataclass
 class AgentExecutionConfig:
@@ -314,13 +318,20 @@ class AgentExecutionAdapter:
         execution_type: str,
         execution_id: str,
     ) -> dict[str, Any]:
-        output = result.get("output", result.get("response", result.get("error")))
-        if not output:
-            output = self._latest_assistant_message(result.get("context"))
         status = result.get(
             "status",
             "completed" if result.get("success") else "failed",
         )
+        output: Any
+        if status == "interrupted":
+            # Keep the pattern-specific error in ``error``/``agent_result`` for
+            # diagnostics, but never expose implementation names such as
+            # ``ReActPattern`` as user-facing output.
+            output = INTERRUPTED_USER_MESSAGE
+        else:
+            output = result.get("output", result.get("response", result.get("error")))
+            if not output:
+                output = self._latest_assistant_message(result.get("context"))
         normalized = {
             "status": status,
             "output": output or "No output provided",

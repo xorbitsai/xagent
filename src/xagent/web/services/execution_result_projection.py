@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ...core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from ..models.task import TaskStatus
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
@@ -35,16 +36,26 @@ def project_execution_result_for_channel(
             interactions = [item for item in raw_interactions if isinstance(item, dict)]
 
     output = str(result.get("output") or "")
-    base_text = chat_message or output
-    if not base_text.strip() and not interactions:
+    if status == "interrupted":
+        # An interruption is control state, not an assistant answer. Show a
+        # friendly status in every chat channel without adding it to the
+        # conversation transcript used by later model turns.
+        base_text = INTERRUPTED_USER_MESSAGE
+        transcript_content = ""
+        interactions = []
+    else:
+        base_text = chat_message or output
+        transcript_content = base_text
+    if status != "interrupted" and not base_text.strip() and not interactions:
         base_text = EMPTY_CHANNEL_OUTPUT_FALLBACK
+        transcript_content = base_text
 
     visible_text = _append_interactions(base_text, interactions)
 
     return ChannelExecutionProjection(
         task_status=_project_task_status(result, status),
         visible_text=visible_text,
-        transcript_content=base_text,
+        transcript_content=transcript_content,
         message_type="question"
         if status == "waiting_for_user" or interactions
         else "assistant_message",

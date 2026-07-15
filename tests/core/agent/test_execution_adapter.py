@@ -935,6 +935,32 @@ def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> 
     assert result["output"] == "answer from context"
 
 
+def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="interrupted",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = adapter._normalize_result(
+        result={
+            "status": "interrupted",
+            "success": False,
+            "error": "ReActPattern interrupted.",
+        },
+        execution_type="agent_react",
+        execution_id="interrupted-exec",
+    )
+
+    assert result["output"] == (
+        "The previous run was stopped. You can send another message to continue."
+    )
+    assert result["error"] == "ReActPattern interrupted."
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> None:
     tracer = TracerCheckpointStore()

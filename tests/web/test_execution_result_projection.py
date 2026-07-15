@@ -64,8 +64,16 @@ def test_project_execution_result_falls_back_for_empty_output():
 
 def test_project_execution_result_maps_interrupted_to_paused():
     projection = project_execution_result_for_channel(
-        {"status": "interrupted", "success": False, "output": "Paused."}
+        {
+            "status": "interrupted",
+            "success": False,
+            "output": "ReActPattern interrupted.",
+        }
     )
 
     assert projection.task_status == TaskStatus.PAUSED
-    assert projection.visible_text == "Paused."
+    assert projection.visible_text == (
+        "The previous run was stopped. You can send another message to continue."
+    )
+    assert projection.transcript_content == ""
+    assert projection.interactions == []

@@ -15,6 +15,8 @@ type TaskCompletedRecord = {
   file_outputs?: unknown
   chat_response?: unknown
   metadata?: unknown
+  error_code?: unknown
+  error_details?: unknown
 }
 
 export type NormalizedTaskCompletion = {
@@ -26,6 +28,8 @@ export type NormalizedTaskCompletion = {
   fileOutputs: Array<string | Record<string, unknown>>
   chatResponse?: unknown
   metadata?: unknown
+  errorCode?: string
+  errorDetails?: Record<string, unknown>
 }
 
 const asRecord = (value: unknown): TaskCompletedRecord | null => {
@@ -67,5 +71,10 @@ export const normalizeTaskCompletedMessage = (
     fileOutputs,
     chatResponse: payload.chat_response,
     metadata: payload.metadata,
+    errorCode: typeof payload.error_code === "string" ? payload.error_code : undefined,
+    errorDetails:
+      payload.error_details && typeof payload.error_details === "object"
+        ? (payload.error_details as Record<string, unknown>)
+        : undefined,
   }
 }

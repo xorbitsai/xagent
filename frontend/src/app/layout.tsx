@@ -11,6 +11,7 @@ import { getThemeFromEnv, themes } from "@/lib/theme";
 import { Toaster } from "@/components/ui/sonner";
 import { McpAppsProvider } from "@/contexts/mcp-apps-context";
 import { VoiceInputController } from "@/components/voice-input-controller";
+import { TaskErrorController } from "@/components/task-error-controller";
 
 const branding = getBrandingFromEnv();
 
@@ -121,6 +122,7 @@ export default function RootLayout({
                 <AuthGuard>
                   <LayoutContent>{children}</LayoutContent>
                   <VoiceInputController />
+                  <TaskErrorController />
                   <Toaster />
                 </AuthGuard>
               </McpAppsProvider>

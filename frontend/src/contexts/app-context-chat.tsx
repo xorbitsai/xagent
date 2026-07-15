@@ -131,6 +131,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import { emitTaskError } from "@/lib/task-error-events"
 import { isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
 import {
   getFinalAnswerStreamActionPayload,
@@ -3975,6 +3976,56 @@ export function AppProvider({
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
 
+        if (!taskData.success) {
+          // error_details carries the structured reason ({code, ..., message});
+          // fall back to its message when the terminal event omits output/result,
+          // so the reason still shows instead of an empty turn degrading to
+          // "unknown error".
+          const failureReason =
+            getString(taskData.output) ||
+            getString(taskData.result) ||
+            getString(taskData.errorDetails?.message)
+          // Coded failures (e.g. a quota-gate refusal) also notify the app
+          // layer so it can surface them richly (see task-error-events). Stock
+          // xagent has a no-op controller and only an app layer ever sets a code.
+          if (taskData.errorCode) {
+            emitTaskError({
+              code: taskData.errorCode,
+              details: taskData.errorDetails,
+              message: failureReason,
+              taskId: currentState.taskId ?? null,
+            })
+          }
+          // Surface the reason live as a failed assistant message so the
+          // conversation matches what a page reload shows. Guard only against an
+          // adjacent duplicate (same reason already the last message) rather than
+          // a TTL cache — a re-executed turn re-emits the same terminal event and
+          // a content-TTL dedup would drop the bubble, leaving an empty turn.
+          const lastMessage = currentState.messages[currentState.messages.length - 1]
+          const lastContent =
+            typeof lastMessage?.content === "string" ? lastMessage.content : ""
+          if (failureReason && !lastContent.includes(failureReason)) {
+            dispatch({
+              type: "ADD_MESSAGE",
+              payload: {
+                id: generateMessageId("msg-task-failed"),
+                role: "assistant",
+                // The reason verbatim, no prefix: a reload replays the
+                // persisted transcript row (this same text), so any live-only
+                // decoration would make the two views diverge.
+                content: failureReason,
+                timestamp: message.timestamp,
+                status: "failed",
+                // Terminal failure IS this turn's result. Without the flag the
+                // conversation panel (which only shows user / isResult /
+                // system-notice messages) filters the bubble out and falls back
+                // to a virtual "unknown error" placeholder until reload.
+                isResult: true,
+              },
+            })
+          }
+        }
+
         // Update DAG execution status to completed
         if (state.dagExecution) {
           const updatedDAGExecution = {
@@ -4333,6 +4384,40 @@ export function AppProvider({
     const clientMessageId = typeof config?.clientMessageId === 'string'
       ? config.clientMessageId
       : generateClientMessageId()
+
+    // Optimistic copy of the sender's own bubble, added once delivery is
+    // acknowledged. The live user_message trace event only exists after the
+    // agent run actually starts — a run refused before that (e.g. the quota
+    // gate) never emits it, so without this copy the sender's message stays
+    // invisible until a reload replays the persisted transcript row. The
+    // reducer reconciles by turn id / content, keeping the persisted event
+    // when it already arrived and replacing this copy when it arrives later.
+    const addOptimisticUserMessage = () => {
+      let content: React.ReactNode = message
+      if (files && files.length > 0) {
+        content = (
+          <UserMessageContent
+            message={message}
+            files={files.map(f => ({
+              name: f.name,
+              type: f.type,
+              size: f.size,
+            }))}
+          />
+        )
+      }
+      dispatch({
+        type: "ADD_MESSAGE",
+        payload: {
+          id: userTurnMessageId(clientMessageId),
+          role: "user",
+          content: content,
+          timestamp: Date.now().toString(),
+          isOptimistic: true,
+        }
+      })
+    }
+
     const targetTaskId = typeof config?.targetTaskId === 'number' ? config.targetTaskId : null
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
       await queuePendingMessage({
@@ -4342,6 +4427,7 @@ export function AppProvider({
         force: config?.force,
         clientMessageId,
       })
+      addOptimisticUserMessage()
       return
     }
 
@@ -4499,6 +4585,7 @@ export function AppProvider({
             force: config?.force,
             clientMessageId,
           })
+          addOptimisticUserMessage()
         } else {
           const parsed = await parseApiResponse(response)
           const errorMessage = getApiErrorMessage(
@@ -4537,34 +4624,7 @@ export function AppProvider({
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
       }
 
-      // The user_message trace usually arrives before the acknowledgement. Add
-      // a stable optimistic copy either way; the reducer keeps the persisted
-      // event when it already arrived and replaces this copy when it arrives
-      // later.
-      let content: React.ReactNode = message
-      if (files && files.length > 0) {
-        content = (
-          <UserMessageContent
-            message={message}
-            files={files.map(f => ({
-              name: f.name,
-              type: f.type,
-              size: f.size,
-            }))}
-          />
-        )
-      }
-
-      dispatch({
-        type: "ADD_MESSAGE",
-        payload: {
-          id: userTurnMessageId(clientMessageId),
-          role: "user",
-          content: content,
-          timestamp: Date.now().toString(),
-          isOptimistic: true,
-        }
-      })
+      addOptimisticUserMessage()
     }
   }, [state.taskId, sendChatMessage, wsExecuteTask, state.currentTask?.status, queuePendingMessage])
 

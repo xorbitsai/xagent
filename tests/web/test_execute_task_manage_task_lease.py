@@ -217,6 +217,51 @@ async def test_execute_task_surfaces_mid_run_quota_reason(db_session) -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_task_start_gate_forwards_structured_reason(db_session) -> None:
+    """When the start gate returns a structured reason (mapping), the run result
+    carries its message plus error_code/error_details so the client can localise
+    and branch, instead of only a plain string."""
+    user = User(username="quota-start-user", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.commit()
+    task = Task(
+        user_id=user.id,
+        title="quota start test",
+        description="test",
+        status=TaskStatus.PENDING,
+        execution_mode="auto",
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    manager = AgentServiceManager()
+    block = {
+        "code": "quota_exceeded",
+        "metric": "runs_per_month",
+        "limit": 0,
+        "plan": "basic",
+        "message": "Team quota exhausted for this billing period.",
+    }
+
+    # The gate short-circuits before lease/tracker/execution, so a patched
+    # check_run_gate returning the structured block is enough.
+    with patch("xagent.web.services.quota_hooks.check_run_gate", return_value=block):
+        result = await manager.execute_task(
+            agent_service=_FakeAgentService(),
+            task="hello",
+            tracking_task_id=str(task.id),
+            db_session=db_session,
+            manage_task_lease=False,
+        )
+
+    assert result["status"] == "quota_exceeded"
+    assert result["success"] is False
+    assert result["output"] == block["message"]
+    assert result["error_code"] == "quota_exceeded"
+    assert result["error_details"] == block
+
+
+@pytest.mark.asyncio
 async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
     db_session,
 ) -> None:

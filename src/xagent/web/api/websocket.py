@@ -1770,6 +1770,11 @@ async def execute_task_background(
                 "output": ai_response,
                 "file_outputs": normalized_outputs,
                 "success": result.get("success", False),
+                # Machine-readable failure classification (e.g. "quota_exceeded")
+                # plus its structured details, so the client can localise and
+                # branch instead of parsing the message. Absent for normal turns.
+                "error_code": result.get("error_code"),
+                "error_details": result.get("error_details"),
                 **control_event_state,
                 "chat_response": chat_response
                 if isinstance(chat_response, dict)

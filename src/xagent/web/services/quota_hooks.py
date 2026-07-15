@@ -10,10 +10,15 @@ Follows the same setter/getter idiom as set_user_tool_overrides_hook etc.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Callable
 
-# (db, user_id) -> reason str if the team is out of quota (block the run), else None
-_run_gate_hook: Callable[[Any, Any], str | None] | None = None
+# (db, user_id) -> reason if the team is out of quota (block the run), else None.
+# The reason is either a plain message str or a structured mapping the app layer
+# builds (e.g. {"code","metric","limit","plan","message"}). Core does not
+# interpret the structure — it forwards it to the run result so the client can
+# localise / branch on it; ``message`` is the human-readable fallback.
+_run_gate_hook: Callable[[Any, Any], "str | Mapping[str, Any] | None"] | None = None
 # (db, user_id, delta_details, delta_actions) -> None; best-effort post-run
 # metering. delta_details is this turn's per-model token breakdown (list of
 # {"type","tokens","model"}) for cost-based credits; delta_actions counts tool
@@ -75,7 +80,7 @@ def set_trigger_record_hook(hook: Callable[[Any], None] | None) -> None:
     _trigger_record_hook = hook
 
 
-def check_run_gate(db: Any, user_id: Any) -> str | None:
+def check_run_gate(db: Any, user_id: Any) -> "str | Mapping[str, Any] | None":
     if _run_gate_hook is None or user_id is None:
         return None
     return _run_gate_hook(db, user_id)

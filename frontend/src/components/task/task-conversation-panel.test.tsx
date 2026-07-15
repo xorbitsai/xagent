@@ -283,6 +283,46 @@ describe("TaskConversationPanel", () => {
     expect(renderedMessages[2]).toHaveTextContent("Done")
   })
 
+  it("renders a terminal failure reason instead of a virtual unknown-error placeholder", () => {
+    // A quota-gate refusal produces a failed result bubble and no trace events.
+    // The bubble must render as the turn's outcome; without it the panel would
+    // fall back to a virtual failed message that shows "unknown error".
+    const quotaReason = "Team quota exhausted for this billing period."
+    appState.messages = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Run analysis",
+        timestamp: "1000",
+      },
+      {
+        id: "msg-task-failed",
+        role: "assistant",
+        content: quotaReason,
+        timestamp: "2000",
+        status: "failed",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+    appState.isHistoryLoading = false
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    // Only the user turn and the failure reason — no extra virtual message.
+    expect(renderedMessages).toHaveLength(2)
+    expect(renderedMessages[1]).toHaveTextContent(quotaReason)
+  })
+
   it("applies current task status only to the latest trace process group", () => {
     appState.messages = [
       {

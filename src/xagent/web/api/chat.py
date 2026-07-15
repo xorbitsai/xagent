@@ -2219,14 +2219,27 @@ class AgentServiceManager:
                     db_session, getattr(gate_task, "user_id", None)
                 )
                 if gate_reason:
-                    # `output` is what every result consumer surfaces as the
-                    # assistant message; set it so the quota reason reaches the
-                    # user instead of a misleading "Task completed".
+                    # The gate returns either a plain message or a structured
+                    # mapping ({code, metric, limit, plan, message}). Surface the
+                    # message as `output` (what every result consumer shows as
+                    # the assistant reply) and forward the structured fields as
+                    # error_code/error_details so the client can localise and
+                    # branch (e.g. Free vs paid) without parsing the message.
+                    if isinstance(gate_reason, Mapping):
+                        reason_message = str(gate_reason.get("message") or "")
+                        error_code = gate_reason.get("code")
+                        error_details = dict(gate_reason)
+                    else:
+                        reason_message = str(gate_reason)
+                        error_code = "quota_exceeded"
+                        error_details = None
                     return {
                         "success": False,
                         "status": "quota_exceeded",
-                        "output": gate_reason,
-                        "error": gate_reason,
+                        "output": reason_message,
+                        "error": reason_message,
+                        "error_code": error_code,
+                        "error_details": error_details,
                     }
             except Exception:
                 logger.warning("Quota gate check failed open", exc_info=True)

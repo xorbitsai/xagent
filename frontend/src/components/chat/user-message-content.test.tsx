@@ -98,4 +98,9 @@ describe("stripAttachedFileRefs", () => {
       )
     ).toBe("Inspect")
   })
+
+  it("returns an empty message for malformed runtime content", () => {
+    expect(stripAttachedFileRefs(null, [image])).toBe("")
+    expect(stripAttachedFileRefs({ content: "Inspect" }, [image])).toBe("")
+  })
 })

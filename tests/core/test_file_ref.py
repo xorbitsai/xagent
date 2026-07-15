@@ -41,7 +41,19 @@ def test_build_file_ref_uses_canonical_file_id_ref() -> None:
     assert result["markdown_link"] == "[report.txt](file:file-id)"
 
 
-@pytest.mark.parametrize("file_id", ["", ".", "..", "nested/file-id"])
+@pytest.mark.parametrize(
+    "file_id",
+    [
+        "",
+        ".",
+        "..",
+        "nested/file-id",
+        "nested\\file-id",
+        "nested%2Ffile-id",
+        "nested%5Cfile-id",
+        "%2E%2E",
+    ],
+)
 def test_build_file_id_ref_rejects_path_like_values(file_id: str) -> None:
     with pytest.raises(ValueError):
         build_file_id_ref(file_id)

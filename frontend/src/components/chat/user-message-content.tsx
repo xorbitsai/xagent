@@ -52,9 +52,13 @@ const decodeFileId = (value: string): string => {
 }
 
 export const stripAttachedFileRefs = (
-  message: string,
+  message: unknown,
   files: unknown
 ): string => {
+  if (typeof message !== "string") {
+    return ""
+  }
+
   const validFiles = sanitizeUserMessageFiles(files)
   const attachedIds = new Set(
     validFiles

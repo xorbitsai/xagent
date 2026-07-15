@@ -68,7 +68,10 @@ def build_file_id_ref(file_id: str) -> str:
     normalized = str(file_id).strip()
     if not normalized or normalized in {".", ".."}:
         raise ValueError("file_id must be a non-empty identifier")
-    if "/" in normalized or "\\" in normalized:
+    decoded = unquote(normalized)
+    if decoded in {".", ".."} or any(
+        separator in value for value in (normalized, decoded) for separator in "/\\"
+    ):
         raise ValueError("file_id must not contain path separators")
     return f"file:{quote(normalized, safe='')}"
 

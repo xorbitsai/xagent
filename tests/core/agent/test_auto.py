@@ -586,6 +586,13 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert "knowledge base or RAG results" in decision_prompt
     assert "do not choose final_answer" in decision_prompt
     assert "explicitly asks to call or use an available tool" in decision_prompt
+    assert "no tool or other work will happen after this routing decision" in (
+        decision_prompt
+    )
+    assert "future tool action" in decision_prompt
+    assert "ask the user to wait" in decision_prompt
+    assert "not already present in the conversation" in decision_prompt
+    assert "even when the user did not explicitly mention a tool" in decision_prompt
     assert "pause for user input" in decision_prompt
     assert "Use react as the default tool-use mode" in decision_prompt
     assert "For follow-up requests" in decision_prompt

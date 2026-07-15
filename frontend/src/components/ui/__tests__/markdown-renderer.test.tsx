@@ -231,6 +231,27 @@ describe('MarkdownRenderer', () => {
     expect(screen.queryByRole('img')).not.toBeInTheDocument()
   })
 
+  it('keeps a playing audio element mounted when surrounding page callbacks update', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['audio-bytes'], { type: 'audio/mpeg' }),
+    })
+    const content = '![podcast.mp3](file:output/podcast.mp3)'
+    const { rerender } = render(
+      <MarkdownRenderer content={content} onFileClick={vi.fn()} />
+    )
+
+    const audioBeforeUpdate = await screen.findByLabelText('podcast.mp3')
+
+    // Trace and task events update the surrounding chat message and create new
+    // callback props. The media DOM node must survive that rerender so the
+    // browser keeps its currentTime and playing state.
+    rerender(<MarkdownRenderer content={content} onFileClick={vi.fn()} />)
+
+    expect(await screen.findByLabelText('podcast.mp3')).toBe(audioBeforeUpdate)
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
   it('prefers link label over generic file id when determining preview kind', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

@@ -3,7 +3,7 @@ import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import type { Components } from 'react-markdown'
+import type { Components, ExtraProps } from 'react-markdown'
 import { apiRequest } from '@/lib/api-wrapper'
 import { AgentCard } from '@/components/chat/AgentCard'
 import { useI18n } from '@/contexts/i18n-context'
@@ -242,140 +242,192 @@ function containsPreviewFileLinkNode(node: any): boolean {
   return node.children.some(containsPreviewFileLinkNode)
 }
 
+type MarkdownRendererContextValue = {
+  onFileClick?: (filePath: string, fileName: string) => void
+  onAgentClick?: (agentId: string, agentName: string) => void
+  openLabel: string
+  loadErrorText: string
+}
+
+type MarkdownComponentProps<Tag extends keyof React.JSX.IntrinsicElements> =
+  React.ComponentPropsWithoutRef<Tag> & ExtraProps
+
+const MarkdownRendererContext = React.createContext<MarkdownRendererContextValue>({
+  openLabel: 'Open',
+  loadErrorText: 'Failed to load preview.',
+})
+
+function MarkdownParagraph({
+  node,
+  children,
+  ...props
+}: MarkdownComponentProps<'p'>) {
+  if (
+    containsAgentCardElement(children) ||
+    containsBlockPreviewElement(children) ||
+    containsPreviewFileLinkNode(node)
+  ) {
+    return (
+      <div className="my-4" {...props}>
+        {children}
+      </div>
+    )
+  }
+
+  return <p {...props}>{children}</p>
+}
+
+function MarkdownLink({
+  node,
+  href,
+  title,
+  children,
+  ...props
+}: MarkdownComponentProps<'a'>) {
+  const { onFileClick, onAgentClick, openLabel, loadErrorText } =
+    React.useContext(MarkdownRendererContext)
+
+  if (href && href.startsWith('file:')) {
+    const filePath = href.replace(/^file:/, '')
+    const fileNameFromPath = filePath.split('/').pop() || filePath
+    const linkText = (node ? hastText(node) : nodeText(children)).trim()
+    const fileName = title || linkText || fileNameFromPath
+    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const fileId = resolveInlineFileId(filePath)
+
+    if (preview) {
+      return (
+        <InlineFilePreview
+          source={{
+            fileId,
+            filename: preview.displayFilename,
+            type: preview.previewKind,
+            mimeType: getInlineFilePreviewMimeType(preview.previewKind),
+          }}
+          openLabel={openLabel}
+          loadErrorText={loadErrorText}
+          onFileClick={onFileClick}
+        />
+      )
+    }
+
+    const handleClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
+      if (onFileClick) {
+        event.preventDefault()
+        const fallbackTitle = title || linkText || fileNameFromPath
+        onFileClick(fileId, fallbackTitle)
+      }
+    }
+
+    return (
+      <a
+        href="#"
+        data-file-path={filePath}
+        className="file-link"
+        title={title || undefined}
+        onClick={handleClick}
+        {...props}
+      >
+        {children}
+      </a>
+    )
+  }
+
+  if (href && href.startsWith('agent:')) {
+    const agentId = href.replace(/^agent:\/\//, '')
+    const agentNameFromLink =
+      (node ? hastText(node) : nodeText(children)).trim() || `Agent ${agentId}`
+
+    return React.createElement('div', {
+      className: 'my-2',
+      key: `agent-${agentId}-wrapper`,
+      'data-agent-card-wrapper': true,
+    }, React.createElement(AgentCardContainer, {
+      key: `agent-${agentId}`,
+      agentId,
+      agentName: agentNameFromLink,
+      onAgentClick,
+    }))
+  }
+
+  return (
+    <a href={href || undefined} title={title || undefined} {...props}>
+      {children}
+    </a>
+  )
+}
+
+function MarkdownImage({
+  node,
+  src,
+  alt,
+  title,
+  ...props
+}: MarkdownComponentProps<'img'>) {
+  const { onFileClick, openLabel, loadErrorText } =
+    React.useContext(MarkdownRendererContext)
+  const resolvedSrc =
+    src || (typeof node?.properties?.src === 'string' ? node.properties.src : '')
+
+  if (resolvedSrc.startsWith('file:')) {
+    const filePath = resolvedSrc.replace(/^file:/, '')
+    const fileNameFromPath = filePath.split('/').pop() || filePath
+    const fileName = title || alt || fileNameFromPath
+    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const previewKind = preview?.previewKind ?? 'image'
+    return (
+      <InlineFilePreview
+        source={{
+          fileId: resolveInlineFileId(filePath),
+          filename: preview?.displayFilename ?? fileName,
+          type: previewKind,
+          mimeType: getInlineFilePreviewMimeType(previewKind),
+        }}
+        openLabel={openLabel}
+        loadErrorText={loadErrorText}
+        onFileClick={onFileClick}
+        imageClassName="file-image cursor-pointer"
+      />
+    )
+  }
+
+  return <img src={resolvedSrc} alt={alt || ''} title={title || alt || ''} {...props} />
+}
+
+// Keep these component identities stable across chat/trace updates. Replacing
+// them makes React remount every custom Markdown node, including a playing
+// <audio> element whose playback state would then be lost.
+const markdownComponents: Components = {
+  p: MarkdownParagraph,
+  a: MarkdownLink,
+  img: MarkdownImage,
+}
+
 export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
   const { t } = useI18n()
-  const components = React.useMemo<Components>(
+  const contextValue = React.useMemo<MarkdownRendererContextValue>(
     () => ({
-      p({ node: _node, children, ...props }) {
-        if (
-          containsAgentCardElement(children) ||
-          containsBlockPreviewElement(children) ||
-          containsPreviewFileLinkNode(_node)
-        ) {
-          return (
-            <div className="my-4" {...props}>
-              {children}
-            </div>
-          )
-        }
-
-        return <p {...props}>{children}</p>
-      },
-      a({ node: _node, href, title, children, ...props }) {
-        if (href && href.startsWith('file:')) {
-          const filePath = href.replace(/^file:/, '')
-          const fileNameFromPath = filePath.split('/').pop() || filePath
-          const linkText = nodeText(children).trim()
-          const fileName = title || linkText || fileNameFromPath
-          const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
-          const fileId = resolveInlineFileId(filePath)
-
-          if (preview) {
-            return (
-              <InlineFilePreview
-                source={{
-                  fileId,
-                  filename: preview.displayFilename,
-                  type: preview.previewKind,
-                  mimeType: getInlineFilePreviewMimeType(preview.previewKind),
-                }}
-                openLabel={t('files.previewDialog.buttons.open')}
-                loadErrorText={t('files.previewDialog.errors.loadFailed')}
-                onFileClick={onFileClick}
-              />
-            )
-          }
-
-          const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
-            if (onFileClick) {
-              e.preventDefault()
-              const fallbackTitle = title || linkText || fileNameFromPath
-              onFileClick(fileId, fallbackTitle)
-            }
-          }
-
-          return (
-            <a
-              href="#"
-              data-file-path={filePath}
-              className="file-link"
-              title={title || undefined}
-              onClick={handleClick}
-              {...props}
-            >
-              {children}
-            </a>
-          )
-        }
-
-        if (href && href.startsWith('agent:')) {
-          const agentId = href.replace(/^agent:\/\//, '')
-          const agentNameFromLink =
-            (typeof children === 'string' ? children : undefined) ??
-            (Array.isArray(children)
-              ? children.map((c: any) => (typeof c === 'string' ? c : '')).join('').trim() || undefined
-              : undefined) ?? `Agent ${agentId}`
-
-          // Render as AgentCardContainer that fetches agent details
-          // Wrap in div to ensure it appears on its own line
-          return React.createElement('div', {
-            className: 'my-2',
-            key: `agent-${agentId}-wrapper`,
-            'data-agent-card-wrapper': true,
-          }, React.createElement(AgentCardContainer, {
-            key: `agent-${agentId}`,
-            agentId: agentId,
-            agentName: agentNameFromLink,
-            onAgentClick: onAgentClick,
-          }))
-        }
-
-        return (
-          <a href={href || undefined} title={title || undefined} {...props}>
-            {children}
-          </a>
-        )
-      },
-      img({ node: _node, src, alt, title, ...props }) {
-        if (src && src.startsWith('file:')) {
-          const filePath = src.replace(/^file:/, '')
-          const fileNameFromPath = filePath.split('/').pop() || filePath
-          const fileName = title || alt || fileNameFromPath
-          const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
-          const previewKind = preview?.previewKind ?? 'image'
-          return (
-            <InlineFilePreview
-              source={{
-                fileId: resolveInlineFileId(filePath),
-                filename: preview?.displayFilename ?? fileName,
-                type: previewKind,
-                mimeType: getInlineFilePreviewMimeType(previewKind),
-              }}
-              openLabel={t('files.previewDialog.buttons.open')}
-              loadErrorText={t('files.previewDialog.errors.loadFailed')}
-              onFileClick={onFileClick}
-              imageClassName="file-image cursor-pointer"
-            />
-          )
-        }
-
-        return <img src={src || ''} alt={alt || ''} title={title || alt || ''} {...props} />
-      }
+      onFileClick,
+      onAgentClick,
+      openLabel: t('files.previewDialog.buttons.open'),
+      loadErrorText: t('files.previewDialog.errors.loadFailed'),
     }),
     [onFileClick, onAgentClick, t]
   )
 
   return (
-    <div className={`prose prose-invert max-w-none break-words [overflow-wrap:anywhere] ${className}`}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex]}
-        components={components}
-        urlTransform={safeUrlTransform}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
+    <MarkdownRendererContext.Provider value={contextValue}>
+      <div className={`prose prose-invert max-w-none break-words [overflow-wrap:anywhere] ${className}`}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkMath]}
+          rehypePlugins={[rehypeKatex]}
+          components={markdownComponents}
+          urlTransform={safeUrlTransform}
+        >
+          {content}
+        </ReactMarkdown>
+      </div>
+    </MarkdownRendererContext.Provider>
   )
 }
 

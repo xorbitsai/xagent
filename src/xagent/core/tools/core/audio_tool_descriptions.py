@@ -111,7 +111,8 @@ Voice options depend on the model:
 
 Provider-specific options:
 - ElevenLabs supports voice_settings keys: stability, similarity_boost, style, speed, use_speaker_boost.
-- ElevenLabs supports provider_options keys such as seed, previous_text, next_text, optimize_streaming_latency, apply_text_normalization, apply_language_text_normalization, and pronunciation_dictionary_locators.
+- ElevenLabs supports provider_options keys such as seed, previous_text, next_text, optimize_streaming_latency, apply_text_normalization, apply_language_text_normalization, pronunciation_dictionary_locators, and pronunciation_aliases.
+- ElevenLabs pronunciation_aliases is a case-sensitive object that maps exact source words or phrases to text that produces the intended spoken pronunciation. It changes only the text sent to ElevenLabs; keep text and written artifacts correctly spelled. Prefer phrase-level aliases over replacing one ambiguous character globally. For example: {{"Claughton": "Cloffton", "UN": "United Nations"}}.
 - Xinference currently does not expose dynamic voice listing through this tool. Some Xinference TTS models may still accept model-specific voice IDs or extra synthesis parameters.
 
 Audio format options:

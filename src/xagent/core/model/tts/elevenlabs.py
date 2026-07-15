@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import uuid
 from collections.abc import Iterable
 from inspect import isawaitable
@@ -32,6 +33,7 @@ _ELEVENLABS_VOICE_SETTING_FIELDS = (
 _ELEVENLABS_PROVIDER_OPTION_FIELDS = (
     "enable_logging",
     "optimize_streaming_latency",
+    "pronunciation_aliases",
     "pronunciation_dictionary_locators",
     "seed",
     "previous_text",
@@ -210,6 +212,46 @@ class ElevenLabsTTS(BaseTTS):
                 "Unsupported ElevenLabs provider_options keys: "
                 f"{unsupported}. Supported keys: {supported}."
             )
+
+    @staticmethod
+    def _apply_pronunciation_aliases(
+        text: str, aliases: Optional[dict[str, str]]
+    ) -> str:
+        """Apply case-sensitive, non-cascading aliases to ElevenLabs input text."""
+        if aliases is None:
+            return text
+        if not isinstance(aliases, dict):
+            raise ValueError(
+                "ElevenLabs pronunciation_aliases must be an object mapping "
+                "source phrases to spoken aliases"
+            )
+
+        normalized_aliases: dict[str, str] = {}
+        for source, alias in aliases.items():
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError(
+                    "ElevenLabs pronunciation_aliases source phrases must be "
+                    "non-empty strings"
+                )
+            if not isinstance(alias, str) or not alias.strip():
+                raise ValueError(
+                    "ElevenLabs pronunciation_aliases spoken aliases must be "
+                    "non-empty strings"
+                )
+            normalized_aliases[source] = alias
+
+        if not normalized_aliases:
+            return text
+
+        # Match all source phrases against the original text in one pass so an
+        # alias is never processed by a later rule. Prefer longer phrases when
+        # rules overlap, which keeps phrase-level corrections deterministic.
+        source_phrases = sorted(normalized_aliases, key=len, reverse=True)
+        pattern = re.compile("|".join(re.escape(source) for source in source_phrases))
+        return pattern.sub(
+            lambda match: normalized_aliases[match.group(0)],
+            text,
+        )
 
     @staticmethod
     async def _close_client(client: Any) -> None:
@@ -544,6 +586,11 @@ class ElevenLabsTTS(BaseTTS):
         final_sample_rate = _sample_rate_from_output_format(final_output_format)
         language_code = kwargs.pop("language_code", None) or language or self.language
         voice_settings = kwargs.pop("voice_settings", None)
+        pronunciation_aliases = kwargs.pop("pronunciation_aliases", None)
+        synthesis_text = self._apply_pronunciation_aliases(
+            text,
+            pronunciation_aliases,
+        )
 
         request_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         self._validate_provider_options(request_kwargs)
@@ -559,7 +606,7 @@ class ElevenLabsTTS(BaseTTS):
             if reference_audio:
                 voice_id = await self._get_or_create_cloned_voice(reference_audio)
             response = client.text_to_speech.convert(
-                text=text,
+                text=synthesis_text,
                 voice_id=voice_id,
                 model_id=self.model,
                 output_format=final_output_format,

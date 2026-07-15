@@ -76,6 +76,84 @@ async def test_synthesize_uses_sdk_convert_and_joins_chunks(
     assert call["voice_settings"].stability == 0.5
 
 
+async def test_synthesize_applies_official_pronunciation_alias_examples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    convert_calls: list[dict[str, object]] = []
+
+    async def convert(**kwargs: object):
+        convert_calls.append(kwargs)
+        yield b"fake-audio"
+
+    fake_client = SimpleNamespace(text_to_speech=SimpleNamespace(convert=convert))
+    monkeypatch.setattr(
+        ElevenLabsTTS,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    source_text = "Claughton addressed the UN."
+    result = await ElevenLabsTTS(api_key="test-key").synthesize(
+        source_text,
+        pronunciation_aliases={
+            "Claughton": "Cloffton",
+            "UN": "United Nations",
+        },
+    )
+
+    assert result == b"fake-audio"
+    assert source_text == "Claughton addressed the UN."
+    assert convert_calls[0]["text"] == "Cloffton addressed the United Nations."
+    assert "pronunciation_aliases" not in convert_calls[0]
+
+
+async def test_synthesize_pronunciation_aliases_are_non_cascading_and_longest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    convert_calls: list[dict[str, object]] = []
+
+    async def convert(**kwargs: object):
+        convert_calls.append(kwargs)
+        yield b"fake-audio"
+
+    fake_client = SimpleNamespace(text_to_speech=SimpleNamespace(convert=convert))
+    monkeypatch.setattr(
+        ElevenLabsTTS,
+        "_create_async_client",
+        staticmethod(lambda api_key, base_url=None: fake_client),
+    )
+
+    await ElevenLabsTTS(api_key="test-key").synthesize(
+        "The United Nations welcomed Claughton.",
+        pronunciation_aliases={
+            "UN": "United Nations",
+            "United Nations": "UN",
+            "Claughton": "Cloffton",
+            "Cloffton": "Claughton",
+        },
+    )
+
+    assert convert_calls[0]["text"] == "The UN welcomed Cloffton."
+
+
+@pytest.mark.parametrize(
+    ("aliases", "error"),
+    [
+        (["Claughton"], "must be an object"),
+        ({"": "Cloffton"}, "source phrases must be non-empty strings"),
+        ({"Claughton": ""}, "spoken aliases must be non-empty strings"),
+    ],
+)
+async def test_synthesize_rejects_invalid_pronunciation_aliases(
+    aliases: object,
+    error: str,
+) -> None:
+    tts = ElevenLabsTTS(api_key="test-key")
+
+    with pytest.raises(ValueError, match=error):
+        await tts.synthesize("Claughton", pronunciation_aliases=aliases)
+
+
 async def test_synthesize_supports_direct_async_generator_sdk_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -732,6 +810,7 @@ def test_elevenlabs_advertises_voice_capabilities() -> None:
         "use_speaker_boost",
     ]
     assert "seed" in tts.supported_provider_options
+    assert "pronunciation_aliases" in tts.supported_provider_options
 
 
 def test_list_available_models_requires_api_key(

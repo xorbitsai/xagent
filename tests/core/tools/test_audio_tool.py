@@ -471,6 +471,8 @@ def test_synthesize_speech_schema_exposes_structured_options() -> None:
 
     assert "Never invent" in synthesize_tool.description
     assert "exact voice_id returned by list_tts_voices" in synthesize_tool.description
+    assert '"Claughton": "Cloffton"' in synthesize_tool.description
+    assert '"UN": "United Nations"' in synthesize_tool.description
     assert "en-male" not in synthesize_tool.description
     assert "zh-female" not in synthesize_tool.description
 

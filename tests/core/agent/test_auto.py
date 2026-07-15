@@ -593,6 +593,9 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert "ask the user to wait" in decision_prompt
     assert "not already present in the conversation" in decision_prompt
     assert "even when the user did not explicitly mention a tool" in decision_prompt
+    assert "does not mean the file contents have been inspected" in decision_prompt
+    assert "no prior tool result explicitly contains" in decision_prompt
+    assert "Never claim to see, read, or hear attachment contents" in decision_prompt
     assert "pause for user input" in decision_prompt
     assert "Use react as the default tool-use mode" in decision_prompt
     assert "For follow-up requests" in decision_prompt

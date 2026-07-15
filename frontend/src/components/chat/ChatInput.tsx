@@ -166,7 +166,7 @@ export function ChatInput({
       const filename =
         chip.getAttribute("data-filename") || path?.split("/").pop() || path;
       const id = fileId || path;
-      chip.replaceWith(document.createTextNode(`[${filename}](file://${id})`));
+      chip.replaceWith(document.createTextNode(`[${filename}](file:${id})`));
     });
 
     clone.querySelectorAll("br").forEach((lineBreak) => {
@@ -726,8 +726,8 @@ export function ChatInput({
       if (message !== currentText) {
         let html = escapeHtml(message);
 
-        // Restore file:// links
-        html = html.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (_match, filename, id) => {
+        // Restore canonical and legacy file links.
+        html = html.replace(/\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g, (_match, filename, id) => {
           // We use the ID as the path since we don't have the real path anymore
           return createFileChipHTML(id, id, filename);
         });

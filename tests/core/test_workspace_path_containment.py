@@ -98,6 +98,66 @@ def test_resolve_path_with_search_finds_legitimate_file(workspace):
     assert resolved == target.resolve()
 
 
+def test_resolve_path_with_search_preserves_legacy_file_path_ref(workspace):
+    target = workspace.output_dir / "data.csv"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    resolved = workspace.resolve_path_with_search("file:output/data.csv")
+
+    assert resolved == target.resolve()
+
+
+@pytest.mark.parametrize(
+    "file_ref",
+    [
+        "file:file-id",
+        "file://file-id",
+        "file://file%20id",
+    ],
+)
+def test_resolve_path_with_search_resolves_internal_file_refs(
+    workspace, monkeypatch, file_ref
+):
+    target = workspace.input_dir / "photo.jpg"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"photo")
+    expected_id = "file id" if "%20" in file_ref else "file-id"
+    monkeypatch.setattr(
+        workspace,
+        "resolve_file_id",
+        lambda file_id: target if file_id == expected_id else None,
+    )
+
+    assert workspace.resolve_path_with_search(file_ref) == target
+
+
+def test_resolve_path_with_search_does_not_treat_local_file_uri_as_file_id(
+    workspace, monkeypatch
+):
+    resolved_ids: list[str] = []
+    monkeypatch.setattr(
+        workspace,
+        "resolve_file_id",
+        lambda file_id: resolved_ids.append(file_id) or None,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        workspace.resolve_path_with_search("file:///tmp/photo.jpg")
+
+    assert resolved_ids == []
+
+
+@pytest.mark.parametrize("file_ref", ["file:file-id", "file://file-id"])
+def test_resolve_file_id_accepts_internal_file_refs(workspace, file_ref):
+    target = workspace.input_dir / "photo.jpg"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"photo")
+    workspace._file_id_to_path["file-id"] = target
+
+    assert workspace.resolve_file_id(file_ref) == target
+
+
 def test_resolve_path_with_search_rejects_symlink_escape_in_fuzzy_match(
     workspace, tmp_path
 ):

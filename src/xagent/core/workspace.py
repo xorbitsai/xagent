@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from ..config import get_uploads_dir
 from .execution_scope import validate_scope_component
+from .file_ref import parse_file_id_ref
 
 logger = logging.getLogger(__name__)
 
@@ -656,7 +657,8 @@ class TaskWorkspace:
         return resolved == scoped_root or resolved.is_relative_to(scoped_root)
 
     def resolve_file_id(self, file_id: str) -> Optional[Path]:
-        file_id = str(file_id).strip()
+        raw_file_id = str(file_id).strip()
+        file_id = parse_file_id_ref(raw_file_id) or raw_file_id
         if not file_id:
             return None
 
@@ -910,9 +912,15 @@ class TaskWorkspace:
             FileNotFoundError: If relative path doesn't exist in any searched directory
         """
         normalized_input = file_path.strip()
-        if normalized_input.startswith("file:") and not normalized_input.startswith(
+        referenced_file_id = parse_file_id_ref(normalized_input)
+        if referenced_file_id is not None:
+            normalized_input = referenced_file_id
+        elif normalized_input.startswith("file:") and not normalized_input.startswith(
             "file://"
         ):
+            # Preserve legacy workspace path refs such as
+            # ``file:output/report.csv``. They are paths, not file ids, and
+            # still pass through the normal workspace containment checks.
             normalized_input = normalized_input[5:].strip()
 
         path = Path(normalized_input)

@@ -4,7 +4,7 @@ import React, { createContext, useContext, useReducer, useCallback, useEffect, u
 import { useRouter } from "next/navigation"
 import { FileText, Target, Zap, CheckCircle, XCircle, Wrench, Activity, Search, Lightbulb, AlertTriangle, Info, Brain, Bot } from "lucide-react"
 import { JsonRenderer, MarkdownRenderer } from "../components/ui/markdown-renderer"
-import { FileAttachment } from "@/components/file/file-attachment"
+import { UserMessageContent } from "@/components/chat/user-message-content"
 import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
@@ -1713,33 +1713,30 @@ export function AppProvider({
 
             if (files.length > 0) {
               content = (
-                <div className="space-y-2">
-                  <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{messageContent}</div>
-                  <FileAttachment
-                    files={files}
-                    variant="user-message"
-                    onPreview={(file) => {
-                      const currentFileId = file.file_id || ""
-                      const normalizedFiles = files.map((f: any) => ({
-                        fileId: f.file_id || "",
-                        fileName: f.name,
-                      })).filter((item: { fileId: string }) => !!item.fileId)
+                <UserMessageContent
+                  message={messageContent}
+                  files={files}
+                  onPreview={(file, previewFiles) => {
+                    const currentFileId = file.file_id || ""
+                    const normalizedFiles = previewFiles.map((previewFile) => ({
+                      fileId: previewFile.file_id || "",
+                      fileName: previewFile.name,
+                    })).filter((item) => !!item.fileId)
 
-                      if (!currentFileId) {
-                        return
+                    if (!currentFileId) {
+                      return
+                    }
+                    dispatch({
+                      type: "OPEN_FILE_PREVIEW",
+                      payload: {
+                        fileId: currentFileId,
+                        fileName: file.name,
+                        files: normalizedFiles,
+                        index: normalizedFiles.findIndex((previewFile) => previewFile.fileId === currentFileId)
                       }
-                      dispatch({
-                        type: "OPEN_FILE_PREVIEW",
-                        payload: {
-                          fileId: currentFileId,
-                          fileName: file.name,
-                          files: normalizedFiles,
-                          index: normalizedFiles.findIndex((f: any) => f.fileId === currentFileId)
-                        }
-                      })
-                    }}
-                  />
-                </div>
+                    })
+                  }}
+                />
               )
             }
 
@@ -4547,13 +4544,14 @@ export function AppProvider({
       let content: React.ReactNode = message
       if (files && files.length > 0) {
         content = (
-          <div className="space-y-2">
-            <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{message}</div>
-            <FileAttachment
-              files={files.map(f => ({ name: f.name, type: f.type, size: f.size, path: '' }))} // Basic info for optimistic render
-              variant="user-message"
-            />
-          </div>
+          <UserMessageContent
+            message={message}
+            files={files.map(f => ({
+              name: f.name,
+              type: f.type,
+              size: f.size,
+            }))}
+          />
         )
       }
 

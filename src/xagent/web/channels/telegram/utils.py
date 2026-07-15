@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
+from ....core.file_ref import parse_file_id_ref
+
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
@@ -248,11 +250,12 @@ def persist_telegram_assistant_turn(
 
 
 def _extract_local_file_id(target: str) -> str | None:
+    internal_file_id = parse_file_id_ref(target)
+    if internal_file_id is not None:
+        return internal_file_id
+
     parsed = urlparse(target)
     path = parsed.path
-    if parsed.scheme == "file":
-        file_id = f"{parsed.netloc}{path}".lstrip("/")
-        return unquote(file_id) or None
 
     for prefix in ("/api/files/preview/", "/api/files/download/"):
         if path.startswith(prefix):

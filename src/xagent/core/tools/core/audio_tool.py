@@ -540,10 +540,6 @@ class AudioToolCore:
         Returns:
             str: Resolved audio path/URL suitable for the audio model
         """
-        # Handle file_id prefix
-        if audio_input.startswith("file:") and not audio_input.startswith("file://"):
-            audio_input = audio_input[5:].strip()
-
         # Check if it's a URL (http/https)
         if audio_input.startswith(("http://", "https://")):
             return audio_input

@@ -13,6 +13,7 @@ from lark_oapi.api.im.v1 import (
 )
 
 from ....config import get_default_task_execution_mode
+from ....core.file_ref import build_file_id_ref
 from ...api.chat import get_agent_manager
 from ...models.database import get_db
 from ...models.task import Task, TaskStatus
@@ -306,7 +307,7 @@ class FeishuBotInstance:
                 )
                 if uploaded_info:
                     file_info_list = [
-                        f"[{info['name']}](file://{info['file_id']})"
+                        f"[{info['name']}]({build_file_id_ref(info['file_id'])})"
                         for info in uploaded_info
                     ]
                     if text:

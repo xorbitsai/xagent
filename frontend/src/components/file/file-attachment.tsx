@@ -5,21 +5,14 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import {
-  FileText,
   Download,
   Eye,
-  Image,
-  File,
-  Music,
-  Video,
-  Archive,
-  FileCode,
-  FileSpreadsheet,
   X
 } from "lucide-react"
 import { cn, getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
+import { FileTypeIcon } from "./file-type-icon"
 
 interface FileInfo {
   name: string
@@ -42,30 +35,6 @@ export function FileAttachment({ files, className, showPreview = true, variant =
   const [previewContent, setPreviewContent] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const { t } = useI18n()
-
-  const getFileIcon = (fileType: string) => {
-    if (fileType.startsWith('image/')) {
-      return <Image className="h-4 w-4" />
-    } else if (fileType.startsWith('video/')) {
-      return <Video className="h-4 w-4" />
-    } else if (fileType.startsWith('audio/')) {
-      return <Music className="h-4 w-4" />
-    } else if (fileType.includes('pdf')) {
-      return <FileText className="h-4 w-4" />
-    } else if (fileType.includes('word') || fileType.includes('document')) {
-      return <FileText className="h-4 w-4" />
-    } else if (fileType.includes('sheet') || fileType.includes('excel')) {
-      return <FileSpreadsheet className="h-4 w-4" />
-    } else if (fileType.includes('presentation') || fileType.includes('powerpoint')) {
-      return <FileText className="h-4 w-4" />
-    } else if (fileType.includes('zip') || fileType.includes('rar') || fileType.includes('tar')) {
-      return <Archive className="h-4 w-4" />
-    } else if (fileType.includes('json') || fileType.includes('xml') || fileType.includes('csv')) {
-      return <FileCode className="h-4 w-4" />
-    } else {
-      return <File className="h-4 w-4" />
-    }
-  }
 
   const formatFileSize = (bytes: number) => {
     if (bytes === 0) return '0 B'
@@ -173,7 +142,11 @@ export function FileAttachment({ files, className, showPreview = true, variant =
                 "transition-colors",
                 variant === 'user-message' ? "text-foreground" : "text-muted-foreground"
               )}>
-                {getFileIcon(file.type)}
+                <FileTypeIcon
+                  filename={file.name}
+                  mimeType={file.type}
+                  className="h-4 w-4"
+                />
               </div>
               <div className="flex flex-col min-w-0">
                 <span className={cn(
@@ -252,7 +225,11 @@ export function FileAttachment({ files, className, showPreview = true, variant =
           <Card className="w-full max-w-4xl max-h-[80vh] flex flex-col">
             <div className="flex items-center justify-between p-4 border-b">
               <div className="flex items-center gap-2">
-                {getFileIcon(previewFile.type)}
+                <FileTypeIcon
+                  filename={previewFile.name}
+                  mimeType={previewFile.type}
+                  className="h-4 w-4"
+                />
                 <span className="font-medium">{previewFile.name}</span>
                 <Badge variant="secondary">{formatFileSize(previewFile.size)}</Badge>
               </div>

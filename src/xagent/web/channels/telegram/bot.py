@@ -19,6 +19,7 @@ from aiogram.types import FSInputFile
 from sqlalchemy.orm import Session
 
 from ....config import get_default_task_execution_mode
+from ....core.file_ref import build_file_id_ref
 from ...api.chat import get_agent_manager
 from ...models.database import get_db
 from ...models.task import Task, TaskStatus
@@ -784,7 +785,7 @@ class TelegramBotInstance:
                             not in voice_file_id_set
                         ]
                         file_info_list = [
-                            f"[{info['name']}](file://{info['file_id']})"
+                            f"[{info['name']}]({build_file_id_ref(info['file_id'])})"
                             for info in regular_uploaded_info
                         ]
                         if text and file_info_list:

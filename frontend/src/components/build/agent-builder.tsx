@@ -290,7 +290,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       const fileId = chip.getAttribute('data-file-id');
       const filename = chip.getAttribute('data-filename') || path?.split('/').pop() || path;
       const id = fileId || path;
-      chip.replaceWith(document.createTextNode(`[${filename}](file://${id})`));
+      chip.replaceWith(document.createTextNode(`[${filename}](file:${id})`));
     });
 
     clone.querySelectorAll("br").forEach((lineBreak) => {
@@ -321,7 +321,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
       let html = escapeHtml(text);
 
-      html = html.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (match, filename, id) => {
+      html = html.replace(/\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g, (match, filename, id) => {
         return createFileChipHTML(id, id, filename);
       });
 
@@ -434,8 +434,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         // Escape HTML to prevent XSS
         let html = escapeHtml(normalizeLineBreaks(instructions));
 
-        // Restore file:// links
-        html = html.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, (match, filename, id) => {
+        // Restore canonical and legacy file links.
+        html = html.replace(/\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g, (match, filename, id) => {
           return createFileChipHTML(id, id, filename);
         });
         html = html.replace(/\n/g, "<br>");

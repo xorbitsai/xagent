@@ -3,7 +3,7 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 FILE_REF_OUTPUT_INSTRUCTIONS = """## FILE REFERENCE OUTPUTS
 When mentioning a generated or uploaded file that has a file_id, render it as a Markdown file reference:
@@ -22,6 +22,55 @@ Rules:
 - For user-visible output links, follow the file reference output rules below.
 
 {FILE_REF_OUTPUT_INSTRUCTIONS}"""
+
+
+def parse_file_id_ref(value: str | None) -> str | None:
+    """Extract a file id from an internal ``file:`` reference.
+
+    ``file:<id>`` is the canonical Xagent form. ``file://<id>`` is accepted
+    for compatibility with older chat and connector messages. Real file URIs
+    such as ``file:///absolute/path`` are deliberately not treated as file
+    ids; callers must still route paths through workspace containment checks.
+    """
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw.startswith("file:"):
+        return None
+
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    if parsed.scheme != "file" or parsed.query or parsed.fragment:
+        return None
+
+    if raw.startswith("file://"):
+        # ``file://<id>`` places the legacy id in the URI authority. A path
+        # means this is a real/remote file URI instead of an internal handle.
+        if not parsed.netloc or parsed.path:
+            return None
+        candidate = parsed.netloc
+    else:
+        candidate = parsed.path
+
+    file_id = unquote(candidate).strip()
+    if not file_id or file_id in {".", ".."}:
+        return None
+    if "/" in file_id or "\\" in file_id:
+        return None
+    return file_id
+
+
+def build_file_id_ref(file_id: str) -> str:
+    """Return the canonical internal URI for a registered file id."""
+    normalized = str(file_id).strip()
+    if not normalized or normalized in {".", ".."}:
+        raise ValueError("file_id must be a non-empty identifier")
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError("file_id must not contain path separators")
+    return f"file:{quote(normalized, safe='')}"
 
 
 def guess_mime_type(filename: str) -> str:
@@ -52,7 +101,7 @@ def build_file_ref(
             {
                 "preview_url": f"/api/files/preview/{encoded_file_id}",
                 "download_url": f"/api/files/download/{encoded_file_id}",
-                "markdown_link": f"[{filename}](file:{file_id})",
+                "markdown_link": f"[{filename}]({build_file_id_ref(file_id)})",
             }
         )
     else:

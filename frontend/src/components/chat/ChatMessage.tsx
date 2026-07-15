@@ -165,7 +165,7 @@ function ExpandableMessage({ content }: { content: string }) {
 
   if (!content) return null;
 
-  const markdownRegex = /\[([^\]]+)\]\(file:\/\/([^)]+)\)/g;
+  const markdownRegex = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
   const backtickRegex = /`([^`]+)`/g;
 
   const segments: React.ReactNode[] = [];

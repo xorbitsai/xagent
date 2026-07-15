@@ -318,9 +318,6 @@ Images are automatically saved to workspace.
         Returns:
             str: Resolved image path/URL suitable for the image model
         """
-        if image_input.startswith("file:") and not image_input.startswith("file://"):
-            image_input = image_input[5:].strip()
-
         # Check if it's a URL (http/https)
         if image_input.startswith(("http://", "https://")):
             return image_input

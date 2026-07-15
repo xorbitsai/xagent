@@ -21,7 +21,7 @@ from urllib.request import url2pathname
 import aiohttp
 from pydantic import Field
 
-from ...file_ref import build_workspace_file_ref, guess_mime_type
+from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
@@ -449,7 +449,7 @@ The generated video URL is temporary on the provider side, so completed videos a
             )
 
         ref_for_resolution = image_ref
-        if image_ref.startswith("file://"):
+        if image_ref.startswith("file://") and parse_file_id_ref(image_ref) is None:
             ref_for_resolution = url2pathname(parsed_ref.path)
 
         resolved_path = await asyncio.to_thread(

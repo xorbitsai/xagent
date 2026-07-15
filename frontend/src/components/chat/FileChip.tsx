@@ -1,7 +1,8 @@
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { File as FileIcon, X } from "lucide-react";
+import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { FileTypeIcon } from "@/components/file/file-type-icon";
 
 // Base styles shared between React component and HTML string
 // Using the more detailed styles from ChatInput as the source of truth
@@ -11,6 +12,7 @@ export const fileChipBaseClasses =
 interface FileChipProps {
   path: string;
   filename?: string;
+  mimeType?: string;
   className?: string;
   onDelete?: () => void;
   showDelete?: boolean;
@@ -21,7 +23,7 @@ interface FileChipProps {
  * React component for displaying a file chip.
  * Used in ChatMessage and other read-only views.
  */
-export function FileChip({ path, filename, className, onDelete, showDelete = false, onClick }: FileChipProps) {
+export function FileChip({ path, filename, mimeType, className, onDelete, showDelete = false, onClick }: FileChipProps) {
   const displayFileName = filename || path.split('/').pop() || path;
 
 
@@ -30,7 +32,11 @@ export function FileChip({ path, filename, className, onDelete, showDelete = fal
       className={cn(fileChipBaseClasses, "mx-1 py-0.5", onClick && "cursor-pointer hover:bg-secondary/90", className)}
       onClick={onClick}
     >
-      <FileIcon className="w-3.5 h-3.5 text-primary" />
+      <FileTypeIcon
+        filename={displayFileName}
+        mimeType={mimeType}
+        className="w-3.5 h-3.5 text-primary"
+      />
       <span className="text-[11px] font-medium text-foreground/70 truncate max-w-[200px]">
         {displayFileName}
       </span>
@@ -54,9 +60,15 @@ export function FileChip({ path, filename, className, onDelete, showDelete = fal
  * Generates HTML string for a file chip.
  * Used in contenteditable div in ChatInput.
  */
-export const createFileChipHTML = (path: string, fileId?: string, filename?: string, className?: string) => {
+export const createFileChipHTML = (path: string, fileId?: string, filename?: string, className?: string, mimeType?: string) => {
   const displayFileName = filename || path.split('/').pop() || path;
-  const iconHtml = renderToStaticMarkup(<FileIcon className="w-3.5 h-3.5 text-primary" />);
+  const iconHtml = renderToStaticMarkup(
+    <FileTypeIcon
+      filename={displayFileName}
+      mimeType={mimeType}
+      className="w-3.5 h-3.5 text-primary"
+    />
+  );
   const deleteIconHtml = renderToStaticMarkup(<X className="w-3.5 h-3.5 text-destructive cursor-pointer" />);
 
   // Note: specific styles for ChatInput context (relative positioning, margins)

@@ -16,7 +16,11 @@ from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel
 
-from ...file_ref import build_workspace_file_ref, safe_asset_filename
+from ...file_ref import (
+    build_workspace_file_ref,
+    parse_file_id_ref,
+    safe_asset_filename,
+)
 from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from .document_parser import DocumentCapabilities, DocumentParseArgs, parse_document
 from .file_tool import (
@@ -435,11 +439,7 @@ class WorkspaceFileOperations:
         if file_ref is None:
             return ""
         value = str(file_ref).strip()
-        if value.startswith("file://"):
-            return value[7:]
-        if value.startswith("file:"):
-            return value[5:]
-        return value
+        return parse_file_id_ref(value) or value
 
     @staticmethod
     def _build_unique_asset_path(path: Path) -> Path:

@@ -6,7 +6,12 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
 
-from ...config import get_database_url
+from ...config import (
+    get_database_url,
+    get_db_max_overflow,
+    get_db_pool_size,
+    get_db_pool_timeout_seconds,
+)
 from ...db.sqlite import apply_sqlite_concurrency_pragmas
 
 _SessionLocal: sessionmaker[Session] | None = None
@@ -27,6 +32,37 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def release_db_connection_if_clean(db: Session | None) -> bool:
+    """Return ``db``'s pooled connection by ending its (read-only) transaction.
+
+    SQLAlchemy sessions hold their connection until commit/rollback/close, so
+    a session that ran a SELECT and then awaits slow non-DB work (remote MCP
+    initialization, sandbox startup, the agent run itself) pins a pool slot
+    in ``idle in transaction`` for the whole wait (issue #889). Calling this
+    before such an await releases the connection; the session stays usable
+    and transparently re-acquires a connection on its next query.
+
+    Only rolls back when the session has no pending ORM changes
+    (new/dirty/deleted), so nothing uncommitted is ever discarded. Callers
+    must not rely on it having released (hence the bool return): a session
+    with pending writes keeps its connection.
+    """
+    if db is None:
+        return False
+    try:
+        if db.new or db.dirty or db.deleted:
+            return False
+        if not db.in_transaction():
+            return True
+        db.rollback()
+        return True
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "Failed to release DB connection", exc_info=True
+        )
+        return False
 
 
 def get_session_local() -> sessionmaker[Session]:
@@ -103,9 +139,9 @@ def init_db(db_url: str | None = None) -> None:
         _engine = create_engine(
             database_url,
             poolclass=QueuePool,
-            pool_size=10,
-            max_overflow=20,
-            pool_timeout=30,  # 30 seconds timeout for getting connection from pool
+            pool_size=get_db_pool_size(),
+            max_overflow=get_db_max_overflow(),
+            pool_timeout=get_db_pool_timeout_seconds(),
             pool_recycle=3600,  # Recycle connections after 1 hour
             pool_pre_ping=True,  # Verify connections before using
         )

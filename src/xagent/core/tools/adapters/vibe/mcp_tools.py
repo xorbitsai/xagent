@@ -66,6 +66,15 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
             if not mcp_configs:
                 return []
 
+    # Everything DB-backed is loaded at this point; what follows is pure
+    # network I/O against remote MCP servers (initialize + list-tools, with
+    # retries). Release the config session's pooled connection first so a
+    # slow or hung server doesn't pin a pool slot in ``idle in transaction``
+    # for the whole handshake (issue #889).
+    release = getattr(config, "release_db_connection", None)
+    if callable(release):
+        release()
+
     try:
         from .factory import ToolFactory
 

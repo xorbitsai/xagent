@@ -79,6 +79,17 @@ class BaseToolConfig(ABC):
         """Get MCP server configurations."""
         pass
 
+    def release_db_connection(self) -> None:
+        """Release any pooled DB connection held by this config's session.
+
+        Tool creators call this right before long non-DB awaits (e.g. remote
+        MCP initialize/list-tools) so a config backed by a live SQLAlchemy
+        session does not pin a pool slot in ``idle in transaction`` for the
+        whole wait (issue #889). The session must remain usable afterwards —
+        it re-acquires a connection on its next query. Default: no-op for
+        configs without a DB session.
+        """
+
     @abstractmethod
     def get_file_tools_enabled(self) -> bool:
         """Whether to include file tools."""

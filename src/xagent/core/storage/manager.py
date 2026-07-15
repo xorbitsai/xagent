@@ -128,21 +128,46 @@ def initialize_storage_manager(
 # Create base model class
 Base = declarative_base()
 
+# Process-wide engine for ad-hoc sessions. ``create_db_session`` used to
+# build a brand-new engine per call and never dispose it; each call left up
+# to a full connection pool alive until GC, which piles real database
+# connections up under load (issue #889). Cache one engine per database URL
+# instead — the URL check lets tests that swap DATABASE_URL still work.
+_adhoc_engine = None
+_adhoc_engine_url: Optional[str] = None
+_adhoc_engine_lock = threading.Lock()
+
+
+def _get_adhoc_engine():  # type: ignore[no-untyped-def]
+    global _adhoc_engine, _adhoc_engine_url
+
+    database_url = get_database_url()
+    if _adhoc_engine is not None and _adhoc_engine_url == database_url:
+        return _adhoc_engine
+
+    with _adhoc_engine_lock:
+        if _adhoc_engine is None or _adhoc_engine_url != database_url:
+            old_engine = _adhoc_engine
+            connect_args = (
+                {"check_same_thread": False} if "sqlite" in database_url else {}
+            )
+            engine = create_engine(database_url, connect_args=connect_args)
+            # WAL + busy_timeout so concurrent writes wait for the lock
+            # instead of failing with "database is locked" (no-op on
+            # non-SQLite engines).
+            apply_sqlite_concurrency_pragmas(engine)
+            Base.metadata.create_all(engine)
+            _adhoc_engine = engine
+            _adhoc_engine_url = database_url
+            if old_engine is not None:
+                old_engine.dispose()
+    return _adhoc_engine
+
 
 def create_db_session() -> Session:
-    database_url = get_database_url()
-    connect_args = {"check_same_thread": False} if "sqlite" in database_url else {}
-    # Create database engine
-    engine = create_engine(database_url, connect_args=connect_args)
-    # WAL + busy_timeout so concurrent writes wait for the lock instead of
-    # failing with "database is locked" (no-op on non-SQLite engines).
-    apply_sqlite_concurrency_pragmas(engine)
-    # Create session factory
+    engine = _get_adhoc_engine()
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-    db = SessionLocal()
-    Base.metadata.create_all(engine)
-    return db
+    return SessionLocal()
 
 
 def get_db_session() -> Generator[Session, None, None]:

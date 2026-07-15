@@ -18,6 +18,9 @@ from xagent.config import (
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
     DATABASE_URL,
+    DB_MAX_OVERFLOW,
+    DB_POOL_SIZE,
+    DB_POOL_TIMEOUT_SECONDS,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
@@ -42,6 +45,7 @@ from xagent.config import (
     MAX_UPLOAD_SIZE,
     MCP_OAUTH_ALLOW_PRIVATE_HOSTS,
     MCP_OAUTH_PROXY_URL,
+    MCP_TOOL_INIT_TIMEOUT_SECONDS,
     OPENROUTER_OFFICIAL_PROVIDERS_ONLY,
     PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
@@ -87,6 +91,9 @@ from xagent.config import (
     get_celery_enabled,
     get_celery_result_backend,
     get_database_url,
+    get_db_max_overflow,
+    get_db_pool_size,
+    get_db_pool_timeout_seconds,
     get_default_sqlite_db_path,
     get_default_task_execution_mode,
     get_external_skills_dirs,
@@ -113,6 +120,7 @@ from xagent.config import (
     get_max_upload_size_bytes,
     get_mcp_oauth_allow_private_hosts,
     get_mcp_oauth_proxy_url,
+    get_mcp_tool_init_timeout_seconds,
     get_openrouter_official_providers_only,
     get_password_reset_expire_minutes,
     get_preview_tmp_dir,
@@ -1050,6 +1058,54 @@ class TestGetDatabaseUrl:
         monkeypatch.setenv(DATABASE_URL, "postgresql://user:pass@localhost/db")
         result = get_database_url()
         assert result == "postgresql://user:pass@localhost/db"
+
+
+class TestDbPoolConfig:
+    """Test DB pool sizing getters."""
+
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv(DB_POOL_SIZE, raising=False)
+        monkeypatch.delenv(DB_MAX_OVERFLOW, raising=False)
+        monkeypatch.delenv(DB_POOL_TIMEOUT_SECONDS, raising=False)
+        assert get_db_pool_size() == 10
+        assert get_db_max_overflow() == 20
+        assert get_db_pool_timeout_seconds() == 30
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(DB_POOL_SIZE, "25")
+        monkeypatch.setenv(DB_MAX_OVERFLOW, "0")
+        monkeypatch.setenv(DB_POOL_TIMEOUT_SECONDS, "5")
+        assert get_db_pool_size() == 25
+        assert get_db_max_overflow() == 0
+        assert get_db_pool_timeout_seconds() == 5
+
+    def test_invalid_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(DB_POOL_SIZE, "abc")
+        monkeypatch.setenv(DB_MAX_OVERFLOW, "-1")
+        monkeypatch.setenv(DB_POOL_TIMEOUT_SECONDS, "0")
+        assert get_db_pool_size() == 10
+        assert get_db_max_overflow() == 20
+        assert get_db_pool_timeout_seconds() == 30
+
+
+class TestMcpToolInitTimeout:
+    """Test get_mcp_tool_init_timeout_seconds() function."""
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(MCP_TOOL_INIT_TIMEOUT_SECONDS, raising=False)
+        assert get_mcp_tool_init_timeout_seconds() == 60
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(MCP_TOOL_INIT_TIMEOUT_SECONDS, "120")
+        assert get_mcp_tool_init_timeout_seconds() == 120
+
+    def test_zero_disables(self, monkeypatch):
+        monkeypatch.setenv(MCP_TOOL_INIT_TIMEOUT_SECONDS, "0")
+        assert get_mcp_tool_init_timeout_seconds() == 0
+
+    def test_invalid_falls_back(self, monkeypatch):
+        monkeypatch.setenv(MCP_TOOL_INIT_TIMEOUT_SECONDS, "not-a-number")
+        assert get_mcp_tool_init_timeout_seconds() == 60
 
 
 class TestGetSandboxCpus:

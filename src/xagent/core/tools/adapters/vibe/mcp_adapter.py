@@ -9,13 +9,14 @@ import inspect
 import logging
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
 import httpx
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
 
+from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
@@ -1096,6 +1097,50 @@ async def _load_direct_mcp_tools(
     return agent_tools
 
 
+async def _load_server_tools_bounded(
+    server_name: str,
+    load_coro: "Coroutine[Any, Any, list[AbstractBaseTool]]",
+    timeout_seconds: int,
+) -> list[AbstractBaseTool]:
+    """Run one server's tool load with a hard wall-clock bound.
+
+    ``asyncio.wait_for`` alone is not a hard bound: it awaits the cancelled
+    task's cleanup, and a hung streamable-HTTP server can stall inside the
+    session context manager's ``__aexit__`` just as easily as inside
+    ``initialize()`` (issue #889). ``asyncio.wait`` + fire-and-forget cancel
+    guarantees the caller resumes at the deadline even if cleanup never
+    completes; the abandoned task is logged and its eventual exception is
+    consumed by a done-callback so it never surfaces as "exception was never
+    retrieved".
+    """
+    if timeout_seconds <= 0:
+        return await load_coro
+
+    task = asyncio.ensure_future(load_coro)
+    done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+    if task in done:
+        return task.result()
+
+    task.cancel()
+
+    def _consume_result(t: "asyncio.Task[Any]") -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.debug(
+                "Abandoned MCP load task for server %s finished with: %s",
+                server_name,
+                exc,
+            )
+
+    task.add_done_callback(_consume_result)
+    raise TimeoutError(
+        f"MCP server {server_name} initialization timed out after "
+        f"{timeout_seconds}s (including cleanup); abandoning it"
+    )
+
+
 async def load_mcp_tools_as_agent_tools(
     connection_map: Dict[str, Connection],
     *,
@@ -1122,6 +1167,7 @@ async def load_mcp_tools_as_agent_tools(
         The function continues processing remaining servers instead of raising.
     """
     agent_tools: List[AbstractBaseTool] = []
+    timeout_seconds = _root_config.get_mcp_tool_init_timeout_seconds()
 
     for server_name, connection in connection_map.items():
         try:
@@ -1149,13 +1195,13 @@ async def load_mcp_tools_as_agent_tools(
                         concurrent_tools=_concurrent_tools,
                     )
 
-                server_tools = await load_sandboxed_mcp_tools(
+                load_coro = load_sandboxed_mcp_tools(
                     connection,
                     sandbox,
                     tool_builder,
                 )
             else:
-                server_tools = await _load_direct_mcp_tools(
+                load_coro = _load_direct_mcp_tools(
                     server_name,
                     connection,
                     name_prefix=name_prefix,
@@ -1163,6 +1209,9 @@ async def load_mcp_tools_as_agent_tools(
                     allow_users=allow_users,
                 )
 
+            server_tools = await _load_server_tools_bounded(
+                server_name, load_coro, timeout_seconds
+            )
             agent_tools.extend(server_tools)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")
 

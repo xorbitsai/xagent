@@ -1091,6 +1091,22 @@ class WebToolConfig(BaseToolConfig):
             self._lazy_db.close()
             self._lazy_db = None
 
+    def release_db_connection(self) -> None:
+        """Return the pooled connection held by this config's session(s).
+
+        See :meth:`BaseToolConfig.release_db_connection`. Rolls back only
+        clean (read-only) transactions via
+        ``release_db_connection_if_clean``; sessions with pending writes are
+        left untouched. Both the caller-owned live session and the lazily
+        minted factory session are released — either one may have run the
+        MCP/agent config SELECTs whose transaction would otherwise stay open
+        across the MCP network await (issue #889).
+        """
+        from ..models.database import release_db_connection_if_clean
+
+        release_db_connection_if_clean(self._live_db)
+        release_db_connection_if_clean(self._lazy_db)
+
     def is_admin(self) -> bool:
         """Whether current user is admin."""
         return self._is_admin_value

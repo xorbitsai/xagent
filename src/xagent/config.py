@@ -53,6 +53,10 @@ FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFI
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 DATABASE_URL = "DATABASE_URL"
+DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
+DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
+DB_POOL_TIMEOUT_SECONDS = "XAGENT_DB_POOL_TIMEOUT_SECONDS"
+MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
@@ -1349,6 +1353,64 @@ def get_database_url() -> str:
     # Default: SQLite in storage root
     db_path = get_default_sqlite_db_path()
     return f"sqlite:///{db_path}"
+
+
+def get_db_pool_size() -> int:
+    """Get the SQLAlchemy connection pool size for the shared web engine.
+
+    Priority:
+        1. XAGENT_DB_POOL_SIZE environment variable
+        2. 10
+
+    Returns:
+        Number of persistent connections kept in the pool per process.
+    """
+    return _get_positive_int_env(DB_POOL_SIZE, 10)
+
+
+def get_db_max_overflow() -> int:
+    """Get the SQLAlchemy connection pool max overflow for the shared web engine.
+
+    Priority:
+        1. XAGENT_DB_MAX_OVERFLOW environment variable
+        2. 20
+
+    Returns:
+        Number of extra connections allowed beyond the pool size (0 disables
+        overflow).
+    """
+    return _get_positive_int_env(DB_MAX_OVERFLOW, 20, minimum=0)
+
+
+def get_db_pool_timeout_seconds() -> int:
+    """Get the timeout for acquiring a connection from the pool, in seconds.
+
+    Priority:
+        1. XAGENT_DB_POOL_TIMEOUT_SECONDS environment variable
+        2. 30
+
+    Returns:
+        Seconds to wait for a free pooled connection before raising.
+    """
+    return _get_positive_int_env(DB_POOL_TIMEOUT_SECONDS, 30)
+
+
+def get_mcp_tool_init_timeout_seconds() -> int:
+    """Get the per-server timeout for MCP tool initialization, in seconds.
+
+    Bounds the connect + initialize + list-tools handshake for one MCP server
+    during agent setup, so a hung server cannot stall task startup (and pin
+    resources such as DB connections) indefinitely. A timed-out server is
+    skipped; the remaining servers still load.
+
+    Priority:
+        1. XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS environment variable
+        2. 60
+
+    Returns:
+        Seconds allowed per MCP server; 0 disables the timeout.
+    """
+    return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
 
 
 def get_sandbox_cpus() -> int | None:

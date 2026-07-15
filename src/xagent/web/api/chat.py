@@ -38,7 +38,7 @@ from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
-from ..models.database import get_db
+from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
@@ -1289,6 +1289,10 @@ class AgentServiceManager:
             "scope_segments": scope_segments,
         }
 
+        # Sandbox startup is container/network work that can take seconds;
+        # don't hold this session's read transaction (and its pool slot)
+        # across it (issue #889).
+        release_db_connection_if_clean(db)
         sandbox = await self._get_or_create_task_sandbox(
             task_id=task_id,
             workspace_owner_id=workspace_owner_id,
@@ -1846,6 +1850,10 @@ class AgentServiceManager:
                     "scope_segments": scope_segments,
                 }
 
+                # Sandbox startup is container/network work that can take
+                # seconds; don't hold this session's read transaction (and
+                # its pool slot) across it (issue #889).
+                release_db_connection_if_clean(db)
                 sandbox = await self._get_or_create_task_sandbox(
                     task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
@@ -2260,6 +2268,13 @@ class AgentServiceManager:
             logger.info(
                 f"=== About to execute task: task_id={task_id}, has_db_session={db_session is not None} ==="
             )
+
+            # All pre-run DB writes (lease, status sync) are committed by
+            # now; release the session's pooled connection so it isn't
+            # pinned in ``idle in transaction`` for the entire agent run
+            # (issue #889). The tracker re-acquires per update and commits,
+            # so the slot is only held during actual DB work from here on.
+            release_db_connection_if_clean(db_session)
 
             # Execute the task
             result = await agent_service.execute_task(

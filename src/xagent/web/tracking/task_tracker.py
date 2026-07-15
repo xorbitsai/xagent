@@ -308,6 +308,12 @@ class TaskTracker:
             )
             if reason is not None:
                 self.quota_interrupt_reason = reason
+            # End the gate's read transaction so this poll doesn't leave the
+            # session's pooled connection pinned in ``idle in transaction``
+            # until the next periodic commit (issue #889).
+            from ..models.database import release_db_connection_if_clean
+
+            release_db_connection_if_clean(self.db_session)
             return reason
         except Exception as e:  # noqa: BLE001
             # Runs per step; log once per run so a persistent failure can't flood.

@@ -1,0 +1,66 @@
+"""Tests for release_db_connection_if_clean (issue #889)."""
+
+from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+from xagent.web.models.database import release_db_connection_if_clean
+
+Base = declarative_base()
+
+
+class Item(Base):
+    __tablename__ = "items"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+
+
+def _make_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return sessionmaker(autocommit=False, autoflush=False, bind=engine)()
+
+
+def test_releases_read_only_transaction():
+    db = _make_session()
+    db.query(Item).all()
+    assert db.in_transaction()
+
+    assert release_db_connection_if_clean(db) is True
+    assert not db.in_transaction()
+
+    # Session stays usable and re-acquires a connection on the next query.
+    assert db.query(Item).all() == []
+
+
+def test_keeps_pending_writes():
+    db = _make_session()
+    db.add(Item(name="pending"))
+
+    assert release_db_connection_if_clean(db) is False
+    assert Item in {type(obj) for obj in db.new} or len(db.new) == 1
+
+    db.commit()
+    assert db.query(Item).count() == 1
+
+
+def test_keeps_flushed_dirty_changes():
+    db = _make_session()
+    db.add(Item(name="one"))
+    db.commit()
+
+    item = db.query(Item).first()
+    item.name = "changed"
+
+    assert release_db_connection_if_clean(db) is False
+    db.commit()
+    assert db.query(Item).first().name == "changed"
+
+
+def test_none_session_is_noop():
+    assert release_db_connection_if_clean(None) is False
+
+
+def test_no_transaction_returns_true():
+    db = _make_session()
+    assert release_db_connection_if_clean(db) is True

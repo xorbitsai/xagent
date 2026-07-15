@@ -71,8 +71,8 @@ export default function WorkforcesPage() {
       <div className="mx-auto flex w-full flex-col gap-6 p-4 sm:p-8">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>
-            <h1 className="text-3xl font-bold">{t("workforces.list.title")}</h1>
-            <p className="mt-2 max-w-2xl text-muted-foreground">
+            <h1 className="text-[22px] font-bold leading-tight">{t("workforces.list.title")}</h1>
+            <p className="mt-0.5 max-w-2xl text-[13px] text-muted-foreground">
               {t("workforces.list.description")}
             </p>
           </div>

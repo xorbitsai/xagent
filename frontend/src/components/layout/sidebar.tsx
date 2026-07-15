@@ -579,21 +579,21 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
   if (allowCollapse && ((isAgentPage && !shouldShowSidebar) || !isSidebarOpen)) {
     return (
-      <div className="flex flex-col items-center justify-start py-4 w-[60px] bg-card border-r border-border shrink-0 h-full relative">
-        <Link href="/task" className="flex items-center justify-center mb-8">
+      <div className="flex flex-col items-center justify-start py-3 w-[54px] bg-[hsl(220_14%_96%)] border-r border-[hsl(220_13%_88%)] shrink-0 h-full relative">
+        <Link href="/task" className="flex items-center justify-center mb-6">
           <img
             src={branding.logoPath}
             alt={branding.logoAlt}
-            className="h-8 w-8 rounded-lg"
+            className="h-7 w-7 rounded-lg"
           />
         </Link>
         <button
           onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
-          className="absolute -right-3 top-6 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors z-50 shadow-sm"
+          className="absolute -right-3 top-5 bg-white border border-[hsl(220_13%_88%)] rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
         >
           <ChevronRight className="h-4 w-4" />
         </button>
-        <div className="flex flex-col gap-2 w-full px-2">
+        <div className="flex flex-col gap-1 w-full px-1.5">
           {navigationGroups.map((group) => (
             group.items.map((item: NavigationItem) => {
               const isActive = isItemActive(item)
@@ -607,11 +607,11 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                     title={item.nameKey ? t(item.nameKey) : item.name}
                     onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
                     className={cn(
-                      "flex w-full items-center justify-center p-2 rounded-lg transition-colors",
-                      isActive ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                      "flex w-full items-center justify-center p-2 rounded-[7px] transition-colors",
+                      isActive ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]" : "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground"
                     )}
                   >
-                    <item.icon className="h-5 w-5" />
+                    <item.icon className="h-4 w-4" />
                   </button>
                 )
               }
@@ -622,23 +622,23 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                   href={item.href}
                   title={item.nameKey ? t(item.nameKey) : item.name}
                   className={cn(
-                    "flex items-center justify-center p-2 rounded-lg transition-colors",
-                    isActive ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                    "flex items-center justify-center p-2 rounded-[7px] transition-colors",
+                    isActive ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]" : "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground"
                   )}
                 >
-                  <item.icon className="h-5 w-5" />
+                  <item.icon className="h-4 w-4" />
                 </Link>
               )
             })
           ))}
         </div>
-        <div className="mt-auto w-full px-2">
+        <div className="mt-auto w-full px-1.5 border-t border-[hsl(220_13%_88%)] pt-3">
           <button
             onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
-            className="flex items-center justify-center w-full p-2 hover:bg-accent/50 rounded-lg transition-colors"
+            className="flex items-center justify-center w-full p-2 hover:bg-[hsl(220_13%_92%)] rounded-[7px] transition-colors"
             title={user?.username || t('sidebar.user.defaultName')}
           >
-            <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-medium text-primary-foreground uppercase shrink-0 shadow-sm">
+            <div className="h-7 w-7 rounded-full bg-[hsl(234_62%_50%)] flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
               {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
             </div>
           </button>
@@ -649,25 +649,25 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
   return (
     <div ref={sidebarRef} className={cn(
-      "flex flex-col bg-gray-100 border-r border-border transition-all duration-300 shrink-0",
+      "flex flex-col bg-[hsl(220_14%_96%)] border-r border-[hsl(220_13%_88%)] transition-all duration-300 shrink-0",
       isAgentPage ? "h-full" : "h-full",
-      shouldShowSidebar ? "w-72" : "w-0",
+      shouldShowSidebar ? "w-60" : "w-0",
       className
     )}>
       {/* Logo */}
-      <div className="flex h-16 items-center justify-between px-6 mt-2 relative">
-        <Link href="/" className="flex items-center gap-2">
+      <div className="flex h-[90px] items-center justify-between px-4 relative">
+        <Link href="/" className="flex items-center gap-2.5">
           <img
             src={branding.logoPath}
             alt={branding.logoAlt}
             className="h-12 w-12 rounded-lg"
           />
-          <h1 className="text-[28px] font-bold" style={{ color: "#2745A6" }}>{branding.appName}</h1>
+          <h1 className="text-[32px] font-bold tracking-tight" style={{ color: "#2745A6" }}>{branding.appName}</h1>
         </Link>
         {allowCollapse && (
           <button
             onClick={() => isAgentPage ? setIsExpanded(false) : setIsSidebarOpen(false)}
-            className="absolute -right-3 top-4 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-accent transition-colors z-50 shadow-sm"
+            className="absolute -right-3 top-4 bg-white border border-[hsl(220_13%_88%)] rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
           >
             <ChevronLeft className="h-4 w-4" />
           </button>
@@ -678,77 +678,75 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       <div
         ref={contentScrollRef}
         onScroll={handleScroll}
-        className="flex-1 flex flex-col min-h-0 overflow-y-auto px-3"
+        className="flex-1 flex flex-col min-h-0 overflow-y-auto px-[10px]"
       >
         {/* Sticky Navigation Groups */}
         <nav
-          className="z-10 bg-transparent -mx-3 px-3 py-2"
+          className="z-10 bg-transparent py-1"
         >
           {/* Groups */}
           {navigationGroups.map((group, groupIndex) => (
-            <div key={group.title} className={cn("mb-6", groupIndex === 0 && "mt-0")}>
-              <div className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">
+            <div key={group.title} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
+              <div className="px-2 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em]">
                 {group.titleKey ? t(group.titleKey) : group.title}
               </div>
-              <div className="space-y-1">
+              <div className="space-y-0.5">
                 {group.items.map((item: NavigationItem) => {
                   const isActive = isItemActive(item)
                   const hasChildren = item.children && item.children.length > 0
                   const isExpanded = isMenuExpanded(item.href)
 
-                  const activeStyle = `
-                    bg-primary/10
-                    text-primary
-                    font-semibold
-                    rounded-lg
-                    mx-2
-                  `;
-                  const inactiveStyle = "text-muted-foreground hover:bg-slate-200/80 hover:text-foreground mx-2 rounded-lg"
+                  const activeStyle = "bg-primary/[0.09] text-[hsl(234_62%_42%)] font-semibold rounded-[7px]"
+                  const inactiveStyle = "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground rounded-[7px]"
 
                   if (hasChildren) {
                     return (
-                      <div key={item.name} className="mb-1">
-                        <button
-                          onClick={() => toggleMenu(item.href)}
-                          className={cn(
-                            "group flex items-center justify-between px-3 py-2 text-sm transition-colors relative w-[calc(100%-1rem)]",
-                            isActive ? activeStyle : inactiveStyle
-                          )}
-                        >
-                          <div className="flex items-center gap-3">
-                            <item.icon className={cn("h-5 w-5", isActive ? "text-primary" : "text-gray-500")} />
-                            {item.nameKey ? t(item.nameKey) : item.name}
-                          </div>
-                          {isExpanded ? (
-                            <ChevronDown className="h-3 w-3 opacity-50" />
-                          ) : (
+                      <Popover key={item.name} open={isExpanded} onOpenChange={() => toggleMenu(item.href)}>
+                        <PopoverTrigger asChild>
+                          <button
+                            className={cn(
+                              "group flex items-center justify-between px-2.5 py-2 text-[13.5px] transition-colors relative w-full",
+                              isActive ? activeStyle : inactiveStyle
+                            )}
+                          >
+                            <div className="flex items-center gap-2.5">
+                              <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(234_62%_42%)]" : "text-muted-foreground")} />
+                              {item.nameKey ? t(item.nameKey) : item.name}
+                            </div>
                             <ChevronRight className="h-3 w-3 opacity-50" />
-                          )}
-                        </button>
-                        {isExpanded && item.children && (
-                          <div className="ml-4 mt-1 space-y-1 border-l border-border/40 pl-2">
-                            {item.children.map((child: NavigationItem) => {
-                              const isChildActive = pathname === child.href
-                              return (
-                                <div key={child.href}>
+                          </button>
+                        </PopoverTrigger>
+                        {item.children && (
+                          <PopoverContent
+                            side="right"
+                            align="start"
+                            sideOffset={8}
+                            className="w-56 rounded-xl border border-border bg-white p-2 shadow-lg"
+                          >
+                            <div className="space-y-0.5">
+                              {item.children.map((child: NavigationItem) => {
+                                const isChildActive = pathname === child.href
+                                return (
                                   <Link
+                                    key={child.href}
                                     href={child.href}
+                                    onClick={() => toggleMenu(item.href)}
                                     className={cn(
-                                      "group flex items-center px-4 py-2 text-sm font-medium transition-colors rounded-lg mx-2",
+                                      "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors",
                                       isChildActive
-                                        ? "bg-primary/10 text-primary"
-                                        : "text-muted-foreground hover:bg-slate-200/80 hover:text-foreground"
+                                        ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]"
+                                        : "text-foreground hover:bg-[hsl(220_13%_92%)]"
                                     )}
                                   >
-                                    <child.icon className={cn("h-4 w-4 mr-3", isChildActive ? "text-primary" : child.color || "text-muted-foreground")} />
+                                    <child.icon className="h-4 w-4 text-muted-foreground" />
                                     {child.nameKey ? t(child.nameKey) : child.name}
                                   </Link>
-                                </div>
-                              )
-                            })}
-                          </div>
+                                )
+                              })}
+                            </div>
+                          </PopoverContent>
                         )}
-                      </div>
+                      </Popover>
                     )
                   }
 
@@ -757,11 +755,11 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                       key={item.name}
                       href={item.href}
                       className={cn(
-                        "group flex items-center px-3 py-2 text-sm font-medium transition-colors mb-1",
+                        "group flex items-center px-2.5 py-2 text-[13.5px] font-medium transition-colors",
                         isActive ? activeStyle : inactiveStyle
                       )}
                     >
-                      <item.icon className={cn("h-5 w-5 mr-3", isActive ? "text-primary" : "text-gray-500")} />
+                      <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(234_62%_42%)]" : "text-muted-foreground")} />
                       {item.nameKey ? t(item.nameKey) : item.name}
                     </Link>
                   )
@@ -772,9 +770,9 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         </nav>
 
         {/* History Section */}
-        <div className="flex flex-col overflow-hidden shrink-0 border-t border-border/40 pt-2 pb-4">
+        <div className="flex flex-col overflow-hidden shrink-0 border-t border-[hsl(220_13%_88%)] pt-1 pb-4">
           <div
-            className="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center justify-between transition-colors group h-8 shrink-0"
+            className="px-2 pt-4 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between h-8 shrink-0"
           >
             {(isSearchVisible || isSearchFocused || searchQuery) ? (
               <div className="flex-1 relative mr-2 h-full flex items-center">
@@ -796,7 +794,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                     }
                   }}
                   containerClassName="w-full h-7"
-                  className="h-7 text-xs text-black bg-transparent border-slate-500/50 focus:border-primary [&::-webkit-search-cancel-button]:hidden"
+                  className="h-7 text-[12px] text-foreground bg-transparent border-[hsl(220_13%_88%)] focus:border-primary [&::-webkit-search-cancel-button]:hidden"
                   autoFocus
                 />
                 <button
@@ -822,7 +820,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
               <div className="flex-1 flex items-center min-w-0 mr-2">
                 <span className="truncate">{t('nav.history')}</span>
                 <div
-                  className="cursor-pointer p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors text-slate-400 hover:text-foreground flex-shrink-0"
+                  className="cursor-pointer p-1 hover:bg-[hsl(220_13%_92%)] rounded transition-colors text-muted-foreground hover:text-foreground flex-shrink-0"
                   onClick={() => setIsSearchVisible(true)}
                 >
                   <Search className="h-3 w-3" />
@@ -830,7 +828,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
               </div>
             )}
             <div
-              className="cursor-pointer p-1 -mr-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors ml-1"
+              className="cursor-pointer p-1 -mr-1 hover:bg-[hsl(220_13%_92%)] rounded transition-colors ml-1"
               onClick={() => setIsHistoryExpanded(!isHistoryExpanded)}
             >
               {isHistoryExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
@@ -855,10 +853,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                         href={`/task/${task.task_id}`}
                         title={task.title}
                         className={cn(
-                          "group flex items-center px-3 py-2 text-sm transition-colors mb-1 truncate relative pr-8 rounded-lg mx-2",
+                          "group flex items-center px-2.5 py-[5px] text-[12.5px] font-medium transition-colors truncate relative pr-8 rounded-[7px]",
                           String(currentTaskId) === String(task.task_id)
-                            ? "bg-primary/10 text-primary font-medium"
-                            : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                            ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]"
+                            : "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground"
                         )}
                       >
                         <div className="relative h-4 w-4 mr-3 flex-shrink-0">
@@ -961,7 +959,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       </div>
 
       {/* User Profile */}
-      <div className="p-4 relative mt-auto shrink-0" ref={userMenuRef}>
+      <div className="px-[10px] py-3 border-t border-[hsl(220_13%_88%)] relative mt-auto shrink-0" ref={userMenuRef}>
         {showUserMenu && (
           <div className="absolute bottom-full left-4 right-4 mb-2 bg-popover border border-border rounded-lg shadow-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-50">
             <div className="py-1">
@@ -1002,15 +1000,15 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         )}
         <button
           onClick={() => setShowUserMenu(!showUserMenu)}
-          className="flex w-full items-center gap-2 hover:bg-accent/50 p-2 -ml-2 rounded-lg transition-colors text-left"
+          className="flex w-full items-center gap-2.5 hover:bg-[hsl(220_13%_92%)] px-2 py-2 rounded-[7px] transition-colors text-left"
         >
-          <div className="h-8 w-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-medium text-white uppercase shrink-0">
+          <div className="h-8 w-8 rounded-full bg-[hsl(234_62%_50%)] flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
             {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
           </div>
-          <div className="ml-3 flex-1">
-            <p className="text-sm font-bold text-foreground">{user?.username || t('sidebar.user.defaultName')}</p>
+          <div className="flex-1 min-w-0">
+            <p className="text-[13px] font-semibold text-foreground truncate">{user?.username || t('sidebar.user.defaultName')}</p>
           </div>
-          <ChevronsUpDown className="h-4 w-4 text-muted-foreground" />
+          <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
         </button>
       </div>
 

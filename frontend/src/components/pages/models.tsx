@@ -453,8 +453,8 @@ export function ModelsPage() {
         {/* Header */}
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
           <div className="space-y-1 w-full sm:w-auto">
-            <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t('models.header.title')}</h1>
-            <p className="text-sm sm:text-base text-muted-foreground">{t('models.header.description')}</p>
+            <h1 className="text-[22px] font-bold leading-tight">{t('models.header.title')}</h1>
+            <p className="text-[13px] text-muted-foreground mt-0.5">{t('models.header.description')}</p>
           </div>
 
           <Button onClick={handleAddModel} className="flex items-center gap-2 shrink-0">

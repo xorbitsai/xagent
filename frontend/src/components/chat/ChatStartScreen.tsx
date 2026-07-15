@@ -96,16 +96,16 @@ export function ChatStartScreen({
   };
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-[80vh] py-16 text-center">
-      <h2 className="text-3xl font-bold mb-3 text-blue-600 dark:text-blue-500">
+    <div className="flex flex-col items-center justify-start min-h-[80vh] pt-10 pb-16 px-6 text-center">
+      <h2 className="text-[26px] font-extrabold mb-2 bg-gradient-to-r from-[hsl(234_62%_45%)] to-[hsl(234_62%_60%)] bg-clip-text text-transparent leading-[1.2] tracking-tight">
         {title}
       </h2>
       {description && (
-        <p className="text-base text-muted-foreground mb-10 max-w-md">{description}</p>
+        <p className="text-[13.5px] text-muted-foreground mb-7 max-w-md leading-[1.7]">{description}</p>
       )}
 
-      <div className="w-full max-w-3xl mx-auto space-y-8">
-        <div className="space-y-4">
+      <div className="w-full max-w-[680px] mx-auto space-y-6">
+        <div>
           <ChatInput
             onSend={(msg, config) => onSend(msg, files, config)}
             isLoading={isSending}
@@ -128,8 +128,8 @@ export function ChatStartScreen({
         </div>
 
         {prompts && prompts.length > 0 && (
-          <div className="space-y-4">
-            <div className="flex items-center gap-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 mt-4 px-1">
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] px-1">
               <Sparkles className="w-3.5 h-3.5" />
               <span>{t("chatPage.sections.startingPrompts")}</span>
             </div>
@@ -169,7 +169,7 @@ export function ChatStartScreen({
             {/* Chat with Agents section */}
             {(agents && agents.length > 0) || !agents ? (
               <>
-                <div className="flex items-center gap-2 text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 mt-8 px-1">
+                <div className="flex items-center gap-2 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] mt-6 px-1">
                   <Bot className="w-3.5 h-3.5" />
                   <span>{t("chatPage.sections.chatWithAgents")}</span>
                 </div>

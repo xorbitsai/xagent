@@ -99,8 +99,8 @@ export function MonitoringPage() {
       <div className="p-8">
         {/* Header */}
         <div className="mb-8">
-          <h1 className="text-3xl font-bold mb-1">{t('monitoring.title')}</h1>
-          <p className="text-muted-foreground">{t('monitoring.description')}</p>
+          <h1 className="text-[22px] font-bold leading-tight">{t('monitoring.title')}</h1>
+          <p className="text-[13px] text-muted-foreground mt-0.5">{t('monitoring.description')}</p>
         </div>
 
         {/* Stats cards */}

@@ -34,7 +34,7 @@ export function FeatureEmptyState({
           <div className="h-16 w-16 rounded-2xl bg-primary/10 flex items-center justify-center text-primary mb-6 shadow-sm border border-primary/5">
             <Icon className="h-8 w-8" />
           </div>
-          <h2 className="text-2xl font-bold mb-3">{title}</h2>
+          <h2 className="text-[20px] font-bold mb-3">{title}</h2>
           <p className="text-muted-foreground text-[15px] max-w-lg leading-relaxed">
             {description}
           </p>

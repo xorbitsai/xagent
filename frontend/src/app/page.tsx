@@ -263,8 +263,8 @@ export default function Home() {
 
         <div className="z-10 flex flex-col items-center w-full max-w-3xl">
           <img src={branding.whiteLogoPath} alt={branding.appName} className="w-14 h-14 mb-6 object-contain rounded-[16px] shadow-2xl" />
-          <h1 className="text-[44px] font-bold text-white mb-4 tracking-tight text-center">{t("home.hero.title", { appName: branding.appName })}</h1>
-          <p className="text-[17px] text-gray-400 text-center mb-10 font-medium max-w-xl">
+          <h1 className="text-[34px] font-extrabold text-white mb-3 tracking-tight text-center leading-[1.15]">{t("home.hero.title", { appName: branding.appName })}</h1>
+          <p className="text-[13.5px] text-gray-400 text-center mb-8 font-medium max-w-xl leading-[1.7]">
             {t("home.hero.subtitle")}
           </p>
 
@@ -362,11 +362,11 @@ export default function Home() {
 
       {/* Main Content Scrollable */}
       <div className="flex-1">
-        <div className="mx-auto p-8 sm:p-12">
+        <div className="mx-auto py-9 px-8 sm:px-14">
 
           {/* Get Started Section */}
-          <h2 className="text-[20px] font-bold mb-6 text-foreground">{t("home.getStarted.title")}</h2>
-          <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5 mb-14">
+          <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.getStarted.title")}</h2>
+          <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-10">
             {[
               { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4" },
               { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: "https://docs.xagent.co" },
@@ -375,7 +375,7 @@ export default function Home() {
             ].map((card, i) => {
               const shouldLoadVideo = card.video ? visibleGetStartedVideos.has(i) : false;
               const cardContent = (
-                <Card className="py-0 gap-0 overflow-hidden border-border/60 hover:shadow-lg transition-all duration-300 group cursor-pointer bg-card rounded-2xl flex flex-col h-full">
+                <Card className="py-0 gap-0 overflow-hidden border-border/60 hover:shadow-md transition-all duration-300 group cursor-pointer bg-card rounded-xl flex flex-col h-full">
                   <div
                     className={`h-[180px] relative flex items-center justify-center overflow-hidden ${card.video ? 'bg-muted' : card.bg}`}
                     data-get-started-video={card.video ? "true" : undefined}
@@ -406,9 +406,9 @@ export default function Home() {
                       </div>
                     )}
                   </div>
-                  <CardContent className="p-5 flex-1">
-                    <h3 className="font-bold text-[16px] mb-2 group-hover:text-primary transition-colors">{card.title}</h3>
-                    <p className="text-[14px] text-muted-foreground leading-relaxed">{card.desc}</p>
+                  <CardContent className="p-4 flex-1">
+                    <h3 className="font-semibold text-[13px] mb-1 group-hover:text-primary transition-colors">{card.title}</h3>
+                    <p className="text-[12px] text-muted-foreground leading-relaxed">{card.desc}</p>
                   </CardContent>
                 </Card>
               );
@@ -428,16 +428,16 @@ export default function Home() {
           {/* Build agents with templates */}
           {templates.length > 0 && (
             <>
-              <div className="flex items-center justify-between mb-6">
-                <h2 className="text-[20px] font-bold text-foreground">{t("home.templates.title")}</h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-[16px] font-bold text-foreground">{t("home.templates.title")}</h2>
                 <Link href="/templates" className="text-[14px] font-semibold text-primary hover:underline flex items-center group">
                   {t("home.templates.viewAll")} <ChevronRight className="w-4 h-4 ml-1 group-hover:translate-x-1 transition-transform" />
                 </Link>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-14">
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-10">
                 {templates.map(template => (
-                  <Card key={template.id} className="flex flex-col border-border/60 hover:shadow-lg transition-all duration-300 p-6 group bg-card rounded-2xl">
+                  <Card key={template.id} className="flex flex-col border-border/60 hover:shadow-md transition-all duration-300 p-5 group bg-card rounded-xl">
                     <div className="flex justify-between items-center mb-2">
                       <span className="text-[11px] font-bold text-primary tracking-wider uppercase bg-primary/10 px-2.5 py-1 rounded-md">
                         {template.category}
@@ -447,7 +447,7 @@ export default function Home() {
                         <span>{template.setup_time || t("home.templates.setupTime", { time: "5 min" })}</span>
                       </div>
                     </div>
-                    <h3 className="font-bold text-xl text-foreground group-hover:text-primary transition-colors line-clamp-1">
+                    <h3 className="font-bold text-[15px] text-foreground group-hover:text-primary transition-colors line-clamp-1">
                       {template.name}
                     </h3>
                     <div className="flex-1 space-y-2.5">
@@ -506,7 +506,7 @@ export default function Home() {
           {/* Recent Tasks */}
           {recentTasks.length > 0 && (
             <>
-              <h2 className="text-[20px] font-bold mb-6 text-foreground">{t("home.recent.title")}</h2>
+              <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.recent.title")}</h2>
               <div className="space-y-3">
                 {recentTasks.map(task => (
                   <Link key={task.task_id} href={`/task/${task.task_id}`} className="flex items-center justify-between p-4 rounded-2xl border border-border/60 bg-card hover:border-primary/30 hover:shadow-md transition-all duration-300 group">

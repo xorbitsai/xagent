@@ -321,10 +321,10 @@ export default function BuildsPage() {
   return (
     <div className="flex flex-col h-full bg-background">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center px-4 md:px-8 py-6 md:py-8 gap-4">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center px-6 md:px-8 py-5 md:py-6 gap-4 border-b border-border/60">
         <div className="w-full sm:w-auto">
-          <h1 className="text-3xl font-bold mb-1">{t("builds.list.header.title")}</h1>
-          <p className="text-muted-foreground">{t("builds.list.header.description")}</p>
+          <h1 className="text-[22px] font-bold leading-tight">{t("builds.list.header.title")}</h1>
+          <p className="text-[13px] text-muted-foreground mt-0.5">{t("builds.list.header.description")}</p>
         </div>
         <div className="flex items-center gap-3 w-full sm:w-auto">
           <SearchInput
@@ -333,8 +333,8 @@ export default function BuildsPage() {
             onChange={setSearchTerm}
             containerClassName="flex-1 sm:w-64"
           />
-          <Button onClick={handleCreate} className="shrink-0 flex items-center gap-1 sm:gap-2">
-            <Plus className="h-4 w-4 sm:mr-2" />
+          <Button onClick={handleCreate} className="shrink-0 flex items-center gap-2 rounded-lg">
+            <Plus className="h-4 w-4" />
             <span className="hidden sm:inline">{t("builds.list.header.create")}</span>
           </Button>
         </div>

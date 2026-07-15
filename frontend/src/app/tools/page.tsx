@@ -35,8 +35,9 @@ import {
   Video,
   Database,
   Trash2,
+  Search,
 } from "lucide-react"
-import { getApiUrl } from "@/lib/utils"
+import { getApiUrl, cn } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
@@ -794,44 +795,29 @@ function ToolsPageContent() {
 
   const ConfigurableToolCard = ({ tool }: { tool: ConfigurableTool }) => {
     return (
-      <Card className="hover:shadow-md transition-all duration-300 border-border/50 hover:border-primary hover:-translate-y-1">
-        <CardContent className="p-6">
-          <div className="flex items-start justify-between mb-4">
-            <div className="flex gap-4">
-              <div className="mt-1 bg-muted/50 p-3 rounded-lg h-fit">
-                <Globe className="h-6 w-6 text-slate-500" />
-              </div>
-              <div>
-                <h3 className="font-semibold text-base mb-1">{tool.display_name || tool.tool_name}</h3>
-                <Badge variant="secondary" className="font-normal text-xs bg-muted text-muted-foreground hover:bg-muted">
-                  Basic
-                </Badge>
-              </div>
-            </div>
+      <div className="flex min-w-0 flex-col overflow-hidden rounded-[14px] border border-border bg-card p-5">
+        <div className="mb-3 flex items-start justify-between">
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-muted/50">
+            <Globe className="h-5 w-5 text-slate-500" />
           </div>
-
-          <p className="text-sm text-muted-foreground mb-6 line-clamp-2 h-10">
-            {getConfigurableToolDescription(tool)}
-          </p>
-
-          <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <Badge variant={tool.configured ? 'secondary' : 'outline'}>
-              {tool.configured ? t('tools.credentials.configured') : t('tools.credentials.notConfigured')}
-            </Badge>
-          </div>
-
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              className="w-full"
-              onClick={() => openCredentialDialog(tool.tool_name)}
-            >
-              {t('tools.credentials.configure')}
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+          <span className={tool.configured
+            ? "rounded-full bg-[rgba(28,202,91,0.12)] px-2 py-0.5 text-[10px] font-semibold text-[rgb(21,157,71)]"
+            : "rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground"}>
+            {tool.configured ? t('tools.credentials.configured') : t('tools.credentials.notConfigured')}
+          </span>
+        </div>
+        <div className="mb-1 text-[9.5px] font-bold uppercase tracking-[0.07em] text-muted-foreground">Basic</div>
+        <h3 className="mb-2 text-[14px] font-bold tracking-[-0.02em] text-foreground">{tool.display_name || tool.tool_name}</h3>
+        <p className="mb-4 flex-1 text-[12px] leading-[1.5] text-muted-foreground line-clamp-3">{getConfigurableToolDescription(tool)}</p>
+        <div className="border-t border-border pt-3">
+          <button
+            className="w-full rounded-lg border border-[rgba(60,131,246,0.28)] px-[14px] py-[6px] text-[11px] font-semibold text-[rgb(60,131,246)] hover:bg-[rgba(60,131,246,0.06)] transition-colors"
+            onClick={() => openCredentialDialog(tool.tool_name)}
+          >
+            {t('tools.credentials.configure')}
+          </button>
+        </div>
+      </div>
     )
   }
 
@@ -849,263 +835,251 @@ function ToolsPageContent() {
       : t('tools.database.manageConnections')
 
     return (
-      <Card className="hover:shadow-md transition-all duration-300 border-border/50 hover:border-primary hover:-translate-y-1">
-        <CardContent className="p-6">
-          <div className="flex items-start justify-between mb-4">
-            <div className="flex gap-4">
-              <div className="mt-1 bg-muted/50 p-3 rounded-lg h-fit">
-                {icon}
-              </div>
-              <div>
-                <h3 className="font-semibold text-base mb-1">{tool.name}</h3>
-                <Badge variant={variant} className="font-normal text-xs bg-muted text-muted-foreground hover:bg-muted">
-                  {label}
-                </Badge>
-              </div>
-            </div>
+      <div className="flex min-w-0 flex-col overflow-hidden rounded-[14px] border border-border bg-card p-5">
+        <div className="mb-3 flex items-start justify-between">
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-muted/50">
+            {icon}
           </div>
-
-          <p className="text-sm text-muted-foreground mb-6 line-clamp-2 h-10">
-            {tool.description}
-          </p>
-
-          <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <Badge variant={tool.enabled ? 'secondary' : 'outline'}>
-              {tool.enabled ? t('tools.policy.enabled') : t('tools.policy.disabled')}
-            </Badge>
-            {configurableTool && (
-              <Badge variant={configurableTool.configured ? 'secondary' : 'outline'}>
-                {configurableTool.configured
-                  ? t('tools.credentials.configured')
-                  : t('tools.credentials.notConfigured')}
-              </Badge>
-            )}
-            {canManageSqlConnections && (
-              <Badge variant="outline">
-                {`${sqlConnections.length} ${t('tools.database.connectionBadge')}`}
-              </Badge>
-            )}
-            <span className="ml-auto">{t('tools.list.usedByAgents', { count: tool.usage_count || 0 })}</span>
-          </div>
-
-          <div className="flex gap-2">
-            {hasSecondaryAction && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="flex-1"
-                onClick={() => {
-                  if (canConfigureCredentials && configToolName) {
-                    openCredentialDialog(configToolName)
-                    return
-                  }
-                  openSqlManager()
-                }}
-              >
-                {configButtonLabel}
-              </Button>
-            )}
-            {isAdmin && (
-              <Button
-                variant="outline"
-                size="sm"
-                className={hasSecondaryAction ? 'flex-1' : 'w-full'}
-                onClick={() => handleToggleToolEnabled(tool)}
-                disabled={isTogglePending}
-              >
-                {isTogglePending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                {tool.enabled ? t('tools.policy.disableAction') : t('tools.policy.enableAction')}
-              </Button>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+          <span className={tool.enabled
+            ? "rounded-full bg-[rgba(28,202,91,0.12)] px-2 py-0.5 text-[10px] font-semibold text-[rgb(21,157,71)]"
+            : "rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground"}>
+            {tool.enabled ? t('tools.policy.enabled') : t('tools.policy.disabled')}
+          </span>
+        </div>
+        <div className="mb-1 truncate text-[9.5px] font-bold uppercase tracking-[0.07em] text-muted-foreground">{label}</div>
+        <h3 className="mb-2 truncate text-[14px] font-bold tracking-[-0.02em] text-foreground">{tool.name}</h3>
+        <p className="mb-4 flex-1 text-[12px] leading-[1.5] text-muted-foreground line-clamp-3 break-words">{tool.description}</p>
+        <div className="flex flex-wrap items-center gap-1 mb-3">
+          {configurableTool && (
+            <span className={configurableTool.configured
+              ? "rounded-full bg-[rgba(28,202,91,0.12)] px-2 py-0.5 text-[10px] font-semibold text-[rgb(21,157,71)]"
+              : "rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground"}>
+              {configurableTool.configured ? t('tools.credentials.configured') : t('tools.credentials.notConfigured')}
+            </span>
+          )}
+          {canManageSqlConnections && (
+            <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">
+              {sqlConnections.length} {t('tools.database.connectionBadge')}
+            </span>
+          )}
+          <span className="ml-auto text-[10px] text-muted-foreground">{t('tools.list.usedByAgents', { count: tool.usage_count || 0 })}</span>
+        </div>
+        <div className="flex gap-2 border-t border-border pt-3">
+          {hasSecondaryAction && (
+            <button
+              className="flex-1 rounded-lg border border-[rgba(60,131,246,0.28)] px-[14px] py-[6px] text-[11px] font-semibold text-[rgb(60,131,246)] hover:bg-[rgba(60,131,246,0.06)] transition-colors"
+              onClick={() => {
+                if (canConfigureCredentials && configToolName) { openCredentialDialog(configToolName); return }
+                openSqlManager()
+              }}
+            >
+              {configButtonLabel}
+            </button>
+          )}
+          {isAdmin && (
+            <button
+              className={`rounded-lg border border-[rgba(60,131,246,0.28)] px-[14px] py-[6px] text-[11px] font-semibold text-[rgb(60,131,246)] hover:bg-[rgba(60,131,246,0.06)] transition-colors disabled:opacity-50 ${hasSecondaryAction ? 'flex-1' : 'w-full'}`}
+              onClick={() => handleToggleToolEnabled(tool)}
+              disabled={isTogglePending}
+            >
+              {isTogglePending && <Loader2 className="mr-1 inline h-3 w-3 animate-spin" />}
+              {tool.enabled ? t('tools.policy.disableAction') : t('tools.policy.enableAction')}
+            </button>
+          )}
+        </div>
+      </div>
     )
   }
 
   const MCPServerCard = ({ server }: { server: MCPServer }) => {
+    const icon = getToolIcon(server.name, 'mcp', 'mcp')
     return (
-      <Card className="hover:shadow-md cursor-pointer transition-all duration-300 border-border/50 hover:border-primary hover:-translate-y-1" onClick={() => handleEditMcpServer(server)}>
-        <CardContent className="p-6">
-          <div className="flex items-start justify-between mb-4">
-            <div className="flex gap-4">
-              <div className="mt-1 bg-muted/50 p-3 rounded-lg h-fit">
-                {getToolIcon(server.name, 'mcp', 'mcp')}
-              </div>
-              <div>
-                <h3 className="font-semibold text-base mb-1">{server.name}</h3>
-                <Badge variant="secondary" className="font-normal text-xs bg-muted text-muted-foreground hover:bg-muted">
-                  {t('tools.mcp.badge')}
-                </Badge>
-              </div>
-            </div>
+      <div
+        className="flex min-w-0 cursor-pointer flex-col overflow-hidden rounded-[14px] border border-border bg-card p-5 transition-all hover:border-primary/40 hover:shadow-sm"
+        onClick={() => handleEditMcpServer(server)}
+      >
+        <div className="mb-3 flex items-start justify-between">
+          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-muted/50">
+            {icon}
           </div>
-
-          <p className="text-sm text-muted-foreground mb-6 line-clamp-2 h-10">
-            {server.description || t('tools.list.noDescription')}
-          </p>
-
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span className="capitalize">{server.transport} {t('tools.list.transport')}</span>
-          </div>
-        </CardContent>
-      </Card>
+          <span className="rounded-full bg-[rgba(28,202,91,0.12)] px-2 py-0.5 text-[10px] font-semibold text-[rgb(21,157,71)]">
+            {t('tools.mcp.badge')}
+          </span>
+        </div>
+        <div className="mb-1 truncate text-[9.5px] font-bold uppercase tracking-[0.07em] text-muted-foreground">
+          {server.transport}
+        </div>
+        <h3 className="mb-2 truncate text-[14px] font-bold tracking-[-0.02em] text-foreground">{server.name}</h3>
+        <p className="flex-1 break-words text-[12px] leading-[1.5] text-muted-foreground line-clamp-3">
+          {server.description || t('tools.list.noDescription')}
+        </p>
+      </div>
     )
   }
 
+  const allTabs = [
+    { id: 'all', label: t('tools.tabs.all') },
+    ...categories.map(cat => ({ id: cat, label: getCategoryLabel(cat) })),
+    { id: 'mcp', label: t('tools.tabs.connectors') },
+  ]
+
+  const totalCount = filteredTools.length + (activeTab === 'all' || activeTab === 'mcp' ? filteredMcpServers.length : 0) + (isAdmin && (activeTab === 'all' || activeTab === 'basic') ? filteredSearchProviderTools.length : 0)
+
   return (
-    <div className="w-full p-6 space-y-8 overflow-y-auto h-[calc(100vh-2rem)]">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
-        <div className="space-y-1 w-full sm:w-auto">
-          <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t('tools.header.title')}</h1>
-          <p className="text-sm sm:text-base text-muted-foreground">{t('tools.header.description')}</p>
+    <div className="flex h-full flex-col overflow-y-auto p-[48px_52px_72px]">
+      {/* Hero — bleeds to edges */}
+      <div className="m-[-48px_-52px_36px] flex flex-col items-center gap-[14px] border-b border-border bg-background p-[48px_64px_44px] text-center">
+        <div>
+          <div className="mb-1 text-[30px] font-extrabold tracking-[-0.04em] text-foreground">
+            {t('tools.header.title')}
+          </div>
+          <div className="text-[13px] tracking-[0.01em] text-muted-foreground">
+            {t('tools.header.description')}
+          </div>
         </div>
-        <div className="flex items-center gap-3 w-full sm:w-auto">
-          <SearchInput
-            placeholder={t('tools.list.searchPlaceholder')}
-            value={searchQuery}
-            onChange={setSearchQuery}
-            className="w-full bg-background"
-            containerClassName="flex-1 sm:w-64"
-          />
-          <Button className="bg-primary text-primary-foreground hover:bg-primary/90 shrink-0" onClick={() => setIsConnectMcpOpen(true)}>
-            <Plus className="h-4 w-4 mr-1 sm:mr-2" />
-            <span className="hidden sm:inline">{t('tools.mcp.addConnector')}</span>
-            <span className="sm:hidden">{t('common.add') || t('tools.mcp.addConnector')}</span>
-          </Button>
-          <Dialog
-            open={isMcpDialogOpen}
-            onOpenChange={(nextOpen) => {
-              setIsMcpDialogOpen(nextOpen)
-              if (!nextOpen) {
-                connectorEditRequestRef.current += 1
-                setCustomApiEditBaseline(null)
-                setMcpEditBaseline(null)
-                setRuntimeValidationError(null)
-              }
-            }}
-          >
-            <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
-              <DialogHeader>
-                <DialogTitle>
-                  {editingServer ? mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.editCustomApi') : t('tools.mcp.dialog.editTitle') : mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.addCustomApi') : t('tools.mcp.dialog.addTitle')}
-                </DialogTitle>
-                <DialogDescription>
-                  {mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.customApiDescription') : t('tools.mcp.dialog.description')}
-                </DialogDescription>
-              </DialogHeader>
-              <div className="space-y-4">
-                {mcpFormData.transport === 'custom_api' ? (
-                  <>
-                    <CustomApiForm
-                      key={editingServer?.id || 'new'}
-                      mcpFormData={mcpFormData}
-                      setMcpFormData={setMcpFormData}
-                      customApiEnv={customApiEnv}
-                      setCustomApiEnv={setCustomApiEnv}
-                      onRuntimeValidationErrorChange={setRuntimeValidationError}
-                      originalEnvObj={customApiEditBaseline?.env ?? {}}
-                    />
-                  </>
-                ) : (
-                  <>
-                    <CustomMcpForm
-                      mcpFormData={mcpFormData}
-                      setMcpFormData={setMcpFormData}
-                      serverId={editingServer?.id}
-                      onOAuthStatusChange={loadMCPServers}
-                      onRuntimeValidationErrorChange={setRuntimeValidationError}
-                    />
-                  </>
-                )}
-              </div>
-              <DialogFooter>
-                <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)}>
-                  {t('tools.mcp.buttons.cancel')}
-                </Button>
-                <Button
-                  onClick={handleSaveMcpServer}
-                  disabled={
-                    isLoading ||
-                    !mcpFormData.name.trim() ||
-                    (mcpFormData.transport === 'custom_api' && customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
-                  }
-                >
-                  {isLoading && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                  {t('tools.mcp.buttons.save')}
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
+
+        {/* Pill search bar */}
+        <div className="flex w-full max-w-[620px]">
+          <div className="flex w-full items-center gap-3 rounded-full border-[1.5px] border-border bg-background px-5 py-[13px] shadow-[0_1px_3px_rgba(0,0,0,0.06)]">
+            <Search className="h-[18px] w-[18px] flex-shrink-0 text-muted-foreground" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder={t('tools.list.searchPlaceholder')}
+              className="w-full border-none bg-transparent text-sm text-foreground outline-none"
+            />
+          </div>
         </div>
       </div>
 
-      {/* Tabs */}
-      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <TabsList className="w-full justify-start bg-transparent p-0 h-auto border-b border-border/80 rounded-none flex overflow-x-auto">
-          <div className="flex space-x-4">
-            <TabsTrigger
-              value="all"
-              className="data-[state=active]:text-primary font-medium data-[state=active]:border-b-2 data-[state=active]:border-primary"
-            >
-              {t('tools.tabs.all')}
-            </TabsTrigger>
-            {categories.map(category => (
-              <TabsTrigger
-                key={category}
-                value={category}
-                className="data-[state=active]:text-primary font-medium data-[state=active]:border-b-2 data-[state=active]:border-primary"
-              >
-                {getCategoryLabel(category)}
-              </TabsTrigger>
-            ))}
-            <TabsTrigger
-              value="mcp"
-              className="data-[state=active]:text-primary font-medium data-[state=active]:border-b-2 data-[state=active]:border-primary"
-            >
-              {t('tools.tabs.connectors')}
-            </TabsTrigger>
-          </div>
-        </TabsList>
+      {/* Pill tabs row */}
+      <div className="mb-7 grid grid-cols-[auto_1fr_auto] items-start gap-3">
+        <Button
+          className="h-[30px] shrink-0 whitespace-nowrap rounded-lg bg-primary px-3 text-xs text-primary-foreground hover:bg-primary/90"
+          size="sm"
+          onClick={() => setIsConnectMcpOpen(true)}
+        >
+          <Plus className="h-3.5 w-3.5 mr-1" />
+          {t('tools.mcp.addConnector')}
+        </Button>
 
-        <div className="mt-6">
-          <TabsContent value={activeTab} className="m-0">
-            <div className="w-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-              {isAdmin && (activeTab === 'all' || activeTab === 'basic') && filteredSearchProviderTools.map((tool) => (
-                <ConfigurableToolCard key={`config-${tool.tool_name}`} tool={tool} />
-              ))}
-
-              {/* Show tools matching the tab */}
-              {activeTab !== 'mcp' && filteredTools.map(tool => (
-                <ToolCard key={`${tool.category}-${tool.name}`} tool={tool} />
-              ))}
-
-              {/* Show MCP servers only in 'all' or 'mcp' tab */}
-              {(activeTab === 'all' || activeTab === 'mcp') && filteredMcpServers.map(server => (
-                <MCPServerCard key={`mcp-${server.id}`} server={server} />
-              ))}
-
-              {/* Empty State */}
-              {(activeTab !== 'mcp' && filteredTools.length === 0 &&
-                filteredSearchProviderTools.length === 0 &&
-                ((activeTab !== 'all' && activeTab !== 'mcp') || (activeTab === 'all' && filteredMcpServers.length === 0)) &&
-                (activeTab !== 'mcp' || filteredMcpServers.length === 0)) && (
-                  <div className="col-span-full flex justify-center">
-                    <EmptyState />
-                  </div>
+        <div className="flex flex-wrap items-center justify-center gap-1.5">
+          {allTabs.map((tab) => {
+            const isActive = activeTab === tab.id
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={cn(
+                  "rounded-full px-4 py-1.5 text-xs transition-all duration-150",
+                  isActive
+                    ? "border-none bg-[linear-gradient(135deg,rgb(48,64,207),rgb(60,131,246))] font-semibold text-white"
+                    : "border border-[rgba(60,131,246,0.16)] bg-transparent font-medium text-muted-foreground"
                 )}
-
-              {/* Special case: Tab is MCP and no servers */}
-              {activeTab === 'mcp' && filteredMcpServers.length === 0 && (
-                <div className="col-span-full flex justify-center">
-                  <EmptyState />
-                </div>
-              )}
-            </div>
-          </TabsContent>
+              >
+                {tab.label}
+              </button>
+            )
+          })}
         </div>
-      </Tabs>
+
+        <span className="shrink-0 whitespace-nowrap rounded-full border border-[rgba(60,131,246,0.18)] bg-[rgba(60,131,246,0.08)] px-[10px] py-[3px] text-[11px] font-semibold text-[rgb(60,131,246)]">
+          {totalCount} items
+        </span>
+      </div>
+
+      {/* Add connector / edit dialogs */}
+      <Dialog
+        open={isMcpDialogOpen}
+        onOpenChange={(nextOpen) => {
+          setIsMcpDialogOpen(nextOpen)
+          if (!nextOpen) {
+            connectorEditRequestRef.current += 1
+            setCustomApiEditBaseline(null)
+            setMcpEditBaseline(null)
+            setRuntimeValidationError(null)
+          }
+        }}
+      >
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>
+              {editingServer ? mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.editCustomApi') : t('tools.mcp.dialog.editTitle') : mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.addCustomApi') : t('tools.mcp.dialog.addTitle')}
+            </DialogTitle>
+            <DialogDescription>
+              {mcpFormData.transport === 'custom_api' ? t('tools.mcp.dialog.customApiDescription') : t('tools.mcp.dialog.description')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            {mcpFormData.transport === 'custom_api' ? (
+              <CustomApiForm
+                key={editingServer?.id || 'new'}
+                mcpFormData={mcpFormData}
+                setMcpFormData={setMcpFormData}
+                customApiEnv={customApiEnv}
+                setCustomApiEnv={setCustomApiEnv}
+                onRuntimeValidationErrorChange={setRuntimeValidationError}
+                originalEnvObj={customApiEditBaseline?.env ?? {}}
+              />
+            ) : (
+              <CustomMcpForm
+                mcpFormData={mcpFormData}
+                setMcpFormData={setMcpFormData}
+                serverId={editingServer?.id}
+                onOAuthStatusChange={loadMCPServers}
+                onRuntimeValidationErrorChange={setRuntimeValidationError}
+              />
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)}>
+              {t('tools.mcp.buttons.cancel')}
+            </Button>
+            <Button
+              onClick={handleSaveMcpServer}
+              disabled={
+                isLoading ||
+                !mcpFormData.name.trim() ||
+                (mcpFormData.transport === 'custom_api' && customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
+              }
+            >
+              {isLoading && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              {t('tools.mcp.buttons.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Tools grid */}
+      <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 xl:grid-cols-4">
+        {isAdmin && (activeTab === 'all' || activeTab === 'basic') && filteredSearchProviderTools.map((tool) => (
+          <ConfigurableToolCard key={`config-${tool.tool_name}`} tool={tool} />
+        ))}
+
+        {activeTab !== 'mcp' && filteredTools.map(tool => (
+          <ToolCard key={`${tool.category}-${tool.name}`} tool={tool} />
+        ))}
+
+        {(activeTab === 'all' || activeTab === 'mcp') && filteredMcpServers.map(server => (
+          <MCPServerCard key={`mcp-${server.id}`} server={server} />
+        ))}
+
+        {(activeTab !== 'mcp' && filteredTools.length === 0 &&
+          filteredSearchProviderTools.length === 0 &&
+          ((activeTab !== 'all' && activeTab !== 'mcp') || (activeTab === 'all' && filteredMcpServers.length === 0)) &&
+          (activeTab !== 'mcp' || filteredMcpServers.length === 0)) && (
+            <div className="col-span-full flex justify-center">
+              <EmptyState />
+            </div>
+          )}
+
+        {activeTab === 'mcp' && filteredMcpServers.length === 0 && (
+          <div className="col-span-4 flex justify-center">
+            <EmptyState />
+          </div>
+        )}
+      </div>
 
       <Dialog open={isSqlManagerOpen} onOpenChange={setIsSqlManagerOpen}>
         <DialogContent className="max-w-4xl max-h-[85vh] overflow-y-auto">

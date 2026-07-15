@@ -1,8 +1,7 @@
 "use client";
 
 import { useState, type KeyboardEvent, type MouseEvent } from "react";
-import { ChevronRight, Clock, Heart, Play } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { Clock, Heart, Play } from "lucide-react";
 import type { Template } from "@/types/template";
 import { cn } from "@/lib/utils";
 import { isNestedInteractiveElement } from "./template-card-utils";
@@ -12,9 +11,6 @@ interface LibraryTemplateCardProps {
   categoryLabel?: string;
   useLabel: string;
   defaultSetupTime: string;
-  accentColorClassName?: string;
-  accentSoftClassName?: string;
-  accentHex?: string;
   onUse: (templateId: string) => void;
   onLike?: (templateId: string, event: MouseEvent<HTMLButtonElement>) => void;
   className?: string;
@@ -54,9 +50,6 @@ export function LibraryTemplateCard({
   categoryLabel,
   useLabel,
   defaultSetupTime,
-  accentColorClassName = "bg-[#5B67FF]",
-  accentSoftClassName = "text-[#5B67FF]",
-  accentHex = "#5B67FF",
   onUse,
   onLike,
   className,
@@ -87,41 +80,50 @@ export function LibraryTemplateCard({
       onClick={handleActivate}
       onKeyDown={handleKeyDown}
       className={cn(
-        "group flex min-h-[250px] cursor-pointer flex-col overflow-hidden rounded-2xl border border-[#E7EAF3] bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-md",
+        "group relative flex cursor-pointer flex-col overflow-hidden rounded-[14px] border border-[rgba(60,131,246,0.22)] bg-[hsl(217_85%_56%/0.03)] transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_10px_32px_rgba(0,0,0,0.11),0_2px_8px_rgba(0,0,0,0.06)]",
         className
       )}
     >
-      <div className={cn("h-1 w-full", accentColorClassName)} />
+      {/* 3px blue top strip — always blue regardless of category */}
+      <div className="h-[3px] flex-shrink-0 bg-[rgb(60,131,246)]" />
 
-      <div className="flex flex-1 flex-col p-4">
-        <div className="flex items-center justify-between gap-3">
-          <span className={cn("text-[10.5px] font-bold uppercase tracking-[0.06em]", accentSoftClassName)}>
+      <div className="flex flex-1 flex-col p-[18px_20px_16px]">
+        {/* Category + setup time */}
+        <div className="mb-[10px] flex items-center justify-between">
+          <span className="text-[10px] font-bold uppercase tracking-[0.08em] text-[rgb(60,131,246)]">
             {categoryLabel || template.category}
           </span>
-          <div className="flex items-center gap-1 text-[11px] text-[#6B7280]">
-            <Clock className="h-[11px] w-[11px]" />
+          <div className="flex items-center gap-[3px] whitespace-nowrap text-[10.5px] text-muted-foreground">
+            <Clock className="h-[11px] w-[11px] flex-shrink-0" />
             <span>{template.setup_time || defaultSetupTime}</span>
           </div>
         </div>
 
-        <h3 className="mt-[10px] text-[15px] font-bold leading-[1.3] text-[#111827]">{template.name}</h3>
+        <h3 className="mb-[10px] text-[14px] font-bold leading-[1.3] tracking-[-0.02em] text-foreground">
+          {template.name}
+        </h3>
 
-        <div className="mt-3 flex-1 space-y-[6px]">
+        {/* Bullet list */}
+        <ul className="mb-[14px] flex flex-1 flex-col gap-[5px] p-0">
           {items.map((item, index) => (
-            <div key={`${template.id}-${index}`} className="flex items-start gap-[7px] text-[12.5px] leading-[1.45] text-[#374151]">
-              <ChevronRight className={cn("mt-1 h-[11px] w-[11px] shrink-0", accentSoftClassName)} strokeWidth={2.4} />
-              <span className="line-clamp-2 flex-1">{item}</span>
-            </div>
+            <li
+              key={`${template.id}-${index}`}
+              className="relative line-clamp-2 pl-3 text-[12px] leading-[1.45] text-muted-foreground"
+            >
+              <span className="absolute left-0 font-bold leading-[1.3] text-[rgb(47,121,238)]">›</span>
+              {item}
+            </li>
           ))}
-        </div>
+        </ul>
 
-        <div className="mt-[14px] border-t border-[#E5E7EB] pt-3">
-          <div className="flex items-center justify-between gap-[10px]">
+        {/* Footer */}
+        <div className="mt-auto border-t border-[rgba(60,131,246,0.08)] pt-[10px]">
+          <div className="flex items-center justify-between gap-2">
             <LibraryConnections template={template} />
-            <div className="flex items-center gap-[10px] text-[11.5px] text-[#6B7280]">
-              <div className="flex items-center gap-1">
-                <Play className="h-[10px] w-[10px] fill-current text-[#64748B]" />
-                <span>{template.used_count ?? 0}</span>
+            <div className="flex flex-shrink-0 items-center gap-[10px]">
+              <div className="flex items-center gap-1 text-[rgba(60,131,246,0.55)]">
+                <Play className="h-[10px] w-[10px] flex-shrink-0 fill-current" />
+                <span className="text-[11px] font-bold text-muted-foreground">{template.used_count ?? 0}</span>
               </div>
               <button
                 type="button"
@@ -130,8 +132,9 @@ export function LibraryTemplateCard({
                   onLike?.(template.id, event);
                 }}
                 className={cn(
-                  "flex items-center gap-1 transition-colors",
-                  template.is_liked ? "text-pink-500" : onLike ? "hover:text-pink-500" : "cursor-default"
+                  "flex items-center gap-1 border-none bg-transparent p-0",
+                  onLike ? "cursor-pointer" : "cursor-default",
+                  template.is_liked ? "text-pink-500" : "text-[rgba(60,131,246,0.55)]"
                 )}
               >
                 <Heart
@@ -140,20 +143,19 @@ export function LibraryTemplateCard({
                     template.is_liked ? "text-rose-500" : "text-rose-400/70"
                   )}
                 />
-                <span>{template.likes ?? 0}</span>
+                <span className="text-[11px] font-bold text-muted-foreground">{template.likes ?? 0}</span>
               </button>
             </div>
           </div>
 
-          <Button
+          <button
             type="button"
-            variant="outline"
-            className="mt-3 h-9 w-full rounded-lg border bg-transparent text-[12px] font-bold uppercase tracking-[0.04em] hover:text-inherit"
-            style={{
-              borderColor: isUseButtonHovered ? accentHex : `${accentHex}40`,
-              backgroundColor: isUseButtonHovered ? `${accentHex}10` : "transparent",
-              color: accentHex,
-            }}
+            className={cn(
+              "mt-[14px] w-full rounded-lg py-[7px] font-inherit text-[11.5px] font-semibold uppercase tracking-[0.04em] transition-all duration-200",
+              isUseButtonHovered
+                ? "border border-transparent bg-[linear-gradient(135deg,rgb(48,64,207),rgb(60,131,246))] text-white"
+                : "border border-[rgba(60,131,246,0.28)] bg-transparent text-[rgb(60,131,246)]"
+            )}
             onClick={(event) => {
               event.stopPropagation();
               handleActivate();
@@ -162,7 +164,7 @@ export function LibraryTemplateCard({
             onMouseLeave={() => setIsUseButtonHovered(false)}
           >
             {useLabel}
-          </Button>
+          </button>
         </div>
       </div>
     </div>

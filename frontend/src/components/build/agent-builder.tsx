@@ -1355,8 +1355,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       {/* Header moved to middle panel */}
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-[240px] flex-1">
-          <h1 className="mb-1 text-3xl font-bold break-words">{name || t("builds.editor.header.title")}</h1>
-          <p className="text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
+          <h1 className="mb-0.5 text-[20px] font-bold break-words leading-tight">{name || t("builds.editor.header.title")}</h1>
+          <p className="text-[13px] text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
         </div>
         <div className="flex max-w-full flex-wrap items-center gap-2 xl:gap-4">
           {readOnly ? (

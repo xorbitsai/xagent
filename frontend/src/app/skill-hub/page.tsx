@@ -339,7 +339,7 @@ export default function SkillHubPage() {
           <div className="rounded-2xl bg-emerald-500/10 p-3 text-emerald-500">
             <Library className="h-8 w-8" />
           </div>
-          <h1 className="text-3xl font-bold tracking-tight">{t("skillHub.page.title")}</h1>
+          <h1 className="text-[22px] font-bold tracking-tight">{t("skillHub.page.title")}</h1>
           <p className="max-w-2xl text-sm text-muted-foreground">
             {t("skillHub.page.subtitle")}
           </p>

@@ -185,8 +185,8 @@ export default function ChannelsPage() {
     <div className="w-full p-8 space-y-6 overflow-auto">
       <div className="flex justify-between items-center mb-8">
         <div>
-          <h1 className="text-3xl font-bold mb-1">{t("channels.page_title")}</h1>
-          <p className="text-muted-foreground">{t("channels.page_description")}</p>
+          <h1 className="text-[22px] font-bold leading-tight">{t("channels.page_title")}</h1>
+          <p className="text-[13px] text-muted-foreground mt-0.5">{t("channels.page_description")}</p>
         </div>
       </div>
 

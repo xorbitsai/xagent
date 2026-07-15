@@ -1000,7 +1000,6 @@ Build when you need.`,
         description: "Try adjusting your search or add a new tool",
       },
       noDescription: "No description provided",
-      transport: "Transport",
       usedByAgents: "Used by {count} agents",
     },
     mcp: {

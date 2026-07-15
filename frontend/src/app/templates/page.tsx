@@ -1,15 +1,14 @@
 "use client";
 
 import { useI18n } from "@/contexts/i18n-context";
-import { Loader2, Search, Star } from "lucide-react";
+import { Loader2, Search } from "lucide-react";
 import { useState, useEffect, useMemo } from "react";
-import { getApiUrl } from "@/lib/utils";
+import { getApiUrl, cn } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import { apiRequest } from "@/lib/api-wrapper";
 import type { Template } from "@/types/template";
 import { FeaturedTemplateCard } from "@/components/templates/featured-template-card";
 import { LibraryTemplateCard } from "@/components/templates/library-template-card";
-import { SegmentedTabs } from "@/components/ui/segmented-tabs";
 import type { TranslationKey } from "@/i18n/translations";
 
 interface CategorySection {
@@ -29,14 +28,6 @@ const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   customer_service: "templates.categoryTitles.customer_service",
   finance_lms_ops: "templates.categoryTitles.finance_lms_ops",
   security: "templates.categoryTitles.security",
-};
-
-const CATEGORY_ACCENTS: Record<string, { border: string; text: string; hex: string }> = {
-  support: { border: "bg-[#3B5AF6]", text: "text-[#3B5AF6]", hex: "#3B5AF6" },
-  sales: { border: "bg-[#15A34A]", text: "text-[#15A34A]", hex: "#15A34A" },
-  marketing: { border: "bg-[#EC4899]", text: "text-[#EC4899]", hex: "#EC4899" },
-  research: { border: "bg-[#7C3AED]", text: "text-[#7C3AED]", hex: "#7C3AED" },
-  productivity: { border: "bg-[#F59E0B]", text: "text-[#F59E0B]", hex: "#F59E0B" },
 };
 
 const normalizeCategoryKey = (category: string) =>
@@ -77,13 +68,6 @@ export default function TemplatesPage() {
     const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(category)];
     return key ? t(key) : formatFallbackLabel(category);
   };
-
-  const categoryAccent = (category: string) =>
-    CATEGORY_ACCENTS[normalizeCategoryKey(category)] || {
-      border: "bg-[#94A3B8]",
-      text: "text-[#94A3B8]",
-      hex: "#94A3B8",
-    };
 
   const categories = useMemo(() => {
     const preferred = ["Sales", "Marketing", "Support", "Research", "Productivity"];
@@ -178,105 +162,123 @@ export default function TemplatesPage() {
   };
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto bg-[#F6F7FB] dark:bg-background">
-      <div className="mx-auto w-full p-6">
-        <div className="mb-[22px] max-w-[600px]">
-          <h1 className="text-[34px] font-bold tracking-tight text-foreground">{t("templates.title")}</h1>
-          <p className="mt-1 text-[13.5px] leading-[1.55] text-muted-foreground">{t("templates.subtitle")}</p>
-        </div>
-
-        <div className="mb-[22px] flex flex-wrap items-center gap-3">
-          <div className="relative w-full max-w-[320px]">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-[14px] w-[14px] -translate-y-1/2 text-muted-foreground" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={t("templates.searchPlaceholder")}
-              className="h-[38px] w-full rounded-[8px] border border-[#E7EAF3] bg-white pl-9 pr-4 text-[13px] placeholder:text-muted-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/10"
-            />
+    <div className="flex h-full flex-col overflow-y-auto p-[48px_52px_72px]">
+      {/* Hero — bleeds to edges via negative margin */}
+      <div className="m-[-48px_-52px_36px] flex flex-col items-center gap-[14px] border-b border-border bg-background p-[48px_64px_44px] text-center">
+        <div className="flex w-full flex-col items-center gap-[14px]">
+          <div>
+            <div className="mb-1 text-[30px] font-extrabold tracking-[-0.04em] text-foreground">
+              {t("templates.title")}
+            </div>
+            <div className="text-[13px] tracking-[0.01em] text-muted-foreground">
+              {t("templates.subtitle")}
+            </div>
           </div>
 
-          <SegmentedTabs
-            items={categories}
-            value={selectedCategory}
-            onValueChange={setSelectedCategory}
-            className="shrink-0"
-          />
-
-          <div className="flex-1" />
-
-          <div className="shrink-0 rounded-full bg-[#EEF2FF] px-[10px] py-[5px] text-[12px] font-semibold text-[#3B5AF6]">
-            {filteredTemplates.length === 1
-              ? t("templates.countOne", { count: filteredTemplates.length })
-              : t("templates.countOther", { count: filteredTemplates.length })}
+          {/* Pill search bar */}
+          <div className="flex w-full max-w-[620px]">
+            <div className="flex w-full items-center gap-3 rounded-full border-[1.5px] border-border bg-background px-5 py-[13px] shadow-[0_1px_3px_rgba(0,0,0,0.06)]">
+              <Search className="h-[18px] w-[18px] flex-shrink-0 text-muted-foreground" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={t("templates.searchPlaceholder")}
+                className="w-full border-none bg-transparent text-sm text-foreground outline-none"
+              />
+            </div>
           </div>
         </div>
-
-        {loading ? (
-          <div className="flex h-64 items-center justify-center">
-            <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-          </div>
-        ) : (
-          <div className="space-y-7">
-            {selectedCategory === "All" && !searchQuery && featuredTemplates.length > 0 ? (
-              <section className="space-y-3">
-                <div className="flex items-center gap-[6px] text-[11.5px] font-bold uppercase tracking-[0.06em] text-[#64748B]">
-                  <Star className="h-[13px] w-[13px] text-yellow-500" />
-                  <span>{t("templates.categoryTitles.featured")}</span>
-                </div>
-                <div className="grid grid-cols-1 gap-[14px] xl:grid-cols-3">
-                  {featuredTemplates.map((template) => (
-                    <FeaturedTemplateCard
-                      key={template.id}
-                      template={template}
-                      categoryLabel={categoryLabel(template.category)}
-                      popularLabel={t("templates.popular")}
-                      runsLabel={t("templates.runs")}
-                      onUse={handleUseTemplate}
-                      onLike={handleLikeTemplate}
-                    />
-                  ))}
-                </div>
-              </section>
-            ) : null}
-
-            {sections.map((section) => (
-              <section key={section.id} className="space-y-3">
-                <div className="flex items-center gap-[6px] text-[11.5px] font-bold uppercase tracking-[0.06em] text-[#64748B]">
-                  <span
-                    className="h-[5px] w-[5px] rounded-full"
-                    style={{ background: categoryAccent(section.templates[0]?.category || section.title).hex }}
-                  />
-                  <span>{section.title}</span>
-                </div>
-                <div className="grid grid-cols-1 gap-[14px] xl:grid-cols-3">
-                  {section.templates.map((template) => (
-                    <LibraryTemplateCard
-                      key={template.id}
-                      template={template}
-                      categoryLabel={categoryLabel(template.category)}
-                      useLabel={t("templates.useTemplate")}
-                      defaultSetupTime={t("templates.defaultSetupTime")}
-                      accentColorClassName={categoryAccent(template.category).border}
-                      accentSoftClassName={categoryAccent(template.category).text}
-                      accentHex={categoryAccent(template.category).hex}
-                      onUse={handleUseTemplate}
-                      onLike={handleLikeTemplate}
-                    />
-                  ))}
-                </div>
-              </section>
-            ))}
-
-            {sections.length === 0 && (
-              <div className="rounded-2xl border border-dashed border-border bg-white px-6 py-20 text-center text-muted-foreground">
-                <p className="text-[15px]">{t("templates.noResults")}</p>
-              </div>
-            )}
-          </div>
-        )}
       </div>
+
+      {/* Category tabs */}
+      <div className="relative mb-5 flex flex-wrap items-center justify-center gap-1.5">
+        {categories.map((cat) => {
+          const isActive = selectedCategory === cat.id;
+          return (
+            <button
+              key={cat.id}
+              onClick={() => setSelectedCategory(cat.id)}
+              className={cn(
+                "rounded-full px-4 py-1.5 text-xs transition-all duration-150",
+                isActive
+                  ? "border-none bg-[linear-gradient(135deg,rgb(48,64,207),rgb(60,131,246))] font-semibold text-white"
+                  : "border border-[rgba(60,131,246,0.16)] bg-transparent font-medium text-muted-foreground"
+              )}
+            >
+              {cat.label}
+            </button>
+          );
+        })}
+        <span className="absolute right-0 rounded-full border border-[rgba(60,131,246,0.18)] bg-[rgba(60,131,246,0.08)] px-[10px] py-[3px] text-[11px] font-semibold text-[rgb(60,131,246)]">
+          {filteredTemplates.length === 1
+            ? t("templates.countOne", { count: filteredTemplates.length })
+            : t("templates.countOther", { count: filteredTemplates.length })}
+        </span>
+      </div>
+
+      {/* Content */}
+      {loading ? (
+        <div className="flex h-64 items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+        </div>
+      ) : (
+        <div className="flex flex-col gap-12">
+          {/* Featured section */}
+          {selectedCategory === "All" && !searchQuery && featuredTemplates.length > 0 && (
+            <div>
+              {/* Featured cards row */}
+              <div className="mb-8 flex w-full flex-wrap gap-[10px]">
+                <div className="mb-1.5 basis-full text-[10.5px] font-bold uppercase tracking-[0.08em] text-muted-foreground">
+                  {t("templates.categoryTitles.featured")}
+                </div>
+                {featuredTemplates.map((template) => (
+                  <div key={template.id} className="flex min-w-[200px] flex-1">
+                    <FeaturedTemplateCard
+                      template={template}
+                      categoryLabel={categoryLabel(template.category)}
+                      onUse={handleUseTemplate}
+                      onLike={handleLikeTemplate}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Library sections */}
+          {sections.map((section) => (
+            <div key={section.id}>
+              {/* Section title */}
+              <div className="mb-[18px] flex items-center gap-3 text-[10.5px] font-bold uppercase tracking-[0.11em] text-[rgb(60,131,246)]">
+                {section.title}
+                <span className="h-px flex-1 bg-[linear-gradient(90deg,rgba(60,131,246,0.22)_0%,transparent_100%)]" />
+              </div>
+
+              {/* 4-column grid */}
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+                {section.templates.map((template) => (
+                  <LibraryTemplateCard
+                    key={template.id}
+                    template={template}
+                    categoryLabel={categoryLabel(template.category)}
+                    useLabel={t("templates.useTemplate")}
+                    defaultSetupTime={t("templates.defaultSetupTime")}
+                    onUse={handleUseTemplate}
+                    onLike={handleLikeTemplate}
+                  />
+                ))}
+              </div>
+            </div>
+          ))}
+
+          {sections.length === 0 && (
+            <div className="rounded-[14px] border border-dashed border-border bg-background p-[72px_24px] text-center text-muted-foreground">
+              <p className="text-[15px]">{t("templates.noResults")}</p>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -330,7 +330,7 @@ export function MemoryPage() {
       {/* Top Header */}
       <div className="border-b flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 p-4 sm:p-8">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t("memory.header.title")}</h1>
+          <h1 className="text-[22px] font-bold leading-tight">{t("memory.header.title")}</h1>
           <p className="text-sm sm:text-base text-muted-foreground">{t("memory.header.description")}</p>
         </div>
 

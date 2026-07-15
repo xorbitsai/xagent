@@ -349,7 +349,7 @@ export function FilesPage() {
       {/* Header (Title + Actions) */}
       <div className="border-b flex flex-col sm:flex-row justify-between items-start sm:items-center p-4 sm:p-8 gap-4">
         <div className="space-y-1 w-full sm:w-auto">
-          <h1 className="text-2xl sm:text-3xl font-bold mb-1">{t('files.header.title')}</h1>
+          <h1 className="text-[22px] font-bold leading-tight">{t('files.header.title')}</h1>
           <p className="text-sm sm:text-base text-muted-foreground">{t('files.header.description')}</p>
         </div>
 

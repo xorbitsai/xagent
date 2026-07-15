@@ -18,6 +18,7 @@ import {
     LayoutTemplate,
     Globe,
     Key,
+    MoreHorizontal,
 } from "lucide-react"
 
 interface SidebarUser {
@@ -179,7 +180,7 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
                 name: "More",
                 nameKey: "nav.more",
                 href: "__resources_more__",
-                icon: Layers,
+                icon: MoreHorizontal,
                 color: "text-gray-500",
                 children: getMoreResourceItemsForUser(user)
             }

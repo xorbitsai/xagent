@@ -85,26 +85,26 @@ export const themes: Record<string, Theme> = {
       cardForeground: '222.2 84% 4.9%',
       popover: '0 0% 100%',
       popoverForeground: '222.2 84% 4.9%',
-      primary: '221.2 83.2% 53.3%',
+      primary: '234 62% 50%',
       primaryForeground: '210 40% 98%',
-      secondary: '210 40% 96%',
+      secondary: '220 14% 96%',
       secondaryForeground: '222.2 84% 4.9%',
-      muted: '210 30% 95%',
-      mutedForeground: '215.4 25% 40%',
-      accent: '210 40% 96%',
+      muted: '220 13% 92%',
+      mutedForeground: '215 14% 52%',
+      accent: '220 13% 92%',
       accentForeground: '222.2 84% 4.9%',
       destructive: '0 84.2% 60.2%',
       destructiveForeground: '210 40% 98%',
-      border: '214.3 31.8% 91.4%',
-      input: '214.3 31.8% 91.4%',
-      ring: '221.2 83.2% 53.3%',
+      border: '220 13% 90%',
+      input: '220 13% 88%',
+      ring: '234 62% 50%',
       // Extended colors
-      gradientFrom: '252 100% 67%', // Purple-400
-      gradientTo: '320 85% 60%', // Pink/Magenta
-      sidebarActiveBgFrom: '270 95% 95%', // Purple-50/100 equivalent
-      sidebarActiveBgTo: '270 50% 98%', // Purple-50/0 equivalent
-      sidebarActiveText: '270 95% 45%', // Purple-700
-      sidebarActiveBorder: '270 95% 60%', // Purple-600
+      gradientFrom: '234 62% 45%',
+      gradientTo: '234 62% 60%',
+      sidebarActiveBgFrom: '234 62% 50% / 0.09',
+      sidebarActiveBgTo: '234 62% 50% / 0',
+      sidebarActiveText: '234 62% 42%',
+      sidebarActiveBorder: '234 62% 50%',
     },
   },
   blue: {

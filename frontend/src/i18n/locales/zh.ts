@@ -1000,7 +1000,6 @@ Build when you need.`,
         description: "尝试调整搜索条件或添加新工具",
       },
       noDescription: "未提供描述",
-      transport: "传输协议",
       usedByAgents: "被 {count} 个任务使用",
     },
     mcp: {

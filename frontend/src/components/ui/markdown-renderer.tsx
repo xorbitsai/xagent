@@ -252,10 +252,15 @@ type MarkdownRendererContextValue = {
 type MarkdownComponentProps<Tag extends keyof React.JSX.IntrinsicElements> =
   React.ComponentPropsWithoutRef<Tag> & ExtraProps
 
-const MarkdownRendererContext = React.createContext<MarkdownRendererContextValue>({
-  openLabel: 'Open',
-  loadErrorText: 'Failed to load preview.',
-})
+const MarkdownRendererContext = React.createContext<MarkdownRendererContextValue | null>(null)
+
+function useMarkdownRendererContext(): MarkdownRendererContextValue {
+  const context = React.useContext(MarkdownRendererContext)
+  if (!context) {
+    throw new Error('Markdown components must be rendered within MarkdownRenderer')
+  }
+  return context
+}
 
 function MarkdownParagraph({
   node,
@@ -285,7 +290,7 @@ function MarkdownLink({
   ...props
 }: MarkdownComponentProps<'a'>) {
   const { onFileClick, onAgentClick, openLabel, loadErrorText } =
-    React.useContext(MarkdownRendererContext)
+    useMarkdownRendererContext()
 
   if (href && href.startsWith('file:')) {
     const filePath = href.replace(/^file:/, '')
@@ -358,16 +363,15 @@ function MarkdownLink({
 }
 
 function MarkdownImage({
-  node,
+  node: _node,
   src,
   alt,
   title,
   ...props
 }: MarkdownComponentProps<'img'>) {
   const { onFileClick, openLabel, loadErrorText } =
-    React.useContext(MarkdownRendererContext)
-  const resolvedSrc =
-    src || (typeof node?.properties?.src === 'string' ? node.properties.src : '')
+    useMarkdownRendererContext()
+  const resolvedSrc = src || ''
 
   if (resolvedSrc.startsWith('file:')) {
     const filePath = resolvedSrc.replace(/^file:/, '')

@@ -1181,13 +1181,6 @@ async def _load_server_tools_bounded(
     # (cancellation-resistant) load keeps counting against the cap.
     task.add_done_callback(lambda _t: gate.release())
 
-    remaining = max(0.0, deadline - loop.time())
-    done, _pending = await asyncio.wait({task}, timeout=remaining)
-    if task in done:
-        return task.result()
-
-    task.cancel()
-
     def _consume_result(t: "asyncio.Task[Any]") -> None:
         if t.cancelled():
             return
@@ -1199,6 +1192,24 @@ async def _load_server_tools_bounded(
                 exc,
             )
 
+    remaining = max(0.0, deadline - loop.time())
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+    except asyncio.CancelledError:
+        # Caller cancelled (run cancelled, lease lost): ``asyncio.wait``
+        # does not cancel its awaited tasks, so propagate the cancel to
+        # the load task ourselves or it would run — and hold its gate
+        # slot and transport — forever. A well-behaved load unwinds and
+        # frees the slot; a cancellation-resistant cleanup keeps its slot
+        # until it truly finishes, same as the timeout path.
+        task.cancel()
+        task.add_done_callback(_consume_result)
+        raise
+
+    if task in done:
+        return task.result()
+
+    task.cancel()
     task.add_done_callback(_consume_result)
     raise TimeoutError(
         f"MCP server {server_name} initialization timed out after "

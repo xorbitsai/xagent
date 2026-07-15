@@ -66,10 +66,15 @@ def _mark_session_statement(orm_execute_state: Any) -> None:
         orm_execute_state.session.info[_MAY_HAVE_WRITTEN_KEY] = True
 
 
-@event.listens_for(Session, "after_commit")
-@event.listens_for(Session, "after_rollback")
-def _clear_session_flushed(session: Session) -> None:
-    session.info[_MAY_HAVE_WRITTEN_KEY] = False
+@event.listens_for(Session, "after_transaction_end")
+def _clear_session_flushed(session: Session, transaction: Any) -> None:
+    # Clear only when the ROOT transaction ends (commit, rollback, or
+    # close). ``after_commit``/``after_rollback`` would fire for savepoint
+    # (begin_nested) completion too, while the outer transaction — and its
+    # uncommitted writes — is still open; clearing there would let the
+    # helper roll those writes away.
+    if transaction.parent is None:
+        session.info[_MAY_HAVE_WRITTEN_KEY] = False
 
 
 def release_db_connection_if_clean(db: Session | None) -> bool:

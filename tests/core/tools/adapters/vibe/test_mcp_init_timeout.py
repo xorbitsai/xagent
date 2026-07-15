@@ -131,6 +131,46 @@ async def test_burst_larger_than_gate_does_not_fan_out(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_caller_cancellation_cancels_child_and_frees_slot(monkeypatch):
+    """Cancelling the caller must propagate to the owned load task —
+    asyncio.wait doesn't do it — or cancelled requests would strand live
+    loads that hold gate slots and transports forever."""
+    monkeypatch.setattr(mcp_adapter_module, "_MAX_INFLIGHT_LOADS_PER_SERVER", 1)
+
+    load_started = asyncio.Event()
+    child_cancelled = asyncio.Event()
+
+    async def hung_but_cancellable_load():
+        load_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            raise
+        return []  # pragma: no cover
+
+    caller = asyncio.create_task(
+        _load_server_tools_bounded("cancel-server", hung_but_cancellable_load(), 30)
+    )
+    await asyncio.wait_for(load_started.wait(), timeout=5)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    # The child observed the cancellation (it would previously run forever)...
+    await asyncio.wait_for(child_cancelled.wait(), timeout=5)
+
+    # ...and released its slot: with a cap of 1, a fresh load on the same
+    # server can start and complete.
+    async def quick_load():
+        return ["tool"]
+
+    assert await _load_server_tools_bounded("cancel-server", quick_load(), 5) == [
+        "tool"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_bounded_load_disabled_with_zero_timeout():
     async def quick_load():
         return ["tool"]

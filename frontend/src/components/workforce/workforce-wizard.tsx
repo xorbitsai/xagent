@@ -133,6 +133,7 @@ export function WorkforceWizard({
     <div className="flex w-full flex-col gap-6">
       <Stepper
         currentStep={step + 1}
+        contentClassName="overflow-visible"
         steps={[
           {
             label: t("workforces.create.steps.nameAndManager"),

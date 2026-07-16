@@ -10,9 +10,16 @@ export interface Step {
 export interface StepperProps extends Omit<React.HTMLAttributes<HTMLDivElement>, 'content'> {
   steps: Step[]
   currentStep: number
+  contentClassName?: string
 }
 
-export function Stepper({ steps, currentStep, className, ...props }: StepperProps) {
+export function Stepper({
+  steps,
+  currentStep,
+  className,
+  contentClassName,
+  ...props
+}: StepperProps) {
   const currentStepContent = steps[currentStep - 1]?.content
 
   return (
@@ -67,7 +74,7 @@ export function Stepper({ steps, currentStep, className, ...props }: StepperProp
         })}
       </div>
       <div
-        className="flex-1 min-h-0 overflow-y-auto"
+        className={cn("flex-1 min-h-0 overflow-y-auto", contentClassName)}
         role="tabpanel"
         aria-label={`Content for ${steps[currentStep - 1]?.label}`}
       >

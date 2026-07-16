@@ -747,11 +747,6 @@ async def test_telegram_new_task_fallback_snapshots_empty(
             "xagent.web.channels.telegram.bot.persist_user_message",
             lambda **_kwargs: None,
         )
-        persisted_turns: list[dict[str, Any]] = []
-        monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.persist_telegram_assistant_turn",
-            lambda **kwargs: persisted_turns.append(kwargs),
-        )
 
         agent_manager = _FakeAgentManager(execution_result)
         monkeypatch.setattr(
@@ -803,7 +798,15 @@ async def test_telegram_new_task_fallback_snapshots_empty(
         assert task is not None
         assert task.connector_runtime_selected_refs == []
         assert _context_row_count(int(task.id)) == 0
-        assert len(persisted_turns) == expected_persisted_turns
+        persisted_turns = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task.id,
+                TaskChatMessage.role == "assistant",
+            )
+            .count()
+        )
+        assert persisted_turns == expected_persisted_turns
     finally:
         db.close()
 

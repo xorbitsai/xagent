@@ -907,15 +907,14 @@ class TelegramBotInstance:
                             run_snapshot.run_id,
                         )
 
-                if projection.transcript_content or projection.interactions:
-                    persist_telegram_assistant_turn(
-                        db=db,
-                        task_id=int(task.id),  # type: ignore
-                        user_id=int(user.id),  # type: ignore
-                        content=projection.transcript_content,
-                        interactions=projection.interactions,
-                        message_type=projection.message_type,
-                    )
+                persist_telegram_assistant_turn(
+                    db=db,
+                    task_id=int(task.id),  # type: ignore
+                    user_id=int(user.id),  # type: ignore
+                    content=projection.transcript_content,
+                    interactions=projection.interactions,
+                    message_type=projection.message_type,
+                )
 
                 output, image_refs, file_refs = self._extract_telegram_output_refs(
                     projection.visible_text,

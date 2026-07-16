@@ -12,14 +12,35 @@ row-level locks).
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from sqlalchemy import Engine, event
+from sqlalchemy.engine import make_url
 
 logger = logging.getLogger(__name__)
 
 # 5s gives concurrent writers room to wait out a short-lived write lock without
 # unbounded blocking.
 DEFAULT_BUSY_TIMEOUT_MS = 5000
+
+
+def ensure_sqlite_parent_directory(database_url: str) -> None:
+    """Create the SQLite database file's parent directory if it is missing.
+
+    sqlite3 creates a missing database file on connect but not missing parent
+    directories: on a fresh install the default ``~/.xagent`` storage root does
+    not exist yet, so the first connection fails with "unable to open database
+    file". Call this before creating an engine for a file-backed SQLite URL.
+
+    Non-SQLite, in-memory, and ``file:`` URI databases are ignored.
+    """
+    url = make_url(database_url)
+    if url.get_backend_name() != "sqlite":
+        return
+    database = url.database
+    if not database or database == ":memory:" or database.startswith("file:"):
+        return
+    Path(database).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
 
 def apply_sqlite_concurrency_pragmas(

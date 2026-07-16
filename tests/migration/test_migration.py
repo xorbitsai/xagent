@@ -128,11 +128,29 @@ class TestTryUpgradeDb:
         assert first_rows == expected_rows
         assert rows == expected_rows
 
+    def test_raises_friendly_error_when_db_revision_is_unknown(self):
+        engine = create_engine("sqlite:///:memory:")
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)")
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO alembic_version (version_num) "
+                    "VALUES ('29991231_revision_from_the_future')"
+                )
+            )
+
+        with pytest.raises(RuntimeError, match="newer version of xagent"):
+            try_upgrade_db(engine)
+
+    @patch("xagent.db.migration._check_revision_is_known")
     @patch("xagent.db.migration.command.upgrade")
     @patch("xagent.db.migration.create_alembic_config")
     @patch("xagent.db.migration.get_alembic_revision")
     def test_successful_upgrade(
-        self, mock_get_revision, mock_create_config, mock_upgrade
+        self, mock_get_revision, mock_create_config, mock_upgrade, _mock_check
     ):
         engine = MagicMock()
         mock_get_revision.return_value = "abc123"
@@ -186,11 +204,12 @@ class TestTryUpgradeDb:
         ):
             try_upgrade_db(engine)
 
+    @patch("xagent.db.migration._check_revision_is_known")
     @patch("xagent.db.migration.command.upgrade")
     @patch("xagent.db.migration.create_alembic_config")
     @patch("xagent.db.migration.get_alembic_revision")
     def test_raises_error_on_upgrade_failure(
-        self, mock_get_revision, mock_create_config, mock_upgrade
+        self, mock_get_revision, mock_create_config, mock_upgrade, _mock_check
     ):
         engine = MagicMock()
         mock_get_revision.return_value = "abc123"
@@ -199,12 +218,18 @@ class TestTryUpgradeDb:
         with pytest.raises(Exception, match="Upgrade failed"):
             try_upgrade_db(engine)
 
+    @patch("xagent.db.migration._check_revision_is_known")
     @patch("xagent.db.migration.logger")
     @patch("xagent.db.migration.command.upgrade")
     @patch("xagent.db.migration.create_alembic_config")
     @patch("xagent.db.migration.get_alembic_revision")
     def test_logs_upgrade_process(
-        self, mock_get_revision, mock_create_config, mock_upgrade, mock_logger
+        self,
+        mock_get_revision,
+        mock_create_config,
+        mock_upgrade,
+        mock_logger,
+        _mock_check,
     ):
         engine = MagicMock()
         mock_get_revision.return_value = "abc123"

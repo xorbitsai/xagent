@@ -7,7 +7,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
 
 from ...config import get_database_url, get_db_pool_kwargs
-from ...db.sqlite import apply_sqlite_concurrency_pragmas
+from ...db.sqlite import (
+    apply_sqlite_concurrency_pragmas,
+    ensure_sqlite_parent_directory,
+)
 
 _SessionLocal: sessionmaker[Session] | None = None
 
@@ -169,6 +172,7 @@ def init_db(db_url: str | None = None) -> None:
     # For SQLite, use NullPool to prevent connection pool issues
     # For other databases, use QueuePool with timeout settings
     if "sqlite" in database_url:
+        ensure_sqlite_parent_directory(database_url)
         _engine = create_engine(
             database_url,
             connect_args={"check_same_thread": False},

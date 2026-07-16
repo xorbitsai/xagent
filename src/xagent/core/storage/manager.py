@@ -18,7 +18,10 @@ from ...config import (
     get_default_sqlite_db_path,
 )
 from ...config import get_storage_root as get_config_storage_root
-from ...db.sqlite import apply_sqlite_concurrency_pragmas
+from ...db.sqlite import (
+    apply_sqlite_concurrency_pragmas,
+    ensure_sqlite_parent_directory,
+)
 
 __all__ = [
     "StorageRootManager",
@@ -151,6 +154,7 @@ def _get_adhoc_engine():  # type: ignore[no-untyped-def]
         if _adhoc_engine is None or _adhoc_engine_url != database_url:
             old_engine = _adhoc_engine
             if "sqlite" in database_url:
+                ensure_sqlite_parent_directory(database_url)
                 engine = create_engine(
                     database_url,
                     connect_args={"check_same_thread": False},

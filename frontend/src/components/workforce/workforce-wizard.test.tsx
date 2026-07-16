@@ -53,5 +53,13 @@ describe("WorkforceWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: /Manager Agent/ }))
 
     expect(screen.getByText("Manager Agent")).toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText("workforces.create.placeholders.name"), {
+      target: { value: "Launch Team" },
+    })
+    fireEvent.click(screen.getByText("common.next"))
+
+    expect(panel).toHaveClass("overflow-y-auto")
+    expect(panel).not.toHaveClass("overflow-visible")
   })
 })

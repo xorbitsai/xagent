@@ -103,15 +103,17 @@ async def create_workforce_run(
     is_visible: bool = True,
 ) -> WorkforceRunStartResult:
     workforce = ensure_workforce_access(db, user, workforce, action="run")
-    if workforce.status == "draft" and not is_preview:
-        raise HTTPException(status_code=400, detail="Workforce must be active to run")
-    policy = get_workforce_policy()
-    policy.before_workforce_run(db, user, workforce)
-
     normalized_message = normalize_text(message, "message", required=True)
 
     selected_files = _normalize_selected_file_ids(selected_file_ids)
-    snapshot = build_workforce_snapshot(db, user, workforce)
+    snapshot = build_workforce_snapshot(
+        db,
+        user,
+        workforce,
+        is_preview=is_preview,
+    )
+    policy = get_workforce_policy()
+    policy.before_workforce_run(db, user, workforce)
     manager_execution_mode = normalize_execution_mode(
         execution_mode or cast(Any, workforce.manager_agent).execution_mode
     )

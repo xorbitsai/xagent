@@ -71,10 +71,14 @@ def validate_workforce_for_run(
     db: Session,
     user: User,
     workforce: Workforce,
+    *,
+    is_preview: bool = False,
 ) -> tuple[Agent, list[WorkforceAgent]]:
     workforce = ensure_workforce_access(db, user, workforce, action="run")
     if workforce.status == "archived":
         raise HTTPException(status_code=400, detail="Archived workforce cannot run")
+    if workforce.status != "active" and not is_preview:
+        raise HTTPException(status_code=400, detail="Workforce must be active to run")
 
     manager_agent = ensure_workforce_agent_run_access(
         workforce.manager_agent, user, db, workforce
@@ -182,9 +186,18 @@ def build_agent_tool_overrides(
 
 
 def build_workforce_snapshot(
-    db: Session, user: User, workforce: Workforce
+    db: Session,
+    user: User,
+    workforce: Workforce,
+    *,
+    is_preview: bool = False,
 ) -> dict[str, Any]:
-    manager_agent, enabled_workers = validate_workforce_for_run(db, user, workforce)
+    manager_agent, enabled_workers = validate_workforce_for_run(
+        db,
+        user,
+        workforce,
+        is_preview=is_preview,
+    )
     snapshot_workers: list[dict[str, Any]] = []
     for worker in enabled_workers:
         alias = (

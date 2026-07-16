@@ -190,13 +190,20 @@ describe("deletePlanStep", () => {
       expect(result).toBe("Step 1: Gather data\nStep 2: Write report")
     })
 
-    it("does NOT renumber unrelated numbered lines outside the plan", () => {
-      // The version line "3.0" and "10." should not be touched by renumber()
-      const instructions = "Config version 3.0 applies.\n\n1. First step\n2. Second step\n3. Third step"
+    it("does NOT renumber a digit-prefixed line the parser skipped (not a plan step)", () => {
+      // "2.   " (whitespace-only content after the marker) matches renumber's
+      // digit-prefix shape but is skipped by parseInstructionSteps (empty step
+      // text), making it the one line form that collides with the plan's
+      // numbering pattern without being a plan step. An unrestricted per-line
+      // scan (the pre-fix behavior) would rewrite it to "1." and shift every
+      // following step's number off by one; the index-restricted renumber
+      // must leave it untouched.
+      const instructions = "1. First step here\n2.   \n3. Second real step\n4. Third real step"
       const result = deletePlanStep(instructions, 0)
-      expect(result).toContain("Config version 3.0 applies.")
-      expect(result).toContain("1. Second step")
-      expect(result).toContain("2. Third step")
+      const lines = result.split("\n")
+      expect(lines[0]).toBe("2.   ") // untouched — not part of the plan
+      expect(lines[1]).toBe("1. Second real step")
+      expect(lines[2]).toBe("2. Third real step")
     })
 
     it("correctly shifts indices of remaining steps after splice", () => {

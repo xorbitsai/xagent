@@ -548,8 +548,11 @@ export function AgentFlowView({
                           }
                           if (e.key === "Escape") {
                             e.preventDefault()
+                            // Blur (rather than clearing state directly) so the
+                            // onBlur handler consumes and resets ignoreBlurRef —
+                            // a stale true flag would swallow the next commit.
                             ignoreBlurRef.current = true
-                            setEditingStepIdx(null)
+                            e.currentTarget.blur()
                           }
                         }}
                         className="min-w-0 flex-1 border-none bg-transparent p-0 text-[11.5px] leading-relaxed text-foreground outline-none"

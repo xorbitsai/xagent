@@ -703,15 +703,11 @@ function ToolsPageContent() {
     return <Code className="h-6 w-6 text-slate-500" />
   }
 
-  const getBadgeInfo = (tool: Tool) => {
+  const getBadgeLabel = (tool: Tool) => {
     // Use display_category if available, otherwise fallback to category
-    const categoryDisplay = tool.display_category
-      ? tool.display_category  // Already formatted correctly (PPT not Ppt)
-      : tool.category
-        ? getCategoryLabel(tool.category)  // Fallback to translation
-        : t('tools.badges.types.tool');
-
-    return { label: categoryDisplay, variant: "secondary" as const }
+    if (tool.display_category) return tool.display_category  // Already formatted correctly (PPT not Ppt)
+    if (tool.category) return getCategoryLabel(tool.category)  // Fallback to translation
+    return t('tools.badges.types.tool')
   }
 
   // Get unique categories
@@ -820,7 +816,7 @@ function ToolsPageContent() {
   }
 
   const ToolCard = ({ tool }: { tool: Tool }) => {
-    const { label } = getBadgeInfo(tool)
+    const label = getBadgeLabel(tool)
     const icon = getToolIcon(tool.name, tool.type, tool.category)
     const configToolName = getConfigToolNameForRuntimeTool(tool)
     const configurableTool = configToolName ? configurableToolByName[configToolName] : undefined

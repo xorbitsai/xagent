@@ -579,7 +579,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
   if (allowCollapse && ((isAgentPage && !shouldShowSidebar) || !isSidebarOpen)) {
     return (
-      <div className="flex flex-col items-center justify-start py-3 w-[54px] bg-[hsl(220_14%_96%)] border-r border-[hsl(220_13%_88%)] shrink-0 h-full relative">
+      <div className="flex flex-col items-center justify-start py-3 w-[54px] bg-secondary border-r border-border shrink-0 h-full relative">
         <Link href="/task" className="flex items-center justify-center mb-6">
           <img
             src={branding.logoPath}
@@ -589,7 +589,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         </Link>
         <button
           onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
-          className="absolute -right-3 top-5 bg-white border border-[hsl(220_13%_88%)] rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
+          className="absolute -right-3 top-5 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
         >
           <ChevronRight className="h-4 w-4" />
         </button>
@@ -608,7 +608,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                     onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
                     className={cn(
                       "flex w-full items-center justify-center p-2 rounded-[7px] transition-colors",
-                      isActive ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]" : "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground"
+                      isActive ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground hover:bg-accent hover:text-foreground"
                     )}
                   >
                     <item.icon className="h-4 w-4" />
@@ -623,7 +623,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                   title={item.nameKey ? t(item.nameKey) : item.name}
                   className={cn(
                     "flex items-center justify-center p-2 rounded-[7px] transition-colors",
-                    isActive ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]" : "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground"
+                    isActive ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground hover:bg-accent hover:text-foreground"
                   )}
                 >
                   <item.icon className="h-4 w-4" />
@@ -632,13 +632,13 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
             })
           ))}
         </div>
-        <div className="mt-auto w-full px-1.5 border-t border-[hsl(220_13%_88%)] pt-3">
+        <div className="mt-auto w-full px-1.5 border-t border-border pt-3">
           <button
             onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
-            className="flex items-center justify-center w-full p-2 hover:bg-[hsl(220_13%_92%)] rounded-[7px] transition-colors"
+            className="flex items-center justify-center w-full p-2 hover:bg-accent rounded-[7px] transition-colors"
             title={user?.username || t('sidebar.user.defaultName')}
           >
-            <div className="h-7 w-7 rounded-full bg-[hsl(234_62%_50%)] flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
+            <div className="h-7 w-7 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
               {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
             </div>
           </button>
@@ -649,7 +649,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
   return (
     <div ref={sidebarRef} className={cn(
-      "flex flex-col bg-[hsl(220_14%_96%)] border-r border-[hsl(220_13%_88%)] transition-all duration-300 shrink-0",
+      "flex flex-col bg-secondary border-r border-border transition-all duration-300 shrink-0",
       isAgentPage ? "h-full" : "h-full",
       shouldShowSidebar ? "w-60" : "w-0",
       className
@@ -667,7 +667,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         {allowCollapse && (
           <button
             onClick={() => isAgentPage ? setIsExpanded(false) : setIsSidebarOpen(false)}
-            className="absolute -right-3 top-4 bg-white border border-[hsl(220_13%_88%)] rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
+            className="absolute -right-3 top-4 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
           >
             <ChevronLeft className="h-4 w-4" />
           </button>
@@ -696,8 +696,8 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                   const hasChildren = item.children && item.children.length > 0
                   const isExpanded = isMenuExpanded(item.href)
 
-                  const activeStyle = "bg-primary/[0.09] text-[hsl(234_62%_42%)] font-semibold rounded-[7px]"
-                  const inactiveStyle = "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground rounded-[7px]"
+                  const activeStyle = "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))] font-semibold rounded-[7px]"
+                  const inactiveStyle = "text-muted-foreground hover:bg-accent hover:text-foreground rounded-[7px]"
 
                   if (hasChildren) {
                     return (
@@ -710,7 +710,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                             )}
                           >
                             <div className="flex items-center gap-2.5">
-                              <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(234_62%_42%)]" : "text-muted-foreground")} />
+                              <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
                               {item.nameKey ? t(item.nameKey) : item.name}
                             </div>
                             <ChevronRight className="h-3 w-3 opacity-50" />
@@ -721,7 +721,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                             side="right"
                             align="start"
                             sideOffset={8}
-                            className="w-56 rounded-xl border border-border bg-white p-2 shadow-lg"
+                            className="w-56 rounded-xl border border-border bg-popover p-2 shadow-lg"
                           >
                             <div className="space-y-0.5">
                               {item.children.map((child: NavigationItem) => {
@@ -734,8 +734,8 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                                     className={cn(
                                       "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors",
                                       isChildActive
-                                        ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]"
-                                        : "text-foreground hover:bg-[hsl(220_13%_92%)]"
+                                        ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
+                                        : "text-foreground hover:bg-accent"
                                     )}
                                   >
                                     <child.icon className="h-4 w-4 text-muted-foreground" />
@@ -759,7 +759,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                         isActive ? activeStyle : inactiveStyle
                       )}
                     >
-                      <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(234_62%_42%)]" : "text-muted-foreground")} />
+                      <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
                       {item.nameKey ? t(item.nameKey) : item.name}
                     </Link>
                   )
@@ -770,7 +770,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         </nav>
 
         {/* History Section */}
-        <div className="flex flex-col overflow-hidden shrink-0 border-t border-[hsl(220_13%_88%)] pt-1 pb-4">
+        <div className="flex flex-col overflow-hidden shrink-0 border-t border-border pt-1 pb-4">
           <div
             className="px-2 pt-4 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between h-8 shrink-0"
           >
@@ -794,7 +794,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                     }
                   }}
                   containerClassName="w-full h-7"
-                  className="h-7 text-[12px] text-foreground bg-transparent border-[hsl(220_13%_88%)] focus:border-primary [&::-webkit-search-cancel-button]:hidden"
+                  className="h-7 text-[12px] text-foreground bg-transparent border-border focus:border-primary [&::-webkit-search-cancel-button]:hidden"
                   autoFocus
                 />
                 <button
@@ -820,7 +820,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
               <div className="flex-1 flex items-center min-w-0 mr-2">
                 <span className="truncate">{t('nav.history')}</span>
                 <div
-                  className="cursor-pointer p-1 hover:bg-[hsl(220_13%_92%)] rounded transition-colors text-muted-foreground hover:text-foreground flex-shrink-0"
+                  className="cursor-pointer p-1 hover:bg-accent rounded transition-colors text-muted-foreground hover:text-foreground flex-shrink-0"
                   onClick={() => setIsSearchVisible(true)}
                 >
                   <Search className="h-3 w-3" />
@@ -828,7 +828,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
               </div>
             )}
             <div
-              className="cursor-pointer p-1 -mr-1 hover:bg-[hsl(220_13%_92%)] rounded transition-colors ml-1"
+              className="cursor-pointer p-1 -mr-1 hover:bg-accent rounded transition-colors ml-1"
               onClick={() => setIsHistoryExpanded(!isHistoryExpanded)}
             >
               {isHistoryExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
@@ -855,8 +855,8 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                         className={cn(
                           "group flex items-center px-2.5 py-[5px] text-[12.5px] font-medium transition-colors truncate relative pr-8 rounded-[7px]",
                           String(currentTaskId) === String(task.task_id)
-                            ? "bg-primary/[0.09] text-[hsl(234_62%_42%)]"
-                            : "text-muted-foreground hover:bg-[hsl(220_13%_92%)] hover:text-foreground"
+                            ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
+                            : "text-muted-foreground hover:bg-accent hover:text-foreground"
                         )}
                       >
                         <div className="relative h-4 w-4 mr-3 flex-shrink-0">
@@ -959,7 +959,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       </div>
 
       {/* User Profile */}
-      <div className="px-[10px] py-3 border-t border-[hsl(220_13%_88%)] relative mt-auto shrink-0" ref={userMenuRef}>
+      <div className="px-[10px] py-3 border-t border-border relative mt-auto shrink-0" ref={userMenuRef}>
         {showUserMenu && (
           <div className="absolute bottom-full left-4 right-4 mb-2 bg-popover border border-border rounded-lg shadow-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-50">
             <div className="py-1">
@@ -1000,9 +1000,9 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         )}
         <button
           onClick={() => setShowUserMenu(!showUserMenu)}
-          className="flex w-full items-center gap-2.5 hover:bg-[hsl(220_13%_92%)] px-2 py-2 rounded-[7px] transition-colors text-left"
+          className="flex w-full items-center gap-2.5 hover:bg-accent px-2 py-2 rounded-[7px] transition-colors text-left"
         >
-          <div className="h-8 w-8 rounded-full bg-[hsl(234_62%_50%)] flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
+          <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
             {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
           </div>
           <div className="flex-1 min-w-0">

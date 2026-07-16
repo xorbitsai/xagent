@@ -881,6 +881,8 @@ Build when you need.`,
       webSearch: "网页搜索",
       databaseConnections: "数据库连接",
       connectors: "连接器",
+      countOne: "{count} 项",
+      countOther: "{count} 项",
     },
     policy: {
       enabled: "已启用",

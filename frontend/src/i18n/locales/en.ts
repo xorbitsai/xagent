@@ -881,6 +881,8 @@ Build when you need.`,
       webSearch: "Web Search",
       databaseConnections: "Database Connections",
       connectors: "Connectors",
+      countOne: "{count} item",
+      countOther: "{count} items",
     },
     policy: {
       enabled: "Enabled",

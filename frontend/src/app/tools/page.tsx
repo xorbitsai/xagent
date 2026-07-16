@@ -6,8 +6,6 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
-import { SearchInput } from "@/components/ui/search-input"
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 import {
   Dialog,
   DialogContent,
@@ -822,7 +820,7 @@ function ToolsPageContent() {
   }
 
   const ToolCard = ({ tool }: { tool: Tool }) => {
-    const { label, variant } = getBadgeInfo(tool)
+    const { label } = getBadgeInfo(tool)
     const icon = getToolIcon(tool.name, tool.type, tool.category)
     const configToolName = getConfigToolNameForRuntimeTool(tool)
     const configurableTool = configToolName ? configurableToolByName[configToolName] : undefined
@@ -964,12 +962,14 @@ function ToolsPageContent() {
           {t('tools.mcp.addConnector')}
         </Button>
 
-        <div className="flex flex-wrap items-center justify-center gap-1.5">
+        <div role="tablist" aria-label={t('tools.header.title')} className="flex flex-wrap items-center justify-center gap-1.5">
           {allTabs.map((tab) => {
             const isActive = activeTab === tab.id
             return (
               <button
                 key={tab.id}
+                role="tab"
+                aria-selected={isActive}
                 onClick={() => setActiveTab(tab.id)}
                 className={cn(
                   "rounded-full px-4 py-1.5 text-xs transition-all duration-150",
@@ -985,7 +985,9 @@ function ToolsPageContent() {
         </div>
 
         <span className="shrink-0 whitespace-nowrap rounded-full border border-[rgba(60,131,246,0.18)] bg-[rgba(60,131,246,0.08)] px-[10px] py-[3px] text-[11px] font-semibold text-[rgb(60,131,246)]">
-          {totalCount} items
+          {totalCount === 1
+            ? t('tools.tabs.countOne', { count: totalCount })
+            : t('tools.tabs.countOther', { count: totalCount })}
         </span>
       </div>
 
@@ -1075,7 +1077,7 @@ function ToolsPageContent() {
           )}
 
         {activeTab === 'mcp' && filteredMcpServers.length === 0 && (
-          <div className="col-span-4 flex justify-center">
+          <div className="col-span-full flex justify-center">
             <EmptyState />
           </div>
         )}

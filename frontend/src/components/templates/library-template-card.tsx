@@ -151,7 +151,7 @@ export function LibraryTemplateCard({
           <button
             type="button"
             className={cn(
-              "mt-[14px] w-full rounded-lg py-[7px] font-inherit text-[11.5px] font-semibold uppercase tracking-[0.04em] transition-all duration-200",
+              "mt-[14px] w-full rounded-lg py-[7px] text-[11.5px] font-semibold uppercase tracking-[0.04em] transition-all duration-200",
               isUseButtonHovered
                 ? "border border-transparent bg-[linear-gradient(135deg,rgb(48,64,207),rgb(60,131,246))] text-white"
                 : "border border-[rgba(60,131,246,0.28)] bg-transparent text-[rgb(60,131,246)]"

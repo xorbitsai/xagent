@@ -1178,7 +1178,9 @@ def get_storage_root() -> Path:
     """
     env_dir = os.getenv(STORAGE_ROOT)
     if env_dir:
-        return Path(env_dir)
+        # Expand ~ here so every consumer (including sqlite3, which opens a
+        # literal ./~/... path) sees the same absolute location.
+        return Path(env_dir).expanduser()
 
     # Default: ~/.xagent
     return Path.home() / ".xagent"

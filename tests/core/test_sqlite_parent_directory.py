@@ -50,10 +50,23 @@ def test_relative_path_without_parent_segment_is_a_noop(tmp_path, monkeypatch) -
     assert not (tmp_path / "relative.db").exists()
 
 
-def test_tilde_path_expands_to_home(tmp_path, monkeypatch) -> None:
+def test_tilde_path_expands_to_home_and_connects(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
-    ensure_sqlite_parent_directory("sqlite:///~/storage-root/xagent.db")
+    url = ensure_sqlite_parent_directory("sqlite:///~/storage-root/xagent.db")
 
+    # The returned URL must point at the expanded path (sqlite3 does not
+    # expand ~), so connecting with it works end-to-end.
     assert (tmp_path / "storage-root").is_dir()
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql("SELECT 1").scalar() == 1
+    engine.dispose()
+    assert (tmp_path / "storage-root" / "xagent.db").exists()
+
+
+def test_plain_urls_are_returned_unchanged(tmp_path) -> None:
+    url = f"sqlite:///{tmp_path / 'xagent.db'}"
+
+    assert ensure_sqlite_parent_directory(url) == url
+    assert ensure_sqlite_parent_directory("sqlite:///:memory:") == "sqlite:///:memory:"

@@ -992,6 +992,13 @@ class TestGetStorageRoot:
         result = get_storage_root()
         assert result == Path("/custom/storage")
 
+    def test_storage_root_expands_tilde(self, monkeypatch, tmp_path):
+        """A ~-prefixed env value resolves to the home directory."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv(STORAGE_ROOT, "~/custom-root")
+        result = get_storage_root()
+        assert result == tmp_path / "custom-root"
+
 
 class TestGetSandboxImage:
     """Test get_sandbox_image() function."""

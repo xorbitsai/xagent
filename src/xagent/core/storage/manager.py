@@ -154,9 +154,10 @@ def _get_adhoc_engine():  # type: ignore[no-untyped-def]
         if _adhoc_engine is None or _adhoc_engine_url != database_url:
             old_engine = _adhoc_engine
             if "sqlite" in database_url:
-                ensure_sqlite_parent_directory(database_url)
+                # The cache key stays the raw URL; only the engine gets the
+                # ~-expanded path (sqlite3 does not expand ~ itself).
                 engine = create_engine(
-                    database_url,
+                    ensure_sqlite_parent_directory(database_url),
                     connect_args={"check_same_thread": False},
                 )
                 # WAL + busy_timeout so concurrent writes wait for the lock

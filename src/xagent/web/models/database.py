@@ -172,7 +172,7 @@ def init_db(db_url: str | None = None) -> None:
     # For SQLite, use NullPool to prevent connection pool issues
     # For other databases, use QueuePool with timeout settings
     if "sqlite" in database_url:
-        ensure_sqlite_parent_directory(database_url)
+        database_url = ensure_sqlite_parent_directory(database_url)
         _engine = create_engine(
             database_url,
             connect_args={"check_same_thread": False},

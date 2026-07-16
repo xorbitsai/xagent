@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 
 
-def ensure_sqlite_parent_directory(database_url: str) -> None:
+def ensure_sqlite_parent_directory(database_url: str) -> str:
     """Create the SQLite database file's parent directory if it is missing.
 
     sqlite3 creates a missing database file on connect but not missing parent
@@ -32,15 +32,23 @@ def ensure_sqlite_parent_directory(database_url: str) -> None:
     not exist yet, so the first connection fails with "unable to open database
     file". Call this before creating an engine for a file-backed SQLite URL.
 
-    Non-SQLite, in-memory, and ``file:`` URI databases are ignored.
+    Returns the URL to hand to ``create_engine``: sqlite3 does not expand
+    ``~`` (it would open a literal ``./~/...`` path), so a ``~``-prefixed
+    database path is rewritten to its expanded absolute form — the same path
+    whose parent was just created. Other URLs are returned unchanged;
+    non-SQLite, in-memory, and ``file:`` URI databases are ignored.
     """
     url = make_url(database_url)
     if url.get_backend_name() != "sqlite":
-        return
+        return database_url
     database = url.database
     if not database or database == ":memory:" or database.startswith("file:"):
-        return
-    Path(database).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        return database_url
+    path = Path(database).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if str(path) != database:
+        return str(url.set(database=str(path)))
+    return database_url
 
 
 def apply_sqlite_concurrency_pragmas(

@@ -3791,7 +3791,6 @@ Build when you need.`,
       inputHint: "你的团队负责人将自动协调各子 Agent。",
       readyTitle: "随时准备就绪",
       readyDesc: "发送消息，{manager} 将协调团队完成你的请求。",
-      inactiveDisabled: "请先发布这个 Workforce 再运行。",
       archivedDisabled: "已归档的 Workforce 不能运行。"
     },
     builder: {

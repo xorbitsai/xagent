@@ -168,34 +168,39 @@ def test_build_workforce_snapshot_for_active_workforce(db_session: Session) -> N
     assert overrides[worker_agent.id]["tool_name"] == f"agent_{worker_agent.id}"
 
 
-def test_validate_workforce_run_requires_active_enabled_workers(
+def test_validate_workforce_run_allows_draft_and_requires_enabled_workers(
     db_session: Session,
 ) -> None:
     user = _create_user(db_session, "owner")
     manager = _create_agent(db_session, user, "Manager")
     workforce = _create_workforce(db_session, user, manager, status="draft")
-
-    with pytest.raises(HTTPException) as draft_error:
-        build_workforce_snapshot(db_session, user, workforce)
-    assert draft_error.value.status_code == 400
-    assert draft_error.value.detail == "Workforce must be active to run"
-
-    workforce.status = "active"
     worker_agent = _create_agent(db_session, user, "Analyst")
-    create_workforce_worker(
+    worker = create_workforce_worker(
         db_session,
         workforce,
         user,
         source_type="existing",
         agent_id=worker_agent.id,
         assignment_instructions="Collect evidence.",
-        enabled=False,
+        enabled=True,
     )
+
+    snapshot = build_workforce_snapshot(db_session, user, workforce)
+    assert snapshot["workforce"]["status"] == "draft"
+
+    worker.enabled = False
 
     with pytest.raises(HTTPException) as worker_error:
         build_workforce_snapshot(db_session, user, workforce)
     assert worker_error.value.status_code == 400
     assert worker_error.value.detail == "Workforce requires at least one enabled worker"
+
+    worker.enabled = True
+    workforce.status = "archived"
+    with pytest.raises(HTTPException) as archived_error:
+        build_workforce_snapshot(db_session, user, workforce)
+    assert archived_error.value.status_code == 400
+    assert archived_error.value.detail == "Archived workforce cannot run"
 
 
 def test_workforce_access_allows_owner_and_admin_only(db_session: Session) -> None:

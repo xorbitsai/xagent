@@ -75,8 +75,6 @@ def validate_workforce_for_run(
     workforce = ensure_workforce_access(db, user, workforce, action="run")
     if workforce.status == "archived":
         raise HTTPException(status_code=400, detail="Archived workforce cannot run")
-    if workforce.status != "active":
-        raise HTTPException(status_code=400, detail="Workforce must be active to run")
 
     manager_agent = ensure_workforce_agent_run_access(
         workforce.manager_agent, user, db, workforce

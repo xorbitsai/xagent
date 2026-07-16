@@ -39,3 +39,21 @@ def test_ignores_in_memory_and_non_sqlite_urls(tmp_path) -> None:
     ensure_sqlite_parent_directory("sqlite://")
     ensure_sqlite_parent_directory("sqlite:///file:shared?mode=memory&uri=true")
     ensure_sqlite_parent_directory("postgresql://user:pw@localhost/xagent")
+
+
+def test_relative_path_without_parent_segment_is_a_noop(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    ensure_sqlite_parent_directory("sqlite:///relative.db")
+
+    # Parent of "relative.db" is "." — nothing gets created, nothing raises.
+    assert not (tmp_path / "relative.db").exists()
+
+
+def test_tilde_path_expands_to_home(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    ensure_sqlite_parent_directory("sqlite:///~/storage-root/xagent.db")
+
+    assert (tmp_path / "storage-root").is_dir()

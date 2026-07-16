@@ -4,7 +4,6 @@ from typing import Any, cast
 from alembic import command
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from alembic.script.revision import RevisionError
 from alembic.util.exc import CommandError
 from sqlalchemy import Engine, inspect
 
@@ -39,7 +38,7 @@ def _check_revision_is_known(alembic_cfg: Any, engine: Engine, version: str) -> 
     script = ScriptDirectory.from_config(alembic_cfg)
     try:
         script.get_revisions(version)
-    except (CommandError, RevisionError):
+    except CommandError:
         db_url = engine.url.render_as_string(hide_password=True)
         raise RuntimeError(
             f"The database at '{db_url}' is at schema revision '{version}', "
@@ -59,7 +58,10 @@ def try_upgrade_db(engine: Engine) -> None:
         alembic_cfg = create_alembic_config(engine)
         version = get_alembic_revision(engine)
 
-        if version is None:
+        # An empty-string version_num (tampered/corrupted alembic_version)
+        # is treated like a missing revision: get_revisions("") dies with a
+        # bare AssertionError instead of a catchable error.
+        if not version:
             if is_database_empty(engine):
                 logger.info("Creating new database, stamping to latest revision.")
                 with engine.begin() as conn:

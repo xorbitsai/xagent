@@ -128,6 +128,51 @@ class TestTryUpgradeDb:
         assert first_rows == expected_rows
         assert rows == expected_rows
 
+    def test_upgrades_through_check_from_known_older_revision(self):
+        engine = create_engine("sqlite:///:memory:")
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)")
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO alembic_version (version_num) "
+                    "VALUES ('20260616_add_agent_triggers')"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TABLE tasks ("
+                    "id INTEGER PRIMARY KEY, "
+                    "source VARCHAR(20), "
+                    "is_visible BOOLEAN NOT NULL)"
+                )
+            )
+
+        try_upgrade_db(engine)
+
+        with engine.begin() as conn:
+            version = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar()
+        script = ScriptDirectory.from_config(create_alembic_config(engine))
+        assert version == script.get_current_head()
+
+    def test_treats_empty_string_revision_as_unversioned(self):
+        engine = create_engine("sqlite:///:memory:")
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)")
+            )
+            conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('')"))
+
+        with pytest.raises(
+            RuntimeError, match="Database exists without alembic revision"
+        ):
+            try_upgrade_db(engine)
+
     def test_raises_friendly_error_when_db_revision_is_unknown(self):
         engine = create_engine("sqlite:///:memory:")
 

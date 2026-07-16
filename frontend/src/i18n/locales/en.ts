@@ -3297,7 +3297,8 @@ Build when you need.`,
       desc: "Copy and paste this script tag into the <body> of your website.",
       copy_btn: "Copy Snippet",
       rotate_key_btn: "Rotate Key",
-      rotating_key: "Rotating…"
+      rotating_key: "Rotating…",
+      rotate_key_confirm: "Rotating the widget key will immediately break all existing embeds. Re-copy and redeploy the snippet after rotation. Continue?"
     },
     share_link: {
       title: "Share Link",
@@ -3319,7 +3320,8 @@ Build when you need.`,
       share_rotated: "Share link rotated",
       share_disabled: "Share link disabled",
       share_failed: "Share link action failed",
-      widget_key_rotated: "Widget key rotated"
+      widget_key_rotated: "Widget key rotated",
+      widget_key_rotate_failed: "Failed to rotate widget key"
     },
     api_panel: {
       title: "Call this agent via REST API",

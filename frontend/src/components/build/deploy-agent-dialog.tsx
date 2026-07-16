@@ -250,15 +250,20 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   const handleRotateWidgetKey = async () => {
     if (!deployAgent) return
+    // Rotating immediately invalidates the key on every site that has it
+    // embedded — require explicit confirmation before calling the API.
+    if (!window.confirm(t("deploy_agent.embed_snippet.rotate_key_confirm") || "Rotating the widget key will immediately break all existing embeds. Re-copy and redeploy the snippet after rotation. Continue?")) {
+      return
+    }
     try {
       setIsRotatingWidgetKey(true)
-      const fallback = t("appWidget.messages.widgetKeyLoadFailed") || "Failed to rotate widget key"
+      const fallback = t("deploy_agent.messages.widget_key_rotate_failed") || "Failed to rotate widget key"
       const state = await rotateAgentWidgetKey(deployAgent.id, fallback)
       setWidgetKey(state.widget_key)
       toast.success(t("deploy_agent.messages.widget_key_rotated") || "Widget key rotated")
     } catch (err) {
       console.error(err)
-      toast.error(err instanceof Error ? err.message : t("appWidget.messages.widgetKeyLoadFailed") || "Failed to rotate widget key")
+      toast.error(err instanceof Error ? err.message : t("deploy_agent.messages.widget_key_rotate_failed") || "Failed to rotate widget key")
     } finally {
       setIsRotatingWidgetKey(false)
     }

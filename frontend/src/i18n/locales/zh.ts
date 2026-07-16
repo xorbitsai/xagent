@@ -3297,7 +3297,8 @@ Build when you need.`,
       desc: "复制此 script 标签并将其粘贴到网站的 <body> 标签中。",
       copy_btn: "复制代码",
       rotate_key_btn: "轮换 Key",
-      rotating_key: "轮换中…"
+      rotating_key: "轮换中…",
+      rotate_key_confirm: "轮换 Widget Key 后，所有已部署的嵌入代码将立即失效，需重新复制并重新部署。确认继续？"
     },
     share_link: {
       title: "分享链接",
@@ -3319,7 +3320,8 @@ Build when you need.`,
       share_rotated: "分享链接已重置",
       share_disabled: "分享链接已关闭",
       share_failed: "分享链接操作失败",
-      widget_key_rotated: "Widget Key 已轮换"
+      widget_key_rotated: "Widget Key 已轮换",
+      widget_key_rotate_failed: "Widget Key 轮换失败"
     },
     api_panel: {
       title: "通过 REST API 调用此 Agent",

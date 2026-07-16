@@ -56,14 +56,16 @@ function writeExplicitPlan(texts: string[]): string {
 }
 
 // Extract ALL qualifying sentences from prose text with no slice cap, used
-// when materializing an inferred plan to explicit. Using the same lower-bound
-// filter as parseInstructionSteps but no upper bound ensures we don't truncate
-// content that the display limit hid from the user.
+// when materializing an inferred plan to explicit. Must use the same filter
+// bounds as the display path in parseInstructionSteps (>= 15 && <= 400) so
+// that display-step indices map 1-to-1 onto the materialized list — a sentence
+// hidden by the upper bound in the display would otherwise sit at an unexpected
+// index and cause an edit to silently overwrite the wrong sentence.
 function inferSentences(text: string): string[] {
   const cleaned = text.replace(/^[-*•]\s+/gm, "")
   return (cleaned.replace(/\n+/g, " ").match(/[^.!?]+(?:[.!?]+|$)/g) || [])
     .map((s) => s.trim().replace(/[.!?]+$/, ""))
-    .filter((s) => s.length >= 15)
+    .filter((s) => s.length >= 15 && s.length <= 400)
 }
 
 // Only renumber lines known to belong to the plan (from the caller's own

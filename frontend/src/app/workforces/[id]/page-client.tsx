@@ -269,6 +269,7 @@ export default function WorkforceDetailPage() {
                 const result: WorkforceRunResponse = await runWorkforce(id, {
                     message: content,
                     files: (files || []).map(f => f.file_id).filter(Boolean) as string[],
+                    is_preview: true,
                     is_visible: false,
                 })
                 taskId = result.task_id

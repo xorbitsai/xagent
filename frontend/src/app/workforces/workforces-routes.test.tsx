@@ -251,7 +251,7 @@ describe("workforce route entry points", () => {
     )
   })
 
-  it("keeps list run actions available for draft workforces", async () => {
+  it("keeps list run actions disabled for draft workforces", async () => {
     listWorkforcesMock.mockResolvedValueOnce({
       ...listResponse,
       items: [
@@ -268,17 +268,12 @@ describe("workforce route entry points", () => {
     render(<WorkforcesPage />)
 
     expect(await screen.findByText("Draft Workforce")).toBeInTheDocument()
-    expect(screen.getByRole("link", { name: /workforces.actions.run/ })).toHaveAttribute(
-      "href",
-      "/workforces/43/run",
-    )
+    expect(screen.queryByRole("link", { name: /workforces.actions.run/ })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /workforces.actions.run/ })).toBeDisabled()
   })
 
-  it("runs a draft workforce and opens the created task", async () => {
-    getWorkforceMock.mockResolvedValueOnce({
-      ...workforceDetail,
-      status: "draft",
-    })
+  it("runs an active workforce and opens the created task", async () => {
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
     runWorkforceMock.mockResolvedValueOnce({
       workforce_run_id: 5,
       task_id: 99,
@@ -311,6 +306,32 @@ describe("workforce route entry points", () => {
     })
     expect(setTaskIdMock).toHaveBeenCalledWith(99, { navigate: false })
     expect(screen.getByTestId("task-conversation-panel")).toBeInTheDocument()
+  })
+
+  it("tests a draft workforce from the editor preview", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      status: "draft",
+    })
+    runWorkforceMock.mockResolvedValueOnce({
+      workforce_run_id: 6,
+      task_id: 100,
+      status: "running",
+      redirect_url: "/task/100",
+    })
+
+    render(<WorkforceDetailPage />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Send Test" }))
+
+    await waitFor(() => {
+      expect(runWorkforceMock).toHaveBeenCalledWith("42", {
+        files: [],
+        is_preview: true,
+        is_visible: false,
+        message: "test message",
+      })
+    })
   })
 
   it("keeps the current manager visible when it is hidden from agent options", async () => {

@@ -661,6 +661,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         message: str,
         selected_file_ids: list[str] | None = None,
         execution_mode: str | None = None,
+        is_preview: bool = False,
         is_visible: bool = True,
     ) -> Any:
         captured.update(
@@ -670,6 +671,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
                 "message": message,
                 "selected_file_ids": selected_file_ids,
                 "execution_mode": execution_mode,
+                "is_preview": is_preview,
                 "is_visible": is_visible,
             }
         )
@@ -702,6 +704,7 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         "message": "go",
         "selected_file_ids": ["file-1"],
         "execution_mode": "think",
+        "is_preview": False,
         "is_visible": True,
     }
 

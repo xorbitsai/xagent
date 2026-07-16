@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
-from .....config import get_uploads_dir
+from .....config import get_agent_pattern_for_execution_mode, get_uploads_dir
 from .....web.services.agent_store import AgentStore
 from .....web.services.model_service import (
     _get_visible_user_ids,
@@ -1725,6 +1725,7 @@ class AgentTool(AbstractBaseTool):
             agent_skills = None
             agent_tool_categories = None
             agent_models = None
+            agent_execution_mode = None
 
             with tool_session_scope(self._session_factory) as db:
                 # Load agent from database - support both PUBLISHED and DRAFT
@@ -1763,6 +1764,7 @@ class AgentTool(AbstractBaseTool):
                 agent_skills = agent.skills
                 agent_tool_categories = agent.tool_categories
                 agent_models = agent.models
+                agent_execution_mode = agent.execution_mode
 
                 # Resolve models
                 storage = UserAwareModelStorage(db)
@@ -1860,7 +1862,7 @@ class AgentTool(AbstractBaseTool):
                     compact_llm=compact_llm,
                     memory=memory,
                     tool_config=tool_config,
-                    use_dag_pattern=True,
+                    pattern=get_agent_pattern_for_execution_mode(agent_execution_mode),
                     id=execution_task_id,
                     enable_workspace=True,
                     workspace_base_dir=self._workspace_base_dir,

@@ -3791,6 +3791,7 @@ Build when you need.`,
       inputHint: "Your team lead will coordinate sub-agents automatically.",
       readyTitle: "Ready when you are",
       readyDesc: "Send a message and {manager} will coordinate the team to complete your request.",
+      inactiveDisabled: "Publish this workforce before running it.",
       archivedDisabled: "Archived workforces cannot run."
     },
     builder: {

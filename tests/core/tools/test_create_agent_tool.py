@@ -2164,6 +2164,7 @@ class TestCreateAndCallAgent:
                 description="Nested agent",
                 instructions="You are delegated.",
                 status=AgentStatus.PUBLISHED,
+                execution_mode="balanced",
                 models={"general": model.id},
             )
             db.add(agent)
@@ -2201,6 +2202,7 @@ class TestCreateAndCallAgent:
                 result = await tool.run_json_async({"task": "do nested work"})
 
             assert result["response"] == "nested response"
+            assert mock_agent_service_class.call_args.kwargs["pattern"] == "react"
             tracer = mock_agent_service_class.call_args.kwargs["tracer"]
             assert any(
                 isinstance(handler, LangfuseTraceHandler) for handler in tracer.handlers

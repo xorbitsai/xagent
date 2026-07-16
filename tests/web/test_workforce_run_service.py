@@ -240,6 +240,45 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
 
 
 @pytest.mark.asyncio
+async def test_create_workforce_run_allows_draft_only_for_preview(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    worker_agent = _create_agent(db_session, user, "Analyst")
+    workforce = _create_workforce(db_session, user, manager)
+    workforce.status = "draft"
+    _add_worker(db_session, user, workforce, worker_agent)
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as run_error:
+        await create_workforce_run(
+            db_session,
+            user,
+            workforce,
+            message="Run before publish",
+        )
+    assert run_error.value.status_code == 400
+    assert run_error.value.detail == "Workforce must be active to run"
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="Preview before publish",
+        is_preview=True,
+        is_visible=False,
+    )
+    await result.background_task
+
+    assert result.task.is_visible is False
+    assert result.workforce_run.status == "running"
+
+
+@pytest.mark.asyncio
 async def test_create_workforce_run_marks_task_failed_when_turn_start_fails_after_claim(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,

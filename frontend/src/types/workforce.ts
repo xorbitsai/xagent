@@ -148,6 +148,7 @@ export interface WorkforceRunPayload {
   message: string
   files?: string[]
   execution_mode?: string | null
+  is_preview?: boolean
   is_visible?: boolean
 }
 

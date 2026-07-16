@@ -145,6 +145,15 @@ def test_pronunciation_aliases_skip_partial_ascii_word_matches() -> None:
     assert result == ("RUN, United Nations, FUN, UNwelcomed, and (United Nations).")
 
 
+def test_pronunciation_aliases_match_non_ascii_source_in_continuous_text() -> None:
+    result = ElevenLabsTTS._apply_pronunciation_aliases(
+        "alpha: αβγ",
+        {"β": "bee"},
+    )
+
+    assert result == "alpha: αbeeγ"
+
+
 @pytest.mark.parametrize(
     ("aliases", "error"),
     [

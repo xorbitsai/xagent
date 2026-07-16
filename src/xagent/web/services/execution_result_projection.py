@@ -36,6 +36,8 @@ def project_execution_result_for_channel(
             interactions = [item for item in raw_interactions if isinstance(item, dict)]
 
     output = str(result.get("output") or "")
+    base_text = chat_message or output
+    transcript_content = base_text
     if status == "interrupted":
         # An interruption is control state, not an assistant answer. Show a
         # friendly status in every chat channel without adding it to the
@@ -43,10 +45,7 @@ def project_execution_result_for_channel(
         base_text = INTERRUPTED_USER_MESSAGE
         transcript_content = ""
         interactions = []
-    else:
-        base_text = chat_message or output
-        transcript_content = base_text
-    if status != "interrupted" and not base_text.strip() and not interactions:
+    elif not base_text.strip() and not interactions:
         base_text = EMPTY_CHANNEL_OUTPUT_FALLBACK
         transcript_content = base_text
 

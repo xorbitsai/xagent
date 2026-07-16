@@ -332,9 +332,10 @@ class _FakeAgentService:
 
 
 class _FakeAgentManager:
-    def __init__(self) -> None:
+    def __init__(self, execution_result: dict[str, Any] | None = None) -> None:
         self.service = _FakeAgentService()
         self.execute_calls: list[dict[str, Any]] = []
+        self.execution_result = execution_result or {"success": True, "output": "done"}
 
     async def get_agent_for_task(
         self,
@@ -347,7 +348,7 @@ class _FakeAgentManager:
 
     async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
         self.execute_calls.append(_kwargs)
-        return {"success": True, "output": "done"}
+        return dict(self.execution_result)
 
 
 def test_web_chat_create_filters_runtime_declared_connectors_and_ignores_payload(
@@ -698,10 +699,27 @@ async def test_feishu_new_task_fallback_snapshots_empty(
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("execution_result", "expected_persisted_turns"),
+    [
+        ({"success": True, "output": "done"}, 1),
+        (
+            {
+                "status": "interrupted",
+                "success": False,
+                "output": "ReActPattern interrupted.",
+            },
+            0,
+        ),
+    ],
+    ids=["completed", "interrupted"],
+)
 @pytest.mark.asyncio
 async def test_telegram_new_task_fallback_snapshots_empty(
     e2e_db: None,
     monkeypatch: pytest.MonkeyPatch,
+    execution_result: dict[str, Any],
+    expected_persisted_turns: int,
 ) -> None:
     _setup_admin_headers()
     db = _db_session()
@@ -718,11 +736,6 @@ async def test_telegram_new_task_fallback_snapshots_empty(
         db.commit()
         db.refresh(channel)
 
-        monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.get_agent_manager",
-            lambda: _FakeAgentManager(),
-        )
-
         async def _restore_telegram_task_context(*_args: Any, **_kwargs: Any) -> None:
             return None
 
@@ -734,9 +747,16 @@ async def test_telegram_new_task_fallback_snapshots_empty(
             "xagent.web.channels.telegram.bot.persist_user_message",
             lambda **_kwargs: None,
         )
+        persisted_turns: list[dict[str, Any]] = []
         monkeypatch.setattr(
             "xagent.web.channels.telegram.bot.persist_telegram_assistant_turn",
-            lambda **_kwargs: None,
+            lambda **kwargs: persisted_turns.append(kwargs),
+        )
+
+        agent_manager = _FakeAgentManager(execution_result)
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.get_agent_manager",
+            lambda: agent_manager,
         )
 
         bot = object.__new__(TelegramBotInstance)
@@ -783,6 +803,7 @@ async def test_telegram_new_task_fallback_snapshots_empty(
         assert task is not None
         assert task.connector_runtime_selected_refs == []
         assert _context_row_count(int(task.id)) == 0
+        assert len(persisted_turns) == expected_persisted_turns
     finally:
         db.close()
 

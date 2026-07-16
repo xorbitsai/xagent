@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
+from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.service import AgentService
 
 
@@ -955,9 +956,7 @@ def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None
         execution_id="interrupted-exec",
     )
 
-    assert result["output"] == (
-        "The previous run was stopped. You can send another message to continue."
-    )
+    assert result["output"] == INTERRUPTED_USER_MESSAGE
     assert result["error"] == "ReActPattern interrupted."
 
 

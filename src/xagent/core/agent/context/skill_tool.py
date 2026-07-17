@@ -91,7 +91,7 @@ class LoadSkillTool:
             }
 
         skill = await self.skill_manager.get_skill(skill_name)
-        if not skill:
+        if not skill or not isinstance(skill, dict):
             available = ", ".join(
                 str(entry.get("name"))
                 for entry in self.context.metadata.get(SKILL_INDEX_METADATA_KEY) or []

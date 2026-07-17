@@ -247,3 +247,21 @@ async def test_build_load_skill_tool_handles_none_skill_list() -> None:
 
     assert tool is None
     assert SKILL_INDEX_METADATA_KEY not in context.metadata
+
+
+@pytest.mark.asyncio
+async def test_load_skill_rejects_non_dict_skill_payload() -> None:
+    class MalformedManager(FakeSkillManager):
+        async def get_skill(self, name: str):  # type: ignore[override]
+            return "not-a-dict"
+
+    context = ExecutionContext()
+    tool = await build_load_skill_tool(
+        skill_manager=MalformedManager([WRITER_SKILL]), context=context
+    )
+    assert tool is not None
+
+    result = await tool.execute(skill_name="writer")
+
+    assert result["success"] is False
+    assert SKILL_CONTEXT_METADATA_KEY not in context.metadata

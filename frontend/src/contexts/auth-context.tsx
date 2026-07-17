@@ -1,12 +1,13 @@
 "use client"
 
-import { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react"
+import React, { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react"
 import { getApiUrl } from "@/lib/utils"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
 import {
   AUTH_CACHE_DURATION_MS,
   AUTH_CACHE_KEY,
   AUTH_TOKEN_UPDATED_EVENT,
+  AuthCache,
   AuthCacheUser,
   clearStoredAuth,
   LEGACY_AUTH_TOKEN_KEY,
@@ -18,6 +19,17 @@ import {
 type User = AuthCacheUser
 
 type TeamRole = "admin" | "member" | null
+
+function isAuthCacheEventPayload(value: unknown): value is AuthCache {
+  if (typeof value !== "object" || value === null) return false
+
+  const candidate = value as Partial<AuthCache>
+  return (
+    typeof candidate.user === "object" &&
+    candidate.user !== null &&
+    typeof candidate.token === "string"
+  )
+}
 
 interface AuthContextType {
   user: User | null
@@ -44,7 +56,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [lastCheckTime, setLastCheckTime] = useState(0)
   const [inTeam, setInTeam] = useState(false)
   const [teamRole, setTeamRole] = useState<TeamRole>(null)
-  const refreshAccessTokenRef = useRef<() => Promise<boolean>>(async () => false)
+  const refreshAccessTokenRef = useRef<(
+    expectedAccessToken?: string | null,
+    expectedUserId?: string | null
+  ) => Promise<boolean>>(
+    async () => false
+  )
 
   // Timer for active token refresh
   useEffect(() => {
@@ -61,11 +78,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         if (shouldRefresh) {
           console.log("Token is about to expire, refreshing actively...")
-          const success = await refreshAccessTokenRef.current()
-          if (!success) {
-            // Refresh failed, stop timer (will automatically redirect to login page)
-            clearInterval(refreshInterval)
-          }
+          await refreshAccessTokenRef.current(cache.token, cache.user?.id || null)
         }
       } else {
         const timeSinceCreation = Date.now() - cache.timestamp
@@ -78,10 +91,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         if (shouldRefresh) {
           console.log("Token cache is missing access expiry info, refreshing actively...")
-          const success = await refreshAccessTokenRef.current()
-          if (!success) {
-            clearInterval(refreshInterval)
-          }
+          await refreshAccessTokenRef.current(cache.token, cache.user?.id || null)
         }
       }
     }, 60000) // Check every minute
@@ -123,14 +133,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => clearTimeout(timer)
   }, [])
 
-  // Listen for token update events
+  // Listen for same-tab refresh events and native cross-tab storage events.
   useEffect(() => {
     const handleTokenUpdate = (event: Event) => {
       const storageEvent = event as StorageEvent
-      if (storageEvent.key === AUTH_CACHE_KEY && storageEvent.newValue) {
+      if (storageEvent.key !== AUTH_CACHE_KEY) return
+
+      if (!storageEvent.newValue) {
+        setUser(null)
+        setToken(null)
+        setRefreshToken(null)
+        return
+      }
+
+      if (storageEvent.newValue) {
         try {
-          const cache = JSON.parse(storageEvent.newValue)
-          if (cache.user && cache.token) {
+          const cache: unknown = JSON.parse(storageEvent.newValue)
+          if (isAuthCacheEventPayload(cache)) {
             setUser(cache.user)
             setToken(cache.token)
             setRefreshToken(cache.refreshToken)
@@ -142,7 +161,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
 
     window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
-    return () => window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
+    window.addEventListener("storage", handleTokenUpdate)
+    return () => {
+      window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
+      window.removeEventListener("storage", handleTokenUpdate)
+    }
   }, [])
 
   // Resolve SaaS team role once we have a session. my-team 404 / any failure =>
@@ -252,18 +275,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             // Explicitly invalid token, clear state
             logout()
             return false
-          } else {
-            // Token expired but refresh failed, apiRequest has handled redirection
-            // We just need to clear local state
+          }
+
+          // A rejected refresh clears the shared cache in apiRequest. A
+          // temporary refresh outage leaves it intact so the next check can
+          // retry without ejecting the user from the app.
+          if (!readAuthCache()) {
             setUser(null)
             setToken(null)
             setRefreshToken(null)
-            clearStoredAuth()
             return false
           }
+          return true
         }
-        // Network error or server error, keep current state
-        return false  // Changed to false because auth check failed
+        // Network or server errors must not turn a temporary outage into logout.
+        return true
       }
 
       const data = await response.json()
@@ -286,43 +312,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  const refreshAccessToken = async (): Promise<boolean> => {
-    if (!refreshToken) return false
-
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/auth/refresh`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      })
-
-      if (response.ok) {
-        const data = await response.json()
-        if (data.success && data.access_token) {
-          setToken(data.access_token)
-          if (data.refresh_token) {
-            setRefreshToken(data.refresh_token)
-          }
-
-          // Update cache with new tokens and expiration times
-          writeAuthCache(
-            user,
-            data.access_token,
-            data.refresh_token || refreshToken,
-            data.expires_in ? data.expires_in : undefined,
-            data.refresh_expires_in ? data.refresh_expires_in : undefined
-          )
-          return true
-        }
+  const refreshAccessToken = async (
+    expectedAccessToken?: string | null,
+    expectedUserId?: string | null
+  ): Promise<boolean> => {
+    const cache = readAuthCache()
+    const result = await refreshStoredAccessToken(
+      expectedAccessToken === undefined ? cache?.token || null : expectedAccessToken,
+      expectedUserId === undefined ? cache?.user?.id || null : expectedUserId
+    )
+    if (result.accessToken !== null) {
+      const updatedCache = readAuthCache()
+      if (updatedCache?.user && updatedCache.token) {
+        setUser(updatedCache.user)
+        setToken(updatedCache.token)
+        setRefreshToken(updatedCache.refreshToken)
       }
-    } catch (error) {
-      console.error("Token refresh failed:", error)
+      return true
     }
 
-    // If refresh fails, logout and redirect to login
-    logout()
+    if (result.rejected) {
+      logout()
+    }
     return false
   }
 

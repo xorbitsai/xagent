@@ -8,8 +8,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
@@ -166,6 +168,71 @@ class TestAuthAPI:
         assert data["success"] is True
         assert data["user"]["username"] == test_user_data["username"]
         assert data["user"]["email"] == test_user_data["email"]
+
+    def test_refresh_rotates_token_and_rejects_stale_token(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        login_response = client.post("/api/auth/login", json=test_user_data)
+        old_refresh_token = login_response.json()["refresh_token"]
+        monkeypatch.setattr(
+            auth_api,
+            "create_refresh_token",
+            lambda data: "rotated-refresh-token",
+        )
+
+        refresh_response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": old_refresh_token},
+        )
+        assert refresh_response.status_code == 200
+        assert refresh_response.json()["success"] is True
+        assert refresh_response.json()["refresh_token"] == "rotated-refresh-token"
+
+        stale_response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": old_refresh_token},
+        )
+        assert stale_response.status_code == 401
+        assert stale_response.json()["detail"] == "Invalid refresh token"
+
+    def test_refresh_rejects_malformed_token(self, test_db):
+        response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": "not-a-jwt"},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid refresh token"
+
+    def test_refresh_reports_temporary_server_failure(self, test_db, monkeypatch):
+        def fail_verification(_token):
+            raise SQLAlchemyError("database unavailable")
+
+        monkeypatch.setattr(auth_api, "verify_refresh_token", fail_verification)
+
+        response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": "temporarily-unverifiable"},
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Token refresh is temporarily unavailable"
+
+    def test_refresh_does_not_mask_programming_errors(self, test_db, monkeypatch):
+        def fail_verification(_token):
+            raise RuntimeError("unexpected refresh bug")
+
+        monkeypatch.setattr(auth_api, "verify_refresh_token", fail_verification)
+
+        with pytest.raises(RuntimeError, match="unexpected refresh bug"):
+            client.post(
+                "/api/auth/refresh",
+                json={"refresh_token": "unexpectedly-broken"},
+            )
 
     def test_get_current_user_profile(self, test_db, test_user_data):
         setup_first_admin()

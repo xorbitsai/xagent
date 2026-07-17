@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_password_reset_expire_minutes
@@ -958,9 +958,9 @@ async def refresh_token(
         # Verify refresh token
         payload = verify_refresh_token(request.refresh_token)
         if not payload:
-            return RefreshTokenResponse(
-                success=False,
-                message="Invalid refresh token",
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid refresh token",
             )
 
         # Get user from database
@@ -968,9 +968,9 @@ async def refresh_token(
         user = db.query(User).filter(User.id == user_id).first()
 
         if not user:
-            return RefreshTokenResponse(
-                success=False,
-                message="User does not exist",
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid refresh token",
             )
 
         # Check if refresh token matches and is not expired
@@ -980,9 +980,9 @@ async def refresh_token(
             user_refresh_token != request.refresh_token
             or refresh_token_expires_at is None
         ):
-            return RefreshTokenResponse(
-                success=False,
-                message="Invalid refresh token",
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid refresh token",
             )
 
         # Check expiration - handle timezone-aware and naive datetimes
@@ -993,16 +993,16 @@ async def refresh_token(
         ):
             # Timezone-aware datetime
             if cast(Any, refresh_token_expires_at) < now:
-                return RefreshTokenResponse(
-                    success=False,
-                    message="Refresh token has expired",
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh token has expired",
                 )
         else:
             # Naive datetime - assume UTC
             if cast(Any, refresh_token_expires_at) < now.replace(tzinfo=None):
-                return RefreshTokenResponse(
-                    success=False,
-                    message="Refresh token has expired",
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh token has expired",
                 )
 
         # Create new access token
@@ -1033,10 +1033,13 @@ async def refresh_token(
             refresh_expires_in=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,  # seconds
         )
 
-    except Exception as e:
-        return RefreshTokenResponse(
-            success=False,
-            message=f"Token refresh failed: {str(e)}",
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        logger.exception("Token refresh failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token refresh is temporarily unavailable",
         )
 
 

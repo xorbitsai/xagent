@@ -153,6 +153,7 @@ async def build_load_skill_tool(
         return None
     if not skills:
         return None
+    skills = [skill for skill in skills if isinstance(skill, dict)]
     if allowed_skills is not None:
         allowed = set(allowed_skills)
         skills = [skill for skill in skills if skill.get("name") in allowed]

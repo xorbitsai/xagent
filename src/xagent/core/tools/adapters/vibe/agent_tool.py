@@ -582,7 +582,8 @@ class CreateAgentTool(AbstractBaseTool):
             "- status: 'success' or 'error'\n"
             "- message: Detailed information about the created agent\n\n"
             "IMPORTANT: Always include the markdown_link in your response when creating an agent successfully. "
-            "Use the format: [Agent Name](agent://agent_id)"
+            "Use the format: [Agent Name](agent://agent_id). Use plain link syntax only — "
+            "NEVER image syntax like ![name](agent://id); agent:// cannot render as an image."
         )
 
     @property

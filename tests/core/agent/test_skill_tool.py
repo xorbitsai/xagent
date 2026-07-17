@@ -190,3 +190,43 @@ def test_skill_index_hides_already_loaded_skills() -> None:
     system_content = context.get_messages_for_llm()[0]["content"]
 
     assert "Available skills:" not in system_content
+
+
+@pytest.mark.asyncio
+async def test_build_load_skill_tool_bounds_index_entries() -> None:
+    context = ExecutionContext()
+    long_description = "A very detailed description. " * 30
+    manager = FakeSkillManager(
+        [
+            {
+                "name": "verbose",
+                "description": long_description,
+                "when_to_use": "Line one.\n\nLine two with   spaces.",
+                "content": "...",
+            }
+        ]
+    )
+
+    tool = await build_load_skill_tool(skill_manager=manager, context=context)
+
+    assert tool is not None
+    entry = context.metadata[SKILL_INDEX_METADATA_KEY][0]
+    assert len(entry["description"]) <= 200
+    assert entry["description"].endswith("…")
+    assert "\n" not in entry["when_to_use"]
+    assert entry["when_to_use"] == "Line one. Line two with spaces."
+
+
+def test_skill_index_renders_name_only_for_empty_meta() -> None:
+    context = ExecutionContext(system_prompt="Base prompt.")
+    context.metadata[SKILL_INDEX_METADATA_KEY] = [
+        {"name": "bare-skill", "description": "", "when_to_use": ""},
+    ]
+    context.add_user_message("hello")
+
+    system_content = context.get_messages_for_llm()[0]["content"]
+
+    assert "- bare-skill\n" in system_content or system_content.rstrip().endswith(
+        "- bare-skill"
+    )
+    assert "- bare-skill:" not in system_content

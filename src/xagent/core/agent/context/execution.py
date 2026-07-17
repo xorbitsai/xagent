@@ -485,7 +485,7 @@ class ExecutionContext:
                     continue
                 description = str(entry.get("description") or "").strip()
                 when_to_use = str(entry.get("when_to_use") or "").strip()
-                line = f"- {name}: {description}"
+                line = f"- {name}: {description}" if description else f"- {name}"
                 if when_to_use:
                     line += f" When to use: {when_to_use}"
                 index_lines.append(line)

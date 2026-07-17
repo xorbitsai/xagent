@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 LOAD_SKILL_TOOL_NAME = "load_skill"
 SKILL_INDEX_METADATA_KEY = "available_skills_index"
 LOADED_SKILLS_METADATA_KEY = "loaded_skills"
+INDEX_ENTRY_MAX_CHARS = 200
+
+
+def _index_text(value: Any, limit: int = INDEX_ENTRY_MAX_CHARS) -> str:
+    """Collapse a skill meta field to a bounded single line for the index.
+
+    Skill descriptions come from whole SKILL.md sections and may span
+    paragraphs; the index goes into every LLM call's system context, so
+    keep each entry to one short line.
+    """
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
 
 _LOAD_SKILL_DESCRIPTION = """Load a skill's full instructions into the system context.
 
@@ -145,8 +160,8 @@ async def build_load_skill_tool(
     context.metadata[SKILL_INDEX_METADATA_KEY] = [
         {
             "name": skill.get("name"),
-            "description": skill.get("description", ""),
-            "when_to_use": skill.get("when_to_use", ""),
+            "description": _index_text(skill.get("description")),
+            "when_to_use": _index_text(skill.get("when_to_use")),
         }
         for skill in skills
     ]

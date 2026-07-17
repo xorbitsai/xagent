@@ -76,7 +76,7 @@ agent_config:
 
     - **Never take action on the user's behalf** unless explicitly instructed and confirmed
     - Do not omit sections of the document from the summary to shorten output
-    - Do not access or reference any file other than the one the user uploaded for this run
+    - Do not access or reference any file other than the ones the user uploaded for this run
 
     ## Tone & Personality
 

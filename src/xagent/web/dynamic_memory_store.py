@@ -22,6 +22,18 @@ MemoryStoreType = Union[
 ]
 
 
+def _embedding_model_fingerprint(model: Optional[DBModel]) -> Optional[tuple]:
+    """Identity of an embedding model config, including reconfigurations.
+
+    ``updated_at`` changes when the model row is edited (API key rotation,
+    endpoint change), so comparing the fingerprint instead of only the id
+    lets the store pick up new credentials without a backend restart.
+    """
+    if model is None:
+        return None
+    return (model.id, str(model.updated_at))
+
+
 class DynamicMemoryStoreManager:
     """Dynamic memory store manager that supports lazy initialization and reconfiguration."""
 
@@ -36,6 +48,10 @@ class DynamicMemoryStoreManager:
         self._memory_store: Optional[MemoryStoreType] = None
         self._lock = threading.RLock()
         self._last_embedding_model_id: Optional[int] = None
+        # (id, updated_at) of the embedding model the store was built with.
+        # Comparing the full fingerprint (not just the id) makes API key or
+        # endpoint rotation on the same model take effect without a restart.
+        self._last_embedding_model_fingerprint: Optional[tuple] = None
         self._is_lancedb: bool = False
 
         # Initialize with in-memory store (will be replaced with LanceDB when embedding model is configured)
@@ -48,6 +64,7 @@ class DynamicMemoryStoreManager:
             self._memory_store = UserIsolatedMemoryStore(in_memory_store)
             self._is_lancedb = False
             self._last_embedding_model_id = None
+            self._last_embedding_model_fingerprint = None
             logger.info("Initialized with in-memory store")
 
     def _get_embedding_model_from_db(self) -> Optional[DBModel]:
@@ -174,6 +191,7 @@ class DynamicMemoryStoreManager:
         """Check if embedding model configuration has changed and update store accordingly."""
         embedding_model = self._get_embedding_model_from_db()
         current_model_id = embedding_model.id if embedding_model else None
+        current_fingerprint = _embedding_model_fingerprint(embedding_model)
 
         with self._lock:
             # Check if we need to update the store
@@ -186,9 +204,10 @@ class DynamicMemoryStoreManager:
             elif (
                 embedding_model
                 and self._is_lancedb
-                and current_model_id != self._last_embedding_model_id
+                and current_fingerprint != self._last_embedding_model_fingerprint
             ):
-                # Embedding model has changed
+                # Embedding model changed, or the same model was reconfigured
+                # (e.g. API key rotation) — rebuild so the new config is used.
                 should_update = True
                 logger.info(
                     "Embedding model configuration changed, updating LanceDB store"
@@ -205,6 +224,7 @@ class DynamicMemoryStoreManager:
                     self._memory_store = self._create_lancedb_store(embedding_model)
                     self._is_lancedb = True
                     self._last_embedding_model_id = current_model_id  # type: ignore[assignment]
+                    self._last_embedding_model_fingerprint = current_fingerprint
                     logger.info("Switched to LanceDB memory store")
                 else:
                     self._initialize_in_memory_store()
@@ -235,14 +255,14 @@ class DynamicMemoryStoreManager:
         """
         with self._lock:
             old_is_lancedb = self._is_lancedb
-            old_model_id = self._last_embedding_model_id
+            old_fingerprint = self._last_embedding_model_fingerprint
 
             self._check_and_update_store()
 
             # Return true if anything changed
             return (
                 old_is_lancedb != self._is_lancedb
-                or old_model_id != self._last_embedding_model_id
+                or old_fingerprint != self._last_embedding_model_fingerprint
             )
 
     def get_store_info(self) -> dict:

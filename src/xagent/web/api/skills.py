@@ -5,8 +5,7 @@ Provides REST API endpoints for managing and using skills in the web application
 """
 
 import logging
-from importlib import import_module
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -38,20 +37,6 @@ class SkillDetail(SkillInfo):
         default_factory=list, description="Files in skill directory"
     )
     path: str = Field(..., description="Skill directory path")
-
-
-class RecallRequest(BaseModel):
-    """Skill recall request"""
-
-    task: str = Field(..., description="User task description")
-    llm_id: str = Field(..., description="LLM ID to use for selection")
-
-
-class RecallResponse(BaseModel):
-    """Skill recall response"""
-
-    skill: Optional[SkillDetail] = Field(None, description="Selected skill or null")
-    reasoning: str = Field(..., description="Reasoning for selection")
 
 
 class ReloadResponse(BaseModel):
@@ -158,56 +143,6 @@ async def get_skill(
         execution_flow=skill.get("execution_flow", ""),
         files=skill.get("files", []),
         path=skill["path"],
-    )
-
-
-@router.post("/recall", response_model=RecallResponse)
-async def recall_skill(
-    request_data: RecallRequest,
-    request: Request,
-    current_user: User = Depends(get_current_user),
-) -> RecallResponse:
-    """
-    Select appropriate skill based on task
-
-    This is the core interface: Vibe Planner calls it to get relevant skill
-
-    Args:
-        request_data: Recall request with task and llm_id
-
-    Returns:
-        Selected skill or null if no relevant skill found
-    """
-    skill_manager = await _request_skill_manager(request, current_user)
-
-    # Get LLM from model_manager
-    get_model_manager = getattr(
-        import_module("xagent.core.model.manager"),
-        "get_model_manager",
-    )
-    model_manager = get_model_manager()
-    llm = model_manager.get_llm(request_data.llm_id)
-
-    try:
-        skill = await skill_manager.select_skill(task=request_data.task, llm=llm)
-    finally:
-        _close_skill_manager(skill_manager)
-
-    if not skill:
-        return RecallResponse(skill=None, reasoning="No relevant skill found")
-
-    return RecallResponse(
-        skill=SkillDetail(
-            name=skill["name"],
-            description=skill.get("description", ""),
-            when_to_use=skill.get("when_to_use", ""),
-            tags=skill.get("tags", []),
-            content=skill.get("content", ""),
-            execution_flow=skill.get("execution_flow", ""),
-            files=skill.get("files", []),
-            path=skill["path"],
-        ),
-        reasoning=f"Selected '{skill['name']}' based on task relevance",
     )
 
 

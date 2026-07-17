@@ -1395,17 +1395,3 @@ async def trace_ai_message(
         event_data.update(data)
     # Use AI_MESSAGE event type to generate "ai_message" event_type for frontend
     return await tracer.trace_event(AI_MESSAGE, task_id=task_id, data=event_data)
-
-
-async def trace_skill_select_start(
-    tracer: Tracer, task_id: str, data: Optional[Dict[str, Any]] = None
-) -> str:
-    """Trace skill selection start event."""
-    return await trace_task_start(tracer, task_id, TraceCategory.SKILL, data)
-
-
-async def trace_skill_select_end(
-    tracer: Tracer, task_id: str, data: Optional[Dict[str, Any]] = None
-) -> str:
-    """Trace skill selection end event."""
-    return await trace_task_end(tracer, task_id, TraceCategory.SKILL, data)

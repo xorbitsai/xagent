@@ -16,7 +16,6 @@ from .library import (
 )
 from .manager import SkillManager
 from .parser import SkillParser
-from .selector import SkillSelector
 
 __all__ = [
     "CompositeSkillLibraryProvider",
@@ -25,7 +24,6 @@ __all__ = [
     "SkillParser",
     "SkillRecord",
     "SkillScopeContext",
-    "SkillSelector",
     "StaticRecordsProvider",
     "get_skill_library_provider",
     "set_skill_library_provider",

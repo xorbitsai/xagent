@@ -316,7 +316,6 @@ const en = {
     },
   },
   branding: {
-    subtitle: "AI Agents for Everyone",
     tagline: `Run instantly.
 Build when you need.`,
     hero_description: "Plan, run and review your agents in one workspace, from instant tasks to fully built workflows.",

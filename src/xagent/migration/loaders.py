@@ -89,6 +89,12 @@ class MigrationLoader:
         self.skill_conflict = skill_conflict
 
     def load(self, bundle: MigrationBundle) -> LoadReport:
+        """Write the bundle into the database and report what happened.
+
+        Consumes the bundle: schedules that cannot become triggers are appended
+        to ``bundle.archived`` in place so that ``run_migration`` archives them
+        to disk afterwards. Don't reuse or re-preview a loaded bundle.
+        """
         report = LoadReport()
         agent = self._load_agent(bundle, report)
         self._load_skills(bundle, report)
@@ -184,10 +190,15 @@ class MigrationLoader:
     # -- skills ------------------------------------------------------------
 
     def _load_skills(self, bundle: MigrationBundle, report: LoadReport) -> None:
+        # Committed name -> source name for this run, so a skip can say whether
+        # it hit a pre-existing skill or a run-mate that normalized to the same
+        # target (e.g. "my skill" vs "my-skill").
+        imported_targets: dict[str, str] = {}
         for skill in bundle.skills:
             try:
+                target_name = _normalize_skill_name(skill.name)
                 imported_name = self._write_skill(
-                    name=skill.name,
+                    target_name=target_name,
                     files=skill.files,
                     slug=skill.slug,
                 )
@@ -198,27 +209,35 @@ class MigrationLoader:
                 report.errors.append(f"skill {skill.name!r}: {exc}")
                 continue
             if imported_name is None:
-                report.skills_skipped.append(skill.name)
+                if target_name in imported_targets:
+                    reason = (
+                        "name collides with "
+                        f"{imported_targets[target_name]!r} after normalization"
+                    )
+                else:
+                    reason = "already exists"
+                report.skills_skipped.append(f"{skill.name} ({reason})")
             else:
                 report.skills_imported.append(imported_name)
+                imported_targets[imported_name] = skill.name
 
     def _write_skill(
         self,
         *,
-        name: str,
+        target_name: str,
         files: dict[str, bytes],
         slug: str | None,
     ) -> str | None:
         """Insert one personal skill, honoring the conflict strategy.
 
-        The actual write is delegated to Skill Hub's ``_write_personal_skill``
-        so migration inherits its name validation, path-traversal checks and
+        ``target_name`` is the already-normalized Skill Hub name. The actual
+        write is delegated to Skill Hub's ``_write_personal_skill`` so
+        migration inherits its name validation, path-traversal checks and
         total-size budget. Returns the stored name, or ``None`` when a
         conflict caused a skip.
         """
         from ..web.api.skill_hub import _write_personal_skill
 
-        target_name = _normalize_skill_name(name)
         existing = (
             self.db.query(UserSkill)
             .filter(UserSkill.user_id == self.user_id, UserSkill.name == target_name)
@@ -275,6 +294,8 @@ class MigrationLoader:
                     if schedule.natural_language
                     else CRON_UNSUPPORTED_REASON
                 )
+                # Deliberate in-place mutation: write_archive(bundle) runs
+                # after load() and picks these up from bundle.archived.
                 bundle.archived.append(
                     ArchivedItem(
                         name=schedule.name,

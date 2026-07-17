@@ -62,6 +62,8 @@ curl -fsSL https://get.xagent.co | sh
 
 Create your admin account at `/setup`; Xagent then guides you to the Models page to connect a provider.
 
+Coming from OpenClaw or Hermes? `xagent migrate` imports your agent, skills, and schedules (see `xagent migrate --help`).
+
 ### Run with Docker (teams / self-hosting)
 
 ```bash

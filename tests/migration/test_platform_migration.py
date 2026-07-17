@@ -292,12 +292,12 @@ def test_loader_skill_conflict_strategies(db_session, hermes_home: Path) -> None
     report1 = MigrationLoader(db_session, user=user).load(bundle1)
     assert "greet" in report1.skills_imported
 
-    # Second import with skip leaves one "greet".
+    # Second import with skip leaves one "greet"; the skip names its reason.
     bundle2 = HermesAdapter(root=hermes_home).parse()
     report2 = MigrationLoader(db_session, user=user, skill_conflict="skip").load(
         bundle2
     )
-    assert report2.skills_skipped == ["greet"]
+    assert report2.skills_skipped == ["greet (already exists)"]
 
     # Third import with rename creates "greet-imported".
     bundle3 = HermesAdapter(root=hermes_home).parse()
@@ -414,6 +414,23 @@ def test_write_archive_persists_items(tmp_path: Path, openclaw_home: Path) -> No
     assert (archive_dir / "TOOLS.md").read_bytes() == b"legacy tool notes"
 
 
+def test_write_archive_survives_uncreatable_archive_dir(tmp_path: Path, caplog) -> None:
+    """A failing mkdir degrades to a warning: the DB import already committed."""
+    import logging
+
+    bundle = MigrationBundle(source="openclaw", source_root="x")
+    bundle.archived = [ArchivedItem(name="TOOLS.md", reason="r", content=b"data")]
+    # A regular file squatting on a path component makes mkdir raise OSError.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        written = write_archive(bundle, blocker / "archive")
+
+    assert written == []
+    assert any("archive" in r.getMessage().lower() for r in caplog.records)
+
+
 def test_write_archive_never_clobbers_on_name_collision(tmp_path: Path) -> None:
     """Fallback names are re-checked, so pathological name sets can't overwrite."""
     bundle = MigrationBundle(source="openclaw", source_root="x")
@@ -474,6 +491,25 @@ def test_loader_normalizes_skill_names_to_hub_rules(db_session) -> None:
         s.name for s in db_session.query(UserSkill).filter(UserSkill.user_id == user.id)
     }
     assert names == {"my-skill"}
+
+
+def test_skills_colliding_after_normalization_report_the_collision(
+    db_session,
+) -> None:
+    """Two source skills that normalize to one name: the skip says which."""
+    user = _make_user(db_session)
+    files = {"SKILL.md": b"---\ndescription: d\n---\n"}
+    bundle = MigrationBundle(source="hermes", source_root="x")
+    bundle.skills = [
+        SkillItem(name="my skill", files=dict(files), source_path="x"),
+        SkillItem(name="my-skill", files=dict(files), source_path="x"),
+    ]
+
+    report = MigrationLoader(db_session, user=user).load(bundle)
+
+    assert report.skills_imported == ["my-skill"]
+    (skipped,) = report.skills_skipped
+    assert skipped == "my-skill (name collides with 'my skill' after normalization)"
 
 
 def test_rerunning_migration_does_not_duplicate_triggers(
@@ -585,11 +621,14 @@ def test_print_report_distinguishes_outcomes(capsys) -> None:
 
     report = LoadReport(agent_name="Clawbot", agent_reused=True)
     report.errors.append("skill 'x': boom")
+    report.skills_skipped.append("y (already exists)")
     _print_report(report, [])
     out = capsys.readouterr().out
     assert "finished with errors" in out
     assert "agent reused" in out
     assert "! skill 'x': boom" in out
+    # Skipped skills are listed with their reason, not just counted.
+    assert "- y (already exists)" in out
 
     _print_report(LoadReport(agent_name=None), [])
     out = capsys.readouterr().out

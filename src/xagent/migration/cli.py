@@ -117,7 +117,11 @@ def _print_report(report: "LoadReport", archive_paths: list[str]) -> None:
         print(f"  agent created        : {report.agent_name}")
     print(f"  skills imported      : {len(report.skills_imported)}")
     if report.skills_skipped:
+        # Each entry carries its reason ("already exists" vs a name collision
+        # within this import), so print them rather than a bare count.
         print(f"  skills skipped       : {len(report.skills_skipped)}")
+        for name in report.skills_skipped:
+            print(f"      - {name}")
     print(f"  schedules imported   : {len(report.schedules_imported)}")
     if report.schedules_skipped:
         print(

@@ -7,6 +7,7 @@ reused by a future web endpoint.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,6 +21,8 @@ from .bundle import MigrationBundle
 if TYPE_CHECKING:
     from ..web.models.user import User
     from .loaders import LoadReport
+
+logger = logging.getLogger(__name__)
 
 
 def build_preview(bundle: MigrationBundle) -> dict[str, object]:
@@ -67,7 +70,20 @@ def write_archive(bundle: MigrationBundle, archive_dir: Path) -> list[str]:
     """
     if not bundle.archived:
         return []
-    archive_dir.mkdir(parents=True, exist_ok=True)
+    # From here on the DB import has already committed; a full disk, bad
+    # permissions or a file squatting on the archive path must degrade to a
+    # warning, not abort the run after the fact.
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not create archive directory %s (%s); "
+            "%d non-migratable item(s) were not written to disk.",
+            archive_dir,
+            exc,
+            len(bundle.archived),
+        )
+        return []
     written: list[str] = []
     reasons: list[str] = []
     for index, item in enumerate(bundle.archived):
@@ -87,8 +103,6 @@ def write_archive(bundle: MigrationBundle, archive_dir: Path) -> list[str]:
             continue
         reasons.append(f"{out_path.name}\t<- {item.source_path}\n  {item.reason}")
     if reasons:
-        # By now the DB import has already committed; a full disk or bad
-        # permissions here must not abort the run after the fact.
         try:
             (archive_dir / "REASON.txt").write_text(
                 "\n".join(reasons) + "\n", encoding="utf-8"

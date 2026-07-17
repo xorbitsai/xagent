@@ -913,7 +913,11 @@ class AutoPattern(AgentPattern):
             "update personal information or preferences for future tasks, "
             "choose react so the memory tools can persist the change; never "
             "claim via final_answer that something was remembered, because "
-            "final_answer cannot store anything. "
+            "final_answer cannot store anything. Likewise, if the user asks "
+            "what they previously told you or what you remember about them "
+            "and the retrieved context does not already contain the answer, "
+            "choose react and look it up with the search_memory tool before "
+            "concluding that nothing was recorded. "
             if memory_tools_available
             else ""
         )

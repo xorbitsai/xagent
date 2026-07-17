@@ -339,7 +339,12 @@ class UpdateMemoryTool:
                     "success": False,
                     "error": f"Memory '{memory_id}' not found.",
                 }
-            note = existing.content
+            note = getattr(existing, "content", None)
+            if note is None:
+                return {
+                    "success": False,
+                    "error": f"Memory '{memory_id}' has no stored note to update.",
+                }
             note.content = content
             if isinstance(note.metadata, dict):
                 note.metadata["updated_by_task"] = self.task

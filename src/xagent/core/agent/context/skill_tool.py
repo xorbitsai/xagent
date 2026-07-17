@@ -151,6 +151,8 @@ async def build_load_skill_tool(
     except Exception:
         logger.exception("Failed to list skills for the skill index")
         return None
+    if not skills:
+        return None
     if allowed_skills is not None:
         allowed = set(allowed_skills)
         skills = [skill for skill in skills if skill.get("name") in allowed]

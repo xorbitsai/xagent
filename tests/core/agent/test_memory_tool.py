@@ -310,3 +310,17 @@ def test_build_memory_tools_composition() -> None:
         "update_memory",
         "delete_memory",
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_memory_reports_note_without_content() -> None:
+    class NoContentStore(CrudMemoryStore):
+        def get(self, note_id: str) -> MemoryResponse:
+            return MemoryResponse(success=True, memory_id=note_id, content=None)
+
+    tool = UpdateMemoryTool(memory_store=NoContentStore(), task="task")
+
+    result = await tool.execute(memory_id="mem-1", content="New text.")
+
+    assert result["success"] is False
+    assert "no stored note" in result["error"]

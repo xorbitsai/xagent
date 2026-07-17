@@ -230,3 +230,20 @@ def test_skill_index_renders_name_only_for_empty_meta() -> None:
         "- bare-skill"
     )
     assert "- bare-skill:" not in system_content
+
+
+@pytest.mark.asyncio
+async def test_build_load_skill_tool_handles_none_skill_list() -> None:
+    class NoneListManager:
+        async def list_skills(self) -> None:
+            return None
+
+    context = ExecutionContext()
+    tool = await build_load_skill_tool(
+        skill_manager=NoneListManager(),
+        context=context,
+        allowed_skills=["writer"],
+    )
+
+    assert tool is None
+    assert SKILL_INDEX_METADATA_KEY not in context.metadata

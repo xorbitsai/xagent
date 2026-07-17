@@ -1825,10 +1825,10 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
         skill_manager=skill_manager,
     )
 
+    # Only the root run retrieves automatically; DAG steps rely on the
+    # search_memory tool instead of re-querying per step.
     assert [search["filters"]["category"] for search in memory_store.searches] == [
         "dag_plan_execute_memory",
-        "general",
-        "react_memory",
         "general",
     ]
     prompt_payload = json.loads(llm.call_kwargs[0]["messages"][1]["content"])

@@ -4071,7 +4071,11 @@ async def test_react_pattern_exposes_store_memory_tool_with_memory_store() -> No
     )
 
     assert result["success"] is True
-    assert "store_memory" in _tool_names_from_llm_call(llm.calls[0])
+    tool_names = _tool_names_from_llm_call(llm.calls[0])
+    assert "store_memory" in tool_names
+    assert "search_memory" in tool_names
+    assert "update_memory" in tool_names
+    assert "delete_memory" in tool_names
     assert len(memory_store.added) == 1
     assert memory_store.added[0].content == "User prefers reports in Chinese."
     # No end-of-run memory-evaluation LLM call: both fake responses are

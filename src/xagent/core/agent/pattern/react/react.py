@@ -43,7 +43,7 @@ from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
 )
-from ...context.memory_tool import build_store_memory_tool
+from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...language import final_answer_language_rule
 from ...result import tool_result_succeeded, unwrap_final_answer_content
@@ -270,14 +270,18 @@ class ReActPattern(AgentPattern):
         try:
             task_text = self._task_text(context)
             self._memory_store = kwargs.get("memory_store")
-            await enrich_context_with_memory(
-                context=context,
-                query=task_text,
-                category="react_memory",
-                memory_store=self._memory_store,
-                runtime=runtime,
-                similarity_threshold=kwargs.get("memory_similarity_threshold"),
-            )
+            # DAG steps skip the automatic retrieval: the root run already
+            # retrieved for the whole task, and steps can search_memory on
+            # demand.
+            if not context.metadata.get("dag_step_id"):
+                await enrich_context_with_memory(
+                    context=context,
+                    query=task_text,
+                    category="react_memory",
+                    memory_store=self._memory_store,
+                    runtime=runtime,
+                    similarity_threshold=kwargs.get("memory_similarity_threshold"),
+                )
             result = await self._run_tool_calling_loop(
                 context=context,
                 tools=await self._with_context_tools(
@@ -318,7 +322,7 @@ class ReActPattern(AgentPattern):
         skill_manager: Any | None,
         allowed_skills: list[str] | None,
     ) -> list[Any]:
-        """Expose ``store_memory``/``load_skill`` for this run.
+        """Expose the memory tool set and ``load_skill`` for this run.
 
         Skipped when ``finalize_after_tool_result`` is set (single_call mode):
         that mode forces a final answer after the first successful tool call,
@@ -326,15 +330,11 @@ class ReActPattern(AgentPattern):
         """
         if self.finalize_after_tool_result:
             return tools
-        extra_tools: list[Any] = []
-        if self._memory_store is not None:
-            memory_tool = build_store_memory_tool(
-                memory_store=self._memory_store,
-                task=task_text,
-                runtime=runtime,
-            )
-            if memory_tool is not None:
-                extra_tools.append(memory_tool)
+        extra_tools: list[Any] = build_memory_tools(
+            memory_store=self._memory_store,
+            task=task_text,
+            runtime=runtime,
+        )
         skill_tool = await build_load_skill_tool(
             skill_manager=skill_manager,
             context=context,

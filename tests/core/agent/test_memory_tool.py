@@ -5,7 +5,11 @@ from typing import Any
 import pytest
 
 from xagent.core.agent.context.memory_tool import (
+    DeleteMemoryTool,
+    SearchMemoryTool,
     StoreMemoryTool,
+    UpdateMemoryTool,
+    build_memory_tools,
     build_store_memory_tool,
 )
 from xagent.core.memory.core import MemoryNote, MemoryResponse
@@ -183,3 +187,126 @@ def test_build_store_memory_tool_requires_store() -> None:
     tool = build_store_memory_tool(memory_store=RecordingMemoryStore(), task="task")
     assert isinstance(tool, StoreMemoryTool)
     assert tool.name == "store_memory"
+
+
+class CrudMemoryStore(RecordingMemoryStore):
+    """Recording store with get/update/delete for the CRUD tools."""
+
+    def __init__(self, notes: dict[str, MemoryNote] | None = None) -> None:
+        super().__init__()
+        self.notes = dict(notes or {})
+        self.updated: list[MemoryNote] = []
+        self.deleted: list[str] = []
+
+    def search(self, **kwargs: Any) -> list[Any]:
+        self.searches.append(kwargs)
+        return list(self.notes.values())
+
+    def get(self, note_id: str) -> MemoryResponse:
+        note = self.notes.get(note_id)
+        if note is None:
+            return MemoryResponse(success=False, error="Note not found")
+        return MemoryResponse(success=True, memory_id=note_id, content=note)
+
+    def update(self, note: MemoryNote) -> MemoryResponse:
+        self.updated.append(note)
+        self.notes[note.id] = note
+        return MemoryResponse(success=True, memory_id=note.id)
+
+    def delete(self, note_id: str) -> MemoryResponse:
+        if note_id not in self.notes:
+            return MemoryResponse(success=False, error="Note not found")
+        del self.notes[note_id]
+        self.deleted.append(note_id)
+        return MemoryResponse(success=True, memory_id=note_id)
+
+
+def _note(note_id: str, content: str) -> MemoryNote:
+    return MemoryNote(id=note_id, content=content, category="react_memory")
+
+
+@pytest.mark.asyncio
+async def test_search_memory_returns_ids_and_content() -> None:
+    store = CrudMemoryStore({"mem-1": _note("mem-1", "User prefers Chinese.")})
+    tool = SearchMemoryTool(memory_store=store)
+
+    result = await tool.execute(query="preferences")
+
+    assert result["success"] is True
+    assert result["count"] == 1
+    assert result["memories"] == [
+        {
+            "id": "mem-1",
+            "content": "User prefers Chinese.",
+            "category": "react_memory",
+        }
+    ]
+    assert store.searches[0]["query"] == "preferences"
+
+
+@pytest.mark.asyncio
+async def test_search_memory_rejects_empty_query_and_emits_trace() -> None:
+    tracer = TraceEventRecorder()
+    store = CrudMemoryStore()
+    tool = SearchMemoryTool(memory_store=store, runtime=FakeRuntime(tracer=tracer))
+
+    empty = await tool.execute(query="  ")
+    ok = await tool.execute(query="anything")
+
+    assert empty["success"] is False
+    assert ok["success"] is True
+    event_types = [event["event_type"] for event in tracer.events]
+    assert event_types == [
+        "task_start_memory_retrieve",
+        "task_end_memory_retrieve",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_memory_replaces_content() -> None:
+    store = CrudMemoryStore({"mem-1": _note("mem-1", "Old fact.")})
+    tool = UpdateMemoryTool(memory_store=store, task="current task")
+
+    result = await tool.execute(memory_id="mem-1", content="Corrected fact.")
+
+    assert result == {"success": True, "memory_id": "mem-1"}
+    assert store.updated[0].content == "Corrected fact."
+    assert store.updated[0].metadata["updated_by_task"] == "current task"
+
+
+@pytest.mark.asyncio
+async def test_update_memory_reports_missing_note_and_bad_args() -> None:
+    store = CrudMemoryStore()
+    tool = UpdateMemoryTool(memory_store=store, task="task")
+
+    missing = await tool.execute(memory_id="nope", content="New text.")
+    bad = await tool.execute(memory_id="", content="")
+
+    assert missing["success"] is False
+    assert "not found" in missing["error"]
+    assert bad["success"] is False
+    assert store.updated == []
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_removes_note() -> None:
+    store = CrudMemoryStore({"mem-1": _note("mem-1", "Wrong fact.")})
+    tool = DeleteMemoryTool(memory_store=store)
+
+    result = await tool.execute(memory_id="mem-1")
+    missing = await tool.execute(memory_id="mem-1")
+
+    assert result == {"success": True, "memory_id": "mem-1"}
+    assert store.deleted == ["mem-1"]
+    assert missing["success"] is False
+
+
+def test_build_memory_tools_composition() -> None:
+    assert build_memory_tools(memory_store=None, task="task") == []
+    tools = build_memory_tools(memory_store=CrudMemoryStore(), task="task")
+    assert [tool.name for tool in tools] == [
+        "store_memory",
+        "search_memory",
+        "update_memory",
+        "delete_memory",
+    ]

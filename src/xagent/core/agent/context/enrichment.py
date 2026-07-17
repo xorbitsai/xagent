@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 from typing import Any, cast
 
@@ -18,22 +16,6 @@ MEMORY_CONTEXT_METADATA_KEY = "retrieved_memory_context"
 RETRIEVED_MEMORIES_METADATA_KEY = "retrieved_memories"
 SELECTED_SKILL_METADATA_KEY = "selected_skill"
 SKILL_CONTEXT_METADATA_KEY = "selected_skill_context"
-SKILL_SELECTION_ATTEMPTS_METADATA_KEY = "skill_selection_attempts"
-
-
-class _RuntimeLLMProxy:
-    def __init__(self, *, runtime: Any, llm: Any) -> None:
-        self.runtime = runtime
-        self.llm = llm
-
-    async def chat(self, **kwargs: Any) -> Any:
-        run_llm_call = getattr(self.runtime, "run_llm_call", None)
-        if callable(run_llm_call):
-            return await run_llm_call(self.llm, **kwargs)
-        return await self.llm.chat(**kwargs)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.llm, name)
 
 
 async def enrich_context_with_memory(
@@ -113,63 +95,6 @@ async def enrich_context_with_memory(
     return memories
 
 
-async def enrich_context_with_skill(
-    *,
-    context: Any,
-    task: str,
-    llm: Any | None,
-    skill_manager: Any | None,
-    runtime: Any | None = None,
-    allowed_skills: list[str] | None = None,
-) -> dict[str, Any] | None:
-    """Select a skill and attach full skill guidance to context metadata."""
-
-    if skill_manager is None or llm is None or not task.strip():
-        return None
-    existing = context.metadata.get(SELECTED_SKILL_METADATA_KEY)
-    if isinstance(existing, dict):
-        return existing
-    attempt_key = _skill_selection_attempt_key(task, allowed_skills)
-    attempts = context.metadata.setdefault(SKILL_SELECTION_ATTEMPTS_METADATA_KEY, {})
-    if isinstance(attempts, dict) and attempt_key in attempts:
-        attempted = attempts.get(attempt_key)
-        return attempted if isinstance(attempted, dict) else None
-
-    task_id = str(
-        _runtime_attr(runtime, "execution_id")
-        or getattr(context, "execution_id", None)
-        or ""
-    )
-    tracer = _runtime_attr(runtime, "tracer")
-    selected_skill = await skill_manager.select_skill(
-        task=task,
-        llm=_RuntimeLLMProxy(runtime=runtime, llm=llm) if runtime is not None else llm,
-        tracer=tracer,
-        task_id=task_id or None,
-        allowed_skills=allowed_skills,
-    )
-    if not selected_skill:
-        if isinstance(attempts, dict):
-            attempts[attempt_key] = None
-        return None
-
-    selected_summary = {
-        "name": selected_skill.get("name"),
-        "description": selected_skill.get("description"),
-        "when_to_use": selected_skill.get("when_to_use"),
-    }
-    if isinstance(attempts, dict):
-        attempts[attempt_key] = selected_summary
-    context.metadata[SELECTED_SKILL_METADATA_KEY] = selected_summary
-    context.metadata[SKILL_CONTEXT_METADATA_KEY] = build_skill_context(selected_skill)
-    logger.info(
-        "Selected v2 skill %s for execution %s",
-        selected_skill.get("name"),
-        getattr(context, "execution_id", None),
-    )
-    return cast(dict[str, Any], selected_skill)
-
-
 def build_skill_context(skill: dict[str, Any]) -> str:
     name = str(skill.get("name") or "Unnamed Skill")
     content = str(skill.get("content") or "").strip()
@@ -194,18 +119,6 @@ def _runtime_attr(runtime: Any | None, name: str) -> Any | None:
     if runtime is None:
         return None
     return getattr(runtime, name, None)
-
-
-def _skill_selection_attempt_key(
-    task: str,
-    allowed_skills: list[str] | None,
-) -> str:
-    payload = json.dumps(
-        {"task": task, "allowed_skills": sorted(allowed_skills or [])},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _build_memory_context(

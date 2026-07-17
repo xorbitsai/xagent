@@ -17,9 +17,7 @@ from xagent.core.agent.context.enrichment import (
     SKILL_CONTEXT_METADATA_KEY,
     _current_user_id,
     _lookup_relevant_memories_with_context,
-    _skill_selection_attempt_key,
     enrich_context_with_memory,
-    enrich_context_with_skill,
 )
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -368,67 +366,6 @@ async def test_enrich_context_with_memory_caches_and_builds_context(
     assert ctx.metadata[MEMORY_CONTEXT_METADATA_KEY] == (
         "Memory: Prefer concise answers."
     )
-
-
-class FakeSkillManager:
-    def __init__(self, selected: dict[str, str] | None) -> None:
-        self.selected = selected
-        self.calls: list[dict[str, object]] = []
-
-    async def select_skill(self, **kwargs: object) -> dict[str, str] | None:
-        self.calls.append(kwargs)
-        return self.selected
-
-
-@pytest.mark.asyncio
-async def test_enrich_context_with_skill_records_selected_skill() -> None:
-    skill = {
-        "name": "writer",
-        "description": "Writes concise copy",
-        "when_to_use": "Writing",
-        "content": "Use short sentences.",
-    }
-    manager = FakeSkillManager(skill)
-    ctx = ExecutionContext(execution_id="exec-skill")
-
-    selected = await enrich_context_with_skill(
-        context=ctx,
-        task="Write release notes",
-        llm=object(),
-        skill_manager=manager,
-        allowed_skills=["writer"],
-    )
-
-    assert selected == skill
-    assert ctx.metadata[enrichment_module.SELECTED_SKILL_METADATA_KEY]["name"] == (
-        "writer"
-    )
-    assert "Use short sentences." in ctx.metadata[SKILL_CONTEXT_METADATA_KEY]
-
-
-@pytest.mark.asyncio
-async def test_enrich_context_with_skill_caches_no_skill() -> None:
-    manager = FakeSkillManager(None)
-    ctx = ExecutionContext(execution_id="exec-skill")
-
-    first = await enrich_context_with_skill(
-        context=ctx,
-        task="No matching skill",
-        llm=object(),
-        skill_manager=manager,
-        allowed_skills=["writer"],
-    )
-    second = await enrich_context_with_skill(
-        context=ctx,
-        task="No matching skill",
-        llm=object(),
-        skill_manager=manager,
-        allowed_skills=["writer"],
-    )
-
-    assert first is None
-    assert second is None
-    assert len(manager.calls) == 1
 
 
 def test_add_messages() -> None:
@@ -988,16 +925,6 @@ def test_serialization_roundtrip() -> None:
     assert restored.llm_calls[0].total_tokens == 15
     assert restored.llm_calls[0].prompt_message_count == 1
     assert restored.compact_config.max_messages == ctx.compact_config.max_messages
-
-
-def test_skill_selection_attempt_key_hashes_task_payload() -> None:
-    task = "x" * 1000
-
-    key = _skill_selection_attempt_key(task, ["b", "a"])
-
-    assert len(key) == 64
-    assert task not in key
-    assert key == _skill_selection_attempt_key(task, ["a", "b"])
 
 
 def test_context_manager_lifecycle() -> None:

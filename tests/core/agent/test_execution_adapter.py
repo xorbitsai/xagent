@@ -107,7 +107,10 @@ class RecordingRegistry:
 
 
 class NoSkillManager:
-    async def select_skill(self, **_: Any) -> None:
+    async def list_skills(self) -> list[dict[str, Any]]:
+        return []
+
+    async def get_skill(self, name: str) -> None:
         return None
 
 

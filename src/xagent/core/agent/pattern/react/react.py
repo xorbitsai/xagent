@@ -41,10 +41,10 @@ from typing import Any, cast
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ...context.enrichment import (
     enrich_context_with_memory,
-    enrich_context_with_skill,
     latest_user_text,
 )
 from ...context.memory_tool import build_store_memory_tool
+from ...context.skill_tool import build_load_skill_tool
 from ...language import final_answer_language_rule
 from ...result import tool_result_succeeded, unwrap_final_answer_content
 from ...runtime import (
@@ -278,17 +278,16 @@ class ReActPattern(AgentPattern):
                 runtime=runtime,
                 similarity_threshold=kwargs.get("memory_similarity_threshold"),
             )
-            await enrich_context_with_skill(
-                context=context,
-                task=task_text,
-                llm=active_llm,
-                skill_manager=kwargs.get("skill_manager"),
-                runtime=runtime,
-                allowed_skills=kwargs.get("allowed_skills"),
-            )
             result = await self._run_tool_calling_loop(
                 context=context,
-                tools=self._with_memory_tool(tools, task_text, runtime),
+                tools=await self._with_context_tools(
+                    tools=tools,
+                    context=context,
+                    task_text=task_text,
+                    runtime=runtime,
+                    skill_manager=kwargs.get("skill_manager"),
+                    allowed_skills=kwargs.get("allowed_skills"),
+                ),
                 llm=active_llm,
                 compact_llm=compact_llm,
                 runtime=runtime,
@@ -309,28 +308,43 @@ class ReActPattern(AgentPattern):
         await runtime.on_pattern_end(context=context, pattern=self, result=result)
         return result
 
-    def _with_memory_tool(
+    async def _with_context_tools(
         self,
+        *,
         tools: list[Any],
+        context: Any,
         task_text: str,
         runtime: PatternRuntime,
+        skill_manager: Any | None,
+        allowed_skills: list[str] | None,
     ) -> list[Any]:
-        """Expose ``store_memory`` when a memory store is active.
+        """Expose ``store_memory``/``load_skill`` for this run.
 
         Skipped when ``finalize_after_tool_result`` is set (single_call mode):
         that mode forces a final answer after the first successful tool call,
-        so a memory store would consume the only tool round.
+        so the only tool round must go to the actual task.
         """
-        if self._memory_store is None or self.finalize_after_tool_result:
+        if self.finalize_after_tool_result:
             return tools
-        memory_tool = build_store_memory_tool(
-            memory_store=self._memory_store,
-            task=task_text,
-            runtime=runtime,
+        extra_tools: list[Any] = []
+        if self._memory_store is not None:
+            memory_tool = build_store_memory_tool(
+                memory_store=self._memory_store,
+                task=task_text,
+                runtime=runtime,
+            )
+            if memory_tool is not None:
+                extra_tools.append(memory_tool)
+        skill_tool = await build_load_skill_tool(
+            skill_manager=skill_manager,
+            context=context,
+            allowed_skills=allowed_skills,
         )
-        if memory_tool is None:
+        if skill_tool is not None:
+            extra_tools.append(skill_tool)
+        if not extra_tools:
             return tools
-        return [*tools, memory_tool]
+        return [*tools, *extra_tools]
 
     async def _run_tool_calling_loop(
         self,

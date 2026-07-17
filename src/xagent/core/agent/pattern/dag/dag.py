@@ -9,7 +9,6 @@ from typing import Any
 from ....model.intent import goal_scope
 from ...context.enrichment import (
     enrich_context_with_memory,
-    enrich_context_with_skill,
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
@@ -388,24 +387,6 @@ class DAGPattern(AgentPattern):
                     runtime=runtime,
                     similarity_threshold=memory_similarity_threshold,
                 )
-                try:
-                    await enrich_context_with_skill(
-                        context=context,
-                        task=task_text,
-                        llm=llm,
-                        skill_manager=skill_manager,
-                        runtime=runtime,
-                        allowed_skills=allowed_skills,
-                    )
-                except LLMCallInterrupted:
-                    interrupted = await self._interrupt_if_requested(
-                        runtime=runtime,
-                        context=context,
-                        label="dag_during_enrichment",
-                    )
-                    if interrupted is not None:
-                        return interrupted
-                    raise
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
                     context=context,

@@ -754,10 +754,21 @@ class FakeMemoryStore:
 
 class FakeSkillManager:
     def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+        self.loaded: list[str] = []
 
-    async def select_skill(self, **kwargs: Any) -> dict[str, Any]:
-        self.calls.append(kwargs)
+    async def list_skills(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "test-skill",
+                "description": "A test skill",
+                "when_to_use": "Testing",
+            }
+        ]
+
+    async def get_skill(self, name: str) -> dict[str, Any] | None:
+        if name != "test-skill":
+            return None
+        self.loaded.append(name)
         return {
             "name": "test-skill",
             "description": "A test skill",
@@ -2508,11 +2519,28 @@ def test_react_compacts_provider_tool_schema_without_losing_named_fields() -> No
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_injects_v1_memory_and_skill_context() -> None:
-    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+async def test_react_pattern_injects_memory_context_and_skill_index() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Loading the skill first.",
+                "tool_calls": [
+                    {
+                        "id": "call_skill",
+                        "function": {
+                            "name": "load_skill",
+                            "arguments": '{"skill_name":"test-skill"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
     memory_store = FakeMemoryStore()
     skill_manager = FakeSkillManager()
-    pattern = ReActPattern(max_iterations=1, tool_choice="none")
+    pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext(system_prompt="You are helpful.")
     context.add_user_message("Do the thing")
 
@@ -2530,12 +2558,19 @@ async def test_react_pattern_injects_v1_memory_and_skill_context() -> None:
         "react_memory",
         "general",
     ]
-    assert skill_manager.calls[0]["task"] == "Do the thing"
-    assert skill_manager.calls[0]["allowed_skills"] == ["test-skill"]
-    system_prompt = llm.calls[0]["messages"][0]["content"]
-    assert "Use the stored project preference." in system_prompt
-    assert "Available Skill: test-skill" in system_prompt
-    assert "Follow the selected skill instructions." in system_prompt
+    first_system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert "Use the stored project preference." in first_system_prompt
+    assert "Available skills:" in first_system_prompt
+    assert "- test-skill: A test skill" in first_system_prompt
+    tool_names = [
+        tool["function"]["name"] for tool in list(llm.calls[0].get("tools") or [])
+    ]
+    assert "load_skill" in tool_names
+    # After load_skill, the full guidance appears in the next system prompt.
+    assert skill_manager.loaded == ["test-skill"]
+    second_system_prompt = llm.calls[1]["messages"][0]["content"]
+    assert "Available Skill: test-skill" in second_system_prompt
+    assert "Follow the selected skill instructions." in second_system_prompt
 
 
 @pytest.mark.asyncio

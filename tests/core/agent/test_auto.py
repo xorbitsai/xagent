@@ -127,7 +127,18 @@ class FakeMemoryStore:
 
 
 class FakeSkillManager:
-    async def select_skill(self, **kwargs: Any) -> dict[str, Any]:
+    async def list_skills(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "auto-skill",
+                "description": "Auto skill",
+                "when_to_use": "Auto tasks",
+            }
+        ]
+
+    async def get_skill(self, name: str) -> dict[str, Any] | None:
+        if name != "auto-skill":
+            return None
         return {
             "name": "auto-skill",
             "description": "Auto skill",
@@ -152,20 +163,6 @@ class QueryMemoryStore:
         self.searches.append(kwargs)
         query = str(kwargs.get("query") or "")
         return [QueryMemoryNote(f"memory for {query}")]
-
-
-class QuerySkillManager:
-    def __init__(self) -> None:
-        self.tasks: list[str] = []
-
-    async def select_skill(self, **kwargs: Any) -> dict[str, Any]:
-        task = str(kwargs.get("task") or "")
-        self.tasks.append(task)
-        return {
-            "name": f"skill-for-{task}",
-            "description": "Task-specific skill",
-            "content": f"Use guidance for {task}.",
-        }
 
 
 def has_tool(kwargs: dict[str, Any], tool_name: str) -> bool:
@@ -353,7 +350,7 @@ def unrepairable_decision_tool_response() -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_auto_decision_sees_memory_and_skill_context() -> None:
+async def test_auto_decision_sees_memory_context() -> None:
     llm = FakeLLM(
         responses=[
             decision_tool_response(
@@ -387,7 +384,6 @@ async def test_auto_decision_sees_memory_and_skill_context() -> None:
         if message["role"] == "system"
     )
     assert "Answer simple follow-ups using the project memory." in system_context
-    assert "Available Skill: auto-skill" in system_context
 
 
 def plan_tool_response(
@@ -1317,7 +1313,6 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
     context.add_user_message("first question")
     runtime = PatternRuntime()
     memory_store = QueryMemoryStore()
-    skill_manager = QuerySkillManager()
 
     def interrupt_after_decision() -> bool:
         return bool(
@@ -1333,7 +1328,6 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
         llm=first_llm,
         runtime=runtime,
         memory_store=memory_store,
-        skill_manager=skill_manager,
     )
 
     assert interrupted["status"] == "interrupted"
@@ -1353,7 +1347,6 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
         llm=resumed_llm,
         runtime=PatternRuntime(),
         memory_store=memory_store,
-        skill_manager=skill_manager,
     )
 
     assert resumed["success"] is True
@@ -1364,16 +1357,13 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
         "replacement question",
         "replacement question",
     ]
-    assert skill_manager.tasks == ["first question", "replacement question"]
     resumed_system_context = next(
         message["content"]
         for message in resumed_llm.calls[0]["messages"]
         if message["role"] == "system"
     )
     assert "memory for replacement question" in resumed_system_context
-    assert "skill-for-replacement question" in resumed_system_context
     assert "memory for first question" not in resumed_system_context
-    assert "skill-for-first question" not in resumed_system_context
 
 
 @pytest.mark.asyncio

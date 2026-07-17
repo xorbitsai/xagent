@@ -28,6 +28,7 @@ from .components import (
 )
 from .enrichment import MEMORY_CONTEXT_METADATA_KEY, SKILL_CONTEXT_METADATA_KEY
 from .message import LLMCallRecord, Message
+from .skill_tool import LOADED_SKILLS_METADATA_KEY, SKILL_INDEX_METADATA_KEY
 
 READ_FILE_CONTEXT_LIMIT = 12_000
 COMPACT_SUMMARY_MAX_TOKENS = 1024
@@ -469,6 +470,32 @@ class ExecutionContext:
                 "to use memory or whether to search; decide the appropriate "
                 "execution strategy yourself."
             )
+        skill_index = self.metadata.get(SKILL_INDEX_METADATA_KEY)
+        if isinstance(skill_index, list) and skill_index:
+            loaded_skills = self.metadata.get(LOADED_SKILLS_METADATA_KEY)
+            loaded_names = (
+                set(loaded_skills) if isinstance(loaded_skills, list) else set()
+            )
+            index_lines = []
+            for entry in skill_index:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name or name in loaded_names:
+                    continue
+                description = str(entry.get("description") or "").strip()
+                when_to_use = str(entry.get("when_to_use") or "").strip()
+                line = f"- {name}: {description}"
+                if when_to_use:
+                    line += f" When to use: {when_to_use}"
+                index_lines.append(line)
+            if index_lines:
+                parts.append(
+                    "Available skills:\n"
+                    "Load a skill's full instructions with the load_skill tool "
+                    "when it clearly matches the current task. Do not load "
+                    "skills unrelated to the task.\n" + "\n".join(index_lines)
+                )
         skill_context = self.metadata.get(SKILL_CONTEXT_METADATA_KEY)
         if skill_context:
             parts.append(

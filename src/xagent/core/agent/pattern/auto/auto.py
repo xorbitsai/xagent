@@ -14,7 +14,6 @@ from ...context.enrichment import (
     SELECTED_SKILL_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
     enrich_context_with_memory,
-    enrich_context_with_skill,
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
@@ -469,24 +468,6 @@ class AutoPattern(AgentPattern):
                 runtime=runtime,
                 similarity_threshold=memory_similarity_threshold,
             )
-            try:
-                await enrich_context_with_skill(
-                    context=context,
-                    task=task_text,
-                    llm=llm,
-                    skill_manager=skill_manager,
-                    runtime=runtime,
-                    allowed_skills=allowed_skills,
-                )
-            except LLMCallInterrupted:
-                interrupted = await self._interrupt_if_requested(
-                    runtime=runtime,
-                    context=context,
-                    label="auto_during_enrichment",
-                )
-                if interrupted is not None:
-                    return interrupted
-                raise
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,

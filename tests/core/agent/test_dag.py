@@ -232,7 +232,18 @@ class FakeMemoryStore:
 
 
 class FakeSkillManager:
-    async def select_skill(self, **kwargs: Any) -> dict[str, Any]:
+    async def list_skills(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "dag-skill",
+                "description": "DAG skill",
+                "when_to_use": "DAG tasks",
+            }
+        ]
+
+    async def get_skill(self, name: str) -> dict[str, Any] | None:
+        if name != "dag-skill":
+            return None
         return {
             "name": "dag-skill",
             "description": "DAG skill",
@@ -1792,7 +1803,7 @@ async def test_llm_plan_generator_filters_unknown_suggested_tools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dag_pattern_enriches_plan_prompt_with_memory_and_skill() -> None:
+async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
     generator = LLMPlanGenerator()
     pattern = DAGPattern(generator)
     context = ExecutionContext(execution_id="dag-enriched")
@@ -1825,8 +1836,19 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory_and_skill() -> None:
         "Split this project using the historical DAG pattern."
         in prompt_payload["retrieved_memory_context"]
     )
-    assert prompt_payload["selected_skill"]["name"] == "dag-skill"
-    assert "Use the DAG skill instructions." in prompt_payload["selected_skill_context"]
+    # DAG steps run ReAct, which exposes the skill index and load_skill tool.
+    step_call = llm.call_kwargs[1]
+    step_tool_names = [
+        tool["function"]["name"] for tool in list(step_call.get("tools") or [])
+    ]
+    assert "load_skill" in step_tool_names
+    step_system = next(
+        message["content"]
+        for message in step_call["messages"]
+        if message["role"] == "system"
+    )
+    assert "Available skills:" in step_system
+    assert "- dag-skill: DAG skill" in step_system
 
 
 @pytest.mark.asyncio

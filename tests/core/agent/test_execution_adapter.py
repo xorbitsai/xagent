@@ -474,7 +474,7 @@ async def test_execution_adapter_includes_persisted_execution_context_before_his
 
 @pytest.mark.asyncio
 async def test_agent_service_passes_conversation_history_to_execution_adapter() -> None:
-    llm = FakeLLM(["generated", '{"should_store": false, "reason": "test"}'])
+    llm = FakeLLM(["generated"])
     service = AgentService(
         name="history-service",
         id="history-service",
@@ -507,7 +507,7 @@ async def test_agent_service_passes_conversation_history_to_execution_adapter() 
 
 @pytest.mark.asyncio
 async def test_agent_service_passes_execution_context_to_execution_adapter() -> None:
-    llm = FakeLLM(["updated", '{"should_store": false, "reason": "test"}'])
+    llm = FakeLLM(["updated"])
     service = AgentService(
         name="execution-context-service",
         id="execution-context-service",

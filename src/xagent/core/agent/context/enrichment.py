@@ -7,16 +7,10 @@ import logging
 from typing import Any, cast
 
 from ...agent.trace import (
-    trace_memory_generate_end,
-    trace_memory_generate_start,
     trace_memory_retrieve_end,
     trace_memory_retrieve_start,
-    trace_memory_store_end,
-    trace_memory_store_start,
 )
-from ...memory.core import MemoryNote
 from ...user_context import current_user_id
-from ..runtime import LLMCallInterrupted
 
 logger = logging.getLogger(__name__)
 
@@ -176,129 +170,6 @@ async def enrich_context_with_skill(
     return cast(dict[str, Any], selected_skill)
 
 
-async def generate_and_store_react_memory(
-    *,
-    context: Any,
-    task: str,
-    result: dict[str, Any],
-    iterations: int,
-    llm: Any | None,
-    memory_store: Any | None,
-    runtime: Any | None = None,
-) -> None:
-    """Generate v1-style ReAct memory insights and store valuable memories."""
-
-    if memory_store is None or llm is None or not task.strip():
-        return
-
-    task_id = str(
-        _runtime_attr(runtime, "execution_id")
-        or getattr(context, "execution_id", None)
-        or ""
-    )
-    step_id = _runtime_attr(runtime, "active_react_step_id")
-    tracer = _runtime_attr(runtime, "tracer")
-    output = str(result.get("output") or result.get("response") or "")
-    messages = [
-        message.to_dict()
-        for message in getattr(context, "messages", [])
-        if not getattr(message, "hidden", False)
-    ]
-
-    if tracer is not None and task_id:
-        await trace_memory_generate_start(
-            tracer,
-            task_id,
-            data={
-                "task": task[:200],
-                "iterations": iterations,
-                "result_length": len(output),
-                "messages_count": len(messages),
-                "step_id": step_id,
-            },
-        )
-
-    insights = await _generate_react_memory_insights(
-        task=task,
-        output=output,
-        iterations=iterations,
-        messages=messages,
-        llm=llm,
-    )
-    should_store = bool(insights and insights.get("should_store"))
-    reason = str(insights.get("reason", "") if insights else "")
-
-    if tracer is not None and task_id:
-        await trace_memory_generate_end(
-            tracer,
-            task_id,
-            data={
-                "insights_generated": insights is not None,
-                "should_store": should_store,
-                "reason": reason,
-                "step_id": step_id,
-            },
-        )
-
-    if not should_store:
-        if tracer is not None and task_id:
-            await trace_memory_store_end(
-                tracer,
-                task_id,
-                data={
-                    "storage_success": False,
-                    "decision": "not_worth_storing",
-                    "reason": reason or "No valuable memory insight generated.",
-                    "step_id": step_id,
-                },
-            )
-        return
-
-    if tracer is not None and task_id:
-        await trace_memory_store_start(
-            tracer,
-            task_id,
-            data={
-                "task": task[:200],
-                "memory_category": "react_memory",
-                "step_id": step_id,
-            },
-        )
-
-    assert insights is not None
-    memory_id = await asyncio.to_thread(
-        store_react_task_memory,
-        memory_store=memory_store,
-        task=task,
-        result={
-            "success": bool(result.get("success", True)),
-            "output": output,
-            "iterations": iterations,
-            "history": messages[-10:] if len(messages) > 10 else messages,
-        },
-        tool_usage_insights=str(insights.get("tool_usage_insights", "")),
-        reasoning_strategy=str(insights.get("reasoning_strategy", "")),
-        classification={
-            "user_preferences": insights.get("user_preferences", ""),
-            "core_insight": insights.get("core_insight", ""),
-            "failure_patterns": insights.get("failure_patterns", ""),
-            "success_patterns": insights.get("success_patterns", ""),
-        },
-    )
-
-    if tracer is not None and task_id:
-        await trace_memory_store_end(
-            tracer,
-            task_id,
-            data={
-                "storage_success": bool(memory_id),
-                "memory_id": memory_id,
-                "reason": reason,
-                "step_id": step_id,
-            },
-        )
-
-
 def build_skill_context(skill: dict[str, Any]) -> str:
     name = str(skill.get("name") or "Unnamed Skill")
     content = str(skill.get("content") or "").strip()
@@ -317,93 +188,6 @@ def latest_user_text(context: Any) -> str:
             return str(getattr(message, "content", "") or "")
     task = context.metadata.get("task") if hasattr(context, "metadata") else None
     return str(task or "")
-
-
-async def _generate_react_memory_insights(
-    *,
-    task: str,
-    output: str,
-    iterations: int,
-    messages: list[dict[str, Any]],
-    llm: Any,
-) -> dict[str, Any] | None:
-    analysis_summary = f"""MEMORY STORAGE EVALUATION:
-
-TASK: {task}
-ITERATIONS: {iterations}
-
-RESULT PREVIEW:
-{output[:300]}{"..." if len(output) > 300 else ""}
-
-Evaluate if this execution contains UNIQUE, NON-OBVIOUS insights that would be valuable for FUTURE tasks.
-
-STORE ONLY IF it contains at least one of:
-- Clear user preferences or stable behavior patterns
-- Non-obvious failures and fixes
-- Reusable strategies that are not routine
-- Domain-specific insights hard to obtain otherwise
-
-DO NOT STORE routine task completion, generic tool usage, common facts, or obvious strategies.
-
-Respond with JSON:
-{{
-  "should_store": true/false,
-  "reason": "specific storage or rejection reason",
-  "core_insight": "essential learning if stored",
-  "user_preferences": "observable user preferences",
-  "failure_patterns": "non-obvious failure modes and solutions",
-  "success_patterns": "non-obvious success patterns",
-  "tool_usage_insights": "non-obvious tool usage insight",
-  "reasoning_strategy": "reusable reasoning strategy"
-}}"""
-    working_messages = list(messages)
-    working_messages.append({"role": "user", "content": analysis_summary})
-    try:
-        run_llm_call = getattr(llm, "run_llm_call", None)
-        response = (
-            await run_llm_call(messages=working_messages)
-            if callable(run_llm_call)
-            else await llm.chat(messages=working_messages)
-        )
-        content = (
-            response.get("content", str(response))
-            if isinstance(response, dict)
-            else str(response)
-        )
-        return _parse_json_object(content)
-    except LLMCallInterrupted:
-        raise
-    except Exception:
-        logger.exception("Failed to generate v2 ReAct memory insights")
-        return None
-
-
-def _parse_json_object(content: str) -> dict[str, Any] | None:
-    text = content.strip()
-    for candidate in _json_candidates(text):
-        try:
-            payload = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        return payload if isinstance(payload, dict) else None
-    return None
-
-
-def _json_candidates(text: str) -> list[str]:
-    candidates = [text]
-    fence_start = text.find("```")
-    if fence_start >= 0:
-        content_start = text.find("\n", fence_start + 3)
-        fence_end = text.find("```", content_start + 1)
-        if content_start >= 0 and fence_end > content_start:
-            candidates.append(text[content_start + 1 : fence_end].strip())
-
-    object_start = text.find("{")
-    object_end = text.rfind("}")
-    if object_start >= 0 and object_end > object_start:
-        candidates.append(text[object_start : object_end + 1].strip())
-
-    return candidates
 
 
 def _runtime_attr(runtime: Any | None, name: str) -> Any | None:
@@ -535,42 +319,6 @@ def enhance_goal_with_memory(query: str, memories: list[dict[str, Any]]) -> str:
     if not memory_lines:
         return query
     return f"{query}\n\nRelevant memory:\n" + "\n".join(memory_lines)
-
-
-def store_react_task_memory(
-    *,
-    memory_store: Any | None,
-    task: str,
-    result: dict[str, Any],
-    tool_usage_insights: str,
-    reasoning_strategy: str,
-    classification: dict[str, Any],
-) -> str | None:
-    if memory_store is None:
-        return None
-
-    content_parts = [
-        f"Task: {task}",
-        f"Result: {str(result.get('output') or '')}",
-        f"Tool usage: {tool_usage_insights}",
-        f"Reasoning strategy: {reasoning_strategy}",
-        f"Core insight: {classification.get('core_insight') or ''}",
-    ]
-    note = MemoryNote(
-        content="\n".join(part for part in content_parts if part.strip()),
-        category="react_memory",
-        metadata={
-            "task": task,
-            "success": bool(result.get("success", True)),
-            "classification": classification,
-        },
-    )
-    response = memory_store.add(note)
-    return (
-        getattr(response, "memory_id", None)
-        if getattr(response, "success", False)
-        else None
-    )
 
 
 def _memory_note_to_dict(memory: Any) -> dict[str, Any]:

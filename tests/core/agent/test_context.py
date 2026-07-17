@@ -17,11 +17,9 @@ from xagent.core.agent.context.enrichment import (
     SKILL_CONTEXT_METADATA_KEY,
     _current_user_id,
     _lookup_relevant_memories_with_context,
-    _parse_json_object,
     _skill_selection_attempt_key,
     enrich_context_with_memory,
     enrich_context_with_skill,
-    generate_and_store_react_memory,
 )
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -29,7 +27,6 @@ from xagent.core.agent.language import (
     output_language_policy,
     response_language_rules,
 )
-from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.web.user_isolated_memory import current_user_id
 
@@ -432,107 +429,6 @@ async def test_enrich_context_with_skill_caches_no_skill() -> None:
     assert first is None
     assert second is None
     assert len(manager.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_generate_and_store_react_memory_store_and_skip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stored: list[dict[str, object]] = []
-
-    async def fake_generate(**_: object) -> dict[str, object]:
-        return {
-            "should_store": True,
-            "reason": "useful",
-            "core_insight": "core",
-            "tool_usage_insights": "tools",
-            "reasoning_strategy": "strategy",
-        }
-
-    def fake_store_react_task_memory(**kwargs: object) -> str:
-        stored.append(kwargs)
-        return "memory-1"
-
-    monkeypatch.setattr(
-        enrichment_module,
-        "_generate_react_memory_insights",
-        fake_generate,
-    )
-    monkeypatch.setattr(
-        enrichment_module,
-        "store_react_task_memory",
-        fake_store_react_task_memory,
-    )
-    ctx = ExecutionContext(execution_id="exec-memory")
-    ctx.add_user_message("Do work")
-
-    await generate_and_store_react_memory(
-        context=ctx,
-        task="Do work",
-        result={"success": True, "output": "Done"},
-        iterations=2,
-        llm=object(),
-        memory_store=object(),
-    )
-
-    assert stored[0]["task"] == "Do work"
-    assert stored[0]["tool_usage_insights"] == "tools"
-
-
-@pytest.mark.asyncio
-async def test_generate_and_store_react_memory_parse_failure_skips_store(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stored: list[dict[str, object]] = []
-
-    async def fake_generate(**_: object) -> None:
-        return None
-
-    monkeypatch.setattr(
-        enrichment_module,
-        "_generate_react_memory_insights",
-        fake_generate,
-    )
-    monkeypatch.setattr(
-        enrichment_module,
-        "store_react_task_memory",
-        lambda **kwargs: stored.append(kwargs),
-    )
-
-    await generate_and_store_react_memory(
-        context=ExecutionContext(execution_id="exec-memory"),
-        task="Do work",
-        result={"success": True, "output": "Done"},
-        iterations=2,
-        llm=object(),
-        memory_store=object(),
-    )
-
-    assert stored == []
-
-
-@pytest.mark.asyncio
-async def test_generate_and_store_react_memory_propagates_interrupt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def fake_generate(**_: object) -> None:
-        raise LLMCallInterrupted("paused")
-
-    monkeypatch.setattr(
-        enrichment_module,
-        "_generate_react_memory_insights",
-        fake_generate,
-    )
-
-    with pytest.raises(LLMCallInterrupted, match="paused"):
-        await generate_and_store_react_memory(
-            context=ExecutionContext(execution_id="exec-memory"),
-            task="Do work",
-            result={"success": True, "output": "Done"},
-            iterations=2,
-            llm=object(),
-            memory_store=object(),
-        )
 
 
 def test_add_messages() -> None:
@@ -1092,19 +988,6 @@ def test_serialization_roundtrip() -> None:
     assert restored.llm_calls[0].total_tokens == 15
     assert restored.llm_calls[0].prompt_message_count == 1
     assert restored.compact_config.max_messages == ctx.compact_config.max_messages
-
-
-def test_parse_json_object_extracts_fenced_json_with_preamble() -> None:
-    content = """Here is the analysis:
-
-```json
-{"should_store": false, "reason": "routine"}
-```
-"""
-
-    parsed = _parse_json_object(content)
-
-    assert parsed == {"should_store": False, "reason": "routine"}
 
 
 def test_skill_selection_attempt_key_hashes_task_payload() -> None:

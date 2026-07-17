@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import re
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,8 +23,6 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
-
-react_module = importlib.import_module("xagent.core.agent.pattern.react.react")
 
 
 class CalculatorArgs(BaseModel):
@@ -2511,18 +2509,7 @@ def test_react_compacts_provider_tool_schema_without_losing_named_fields() -> No
 
 @pytest.mark.asyncio
 async def test_react_pattern_injects_v1_memory_and_skill_context() -> None:
-    llm = FakeLLM(
-        responses=[
-            {"content": "Done.", "done": True},
-            {
-                "content": (
-                    '{"should_store": false, "reason": "routine", '
-                    '"core_insight": "", "user_preferences": "", '
-                    '"failure_patterns": "", "success_patterns": ""}'
-                )
-            },
-        ]
-    )
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
     memory_store = FakeMemoryStore()
     skill_manager = FakeSkillManager()
     pattern = ReActPattern(max_iterations=1, tool_choice="none")
@@ -2553,18 +2540,7 @@ async def test_react_pattern_injects_v1_memory_and_skill_context() -> None:
 
 @pytest.mark.asyncio
 async def test_react_pattern_emits_memory_retrieve_trace_events() -> None:
-    llm = FakeLLM(
-        responses=[
-            {"content": "Done.", "done": True},
-            {
-                "content": (
-                    '{"should_store": false, "reason": "routine", '
-                    '"core_insight": "", "user_preferences": "", '
-                    '"failure_patterns": "", "success_patterns": ""}'
-                )
-            },
-        ]
-    )
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
     memory_store = FakeMemoryStore()
     tracer = TraceEventRecorder()
     runtime = PatternRuntime(tracer=tracer, execution_id="task-memory-trace")
@@ -2592,7 +2568,8 @@ async def test_react_pattern_emits_memory_retrieve_trace_events() -> None:
     store_events = [
         event for event in tracer.events if "memory_store" in event["event_type"]
     ]
-    assert [event["event_type"] for event in store_events] == ["task_end_memory_store"]
+    # store_memory is model-driven now; no tool call means no store events.
+    assert store_events == []
 
 
 @pytest.mark.asyncio
@@ -2746,53 +2723,6 @@ async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
     assert context.messages[-2].metadata["tool_name"] == "final_answer"
     assert context.messages[-1].role == "assistant"
     assert context.messages[-1].content == "The result is 4."
-
-
-@pytest.mark.asyncio
-async def test_react_pattern_final_answer_tool_persists_memory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    memory_calls: list[dict[str, Any]] = []
-
-    async def fake_generate_and_store_react_memory(**kwargs: Any) -> None:
-        memory_calls.append(kwargs)
-
-    monkeypatch.setattr(
-        react_module,
-        "generate_and_store_react_memory",
-        fake_generate_and_store_react_memory,
-    )
-    llm = FakeLLM(
-        responses=[
-            {
-                "tool_calls": [
-                    {
-                        "id": "call_final",
-                        "function": {
-                            "name": "final_answer",
-                            "arguments": '{"answer":"Done."}',
-                        },
-                    }
-                ],
-            },
-        ]
-    )
-    pattern = ReActPattern(max_iterations=2)
-    context = ExecutionContext()
-    context.add_user_message("Finish")
-
-    result = await pattern.run(context=context, tools=[], llm=llm)
-
-    assert result["success"] is True
-    assert result["response"] == "Done."
-    assert context.messages[-2].role == "tool"
-    assert context.messages[-2].tool_call_id == "call_final"
-    assert context.messages[-1].content == "Done."
-    assert memory_calls
-    assert memory_calls[0]["task"] == "Finish"
-    assert memory_calls[0]["context"].messages[-2].role == "tool"
-    assert memory_calls[0]["result"]["response"] == "Done."
-    assert memory_calls[0]["iterations"] == 1
 
 
 @pytest.mark.asyncio
@@ -3269,19 +3199,7 @@ async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool(
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_resume_uses_original_task_for_memory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    memory_calls: list[dict[str, Any]] = []
-
-    async def fake_generate_and_store_react_memory(**kwargs: Any) -> None:
-        memory_calls.append(kwargs)
-
-    monkeypatch.setattr(
-        react_module,
-        "generate_and_store_react_memory",
-        fake_generate_and_store_react_memory,
-    )
+async def test_react_pattern_resume_binds_original_task_to_store_memory() -> None:
     llm = FakeLLM(
         responses=[
             {
@@ -3307,18 +3225,40 @@ async def test_react_pattern_resume_uses_original_task_for_memory(
     context.add_user_message("B")
     resumed_pattern = ReActPattern(max_iterations=3)
     resumed_pattern.load_state(pattern.get_state())
-    resumed_llm = FakeLLM([{"content": "Continuing with B.", "done": True}])
+    resumed_llm = FakeLLM(
+        responses=[
+            {
+                "content": "Storing the preference.",
+                "tool_calls": [
+                    {
+                        "id": "call_mem",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": (
+                                '{"content":"User chose option B.",'
+                                '"kind":"user_preference"}'
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Continuing with B.", "done": True},
+        ]
+    )
+    memory_store = MemoryToolStore()
 
     resumed = await resumed_pattern.run(
         context=context,
         tools=[],
         llm=resumed_llm,
-        memory_store=object(),
+        memory_store=memory_store,
     )
 
     assert resumed["success"] is True
-    assert memory_calls
-    assert memory_calls[0]["task"] == "Ask, then calculate"
+    assert len(memory_store.added) == 1
+    # The store_memory tool is bound to the original task, not the resume turn.
+    assert memory_store.added[0].metadata["task"] == "Ask, then calculate"
 
 
 @pytest.mark.asyncio
@@ -4038,3 +3978,101 @@ async def test_react_pattern_runtime_injected_from_runner_style_traces_events() 
         "finish_span",
         "finish_trace",
     ]
+
+
+class MemoryToolStore:
+    """Fake memory store with both search (retrieval/dedup) and add (store)."""
+
+    def __init__(self) -> None:
+        self.searches: list[dict[str, Any]] = []
+        self.added: list[Any] = []
+
+    def search(self, **kwargs: Any) -> list[Any]:
+        self.searches.append(kwargs)
+        return []
+
+    def add(self, note: Any) -> Any:
+        self.added.append(note)
+        return SimpleNamespace(success=True, memory_id=f"mem-{len(self.added)}")
+
+
+def _tool_names_from_llm_call(call: dict[str, Any]) -> list[str]:
+    return [tool["function"]["name"] for tool in list(call.get("tools") or [])]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_exposes_store_memory_tool_with_memory_store() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Worth remembering.",
+                "tool_calls": [
+                    {
+                        "id": "call_mem",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": (
+                                '{"content":"User prefers reports in Chinese.",'
+                                '"kind":"user_preference"}'
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
+    memory_store = MemoryToolStore()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Write the weekly report")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    assert "store_memory" in _tool_names_from_llm_call(llm.calls[0])
+    assert len(memory_store.added) == 1
+    assert memory_store.added[0].content == "User prefers reports in Chinese."
+    # No end-of-run memory-evaluation LLM call: both fake responses are
+    # consumed by the ReAct loop itself.
+    assert llm.responses == []
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_without_memory_store_has_no_store_memory_tool() -> None:
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+    pattern = ReActPattern(max_iterations=1, tool_choice="none")
+    context = ExecutionContext()
+    context.add_user_message("Do the thing")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert "store_memory" not in _tool_names_from_llm_call(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_skips_store_memory_tool_in_single_call_mode() -> None:
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+    memory_store = MemoryToolStore()
+    pattern = ReActPattern(max_iterations=2, finalize_after_tool_result=True)
+    context = ExecutionContext()
+    context.add_user_message("Quick question")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    assert "store_memory" not in _tool_names_from_llm_call(llm.calls[0])
+    assert memory_store.added == []

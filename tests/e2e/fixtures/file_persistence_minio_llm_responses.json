@@ -32,16 +32,5 @@
       "answer": "Created static-output.txt",
       "success": true
     }
-  },
-  {
-    "kind": "json_text",
-    "content": {
-      "should_store": false,
-      "reason": "Routine deterministic test execution.",
-      "core_insight": "",
-      "user_preferences": "",
-      "failure_patterns": "",
-      "success_patterns": ""
-    }
   }
 ]

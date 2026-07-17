@@ -42,9 +42,9 @@ from ....model.chat.tool_protocol import get_tool_protocol_error
 from ...context.enrichment import (
     enrich_context_with_memory,
     enrich_context_with_skill,
-    generate_and_store_react_memory,
     latest_user_text,
 )
+from ...context.memory_tool import build_store_memory_tool
 from ...language import final_answer_language_rule
 from ...result import tool_result_succeeded, unwrap_final_answer_content
 from ...runtime import (
@@ -288,7 +288,7 @@ class ReActPattern(AgentPattern):
             )
             result = await self._run_tool_calling_loop(
                 context=context,
-                tools=tools,
+                tools=self._with_memory_tool(tools, task_text, runtime),
                 llm=active_llm,
                 compact_llm=compact_llm,
                 runtime=runtime,
@@ -308,6 +308,29 @@ class ReActPattern(AgentPattern):
 
         await runtime.on_pattern_end(context=context, pattern=self, result=result)
         return result
+
+    def _with_memory_tool(
+        self,
+        tools: list[Any],
+        task_text: str,
+        runtime: PatternRuntime,
+    ) -> list[Any]:
+        """Expose ``store_memory`` when a memory store is active.
+
+        Skipped when ``finalize_after_tool_result`` is set (single_call mode):
+        that mode forces a final answer after the first successful tool call,
+        so a memory store would consume the only tool round.
+        """
+        if self._memory_store is None or self.finalize_after_tool_result:
+            return tools
+        memory_tool = build_store_memory_tool(
+            memory_store=self._memory_store,
+            task=task_text,
+            runtime=runtime,
+        )
+        if memory_tool is None:
+            return tools
+        return [*tools, memory_tool]
 
     async def _run_tool_calling_loop(
         self,
@@ -553,7 +576,6 @@ class ReActPattern(AgentPattern):
             if normalized.get("done", True):
                 return await self._finalize_success(
                     context=context,
-                    llm=llm,
                     runtime=runtime,
                     response=assistant_content or normalized.get("raw"),
                 )
@@ -1334,7 +1356,6 @@ class ReActPattern(AgentPattern):
                 context.add_assistant_message(answer)
             return await self._finalize_success(
                 context=context,
-                llm=llm,
                 runtime=runtime,
                 response=answer,
             )
@@ -2043,7 +2064,6 @@ class ReActPattern(AgentPattern):
         self,
         *,
         context: Any,
-        llm: Any,
         runtime: PatternRuntime,
         response: Any,
     ) -> dict[str, Any]:
@@ -2057,15 +2077,6 @@ class ReActPattern(AgentPattern):
             output=response,
             metadata={"response": response, "status": self.status},
         ).to_dict()
-        await generate_and_store_react_memory(
-            context=context,
-            task=self._task_text(context),
-            result=result,
-            iterations=self.current_iteration + 1,
-            llm=llm,
-            memory_store=getattr(self, "_memory_store", None),
-            runtime=runtime,
-        )
         return result
 
     def _ensure_pending_tool_call_envelope(self, context: Any) -> None:

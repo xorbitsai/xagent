@@ -1803,13 +1803,6 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory_and_skill() -> None:
         [
             plan_tool_response([{"id": "only", "task": "Only step"}]),
             {"content": "step done", "done": True},
-            {
-                "content": (
-                    '{"should_store": false, "reason": "routine", '
-                    '"core_insight": "", "user_preferences": "", '
-                    '"failure_patterns": "", "success_patterns": ""}'
-                )
-            },
         ]
     )
 

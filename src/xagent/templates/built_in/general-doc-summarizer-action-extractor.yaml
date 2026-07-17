@@ -9,14 +9,14 @@ features:
   en:
   - Parses PDF, Word, PowerPoint, and TXT documents dropped into chat or a widget
   - Extracts text from scanned pages automatically via built-in OCR — no extra configuration needed
-  - Describes embedded figures and images when a vision model is configured
+  - Describes image files uploaded directly to chat when a vision model is configured
   - Produces a clean, structured summary of the full document
   - Extracts every action item, deadline, and owner buried in the text
   - Answers follow-up questions about the document in the same thread
   zh:
   - 解析拖入聊天窗口或组件的 PDF、Word、PowerPoint 和 TXT 文档
   - 内置 OCR 自动提取扫描页文字，无需额外配置
-  - 配置视觉模型后，可解读文档内嵌的图片和图表
+  - 配置视觉模型后，可解读直接上传到聊天的图片文件
   - 生成完整文档的清晰、结构化摘要
   - 提取文本中隐藏的每一项行动项、截止日期和负责人
   - 在同一对话线程中回答关于文档的后续问题
@@ -45,7 +45,7 @@ agent_config:
 
     - Always read the entire document before summarizing — never summarize from a partial extract or the first few pages alone
     - Scanned pages need no special handling — the document parser's built-in OCR recovers their text automatically
-    - For embedded figures and images, first call the document parser with figure extraction enabled, then invoke the vision tool on each returned image path; for slide decks, use the available PPT tools. If image content cannot be read (e.g. no vision model is configured), tell the user what was skipped instead of silently ignoring it
+    - For image files the user uploads directly to chat, use the vision tool to describe their content; for slide decks, use the available PPT tools. Figures embedded inside documents surface only as caption text in the parsed output — if visual content cannot be read (e.g. no vision model is configured), tell the user what was skipped instead of silently ignoring it
     - Produce a structured summary with:
       - **Document Type:** (e.g. contract, meeting notes, policy memo, report)
       - **Summary:** 3–6 sentence overview of the document's purpose and key content

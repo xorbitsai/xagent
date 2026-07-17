@@ -485,6 +485,7 @@ class AutoPattern(AgentPattern):
                     llm=llm,
                     compact_llm=compact_llm,
                     runtime=runtime,
+                    memory_tools_available=memory_store is not None,
                 )
                 self.decision = decision_result.decision
                 final_answer_stream = decision_result.final_answer_stream
@@ -733,6 +734,7 @@ class AutoPattern(AgentPattern):
         llm: Any,
         compact_llm: Any | None,
         runtime: PatternRuntime,
+        memory_tools_available: bool = False,
     ) -> AutoDecisionResult:
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
@@ -759,6 +761,7 @@ class AutoPattern(AgentPattern):
         decision_prompt = self._decision_prompt(
             tools,
             current_request=current_request,
+            memory_tools_available=memory_tools_available,
         )
         decision_tools = [self._decision_tool_schema()]
         retry_feedback: str | None = None
@@ -903,7 +906,17 @@ class AutoPattern(AgentPattern):
         tools: list[Any],
         *,
         current_request: str = "",
+        memory_tools_available: bool = False,
     ) -> str:
+        memory_rule = (
+            "If the latest user message asks to remember, store, forget, or "
+            "update personal information or preferences for future tasks, "
+            "choose react so the memory tools can persist the change; never "
+            "claim via final_answer that something was remembered, because "
+            "final_answer cannot store anything. "
+            if memory_tools_available
+            else ""
+        )
         tool_count = len(tools)
         tool_names = self._execution_tool_names(tools)
         tool_capability_summary = (
@@ -944,6 +957,7 @@ class AutoPattern(AgentPattern):
             "tool, to pause for user input, or to wait for a user choice, choose "
             "react; do not choose final_answer merely to restate or paraphrase the "
             "requested tool action. "
+            f"{memory_rule}"
             "A final answer means the latest user request is already complete and "
             "no tool or other work will happen after this routing decision. If the "
             "user-facing answer would describe a future tool action, ask the user "

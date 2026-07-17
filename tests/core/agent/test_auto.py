@@ -1757,3 +1757,40 @@ async def test_auto_pattern_dag_resume_from_tracer_does_not_redecide(
     assert resumed["pattern"] == "AutoPattern"
     assert len(resumed_llm.calls) == 2
     assert has_tool(resumed_llm.calls[1], DAG_COMPLETION_TOOL_NAME)
+
+
+@pytest.mark.asyncio
+async def test_auto_decision_prompt_includes_memory_rule_only_with_store() -> None:
+    async def run_and_get_routing_prompt(memory_store: Any | None) -> str:
+        llm = FakeLLM(
+            responses=[
+                decision_tool_response(
+                    AutoAction.FINAL_ANSWER.value,
+                    "simple",
+                    "Done.",
+                )
+            ]
+        )
+        context = ExecutionContext()
+        context.add_user_message("记住：我喜欢坂本龙一的音乐")
+        result = await AutoPattern().run(
+            context=context,
+            tools=[],
+            llm=llm,
+            memory_store=memory_store,
+        )
+        assert result["success"] is True
+        routing_messages = [
+            message["content"]
+            for message in llm.calls[0]["messages"]
+            if message["role"] == "user"
+            and "Auto routing instruction" in str(message["content"])
+        ]
+        assert routing_messages
+        return str(routing_messages[-1])
+
+    with_memory = await run_and_get_routing_prompt(FakeMemoryStore())
+    without_memory = await run_and_get_routing_prompt(None)
+
+    assert "memory tools can persist" in with_memory
+    assert "memory tools can persist" not in without_memory

@@ -1,6 +1,6 @@
 ---
 description: Evidence-first retrieval-augmented reasoning skill for decision-critical scenarios. Retrieves information from a specified knowledge base, extracts verifiable evidence, detects conflicting claims, and evaluates answer sufficiency with explicit confidence and risk signals. Produces traceable outputs suitable for agent-level decision control and escalation.
----------------
+---
 
 # Evidence-Based RAG
 

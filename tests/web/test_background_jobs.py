@@ -73,6 +73,26 @@ def test_background_job_enqueue_unavailable_without_worker(monkeypatch):
     assert is_background_job_enqueue_available(check_worker=True) is False
 
 
+def test_web_ingest_enqueue_accepts_broker_only_without_worker(monkeypatch):
+    """The web-ingest enqueue pre-check must accept a job when the broker is
+    reachable even if no worker answers the liveness ping.
+
+    Regression guard for the ``check_worker=False`` call sites in ``kb.py``:
+    reverting them to ``check_worker=True`` makes the unanswered ping raise a
+    spurious 503 here, which is the production false-alarm this fixes.
+    """
+    import asyncio
+
+    monkeypatch.setenv(CELERY_ENABLED, "true")
+    monkeypatch.setenv(CELERY_BROKER_URL, "memory://")
+
+    from xagent.web.api.kb import _ensure_background_job_queue_available_async
+
+    # Must not raise HTTPException(503): broker is reachable and worker
+    # liveness is intentionally not gated on the accept path.
+    asyncio.run(_ensure_background_job_queue_available_async())
+
+
 def test_job_capabilities_use_sync_without_worker(monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "true")
     monkeypatch.setenv(CELERY_BROKER_URL, "memory://")

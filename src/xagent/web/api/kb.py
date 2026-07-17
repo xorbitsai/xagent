@@ -1615,7 +1615,7 @@ def _cleanup_background_ingest_staging_file(staging_path: Path | str | None) -> 
 async def _ensure_background_job_queue_available_async() -> None:
     if not await asyncio.to_thread(
         is_background_job_enqueue_available,
-        check_worker=True,
+        check_worker=False,
     ):
         raise HTTPException(
             status_code=503,
@@ -1629,7 +1629,7 @@ async def _enqueue_background_job_or_503_async(
 ) -> BackgroundJob:
     if not await asyncio.to_thread(
         is_background_job_enqueue_available,
-        check_worker=True,
+        check_worker=False,
     ):
         mark_job_failed(
             db,

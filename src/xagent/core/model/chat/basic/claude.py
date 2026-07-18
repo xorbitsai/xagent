@@ -25,6 +25,27 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _anthropic_input_usage(usage: Any) -> tuple[int, int, int]:
+    """Normalize Anthropic usage to (input_tokens, cache_read, cache_write).
+
+    Anthropic's ``usage.input_tokens`` excludes tokens read from or written to
+    the prompt cache. The normalized total re-adds both so input counts stay
+    comparable across providers, where cached tokens are a subset of the
+    reported input tokens.
+    """
+
+    def _count(name: str) -> int:
+        value = getattr(usage, name, 0)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    cache_read = _count("cache_read_input_tokens")
+    cache_write = _count("cache_creation_input_tokens")
+    return _count("input_tokens") + cache_read + cache_write, cache_read, cache_write
+
+
 def _anthropic_stream_tool_calls(
     accumulated_tool_calls: Dict[str, Dict],
 ) -> List[Dict[str, Any]]:
@@ -626,7 +647,7 @@ class ClaudeLLM(BaseLLM):
             # Record token usage
             if hasattr(response, "usage"):
                 usage = response.usage
-                input_tokens = getattr(usage, "input_tokens", 0)
+                input_tokens, cache_read, cache_write = _anthropic_input_usage(usage)
                 output_tokens = getattr(usage, "output_tokens", 0)
                 add_token_usage(
                     input_tokens=input_tokens,
@@ -634,6 +655,8 @@ class ClaudeLLM(BaseLLM):
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="chat",
+                    cached_input_tokens=cache_read,
+                    cache_write_input_tokens=cache_write,
                 )
 
             # Check for tool use in response
@@ -1012,13 +1035,19 @@ class ClaudeLLM(BaseLLM):
                     # Message start (contains usage info)
                     if hasattr(event, "message") and hasattr(event.message, "usage"):
                         usage = event.message.usage
-                        # Record input tokens
-                        if hasattr(usage, "input_tokens"):
+                        # Record input tokens (cache reads/writes are excluded
+                        # from Anthropic's input_tokens; re-add them)
+                        input_tokens, cache_read, cache_write = _anthropic_input_usage(
+                            usage
+                        )
+                        if input_tokens:
                             add_token_usage(
-                                input_tokens=usage.input_tokens,
+                                input_tokens=input_tokens,
                                 model=self._model_name,
                                 model_id=self.model_id,
                                 call_type="stream_chat",
+                                cached_input_tokens=cache_read,
+                                cache_write_input_tokens=cache_write,
                             )
 
                 elif event.type == "message_delta":

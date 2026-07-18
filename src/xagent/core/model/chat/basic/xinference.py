@@ -8,7 +8,7 @@ from xinference_client import RESTfulClient as XinferenceClient
 
 from ..exceptions import LLMTimeoutError
 from ..timeout_config import TimeoutConfig
-from ..token_context import add_token_usage
+from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
@@ -248,6 +248,7 @@ class XinferenceLLM(BaseLLM):
                 model=self._model_name,
                 model_id=self.model_id,
                 call_type="chat",
+                cached_input_tokens=extract_cached_input_tokens(usage),
             )
 
         # Check for tool calls
@@ -508,6 +509,7 @@ class XinferenceLLM(BaseLLM):
                 model=self._model_name,
                 model_id=self.model_id,
                 call_type="stream_chat",
+                cached_input_tokens=extract_cached_input_tokens(usage),
             )
 
         # Check choices

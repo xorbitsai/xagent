@@ -14,7 +14,7 @@ except ImportError:
 
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
-from ..token_context import add_token_usage
+from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
@@ -236,6 +236,7 @@ class ZhipuLLM(BaseLLM):
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="chat",
+                    cached_input_tokens=extract_cached_input_tokens(usage),
                 )
 
             # Extract the choice
@@ -691,6 +692,7 @@ class ZhipuLLM(BaseLLM):
                         model=self._model_name,
                         model_id=self.model_id,
                         call_type="stream_chat",
+                        cached_input_tokens=extract_cached_input_tokens(usage),
                     )
 
                     # Yield usage chunk
@@ -862,6 +864,7 @@ class ZhipuLLM(BaseLLM):
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="vision_chat",
+                    cached_input_tokens=extract_cached_input_tokens(usage),
                 )
 
             # Extract the choice

@@ -7,6 +7,7 @@ from jsonschema import Draft202012Validator
 
 from xagent.core.model.chat.basic.claude import (
     ClaudeLLM,
+    _anthropic_input_usage,
     _fix_pydantic_schema_for_claude,
 )
 from xagent.core.model.chat.types import ChunkType
@@ -1087,3 +1088,120 @@ class TestClaudeLLM:
         assert len(anthropic_tools) == 1
         assert anthropic_tools[0]["strict"] is True
         assert anthropic_tools[0]["name"] == "search_flights"
+
+
+class TestClaudePromptCacheUsage:
+    """Anthropic reports cache reads/writes outside input_tokens; we re-add them."""
+
+    @pytest.fixture
+    def llm(self, claude_llm_config):
+        return ClaudeLLM(**claude_llm_config)
+
+    def test_anthropic_input_usage_normalization(self):
+        usage = SimpleNamespace(
+            input_tokens=10,
+            cache_read_input_tokens=80,
+            cache_creation_input_tokens=30,
+        )
+        assert _anthropic_input_usage(usage) == (120, 80, 30)
+
+        # Missing cache fields (older SDK / cache disabled) fall back to 0.
+        assert _anthropic_input_usage(SimpleNamespace(input_tokens=10)) == (10, 0, 0)
+
+        # Non-numeric values (e.g. Mock attributes in tests) must not raise.
+        bad = SimpleNamespace(
+            input_tokens=10,
+            cache_read_input_tokens=object(),
+            cache_creation_input_tokens=None,
+        )
+        assert _anthropic_input_usage(bad) == (10, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_chat_records_normalized_cache_usage(self, llm, mocker):
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        mock_text_block = mocker.Mock()
+        mock_text_block.type = "text"
+        mock_text_block.text = "ok"
+
+        mock_response = mocker.Mock()
+        mock_response.stop_reason = "stop"
+        mock_response.content = [mock_text_block]
+        mock_response.usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            cache_read_input_tokens=80,
+            cache_creation_input_tokens=30,
+        )
+        mock_response.model_dump = mocker.Mock(return_value={"content": "ok"})
+
+        mock_client = mocker.AsyncMock()
+        mock_client.messages.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.claude.AsyncAnthropic",
+            return_value=mock_client,
+        )
+
+        with TokenContextManager() as manager:
+            await llm.chat([{"role": "user", "content": "hi"}])
+            usage = manager.get_usage()
+
+        assert usage.input_tokens == 120
+        assert usage.output_tokens == 5
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["tokens"] == 120
+        assert inp["cached_tokens"] == 80
+        assert inp["cache_write_tokens"] == 30
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_records_cache_usage_from_message_start(
+        self, llm, mocker
+    ):
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        events = [
+            SimpleNamespace(
+                type="message_start",
+                message=SimpleNamespace(
+                    usage=SimpleNamespace(
+                        input_tokens=10,
+                        cache_read_input_tokens=40,
+                        cache_creation_input_tokens=15,
+                    )
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_start",
+                index=0,
+                content_block=SimpleNamespace(type="text", text=""),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                index=0,
+                delta=SimpleNamespace(type="text_delta", text="ok"),
+            ),
+            SimpleNamespace(
+                type="message_delta",
+                delta=SimpleNamespace(stop_reason="end_turn"),
+                usage=SimpleNamespace(output_tokens=5),
+            ),
+        ]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.messages.create.return_value = _AsyncEventStream(events)
+        mocker.patch(
+            "xagent.core.model.chat.basic.claude.AsyncAnthropic",
+            return_value=mock_client,
+        )
+
+        with TokenContextManager() as manager:
+            async for _chunk in llm.stream_chat([{"role": "user", "content": "hi"}]):
+                pass
+            usage = manager.get_usage()
+
+        assert usage.input_tokens == 65
+        assert usage.output_tokens == 5
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["tokens"] == 65
+        assert inp["cached_tokens"] == 40
+        assert inp["cache_write_tokens"] == 15

@@ -10,36 +10,13 @@ from openai import AsyncOpenAI
 from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
-from ..token_context import add_token_usage
+from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
 
 PROVIDER_STATE_METADATA_KEY = "_xagent_provider_state"
-
-
-def _cached_input_tokens(usage: Any) -> int:
-    """Prompt-cache-hit input tokens from an OpenAI-style usage object.
-
-    DeepSeek reports ``prompt_cache_hit_tokens``; OpenAI/DashScope report
-    ``prompt_tokens_details.cached_tokens``. Returns 0 when unavailable.
-    """
-    if usage is None:
-        return 0
-    hit = getattr(usage, "prompt_cache_hit_tokens", None)
-    if hit is not None:
-        try:
-            return int(hit)
-        except (TypeError, ValueError):
-            return 0
-    details = getattr(usage, "prompt_tokens_details", None)
-    if details is not None:
-        try:
-            return int(getattr(details, "cached_tokens", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-    return 0
 
 
 def _truncate_error_detail(value: Any, limit: int = 4000) -> str:
@@ -397,7 +374,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     output_tokens=resp.usage.completion_tokens,
                     model=self._model_name,
                     model_id=self.model_id,
-                    cached_input_tokens=_cached_input_tokens(resp.usage),
+                    cached_input_tokens=extract_cached_input_tokens(resp.usage),
                     call_type="chat",
                 )
 
@@ -724,7 +701,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     output_tokens=response.usage.completion_tokens,
                     model=self._model_name,
                     model_id=self.model_id,
-                    cached_input_tokens=_cached_input_tokens(response.usage),
+                    cached_input_tokens=extract_cached_input_tokens(response.usage),
                     call_type="chat",
                 )
 
@@ -1064,7 +1041,7 @@ class OpenAICompatibleLLM(BaseLLM):
                             output_tokens=output_tokens,
                             model=self._model_name,
                             model_id=self.model_id,
-                            cached_input_tokens=_cached_input_tokens(usage),
+                            cached_input_tokens=extract_cached_input_tokens(usage),
                             call_type="stream_chat",
                         )
 
@@ -1155,7 +1132,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     output_tokens=raw_chunk.usage.completion_tokens,
                     model=self._model_name,
                     model_id=self.model_id,
-                    cached_input_tokens=_cached_input_tokens(raw_chunk.usage),
+                    cached_input_tokens=extract_cached_input_tokens(raw_chunk.usage),
                     call_type="stream_chat",
                 )
 

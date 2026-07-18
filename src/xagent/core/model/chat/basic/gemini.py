@@ -485,6 +485,9 @@ class GeminiLLM(BaseLLM):
                 usage_metadata = response.usage_metadata
                 input_tokens = getattr(usage_metadata, "prompt_token_count", 0)
                 output_tokens = getattr(usage_metadata, "candidates_token_count", 0)
+                cached_tokens = (
+                    getattr(usage_metadata, "cached_content_token_count", 0) or 0
+                )
 
                 if input_tokens > 0 or output_tokens > 0:
                     add_token_usage(
@@ -493,6 +496,7 @@ class GeminiLLM(BaseLLM):
                         model=self._model_name,
                         model_id=self.model_id,
                         call_type="chat",
+                        cached_input_tokens=cached_tokens,
                     )
             else:
                 logger.warning("No usage_metadata in Gemini SDK response")
@@ -721,6 +725,9 @@ class GeminiLLM(BaseLLM):
                     output_tokens = (
                         getattr(usage_metadata, "candidates_token_count", 0) or 0
                     )
+                    cached_tokens = (
+                        getattr(usage_metadata, "cached_content_token_count", 0) or 0
+                    )
 
                     if input_tokens > 0 or output_tokens > 0:
                         usage_received = True
@@ -731,6 +738,7 @@ class GeminiLLM(BaseLLM):
                             model=self._model_name,
                             model_id=self.model_id,
                             call_type="stream_chat",
+                            cached_input_tokens=cached_tokens,
                         )
 
                         yield StreamChunk(

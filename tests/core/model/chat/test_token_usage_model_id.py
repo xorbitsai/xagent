@@ -116,8 +116,25 @@ def test_add_token_usage_records_cached_tokens():
     assert inp["cached_tokens"] == 40
 
 
+def test_add_token_usage_records_cache_write_tokens():
+    with TokenContextManager() as mgr:
+        add_token_usage(
+            input_tokens=100,
+            model="m",
+            model_id="platform/x",
+            call_type="chat",
+            cached_input_tokens=40,
+            cache_write_input_tokens=25,
+        )
+        details = mgr.get_usage().details
+
+    inp = next(d for d in details if d["type"] == "input")
+    assert inp["cached_tokens"] == 40
+    assert inp["cache_write_tokens"] == 25
+
+
 def test_cached_input_tokens_helper():
-    from xagent.core.model.chat.basic.openai import _cached_input_tokens
+    from xagent.core.model.chat.token_context import extract_cached_input_tokens
 
     class DeepSeekUsage:
         prompt_cache_hit_tokens = 30
@@ -131,10 +148,24 @@ def test_cached_input_tokens_helper():
     class NoCache:
         pass
 
-    assert _cached_input_tokens(DeepSeekUsage()) == 30  # deepseek field
-    assert _cached_input_tokens(OpenAIUsage()) == 25  # openai/dashscope field
-    assert _cached_input_tokens(NoCache()) == 0
-    assert _cached_input_tokens(None) == 0
+    assert extract_cached_input_tokens(DeepSeekUsage()) == 30  # deepseek field
+    assert extract_cached_input_tokens(OpenAIUsage()) == 25  # openai/dashscope field
+    assert extract_cached_input_tokens(NoCache()) == 0
+    assert extract_cached_input_tokens(None) == 0
+
+
+def test_cached_input_tokens_helper_dict_shapes():
+    """Streaming chunks often surface usage as plain dicts."""
+    from xagent.core.model.chat.token_context import extract_cached_input_tokens
+
+    assert extract_cached_input_tokens({"prompt_cache_hit_tokens": 30}) == 30
+    assert (
+        extract_cached_input_tokens({"prompt_tokens_details": {"cached_tokens": 25}})
+        == 25
+    )
+    assert extract_cached_input_tokens({"prompt_tokens_details": None}) == 0
+    assert extract_cached_input_tokens({"prompt_tokens": 10}) == 0
+    assert extract_cached_input_tokens({"prompt_cache_hit_tokens": "bad"}) == 0
 
 
 def test_aggregate_token_usage_by_model_prefers_model_id_and_sorts_by_total():

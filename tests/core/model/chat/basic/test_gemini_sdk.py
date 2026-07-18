@@ -679,3 +679,48 @@ class TestGeminiLLMSDK:
 
         with pytest.raises(LLMRetryableError, match="code=504"):
             await llm.chat(messages)
+
+
+class TestGeminiPromptCacheUsage:
+    """cached_content_token_count is recorded as cached input tokens."""
+
+    @pytest.fixture
+    def llm(self, gemini_llm_config: Dict[str, str]) -> GeminiLLM:
+        return GeminiLLM(**gemini_llm_config)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_chat_records_cached_content_tokens(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        mock_part = MagicMock()
+        mock_part.text = "ok"
+        mock_part.function_call = None
+        mock_content = MagicMock()
+        mock_content.parts = [mock_part]
+        mock_candidate = MagicMock()
+        mock_candidate.content = mock_content
+
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = MagicMock()
+        mock_response.usage_metadata.prompt_token_count = 100
+        mock_response.usage_metadata.candidates_token_count = 5
+        mock_response.usage_metadata.cached_content_token_count = 60
+
+        mock_sdk_client = MagicMock()
+        mocker.patch("google.genai.Client", return_value=mock_sdk_client)
+
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_sdk_client.aio.models.generate_content = mock_generate_content
+
+        with TokenContextManager() as manager:
+            await llm.chat([{"role": "user", "content": "hi"}])
+            usage = manager.get_usage()
+
+        assert usage.input_tokens == 100
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60

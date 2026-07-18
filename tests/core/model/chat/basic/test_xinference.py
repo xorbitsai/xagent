@@ -487,3 +487,34 @@ class TestProcessChatResponse:
                     ]
                 }
             )
+
+
+class TestXinferencePromptCacheUsage:
+    """Dict-shaped usage payloads surface cached input tokens."""
+
+    def test_process_chat_response_records_cached_tokens(self) -> None:
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        llm = XinferenceLLM(model_name="qwen3-thinking")
+
+        with TokenContextManager() as manager:
+            llm._process_chat_response(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 5,
+                        "prompt_tokens_details": {"cached_tokens": 60},
+                    },
+                }
+            )
+            usage = manager.get_usage()
+
+        assert usage.input_tokens == 100
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60

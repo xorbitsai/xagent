@@ -275,8 +275,11 @@ const en = {
     tokenUsage: {
       input: "Input tokens",
       output: "Output tokens",
+      cached: "Cached input tokens",
       inputShort: "Input",
       outputShort: "Output",
+      cachedShort: "Cached",
+      cachedShare: "{pct}% cached",
       oneModel: "{count} model",
       models: "{count} models",
       oneModelWithUnattributed: "{count} model + {unattributed} unattributed",

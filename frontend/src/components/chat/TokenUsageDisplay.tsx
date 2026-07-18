@@ -17,6 +17,7 @@ interface TokenUsage {
   output_tokens: number;
   total_tokens: number;
   llm_calls: number;
+  cached_input_tokens: number;
   model_usage: ModelTokenUsage[];
 }
 
@@ -25,6 +26,7 @@ interface ModelTokenUsage {
   model_name: string;
   input_tokens: number;
   output_tokens: number;
+  cached_input_tokens?: number;
 }
 
 // Build formatters lazily per locale so this file stays valid regardless of the
@@ -83,6 +85,7 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
             output_tokens: data.output_tokens || 0,
             total_tokens: data.total_tokens || 0,
             llm_calls: data.llm_calls || 0,
+            cached_input_tokens: data.cached_input_tokens || 0,
             model_usage: Array.isArray(data.model_usage) ? data.model_usage : [],
           });
         }
@@ -138,6 +141,19 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
         >
           {t('chatPage.tokenUsage.inputShort')}
         </span>
+        {usage.cached_input_tokens > 0 && usage.input_tokens > 0 && (
+          <span
+            className="text-muted-foreground"
+            title={`${t('chatPage.tokenUsage.cached')}: ${formatExactTokenCount(usage.cached_input_tokens, locale)}`}
+          >
+            {t('chatPage.tokenUsage.cachedShare', {
+              pct: Math.min(
+                100,
+                Math.round((usage.cached_input_tokens / usage.input_tokens) * 100),
+              ),
+            })}
+          </span>
+        )}
       </span>
       <span className="flex items-center gap-1.5 whitespace-nowrap">
         <span className="font-medium text-foreground" title={formatExactTokenCount(usage.output_tokens, locale)}>
@@ -163,15 +179,21 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
           </PopoverTrigger>
           <PopoverContent
             align="end"
-            className="w-[28rem] max-w-[calc(100vw-2rem)] p-0"
+            className="w-[32rem] max-w-[calc(100vw-2rem)] p-0"
           >
             <div className="border-b px-3 py-2.5 text-sm font-medium">
               {t('chatPage.tokenUsage.byModel')}
             </div>
-            <div className="grid grid-cols-[minmax(0,1fr)_5rem_5rem] gap-x-4 gap-y-2 p-3 text-xs">
+            <div className="grid grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] gap-x-4 gap-y-2 p-3 text-xs">
               <span className="text-muted-foreground">{t('chatPage.tokenUsage.model')}</span>
               <span className="text-right text-muted-foreground">
                 {t('chatPage.tokenUsage.inputShort')}
+              </span>
+              <span
+                className="text-right text-muted-foreground"
+                title={t('chatPage.tokenUsage.cached')}
+              >
+                {t('chatPage.tokenUsage.cachedShort')}
               </span>
               <span className="text-right text-muted-foreground">
                 {t('chatPage.tokenUsage.outputShort')}
@@ -195,6 +217,12 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                   </span>
                   <span className="text-right tabular-nums" title={formatExactTokenCount(model.input_tokens, locale)}>
                     {formatTokenCount(model.input_tokens, locale)}
+                  </span>
+                  <span
+                    className="text-right tabular-nums text-muted-foreground"
+                    title={formatExactTokenCount(model.cached_input_tokens ?? 0, locale)}
+                  >
+                    {formatTokenCount(model.cached_input_tokens ?? 0, locale)}
                   </span>
                   <span className="text-right tabular-nums" title={formatExactTokenCount(model.output_tokens, locale)}>
                     {formatTokenCount(model.output_tokens, locale)}

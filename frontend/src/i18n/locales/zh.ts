@@ -275,8 +275,11 @@ const zh = {
     tokenUsage: {
       input: "输入tokens",
       output: "输出tokens",
+      cached: "缓存命中tokens",
       inputShort: "输入",
       outputShort: "输出",
+      cachedShort: "缓存",
+      cachedShare: "{pct}% 缓存命中",
       oneModel: "{count} 个模型",
       models: "{count} 个模型",
       oneModelWithUnattributed: "{count} 个模型 + {unattributed} 个未归属",

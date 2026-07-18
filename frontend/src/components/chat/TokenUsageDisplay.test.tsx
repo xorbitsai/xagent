@@ -22,8 +22,11 @@ vi.mock("@/contexts/i18n-context", () => ({
       const message = {
         "chatPage.tokenUsage.input": "Input tokens",
         "chatPage.tokenUsage.output": "Output tokens",
+        "chatPage.tokenUsage.cached": "Cached input tokens",
         "chatPage.tokenUsage.inputShort": "Input",
         "chatPage.tokenUsage.outputShort": "Output",
+        "chatPage.tokenUsage.cachedShort": "Cached",
+        "chatPage.tokenUsage.cachedShare": "{pct}% cached",
         "chatPage.tokenUsage.oneModel": "{count} model",
         "chatPage.tokenUsage.models": "{count} models",
         "chatPage.tokenUsage.oneModelWithUnattributed": "{count} model + {unattributed} unattributed",
@@ -132,7 +135,7 @@ describe("TokenUsageDisplay", () => {
     fireEvent.click(screen.getByRole("button", { name: /2 models/ }))
 
     const modelUsageDialog = await screen.findByRole("dialog")
-    expect(modelUsageDialog).toHaveClass("w-[28rem]")
+    expect(modelUsageDialog).toHaveClass("w-[32rem]")
     expect(screen.getAllByText("Input")).toHaveLength(2)
     expect(screen.getAllByText("Output")).toHaveLength(2)
     expect(screen.getByText("deepseek/deepseek-v4-pro")).toBeInTheDocument()
@@ -260,4 +263,82 @@ describe("TokenUsageDisplay", () => {
       expect(screen.queryByRole("button")).not.toBeInTheDocument()
     },
   )
+})
+
+describe("TokenUsageDisplay cached tokens", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    i18nMock.locale = "en"
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("shows the cached share and a per-model cached column", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 100_000,
+          output_tokens: 5_000,
+          total_tokens: 105_000,
+          llm_calls: 2,
+          cached_input_tokens: 75_000,
+          model_usage: [
+            {
+              model_id: "main",
+              model_name: "claude-sonnet-5",
+              input_tokens: 100_000,
+              output_tokens: 5_000,
+              cached_input_tokens: 75_000,
+              cache_write_input_tokens: 1_000,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={11} isRunning={false} />)
+
+    const share = await screen.findByText("75% cached")
+    expect(share).toHaveAttribute("title", "Cached input tokens: 75,000")
+
+    fireEvent.click(screen.getByRole("button", { name: /^1 model$/ }))
+    await screen.findByRole("dialog")
+    expect(screen.getByText("Cached")).toHaveAttribute(
+      "title",
+      "Cached input tokens",
+    )
+    expect(screen.getByText("75k")).toHaveAttribute("title", "75,000")
+  })
+
+  it("hides the cached share when the backend reports no cache usage", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 100,
+          output_tokens: 5,
+          total_tokens: 105,
+          llm_calls: 1,
+          model_usage: [
+            {
+              model_id: "main",
+              model_name: "gpt-4.1",
+              input_tokens: 100,
+              output_tokens: 5,
+              cached_input_tokens: 0,
+              cache_write_input_tokens: 0,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={12} isRunning={false} />)
+
+    await screen.findByText("Input")
+    expect(screen.queryByText(/% cached/)).not.toBeInTheDocument()
+  })
 })

@@ -1195,8 +1195,10 @@ class TestClaudePromptCacheUsage:
         )
 
         with TokenContextManager() as manager:
-            async for _chunk in llm.stream_chat([{"role": "user", "content": "hi"}]):
-                pass
+            chunks = [
+                chunk
+                async for chunk in llm.stream_chat([{"role": "user", "content": "hi"}])
+            ]
             usage = manager.get_usage()
 
         assert usage.input_tokens == 65
@@ -1205,3 +1207,14 @@ class TestClaudePromptCacheUsage:
         assert inp["tokens"] == 65
         assert inp["cached_tokens"] == 40
         assert inp["cache_write_tokens"] == 15
+
+        # The yielded usage chunk carries the message_start input counts so
+        # downstream consumers (runtime usage/trace) see cache telemetry.
+        usage_chunk = next(c for c in chunks if c.type == ChunkType.USAGE)
+        assert usage_chunk.usage == {
+            "input_tokens": 65,
+            "output_tokens": 5,
+            "total_tokens": 70,
+            "cached_input_tokens": 40,
+            "cache_write_input_tokens": 15,
+        }

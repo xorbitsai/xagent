@@ -16,6 +16,7 @@ from ..agent.trace import (
     normalize_llm_trace_payload,
 )
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
 from .result import normalize_tool_failure_code, tool_result_succeeded
@@ -328,21 +329,27 @@ class PatternRuntime:
         if not usage:
             return {}
         if isinstance(usage, dict):
-            return dict(usage)
-        payload: dict[str, Any] = {}
-        for key in (
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-            "input_tokens",
-            "output_tokens",
-            "prompt_token_count",
-            "completion_token_count",
-            "candidates_token_count",
-        ):
-            value = getattr(usage, key, None)
-            if value is not None:
-                payload[key] = value
+            payload = dict(usage)
+        else:
+            payload = {}
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+                "prompt_token_count",
+                "completion_token_count",
+                "candidates_token_count",
+                "cached_input_tokens",
+            ):
+                value = getattr(usage, key, None)
+                if value is not None:
+                    payload[key] = value
+        if "cached_input_tokens" not in payload:
+            cached = extract_cached_input_tokens(usage)
+            if cached:
+                payload["cached_input_tokens"] = cached
         return payload
 
     def _merge_usage(
@@ -847,6 +854,7 @@ class PatternRuntime:
                 output_tokens=usage[1],
                 prompt_message_count=len(getattr(context, "messages", [])),
             )
+        cached_tokens = self._extract_cached_tokens(response)
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -863,6 +871,7 @@ class PatternRuntime:
                     if usage is not None
                     else {}
                 ),
+                **({"cached_input_tokens": cached_tokens} if cached_tokens else {}),
                 **event_metadata,
             },
         )
@@ -898,6 +907,16 @@ class PatternRuntime:
                 return input_tokens, output_tokens
 
         return None
+
+    def _extract_cached_tokens(self, response: Any) -> int:
+        """Prompt-cache-hit tokens from a response's usage payload, 0 if absent."""
+        usage = self._get_value(response, "usage")
+        if usage is None:
+            return 0
+        direct = self._first_int(usage, ("cached_input_tokens",))
+        if direct > 0:
+            return direct
+        return extract_cached_input_tokens(usage)
 
     def _first_int(self, source: Any, keys: tuple[str, ...]) -> int:
         for key in keys:

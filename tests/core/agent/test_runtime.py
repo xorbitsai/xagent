@@ -825,3 +825,54 @@ async def test_concurrent_tool_calls_all_count() -> None:
     )
 
     assert get_token_usage().tool_calls == 8
+
+
+class StreamingLLMWithCachedUsage:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
+        yield StreamChunk(
+            type=ChunkType.USAGE,
+            usage={
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "total_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            },
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+@pytest.mark.asyncio
+async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
+    """Provider cache telemetry reaches the merged usage payload and the
+    LLM end trace event as a normalized cached_input_tokens count."""
+    events: list[dict[str, Any]] = []
+
+    class _CaptureTracer:
+        async def trace_event(
+            self,
+            event_type: Any,
+            task_id: Any = None,
+            step_id: Any = None,
+            data: Any = None,
+            parent_id: Any = None,
+        ) -> str:
+            events.append({"data": dict(data or {})})
+            return "evt"
+
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=outbound,
+        tracer=_CaptureTracer(),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.stream_final_answer(
+        StreamingLLMWithCachedUsage(), messages=[]
+    )
+    assert result["usage"]["cached_input_tokens"] == 4
+
+    await runtime.on_llm_end(context=context, response=result)
+    assert events[-1]["data"]["cached_input_tokens"] == 4
+    assert events[-1]["data"]["input_tokens"] == 7

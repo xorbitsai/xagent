@@ -798,6 +798,12 @@ class ClaudeLLM(BaseLLM):
         tool_id_by_content_block_index: Dict[int, str] = {}
         current_content = ""
 
+        # Input-side usage arrives on message_start; the final usage chunk is
+        # yielded at message_delta, so carry the values across events.
+        stream_input_tokens = 0
+        stream_cache_read = 0
+        stream_cache_write = 0
+
         try:
             # Convert messages to Anthropic format
             system_message, anthropic_messages = (
@@ -1040,6 +1046,9 @@ class ClaudeLLM(BaseLLM):
                         input_tokens, cache_read, cache_write = _anthropic_input_usage(
                             usage
                         )
+                        stream_input_tokens = input_tokens
+                        stream_cache_read = cache_read
+                        stream_cache_write = cache_write
                         if input_tokens:
                             add_token_usage(
                                 input_tokens=input_tokens,
@@ -1063,13 +1072,22 @@ class ClaudeLLM(BaseLLM):
                                 call_type="stream_chat",
                             )
 
-                        # Yield usage chunk
+                        # Yield usage chunk. Input-side counts come from
+                        # message_start; message_delta usually only carries
+                        # output tokens.
+                        input_total = stream_input_tokens or (
+                            getattr(usage, "input_tokens", 0) or 0
+                        )
+                        output_total = getattr(usage, "output_tokens", 0) or 0
                         usage_dict = {
-                            "input_tokens": getattr(usage, "input_tokens", 0),
-                            "output_tokens": getattr(usage, "output_tokens", 0),
-                            "total_tokens": getattr(usage, "input_tokens", 0)
-                            + getattr(usage, "output_tokens", 0),
+                            "input_tokens": input_total,
+                            "output_tokens": output_total,
+                            "total_tokens": input_total + output_total,
                         }
+                        if stream_cache_read:
+                            usage_dict["cached_input_tokens"] = stream_cache_read
+                        if stream_cache_write:
+                            usage_dict["cache_write_input_tokens"] = stream_cache_write
                         yield StreamChunk(
                             type=ChunkType.USAGE,
                             usage=usage_dict,

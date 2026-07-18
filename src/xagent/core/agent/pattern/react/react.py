@@ -334,6 +334,7 @@ class ReActPattern(AgentPattern):
             memory_store=self._memory_store,
             task=task_text,
             runtime=runtime,
+            context=context,
         )
         skill_tool = await build_load_skill_tool(
             skill_manager=skill_manager,

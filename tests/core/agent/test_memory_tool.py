@@ -324,3 +324,24 @@ async def test_update_memory_reports_note_without_content() -> None:
 
     assert result["success"] is False
     assert "no stored note" in result["error"]
+
+
+def test_build_memory_tools_stamps_guidance_flag_on_context() -> None:
+    class Ctx:
+        def __init__(self) -> None:
+            self.metadata: dict[str, Any] = {}
+
+    context = Ctx()
+    tools = build_memory_tools(
+        memory_store=RecordingMemoryStore(), task="task", context=context
+    )
+
+    assert tools
+    assert context.metadata["memory_tools_enabled"] is True
+
+    disabled_context = Ctx()
+    assert (
+        build_memory_tools(memory_store=None, task="task", context=disabled_context)
+        == []
+    )
+    assert "memory_tools_enabled" not in disabled_context.metadata

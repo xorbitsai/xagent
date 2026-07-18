@@ -27,6 +27,7 @@ from .components import (
     clone_component,
 )
 from .enrichment import MEMORY_CONTEXT_METADATA_KEY, SKILL_CONTEXT_METADATA_KEY
+from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
 from .skill_tool import LOADED_SKILLS_METADATA_KEY, SKILL_INDEX_METADATA_KEY
 
@@ -469,6 +470,19 @@ class ExecutionContext:
                 "results, or tools before answering. Do not ask the user whether "
                 "to use memory or whether to search; decide the appropriate "
                 "execution strategy yourself."
+            )
+        if self.metadata.get(MEMORY_TOOLS_METADATA_KEY):
+            parts.append(
+                "Memory persistence:\n"
+                "You have memory tools for knowledge that should outlive this "
+                "task. While working, use store_memory when you notice a "
+                "stable user preference or a correction the user gave you, a "
+                "non-obvious mistake you made and how you fixed it, or a "
+                "reusable lesson about this domain or its tools; do not store "
+                "routine task completions or widely known facts. If a "
+                "retrieved memory contradicts what you observe now, correct "
+                "it with update_memory or remove it with delete_memory "
+                "(find memory ids via search_memory)."
             )
         skill_index = self.metadata.get(SKILL_INDEX_METADATA_KEY)
         if isinstance(skill_index, list) and skill_index:

@@ -1093,3 +1093,19 @@ def test_custom_component_roundtrip_without_context_schema_change() -> None:
         "library_dirs": ["/tmp/skills"],
         "active": ["writer"],
     }
+
+
+def test_system_context_renders_memory_persistence_guidance() -> None:
+    from xagent.core.agent.context.memory_tool import MEMORY_TOOLS_METADATA_KEY
+
+    context = ExecutionContext(system_prompt="Base prompt.")
+    context.add_user_message("hello")
+
+    without_flag = context.get_messages_for_llm()[0]["content"]
+    assert "Memory persistence:" not in without_flag
+
+    context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
+    with_flag = context.get_messages_for_llm()[0]["content"]
+    assert "Memory persistence:" in with_flag
+    assert "store_memory" in with_flag
+    assert "update_memory" in with_flag

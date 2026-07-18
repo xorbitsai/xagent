@@ -28,6 +28,7 @@ STORE_MEMORY_TOOL_NAME = "store_memory"
 SEARCH_MEMORY_TOOL_NAME = "search_memory"
 UPDATE_MEMORY_TOOL_NAME = "update_memory"
 DELETE_MEMORY_TOOL_NAME = "delete_memory"
+MEMORY_TOOLS_METADATA_KEY = "memory_tools_enabled"
 DEFAULT_MAX_STORES_PER_RUN = 5
 DEFAULT_DEDUP_SIMILARITY_THRESHOLD = 0.9
 DEFAULT_SEARCH_LIMIT = 5
@@ -424,15 +425,21 @@ def build_memory_tools(
     memory_store: Any | None,
     task: str,
     runtime: Any | None = None,
+    context: Any | None = None,
 ) -> list[Any]:
-    """Create the memory tool set, or [] when no memory store is active."""
+    """Create the memory tool set, or [] when no memory store is active.
+
+    When ``context`` is given, mark it so the system context renders the
+    memory-usage guidance alongside the tools (see
+    ``MEMORY_TOOLS_METADATA_KEY``).
+    """
 
     if memory_store is None:
         return []
     store_tool = build_store_memory_tool(
         memory_store=memory_store, task=task, runtime=runtime
     )
-    return [
+    tools = [
         tool
         for tool in (
             store_tool,
@@ -442,6 +449,9 @@ def build_memory_tools(
         )
         if tool is not None
     ]
+    if tools and context is not None and hasattr(context, "metadata"):
+        context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
+    return tools
 
 
 def _runtime_attr(runtime: Any | None, name: str) -> Any | None:

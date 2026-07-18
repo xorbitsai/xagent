@@ -12,6 +12,7 @@ from xagent.core.agent.pattern.final_answer_stream import (
 )
 from xagent.core.agent.runtime import (
     LLMCallInterrupted,
+    ToolCallInterrupted,
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
@@ -318,6 +319,76 @@ async def test_runtime_interrupt_converts_active_llm_cancel() -> None:
 
     with pytest.raises(LLMCallInterrupted, match="stop now"):
         await task
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_cancels_active_tool_call() -> None:
+    runtime = PatternRuntime()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_tool() -> str:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "never"
+
+    task = asyncio.create_task(runtime.run_tool_call(slow_tool))
+    await started.wait()
+    runtime.request_interrupt("pause now")
+
+    with pytest.raises(ToolCallInterrupted, match="pause now"):
+        await task
+    assert cancelled.is_set()
+    assert not runtime._active_tool_tasks
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_cleans_up_active_tool_call() -> None:
+    runtime = PatternRuntime()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_tool() -> str:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "never"
+
+    outer_task = asyncio.create_task(runtime.run_tool_call(slow_tool))
+    await started.wait()
+    tool_task = next(iter(runtime._active_tool_tasks))
+
+    outer_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    assert tool_task.cancelled()
+    assert cancelled.is_set()
+    assert not runtime._active_tool_tasks
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_start_tool_after_interrupt() -> None:
+    runtime = PatternRuntime()
+    invoked = False
+
+    async def tool() -> str:
+        nonlocal invoked
+        invoked = True
+        return "never"
+
+    runtime.request_interrupt("already paused")
+
+    with pytest.raises(ToolCallInterrupted, match="already paused"):
+        await runtime.run_tool_call(tool)
+    assert invoked is False
 
 
 @pytest.mark.asyncio
@@ -685,6 +756,27 @@ async def test_runtime_trace_events_are_best_effort() -> None:
     )
 
     await runtime.on_llm_start(context=ExecutionContext(), messages=[], tools=[])
+
+
+@pytest.mark.asyncio
+async def test_on_tool_cancelled_closes_trace_without_error_event() -> None:
+    tracer = CheckpointTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-cancelled-tool")
+
+    await runtime.on_tool_cancelled(
+        tool_call={"name": "understand_images", "args": {}, "id": "vision-1"},
+        reason="paused by user",
+    )
+
+    assert [event["event_type"] for event in tracer.events] == ["action_end_tool"]
+    assert tracer.events[0]["data"] == {
+        "tool_name": "understand_images",
+        "tool_params": {},
+        "tool_call_id": "vision-1",
+        "success": False,
+        "interrupted": True,
+        "interrupt_reason": "paused by user",
+    }
 
 
 @pytest.mark.asyncio

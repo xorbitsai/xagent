@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -955,6 +956,66 @@ async def test_auto_react_repetition_stays_in_single_react_trace() -> None:
     assert "auto_child_reroute" not in [
         checkpoint["label"] for checkpoint in runtime.checkpoints
     ]
+
+
+@pytest.mark.asyncio
+async def test_auto_interrupt_cancels_child_react_tool() -> None:
+    class SlowVisionTool:
+        name = "understand_images"
+        description = "Analyze an image."
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def ainvoke(self, _args: dict[str, Any]) -> Any:
+            self.started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return {"success": True, "answer": "never"}
+
+    llm = FakeLLM(
+        [
+            decision_tool_response("react", "Image inspection needs a tool."),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "vision-1",
+                        "function": {
+                            "name": "understand_images",
+                            "arguments": json.dumps(
+                                {
+                                    "images": "file-id",
+                                    "question": "What is shown?",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    runtime = PatternRuntime(execution_id="auto-cancel-tool")
+    pattern = AutoPattern(react_pattern=ReActPattern(max_iterations=2))
+    context = ExecutionContext(execution_id="auto-cancel-tool")
+    context.add_user_message("Inspect this image.")
+    tool = SlowVisionTool()
+
+    task = asyncio.create_task(
+        pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+    )
+    await tool.started.wait()
+    runtime.request_interrupt("paused by websocket")
+    result = await task
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["interrupt_reason"] == "paused by websocket"
+    assert tool.cancelled.is_set()
 
 
 @pytest.mark.asyncio

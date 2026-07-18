@@ -24,6 +24,7 @@ This is test-support code (no production logic); it is exercised by
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 from typing import Any
 
@@ -229,6 +230,12 @@ class FakeRuntime:
         self._interrupt = True
         self.interrupt_reason = reason
 
+    async def run_tool_call(self, invoke: Any) -> Any:
+        result = invoke()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     async def checkpoint(
         self,
         status: str,
@@ -273,6 +280,20 @@ class FakeRuntime:
                     "tool_call_id": self._tool_call_id(tool_call),
                     "error": str(error),
                     "result": result,
+                },
+            )
+        )
+
+    async def on_tool_cancelled(
+        self, *, tool_call: dict[str, Any], reason: str | None = None
+    ) -> None:
+        self.events.append(
+            (
+                "on_tool_cancelled",
+                {
+                    "tool_name": tool_call.get("name"),
+                    "tool_call_id": self._tool_call_id(tool_call),
+                    "reason": reason,
                 },
             )
         )

@@ -50,6 +50,7 @@ from ...result import tool_result_succeeded, unwrap_final_answer_content
 from ...runtime import (
     LLMCallInterrupted,
     PatternRuntime,
+    ToolCallInterrupted,
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
@@ -1671,10 +1672,9 @@ class ReActPattern(AgentPattern):
                     pattern=self,
                     metadata={"tool_calls": segment},
                 )
-                # In-flight tools are not cancellable, so an interrupt that
-                # arrives during the batch is honored here, at the segment
-                # boundary. The completed (read-only, concurrency-safe) results
-                # are already recorded, which is correct for resume.
+                # Catch interrupts that arrive after the batch completed but
+                # before the next segment begins. Interrupts during the batch
+                # cancel its runtime-owned tool tasks immediately.
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
                     context=context,
@@ -2196,7 +2196,21 @@ class ReActPattern(AgentPattern):
         try:
             await runtime.on_tool_start(tool_call=tool_call)
             try:
-                result = await self._execute_tool(tool_call, tools)
+                result = await runtime.run_tool_call(
+                    lambda: self._execute_tool(tool_call, tools)
+                )
+            except ToolCallInterrupted as exc:
+                await runtime.on_tool_cancelled(
+                    tool_call=tool_call,
+                    reason=str(exc),
+                )
+                self._record_tool_call(
+                    tool_call,
+                    status="interrupted",
+                    error=str(exc),
+                )
+                recorded_terminal = True
+                raise
             except Exception as exc:  # noqa: BLE001
                 error_result = {
                     "success": False,

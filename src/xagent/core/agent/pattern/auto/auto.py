@@ -187,6 +187,9 @@ class _AutoChildRuntime:
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
 
+    async def run_tool_call(self, invoke: Any) -> Any:
+        return await self.parent.run_tool_call(invoke)
+
     async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.stream_final_answer(llm, **kwargs)
 
@@ -270,6 +273,14 @@ class _AutoChildRuntime:
         result: Any | None = None,
     ) -> None:
         await self.parent.on_tool_error(tool_call=tool_call, error=error, result=result)
+
+    async def on_tool_cancelled(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        reason: str | None = None,
+    ) -> None:
+        await self.parent.on_tool_cancelled(tool_call=tool_call, reason=reason)
 
     async def on_llm_start(
         self,

@@ -35,7 +35,13 @@ def _anthropic_input_usage(usage: Any) -> tuple[int, int, int]:
     """
 
     def _count(name: str) -> int:
-        value = getattr(usage, name, 0)
+        # Missing/None/non-numeric values are normal (older SDKs, cache
+        # disabled, message_delta usage) — treat them as 0; token accounting
+        # must never raise out of an LLM call.
+        if isinstance(usage, dict):
+            value = usage.get(name, 0)
+        else:
+            value = getattr(usage, name, 0)
         try:
             return max(0, int(value))
         except (TypeError, ValueError):

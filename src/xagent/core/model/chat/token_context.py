@@ -229,7 +229,11 @@ def extract_cached_input_tokens(usage: Any) -> int:
         return 0
     hit = _usage_field(usage, "prompt_cache_hit_tokens")
     if hit is not None:
-        return max(0, _coerce_int(hit))
+        value = max(0, _coerce_int(hit))
+        if value:
+            return value
+        # Some proxies emit prompt_cache_hit_tokens=0 as a default while the
+        # real count sits in prompt_tokens_details; fall through to it.
     details = _usage_field(usage, "prompt_tokens_details")
     if details is not None:
         return max(0, _coerce_int(_usage_field(details, "cached_tokens")))

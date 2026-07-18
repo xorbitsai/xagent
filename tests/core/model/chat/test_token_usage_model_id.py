@@ -166,6 +166,16 @@ def test_cached_input_tokens_helper_dict_shapes():
     assert extract_cached_input_tokens({"prompt_tokens_details": None}) == 0
     assert extract_cached_input_tokens({"prompt_tokens": 10}) == 0
     assert extract_cached_input_tokens({"prompt_cache_hit_tokens": "bad"}) == 0
+    # A default hit=0 must not shadow a real prompt_tokens_details value.
+    assert (
+        extract_cached_input_tokens(
+            {
+                "prompt_cache_hit_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 25},
+            }
+        )
+        == 25
+    )
 
 
 def test_aggregate_token_usage_by_model_prefers_model_id_and_sorts_by_total():

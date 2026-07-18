@@ -1116,6 +1116,16 @@ class TestClaudePromptCacheUsage:
         )
         assert _anthropic_input_usage(bad) == (10, 0, 0)
 
+        # Dict-shaped payloads are handled like the shared cache helper.
+        assert _anthropic_input_usage(
+            {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 30,
+            }
+        ) == (120, 80, 30)
+        assert _anthropic_input_usage({}) == (0, 0, 0)
+
     @pytest.mark.asyncio
     async def test_chat_records_normalized_cache_usage(self, llm, mocker):
         from xagent.core.model.chat.token_context import TokenContextManager

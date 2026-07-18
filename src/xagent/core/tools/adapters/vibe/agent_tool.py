@@ -1706,7 +1706,6 @@ class AgentTool(AbstractBaseTool):
         execution_task_id: Optional[str] = None
         try:
             from .....core.agent.service import AgentService
-            from .....core.memory.in_memory import InMemoryMemoryStore
             from .....web.services.llm_utils import UserAwareModelStorage
 
             # ---- Phase 1: load agent config + resolve models in a
@@ -1859,15 +1858,21 @@ class AgentTool(AbstractBaseTool):
                     parent_db_task_id=parent_db_task_id,
                 )
 
-                # Create agent service
-                memory = InMemoryMemoryStore()
+                # Create agent service. Memory stays disabled for sub-agent
+                # runs: these are stateless one-shot executors, and any store
+                # we hand them here would be discarded when the call returns —
+                # the memory tools would report success while the note
+                # silently evaporates (the pre-tool pipeline had the same
+                # flaw, writing its end-of-run evaluation into a throwaway
+                # InMemoryMemoryStore). Wire the parent's real store through
+                # deliberately if sub-agent memory is ever wanted.
                 agent_service = AgentService(
                     name=agent_name,
                     llm=default_llm,
                     fast_llm=fast_llm,
                     vision_llm=vision_llm,
                     compact_llm=compact_llm,
-                    memory=memory,
+                    memory_enabled=False,
                     tool_config=tool_config,
                     pattern=get_agent_pattern_for_execution_mode(agent_execution_mode),
                     id=execution_task_id,

@@ -202,12 +202,16 @@ def test_aggregate_token_usage_by_model_prefers_model_id_and_sorts_by_total():
             "model_name": "shared-name",
             "input_tokens": 100,
             "output_tokens": 25,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
         {
             "model_id": "compact-model",
             "model_name": "shared-name",
             "input_tokens": 20,
             "output_tokens": 5,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
     ]
 
@@ -226,6 +230,8 @@ def test_aggregate_token_usage_by_model_keeps_legacy_unattributed_tokens():
             "model_name": "",
             "input_tokens": 12,
             "output_tokens": 3,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         }
     ]
 
@@ -254,6 +260,8 @@ def test_aggregate_token_usage_by_model_merges_unique_legacy_name_group():
             "model_name": "gpt-4o",
             "input_tokens": 150,
             "output_tokens": 30,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         }
     ]
 
@@ -281,18 +289,24 @@ def test_aggregate_token_usage_by_model_keeps_ambiguous_legacy_name_group():
             "model_name": "shared-name",
             "input_tokens": 30,
             "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
         {
             "model_id": "main-model",
             "model_name": "shared-name",
             "input_tokens": 20,
             "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
         {
             "model_id": "compact-model",
             "model_name": "shared-name",
             "input_tokens": 10,
             "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
     ]
 
@@ -327,11 +341,57 @@ async def test_openrouter_auto_usage_is_attributed_to_each_selected_model():
             "model_name": "deepseek/deepseek-v4-flash",
             "input_tokens": 100,
             "output_tokens": 50,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
         {
             "model_id": "router:anthropic/claude-opus-4.8",
             "model_name": "anthropic/claude-opus-4.8",
             "input_tokens": 20,
             "output_tokens": 10,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
+    ]
+
+
+def test_aggregate_token_usage_by_model_sums_and_clamps_cache_tokens():
+    details = [
+        {
+            "type": "input",
+            "tokens": 100,
+            "model": "m",
+            "model_id": "main",
+            "cached_tokens": 60,
+            "cache_write_tokens": 10,
+        },
+        {
+            "type": "input",
+            "tokens": 50,
+            "model": "m",
+            "model_id": "main",
+            "cached_tokens": 20,
+        },
+        # Malformed entry claims more cached tokens than its own input;
+        # it must be clamped to the entry total instead of inflating sums.
+        {
+            "type": "input",
+            "tokens": 10,
+            "model": "m",
+            "model_id": "main",
+            "cached_tokens": 999,
+            "cache_write_tokens": -5,
+        },
+        {"type": "output", "tokens": 5, "model": "m", "model_id": "main"},
+    ]
+
+    assert aggregate_token_usage_by_model(details) == [
+        {
+            "model_id": "main",
+            "model_name": "m",
+            "input_tokens": 160,
+            "output_tokens": 5,
+            "cached_input_tokens": 90,
+            "cache_write_input_tokens": 10,
+        }
     ]

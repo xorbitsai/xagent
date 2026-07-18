@@ -586,6 +586,7 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
                 "tokens": 100,
                 "model": "gpt-4.1",
                 "model_id": "main",
+                "cached_tokens": 60,
             },
             {
                 "type": "output",
@@ -612,20 +613,26 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
 
     response = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
     assert response.status_code == 200
-    assert response.json()["model_usage"] == [
+    payload = response.json()
+    assert payload["model_usage"] == [
         {
             "model_id": "main",
             "model_name": "gpt-4.1",
             "input_tokens": 100,
             "output_tokens": 25,
+            "cached_input_tokens": 60,
+            "cache_write_input_tokens": 0,
         },
         {
             "model_id": "compact",
             "model_name": "gpt-4.1-mini",
             "input_tokens": 20,
             "output_tokens": 5,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
         },
     ]
+    assert payload["cached_input_tokens"] == 60
 
 
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):

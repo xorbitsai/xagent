@@ -275,6 +275,8 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
             },
         )
         # Some legacy adapters only stamped the name on one of the pair.
@@ -282,6 +284,15 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             aggregate["model_name"] = model_name
         aggregate[f"{token_type}_tokens"] += tokens
         aggregate["total_tokens"] += tokens
+        if token_type == "input":
+            # Legacy entries predate cache tracking; clamp to the entry's
+            # own input tokens so malformed data can't exceed the total.
+            cached = min(tokens, max(0, _coerce_int(detail.get("cached_tokens"))))
+            cache_write = min(
+                tokens, max(0, _coerce_int(detail.get("cache_write_tokens")))
+            )
+            aggregate["cached_input_tokens"] += cached
+            aggregate["cache_write_input_tokens"] += cache_write
 
     id_keys_by_name: Dict[str, List[tuple[str, str]]] = {}
     for key, aggregate in grouped.items():
@@ -298,6 +309,8 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         target["input_tokens"] += aggregate["input_tokens"]
         target["output_tokens"] += aggregate["output_tokens"]
         target["total_tokens"] += aggregate["total_tokens"]
+        target["cached_input_tokens"] += aggregate["cached_input_tokens"]
+        target["cache_write_input_tokens"] += aggregate["cache_write_input_tokens"]
         del grouped[key]
 
     sorted_groups = sorted(
@@ -314,6 +327,8 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             "model_name": item["model_name"],
             "input_tokens": item["input_tokens"],
             "output_tokens": item["output_tokens"],
+            "cached_input_tokens": item["cached_input_tokens"],
+            "cache_write_input_tokens": item["cache_write_input_tokens"],
         }
         for item in sorted_groups
     ]

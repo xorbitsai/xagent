@@ -3413,6 +3413,7 @@ async def get_task(
             agent_name = task.agent.name if task.agent else None
             agent_logo_url = task.agent.logo_url if task.agent else None
 
+            model_usage = aggregate_token_usage_by_model(task.token_usage_details)
             response = {
                 "task_id": task.id,
                 "title": task.title,
@@ -3436,7 +3437,10 @@ async def get_task(
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,
                 "llm_calls": task.llm_calls or 0,
-                "model_usage": aggregate_token_usage_by_model(task.token_usage_details),
+                "cached_input_tokens": sum(
+                    entry["cached_input_tokens"] for entry in model_usage
+                ),
+                "model_usage": model_usage,
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,

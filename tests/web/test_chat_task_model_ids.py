@@ -587,6 +587,7 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
                 "model": "gpt-4.1",
                 "model_id": "main",
                 "cached_tokens": 60,
+                "cache_write_tokens": 15,
             },
             {
                 "type": "output",
@@ -621,7 +622,7 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
             "input_tokens": 100,
             "output_tokens": 25,
             "cached_input_tokens": 60,
-            "cache_write_input_tokens": 0,
+            "cache_write_input_tokens": 15,
         },
         {
             "model_id": "compact",
@@ -633,6 +634,7 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
         },
     ]
     assert payload["cached_input_tokens"] == 60
+    assert payload["cache_write_input_tokens"] == 15
 
 
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):

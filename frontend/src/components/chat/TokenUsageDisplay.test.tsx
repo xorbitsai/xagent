@@ -313,6 +313,30 @@ describe("TokenUsageDisplay cached tokens", () => {
     expect(screen.getByText("75k")).toHaveAttribute("title", "75,000")
   })
 
+  it("suppresses the cached share when input tokens are zero", async () => {
+    // Malformed/partial backend data: cached > 0 with input == 0 must not
+    // render a NaN/Infinity percentage.
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 5,
+          total_tokens: 5,
+          llm_calls: 1,
+          cached_input_tokens: 75_000,
+          model_usage: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={13} isRunning={false} />)
+
+    await screen.findByText("Input")
+    expect(screen.queryByText(/% cached/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/NaN|Infinity/)).not.toBeInTheDocument()
+  })
+
   it("hides the cached share when the backend reports no cache usage", async () => {
     apiRequestMock.mockResolvedValue(
       new Response(

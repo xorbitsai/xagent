@@ -724,3 +724,45 @@ class TestGeminiPromptCacheUsage:
         assert usage.input_tokens == 100
         inp = next(d for d in usage.details if d["type"] == "input")
         assert inp["cached_tokens"] == 60
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_usage_chunk_carries_cached_tokens(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        usage_chunk = MagicMock()
+        usage_chunk.usage_metadata = MagicMock()
+        usage_chunk.usage_metadata.prompt_token_count = 100
+        usage_chunk.usage_metadata.candidates_token_count = 5
+        usage_chunk.usage_metadata.cached_content_token_count = 60
+        usage_chunk.candidates = None
+
+        end_chunk = MagicMock()
+        end_chunk.candidates = None
+        end_chunk.usage_metadata = None
+
+        async def mock_stream():
+            for chunk in [usage_chunk, end_chunk]:
+                yield chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        with TokenContextManager() as manager:
+            chunks = [
+                chunk
+                async for chunk in llm.stream_chat([{"role": "user", "content": "hi"}])
+            ]
+            usage = manager.get_usage()
+
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60
+
+        usage_payloads = [c.usage for c in chunks if c.is_usage()]
+        assert usage_payloads and usage_payloads[0]["cached_input_tokens"] == 60

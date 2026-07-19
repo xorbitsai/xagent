@@ -913,7 +913,9 @@ class PatternRuntime:
         usage = self._get_value(response, "usage")
         if usage is None:
             return 0
-        direct = self._first_int(usage, ("cached_input_tokens",))
+        direct = self._first_int(
+            usage, ("cached_input_tokens", "cache_read_input_tokens")
+        )
         if direct > 0:
             return direct
         return extract_cached_input_tokens(usage)

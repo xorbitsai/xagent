@@ -3440,6 +3440,9 @@ async def get_task(
                 "cached_input_tokens": sum(
                     entry["cached_input_tokens"] for entry in model_usage
                 ),
+                "cache_write_input_tokens": sum(
+                    entry["cache_write_input_tokens"] for entry in model_usage
+                ),
                 "model_usage": model_usage,
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,

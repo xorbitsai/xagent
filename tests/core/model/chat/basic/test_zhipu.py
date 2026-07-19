@@ -526,3 +526,42 @@ class TestZhipuPromptCacheUsage:
         assert usage.input_tokens == 100
         inp = next(d for d in usage.details if d["type"] == "input")
         assert inp["cached_tokens"] == 60
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_usage_chunk_carries_cached_tokens(
+        self, zhipu_llm, mock_zhipu_client
+    ):
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        mock_zhipu_client.chat.completions.create.return_value = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="ok", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=100,
+                    completion_tokens=5,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=60),
+                ),
+            ),
+        ]
+
+        with TokenContextManager() as manager:
+            chunks = [
+                chunk
+                async for chunk in zhipu_llm.stream_chat(
+                    [{"role": "user", "content": "hi"}]
+                )
+            ]
+            usage = manager.get_usage()
+
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60
+
+        usage_payloads = [
+            c.usage for c in chunks if c.type == ChunkType.USAGE and c.usage
+        ]
+        assert usage_payloads and usage_payloads[0]["cached_input_tokens"] == 60

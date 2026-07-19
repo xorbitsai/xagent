@@ -93,6 +93,54 @@ def test_web_ingest_enqueue_accepts_broker_only_without_worker(monkeypatch):
     asyncio.run(_ensure_background_job_queue_available_async())
 
 
+def test_web_ingest_enqueue_marks_enqueued_broker_only_without_worker(
+    tmp_path, monkeypatch
+):
+    """The enqueue path (``_enqueue_background_job_or_503_async``) must accept and
+    mark a job ``ENQUEUED`` when the Redis broker is reachable but no worker
+    answers, instead of marking it ``failed`` with a 503.
+
+    This is the higher-risk call site (the one that actually publishes via
+    ``apply_async``). Uses a ``redis://`` broker so the Redis-reachability branch
+    of ``is_background_job_enqueue_available`` is exercised (monkeypatched
+    reachable), unlike the ``memory://`` case above.
+    """
+    import asyncio
+
+    from xagent.web.services import background_jobs as bg
+
+    monkeypatch.setenv(CELERY_ENABLED, "true")
+    monkeypatch.setenv(CELERY_BROKER_URL, "redis://localhost:6379/0")
+    monkeypatch.setattr(bg, "_is_redis_broker_reachable", lambda _url: True)
+
+    from xagent.web.api import kb
+    from xagent.web.jobs import tasks
+
+    monkeypatch.setattr(
+        tasks.execute_background_job,
+        "apply_async",
+        MagicMock(return_value=MagicMock(id="fake-task-id")),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-enqueue.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db)
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"url": "https://example.com"},
+        )
+
+        result = asyncio.run(kb._enqueue_background_job_or_503_async(db, job))
+
+        assert result.status == BackgroundJobStatus.ENQUEUED.value
+        assert result.celery_task_id == "fake-task-id"
+    finally:
+        db.close()
+
+
 def test_job_capabilities_use_sync_without_worker(monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "true")
     monkeypatch.setenv(CELERY_BROKER_URL, "memory://")

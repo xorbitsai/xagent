@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
@@ -29,8 +29,12 @@ SEARCH_MEMORY_TOOL_NAME = "search_memory"
 UPDATE_MEMORY_TOOL_NAME = "update_memory"
 DELETE_MEMORY_TOOL_NAME = "delete_memory"
 MEMORY_TOOLS_METADATA_KEY = "memory_tools_enabled"
+# Cap per ReAct run. Each DAG step runs its own ReActPattern, so a DAG
+# task gets a fresh cap per step rather than one shared task-wide cap.
 DEFAULT_MAX_STORES_PER_RUN = 5
-DEFAULT_DEDUP_SIMILARITY_THRESHOLD = 0.9
+# Cosine distance passed to search(similarity_threshold=...): lower = stricter
+# dedup (fewer results count as duplicates).
+DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.9
 DEFAULT_SEARCH_LIMIT = 5
 MAX_SEARCH_LIMIT = 20
 
@@ -42,16 +46,7 @@ MemoryKind = Literal[
     "strategy",
     "domain_insight",
 ]
-_MEMORY_KINDS = frozenset(
-    {
-        "user_preference",
-        "failure_pattern",
-        "success_pattern",
-        "tool_usage",
-        "strategy",
-        "domain_insight",
-    }
-)
+_MEMORY_KINDS = frozenset(get_args(MemoryKind))
 
 _STORE_MEMORY_DESCRIPTION = """Store a durable memory for future tasks.
 
@@ -92,14 +87,14 @@ class StoreMemoryTool:
         runtime: Any | None = None,
         category: str = "react_memory",
         max_stores: int = DEFAULT_MAX_STORES_PER_RUN,
-        dedup_similarity_threshold: float = DEFAULT_DEDUP_SIMILARITY_THRESHOLD,
+        dedup_distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD,
     ) -> None:
         self.memory_store = memory_store
         self.task = task
         self.runtime = runtime
         self.category = category
         self.max_stores = max_stores
-        self.dedup_similarity_threshold = dedup_similarity_threshold
+        self.dedup_distance_threshold = dedup_distance_threshold
         self.stored_count = 0
 
     async def execute(
@@ -189,7 +184,7 @@ class StoreMemoryTool:
                 query=content,
                 k=1,
                 filters={"category": self.category},
-                similarity_threshold=self.dedup_similarity_threshold,
+                similarity_threshold=self.dedup_distance_threshold,
             )
         except Exception:
             logger.exception("store_memory dedup search failed; storing anyway")
@@ -248,7 +243,11 @@ class SearchMemoryTool:
         query = str(query or "").strip()
         if not query:
             return {"success": False, "error": "query must be a non-empty string."}
-        limit = max(1, min(int(limit), MAX_SEARCH_LIMIT))
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = DEFAULT_SEARCH_LIMIT
+        limit = max(1, min(limit, MAX_SEARCH_LIMIT))
 
         task_id = str(_runtime_attr(self.runtime, "execution_id") or "")
         step_id = _runtime_attr(self.runtime, "active_react_step_id")
@@ -436,18 +435,11 @@ def build_memory_tools(
 
     if memory_store is None:
         return []
-    store_tool = build_store_memory_tool(
-        memory_store=memory_store, task=task, runtime=runtime
-    )
-    tools = [
-        tool
-        for tool in (
-            store_tool,
-            SearchMemoryTool(memory_store=memory_store, runtime=runtime),
-            UpdateMemoryTool(memory_store=memory_store, task=task),
-            DeleteMemoryTool(memory_store=memory_store),
-        )
-        if tool is not None
+    tools: list[Any] = [
+        StoreMemoryTool(memory_store=memory_store, task=task, runtime=runtime),
+        SearchMemoryTool(memory_store=memory_store, runtime=runtime),
+        UpdateMemoryTool(memory_store=memory_store, task=task),
+        DeleteMemoryTool(memory_store=memory_store),
     ]
     if tools and context is not None and hasattr(context, "metadata"):
         context.metadata[MEMORY_TOOLS_METADATA_KEY] = True

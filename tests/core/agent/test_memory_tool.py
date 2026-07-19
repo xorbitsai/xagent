@@ -345,3 +345,14 @@ def test_build_memory_tools_stamps_guidance_flag_on_context() -> None:
         == []
     )
     assert "memory_tools_enabled" not in disabled_context.metadata
+
+
+@pytest.mark.asyncio
+async def test_search_memory_coerces_invalid_limit() -> None:
+    store = RecordingMemoryStore()
+    tool = SearchMemoryTool(memory_store=store)
+
+    result = await tool.execute(query="anything", limit="lots")  # type: ignore[arg-type]
+
+    assert result["success"] is True
+    assert store.searches[0]["k"] == 5

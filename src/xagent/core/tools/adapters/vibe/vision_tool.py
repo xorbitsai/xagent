@@ -11,7 +11,12 @@ from xagent.core.workspace import TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
 from ....model.chat.basic.base import BaseLLM
-from ...core.vision_tool import DetectObjectsResult, UnderstandImagesResult, VisionCore
+from ...core.vision_tool import (
+    DetectObjectsResult,
+    UnderstandImagesResult,
+    UnderstandMediaResult,
+    VisionCore,
+)
 from .base import ToolCategory
 from .function import FunctionTool
 
@@ -51,72 +56,83 @@ class VisionTool:
         # Create core instance
         self.core = VisionCore(vision_model, output_directory=output_dir)
 
-    def _resolve_image_path(self, image_path: str) -> str:
-        """
-        Resolve image path using workspace if available.
-
-        Args:
-            image_path: Original image path
-
-        Returns:
-            Resolved image path
-        """
+    def _resolve_media_path(self, media_path: str) -> str:
+        """Resolve an image or video path using the task workspace."""
         # If it's a URL, return as-is
-        if image_path.startswith(("http://", "https://", "data:")):
-            return image_path
+        if media_path.startswith(("http://", "https://", "data:")):
+            return media_path
 
         # Try to resolve using workspace
         if self.workspace:
             try:
-                resolved_path = self.workspace.resolve_path_with_search(image_path)
+                resolved_path = self.workspace.resolve_path_with_search(media_path)
                 return str(resolved_path)
             except (ValueError, FileNotFoundError):
                 pass
 
         # Return original path
-        return image_path
+        return media_path
 
-    def _resolve_images(
+    def _resolve_media(
         self,
-        images: Union[str, List[str]],
+        media: Union[str, List[str]],
     ) -> str | list[str]:
-        """Resolve all image paths using workspace."""
-        if isinstance(images, str):
-            return self._resolve_image_path(images)
-        elif isinstance(images, List):
-            return [self._resolve_image_path(img) for img in images]
-        return images
+        """Resolve all media paths using workspace."""
+        if isinstance(media, str):
+            return self._resolve_media_path(media)
+        if isinstance(media, list):
+            return [self._resolve_media_path(item) for item in media]
+        return media
 
-    def _normalize_images(
+    def _normalize_media(
         self,
-        images: Union[str, List[str]],
+        media: Union[str, List[str]],
     ) -> Union[str, List[str]]:
-        """
-        Normalize and validate image input.
+        """Normalize and validate image/video input."""
+        if media is None:
+            raise ValueError("At least one image or video must be provided")
 
-        Args:
-            images: Single image path/URL or list of image paths/URLs
+        if isinstance(media, str):
+            return media
+        if isinstance(media, list):
+            if not media:
+                raise ValueError("At least one image or video must be provided")
+            if all(isinstance(item, str) for item in media):
+                return media
+            raise ValueError("all items in media must be strings")
+        raise TypeError("media must be a string or a list of strings")
 
-        Returns:
-            Normalized image input (single string or list)
+    # Internal compatibility helpers for image-specific operations.
+    _resolve_image_path = _resolve_media_path
+    _resolve_images = _resolve_media
+    _normalize_images = _normalize_media
 
-        Raises:
-            ValueError: If images is None or invalid
-        """
-        if images is None:
-            raise ValueError("At least one image must be provided")
-
-        if isinstance(images, str):
-            return images
-        elif isinstance(images, list):
-            if not images:
-                raise ValueError("At least one image must be provided")
-            if all(isinstance(x, str) for x in images):
-                return images
-            else:
-                raise ValueError("all items in images must be strings")
-        else:
-            raise TypeError("images must be a string or a list of strings")
+    async def understand_media(
+        self,
+        media: Union[str, List[str]],
+        question: str,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        max_frames: Optional[int] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> UnderstandMediaResult:
+        """Analyze images, videos, or mixed media with one public tool."""
+        try:
+            normalized_media = self._normalize_media(media)
+            resolved_media = self._resolve_media(normalized_media)
+        except Exception as e:
+            logger.error("understand_media: error resolving media: %s", e)
+            return UnderstandMediaResult(success=False, error=str(e))
+        return await self.core.understand_media(
+            resolved_media,
+            question,
+            start_time,
+            end_time,
+            max_frames,
+            temperature,
+            max_tokens,
+        )
 
     async def understand_images(
         self,
@@ -137,14 +153,11 @@ class VisionTool:
         Returns:
             UnderstandImagesResult with analysis result and metadata
         """
-        try:
-            normalized_images = self._normalize_images(images)
-            resolved_images = self._resolve_images(normalized_images)
-        except Exception as e:
-            logger.error(f"understand_images: Error in resolving images: {e}")
-            return UnderstandImagesResult(success=False, error=str(e))
-        return await self.core.understand_images(
-            resolved_images, question, temperature, max_tokens
+        return await self.understand_media(
+            media=images,
+            question=question,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
 
     async def describe_images(
@@ -257,66 +270,40 @@ class VisionTool:
         """Get all tool instances."""
         tools = [
             VisionFunctionTool(
-                self.understand_images,
-                name="understand_images",
+                self.understand_media,
+                name="understand_media",
                 description="""
-Analyze images and answer questions about their content using AI vision capabilities.
+Analyze images, videos, or a mixture of both with one AI vision tool.
 
-This tool can understand and interpret images, including:
+Use this tool to:
 - Identifying objects, people, and scenes
 - Reading text in images (OCR capabilities)
-- Describing actions and activities
-- Analyzing image composition and style
-- Comparing multiple images
-- Answering specific questions about image content
+- Understanding actions and scene changes across a video
+- Comparing multiple images or videos
+- Answering specific questions about visual content
 
 Parameters:
-- images (required): Single image path/URL or list of image paths/URLs. Supports:
-  * Local file paths or file IDs (e.g., MUST use the exact `file_id` or filename from the uploaded files list in the system prompt)
-  * Remote URLs (e.g., "https://example.com/image.jpg")
-  * Multiple images as a list
-- question (required): Question to ask about the images
+- media (required): One image/video path or file_id, or a list of them. Always use
+  the exact file_id or filename from uploaded/generated file metadata.
+- question (required): Question to ask about the media
+- start_time/end_time (optional): Video time range in seconds
+- max_frames (optional): Maximum sampled frames per video when the model has no
+  native video input, 1-10 (default 8)
 - temperature (optional): Sampling temperature (0.0 to 2.0)
 - max_tokens (optional): Maximum tokens in response
 
 Examples:
 - "What is in this image?"
-- "Read the text shown in this image"
-- "Compare these two images and tell me the differences"
-- "What action is being performed in this image?"
-- "Describe the setting and mood of this scene"
+- "What happens in this video from beginning to end?"
+- "Does the cat leave the room?"
+- "Compare these two images and this video"
 
-Image requirements:
-- Formats: JPEG, PNG, WebP, GIF, BMP
-- Size: Up to 10MB per image
-- Maximum: 10 images per request
-- Local files will be automatically resolved in workspace
+Supported images: JPEG, PNG, WebP, GIF, BMP. Supported local/workspace videos:
+MP4, MOV, M4V, WebM, AVI, MKV. Models with native video support receive the
+video directly so motion, timing, and audio-capable model inputs are preserved.
+Other vision models use chronologically sampled, timestamped frames.
 
-The tool uses advanced vision AI models to provide detailed, accurate analysis of image content.
-                """.strip(),
-            ),
-            VisionFunctionTool(
-                self.describe_images,
-                name="describe_images",
-                description="""
-Generate natural language descriptions of images with configurable detail level.
-
-This tool provides automated image description capabilities, perfect for:
-- Generating alt text for accessibility
-- Creating image captions
-- Documenting visual content
-- Automated image analysis workflows
-
-Parameters:
-- images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs. Supports local file paths or file IDs (e.g., MUST use the exact `file_id` or filename from the uploaded files list in the system prompt)
-- detail_level (optional): Level of detail ("simple", "normal", "detailed") - default: "normal"
-  * "simple": Brief, concise description
-  * "normal": Standard description with main elements
-  * "detailed": Comprehensive analysis with fine details
-- temperature (optional): Sampling temperature (0.0 to 2.0)
-- max_tokens (optional): Maximum tokens in response
-
-Use this tool when you need descriptive text about images without asking specific questions.
+Never pass a video to detect_objects or encode it as image_url; use this tool.
                 """.strip(),
             ),
             VisionFunctionTool(

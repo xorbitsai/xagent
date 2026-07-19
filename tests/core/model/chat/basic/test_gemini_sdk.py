@@ -540,11 +540,41 @@ class TestGeminiLLMSDK:
         vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
         assert "vision" in vision_llm.abilities
 
-        # Test non-vision model
+        # Gemini chat models are natively multimodal.
         chat_llm = GeminiLLM(model_name="gemini-1.5-pro", api_key="test-key")
-        assert "vision" not in chat_llm.abilities
+        assert "vision" in chat_llm.abilities
         assert "chat" in chat_llm.abilities
         assert "tool_calling" in chat_llm.abilities
+
+    def test_native_video_conversion_uses_inline_data_and_offsets(self) -> None:
+        llm = GeminiLLM(model_name="gemini-2.5-flash", api_key="test-key")
+        content = llm.build_native_video_content(
+            "data:video/mp4;base64,ZmFrZV92aWRlbw==",
+            start_time=1.5,
+            end_time=4,
+        )
+
+        _, messages = llm._convert_messages_to_gemini_format(
+            [{"role": "user", "content": [content]}]
+        )
+
+        assert messages == [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "video/mp4",
+                            "data": "ZmFrZV92aWRlbw==",
+                        },
+                        "video_metadata": {
+                            "start_offset": "1.5s",
+                            "end_offset": "4s",
+                        },
+                    }
+                ],
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_supports_thinking_mode(self, llm: GeminiLLM) -> None:

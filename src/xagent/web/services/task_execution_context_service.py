@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from ...core.file_ref import build_file_id_ref
 from ...skills.utils import create_skill_manager
 from ..models.task import TraceEvent
 
@@ -182,6 +183,7 @@ def summarize_execution_failure_event(data: Dict[str, Any]) -> Optional[str]:
 def _summarize_generic_result(result: Any, max_length: int = 240) -> Optional[str]:
     if result is None:
         return None
+    file_links = _collect_file_reference_links(result)
     compact_result = _compact_preview_value(result)
     if isinstance(compact_result, str):
         preview = compact_result.strip()
@@ -191,11 +193,69 @@ def _summarize_generic_result(result: Any, max_length: int = 240) -> Optional[st
         except Exception:
             preview = str(compact_result).strip()
 
+    file_summary = f"files: {', '.join(file_links)}" if file_links else ""
     if not preview:
-        return None
-    if len(preview) > max_length:
-        return preview[: max_length - 3] + "..."
-    return preview
+        return file_summary or None
+    if not file_summary:
+        if len(preview) > max_length:
+            return preview[: max_length - 3] + "..."
+        return preview
+
+    # FileRefs are durable execution state. Keep their canonical markdown links
+    # intact and spend only the remaining preview budget on verbose provider
+    # payloads (video URLs commonly appear before file_ref in tool results).
+    separator = "; result: "
+    remaining = max_length - len(file_summary) - len(separator)
+    if remaining <= 3:
+        return file_summary
+    if len(preview) > remaining:
+        preview = preview[: remaining - 3] + "..."
+    return file_summary + separator + preview
+
+
+_MARKDOWN_FILE_LINK_RE = re.compile(r"!?\[[^\]]*\]\((file:[^)\s]+)\)")
+
+
+def _collect_file_reference_links(value: Any, *, limit: int = 5) -> List[str]:
+    """Collect exact model-facing FileRef links from a nested tool result."""
+    links: List[str] = []
+    seen: set[str] = set()
+
+    def add(link: str) -> None:
+        normalized = link.strip()
+        if not normalized or normalized in seen or len(links) >= limit:
+            return
+        seen.add(normalized)
+        links.append(normalized)
+
+    def visit(item: Any, depth: int = 0) -> None:
+        if depth > 8 or len(links) >= limit:
+            return
+        if isinstance(item, dict):
+            file_id = str(item.get("file_id") or "").strip()
+            filename = str(item.get("filename") or item.get("name") or "").strip()
+            markdown_link = item.get("markdown_link")
+            if isinstance(markdown_link, str):
+                matches = _MARKDOWN_FILE_LINK_RE.findall(markdown_link)
+                if matches:
+                    add(markdown_link)
+            elif file_id and filename:
+                try:
+                    add(f"[{filename}]({build_file_id_ref(file_id)})")
+                except ValueError:
+                    pass
+
+            for key, nested in item.items():
+                if key in {"raw", "raw_response", "content", "video_url"}:
+                    continue
+                if isinstance(nested, (dict, list, tuple)):
+                    visit(nested, depth + 1)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested, depth + 1)
+
+    visit(value)
+    return links
 
 
 def _compact_preview_value(value: Any, *, max_string_length: int = 160) -> Any:

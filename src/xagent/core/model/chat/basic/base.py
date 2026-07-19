@@ -33,7 +33,7 @@ class BaseLLM(ABC):
     def abilities(self) -> List[str]:
         """
         Get the list of abilities supported by this LLM implementation.
-        Possible abilities: ["chat", "vision", "thinking_mode", "tool_calling"]
+        Possible abilities: ["chat", "vision", "video", "thinking_mode", "tool_calling"]
 
         Returns:
             List[str]: List of supported abilities
@@ -81,6 +81,42 @@ class BaseLLM(ABC):
         Defaults to True to preserve existing structured-output routing.
         """
         return True
+
+    @property
+    def supports_native_video_input(self) -> bool:
+        """Whether this model accepts a video as one multimodal input.
+
+        Provider adapters override this when their public API has a known video
+        contract.  OpenAI-compatible or self-hosted models can opt in explicitly
+        by adding ``video`` to their configured abilities.
+        """
+        return self.has_ability("video")
+
+    @property
+    def supports_native_video_with_images(self) -> bool:
+        """Whether native video and image parts may share one model request."""
+        return False
+
+    @property
+    def supports_native_video_time_range(self) -> bool:
+        """Whether native video input enforces start/end offsets."""
+        return False
+
+    def build_native_video_content(
+        self,
+        video_url: str,
+        *,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> dict[str, Any]:
+        """Build the provider-ready content part for one native video input.
+
+        The default is the OpenAI-compatible ``video_url`` shape used by a
+        number of third-party providers.  Provider adapters can translate or
+        enrich it without leaking provider checks into the vision tool.
+        """
+        _ = start_time, end_time
+        return {"type": "video_url", "video_url": {"url": video_url}}
 
     def has_ability(self, ability: str) -> bool:
         """

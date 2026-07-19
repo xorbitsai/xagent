@@ -14,6 +14,7 @@ from ...core.agent.transcript import (
     normalize_transcript_messages,
 )
 from ..models.chat_message import TaskChatMessage
+from .file_reference_output_service import reconcile_assistant_file_references
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +278,15 @@ def persist_assistant_message(
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
-    transcript_content = build_assistant_transcript_content(content, interactions)
+    reconciled_content = reconcile_assistant_file_references(
+        db,
+        task_id=task_id,
+        user_id=user_id,
+        content=content,
+    )
+    transcript_content = build_assistant_transcript_content(
+        reconciled_content, interactions
+    )
     return _persist_message(
         db=db,
         task_id=task_id,
@@ -302,7 +311,15 @@ def persist_assistant_message_no_commit(
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
 
-    transcript_content = build_assistant_transcript_content(content, interactions)
+    reconciled_content = reconcile_assistant_file_references(
+        db,
+        task_id=task_id,
+        user_id=user_id,
+        content=content,
+    )
+    transcript_content = build_assistant_transcript_content(
+        reconciled_content, interactions
+    )
     normalized_content = transcript_content.strip()
     if not normalized_content:
         return None

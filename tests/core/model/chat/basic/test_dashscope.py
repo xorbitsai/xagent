@@ -113,6 +113,32 @@ def test_dashscope_provider_reasoning_hook_disables_qwen_thinking(dashscope_llm)
     }
 
 
+@pytest.mark.parametrize(
+    "model_name",
+    ["qwen3.7-plus", "qwen3.5-plus", "qwen3-vl-flash", "qwen-omni-turbo"],
+)
+def test_dashscope_native_video_capability_for_supported_families(model_name):
+    llm = DashScopeLLM(
+        model_name=model_name,
+        base_url=_DASHSCOPE_BASE_URL,
+        api_key="test-key",
+        abilities=["vision"],
+    )
+
+    assert llm.supports_native_video_input is True
+
+
+def test_dashscope_text_model_does_not_claim_native_video():
+    llm = DashScopeLLM(
+        model_name="qwen-plus",
+        base_url=_DASHSCOPE_BASE_URL,
+        api_key="test-key",
+        abilities=["vision"],
+    )
+
+    assert llm.supports_native_video_input is False
+
+
 def test_dashscope_provider_reasoning_hook_enables_qwen_thinking(dashscope_llm):
     assert dashscope_llm._prepare_provider_reasoning_extra_body(
         extra_body={"trace_id": "abc"},

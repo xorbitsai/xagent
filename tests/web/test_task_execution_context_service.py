@@ -131,6 +131,47 @@ def test_summarize_tool_event_compacts_nested_large_strings():
     assert "a" * 200 not in summary
 
 
+def test_summarize_tool_event_preserves_file_ref_before_long_video_payload():
+    file_id = "c6553861-5bdd-4628-9b15-1310e34fe499"
+    markdown_link = f"[generated_video_253a6da9.mp4](file:{file_id})"
+
+    summary = summarize_tool_event(
+        {
+            "tool_name": "generate_video",
+            "success": True,
+            "result": {
+                "success": True,
+                "video_url": "https://provider.example/video?signature=" + ("x" * 500),
+                "file_ref": {
+                    "file_id": file_id,
+                    "filename": "generated_video_253a6da9.mp4",
+                    "markdown_link": markdown_link,
+                },
+            },
+        }
+    )
+
+    assert summary is not None
+    assert summary.startswith("- Tool generate_video previously returned: files: ")
+    assert markdown_link in summary
+    assert file_id in summary
+
+
+def test_summarize_tool_event_builds_link_from_file_id_and_filename():
+    summary = summarize_tool_event(
+        {
+            "tool_name": "write_file",
+            "success": True,
+            "result": {
+                "file_refs": [{"file_id": "report-id", "filename": "report.pdf"}]
+            },
+        }
+    )
+
+    assert summary is not None
+    assert "[report.pdf](file:report-id)" in summary
+
+
 def test_summarize_execution_failure_event_includes_step_anchor():
     summary = summarize_execution_failure_event(
         {

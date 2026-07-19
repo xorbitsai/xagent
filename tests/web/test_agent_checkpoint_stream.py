@@ -237,6 +237,48 @@ async def test_agent_outbound_handler_skips_hidden_messages(monkeypatch) -> None
     assert broadcast_calls == []
 
 
+@pytest.mark.asyncio
+async def test_agent_outbound_handler_repairs_completed_final_answer(
+    monkeypatch,
+) -> None:
+    broadcast_calls: list[tuple[dict[str, object], int]] = []
+
+    def fake_reconcile(task_id: int, content: str) -> str:
+        assert task_id == 365
+        assert content == "[video.mp4](file:invented-id)"
+        return "[video.mp4](file:real-id)"
+
+    async def fake_to_thread(func: object, /, *args: object):
+        return func(*args)
+
+    async def fake_broadcast(event: dict[str, object], task_id: int) -> None:
+        broadcast_calls.append((event, task_id))
+
+    monkeypatch.setattr(
+        "xagent.web.api.websocket._reconcile_streamed_final_answer",
+        fake_reconcile,
+    )
+    monkeypatch.setattr("xagent.web.api.websocket.asyncio.to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.broadcast_to_task", fake_broadcast
+    )
+
+    handler = make_agent_outbound_handler(365)
+    await handler(
+        {
+            "type": "final_answer_end",
+            "message_id": "final-answer-1",
+            "content": "[video.mp4](file:invented-id)",
+        }
+    )
+
+    assert len(broadcast_calls) == 1
+    event, task_id = broadcast_calls[0]
+    assert task_id == 365
+    assert event["type"] == "final_answer_end"
+    assert event["content"] == "[video.mp4](file:real-id)"
+
+
 def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

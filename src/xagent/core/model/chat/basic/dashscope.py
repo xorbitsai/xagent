@@ -45,6 +45,34 @@ class DashScopeLLM(OpenAILLM):
             timeout_config=timeout_config,
         )
 
+    @property
+    def supports_native_video_input(self) -> bool:
+        """Return whether the configured Qwen model accepts ``video_url``."""
+        if super().supports_native_video_input:
+            return True
+        if not self.has_ability("vision"):
+            return False
+
+        model_name = self._model_name.lower()
+        native_video_families = (
+            "qwen-vl",
+            "qwen2-vl",
+            "qwen2.5-vl",
+            "qwen3-vl",
+            "qwen3.5",
+            "qwen3.6",
+            "qwen3.7",
+            "qwen-omni",
+            "qwen3-omni",
+            "qvq",
+        )
+        return model_name.startswith(native_video_families)
+
+    @property
+    def supports_native_video_with_images(self) -> bool:
+        """Qwen multimodal requests can combine image and video inputs."""
+        return self.supports_native_video_input
+
     @staticmethod
     def _is_strict_tool_choice(
         tool_choice: Optional[Union[str, Dict[str, Any]]],

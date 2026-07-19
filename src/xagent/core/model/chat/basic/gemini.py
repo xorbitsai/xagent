@@ -195,12 +195,9 @@ class GeminiLLM(BaseLLM):
         if abilities:
             self._abilities = abilities
         else:
-            self._abilities = ["chat", "tool_calling"]
-            if any(
-                vision_keyword in model_name.lower()
-                for vision_keyword in ["vision", "pro-vision", "flash-vision", "2.5"]
-            ):
-                self._abilities.append("vision")
+            # Gemini chat models are natively multimodal; the separate image
+            # generation adapter owns generation-only models.
+            self._abilities = ["chat", "tool_calling", "vision"]
 
         # Initialize the Gemini client (lazy initialization)
         self._client: Optional[Any] = None
@@ -214,6 +211,43 @@ class GeminiLLM(BaseLLM):
     def abilities(self) -> List[str]:
         """Get the list of abilities supported by this Gemini LLM implementation."""
         return self._abilities
+
+    @property
+    def supports_native_video_input(self) -> bool:
+        """Gemini multimodal models process videos natively."""
+        return self.has_ability("vision")
+
+    @property
+    def supports_native_video_with_images(self) -> bool:
+        """Gemini accepts mixed image and native video parts."""
+        return self.supports_native_video_input
+
+    @property
+    def supports_native_video_time_range(self) -> bool:
+        """Gemini supports start and end offsets in video metadata."""
+        return self.supports_native_video_input
+
+    def build_native_video_content(
+        self,
+        video_url: str,
+        *,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> Dict[str, Any]:
+        """Build the canonical part converted to Gemini inline/file data later."""
+        metadata: Dict[str, Any] = {}
+        if start_time is not None:
+            metadata["start_offset"] = f"{start_time:g}s"
+        if end_time is not None:
+            metadata["end_offset"] = f"{end_time:g}s"
+
+        content: Dict[str, Any] = {
+            "type": "video_url",
+            "video_url": {"url": video_url},
+        }
+        if metadata:
+            content["video_metadata"] = metadata
+        return content
 
     def _ensure_client(self) -> None:
         """Ensure the Gemini client is initialized using official SDK."""
@@ -326,6 +360,49 @@ class GeminiLLM(BaseLLM):
                                         }
                                     }
                                 )
+                        elif item.get("type") == "video_url":
+                            video_url = item.get("video_url", {})
+                            if isinstance(video_url, dict):
+                                url = video_url.get("url", "")
+                            else:
+                                url = video_url
+
+                            video_part: Dict[str, Any]
+                            if isinstance(url, str) and url.startswith("data:video/"):
+                                try:
+                                    mime_type = url.split(":", 1)[1].split(";", 1)[0]
+                                    base64_data = url.split(",", 1)[1]
+                                except (IndexError, ValueError) as exc:
+                                    raise ValueError(
+                                        "Invalid video data URL for Gemini"
+                                    ) from exc
+                                video_part = {
+                                    "inline_data": {
+                                        "mime_type": mime_type,
+                                        "data": base64_data,
+                                    }
+                                }
+                            elif isinstance(url, str) and (
+                                url.startswith("gs://")
+                                or "youtube.com/" in url
+                                or "youtu.be/" in url
+                            ):
+                                video_part = {
+                                    "file_data": {
+                                        "file_uri": url,
+                                        "mime_type": "video/mp4",
+                                    }
+                                }
+                            else:
+                                raise ValueError(
+                                    "Gemini native video input requires an inline local "
+                                    "video, a Google Cloud Storage URI, or a YouTube URL"
+                                )
+
+                            metadata = item.get("video_metadata")
+                            if isinstance(metadata, dict) and metadata:
+                                video_part["video_metadata"] = metadata
+                            parts.append(video_part)
 
                 gemini_messages.append({"role": gemini_role, "parts": parts})
 

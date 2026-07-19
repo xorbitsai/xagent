@@ -16,6 +16,9 @@ from ..models.database import get_db
 from ..models.task import Task, TraceEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.user import User
+from ..services.file_reference_output_service import (
+    reconcile_assistant_file_references,
+)
 from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
@@ -236,6 +239,14 @@ def _serialize_transcript_with_events(
     # assistant (2), since compaction happens before the assistant reply.
     rows: list[tuple[float, int, dict[str, Any]]] = []
     for message in sorted(messages, key=_message_sort_key):
+        content = message.content
+        if message.role == "assistant":
+            content = reconcile_assistant_file_references(
+                db,
+                task_id=int(task.id),
+                user_id=int(task.user_id),
+                content=content,
+            )
         rows.append(
             (
                 _event_epoch(message.created_at) or 0.0,
@@ -243,7 +254,7 @@ def _serialize_transcript_with_events(
                 {
                     "id": int(message.id),
                     "role": message.role,
-                    "content": message.content,
+                    "content": content,
                     "message_type": message.message_type,
                     "interactions": message.interactions,
                     "turn_id": message.turn_id,
@@ -534,7 +545,12 @@ async def get_conversation_log_detail(
             "task": {
                 "task_id": int(task.id),
                 "input": task.input,
-                "output": task.output,
+                "output": reconcile_assistant_file_references(
+                    db,
+                    task_id=int(task.id),
+                    user_id=int(task.user_id),
+                    content=task.output,
+                ),
                 "error_message": task.error_message,
                 "description": task.description,
             },

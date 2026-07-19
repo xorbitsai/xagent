@@ -79,7 +79,7 @@ class ZhipuLLM(BaseLLM):
             self._abilities = ["chat", "tool_calling"]
             if any(
                 vision_keyword in model_name.lower()
-                for vision_keyword in ["glm-4v", "glm-4.5v", "vision"]
+                for vision_keyword in ["glm-4v", "glm-4.5v", "glm-4.6v", "vision"]
             ):
                 self._abilities.append("vision")
             if self.supports_thinking_mode:
@@ -97,6 +97,30 @@ class ZhipuLLM(BaseLLM):
     def abilities(self) -> List[str]:
         """Get the list of abilities supported by this Zhipu LLM implementation."""
         return self._abilities
+
+    @property
+    def supports_native_video_input(self) -> bool:
+        """Return whether the configured GLM visual model accepts video input."""
+        if super().supports_native_video_input:
+            return True
+        if not self.has_ability("vision"):
+            return False
+
+        model_name = self._model_name.lower()
+        return model_name.startswith(("glm-4v-plus-0111", "glm-4.5v", "glm-4.6v"))
+
+    def build_native_video_content(
+        self,
+        video_url: str,
+        *,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> Dict[str, Any]:
+        """Build Zhipu's ``video_url`` part, including raw local Base64."""
+        _ = start_time, end_time
+        if video_url.startswith("data:video/") and "," in video_url:
+            video_url = video_url.split(",", 1)[1]
+        return {"type": "video_url", "video_url": {"url": video_url}}
 
     def _ensure_client(self) -> None:
         """Ensure the Zhipu client is initialized."""

@@ -30,6 +30,28 @@ class TestZhipuLLM:
             llm._client = mock_zhipu_client
             return llm
 
+    @pytest.mark.parametrize("model_name", ["glm-4.5v", "glm-4.6v-flash"])
+    def test_native_video_capability(self, model_name):
+        llm = ZhipuLLM(
+            model_name=model_name,
+            api_key="test-key",
+            abilities=["vision"],
+        )
+
+        assert llm.supports_native_video_input is True
+
+    def test_native_video_content_uses_raw_base64(self):
+        llm = ZhipuLLM(
+            model_name="glm-4.6v",
+            api_key="test-key",
+            abilities=["vision"],
+        )
+
+        assert llm.build_native_video_content("data:video/mp4;base64,ZmFrZQ==") == {
+            "type": "video_url",
+            "video_url": {"url": "ZmFrZQ=="},
+        }
+
     @pytest.mark.asyncio
     async def test_normal_text_response(self, zhipu_llm, mock_zhipu_client):
         """Test normal text response handling."""

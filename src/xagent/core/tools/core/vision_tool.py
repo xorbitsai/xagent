@@ -3,16 +3,20 @@ Pure Vision Tool Core
 Standalone vision capabilities without framework dependencies
 """
 
+import asyncio
 import base64
 import logging
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ...model.chat.basic.base import BaseLLM
 
@@ -25,15 +29,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_MAX_INLINE_VIDEO_BYTES = 64 * 1024 * 1024
 
-class UnderstandImagesResult(BaseModel):
-    """Return model for understand_images method"""
+
+class UnderstandMediaResult(BaseModel):
+    """Result returned by the unified image and video understanding entrypoint."""
 
     success: bool
     answer: Optional[str] = None
+    media_processed: Optional[int] = None
     images_processed: Optional[int] = None
+    videos_processed: Optional[int] = None
+    native_videos_processed: Optional[int] = None
+    frames_extracted: Optional[int] = None
     model_used: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
     error: Optional[str] = None
+
+
+# Backwards-compatible name for direct/internal callers. The agent-facing tool is
+# ``understand_media`` so image and video understanding do not consume two tool
+# slots.
+UnderstandImagesResult = UnderstandMediaResult
 
 
 class DetectObjectsResult(BaseModel):
@@ -147,6 +164,32 @@ class VisionCore:
         except Exception as e:
             raise RuntimeError(f"Failed to read image file {image_path}: {e}")
 
+    def _convert_video_to_base64(self, video_path: str) -> str:
+        """Convert a local video to a provider-neutral Base64 data URL."""
+        if video_path.startswith(("http://", "https://", "data:")):
+            return video_path
+
+        resolved_path = Path(video_path).resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        if resolved_path.stat().st_size > _MAX_INLINE_VIDEO_BYTES:
+            raise ValueError(
+                "Local video is too large for inline native input; "
+                "falling back to sampled frames"
+            )
+
+        mime_type = mimetypes.guess_type(str(resolved_path))[0] or "video/mp4"
+        if not mime_type.startswith("video/"):
+            raise ValueError(f"Unsupported video MIME type: {mime_type}")
+
+        try:
+            encoded = base64.b64encode(resolved_path.read_bytes()).decode("ascii")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to read video file {video_path}: {exc}"
+            ) from exc
+        return f"data:{mime_type};base64,{encoded}"
+
     def _validate_images(self, images: Union[str, List[str]]) -> List[str]:
         """
         Validate and normalize image inputs.
@@ -168,6 +211,189 @@ class VisionCore:
 
         return images
 
+    def _validate_media(self, media: Union[str, List[str]]) -> List[str]:
+        """Validate and normalize media inputs."""
+        if isinstance(media, str):
+            media = [media]
+        if not media:
+            raise ValueError("At least one image or video must be provided")
+        if not all(isinstance(item, str) and item.strip() for item in media):
+            raise ValueError("all items in media must be non-empty strings")
+        if len(media) > 10:
+            raise ValueError("Maximum 10 media files can be analyzed at once")
+        return media
+
+    def _detect_media_kind(self, media_path: str) -> str:
+        """Classify an input without ever treating a video as an image."""
+        if media_path.startswith("data:"):
+            mime_type = media_path[5:].split(";", 1)[0].lower()
+        else:
+            type_source = media_path
+            if media_path.startswith(("http://", "https://")):
+                type_source = urlsplit(media_path).path
+            mime_type = (mimetypes.guess_type(type_source)[0] or "").lower()
+
+        if mime_type.startswith("image/"):
+            return "image"
+        if mime_type.startswith("video/"):
+            return "video"
+
+        suffix = Path(urlsplit(media_path).path).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+            return "image"
+        if suffix in {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}:
+            return "video"
+        raise ValueError(
+            f"Unsupported media type for {media_path!r}; provide a supported image "
+            "or video file"
+        )
+
+    def _probe_video_duration(self, video_path: str) -> float:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            raise RuntimeError(
+                "Video understanding requires ffprobe/ffmpeg to sample frames"
+            )
+        try:
+            completed = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    video_path,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            duration = float(completed.stdout.strip())
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Failed to inspect video {video_path}: {exc}") from exc
+        if duration <= 0:
+            raise RuntimeError(f"Video has no readable duration: {video_path}")
+        return duration
+
+    def _extract_video_frames(
+        self,
+        video_path: str,
+        *,
+        start_time: Optional[float],
+        end_time: Optional[float],
+        max_frames: int,
+    ) -> List[tuple[float, str]]:
+        """Sample video frames as JPEG data URLs for provider-neutral vision input."""
+        if video_path.startswith(("http://", "https://", "data:")):
+            raise ValueError(
+                "Video URLs and data URLs are not sampled directly; upload the video "
+                "or pass a workspace file_id"
+            )
+        resolved_path = str(Path(video_path).resolve())
+        if not Path(resolved_path).is_file():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError(
+                "Video understanding requires ffprobe/ffmpeg to sample frames"
+            )
+
+        duration = self._probe_video_duration(resolved_path)
+        start = max(0.0, start_time or 0.0)
+        end = min(duration, end_time if end_time is not None else duration)
+        if start >= duration:
+            raise ValueError(
+                f"start_time {start:g}s is outside the {duration:.2f}s video"
+            )
+        if end <= start:
+            raise ValueError("end_time must be greater than start_time")
+
+        # Sample the midpoint of equal time buckets. Container duration can be
+        # driven by a longer audio stream, so requesting a frame near exact EOF
+        # may legitimately return no video bytes.
+        bucket_duration = (end - start) / max_frames
+        timestamps = [
+            start + bucket_duration * (index + 0.5) for index in range(max_frames)
+        ]
+
+        frames: List[tuple[float, str]] = []
+        for timestamp in timestamps:
+            try:
+                completed = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-v",
+                        "error",
+                        "-ss",
+                        f"{timestamp:.3f}",
+                        "-i",
+                        resolved_path,
+                        "-frames:v",
+                        "1",
+                        "-f",
+                        "image2pipe",
+                        "-vcodec",
+                        "mjpeg",
+                        "pipe:1",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning(
+                    "Failed to sample video frame at %.2fs from %s: %s",
+                    timestamp,
+                    video_path,
+                    exc,
+                )
+                continue
+            if not completed.stdout:
+                logger.warning(
+                    "Video decoder returned an empty frame at %.2fs from %s",
+                    timestamp,
+                    video_path,
+                )
+                continue
+            encoded = base64.b64encode(completed.stdout).decode("ascii")
+            frames.append((timestamp, f"data:image/jpeg;base64,{encoded}"))
+        if not frames:
+            raise RuntimeError(f"No video frames could be decoded from {video_path}")
+        return frames
+
+    def _video_frame_budgets(
+        self,
+        *,
+        image_count: int,
+        video_count: int,
+        max_frames: int,
+    ) -> List[int]:
+        """Share the model's ten-visual-input budget across videos."""
+        available = 10 - image_count
+        if available < video_count:
+            raise ValueError(
+                "Too many images and videos to include at least one frame per video"
+            )
+        budgets = [1] * video_count
+        remaining = available - video_count
+        while remaining:
+            changed = False
+            for index, budget in enumerate(budgets):
+                if budget >= max_frames:
+                    continue
+                budgets[index] += 1
+                remaining -= 1
+                changed = True
+                if not remaining:
+                    break
+            if not changed:
+                break
+        return budgets
+
     def _get_attr_safely(self, obj: Any, attr_name: str) -> Optional[str]:
         """
         Safely get an attribute value from an object, excluding Mock objects.
@@ -186,19 +412,25 @@ class VisionCore:
             return str(value) if value is not None else None
         return None
 
-    async def understand_images(
+    async def understand_media(
         self,
-        images: Union[str, List[str]],
+        media: Union[str, List[str]],
         question: str,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        max_frames: Optional[int] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> UnderstandImagesResult:
+    ) -> UnderstandMediaResult:
         """
-        Analyze images and answer questions about their content.
+        Analyze images, videos, or mixed media and answer a question.
 
         Args:
-            images: Single image path/URL or list of image paths/URLs
+            media: Image/video path, URL, file id, or a list of them
             question: Question to ask about the images
+            start_time: Optional video sampling start in seconds
+            end_time: Optional video sampling end in seconds
+            max_frames: Maximum sampled frames per video (1-10, default 8)
             temperature: Sampling temperature for generation
             max_tokens: Maximum tokens to generate
 
@@ -208,6 +440,15 @@ class VisionCore:
         try:
             temperature = self._coerce_optional_float(temperature, "temperature")
             max_tokens = self._coerce_optional_int(max_tokens, "max_tokens")
+            start_time = self._coerce_optional_float(start_time, "start_time")
+            end_time = self._coerce_optional_float(end_time, "end_time")
+            max_frames = self._coerce_optional_int(max_frames, "max_frames") or 8
+            if max_frames < 1 or max_frames > 10:
+                raise ValueError("max_frames must be between 1 and 10")
+            if start_time is not None and start_time < 0:
+                raise ValueError("start_time must be greater than or equal to 0")
+            if end_time is not None and end_time < 0:
+                raise ValueError("end_time must be greater than or equal to 0")
 
             # Validate vision model capability
             if not self.vision_model.has_ability("vision"):
@@ -225,43 +466,114 @@ class VisionCore:
                 if provider:
                     model_info += f", Provider: {provider}"
 
-                return UnderstandImagesResult(
+                return UnderstandMediaResult(
                     success=False,
                     error=f"{model_info} does not support vision capabilities",
                 )
 
-            # Validate and normalize images
-            validated_images = self._validate_images(images)
+            validated_media = self._validate_media(media)
+            classified = [
+                (media_path, self._detect_media_kind(media_path))
+                for media_path in validated_media
+            ]
+            image_count = sum(kind == "image" for _, kind in classified)
+            video_count = sum(kind == "video" for _, kind in classified)
+            video_budgets = iter(
+                self._video_frame_budgets(
+                    image_count=image_count,
+                    video_count=video_count,
+                    max_frames=max_frames,
+                )
+            )
+            use_native_video = self.vision_model.supports_native_video_input and (
+                image_count == 0 or self.vision_model.supports_native_video_with_images
+            )
+            if (start_time is not None or end_time is not None) and not (
+                self.vision_model.supports_native_video_time_range
+            ):
+                use_native_video = False
 
-            # Convert images to appropriate format
-            image_contents: List[Dict[str, Any]] = []
-            for img_path in validated_images:
+            visual_contents: List[Dict[str, Any]] = []
+            warnings: List[str] = []
+            processed_images = 0
+            processed_videos = 0
+            native_videos = 0
+            extracted_frames = 0
+            for media_path, kind in classified:
                 try:
-                    if img_path.startswith(("http://", "https://")):
-                        image_contents.append(
-                            {"type": "image_url", "image_url": {"url": img_path}}
+                    if kind == "video":
+                        frame_budget = next(video_budgets)
+                        if use_native_video:
+                            try:
+                                video_data = self._convert_video_to_base64(media_path)
+                                visual_contents.append(
+                                    self.vision_model.build_native_video_content(
+                                        video_data,
+                                        start_time=start_time,
+                                        end_time=end_time,
+                                    )
+                                )
+                                processed_videos += 1
+                                native_videos += 1
+                                continue
+                            except Exception as exc:
+                                warning = (
+                                    f"Native video input unavailable for {media_path}: "
+                                    f"{exc}; using sampled frames"
+                                )
+                                logger.warning(warning)
+                                warnings.append(warning)
+
+                        frames = await asyncio.to_thread(
+                            self._extract_video_frames,
+                            media_path,
+                            start_time=start_time,
+                            end_time=end_time,
+                            max_frames=frame_budget,
                         )
-                    elif img_path.startswith("data:"):
-                        image_contents.append(
-                            {"type": "image_url", "image_url": {"url": img_path}}
-                        )
+                        for timestamp, frame_data in frames:
+                            visual_contents.extend(
+                                [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            f"Video {Path(media_path).name}, frame at "
+                                            f"{timestamp:.2f} seconds:"
+                                        ),
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": frame_data},
+                                    },
+                                ]
+                            )
+                        processed_videos += 1
+                        extracted_frames += len(frames)
                     else:
-                        base64_data = self._convert_image_to_base64(img_path)
-                        image_contents.append(
-                            {"type": "image_url", "image_url": {"url": base64_data}}
+                        image_data = (
+                            media_path
+                            if media_path.startswith(("http://", "https://", "data:"))
+                            else self._convert_image_to_base64(media_path)
                         )
+                        visual_contents.append(
+                            {"type": "image_url", "image_url": {"url": image_data}}
+                        )
+                        processed_images += 1
                 except Exception as e:
-                    logger.warning(f"Failed to process image {img_path}: {e}")
+                    warning = f"Failed to process {kind} {media_path}: {e}"
+                    logger.warning(warning)
+                    warnings.append(warning)
                     continue
 
-            if not image_contents:
-                return UnderstandImagesResult(
-                    success=False, error="No valid images could be processed"
+            if not visual_contents:
+                return UnderstandMediaResult(
+                    success=False,
+                    warnings=warnings,
+                    error="No valid images or video frames could be processed",
                 )
 
-            # Prepare the message content with images and question
             content = [{"type": "text", "text": question}]
-            content.extend(image_contents)
+            content.extend(visual_contents)
 
             # Create the message for vision chat
             messages = [{"role": "user", "content": content}]
@@ -281,16 +593,36 @@ class VisionCore:
             else:
                 answer = str(result)
 
-            return UnderstandImagesResult(
+            return UnderstandMediaResult(
                 success=True,
                 answer=answer,
-                images_processed=len(image_contents),
+                media_processed=processed_images + processed_videos,
+                images_processed=processed_images,
+                videos_processed=processed_videos,
+                native_videos_processed=native_videos,
+                frames_extracted=extracted_frames,
                 model_used=self.vision_model.__class__.__name__,
+                warnings=warnings,
             )
 
         except Exception as e:
-            logger.error(f"Image understanding failed: {e}")
-            return UnderstandImagesResult(success=False, error=str(e))
+            logger.error(f"Media understanding failed: {e}")
+            return UnderstandMediaResult(success=False, error=str(e))
+
+    async def understand_images(
+        self,
+        images: Union[str, List[str]],
+        question: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> UnderstandImagesResult:
+        """Backwards-compatible internal image-only entrypoint."""
+        return await self.understand_media(
+            media=images,
+            question=question,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
     async def describe_images(
         self,
@@ -819,6 +1151,30 @@ class VisionCore:
 
 
 # Convenience functions for direct usage
+async def understand_media(
+    vision_model: BaseLLM,
+    media: Union[str, List[str]],
+    question: str,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    output_directory: Optional[str] = None,
+) -> UnderstandMediaResult:
+    """Analyze images, videos, or mixed media with a vision model."""
+    core = VisionCore(vision_model, output_directory)
+    return await core.understand_media(
+        media,
+        question,
+        start_time,
+        end_time,
+        max_frames,
+        temperature,
+        max_tokens,
+    )
+
+
 async def understand_images(
     vision_model: BaseLLM,
     images: Union[str, List[str]],

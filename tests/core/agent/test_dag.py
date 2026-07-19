@@ -1417,6 +1417,99 @@ async def test_dag_pattern_concurrent_interrupt_cancels_sibling_and_replans(
 
 
 @pytest.mark.asyncio
+async def test_dag_interrupt_cancels_in_flight_step_tool() -> None:
+    class SlowVisionTool:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.metadata = type(
+                "Metadata",
+                (),
+                {
+                    "name": "understand_images",
+                    "description": "Analyze an image.",
+                },
+            )()
+
+        def args_type(self) -> type:
+            class Args:
+                @staticmethod
+                def model_json_schema() -> dict[str, Any]:
+                    return {
+                        "type": "object",
+                        "properties": {
+                            "images": {"type": "string"},
+                            "question": {"type": "string"},
+                        },
+                    }
+
+            return Args
+
+        async def run_json_async(self, _args: dict[str, Any]) -> Any:
+            self.started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return {"success": True, "answer": "never"}
+
+    runtime = PatternRuntime(execution_id="dag-cancel-tool")
+    tool = SlowVisionTool()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(
+                id="inspect",
+                task="Inspect the image",
+                tool_names=["understand_images"],
+            )
+        ),
+        react_max_iterations=2,
+    )
+    context = ExecutionContext(execution_id="dag-cancel-tool")
+    context.add_user_message("Inspect this image.")
+    llm = SequenceLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "dag-vision-1",
+                        "function": {
+                            "name": "understand_images",
+                            "arguments": json.dumps(
+                                {
+                                    "images": "file-id",
+                                    "question": "What is shown?",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    task = asyncio.create_task(
+        pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+    )
+    await tool.started.wait()
+    runtime.request_interrupt("pause DAG tool")
+    result = await task
+
+    assert result["status"] == "interrupted"
+    assert result["active_step_id"] == "inspect"
+    assert tool.cancelled.is_set()
+    child_checkpoint = next(
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "dag_interrupted"
+        and checkpoint["metadata"].get("child_label") == "interrupted"
+    )
+    assert child_checkpoint["metadata"]["safe_point"] == "during_tool"
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_concurrent_failure_clears_cancelled_sibling() -> None:
     class FailingAndSlowLLM:
         def __init__(self) -> None:

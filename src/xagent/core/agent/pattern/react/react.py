@@ -15,9 +15,12 @@ flag never changes observable results, only latency:
 - I4 (control short-circuit): a control tool (final_answer / send_message /
   ask_user_question) owns its segment and ends the turn's tool execution; later
   tool calls in the same turn do not run.
-- I5 (interrupt / resume): an interrupt is honored at a segment boundary with
-  the remaining calls left pending; a crash mid-batch leaves the whole segment
-  pending so resume re-runs it (safe because batched tools are read-only).
+- I5 (interrupt / resume): an interrupt during a concurrent batch preserves
+  calls that already completed and leaves only interrupted calls pending. A
+  cancelled call may still have committed externally before cancellation was
+  observed, so ``concurrency_safe`` is an explicit idempotency contract as well
+  as a concurrency contract. A crash before backfill leaves the whole segment
+  pending for resume under the same contract.
 - I6 (trace pairing): tool trace spans pair START with END/ERROR by
   ``tool_call_id`` rather than tool name, so concurrent same-name calls do not
   cross-attribute (see ``tracing/langfuse/handler.py``).
@@ -48,6 +51,7 @@ from ...context.enrichment import (
 from ...language import final_answer_language_rule
 from ...result import tool_result_succeeded, unwrap_final_answer_content
 from ...runtime import (
+    ExecutionInterrupted,
     LLMCallInterrupted,
     PatternRuntime,
     ToolCallInterrupted,
@@ -294,11 +298,15 @@ class ReActPattern(AgentPattern):
                 compact_llm=compact_llm,
                 runtime=runtime,
             )
-        except LLMCallInterrupted:
+        except ExecutionInterrupted as exc:
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
-                label="during_enrichment",
+                label=(
+                    "during_tool"
+                    if isinstance(exc, ToolCallInterrupted)
+                    else "during_enrichment"
+                ),
             )
             if interrupted is None:
                 raise
@@ -1454,8 +1462,10 @@ class ReActPattern(AgentPattern):
     def _tool_is_concurrency_safe(self, name: str, tools: list[Any]) -> bool:
         """Whether ``name`` may run concurrently with other safe tools.
 
-        Conservative: unknown tools and tools without the metadata flag are
-        treated as not safe.
+        The metadata flag is also the tool author's idempotency declaration:
+        an interrupted call can be retried on resume when cancellation races
+        with an external side effect. Unknown tools and tools without the flag
+        are conservatively kept serial.
         """
         try:
             tool = self._find_tool(name, tools)
@@ -1559,11 +1569,36 @@ class ReActPattern(AgentPattern):
         # bug. The serial path lets those propagate and halt the turn; re-raise
         # here so the concurrent path behaves identically instead of
         # mis-reporting infrastructure breakage to the model as a tool failure.
-        # Re-raising before backfill leaves the whole (idempotent) segment
-        # pending, so resume re-runs it cleanly (I5).
+        # Infrastructure failures preserve the historical all-or-nothing
+        # behavior: do not backfill any result before propagating the failure.
         for result in raw_results:
-            if isinstance(result, BaseException):
+            if isinstance(result, BaseException) and not isinstance(
+                result, ToolCallInterrupted
+            ):
                 raise result
+
+        interrupted = next(
+            (
+                result
+                for result in raw_results
+                if isinstance(result, ToolCallInterrupted)
+            ),
+            None,
+        )
+        if interrupted is not None:
+            completed_ids: set[str] = set()
+            for tool_call, result in zip(batch, raw_results):
+                if isinstance(result, BaseException):
+                    continue
+                self._backfill_result(tool_call, result, context)
+                completed_ids.add(str(tool_call.get("id") or ""))
+            self._reorder_ledger_for_batch(batch)
+            self.pending_tool_calls = [
+                tool_call
+                for tool_call in self.pending_tool_calls
+                if str(tool_call.get("id") or "") not in completed_ids
+            ]
+            raise interrupted
 
         for tool_call, result in zip(batch, raw_results):
             self._backfill_result(tool_call, result, context)

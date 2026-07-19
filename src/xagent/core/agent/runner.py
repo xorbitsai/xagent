@@ -11,7 +11,7 @@ from ..model.intent import enter_goal, exit_goal
 from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
-from .runtime import LLMCallInterrupted, PatternRuntime, load_pattern_checkpoint
+from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ class AgentRunner:
                                 streaming_handler=streaming_handler,
                             )
                         )
-                    except LLMCallInterrupted as exc:
+                    except ExecutionInterrupted as exc:
                         normalized = {
                             "success": False,
                             "status": "interrupted",

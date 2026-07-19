@@ -24,17 +24,16 @@ from .streaming import merge_streamed_tool_call_arguments
 logger = logging.getLogger(__name__)
 
 
-class LLMCallInterrupted(Exception):
+class ExecutionInterrupted(Exception):
+    """Base signal for an execution interrupted at an active I/O boundary."""
+
+
+class LLMCallInterrupted(ExecutionInterrupted):
     """Raised when an active LLM call is cancelled by an execution interrupt."""
 
 
-class ToolCallInterrupted(LLMCallInterrupted):
-    """Raised when an active tool call is cancelled by an execution interrupt.
-
-    Subclassing the existing interruption signal keeps pattern and runner
-    boundaries compatible while allowing tool execution to distinguish the
-    cancellation and close its trace cleanly.
-    """
+class ToolCallInterrupted(ExecutionInterrupted):
+    """Raised when an active tool call is cancelled by an execution interrupt."""
 
 
 async def prepare_llm_for_context(
@@ -779,17 +778,11 @@ class PatternRuntime:
                 "success": True,
             },
         )
-        if self.tracer is None:
-            return
-        payload = {
-            "name": f"tool.{tool_call['name']}",
-            "status": "success",
-            "output": result,
-        }
-        self.finished_spans.append(payload)
-        finish_span = getattr(self.tracer, "finish_span", None)
-        if callable(finish_span):
-            await self._maybe_await(finish_span(**payload))
+        await self._finish_tool_span(
+            tool_call=tool_call,
+            status="success",
+            output=result,
+        )
 
     async def on_tool_error(
         self,
@@ -819,17 +812,11 @@ class PatternRuntime:
             step_id=self._step_id_from_payload(tool_call),
             data=data,
         )
-        if self.tracer is None:
-            return
-        payload = {
-            "name": f"tool.{tool_call['name']}",
-            "status": "error",
-            "output": {"error": str(error)},
-        }
-        self.finished_spans.append(payload)
-        finish_span = getattr(self.tracer, "finish_span", None)
-        if callable(finish_span):
-            await self._maybe_await(finish_span(**payload))
+        await self._finish_tool_span(
+            tool_call=tool_call,
+            status="error",
+            output={"error": str(error)},
+        )
 
     async def on_tool_cancelled(
         self,
@@ -853,15 +840,30 @@ class PatternRuntime:
                 "interrupt_reason": cancellation_reason,
             },
         )
+        await self._finish_tool_span(
+            tool_call=tool_call,
+            status="cancelled",
+            output={
+                "interrupted": True,
+                "reason": cancellation_reason,
+            },
+        )
+
+    async def _finish_tool_span(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        status: str,
+        output: Any,
+    ) -> None:
+        """Finish one tool span with the common tracer bookkeeping."""
+
         if self.tracer is None:
             return
         payload = {
             "name": f"tool.{tool_call['name']}",
-            "status": "cancelled",
-            "output": {
-                "interrupted": True,
-                "reason": cancellation_reason,
-            },
+            "status": status,
+            "output": output,
         }
         self.finished_spans.append(payload)
         finish_span = getattr(self.tracer, "finish_span", None)

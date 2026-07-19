@@ -16,6 +16,8 @@ behavior:
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from tests.core.agent.concurrency_harness import (
@@ -25,6 +27,7 @@ from tests.core.agent.concurrency_harness import (
     make_react,
     make_tool_call,
 )
+from xagent.core.agent import PatternRuntime, ToolCallInterrupted
 
 
 def _checkpoint_statuses(runtime: FakeRuntime) -> list[str]:
@@ -143,6 +146,43 @@ async def test_interrupt_after_capped_batch_preserves_remaining() -> None:
     # Only the first capped batch ran; the remainder is preserved for resume.
     assert [r["tool_name"] for r in context.tool_results] == ["s1", "s2"]
     assert [tc["name"] for tc in pattern.pending_tool_calls] == ["s3", "s4"]
+
+
+async def test_interrupt_during_batch_preserves_completed_results() -> None:
+    blocked = asyncio.Event()
+    tools = [
+        FakeTool("s1", read_only=True),
+        FakeTool("s2", read_only=True, gate=blocked),
+    ]
+    pattern = _make_pattern(max_concurrency=2)
+    calls = [make_tool_call("s1"), make_tool_call("s2")]
+    pattern.pending_tool_calls = list(calls)
+    context = RecordingContext()
+    runtime = PatternRuntime(execution_id="partial-batch-interrupt")
+
+    task = asyncio.create_task(
+        pattern._execute_pending_tool_calls(
+            context=context,
+            tools=tools,
+            llm=None,
+            runtime=runtime,
+        )
+    )
+    while (
+        pattern.tool_ledger.get(calls[0]["id"]) is None
+        or pattern.tool_ledger[calls[0]["id"]].status != "completed"
+        or not tools[1].calls
+    ):
+        await asyncio.sleep(0)
+
+    runtime.request_interrupt("pause partial batch")
+    with pytest.raises(ToolCallInterrupted, match="pause partial batch"):
+        await task
+
+    assert [result["tool_name"] for result in context.tool_results] == ["s1"]
+    assert [call["name"] for call in pattern.pending_tool_calls] == ["s2"]
+    assert pattern.tool_ledger[calls[0]["id"]].status == "completed"
+    assert pattern.tool_ledger[calls[1]["id"]].status == "interrupted"
 
 
 async def test_concurrent_batch_then_unsafe_serial_preserves_order() -> None:

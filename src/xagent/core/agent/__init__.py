@@ -70,6 +70,7 @@ from .pattern import (
 from .registry import ExecutionHandle, ExecutionLifecycleStatus, ExecutionRegistry
 from .runner import AgentRunner
 from .runtime import (
+    ExecutionInterrupted,
     LLMCallInterrupted,
     PatternRuntime,
     ToolCallInterrupted,
@@ -107,6 +108,7 @@ __all__ = [
     "ExecutionSnapshot",
     "ExecutionStatus",
     "ExecutionContext",
+    "ExecutionInterrupted",
     "GenericComponent",
     "LLMCallInterrupted",
     "ToolCallInterrupted",

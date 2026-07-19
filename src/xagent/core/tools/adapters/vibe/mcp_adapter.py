@@ -378,8 +378,9 @@ class MCPToolAdapter(AbstractBaseTool):
                 (``normalize_mcp_server_name``), surfaced on
                 ``metadata.source_server`` so server-scoped selection matches
                 by structured equality rather than re-parsing the tool name.
-            concurrency_safe: Whether the server operator has opted this MCP
-                server into concurrent tool execution.
+            concurrency_safe: Whether the server operator guarantees these MCP
+                tools are both concurrency-safe and idempotent when retried
+                after interruption.
             concurrent_tools: Optional allowlist of raw MCP tool names. Empty
                 means every tool from an opted-in server is safe.
         """

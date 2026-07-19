@@ -64,7 +64,10 @@ class MCPServerConfig(BaseModel):
     )
     concurrency_safe: bool = Field(
         False,
-        description="Whether this server's MCP tools may run concurrently",
+        description=(
+            "Whether this server's MCP tools may run concurrently and are "
+            "idempotent when retried after interruption"
+        ),
     )
     concurrent_tools: List[str] = Field(
         default_factory=list,

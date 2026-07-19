@@ -524,7 +524,18 @@ class TestVisionToolUnderstandMedia:
         )
         tool = VisionTool(mock_vision_model)
 
-        with patch.object(tool.core, "_extract_video_frames") as extract_frames:
+        with (
+            patch.object(
+                tool.core,
+                "_convert_video_to_base64",
+                return_value="data:video/mp4;base64,ZmFrZS12aWRlbw==",
+            ) as convert_video,
+            patch(
+                "xagent.core.tools.core.vision_tool.asyncio.to_thread",
+                new=AsyncMock(return_value="data:video/mp4;base64,ZmFrZS12aWRlbw=="),
+            ) as to_thread,
+            patch.object(tool.core, "_extract_video_frames") as extract_frames,
+        ):
             result = await tool.understand_media(
                 str(video_path),
                 "What happens?",
@@ -537,6 +548,7 @@ class TestVisionToolUnderstandMedia:
         assert result.native_videos_processed == 1
         assert result.frames_extracted == 0
         extract_frames.assert_not_called()
+        to_thread.assert_awaited_once_with(convert_video, str(video_path))
 
         video_data = mock_vision_model.build_native_video_content.call_args.args[0]
         assert video_data.startswith("data:video/mp4;base64,")
@@ -644,6 +656,122 @@ class TestVisionToolUnderstandMedia:
             video_count=2,
             max_frames=8,
         ) == [4, 4]
+
+    @pytest.mark.asyncio
+    async def test_all_native_videos_skip_fallback_frame_budget(
+        self, mock_vision_model
+    ):
+        mock_vision_model.supports_native_video_input = True
+        mock_vision_model.build_native_video_content = Mock(
+            side_effect=lambda url, **_: {
+                "type": "video_url",
+                "video_url": {"url": url},
+            }
+        )
+        tool = VisionTool(mock_vision_model)
+        media = [f"clip-{index}.mp4" for index in range(10)]
+
+        with (
+            patch.object(
+                tool.core,
+                "_convert_video_to_base64",
+                return_value="data:video/mp4;base64,ZmFrZS12aWRlbw==",
+            ),
+            patch.object(tool.core, "_video_frame_budgets") as frame_budgets,
+        ):
+            result = await tool.understand_media(media, "Summarize all videos")
+
+        assert result.success is True
+        assert result.native_videos_processed == 10
+        assert result.frames_extracted == 0
+        frame_budgets.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_native_failure_budgets_only_fallback_videos(self, mock_vision_model):
+        mock_vision_model.supports_native_video_input = True
+        mock_vision_model.build_native_video_content = Mock(
+            return_value={
+                "type": "video_url",
+                "video_url": {"url": "provider-ready-video"},
+            }
+        )
+        tool = VisionTool(mock_vision_model)
+
+        with (
+            patch.object(
+                tool.core,
+                "_convert_video_to_base64",
+                side_effect=[
+                    "data:video/mp4;base64,ZmFrZS12aWRlbw==",
+                    ValueError("cannot inline"),
+                ],
+            ),
+            patch.object(
+                tool.core,
+                "_extract_video_frames",
+                return_value=[(1.0, "data:image/jpeg;base64,ZmFrZQ==")],
+            ) as extract_frames,
+        ):
+            result = await tool.understand_media(
+                ["native.mp4", "fallback.mp4"],
+                "Compare the videos",
+                max_frames=8,
+            )
+
+        assert result.success is True
+        assert result.native_videos_processed == 1
+        assert result.frames_extracted == 1
+        extract_frames.assert_called_once_with(
+            "fallback.mp4",
+            start_time=None,
+            end_time=None,
+            max_frames=8,
+        )
+
+    def test_probe_video_duration_requires_ffprobe(self, vision_tool_without_workspace):
+        with patch(
+            "xagent.core.tools.core.vision_tool.shutil.which", return_value=None
+        ):
+            with pytest.raises(RuntimeError, match="requires ffprobe/ffmpeg"):
+                vision_tool_without_workspace.core._probe_video_duration("clip.mp4")
+
+    def test_extract_video_frames_skips_empty_frame_and_uses_bucket_midpoints(
+        self, vision_tool_without_workspace, tmp_path
+    ):
+        video_path = tmp_path / "clip.mp4"
+        video_path.write_bytes(b"fake-video")
+        completed_frames = [Mock(stdout=b""), Mock(stdout=b"jpeg-frame")]
+
+        with (
+            patch(
+                "xagent.core.tools.core.vision_tool.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ),
+            patch.object(
+                vision_tool_without_workspace.core,
+                "_probe_video_duration",
+                return_value=8.0,
+            ),
+            patch(
+                "xagent.core.tools.core.vision_tool.subprocess.run",
+                side_effect=completed_frames,
+            ) as run,
+        ):
+            frames = vision_tool_without_workspace.core._extract_video_frames(
+                str(video_path),
+                start_time=0.0,
+                end_time=8.0,
+                max_frames=2,
+            )
+
+        assert frames == [
+            (
+                6.0,
+                "data:image/jpeg;base64,"
+                + base64.b64encode(b"jpeg-frame").decode("ascii"),
+            )
+        ]
+        assert [call.args[0][4] for call in run.call_args_list] == ["2.000", "6.000"]
 
 
 class TestVisionToolDescribeImages:

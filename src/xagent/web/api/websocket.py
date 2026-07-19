@@ -57,6 +57,7 @@ from ..services.chat_history_service import (
     mark_user_message_delivery_sync,
 )
 from ..services.file_reference_output_service import (
+    load_assistant_file_reference_records,
     reconcile_assistant_file_references,
 )
 from ..services.file_turn import (
@@ -1683,17 +1684,14 @@ async def execute_task_background(
                         db_new,
                         task_id=task_id,
                         user_id=int(effective_user_id),
-                        content=str(
-                            chat_response.get("message", ai_response)
-                            if isinstance(chat_response, dict)
-                            else ai_response
-                        ),
+                        content=str(ai_response),
                         message_type="chat_response"
                         if isinstance(chat_response, dict)
                         else "final_answer",
                         interactions=chat_response.get("interactions")
                         if isinstance(chat_response, dict)
                         else None,
+                        content_is_reconciled=True,
                     )
                     # Commit the pending terminal status. ``persist_assistant_message``
                     # commits internally when it writes a row, but it
@@ -2249,6 +2247,7 @@ async def execute_resume_background(
                         content=output,
                         message_type="final_answer",
                         turn_id=_latest_result_user_turn_id(result),
+                        content_is_reconciled=True,
                     )
                     orm_task_updated = cast(Any, task_updated)
                     orm_task_updated.output = output
@@ -4784,6 +4783,11 @@ async def send_historical_data_as_stream(
                 .order_by(TaskChatMessage.created_at, TaskChatMessage.id)
                 .all()
             )
+            file_reference_records = load_assistant_file_reference_records(
+                db,
+                task_id=int(task_id),
+                user_id=int(task.user_id),
+            )
             for chat_message in chat_messages:
                 role = str(chat_message.role)
                 content = str(chat_message.content or "").strip()
@@ -4793,6 +4797,7 @@ async def send_historical_data_as_stream(
                         task_id=int(task_id),
                         user_id=int(task.user_id),
                         content=content,
+                        records=file_reference_records,
                     )
                 # Read attachments off the row so file-only turns (empty
                 # content + non-empty attachments) survive replay and so the

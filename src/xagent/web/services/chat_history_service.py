@@ -277,12 +277,17 @@ def persist_assistant_message(
     message_type: str = "assistant_message",
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
+    content_is_reconciled: bool = False,
 ) -> Optional[TaskChatMessage]:
-    reconciled_content = reconcile_assistant_file_references(
-        db,
-        task_id=task_id,
-        user_id=user_id,
-        content=content,
+    reconciled_content = (
+        content
+        if content_is_reconciled
+        else reconcile_assistant_file_references(
+            db,
+            task_id=task_id,
+            user_id=user_id,
+            content=content,
+        )
     )
     transcript_content = build_assistant_transcript_content(
         reconciled_content, interactions
@@ -308,14 +313,19 @@ def persist_assistant_message_no_commit(
     message_type: str = "assistant_message",
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
+    content_is_reconciled: bool = False,
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
 
-    reconciled_content = reconcile_assistant_file_references(
-        db,
-        task_id=task_id,
-        user_id=user_id,
-        content=content,
+    reconciled_content = (
+        content
+        if content_is_reconciled
+        else reconcile_assistant_file_references(
+            db,
+            task_id=task_id,
+            user_id=user_id,
+            content=content,
+        )
     )
     transcript_content = build_assistant_transcript_content(
         reconciled_content, interactions

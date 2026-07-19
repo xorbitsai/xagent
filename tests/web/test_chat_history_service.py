@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
@@ -155,6 +157,31 @@ def test_persist_assistant_message_repairs_invented_file_id():
 
         assert message is not None
         assert message.content == "[generated_video.mp4](file:real-video-id)"
+    finally:
+        db_session.close()
+
+
+def test_persist_assistant_message_skips_duplicate_reconciliation():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+
+        with patch(
+            "xagent.web.services.chat_history_service."
+            "reconcile_assistant_file_references",
+            side_effect=AssertionError("content was already reconciled"),
+        ):
+            message = persist_assistant_message(
+                db_session,
+                int(task.id),
+                int(task.user_id),
+                "Already canonical",
+                message_type="final_answer",
+                content_is_reconciled=True,
+            )
+
+        assert message is not None
+        assert message.content == "Already canonical"
     finally:
         db_session.close()
 

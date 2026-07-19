@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
@@ -478,13 +478,6 @@ class VisionCore:
             ]
             image_count = sum(kind == "image" for _, kind in classified)
             video_count = sum(kind == "video" for _, kind in classified)
-            video_budgets = iter(
-                self._video_frame_budgets(
-                    image_count=image_count,
-                    video_count=video_count,
-                    max_frames=max_frames,
-                )
-            )
             use_native_video = self.vision_model.supports_native_video_input and (
                 image_count == 0 or self.vision_model.supports_native_video_with_images
             )
@@ -495,35 +488,64 @@ class VisionCore:
 
             visual_contents: List[Dict[str, Any]] = []
             warnings: List[str] = []
+            native_video_contents: Dict[int, Dict[str, Any]] = {}
+            fallback_video_count = video_count
+            if use_native_video:
+                fallback_video_count = 0
+                for index, (media_path, kind) in enumerate(classified):
+                    if kind != "video":
+                        continue
+                    try:
+                        video_data = await asyncio.to_thread(
+                            self._convert_video_to_base64, media_path
+                        )
+                        native_video_contents[index] = (
+                            self.vision_model.build_native_video_content(
+                                video_data,
+                                start_time=start_time,
+                                end_time=end_time,
+                            )
+                        )
+                    except Exception as exc:
+                        fallback_video_count += 1
+                        warning = (
+                            f"Native video input unavailable for {media_path}: "
+                            f"{exc}; using sampled frames"
+                        )
+                        logger.warning(warning)
+                        warnings.append(warning)
+
             processed_images = 0
             processed_videos = 0
             native_videos = 0
             extracted_frames = 0
-            for media_path, kind in classified:
+            video_budgets: Optional[Iterator[int]] = None
+
+            def next_fallback_frame_budget() -> int:
+                """Allocate the frame budget only when a video needs sampling."""
+
+                nonlocal video_budgets
+                if video_budgets is None:
+                    video_budgets = iter(
+                        self._video_frame_budgets(
+                            image_count=image_count,
+                            video_count=fallback_video_count,
+                            max_frames=max_frames,
+                        )
+                    )
+                return next(video_budgets)
+
+            for index, (media_path, kind) in enumerate(classified):
                 try:
                     if kind == "video":
-                        frame_budget = next(video_budgets)
-                        if use_native_video:
-                            try:
-                                video_data = self._convert_video_to_base64(media_path)
-                                visual_contents.append(
-                                    self.vision_model.build_native_video_content(
-                                        video_data,
-                                        start_time=start_time,
-                                        end_time=end_time,
-                                    )
-                                )
-                                processed_videos += 1
-                                native_videos += 1
-                                continue
-                            except Exception as exc:
-                                warning = (
-                                    f"Native video input unavailable for {media_path}: "
-                                    f"{exc}; using sampled frames"
-                                )
-                                logger.warning(warning)
-                                warnings.append(warning)
+                        native_content = native_video_contents.get(index)
+                        if native_content is not None:
+                            visual_contents.append(native_content)
+                            processed_videos += 1
+                            native_videos += 1
+                            continue
 
+                        frame_budget = next_fallback_frame_budget()
                         frames = await asyncio.to_thread(
                             self._extract_video_frames,
                             media_path,

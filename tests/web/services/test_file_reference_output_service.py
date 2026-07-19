@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -121,5 +123,34 @@ def test_reconcile_unlinks_unknown_or_ambiguous_file_reference():
 
         assert content == "missing.mp4 and report.mp4"
         assert "file:" not in content
+    finally:
+        db.close()
+
+
+def test_reconcile_reuses_prefetched_records_without_querying():
+    db, user, task = _create_context()
+    try:
+        record = _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video.mp4",
+        )
+
+        with patch.object(
+            db,
+            "query",
+            side_effect=AssertionError("prefetched reconciliation must not query"),
+        ):
+            content = reconcile_assistant_file_references(
+                db,
+                task_id=int(task.id),
+                user_id=int(user.id),
+                content="[generated_video.mp4](file:invented-id)",
+                records=[record],
+            )
+
+        assert content == "[generated_video.mp4](file:real-id)"
     finally:
         db.close()

@@ -6,6 +6,7 @@ Standalone vision capabilities without framework dependencies
 import asyncio
 import base64
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -445,10 +446,16 @@ class VisionCore:
             max_frames = self._coerce_optional_int(max_frames, "max_frames") or 8
             if max_frames < 1 or max_frames > 10:
                 raise ValueError("max_frames must be between 1 and 10")
-            if start_time is not None and start_time < 0:
-                raise ValueError("start_time must be greater than or equal to 0")
-            if end_time is not None and end_time < 0:
-                raise ValueError("end_time must be greater than or equal to 0")
+            if start_time is not None and (
+                not math.isfinite(start_time) or start_time < 0
+            ):
+                raise ValueError(
+                    "start_time must be a finite number greater than or equal to 0"
+                )
+            if end_time is not None and (not math.isfinite(end_time) or end_time < 0):
+                raise ValueError(
+                    "end_time must be a finite number greater than or equal to 0"
+                )
 
             # Validate vision model capability
             if not self.vision_model.has_ability("vision"):

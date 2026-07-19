@@ -468,6 +468,36 @@ class TestVisionToolUnderstandMedia:
     """Tests for the public image/video understanding entrypoint."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field_name", "invalid_value"),
+        [
+            ("start_time", float("nan")),
+            ("start_time", float("inf")),
+            ("end_time", float("nan")),
+            ("end_time", float("inf")),
+        ],
+    )
+    async def test_understand_video_rejects_non_finite_time_ranges(
+        self,
+        vision_tool_without_workspace,
+        mock_vision_model,
+        field_name,
+        invalid_value,
+    ):
+        result = await vision_tool_without_workspace.understand_media(
+            "clip.mp4",
+            "What happens?",
+            **{field_name: invalid_value},
+        )
+
+        assert result.success is False
+        assert (
+            f"{field_name} must be a finite number greater than or equal to 0"
+            in result.error
+        )
+        mock_vision_model.vision_chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_understand_video_samples_timestamped_frames(
         self, vision_tool_without_workspace, mock_vision_model
     ):

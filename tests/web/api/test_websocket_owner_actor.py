@@ -561,6 +561,12 @@ async def test_pause_admin_on_other_users_task_runs_as_owner(db_session) -> None
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_pause_task(MagicMock(), int(task.id), {"user": admin})
+        for _ in range(100):
+            if "task_owner_user_id" in captured:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable pause command was not dispatched in time")
 
     # Built and paused as the OWNER, not the admin actor.
     assert captured["task_owner_user_id"] == int(owner.id)

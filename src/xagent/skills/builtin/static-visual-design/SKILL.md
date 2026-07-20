@@ -124,9 +124,14 @@ clear in the specification, the direction is not ready to generate.
 
 ## Use brand and reference assets intentionally
 
-Inspect relevant uploaded or workspace images with `understand_media`. Pass
-useful product, campaign, style, or layout references to image generation or
-editing so the result belongs to the intended visual world.
+Inspect relevant uploaded or workspace images with `understand_media`. SVG is
+source text: `understand_media` passes local/workspace SVG XML directly to the
+model so it can inspect exact markup, `viewBox`, paths, text, `fill`, `stroke`,
+gradients, and the encoded visual structure without guessing from a raster.
+Do not repeatedly call it for the same SVG. Use `read_file` only when the raw
+file content itself is the required result. Pass useful product, campaign,
+style, or layout references to image generation or editing so the result belongs
+to the intended visual world.
 
 For work naming a real brand, resolve the brand identity before rendering final
 candidates. Look first in user uploads and the task workspace. When browsing is

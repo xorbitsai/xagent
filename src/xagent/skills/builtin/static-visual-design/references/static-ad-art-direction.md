@@ -18,6 +18,39 @@ Before rendering, reduce the brief to four decisions:
 If a direction needs two promises, two unrelated hero images, or two CTAs, it
 is not yet a direction. Resolve that conflict before generation.
 
+## Invent the campaign device
+
+A proposition becomes an ad only when it finds its device: the one image that
+dramatizes the promise. Do not jump from an angle name ("milestone pride",
+"offer-led") straight to a layout; generate device candidates deliberately.
+These are generative moves, not a menu — each move can produce many different
+devices from the same brief:
+
+- **Dramatize the verb.** Take the action word inside the proposition —
+  switch, join, port, save, unlock, upgrade — and stage it literally: a crowd
+  mid-movement, a door standing open, a queue crossing over.
+- **Make the number a thing.** Give proof physical form in a real place: a
+  human sea, a monument, a stadium filled to the exact count, product units
+  assembled into the figure.
+- **Literalize the offer.** Render the benefit as a tangible object or event —
+  a gift revealed, a meter refilling, a bill torn in half — but only when the
+  object adds drama or meaning beyond restating the offer word.
+- **Stage a recognizable moment.** Borrow a civic or cultural scene the
+  audience lives in — a rally, a festival, a countdown, a homecoming — and
+  let the brand host it.
+- **Shift the scale.** Make the small cause huge or the huge consequence
+  small: a thumb-sized product casting a city-block shadow, a city skyline
+  balanced on one small object the brand sells.
+- **Let a brand asset act.** Give the mascot, logo form, or brand color a
+  role in the story instead of a corner placement.
+
+For one brief, generate more device candidates than direction slots — five to
+eight sketches for a set of three — then keep the ones that dramatize
+genuinely different propositions and discard any that merely decorate. A kept
+direction states its device in one sentence, such as "the 1.4M milestone
+staged as a rally the viewer is invited to join." Every device must still
+pass the competitor-substitution test and carry verified claims only.
+
 ## Choose a communication structure
 
 Choose one structure because it serves the proposition. Do not combine several
@@ -28,6 +61,17 @@ structures to make the canvas look busier.
 Use one number, milestone, result, short quote, or recognized fact as the main
 visual mass. Pair it with imagery that demonstrates scale or consequence. Best
 for social proof, launches, milestones, and concrete results.
+
+The pairing is mandatory, not decorative: the number must be physically
+integrated with a scene, material, environment, or crowd that makes the scale
+believable — built into a real location, towering over a gathering, assembled
+from product units, carved into a material the brand owns. A large numeral
+floating on a plain or gradient background is typography, not proof, and is an
+incomplete direction. When the proposition is local social proof, include one
+recognizable cue of the actual market (a landmark, streetscape, or audience
+context) so the claim reads as "here", not anywhere. The headline must then add
+meaning the numeral does not already carry; restating the number in words is a
+wasted line.
 
 ### Offer reveal
 
@@ -84,6 +128,8 @@ Every direction needs a compact design specification:
 - focal subject and its approximate share of the canvas;
 - primary, secondary, and tertiary information roles;
 - intended scan path, such as top-left to center to CTA;
+- the depth stack: environment, atmosphere, focal subject, supporting
+  graphics, typography, and brand (see below);
 - image zone, type zone, brand zone, and deliberate negative space;
 - type character, headline line count, alignment, and contrast strategy;
 - dominant, supporting, and accent color roles;
@@ -105,6 +151,34 @@ Design for a three-pass read:
 
 If the scan order is not obvious in the written specification, generation will
 not fix it.
+
+## Build the canvas as a depth stack
+
+Think in layers the way a working designer builds the file. Every direction
+must consciously decide six layers:
+
+1. **Environment** — the world behind the message: a place, a surface, a
+   material, a crowd, or a deliberate flat field.
+2. **Atmosphere** — light direction, depth of field, haze, particles, weather;
+   whatever binds the subject to the environment and gives the canvas air.
+3. **Focal subject** — the hero device, ideally physically situated in the
+   environment rather than pasted over it.
+4. **Supporting graphics** — callouts, secondary proof, texture, pattern.
+5. **Typography** — the headline, support line, and CTA hierarchy.
+6. **Brand** — logo lockup, mandatories, fine print.
+
+Leaving a layer empty is a legitimate design decision only when the
+specification records it as one. For an open brief, a deliberately flat,
+minimal treatment — empty environment and atmosphere, typography carrying
+everything — may appear at most once in a set of directions; if two or more
+specifications read "solid or gradient background, no atmosphere", the set
+has collapsed into layout variants of a single idea. When the brief itself
+calls for a typographic or minimalist system, keep the stack discipline but
+create the depth inside that system: paper texture, ink behavior, embossing,
+shadow, and material light are atmosphere too. Write the render prompt in the same order
+the stack is built — environment, light, subject, supporting graphics, exact
+copy, brand — so the image model receives a scene to construct instead of a
+list of text blocks to place.
 
 ## Control typography and copy load
 
@@ -147,6 +221,34 @@ in parallel with generation. Attach acquired references through the image
 tool's actual image-input parameter; a filename mentioned only inside prose is
 not a model input.
 
+## Write the render prompt as an art direction brief
+
+Describe the ad the way an art director briefs a photographer or illustrator:
+the scene, the focal subject and what it is made of, the light, the material
+and production finish, the mood, and the exact copy in quotation marks. Give
+placement as loose spatial relationships ("the numeral anchors the lower left,
+the skyline recedes behind it") rather than engineering zones.
+
+Do not write the prompt as a UI specification. Percentage zone maps ("top 15%:
+empty, center 15-55%: hero"), CSS-like color-and-weight tables, and web
+interface vocabulary produce flat screen layouts instead of designed
+advertising. Never describe the CTA as a "button", "pill", or other interface
+control: in a static ad the CTA is a graphic device — a color band, a painted
+block, a ticket stub, a stamped mark — sized as one short line that cannot
+wrap.
+
+Keep the negative prompt short and factual. Some image providers ignore the
+negative prompt entirely, so any exclusion the direction depends on must also
+be expressed positively in the prompt ("empty sky above the skyline", "the
+only text on the canvas is..."). It may contain render-quality defects
+(misspelled or distorted text, watermarks, contact sheets, extra panels,
+malformed anatomy, fake logos or QR codes) plus at most two or three
+exclusions that the locked direction specifically requires. Do not blanket-ban
+whole families of imagery — people, crowds, skylines, silhouettes, glow, 3D,
+confetti — as a routine safety list; stripping every scene-making device from
+the model is how an ad collapses into a bare text layout. Exclude a device only
+when the design specification records why it conflicts with this direction.
+
 ## Make the concept brand-specific
 
 Apply the substitution test: mentally replace the named brand with its closest
@@ -176,7 +278,12 @@ has any of these failures:
 - a fake, misspelled, duplicated, or visibly distorted identity mark;
 - an unverified claim, offer detail, URL, date, rating, quote, or legal line;
 - no dominant entry point, unclear scan order, or unreadable essential text;
-- a focal image that merely decorates or repeats the headline;
+- a focal image that merely decorates or repeats the headline, or a headline
+  that restates in words what the focal element already shows;
+- more than one CTA competing on the canvas, or a CTA whose text wraps or
+  renders as a web interface button;
+- an environment or atmosphere layer the specification called for that the
+  render dropped, leaving a flat layout the direction did not choose;
 - a concept that passes the competitor-substitution test unchanged;
 - clipped elements, accidental overlaps, malformed subjects, watermarks, or
   unrelated lettering.

@@ -73,12 +73,28 @@ for identity assets in parallel with artifact generation. Inspection depends on
 the render results. Independent renders may run in parallel only after all
 shared inputs are resolved.
 
+Never bake asset-availability conclusions into planned work before the
+acquisition step has run. Do not write instructions such as "use the brand name
+in typography since no logo asset is available" into a step definition; whether
+a verified logo exists is an outcome of asset resolution, and how the brand is
+represented must stay open until that outcome is known.
+
 Give every direction one single-minded proposition, one visual device, and one
 structural approach. The proposition explains why the audience should care;
 the visual device creates the memorable image; the structure controls how the
 message is scanned. Evaluate directions for brand fit, stopping power,
 glance-level clarity, offer comprehension, and factual safety. Do not let a
 creative become two disconnected ads stacked in one canvas.
+
+Invent each direction's visual device deliberately instead of jumping from an
+angle name to a layout. Use generative moves — dramatize the verb in the
+proposition, give the proof number physical form in a real place, literalize
+the offer as an object or event, stage a recognizable cultural moment, shift
+scale, or cast a brand asset as the protagonist — and sketch more device
+candidates than you have direction slots before keeping the strongest. An
+angle name like "milestone pride" is not a device; "the milestone staged as a
+rally the viewer is invited to join" is. The art-direction reference expands
+these moves.
 
 Do not create directions by accumulating a universal blacklist of subjects or
 styles. No device is inherently right or wrong: a person, product, phone,
@@ -131,9 +147,11 @@ ideas on their own.
 
 Before rendering, turn each direction into a compact design specification:
 canvas and placement, communication structure, focal subject, visual-weight
-distribution, three-level information hierarchy, scan path, image/type/brand
-zones, typography character and line count, color roles, production finish,
-reference responsibilities, and explicit exclusions. If the scan order is not
+distribution, three-level information hierarchy, scan path, the depth stack
+(environment, atmosphere, focal subject, supporting graphics, typography,
+brand — each layer decided, not defaulted to empty), typography character and
+line count, color roles, production finish, reference responsibilities, and
+explicit exclusions. If the scan order is not
 clear in the specification, the direction is not ready to generate. Keep the
 specification compact enough to survive intact into the render prompt. Do not
 create a separate directions or strategy artifact unless the user asks for it,
@@ -214,8 +232,12 @@ split-frame compositions, and duplicated headlines. Do not put words such as
 
 Keep copy load proportional to the format. A typical feed ad should have one
 exact headline of no more than two short lines, at most one short support line,
-one concise CTA, and only required fine print. Never send alternative copy,
-strategy labels, markdown, rationale, or production notes for rendering.
+one concise CTA, and only required fine print. The offer is expressed through
+the headline or the CTA, never as an additional standalone "offer highlight"
+element; if a brief or step description enumerates headline, support, offer,
+and CTA as four separate text blocks, merge them back into this budget before
+rendering. Never send alternative copy, strategy labels, markdown, rationale,
+or production notes for rendering.
 
 Write a concept-specific prompt for every direction. Do not reuse a generic
 "modern professional ad" prompt with only the colors and headline changed.
@@ -226,12 +248,34 @@ visual metaphor, production finish, palette balance, and type strategy. Do not
 reuse the same gradient, display treatment, and decorative motif across the
 set. Compare the actual render prompts, not merely their direction names or
 strategy labels. If the prompts describe the same focal mechanism and layout,
-revise them before rendering.
+revise them before rendering. Distinct propositions do not make distinct
+directions when every focal subject is the same device: a set in which each
+direction's hero is a large typographic number or headline is one direction
+wearing three copy variations. For an open brief, at most one direction in a
+set may use pure typography as its focal subject; the others must be carried
+by a scene, person, place, object, or material device. The same limit applies
+to production depth: a deliberately flat, minimal treatment with an empty
+environment and atmosphere is one direction at most, never the unexamined
+default for the whole set. When the user explicitly requests a typographic,
+minimalist, or otherwise constrained system, follow the brief and create the
+variation inside that system — through composition, scale, material, and
+color — instead of forcing scenes into it.
 
 For campaign directions developed above and for plural creative requests, make
 the concepts materially different before making size variants. Vary the idea,
 composition, subject, image treatment, and hierarchy—not merely crop or accent
 color. Cosmetic resizes are not distinct concepts.
+
+Choose each aspect ratio from the actual placement, never as a habit, and let
+the medium set the vocabulary: social campaigns default to 4:5 feed and 9:16
+story (1:1 only when a channel specifically requires square); print, poster,
+out-of-home, and display work follows its placement's actual dimensions, such
+as standard banner and billboard sizes. When the user has not named channels,
+either ask or cover the likely placements deliberately and say which asset
+serves which placement. Do not silently default every render to one square
+canvas. Compose natively for the chosen ratio: a square
+canvas wants a centered or radial composition built around its focal device,
+not a vertical poster stack with dead side margins.
 
 Generate each materially different aspect ratio for that format. Do not force a
 landscape master into square, portrait, or story placements when a fresh
@@ -296,10 +340,16 @@ layout.
 ## Apply the completion gate
 
 Do not enter `final_answer` until every requested visual exists as a successful
-tool result and the final files pass inspection. For a brand-specific final,
-reject fake, duplicated, misspelled, or visibly distorted identity marks. When
-the user explicitly requires an exact logo, a brand name rendered as ordinary
-text does not satisfy the requirement.
+tool result and the final files pass inspection. A successful `generate_image`
+or `edit_image` call is never completion evidence by itself, in any execution
+form: when render work is defined as a plan step, the step's completion
+criteria and termination condition must require that the result passed
+`understand_media` inspection with no automatic rejection — never "the
+generation tool returned success". When no plan is involved, apply the same
+rule to the direct decision to stop. For a brand-specific final, reject fake,
+duplicated, misspelled, or visibly distorted identity marks. When the user
+explicitly requires an exact logo, a brand name rendered as ordinary text does
+not satisfy the requirement.
 
 Reject or continue iterating on an output that is merely polished but generic,
 uses two disconnected visual ideas, weakens the supplied fact into awkward

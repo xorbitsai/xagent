@@ -69,10 +69,15 @@ When given a user request, rewrite and enrich the prompt into a **professional i
   to copy every gradient, metallic effect, ribbon, swoosh, or decorative motif
   from one campaign.
 - Use precise, concept-specific visual language rather than keyword soup.
-- Always generate **positive prompt** (desired content) and **negative prompt**
-  (avoid: low quality, blur, text artifacts, distorted text, misspelled words,
-  fake logos, trademark symbols, contact sheets, multiple panels, duplicated
-  layouts, duplicated headlines)
+- Express every constraint that matters in the **positive prompt**: some
+  providers ignore negative_prompt entirely, so anything the image must show
+  or avoid needs to be stated positively in the prompt itself.
+- If you use **negative_prompt**, keep it short and quality-focused (low
+  quality, blur, distorted or misspelled text, watermarks, fake logos,
+  contact sheets, extra panels), plus at most a few exclusions this specific
+  request needs. Do not blanket-ban whole families of imagery such as people,
+  crowds, skylines, glow, or 3D as a routine list; that strips legitimate
+  content and flattens the result.
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 
 Available models (⭐[DEFAULT] marks the configured default model):
@@ -82,13 +87,13 @@ Available models (⭐[DEFAULT] marks the configured default model):
 
 Parameters:
 - prompt (required): optimized image description with visual details
-- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1280*720", "1920*1080")
+- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024"). Defaults to a square when omitted, so for ads, posters, and social graphics always pass the placement's real dimensions or aspect_ratio explicitly instead of relying on the default.
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
-- aspect_ratio (optional): aspect ratio (e.g. "1:1", "3:2", "16:9", "21:9") - overrides calculated aspect ratio from size
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
-- negative_prompt (optional): undesired elements, auto-generated if empty
+- negative_prompt (optional): undesired elements; ignored by some providers, so critical constraints belong in the prompt
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
@@ -138,12 +143,12 @@ Available models (⭐[DEFAULT] marks the configured default model):
 Parameters:
 - image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
 - prompt (required): description of the desired edits and changes
-- negative_prompt (optional): undesired elements in the result
-- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1280*720", "1920*1080")
+- negative_prompt (optional): undesired elements in the result; ignored by some providers, so critical constraints belong in the prompt
+- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
-- aspect_ratio (optional): aspect ratio (e.g. "1:1", "3:2", "16:9", "21:9") - overrides calculated aspect ratio from size
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**

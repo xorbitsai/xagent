@@ -102,7 +102,10 @@ Text handling in edited images:
 - **Text modifications**: If you want to change existing text in the image, clearly describe what text should be changed and what it should become
 - **New text addition**: Specify exactly what text should appear and where (e.g., "add 'Happy Birthday' text at the top")
 - **Text removal**: Request to remove specific text elements
-- **Brand fidelity**: Do not use image editing to redraw an exact logo, QR code, or trademark. Preserve the supplied asset and composite it deterministically after the generative edit.
+- **Brand fidelity**: Use supplied logos, QR codes, or trademarks as references,
+  but do not claim that a generative edit preserved them pixel-for-pixel. If
+  exact fidelity is explicitly required, use a deterministic asset-processing
+  workflow when one is available or explain the limitation.
 
 Available models (⭐[DEFAULT] marks the configured default model):
 {}

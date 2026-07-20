@@ -137,7 +137,6 @@ class ToolRegistry:
                 pptx_tool,
                 skill_tools,
                 sound_effect_tool,
-                special_image_tools,
                 sql_tool,
                 translate_json,
                 video_tool,

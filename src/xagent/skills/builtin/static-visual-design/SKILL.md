@@ -165,12 +165,17 @@ generation call alone is not proof that the asset is finished. Compare the
 candidates side by side and discard the safest generic option even when it is
 technically clean.
 
-## Add exact assets as the final layer
+## Handle identity assets without blind post-processing
 
-After the creative itself passes inspection, composite official logos and QR
-codes from their original files as a deterministic final layer. Use
-`logo_overlay` when it fits the placement. Never leave a generated pseudo-logo
-underneath the official mark; remove it or regenerate the creative first.
+Use official logos and other brand assets as generation or editing references
+when the image model supports them. Inspect the result closely. Never add a
+second logo over a generated pseudo-logo, and never treat a generic typed brand
+name as proof of fidelity; remove the artifact or regenerate the creative.
+
+Do not make deterministic compositing an automatic final step for every branded
+visual. If the user explicitly requires pixel-identical reproduction, use an
+available deterministic asset-processing workflow or explain the limitation;
+do not pretend a generative result is exact.
 
 Do not use HTML/CSS plus browser screenshots for ordinary poster, ad, banner,
 or social-creative generation. Use HTML only when the user explicitly requests
@@ -181,9 +186,9 @@ layout.
 
 Do not enter `final_answer` until every requested visual exists as a successful
 tool result and the final files pass inspection. For a brand-specific final,
-also require the exact verified logo to be visibly composited unless the user
-explicitly requested a logo-free result. A brand name rendered as ordinary text
-does not satisfy this requirement.
+reject fake, duplicated, misspelled, or visibly distorted identity marks. When
+the user explicitly requires an exact logo, a brand name rendered as ordinary
+text does not satisfy the requirement.
 
 Reject or continue iterating on an output that is merely polished but generic,
 uses two disconnected visual ideas, weakens the supplied fact into awkward

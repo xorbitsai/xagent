@@ -36,7 +36,8 @@ def test_static_visual_design_skill_routes_designed_graphics_and_brand_assets() 
     assert "download_web_asset" in content
     assert "Cosmetic resizes are not distinct concepts" in content
     assert "never invent prices, milestones, performance" in content
-    assert "composite official logos and QR codes" in content
+    assert "Never add a second logo over a generated pseudo-logo" in content
+    assert "Do not make deterministic compositing an automatic final step" in content
     assert "Do not use HTML/CSS plus browser screenshots" in content
     assert "Do not enter `final_answer`" in content
     assert "merely polished but generic" in content

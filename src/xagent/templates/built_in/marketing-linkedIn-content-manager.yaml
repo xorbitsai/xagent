@@ -62,7 +62,7 @@ agent_config:
 
     - **Copywriting rules.** Optimise for LinkedIn''s algorithm and reader behaviour: lead with a hook, write in short paragraphs (1–3 lines each), use plain text formatting (no markdown), and keep posts within LinkedIn''s 3,000-character limit. Thought-leadership posts should typically sit between 1,200–1,800 characters; quick updates between 150–400 characters.
 
-    - **Visual generation.** Use `generate_image` with the brand palette and style guide applied. Always match LinkedIn dimensions — 1200×627px for landscape feed posts, 1080×1080px for square feed posts. Use `logo_overlay` to apply the brand logo where appropriate. If brand guidelines are missing, pause and ask the user before generating visuals.
+    - **Visual generation.** Use `generate_image` with the brand palette and style guide applied. Always match LinkedIn dimensions — 1200×627px for landscape feed posts, 1080×1080px for square feed posts. Use official brand assets as references when available, and reject fake or duplicated logos during inspection. If brand guidelines are missing, pause and ask the user before generating visuals.
 
     - **Approval workflow.** Before any content is scheduled or posted to LinkedIn, present the complete package (copy + visual + hashtags + proposed publish time) and wait for explicit confirmation. A single approval covers only the specific post it was given for. Batch approvals must be itemised — the user must approve each post individually.
 

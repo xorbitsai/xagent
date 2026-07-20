@@ -27,6 +27,7 @@ from tests.core.agent.concurrency_harness import (
     make_react,
     make_tool_call,
 )
+from xagent.core.agent import PatternRuntime, ToolCallInterrupted
 
 
 async def test_ordered_backfill_despite_out_of_order_completion() -> None:
@@ -188,8 +189,8 @@ async def test_concurrent_batch_propagates_infra_callback_failure() -> None:
     # failure. The serial path lets it propagate and halt the turn; the
     # concurrent path must do the same instead of mis-reporting infrastructure
     # breakage to the model as a tool-failure result. The exception is re-raised
-    # before backfill, so nothing is committed to the context and the whole
-    # (idempotent) segment stays pending for a clean re-run on resume.
+    # after successful neighbors are back-filled so an explicit retry cannot
+    # repeat work that already completed.
     class _BoomOnFirst(FakeRuntime):
         async def on_tool_start(self, *, tool_call: dict) -> None:
             if tool_call["name"] == "boom":
@@ -208,10 +209,79 @@ async def test_concurrent_batch_propagates_infra_callback_failure() -> None:
     with pytest.raises(RuntimeError, match="trace down"):
         await pattern._run_concurrent_batch(batch, tools, _BoomOnFirst(), context)
 
-    # Nothing was back-filled (the turn halts; the segment re-runs on resume)...
-    assert context.tool_results == []
-    # ...but the failing call still reaches a terminal ledger state (I3 walk).
+    assert [result["tool_name"] for result in context.tool_results] == ["s1", "s3"]
+    # The failing call still reaches a terminal ledger state (I3 walk).
     assert pattern.tool_ledger[batch[1]["id"]].status == "failed"
+
+
+async def test_mixed_infra_failure_and_interrupt_reconciles_batch_before_raise() -> (
+    None
+):
+    class _BoomOnStart(PatternRuntime):
+        async def on_tool_start(self, *, tool_call: dict) -> None:
+            if tool_call["name"] == "boom":
+                raise RuntimeError("trace down")
+            await super().on_tool_start(tool_call=tool_call)
+
+    blocked = asyncio.Event()
+    tools = [
+        FakeTool("done", concurrency_safe=True),
+        FakeTool("boom", concurrency_safe=True),
+        FakeTool("paused", concurrency_safe=True, gate=blocked),
+    ]
+    pattern = make_react(parallel=True, max_concurrency=3)
+    context = RecordingContext()
+    batch = [make_tool_call(name) for name in ("done", "boom", "paused")]
+    pattern.pending_tool_calls = list(batch)
+    runtime = _BoomOnStart(execution_id="mixed-batch-failure")
+
+    task = asyncio.create_task(
+        pattern._run_concurrent_batch(batch, tools, runtime, context)
+    )
+    while not tools[0].calls or not tools[2].calls:
+        await asyncio.sleep(0)
+    runtime.request_interrupt("pause mixed batch")
+
+    with pytest.raises(RuntimeError, match="trace down"):
+        await task
+
+    assert [result["tool_name"] for result in context.tool_results] == ["done"]
+    assert [call["name"] for call in pattern.pending_tool_calls] == [
+        "boom",
+        "paused",
+    ]
+    assert pattern.tool_ledger[batch[0]["id"]].status == "completed"
+    assert pattern.tool_ledger[batch[1]["id"]].status == "failed"
+    assert pattern.tool_ledger[batch[2]["id"]].status == "interrupted"
+
+
+async def test_interrupt_filter_uses_batch_position_when_ids_repeat() -> None:
+    blocked = asyncio.Event()
+    tools = [
+        FakeTool("done", concurrency_safe=True),
+        FakeTool("paused", concurrency_safe=True, gate=blocked),
+    ]
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+    batch = [
+        make_tool_call("done", id="provider-duplicate"),
+        make_tool_call("paused", id="provider-duplicate"),
+    ]
+    pattern.pending_tool_calls = list(batch)
+    runtime = PatternRuntime(execution_id="duplicate-provider-ids")
+
+    task = asyncio.create_task(
+        pattern._run_concurrent_batch(batch, tools, runtime, context)
+    )
+    while not tools[0].calls or not tools[1].calls:
+        await asyncio.sleep(0)
+    runtime.request_interrupt("pause duplicate ids")
+
+    with pytest.raises(ToolCallInterrupted, match="pause duplicate ids"):
+        await task
+
+    assert [result["tool_name"] for result in context.tool_results] == ["done"]
+    assert pattern.pending_tool_calls == [batch[1]]
 
 
 # --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------

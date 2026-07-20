@@ -1564,19 +1564,21 @@ class ReActPattern(AgentPattern):
         )
 
         # Tool-level failures are already converted to error dicts inside
-        # _execute_tool_safely, so anything coming back as a real exception is an
-        # infra-callback failure (on_tool_start/on_tool_end) or an unexpected
-        # bug. The serial path lets those propagate and halt the turn; re-raise
-        # here so the concurrent path behaves identically instead of
-        # mis-reporting infrastructure breakage to the model as a tool failure.
-        # Infrastructure failures preserve the historical all-or-nothing
-        # behavior: do not backfill any result before propagating the failure.
-        for result in raw_results:
-            if isinstance(result, BaseException) and not isinstance(
-                result, ToolCallInterrupted
-            ):
-                raise result
-
+        # _execute_tool_safely. Reconcile the successful calls before propagating
+        # any real exception so a mixed infra-failure/interrupt batch cannot
+        # replay work that already completed. Keep exceptional calls pending by
+        # their object identity in this batch: provider-supplied ids are not
+        # guaranteed unique, so id-based filtering could accidentally drop a
+        # different call.
+        infra_error = next(
+            (
+                result
+                for result in raw_results
+                if isinstance(result, BaseException)
+                and not isinstance(result, ToolCallInterrupted)
+            ),
+            None,
+        )
         interrupted = next(
             (
                 result
@@ -1585,19 +1587,28 @@ class ReActPattern(AgentPattern):
             ),
             None,
         )
-        if interrupted is not None:
-            completed_ids: set[str] = set()
+        if infra_error is not None or interrupted is not None:
             for tool_call, result in zip(batch, raw_results):
                 if isinstance(result, BaseException):
                     continue
                 self._backfill_result(tool_call, result, context)
-                completed_ids.add(str(tool_call.get("id") or ""))
             self._reorder_ledger_for_batch(batch)
+            completed_call_objects = {
+                id(tool_call)
+                for tool_call, result in zip(batch, raw_results)
+                if not isinstance(result, BaseException)
+            }
             self.pending_tool_calls = [
                 tool_call
                 for tool_call in self.pending_tool_calls
-                if str(tool_call.get("id") or "") not in completed_ids
+                if id(tool_call) not in completed_call_objects
             ]
+            # Preserve the serial path's infra-error priority while keeping the
+            # ledger, context, and pending queue consistent for diagnostics or
+            # an explicit retry.
+            if infra_error is not None:
+                raise infra_error
+            assert interrupted is not None
             raise interrupted
 
         for tool_call, result in zip(batch, raw_results):

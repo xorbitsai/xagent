@@ -127,6 +127,29 @@ def test_reconcile_unlinks_unknown_or_ambiguous_file_reference():
         db.close()
 
 
+def test_reconcile_unlinks_record_with_invalid_file_id():
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="invalid/id",
+            filename="generated_video.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[generated_video.mp4](file:invented-id)",
+        )
+
+        assert content == "generated_video.mp4"
+    finally:
+        db.close()
+
+
 def test_reconcile_reuses_prefetched_records_without_querying():
     db, user, task = _create_context()
     try:

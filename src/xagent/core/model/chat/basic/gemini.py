@@ -227,6 +227,13 @@ class GeminiLLM(BaseLLM):
         """Gemini supports start and end offsets in video metadata."""
         return self.supports_native_video_input
 
+    @staticmethod
+    def _supports_native_video_url(video_url: str) -> bool:
+        """Return whether Gemini can consume this video reference directly."""
+        return video_url.startswith(("data:video/", "gs://")) or any(
+            host in video_url for host in ("youtube.com/", "youtu.be/")
+        )
+
     def build_native_video_content(
         self,
         video_url: str,
@@ -235,6 +242,12 @@ class GeminiLLM(BaseLLM):
         end_time: float | None = None,
     ) -> Dict[str, Any]:
         """Build the canonical part converted to Gemini inline/file data later."""
+        if not self._supports_native_video_url(video_url):
+            raise ValueError(
+                "Gemini native video input requires an inline local video, "
+                "a Google Cloud Storage URI, or a YouTube URL"
+            )
+
         metadata: Dict[str, Any] = {}
         if start_time is not None:
             metadata["start_offset"] = f"{start_time:g}s"
@@ -382,11 +395,9 @@ class GeminiLLM(BaseLLM):
                                         "data": base64_data,
                                     }
                                 }
-                            elif isinstance(url, str) and (
-                                url.startswith("gs://")
-                                or "youtube.com/" in url
-                                or "youtu.be/" in url
-                            ):
+                            elif isinstance(
+                                url, str
+                            ) and self._supports_native_video_url(url):
                                 video_part = {
                                     "file_data": {
                                         "file_uri": url,

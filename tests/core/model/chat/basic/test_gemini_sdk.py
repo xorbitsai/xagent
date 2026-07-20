@@ -576,6 +576,12 @@ class TestGeminiLLMSDK:
             }
         ]
 
+    def test_native_video_conversion_rejects_unsupported_remote_url(self) -> None:
+        llm = GeminiLLM(model_name="gemini-2.5-flash", api_key="test-key")
+
+        with pytest.raises(ValueError, match="inline local video"):
+            llm.build_native_video_content("https://example.com/clip.mp4")
+
     @pytest.mark.asyncio
     async def test_supports_thinking_mode(self, llm: GeminiLLM) -> None:
         """Test that Gemini does not support thinking mode."""

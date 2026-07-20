@@ -498,6 +498,26 @@ class TestVisionToolUnderstandMedia:
         mock_vision_model.vision_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("start_time", "end_time"), [(4, 4), (10, 2)])
+    async def test_understand_video_rejects_non_increasing_time_range(
+        self,
+        vision_tool_without_workspace,
+        mock_vision_model,
+        start_time,
+        end_time,
+    ):
+        result = await vision_tool_without_workspace.understand_media(
+            "clip.mp4",
+            "What happens?",
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        assert result.success is False
+        assert "end_time must be greater than start_time" in result.error
+        mock_vision_model.vision_chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_understand_video_samples_timestamped_frames(
         self, vision_tool_without_workspace, mock_vision_model
     ):
@@ -678,11 +698,42 @@ class TestVisionToolUnderstandMedia:
         ]
         assert content[1]["type"] == "video_url"
 
+    @pytest.mark.asyncio
+    async def test_unsupported_native_video_url_does_not_fail_other_media(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        mock_vision_model.supports_native_video_input = True
+
+        def build_native_video_content(url, **_):
+            if url.startswith("https://"):
+                raise ValueError("unsupported remote video URL")
+            return {"type": "video_url", "video_url": {"url": url}}
+
+        mock_vision_model.build_native_video_content = Mock(
+            side_effect=build_native_video_content
+        )
+
+        result = await vision_tool_without_workspace.understand_media(
+            [
+                "data:video/mp4;base64,ZmFrZV92aWRlbw==",
+                "https://example.com/remote.mp4",
+            ],
+            "Summarize the available video",
+        )
+
+        assert result.success is True
+        assert result.videos_processed == 1
+        assert result.native_videos_processed == 1
+        assert any("unsupported remote video URL" in item for item in result.warnings)
+        assert any("upload the video" in item for item in result.warnings)
+        mock_vision_model.vision_chat.assert_awaited_once()
+
     def test_frame_budget_reserves_one_frame_for_every_video(
         self, vision_tool_without_workspace
     ):
         assert vision_tool_without_workspace.core._video_frame_budgets(
             image_count=2,
+            native_video_count=0,
             video_count=2,
             max_frames=8,
         ) == [4, 4]
@@ -717,7 +768,7 @@ class TestVisionToolUnderstandMedia:
         frame_budgets.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_native_failure_budgets_only_fallback_videos(self, mock_vision_model):
+    async def test_native_videos_consume_fallback_frame_budget(self, mock_vision_model):
         mock_vision_model.supports_native_video_input = True
         mock_vision_model.build_native_video_content = Mock(
             return_value={
@@ -733,6 +784,7 @@ class TestVisionToolUnderstandMedia:
                 "_convert_video_to_base64",
                 side_effect=[
                     "data:video/mp4;base64,ZmFrZS12aWRlbw==",
+                    "data:video/mp4;base64,ZmFrZS12aWRlbw==",
                     ValueError("cannot inline"),
                 ],
             ),
@@ -743,13 +795,13 @@ class TestVisionToolUnderstandMedia:
             ) as extract_frames,
         ):
             result = await tool.understand_media(
-                ["native.mp4", "fallback.mp4"],
+                ["native-1.mp4", "native-2.mp4", "fallback.mp4"],
                 "Compare the videos",
-                max_frames=8,
+                max_frames=10,
             )
 
         assert result.success is True
-        assert result.native_videos_processed == 1
+        assert result.native_videos_processed == 2
         assert result.frames_extracted == 1
         extract_frames.assert_called_once_with(
             "fallback.mp4",

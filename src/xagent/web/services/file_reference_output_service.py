@@ -105,6 +105,17 @@ def reconcile_assistant_file_references(
             )
             return label
 
-        return f"{prefix}[{label}]({build_file_id_ref(str(record.file_id))})"
+        try:
+            canonical_ref = build_file_id_ref(str(record.file_id))
+        except ValueError:
+            logger.warning(
+                "Removed assistant FileRef %s for task %s because stored file id %s "
+                "is invalid",
+                referenced_id or target,
+                task_id,
+                record.file_id,
+            )
+            return label
+        return f"{prefix}[{label}]({canonical_ref})"
 
     return _MARKDOWN_FILE_REFERENCE_RE.sub(replacement, content)

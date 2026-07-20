@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
@@ -370,11 +370,12 @@ class VisionCore:
         self,
         *,
         image_count: int,
+        native_video_count: int,
         video_count: int,
         max_frames: int,
     ) -> List[int]:
         """Share the model's ten-visual-input budget across videos."""
-        available = 10 - image_count
+        available = 10 - image_count - native_video_count
         if available < video_count:
             raise ValueError(
                 "Too many images and videos to include at least one frame per video"
@@ -427,7 +428,7 @@ class VisionCore:
         Analyze images, videos, or mixed media and answer a question.
 
         Args:
-            media: Image/video path, URL, file id, or a list of them
+            media: Image/video path, provider-supported URL, file id, or a list of them
             question: Question to ask about the images
             start_time: Optional video sampling start in seconds
             end_time: Optional video sampling end in seconds
@@ -456,6 +457,12 @@ class VisionCore:
                 raise ValueError(
                     "end_time must be a finite number greater than or equal to 0"
                 )
+            if (
+                start_time is not None
+                and end_time is not None
+                and end_time <= start_time
+            ):
+                raise ValueError("end_time must be greater than start_time")
 
             # Validate vision model capability
             if not self.vision_model.has_ability("vision"):
@@ -526,21 +533,16 @@ class VisionCore:
             processed_videos = 0
             native_videos = 0
             extracted_frames = 0
-            video_budgets: Optional[Iterator[int]] = None
-
-            def next_fallback_frame_budget() -> int:
-                """Allocate the frame budget only when a video needs sampling."""
-
-                nonlocal video_budgets
-                if video_budgets is None:
-                    video_budgets = iter(
-                        self._video_frame_budgets(
-                            image_count=image_count,
-                            video_count=fallback_video_count,
-                            max_frames=max_frames,
-                        )
-                    )
-                return next(video_budgets)
+            video_budgets = iter(
+                self._video_frame_budgets(
+                    image_count=image_count,
+                    native_video_count=len(native_video_contents),
+                    video_count=fallback_video_count,
+                    max_frames=max_frames,
+                )
+                if fallback_video_count
+                else []
+            )
 
             for index, (media_path, kind) in enumerate(classified):
                 try:
@@ -552,7 +554,7 @@ class VisionCore:
                             native_videos += 1
                             continue
 
-                        frame_budget = next_fallback_frame_budget()
+                        frame_budget = next(video_budgets)
                         frames = await asyncio.to_thread(
                             self._extract_video_frames,
                             media_path,

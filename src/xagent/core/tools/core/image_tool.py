@@ -39,6 +39,11 @@ If generate_image is called with images, it will delegate to edit_image automati
 When given a user request, rewrite and enrich the prompt into a **professional image generation prompt**:
 - Expand with **visual details** (style, composition, lighting, colors, textures, atmosphere)
 - Transform abstract concepts into **concrete visual scenes**
+- Organize designed graphics around one focal device, a clear hierarchy, and one
+  coherent production finish. Do not use vague words such as "professional" or
+  "premium" as substitutes for a specific visual idea.
+- For multiple creative directions, vary the proposition, structure, focal
+  subject, and treatment materially before varying colors or crops.
 - Text and brand handling:
   1. The tool can generate complete designed graphics such as ads, posters,
      banners, and cards, including typography and user-supplied copy; it is not
@@ -48,7 +53,10 @@ When given a user request, rewrite and enrich the prompt into a **professional i
      composition.
   4. Generated depictions are not suitable when a supplied logo, QR code,
      certification mark, or other exact asset must remain pixel-identical.
-- Use vivid keywords (comma-separated) for better results
+- Treat reference images as evidence of recurring brand cues, not an instruction
+  to copy every gradient, metallic effect, ribbon, swoosh, or decorative motif
+  from one campaign.
+- Use precise, concept-specific visual language rather than keyword soup.
 - Always generate **positive prompt** (desired content) and **negative prompt** (avoid: low quality, blur, text artifacts, distorted text, misspelled words, fake logos, brand logos, trademark symbols)
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 

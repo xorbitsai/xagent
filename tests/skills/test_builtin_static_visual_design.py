@@ -28,13 +28,21 @@ def test_static_visual_design_skill_routes_designed_graphics_and_brand_assets() 
     assert "Do not interpret the singular nouns" in content
     assert "render two or three candidates" in content
     assert "one visual device, and one structural approach" in content
+    assert "one coherent planning pass" in content
+    assert "do not delegate open-ended ideation" in content
+    assert "creative-risk ladder" in content
+    assert "Brand-safe evolution" in content
     assert "headline and image divide the communication work" in content
     assert "generic business portraits holding phones" in content
     assert "prior winning creative, and performance evidence" in content
     assert "a brand-specific final requires a verified logo" in content
     assert "Include it as a generation reference" in content
+    assert "Stable cues may include the official logo" in content
+    assert "datedness is not a brand requirement" in content
     assert "download_web_asset" in content
     assert "Cosmetic resizes are not distinct concepts" in content
+    assert "Each direction must differ on at least three" in content
+    assert "stacked display effects as a warning sign" in content
     assert "never invent prices, milestones, performance" in content
     assert "Never add a second logo over a generated pseudo-logo" in content
     assert "Do not make deterministic compositing an automatic final step" in content

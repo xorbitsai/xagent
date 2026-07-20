@@ -50,12 +50,34 @@ before committing to a visual. Useful angle families include milestone pride or
 social proof, offer-led value, product benefit, emotional identity, and urgency,
 but choose only those supported by the brief.
 
+Keep this initial direction-setting in one coherent planning pass. One creative
+lead should define and compare the full set of directions; do not delegate
+open-ended ideation to independent agents or parallel nodes. Independent
+ideation tends to converge on the same obvious brand cues while changing only
+surface decoration. Parallel execution is useful only after the briefs are
+locked: each executor receives a distinct proposition, structure, focal device,
+production finish, and explicit exclusions, and must not reinterpret the other
+directions.
+
 Give every direction one single-minded proposition, one visual device, and one
 structural approach. The proposition explains why the audience should care;
 the visual device creates the memorable image; the structure controls how the
 message is scanned. Evaluate directions for brand fit, stopping power,
 glance-level clarity, offer comprehension, and factual safety. Do not let a
 creative become two disconnected ads stacked in one canvas.
+
+When client taste is unknown, build a creative-risk ladder instead of betting
+everything on one aesthetic:
+
+1. **Brand-safe evolution** — immediately recognizable, with a cleaner and more
+   disciplined use of familiar brand cues.
+2. **Contemporary reinterpretation** — preserves identity while changing the
+   composition, image language, or type system meaningfully.
+3. **Bold exploration** — uses a more ownable campaign metaphor or unexpected
+   art direction while remaining factually and strategically on brief.
+
+Do not make every option safe or every option experimental. The ladder gives a
+client a comfortable choice and reveals how much change they will accept.
 
 Do not interpret the singular nouns "an ad," "a poster," or "a social post" as
 an instruction to explore only one direction. When the creative direction is
@@ -107,6 +129,19 @@ Treat identity-critical assets differently:
   the requested branded asset complete, and never typeset or invent a substitute
   logo.
 
+Separate stable identity cues from temporary campaign styling. Stable cues may
+include the official logo, recurring color relationships, typography character,
+product imagery, graphic proportions, and tone of voice. Temporary styling may
+include a particular gradient, metallic 3D type, bevel, glow, ribbon, confetti,
+swoosh, or seasonal campaign motif. Use several recent official references when
+available to infer what recurs; do not copy every effect from one old banner.
+
+When official references look dated, familiarity still matters, but datedness
+is not a brand requirement. Preserve recognition through the stable cues and
+modernize hierarchy, whitespace, type discipline, image quality, depth, and the
+number of competing effects. A brand-safe direction should feel like the next
+campaign from the same brand, not a replica of its oldest promotion.
+
 ## Generate the complete creative
 
 Use `generate_image` to create the full designed asset, including the intended
@@ -128,6 +163,12 @@ Prompt with:
 Write a concept-specific prompt for every direction. Do not reuse a generic
 "modern professional ad" prompt with only the colors and headline changed.
 
+Before generation, compare the locked briefs as a set. Each direction must
+differ on at least three of these axes: focal subject, structural approach,
+visual metaphor, production finish, palette balance, and type strategy. Do not
+reuse the same gradient, display treatment, and decorative motif across the
+set. If the briefs cannot pass this comparison, revise them before rendering.
+
 For campaign directions developed above and for plural creative requests, make
 the concepts materially different before making size variants. Vary the idea,
 composition, subject, image treatment, and hierarchy—not merely crop or accent
@@ -143,6 +184,11 @@ device renders, giant centered white type, heavy shadows, neon glows, arbitrary
 waves, confetti, floating spheres, and excessive sparkles. Favor one clear focal
 point, a recognizable silhouette at thumbnail size, and a visual idea specific
 enough that another brand could not use it unchanged.
+
+Treat stacked display effects as a warning sign: metallic 3D lettering plus
+bevels, glow, drop shadows, ribbons, swooshes, confetti, and multiple headline
+blocks rarely become stronger by accumulation. Keep only the effects that serve
+the chosen visual device and remove the rest.
 
 ## Inspect and iterate with image tools
 

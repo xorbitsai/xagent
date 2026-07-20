@@ -207,6 +207,8 @@ class TestLogoOverlayTool:
         assert self.tool.name == "logo_overlay"
         assert "logo" in self.tool.description.lower()
         assert "overlay" in self.tool.description.lower()
+        assert "exact logo asset" in self.tool.description.lower()
+        assert "instead of asking an image model" in self.tool.description.lower()
         assert "image" in self.tool.tags
         assert "logo" in self.tool.tags
         assert self.tool.args_type() == LogoOverlayArgs

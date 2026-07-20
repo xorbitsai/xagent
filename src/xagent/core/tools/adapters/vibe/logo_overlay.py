@@ -74,10 +74,11 @@ class LogoOverlayTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Overlay a logo on a base image with customizable position, size, and opacity.
-        Supports both local file paths and remote URLs for both base image and logo.
-        The logo will be automatically resized and positioned according to your specifications.
-        Output is saved to the workspace uploads directory."""
+        return """Overlay an exact logo asset on a base image with customizable position, size, and opacity.
+        Use this for branded final images instead of asking an image model to recreate or approximate a logo.
+        Supports both local file paths and remote URLs for the base image and logo.
+        The supplied logo pixels are preserved while the asset is resized and positioned.
+        Output is saved and registered in the current workspace."""
 
     @property
     def tags(self) -> list[str]:

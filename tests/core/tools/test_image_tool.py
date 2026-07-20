@@ -450,6 +450,9 @@ class TestImageGenerationTool:
         assert "model2:" in description
         assert "Test model 1 description" in description
         assert "Test model 2 description" in description
+        assert "generate complete designed graphics" in description
+        assert "text-free backgrounds" in description
+        assert "must remain pixel-identical" in description
 
     def test_generate_image_tool_schema_includes_reference_images(self, image_tool):
         """Test that generate_image exposes reference images to the model."""

@@ -39,15 +39,17 @@ If generate_image is called with images, it will delegate to edit_image automati
 When given a user request, rewrite and enrich the prompt into a **professional image generation prompt**:
 - Expand with **visual details** (style, composition, lighting, colors, textures, atmosphere)
 - Transform abstract concepts into **concrete visual scenes**
-- Text handling priority:
-  1. **Direct text display**: User-specified text content, names, dates, numbers, and quotes must appear directly as readable text in the image
-  2. **Visual description**: Brand names, abstract concepts, and style descriptions should be represented visually
-  3. **Mixed approach**: When users provide both specific text and style requirements, include both the exact text and visual elements
-
-- For greeting cards, posters, banners, and similar text-focused designs: Always preserve user-specified text content as readable text elements
+- Text and brand handling:
+  1. The tool can generate complete designed graphics such as ads, posters,
+     banners, and cards, including typography and user-supplied copy; it is not
+     limited to producing text-free backgrounds.
+  2. Quote required copy clearly and keep unnecessary text out.
+  3. Reference images can guide product identity, visual language, palette, and
+     composition.
+  4. Generated depictions are not suitable when a supplied logo, QR code,
+     certification mark, or other exact asset must remain pixel-identical.
 - Use vivid keywords (comma-separated) for better results
 - Always generate **positive prompt** (desired content) and **negative prompt** (avoid: low quality, blur, text artifacts, distorted text, misspelled words, fake logos, brand logos, trademark symbols)
-- For brands/logos: use visual descriptions like "tech company logo" rather than specific names
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 
 Available models (⭐[DEFAULT] marks the configured default model):
@@ -100,6 +102,7 @@ Text handling in edited images:
 - **Text modifications**: If you want to change existing text in the image, clearly describe what text should be changed and what it should become
 - **New text addition**: Specify exactly what text should appear and where (e.g., "add 'Happy Birthday' text at the top")
 - **Text removal**: Request to remove specific text elements
+- **Brand fidelity**: Do not use image editing to redraw an exact logo, QR code, or trademark. Preserve the supplied asset and composite it deterministically after the generative edit.
 
 Available models (⭐[DEFAULT] marks the configured default model):
 {}

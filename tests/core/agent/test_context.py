@@ -172,6 +172,9 @@ def test_system_context_includes_file_reference_output_spec() -> None:
     assert "[filename](file:file_id)" in system_message
     assert "![filename](file:file_id)" in system_message
     assert "Do not mention only the filename" in system_message
+    assert "File delivery integrity" in system_message
+    assert "Never invent, guess, or construct a file_id" in system_message
+    assert "it is not delivered until a successful tool result" in system_message
 
 
 def test_response_language_rules_uses_custom_subject_throughout() -> None:

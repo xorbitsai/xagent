@@ -80,6 +80,13 @@ message is scanned. Evaluate directions for brand fit, stopping power,
 glance-level clarity, offer comprehension, and factual safety. Do not let a
 creative become two disconnected ads stacked in one canvas.
 
+Do not create directions by accumulating a universal blacklist of subjects or
+styles. No device is inherently right or wrong: a person, product, phone,
+mascot, gradient, confetti field, typographic composition, or empty color field
+can all work when it performs a clear role in the proposition. Exclude an
+element only when it conflicts with the chosen direction, brand evidence, or
+message—not because it appeared in a generic list.
+
 When client taste is unknown, build a creative-risk ladder instead of betting
 everything on one aesthetic:
 
@@ -115,12 +122,22 @@ unrelated symbols. Match information density to the placement: feed ads and
 banners usually need a short hook and one support line; event and information
 posters may carry more detail if the hierarchy remains obvious.
 
+Treat the visual device as a mechanism, not a medium label. Photography,
+illustration, objects, characters, expressive type, spatial relationships, and
+material treatments are all valid, but the direction must state what the
+device makes the audience notice or understand. “Bold typography,” “brand
+gradient,” “large number,” and “premium styling” are treatments, not complete
+ideas on their own.
+
 Before rendering, turn each direction into a compact design specification:
 canvas and placement, communication structure, focal subject, visual-weight
 distribution, three-level information hierarchy, scan path, image/type/brand
 zones, typography character and line count, color roles, production finish,
 reference responsibilities, and explicit exclusions. If the scan order is not
-clear in the specification, the direction is not ready to generate.
+clear in the specification, the direction is not ready to generate. Keep the
+specification compact enough to survive intact into the render prompt. Do not
+create a separate directions or strategy artifact unless the user asks for it,
+and do not make reading a required reference document its own deliverable step.
 
 ## Use brand and reference assets intentionally
 
@@ -146,7 +163,10 @@ Treat identity-critical assets differently:
 - Use an official supplied logo as the source of truth. Include it as a
   generation reference whenever the image tool supports references so palette,
   brand language, proportions, and reserved placement influence the whole
-  design. Still do not trust a generated or edited recreation as the final logo.
+  design. Pass the actual path, URL, or file_id through the image tool's
+  `images` argument (or use `edit_image` directly); naming the asset only in the
+  prompt does not attach it. Still do not trust a generated or edited recreation
+  as the final logo.
 - Preserve QR codes, certification marks, sponsor marks, UI screenshots, and
   other exact assets pixel-for-pixel.
 - Unless the user explicitly requests an unbranded or logo-free concept, a
@@ -204,7 +224,9 @@ Before generation, compare the locked briefs as a set. Each direction must
 differ on at least three of these axes: focal subject, structural approach,
 visual metaphor, production finish, palette balance, and type strategy. Do not
 reuse the same gradient, display treatment, and decorative motif across the
-set. If the briefs cannot pass this comparison, revise them before rendering.
+set. Compare the actual render prompts, not merely their direction names or
+strategy labels. If the prompts describe the same focal mechanism and layout,
+revise them before rendering.
 
 For campaign directions developed above and for plural creative requests, make
 the concepts materially different before making size variants. Vary the idea,
@@ -215,12 +237,12 @@ Generate each materially different aspect ratio for that format. Do not force a
 landscape master into square, portrait, or story placements when a fresh
 composition would be stronger.
 
-Avoid generic AI-ad shortcuts unless the concept genuinely needs them:
-purple-blue gradients, generic business portraits holding phones, floating
-device renders, giant centered white type, heavy shadows, neon glows, arbitrary
-waves, confetti, floating spheres, and excessive sparkles. Favor one clear focal
-point, a recognizable silhouette at thumbnail size, and a visual idea specific
-enough that another brand could not use it unchanged.
+Do not forbid familiar devices merely because they are common in generated ads.
+A gradient, portrait, phone, giant headline, glow, wave, confetti field, or
+sparkle can be the right choice. Reject it only when it is an unexamined default,
+does no communication work, or could move unchanged to a competitor. Favor one
+clear focal point, a recognizable silhouette at thumbnail size, and a visual
+idea specific enough that another brand could not use it unchanged.
 
 Treat stacked display effects as a warning sign: metallic 3D lettering plus
 bevels, glow, drop shadows, ribbons, swooshes, confetti, and multiple headline

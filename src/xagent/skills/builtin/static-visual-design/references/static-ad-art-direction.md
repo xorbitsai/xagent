@@ -143,7 +143,9 @@ Those belong in planning; render each locked direction in a separate call.
 References must already be resolved before rendering begins. Every generation
 step must depend on the shared brand-and-brief step and receive the locked
 direction, exact copy, and relevant reference assets. Do not search for the logo
-in parallel with generation.
+in parallel with generation. Attach acquired references through the image
+tool's actual image-input parameter; a filename mentioned only inside prose is
+not a model input.
 
 ## Make the concept brand-specific
 
@@ -155,7 +157,8 @@ Brand specificity can come from a real product truth, audience behavior,
 recognizable setting, distinctive visual code, ownable metaphor, or verified
 campaign language. A brand-colored gradient, generic crowd, smiling model,
 phone mockup, glowing particles, city skyline, ribbon, or confetti does not make
-an idea specific by itself.
+an idea specific by itself. These devices are not prohibited; require each one
+to perform a clear strategic or compositional role.
 
 For people-led work, define a credible moment instead of demographic shorthand.
 For abstract work, explain what each form or motion represents. Do not translate

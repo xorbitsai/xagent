@@ -51,6 +51,9 @@ When given a user request, rewrite and enrich the prompt into a **professional i
   2. Quote required copy clearly and keep unnecessary text out.
   3. Reference images can guide product identity, visual language, palette, and
      composition.
+     When a reference file has already been acquired, pass its path, URL, or
+     file_id through the images parameter. Mentioning a reference only in the
+     prompt does not attach it to the model request.
   4. Generated depictions are not suitable when a supplied logo, QR code,
      certification mark, or other exact asset must remain pixel-identical.
 - For a poster, ad, banner, or social graphic, create one single final

@@ -124,6 +124,8 @@ class TestImageGenerationToolCore:
         assert "one exact headline" in description
         assert "one concise CTA" in description
         assert "design rationale" in description
+        assert "file_id through the images parameter" in description
+        assert "prompt does not attach it to the model request" in description
 
     def test_init_with_models(self, mock_image_models, mock_workspace):
         """Test ImageGenerationToolCore initialization with models"""

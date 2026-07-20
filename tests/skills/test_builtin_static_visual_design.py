@@ -39,7 +39,6 @@ def test_static_visual_design_skill_routes_designed_graphics_and_brand_assets() 
     assert "Use `edit_image` only" in content
     assert "Brand-safe evolution" in content
     assert "headline and image divide the communication work" in content
-    assert "generic business portraits holding phones" in content
     assert "prior winning creative, and performance evidence" in content
     assert "a brand-specific final requires a verified logo" in content
     assert "Include it as a generation reference" in content
@@ -59,6 +58,11 @@ def test_static_visual_design_skill_routes_designed_graphics_and_brand_assets() 
     assert "Do not enter `final_answer`" in content
     assert "merely polished but generic" in content
     assert "Return only final PNG or JPEG files" in content
+    assert "No device is inherently right or wrong" in content
+    assert "treatments, not complete ideas" in content
+    assert "naming the asset only in the prompt does not attach it" in content
+    assert "Compare the actual render prompts" in content
+    assert "Do not forbid familiar devices" in content
 
 
 def test_static_visual_design_includes_art_direction_reference() -> None:

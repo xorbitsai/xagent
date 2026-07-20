@@ -2,6 +2,7 @@
 Unit tests for logo_overlay tool functionality.
 """
 
+import io
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -349,6 +350,7 @@ class TestLogoOverlayTool:
         # Mock httpx client
         mock_response = Mock()
         mock_response.content = b"fake_image_data"
+        mock_response.headers = {"content-type": "image/jpeg"}
         mock_response.raise_for_status = Mock()
 
         with patch("httpx.AsyncClient") as mock_client_class:
@@ -388,6 +390,26 @@ class TestLogoOverlayTool:
 
             assert result is not None
             mock_open.assert_called_once_with("/local/path/image.jpg")
+
+    @pytest.mark.asyncio
+    async def test_load_image_local_svg_rasterizes_before_pillow(
+        self, tmp_path: Path
+    ) -> None:
+        svg_path = tmp_path / "official-logo.svg"
+        svg_path.write_text('<svg xmlns="http://www.w3.org/2000/svg" />')
+        rendered = io.BytesIO()
+        Image.new("RGBA", (146, 32), (146, 0, 186, 255)).save(rendered, format="PNG")
+
+        with patch(
+            "xagent.core.tools.core.logo_overlay.rasterize_svg_bytes",
+            return_value=rendered.getvalue(),
+        ) as rasterize:
+            result = await self.core._load_image(str(svg_path), "logo image")
+
+        assert result is not None
+        assert result.mode == "RGBA"
+        assert result.size == (146, 32)
+        rasterize.assert_called_once_with(svg_path.read_bytes())
 
     @pytest.mark.asyncio
     async def test_load_image_local_path_not_found(self) -> None:
@@ -647,6 +669,7 @@ class TestLogoOverlayToolIntegration:
             mock_client_class.return_value.__aenter__.return_value = mock_client
             mock_response = Mock()
             mock_response.content = b"fake_image_data"
+            mock_response.headers = {"content-type": "image/jpeg"}
             mock_response.raise_for_status = Mock()
             mock_client.get.return_value = mock_response
 

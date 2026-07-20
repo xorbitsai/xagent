@@ -1101,6 +1101,24 @@ class TestVisionToolHelperMethods:
         )
         assert result == "https://example.com/test.jpg"
 
+    def test_convert_svg_to_png_base64(self, vision_tool_without_workspace, tmp_path):
+        svg_path = tmp_path / "official-logo.svg"
+        svg_path.write_text('<svg xmlns="http://www.w3.org/2000/svg" />')
+        png_bytes = b"rendered-png"
+
+        with patch(
+            "xagent.core.tools.core.vision_tool.rasterize_svg_bytes",
+            return_value=png_bytes,
+        ) as rasterize:
+            result = vision_tool_without_workspace.core._convert_image_to_base64(
+                str(svg_path)
+            )
+
+        assert result == (
+            "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+        )
+        rasterize.assert_called_once_with(svg_path.read_bytes())
+
     def test_validate_images_string_input(self, vision_tool_without_workspace):
         """Test _validate_images method with string input"""
         result = vision_tool_without_workspace.core._validate_images("test_image.jpg")

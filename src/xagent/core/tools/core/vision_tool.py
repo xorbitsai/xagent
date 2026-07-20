@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
 from ...model.chat.basic.base import BaseLLM
+from ...utils.svg import rasterize_svg_bytes
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -160,6 +161,9 @@ class VisionCore:
         try:
             with open(image_path, "rb") as image_file:
                 image_data = image_file.read()
+                if mime_type == "image/svg+xml" or image_path.lower().endswith(".svg"):
+                    image_data = rasterize_svg_bytes(image_data)
+                    mime_type = "image/png"
                 base64_data = base64.b64encode(image_data).decode("utf-8")
                 return f"data:{mime_type};base64,{base64_data}"
         except Exception as e:

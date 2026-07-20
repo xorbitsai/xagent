@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional, cast
 import httpx
 from PIL import Image
 
+from ...utils.svg import rasterize_svg_bytes
+
 logger = logging.getLogger(__name__)
 
 
@@ -141,10 +143,13 @@ class LogoOverlayCore:
             response = await client.get(image_url)
             response.raise_for_status()
 
-            # Convert to PIL Image
             import io
 
-            image_data = io.BytesIO(response.content)
+            raw_image = response.content
+            content_type = response.headers.get("content-type", "").split(";", 1)[0]
+            if content_type == "image/svg+xml" or image_url.lower().endswith(".svg"):
+                raw_image = rasterize_svg_bytes(raw_image)
+            image_data = io.BytesIO(raw_image)
             image = cast(Image.Image, Image.open(image_data))
             image.load()  # Load image data
 
@@ -160,7 +165,17 @@ class LogoOverlayCore:
         if not os.path.exists(image_path):
             raise FileNotFoundError(f"Local file not found: {image_path}")
 
-        image = cast(Image.Image, Image.open(image_path))
+        if image_path.lower().endswith(".svg"):
+            import io
+
+            image = cast(
+                Image.Image,
+                Image.open(
+                    io.BytesIO(rasterize_svg_bytes(Path(image_path).read_bytes()))
+                ),
+            )
+        else:
+            image = cast(Image.Image, Image.open(image_path))
         image.load()  # Load image data
 
         # Convert to RGBA for transparency support

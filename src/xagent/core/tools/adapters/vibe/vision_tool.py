@@ -298,7 +298,8 @@ Examples:
 - "Does the cat leave the room?"
 - "Compare these two images and this video"
 
-Supported images: JPEG, PNG, WebP, GIF, BMP. Supported local/workspace videos:
+Supported images: JPEG, PNG, WebP, GIF, BMP, and SVG. SVG inputs are rasterized
+to PNG internally before the vision model receives them. Supported local/workspace videos:
 MP4, MOV, M4V, WebM, AVI, MKV. Models with native video support receive the
 video directly so motion, timing, and audio-capable model inputs are preserved.
 Other vision models use chronologically sampled, timestamped frames.

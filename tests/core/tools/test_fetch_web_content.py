@@ -112,6 +112,101 @@ class TestFetchWebContentTool:
         assert result["error"] is None
 
     @pytest.mark.asyncio
+    async def test_fetch_discovers_exact_html_assets_when_requested(self, fetch_tool):
+        html = """
+        <html>
+          <head>
+            <title>Brand</title>
+            <link rel="icon" href="/favicon.png">
+          </head>
+          <body>
+            <img src="/assets/brand-logo.svg" alt="Brand logo">
+            <img src="/assets/product.png" alt="Product">
+          </body>
+        </html>
+        """
+        response = _MockStreamResponse(
+            body=html.encode("utf-8"),
+            headers={"content-type": "text/html"},
+            url="https://example.com/campaign",
+        )
+
+        with patch(
+            "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+        ):
+            result = await fetch_tool.run_json_async(
+                {
+                    "url": "https://example.com/campaign",
+                    "include_assets": True,
+                    "asset_query": "logo",
+                }
+            )
+
+        assert result["success"] is True
+        assert result["assets"] == [
+            {
+                "url": "https://example.com/assets/brand-logo.svg",
+                "kind": "image",
+                "name": "",
+                "alt": "Brand logo",
+                "source": "html",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fetch_discovers_logo_from_spa_asset_manifest(self, fetch_tool):
+        html = """
+        <html>
+          <head><title>SIMBA</title></head>
+          <body>
+            <div id="root"></div>
+            <script defer src="/static/js/main.abc123.js"></script>
+          </body>
+        </html>
+        """
+        response = _MockStreamResponse(
+            body=html.encode("utf-8"),
+            headers={"content-type": "text/html"},
+            url="https://simba.example/6yearsstrong",
+        )
+        manifest_response = httpx.Response(
+            200,
+            json={
+                "files": {
+                    "main.js": "/static/js/main.abc123.js",
+                    "static/media/simba-logo.svg": (
+                        "/static/media/simba-logo.958c8ff7.svg"
+                    ),
+                    "static/media/banner.png": "/static/media/banner.1234.png",
+                }
+            },
+            headers={"content-type": "application/json"},
+            request=httpx.Request("GET", "https://simba.example/asset-manifest.json"),
+        )
+
+        with (
+            patch(
+                "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+            ),
+            patch("httpx.AsyncClient.get", return_value=manifest_response) as mock_get,
+        ):
+            result = await fetch_tool.run_json_async(
+                {
+                    "url": "https://simba.example/6yearsstrong",
+                    "include_assets": True,
+                    "asset_query": "logo",
+                }
+            )
+
+        assert result["success"] is True
+        assert result["content"] == ""
+        assert [asset["url"] for asset in result["assets"]] == [
+            "https://simba.example/asset-manifest.json",
+            "https://simba.example/static/media/simba-logo.958c8ff7.svg",
+        ]
+        mock_get.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_fetch_follows_redirects(self, fetch_tool):
         html = "<html><body><p>Redirect target</p></body></html>"
         response = _MockStreamResponse(
@@ -234,3 +329,5 @@ class TestFetchWebContentTool:
     def test_args_validation(self):
         args = FetchWebContentArgs(url="https://example.com")
         assert args.url == "https://example.com"
+        assert args.include_assets is False
+        assert args.asset_query is None

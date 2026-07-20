@@ -380,6 +380,125 @@ def test_kb_document_job_reads_staged_file_and_publishes_canonical(
         db.close()
 
 
+class _StubEmbeddingAdapter:
+    """Deterministic embedding adapter so the real pipeline avoids external APIs."""
+
+    def encode(self, text, dimension=None, instruct=None):
+        if isinstance(text, str):
+            return [float(len(text)), 0.0]
+        return [[float(len(item)), float(i)] for i, item in enumerate(text)]
+
+    def get_dimension(self) -> int:
+        return 2
+
+    @property
+    def abilities(self):
+        return ["embedding"]
+
+
+def test_kb_document_job_full_worker_path_new_target_end_to_end(tmp_path, monkeypatch):
+    """Real register->parse->publish->cleanup without mocking run_document_ingestion.
+
+    Proves GH #931 end-to-end: a new staged target is parsed from the staged file
+    (canonical absent until publish), and the persisted document row, content hash,
+    chunks, embeddings, and published file all represent the same staged bytes.
+    """
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    monkeypatch.setenv("LANCEDB_DIR", str((tmp_path / "lancedb").resolve()))
+
+    from xagent.core.model.model import EmbeddingModelConfig
+    from xagent.core.storage.manager import initialize_storage_manager
+    from xagent.core.tools.core.RAG_tools.parse.parse_document import (
+        _get_document_from_db,
+    )
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+    from xagent.core.tools.core.RAG_tools.utils.hash_utils import compute_file_hash
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    storage_root = tmp_path / "storage"
+    uploads_dir = storage_root / "uploads"
+    uploads_dir.mkdir(parents=True)
+    initialize_storage_manager(str(storage_root), str(uploads_dir))
+
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_with_snapshot",
+        lambda *args, **kwargs: None,
+    )
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="stub",
+        model_provider="stub",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _StubEmbeddingAdapter()),
+    )
+    # Collection init resolves the adapter through its own imported reference.
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_embedding_adapter",
+        lambda *args, **kwargs: (stub_config, _StubEmbeddingAdapter()),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "kb-full-worker.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-full-worker-test")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("staged end to end content", encoding="utf-8")
+        assert not target_file.exists()
+        file_id = "55555555-5555-4555-8555-555555555555"
+        ingestion_config = IngestionConfig(embedding_model_id="embedding-default")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": file_id,
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": True,
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "collection_existed_before": False,
+            },
+        )
+
+        result = handle_kb_ingest_document(db, job)
+
+        # Ingestion succeeded end-to-end on the real pipeline.
+        assert result["status"] == "success"
+        assert result["chunk_count"] > 0
+        assert result["embedding_count"] > 0
+        assert result["vector_count"] > 0
+        assert result["file_id"] == file_id
+
+        # Canonical file published with staged bytes; staged input cleaned up.
+        assert target_file.read_text(encoding="utf-8") == "staged end to end content"
+        assert not staged_file.exists()
+
+        # Durable metadata is canonical and its hash matches the published bytes.
+        document = _get_document_from_db(
+            collection="kb",
+            doc_id=result["doc_id"],
+            user_id=int(user.id),
+            is_admin=True,
+        )
+        assert document is not None
+        assert document["source_path"] == str(target_file)
+        assert document["content_hash"] == compute_file_hash(str(target_file))
+    finally:
+        db.close()
+
+
 def test_kb_document_job_supersedes_older_generation_for_same_target(
     tmp_path, monkeypatch
 ):

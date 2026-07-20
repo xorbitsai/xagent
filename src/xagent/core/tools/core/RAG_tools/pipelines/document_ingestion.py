@@ -841,6 +841,10 @@ def _process_document_impl(
                     user_id=user_id,
                     is_admin=is_admin,
                     progress_callback=parse_tracker,
+                    # Parse the physical input actually supplied to this run, not
+                    # the canonical path persisted in document metadata (which for
+                    # staged uploads is not published until ingestion succeeds).
+                    source_path_override=source_path,
                 )
         parse_model = (
             parse_response

@@ -334,6 +334,14 @@ class ParseDocumentRequest(BaseModel):
     collection: str = Field(..., description="Collection name for data isolation")
     doc_id: str = Field(..., description="Document ID to parse")
     parse_method: ParseMethod = Field(..., description="Parsing method to use")
+    source_path_override: Optional[str] = Field(
+        None,
+        description=(
+            "Physical file path to parse instead of the document row's persisted "
+            "source_path. Used by staged ingestion so parsing reads the staged "
+            "upload while durable metadata keeps the canonical path."
+        ),
+    )
     params: Optional[Dict[str, Any]] = Field(
         None, description="Optional parameters for parsing"
     )

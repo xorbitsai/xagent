@@ -720,6 +720,43 @@ def test_process_document_passes_file_id_to_register_document(
     assert captured_kwargs["file_id"] == "file-123"
 
 
+def test_process_document_parses_physical_source_not_metadata_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parsing must read the physical source_path, not the canonical metadata path.
+
+    Staged uploads pass the staged file as ``source_path`` and the not-yet-published
+    canonical path as ``metadata_source_path``. The parse step must be handed the
+    physical staged path so it never depends on a file published only after success.
+    """
+    _patch_pipeline_dependencies(monkeypatch)
+    captured_kwargs: Dict[str, object] = {}
+
+    def _capture_parse_document(**kwargs: object) -> dict:
+        captured_kwargs.update(kwargs)
+        return ParseDocumentResponse(
+            doc_id="doc-1",
+            parse_hash="hash-1",
+            paragraphs=[ParsedParagraph(text="para", metadata={})],
+            written=True,
+        ).model_dump()
+
+    monkeypatch.setattr(document_ingestion, "parse_document", _capture_parse_document)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/staging/.background-ingest/abc/doc.pdf",
+        config=IngestionConfig(),
+        metadata_source_path="/uploads/user_1/kb/doc.pdf",
+    )
+
+    assert result.status == "success"
+    assert (
+        captured_kwargs["source_path_override"]
+        == "/staging/.background-ingest/abc/doc.pdf"
+    )
+
+
 def test_process_document_skips_embedding_when_no_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

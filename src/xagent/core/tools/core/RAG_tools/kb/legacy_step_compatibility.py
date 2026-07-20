@@ -277,6 +277,7 @@ class KBLegacyStepCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
         progress_callback: Optional[Any] = None,
+        source_path_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         from ..parse.parse_document import _parse_document_impl
 
@@ -295,6 +296,7 @@ class KBLegacyStepCompatibilityFacade:
                     user_id=user_id,
                     is_admin=is_admin,
                     progress_callback=progress_callback,
+                    source_path_override=source_path_override,
                     handle=handle,
                 )
             self._record_parse_side_effect(

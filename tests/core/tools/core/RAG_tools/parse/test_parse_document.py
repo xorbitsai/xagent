@@ -224,6 +224,82 @@ class TestParseDocumentCore:
                 is_admin=True,
             )
 
+    def test_staged_parse_uses_physical_path_when_canonical_absent(
+        self,
+        tmp_path,
+        temp_lancedb_dir: str,
+        test_collection: str,
+        test_doc_id: str,
+    ) -> None:
+        """Regression for GH #931: staged ingestion must parse the physical staged
+        file while durable metadata keeps the canonical path, even though that
+        canonical file is not published until after ingestion succeeds.
+        """
+        staged = tmp_path / "staged.txt"
+        staged.write_text("staged marker content", encoding="utf-8")
+        canonical = tmp_path / "canonical" / "doc.txt"
+        assert not canonical.exists()
+
+        register_document(
+            collection=test_collection,
+            source_path=str(staged),
+            metadata_source_path=str(canonical),
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+
+        out = parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method=ParseMethod.DEEPDOC,
+            user_id=1,
+            is_admin=True,
+            source_path_override=str(staged),
+        )
+
+        # Parse succeeded reading the staged file; canonical never had to exist.
+        assert out["written"] is True
+        assert not canonical.exists()
+        joined = " ".join(p["text"] for p in out["paragraphs"])
+        assert "staged marker content" in joined
+
+    def test_staged_parse_reads_new_staged_bytes_over_existing_canonical(
+        self,
+        tmp_path,
+        temp_lancedb_dir: str,
+        test_collection: str,
+        test_doc_id: str,
+    ) -> None:
+        """Updating an existing target must parse the new staged bytes, not the
+        previous canonical file contents (GH #931 second consequence)."""
+        canonical = tmp_path / "canonical" / "doc.txt"
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text("old canonical content", encoding="utf-8")
+        staged = tmp_path / "staged.txt"
+        staged.write_text("new staged content", encoding="utf-8")
+
+        register_document(
+            collection=test_collection,
+            source_path=str(staged),
+            metadata_source_path=str(canonical),
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+
+        out = parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method=ParseMethod.DEEPDOC,
+            user_id=1,
+            is_admin=True,
+            source_path_override=str(staged),
+        )
+
+        assert out["written"] is True
+        joined = " ".join(p["text"] for p in out["paragraphs"])
+        assert "new staged content" in joined
+        assert "old canonical content" not in joined
+
 
 class TestParseDocumentFallback:
     """Test three-tier fallback logic for parse_document internal functions."""

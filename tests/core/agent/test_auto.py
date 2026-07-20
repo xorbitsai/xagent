@@ -1699,6 +1699,68 @@ async def test_auto_pattern_retries_unavailable_tool_call_as_routing_decision() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "protocol_code",
+    ["malformed_tool_arguments", "unavailable_tool_call"],
+)
+async def test_auto_pattern_retries_provider_routing_protocol_errors(
+    protocol_code: str,
+) -> None:
+    llm = RaisingFakeLLM(
+        [
+            load_skill_tool_response("auto-skill"),
+            {"tool_calls": []},
+            LLMToolProtocolError(
+                provider="deepseek",
+                code=protocol_code,
+                message="invalid routing tool call",
+            ),
+            decision_tool_response("react", "Recovered after protocol error."),
+        ]
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-protocol-retry")
+    context.add_user_message("Use the auto skill for this task")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+        skill_manager=FakeSkillManager(),
+    )
+
+    assert result["success"] is True
+    assert pattern.selected_pattern == "react"
+    assert pattern.routing_skill_loads == 1
+    assert len(llm.calls) == 4
+    assert [tool["function"]["name"] for tool in llm.calls[1]["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    assert [tool["function"]["name"] for tool in llm.calls[2]["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    assert [tool["function"]["name"] for tool in llm.calls[3]["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    retry_message = llm.calls[3]["messages"][-1]["content"]
+    assert protocol_code.split("_", 1)[0] in retry_message
+    assert "one complete JSON object" in retry_message
+    assert DECISION_TOOL_NAME in retry_message
+    assert any(
+        checkpoint["label"] == "auto_decision_retry"
+        and checkpoint["metadata"].get("protocol_code") == protocol_code
+        for checkpoint in runtime.checkpoints
+    )
+    llm_error_hooks = [
+        payload for name, payload in runtime.hooks if name == "llm_error"
+    ]
+    assert llm_error_hooks[-1]["metadata"]["protocol_code"] == protocol_code
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_missing_decision_tool_call_fails() -> None:
     llm = FakeLLM(["not a tool call", {"tool_calls": []}])
     pattern = AutoPattern()

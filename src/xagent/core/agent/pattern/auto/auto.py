@@ -130,7 +130,7 @@ class AutoDecisionResult:
 
 DECISION_TOOL_NAME = "select_execution_pattern"
 MAX_DECISION_PARSE_ATTEMPTS = 2
-MAX_AUTO_ROUTING_SKILL_LOADS = 3
+MAX_AUTO_ROUTING_SKILL_LOADS = 1
 AUTO_DECISION_REQUIRED_TOOL_MESSAGE = (
     "Auto routing failed because the model did not return the required "
     "decision tool call. Please retry."
@@ -881,7 +881,10 @@ class AutoPattern(AgentPattern):
                 if protocol_retries >= 1:
                     raise
                 protocol_retries += 1
-                retry_feedback = self._tool_protocol_retry_feedback(exc)
+                retry_feedback = self._tool_protocol_retry_feedback(
+                    exc,
+                    skill_loading_available=skill_loading_available,
+                )
                 logger.warning(
                     "AutoPattern routing received invalid %s tool protocol; "
                     "retrying decision. execution_id=%s attempt=%s",
@@ -889,12 +892,11 @@ class AutoPattern(AgentPattern):
                     getattr(context, "execution_id", None),
                     attempt + protocol_retries,
                 )
-                await runtime.checkpoint(
-                    "auto_decision_retry",
+                await self._checkpoint_decision_retry(
                     context=context,
-                    pattern=self,
+                    runtime=runtime,
+                    attempt=attempt + protocol_retries,
                     metadata={
-                        "attempt": attempt + protocol_retries,
                         "error": str(exc),
                         "protocol_code": exc.code,
                     },
@@ -973,6 +975,7 @@ class AutoPattern(AgentPattern):
                 )
                 retry_feedback = None
                 attempt = 0
+                protocol_retries = 0
                 continue
 
             try:
@@ -1067,6 +1070,8 @@ class AutoPattern(AgentPattern):
             return False
         loaded = metadata.get(LOADED_SKILLS_METADATA_KEY)
         loaded_names = set(loaded) if isinstance(loaded, list) else set()
+        if loaded_names:
+            return False
         return any(
             isinstance(entry, dict)
             and str(entry.get("name") or "").strip()
@@ -1167,7 +1172,16 @@ class AutoPattern(AgentPattern):
             )
         )
 
-    def _tool_protocol_retry_feedback(self, error: LLMToolProtocolError) -> str:
+    def _tool_protocol_retry_feedback(
+        self,
+        error: LLMToolProtocolError,
+        *,
+        skill_loading_available: bool,
+    ) -> str:
+        available_tools = [DECISION_TOOL_NAME]
+        if skill_loading_available:
+            available_tools.append(LOAD_SKILL_TOOL_NAME)
+        available_tool_text = ", ".join(available_tools)
         if error.code == "malformed_tool_arguments":
             correction = (
                 "The provider rejected the previous routing tool call because "
@@ -1182,9 +1196,10 @@ class AutoPattern(AgentPattern):
             correction = "The provider rejected the previous routing tool call."
         return (
             f"{correction} Retry by calling exactly one currently available "
-            f"routing tool: {DECISION_TOOL_NAME}. Use the exact tool name and "
+            f"routing tool: {available_tool_text}. Use the exact tool name and "
             "one complete JSON object matching its schema. Do not answer in "
-            "natural language."
+            "natural language. Do not repeat load_skill for a skill already "
+            "loaded into the system context."
         )
 
     def _truncate_retry_preview(self, value: str, *, limit: int = 1200) -> str:

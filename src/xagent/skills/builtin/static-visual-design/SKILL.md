@@ -50,10 +50,12 @@ before committing to a visual. Useful angle families include milestone pride or
 social proof, offer-led value, product benefit, emotional identity, and urgency,
 but choose only those supported by the brief.
 
-Give every direction one single-minded proposition and one coherent organizing
-visual idea. Evaluate directions for brand fit, stopping power, glance-level
-clarity, offer comprehension, and factual safety. Do not let a creative become
-two disconnected ads stacked in one canvas.
+Give every direction one single-minded proposition, one visual device, and one
+structural approach. The proposition explains why the audience should care;
+the visual device creates the memorable image; the structure controls how the
+message is scanned. Evaluate directions for brand fit, stopping power,
+glance-level clarity, offer comprehension, and factual safety. Do not let a
+creative become two disconnected ads stacked in one canvas.
 
 Do not interpret the singular nouns "an ad," "a poster," or "a social post" as
 an instruction to explore only one direction. When the creative direction is
@@ -61,23 +63,42 @@ open, render two or three candidates so the user can choose. When the user
 explicitly requests exactly one final asset, still compare possible directions
 and render the strongest one without exposing unnecessary internal deliberation.
 
+## Choose a designed structure
+
+Do not default every request to a stock portrait or product mockup beside large
+headline text. Select a structure that serves the message, such as a dominant
+stat, a single hero scene, a product or object spotlight with callouts, a
+before/after contrast, a problem/solution transition, an editorial typographic
+composition, a proof or quote card, or an information-rich event poster. Treat
+these as a varied vocabulary, not fixed templates.
+
+Make the headline and image divide the communication work. The image should add
+proof, tension, emotion, scale, contrast, or surprise instead of literally
+captioning the headline. Prefer one ownable campaign device over a collage of
+unrelated symbols. Match information density to the placement: feed ads and
+banners usually need a short hook and one support line; event and information
+posters may carry more detail if the hierarchy remains obvious.
+
 ## Use brand and reference assets intentionally
 
 Inspect relevant uploaded or workspace images with `understand_media`. Pass
 useful product, campaign, style, or layout references to image generation or
 editing so the result belongs to the intended visual world.
 
-For work naming a real brand, resolve the brand identity before treating the
-asset as final. Look first in user uploads and the task workspace. When browsing
-is available, use only an official brand site or brand kit as an external source;
-otherwise ask the user for the asset. A visually plausible search result is not
-proof that a logo is authentic.
+For work naming a real brand, resolve the brand identity before rendering final
+candidates. Look first in user uploads and the task workspace. When browsing is
+available, use only an official brand site or brand kit as an external source.
+Use `fetch_web_content` with `include_assets=true` and an `asset_query` such as
+`logo` to discover official static assets, then use `download_web_asset` on the
+exact returned URL. Otherwise ask the user for the asset. A visually plausible
+search result is not proof that a logo is authentic.
 
 Treat identity-critical assets differently:
 
-- Use an official supplied logo as the source of truth. It may be included as a
-  generation reference for brand language, proportions, and reserved placement,
-  but do not trust a generated or edited recreation as the final logo.
+- Use an official supplied logo as the source of truth. Include it as a
+  generation reference whenever the image tool supports references so palette,
+  brand language, proportions, and reserved placement influence the whole
+  design. Still do not trust a generated or edited recreation as the final logo.
 - Preserve QR codes, certification marks, sponsor marks, UI screenshots, and
   other exact assets pixel-for-pixel.
 - Unless the user explicitly requests an unbranded or logo-free concept, a
@@ -93,12 +114,19 @@ composition, typography, hierarchy, graphic elements, and user-supplied copy.
 Prompt with:
 
 - the organizing visual idea and emotional tone;
+- the chosen structure, focal subject, and specific visual device;
 - exact text to render, quoted clearly;
 - hierarchy and approximate placement, without over-constraining every pixel;
 - target aspect ratio and viewing context;
-- relevant reference images;
+- relevant brand, product, campaign, and style references, with a clear statement
+  of what to borrow from each;
+- the intended production finish, such as documentary photography, tactile
+  collage, screen print, editorial type, clean product render, or bold flat art;
 - any quiet zones required for an exact logo or QR overlay;
 - exclusions such as fake logos, fake QR codes, watermarks, and unrelated text.
+
+Write a concept-specific prompt for every direction. Do not reuse a generic
+"modern professional ad" prompt with only the colors and headline changed.
 
 For campaign directions developed above and for plural creative requests, make
 the concepts materially different before making size variants. Vary the idea,
@@ -109,10 +137,12 @@ Generate each materially different aspect ratio for that format. Do not force a
 landscape master into square, portrait, or story placements when a fresh
 composition would be stronger.
 
-Avoid generic AI-ad decoration unless the brief calls for it: purple-blue
-gradients, giant centered white type, heavy shadows, neon glows, arbitrary
-waves, confetti, floating spheres, and excessive sparkles. Favor one clear
-focal point and glance-level comprehension.
+Avoid generic AI-ad shortcuts unless the concept genuinely needs them:
+purple-blue gradients, generic business portraits holding phones, floating
+device renders, giant centered white type, heavy shadows, neon glows, arbitrary
+waves, confetti, floating spheres, and excessive sparkles. Favor one clear focal
+point, a recognizable silhouette at thumbnail size, and a visual idea specific
+enough that another brand could not use it unchanged.
 
 ## Inspect and iterate with image tools
 
@@ -121,6 +151,8 @@ Inspect every candidate with `understand_media`, checking:
 - exact spelling, numbers, dates, CTA, offer, and disclaimer;
 - whether the copy reads naturally and expresses the intended campaign angle;
 - hierarchy, contrast, and thumbnail-size legibility;
+- whether the headline and image complement rather than repeat each other;
+- whether the visual device feels ownable instead of stock or interchangeable;
 - crop, balance, edge clearance, and platform safe zones;
 - consistency with the supplied references and recognizable brand language;
 - accidental pseudo-logos, fake QR codes, watermarks, malformed objects, or
@@ -129,7 +161,9 @@ Inspect every candidate with `understand_media`, checking:
 Use `edit_image` to refine a strong candidate or regenerate when the organizing
 idea is weak. Correct copy errors through editing or regeneration and inspect
 again. Shorten nonessential copy only when the brief permits it. A successful
-generation call alone is not proof that the asset is finished.
+generation call alone is not proof that the asset is finished. Compare the
+candidates side by side and discard the safest generic option even when it is
+technically clean.
 
 ## Add exact assets as the final layer
 

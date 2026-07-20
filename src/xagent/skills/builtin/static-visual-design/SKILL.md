@@ -17,6 +17,13 @@ model solve the composition, type treatment, atmosphere, and graphic language
 together instead of reducing the work to a generated background plus an HTML
 layout.
 
+For advertising creatives, campaign posters, promotional social posts,
+announcement graphics, and other commercially designed static visuals, read
+`references/static-ad-art-direction.md` with `read_skill_doc` before defining
+directions or rendering. Use its communication structures, layout specification,
+one-canvas contract, and rejection rules. Do not treat the reference as a menu
+of decorative styles.
+
 ## Establish the brief
 
 Identify the minimum useful brief before generating:
@@ -59,6 +66,13 @@ locked: each executor receives a distinct proposition, structure, focal device,
 production finish, and explicit exclusions, and must not reinterpret the other
 directions.
 
+Represent this order in the execution plan. Brand/reference acquisition is a
+shared prerequisite, creative direction and design specification depend on that
+grounding, and every render depends on the locked specification. Do not search
+for identity assets in parallel with artifact generation. Inspection depends on
+the render results. Independent renders may run in parallel only after all
+shared inputs are resolved.
+
 Give every direction one single-minded proposition, one visual device, and one
 structural approach. The proposition explains why the audience should care;
 the visual device creates the memorable image; the structure controls how the
@@ -100,6 +114,13 @@ captioning the headline. Prefer one ownable campaign device over a collage of
 unrelated symbols. Match information density to the placement: feed ads and
 banners usually need a short hook and one support line; event and information
 posters may carry more detail if the hierarchy remains obvious.
+
+Before rendering, turn each direction into a compact design specification:
+canvas and placement, communication structure, focal subject, visual-weight
+distribution, three-level information hierarchy, scan path, image/type/brand
+zones, typography character and line count, color roles, production finish,
+reference responsibilities, and explicit exclusions. If the scan order is not
+clear in the specification, the direction is not ready to generate.
 
 ## Use brand and reference assets intentionally
 
@@ -157,8 +178,19 @@ Prompt with:
   of what to borrow from each;
 - the intended production finish, such as documentary photography, tactile
   collage, screen print, editorial type, clean product render, or bold flat art;
-- any quiet zones required for an exact logo or QR overlay;
+- any quiet zones required around identity-critical asset placement;
 - exclusions such as fake logos, fake QR codes, watermarks, and unrelated text.
+
+Each call must request one finished placement on one continuous canvas. Render
+each direction separately. Explicitly exclude contact sheets, moodboards,
+option grids, multiple versions, presentation mockups, repeated layouts,
+split-frame compositions, and duplicated headlines. Do not put words such as
+"variations," "option A/B," or "layout exploration" in a render prompt.
+
+Keep copy load proportional to the format. A typical feed ad should have one
+exact headline of no more than two short lines, at most one short support line,
+one concise CTA, and only required fine print. Never send alternative copy,
+strategy labels, markdown, rationale, or production notes for rendering.
 
 Write a concept-specific prompt for every direction. Do not reuse a generic
 "modern professional ad" prompt with only the colors and headline changed.
@@ -204,12 +236,18 @@ Inspect every candidate with `understand_media`, checking:
 - accidental pseudo-logos, fake QR codes, watermarks, malformed objects, or
   unrelated lettering.
 
-Use `edit_image` to refine a strong candidate or regenerate when the organizing
-idea is weak. Correct copy errors through editing or regeneration and inspect
-again. Shorten nonessential copy only when the brief permits it. A successful
-generation call alone is not proof that the asset is finished. Compare the
-candidates side by side and discard the safest generic option even when it is
-technically clean.
+Automatically reject contact sheets, multiple ads in one image, duplicated
+layouts or headlines, fake or duplicated logos, wrong or invented copy,
+unverified claims, unclear hierarchy, and clipped or overlapping essentials.
+Do not rationalize these as stylistic choices.
+
+Use `edit_image` only to refine a strong, single-canvas candidate with a
+localized defect. Regenerate from the locked design specification when the
+organizing idea, focal subject, hierarchy, copy load, or canvas structure is
+wrong, or when several text errors appear. Correct permitted copy errors and
+inspect again. A successful generation call alone is not proof that the asset
+is finished. Compare the candidates side by side and discard the safest generic
+option even when it is technically clean.
 
 ## Handle identity assets without blind post-processing
 

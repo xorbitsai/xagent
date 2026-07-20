@@ -1751,6 +1751,8 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "dependencies is required for every step" in system_prompt
     assert "screenshot or render steps must depend" in system_prompt
+    assert "shared prerequisite" in system_prompt
+    assert "Do not run artifact generation in parallel" in system_prompt
     assert '"termination_condition"' in system_prompt
     assert '"completion_evidence"' in system_prompt
     assert "Few-shot examples" in system_prompt

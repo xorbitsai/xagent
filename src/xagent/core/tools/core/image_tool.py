@@ -53,11 +53,23 @@ When given a user request, rewrite and enrich the prompt into a **professional i
      composition.
   4. Generated depictions are not suitable when a supplied logo, QR code,
      certification mark, or other exact asset must remain pixel-identical.
+- For a poster, ad, banner, or social graphic, create one single final
+  composition on one continuous canvas per call. Do not generate a contact
+  sheet, moodboard, option grid, multiple versions, repeated layouts, split
+  frames, presentation mockups, or duplicated headlines unless the user
+  explicitly asks for that output format.
+- Keep designed-graphic copy sparse: normally one exact headline, at most one
+  short support line, one concise CTA, and only required fine print. Do not
+  render alternative copy, strategy labels, markdown, prompt annotations, or
+  design rationale.
 - Treat reference images as evidence of recurring brand cues, not an instruction
   to copy every gradient, metallic effect, ribbon, swoosh, or decorative motif
   from one campaign.
 - Use precise, concept-specific visual language rather than keyword soup.
-- Always generate **positive prompt** (desired content) and **negative prompt** (avoid: low quality, blur, text artifacts, distorted text, misspelled words, fake logos, brand logos, trademark symbols)
+- Always generate **positive prompt** (desired content) and **negative prompt**
+  (avoid: low quality, blur, text artifacts, distorted text, misspelled words,
+  fake logos, trademark symbols, contact sheets, multiple panels, duplicated
+  layouts, duplicated headlines)
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 
 Available models (⭐[DEFAULT] marks the configured default model):

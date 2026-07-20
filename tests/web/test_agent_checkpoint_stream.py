@@ -36,6 +36,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.user import User
+from xagent.web.models.workforce import WorkforceRun
 
 
 def test_agent_checkpoint_is_not_converted_to_websocket_stream_event() -> None:
@@ -742,21 +743,41 @@ async def test_historical_replay_promotes_workforce_delegation_summary(
         task_id = int(task.id)
         user_id = int(task.user_id)
         base_time = datetime(2026, 5, 22, tzinfo=timezone.utc)
-        db.add(
-            DatabaseTraceEvent(
-                task_id=task_id,
-                event_id="delegation-end",
-                event_type="task_update_general",
-                timestamp=base_time + timedelta(seconds=1),
-                data={
-                    "event_type": "workforce_delegation_end",
-                    "status": "end",
-                    "worker_task_id": "agent_123_abcd1234",
-                    "worker_alias": "Writer",
-                    "output": "draft complete",
-                    "messages": [{"role": "user", "content": "raw prompt"}],
-                },
-            )
+        db.add_all(
+            [
+                WorkforceRun(
+                    workforce_id=999,
+                    task_id=task_id,
+                    user_id=user_id,
+                    status="completed",
+                    snapshot={},
+                ),
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id="delegation-end",
+                    event_type="task_update_general",
+                    timestamp=base_time + timedelta(seconds=1),
+                    data={
+                        "event_type": "workforce_delegation_end",
+                        "status": "end",
+                        "worker_task_id": "agent_123_abcd1234",
+                        "worker_alias": "Writer",
+                        "output": "draft complete",
+                        "messages": [{"role": "user", "content": "raw prompt"}],
+                    },
+                ),
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    build_id="agent_123_abcd1234",
+                    event_id="delegated-internal",
+                    event_type="llm_call_start",
+                    timestamp=base_time,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_123_abcd1234",
+                    },
+                ),
+            ]
         )
         db.commit()
     finally:
@@ -799,6 +820,84 @@ async def test_historical_replay_promotes_workforce_delegation_summary(
     assert delegation_event["data"]["output"] == "draft complete"
     assert "messages" not in delegation_event["data"]
     assert "event_type" not in delegation_event["data"]
+    assert not any(
+        event.get("event_id") == "delegated-internal" for event in sent_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_historical_replay_includes_child_trace_for_non_workforce_task(
+    monkeypatch,
+) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        "non-workforce-child-history"
+    )
+    try:
+        task_id = int(task.id)
+        user_id = int(task.user_id)
+        base_time = datetime(2026, 5, 22, tzinfo=timezone.utc)
+        db.add_all(
+            [
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    build_id="agent_123_abcd1234",
+                    event_id="delegated-progress",
+                    event_type="agent_progress",
+                    timestamp=base_time,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_123_abcd1234",
+                        "message": "Child is working",
+                    },
+                ),
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    build_id="builder-session",
+                    event_id="unrelated-build",
+                    event_type="agent_progress",
+                    timestamp=base_time + timedelta(seconds=1),
+                    data={"source": "builder", "message": "Internal build trace"},
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    delegated_event = next(
+        event for event in sent_events if event.get("event_id") == "delegated-progress"
+    )
+    assert delegated_event["event_type"] == "agent_progress"
+    assert delegated_event["data"]["source"] == "xagent-agent-tool-child"
+    assert not any(event.get("event_id") == "unrelated-build" for event in sent_events)
 
 
 @pytest.mark.asyncio

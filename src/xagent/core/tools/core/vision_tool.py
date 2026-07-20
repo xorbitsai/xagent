@@ -414,6 +414,14 @@ class VisionCore:
             return str(value) if value is not None else None
         return None
 
+    def _model_used(self) -> str:
+        """Return the configured model identity, not an internal wrapper class."""
+        return (
+            self._get_attr_safely(self.vision_model, "model_name")
+            or self._get_attr_safely(self.vision_model, "model_id")
+            or self.vision_model.__class__.__name__
+        )
+
     async def understand_media(
         self,
         media: Union[str, List[str]],
@@ -632,7 +640,7 @@ class VisionCore:
                 videos_processed=processed_videos,
                 native_videos_processed=native_videos,
                 frames_extracted=extracted_frames,
-                model_used=self.vision_model.__class__.__name__,
+                model_used=self._model_used(),
                 warnings=warnings,
             )
 

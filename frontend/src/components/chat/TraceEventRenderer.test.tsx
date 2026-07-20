@@ -64,6 +64,20 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
 import { TraceEventRenderer } from "./TraceEventRenderer"
 
 describe("TraceEventRenderer", () => {
+  it("ignores null, primitive, and malformed trace event entries", () => {
+    expect(() => render(
+      <TraceEventRenderer
+        events={[
+          null,
+          42,
+          "not-an-event",
+          { event_type: 17, data: "not-an-object" },
+          { event_type: "agent_progress", data: null },
+        ] as unknown as React.ComponentProps<typeof TraceEventRenderer>["events"]}
+      />,
+    )).not.toThrow()
+  })
+
   beforeEach(() => {
     window.scrollTo = vi.fn()
   })
@@ -666,6 +680,7 @@ describe("TraceEventRenderer", () => {
   })
 
   it("renders workforce delegation trace events as a dedicated step", () => {
+    const onAgentExecutionClick = vi.fn()
     render(
       <TraceEventRenderer
         events={[
@@ -691,17 +706,205 @@ describe("TraceEventRenderer", () => {
             },
           },
         ]}
+        onAgentExecutionClick={onAgentExecutionClick}
       />,
     )
 
-    const toggle = screen.getByRole("button", {
-      name: /traceEventRenderer.delegateToWorker:Researcher/,
-    })
+    fireEvent.click(screen.getByRole("button", {
+      name: "traceEventRenderer.viewAgentExecution",
+    }))
+    expect(onAgentExecutionClick).toHaveBeenCalledWith(expect.objectContaining({
+      workerTaskId: "99",
+      agentName: "Researcher",
+      workerAlias: "Researcher",
+      status: "completed",
+    }))
 
-    expect(toggle).toHaveAttribute("aria-expanded", "false")
-    fireEvent.click(toggle)
-    expect(toggle).toHaveAttribute("aria-expanded", "true")
-    expect(screen.getByText(/Research complete/)).toBeInTheDocument()
+    expect(screen.getByRole("heading", {
+      name: /traceEventRenderer.delegateToWorker:Researcher/,
+    })).toBeInTheDocument()
+    expect(screen.queryByRole("button", {
+      name: "traceEventRenderer.showProcess",
+    })).not.toBeInTheDocument()
+    expect(screen.queryByText(/Research complete/)).not.toBeInTheDocument()
+  })
+
+  it("renders each workforce manager summary after its completed Agent call", () => {
+    render(
+      <TraceEventRenderer
+        onAgentExecutionClick={vi.fn()}
+        events={[
+          {
+            event_id: "manager-start",
+            event_type: "react_task_start",
+            step_id: "manager-react",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "research-start",
+            event_type: "workforce_delegation_start",
+            timestamp: 2000,
+            data: {
+              worker_task_id: "agent_research_run",
+              worker_alias: "Researcher",
+            },
+          },
+          {
+            event_id: "research-end",
+            event_type: "workforce_delegation_end",
+            timestamp: 3000,
+            data: {
+              worker_task_id: "agent_research_run",
+              output: '{"status":"complete"}',
+            },
+          },
+          {
+            event_id: "research-summary",
+            event_type: "agent_progress",
+            step_id: "manager-react",
+            timestamp: 4000,
+            data: {
+              message: "## Research Complete\n\nThe evidence is ready for script writing.",
+            },
+          },
+          {
+            event_id: "writer-start",
+            event_type: "workforce_delegation_start",
+            timestamp: 5000,
+            data: {
+              worker_task_id: "agent_writer_run",
+              worker_alias: "Writer",
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByRole("heading", {
+      name: /traceEventRenderer.delegateToWorker:Researcher/,
+    })).toBeInTheDocument()
+    expect(screen.getByText("Research Complete")).toBeInTheDocument()
+    expect(screen.getByText("The evidence is ready for script writing.")).toBeInTheDocument()
+
+    const pageText = document.body.textContent || ""
+    expect(pageText.indexOf("traceEventRenderer.delegateToWorker:Researcher"))
+      .toBeLessThan(pageText.indexOf("Research Complete"))
+    expect(pageText.indexOf("Research Complete"))
+      .toBeLessThan(pageText.indexOf("traceEventRenderer.delegateToWorker:Writer"))
+  })
+
+  it("can render completed Agent details expanded by default", () => {
+    render(
+      <TraceEventRenderer
+        defaultExpandSteps
+        events={[
+          {
+            event_id: "worker-start",
+            event_type: "react_task_start",
+            step_id: "react-worker",
+            timestamp: Date.now(),
+            data: {
+              source: "xagent-agent-tool-child",
+              worker_task_id: "agent_17_d8306189",
+              agent_name: "Video Generation Agent",
+            },
+          },
+          {
+            event_id: "worker-end",
+            event_type: "react_task_end",
+            step_id: "react-worker",
+            timestamp: Date.now() + 1,
+            data: {
+              source: "xagent-agent-tool-child",
+              worker_task_id: "agent_17_d8306189",
+              agent_name: "Video Generation Agent",
+              result: "Pilot scenes generated",
+            },
+          },
+        ]}
+        taskStatus="completed"
+      />,
+    )
+
+    expect(screen.getByRole("button", { name: "Video Generation Agent" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    )
+    expect(screen.queryByRole("button", {
+      name: "traceEventRenderer.hideProcess",
+    })).not.toBeInTheDocument()
+  })
+
+  it("groups delegated agent internals into the worker execution step", () => {
+    const timestamp = Date.now()
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "delegation-start",
+            event_type: "workforce_delegation_start",
+            timestamp,
+            data: {
+              worker_task_id: "agent_17_run",
+              worker_alias: "Video Generation Agent",
+              tool_name: "agent_17",
+            },
+          },
+          {
+            event_id: "child-react-start",
+            event_type: "react_task_start",
+            step_id: "react-child",
+            timestamp: timestamp + 1,
+            data: {
+              source: "xagent-agent-tool-child",
+              worker_task_id: "agent_17_run",
+              agent_name: "Video Generation Agent",
+            },
+          },
+          {
+            event_id: "child-tool-start",
+            event_type: "tool_execution_start",
+            step_id: "react-child",
+            timestamp: timestamp + 2,
+            data: {
+              source: "xagent-agent-tool-child",
+              worker_task_id: "agent_17_run",
+              agent_name: "Video Generation Agent",
+              tool_name: "generate_video",
+              tool_call_id: "video-call-1",
+              tool_params: { seconds: "4" },
+            },
+          },
+          {
+            event_id: "child-tool-failed",
+            event_type: "tool_execution_failed",
+            step_id: "react-child",
+            timestamp: timestamp + 3,
+            data: {
+              source: "xagent-agent-tool-child",
+              worker_task_id: "agent_17_run",
+              agent_name: "Video Generation Agent",
+              tool_name: "generate_video",
+              tool_call_id: "video-call-1",
+              error: "Invalid duration",
+            },
+          },
+        ]}
+      />,
+    )
+
+    const workerToggle = screen
+      .getAllByRole("button", { name: /Video Generation Agent/ })
+      .find((button) => button.hasAttribute("aria-expanded"))
+    expect(workerToggle).toBeDefined()
+    if (workerToggle?.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(workerToggle)
+    }
+
+    const toolToggle = screen.getByRole("button", { name: /generate_video/ })
+    fireEvent.click(toolToggle)
+    expect(screen.getByText("Invalid duration")).toBeInTheDocument()
   })
 
   it("renders workforce delegation failures as errors", () => {
@@ -730,10 +933,9 @@ describe("TraceEventRenderer", () => {
       />,
     )
 
-    const stepToggle = screen.getByRole("button", {
+    expect(screen.getByRole("button", {
       name: /traceEventRenderer.delegateToWorker:Researcher/,
-    })
-    fireEvent.click(stepToggle)
+    })).toBeInTheDocument()
 
     const errorToggle = screen.getByRole("button", {
       name: /traceEventRenderer.workerFailed/,

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.retry.wrapper import create_retry_wrapper
 from xagent.core.tools.adapters.vibe.vision_tool import VisionTool, get_vision_tool
 from xagent.web.services.model_service import get_default_vision_model
 
@@ -218,6 +219,28 @@ class TestVisionToolUnderstandImages:
             == "This is a beautiful landscape photo with mountains and a lake."
         )
         assert result.images_processed == 1
+
+    @pytest.mark.asyncio
+    async def test_understand_reports_model_name_through_retry_wrapper(self) -> None:
+        model = Mock(spec=BaseLLM)
+        model.model_name = "deepseek/deepseek-v4-flash"
+        model.model_id = "configured-model-id"
+        model.vision_chat = AsyncMock(return_value="Token usage details")
+        model.has_ability = Mock(return_value=True)
+        wrapped_model = create_retry_wrapper(
+            model,
+            BaseLLM,
+            retry_methods={"vision_chat"},
+        )
+
+        result = await VisionTool(wrapped_model).understand_images(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            "Read the token usage.",
+        )
+
+        assert wrapped_model.__class__.__name__ == "GenericRetryWrapper"
+        assert result.success is True
+        assert result.model_used == "deepseek/deepseek-v4-flash"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

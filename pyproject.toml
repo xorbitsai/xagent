@@ -44,6 +44,7 @@ dependencies = [
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",
   "pillow >= 10.0.0",
+  "pypinyin>=0.53.0",
   "lancedb>=0.13.0",
   "pyarrow>=16.1.0",
   # Basic document processing (keep pypdf for basic PDF support)

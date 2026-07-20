@@ -384,7 +384,7 @@ def _build_tool_start(
 
     For legacy ``call_agent_<name>`` delegation tool names we extract
     the suffix for backward-compatible display. Canonical ``agent_<id>``
-    names are already the stable public identifier.
+    and semantic Workforce tool names are already stable public identifiers.
 
     The args/input value lives under different keys depending on which
     runtime emitted the event: v1 uses ``tool_args``, v2 uses

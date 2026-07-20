@@ -208,6 +208,39 @@ def test_tool_execution_agent_id_tool_becomes_agent_delegation():
     assert "result" not in s["data"]
 
 
+def test_tool_execution_semantic_workforce_tool_becomes_agent_delegation():
+    """Semantic Workforce tool names remain agent delegation steps."""
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="s4",
+            data={
+                "tool_name": "worker_preproduction_qa__a18",
+                "tool_args": {"task": "review"},
+                "tool_execution_id": "tx-workforce",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="s4",
+            data={
+                "tool_name": "worker_preproduction_qa__a18",
+                "tool_args": {"task": "review"},
+                "tool_execution_id": "tx-workforce",
+                "result": {"status": "approved"},
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 4, tzinfo=timezone.utc),
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "agent_delegation"
+    assert steps[0]["data"]["sub_agent_name"] == ("worker_preproduction_qa__a18")
+
+
 def test_tool_execution_legacy_call_agent_trace_still_maps_to_delegation():
     """Historical traces with ``call_agent_<name>`` remain readable."""
     events = [

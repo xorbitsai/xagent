@@ -1,5 +1,6 @@
 """Tests for the model-invocable ``store_memory`` tool."""
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -113,6 +114,22 @@ async def test_store_memory_enforces_per_run_quota() -> None:
     assert result["success"] is False
     assert "limit" in result["error"]
     assert len(store.added) == 2
+
+
+@pytest.mark.asyncio
+async def test_store_memory_serializes_concurrent_quota_checks() -> None:
+    store = RecordingMemoryStore()
+    tool = StoreMemoryTool(memory_store=store, task="task", max_stores=1)
+
+    results = await asyncio.gather(
+        tool.execute(content="First concurrent insight."),
+        tool.execute(content="Second concurrent insight."),
+    )
+
+    assert sum(result.get("stored") is True for result in results) == 1
+    assert sum("limit" in result.get("error", "") for result in results) == 1
+    assert len(store.added) == 1
+    assert tool.stored_count == 1
 
 
 @pytest.mark.asyncio
@@ -272,6 +289,19 @@ async def test_update_memory_replaces_content() -> None:
     assert result == {"success": True, "memory_id": "mem-1"}
     assert store.updated[0].content == "Corrected fact."
     assert store.updated[0].metadata["updated_by_task"] == "current task"
+
+
+@pytest.mark.asyncio
+async def test_update_memory_initializes_missing_metadata() -> None:
+    note = _note("mem-1", "Old fact.")
+    note.metadata = None  # type: ignore[assignment]
+    store = CrudMemoryStore({"mem-1": note})
+    tool = UpdateMemoryTool(memory_store=store, task="current task")
+
+    result = await tool.execute(memory_id="mem-1", content="Corrected fact.")
+
+    assert result == {"success": True, "memory_id": "mem-1"}
+    assert store.updated[0].metadata == {"updated_by_task": "current task"}
 
 
 @pytest.mark.asyncio

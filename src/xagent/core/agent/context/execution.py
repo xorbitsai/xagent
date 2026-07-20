@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from ...file_ref import FILE_REF_OUTPUT_INSTRUCTIONS
+from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -367,7 +367,7 @@ class ExecutionContext:
         return str(self.metadata.get("task") or "").strip()
 
     def _system_context(self) -> str:
-        parts = [self._current_time_context(), FILE_REF_OUTPUT_INSTRUCTIONS]
+        parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
         current_task = self._current_user_request_text()
         if current_task and not dag_step_id:

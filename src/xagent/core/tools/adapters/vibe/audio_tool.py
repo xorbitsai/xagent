@@ -75,6 +75,21 @@ class AudioTool(AudioToolCore):
             default_tts_model,
         )
 
+    async def _transcribe_audio_by_file_ref(
+        self,
+        file_path_or_id: str,
+        language: Optional[str] = None,
+        model_id: Optional[str] = None,
+        verbose: bool = False,
+    ) -> Dict[str, Any]:
+        """Transcribe audio referenced by a workspace file ID, path, or URL."""
+        return await super().transcribe_audio(
+            audio_file_path=file_path_or_id,
+            language=language,
+            model_id=model_id,
+            verbose=verbose,
+        )
+
     def get_tools(self) -> list:
         """Get all tool instances."""
         # Format descriptions with model information
@@ -91,7 +106,7 @@ class AudioTool(AudioToolCore):
         )
         tools = [
             AudioFunctionTool(
-                self.transcribe_audio,
+                self._transcribe_audio_by_file_ref,
                 name="transcribe_audio",
                 description=transcribe_description,
                 owner=self,

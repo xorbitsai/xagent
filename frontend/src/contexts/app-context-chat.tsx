@@ -1569,6 +1569,20 @@ export function AppProvider({
             step_id: message.step_id || traceEventData.step_id || (traceEventData.data || {}).step_id,
             task_id: message.task_id || traceEventData.task_id || (traceEventData.data || {}).task_id,
           }
+          const isDelegatedChildEvent =
+            eventData.source === "xagent-agent-tool-child"
+          const addDelegatedChildTraceEvent = () => {
+            dispatch({
+              type: "ADD_TRACE_EVENT",
+              payload: {
+                event_id: message.event_id || eventData.event_id || generateMessageId("trace-agent-child"),
+                event_type: eventType,
+                step_id: message.step_id || eventData.step_id,
+                timestamp: message.timestamp?.toString() || Date.now().toString(),
+                data: eventData,
+              }
+            })
+          }
 
           // Handle structured trace events
           if (eventType === "task_info") {
@@ -1661,6 +1675,13 @@ export function AppProvider({
 
           // User Message Events
           else if (eventType === "user_message") {
+            // A delegated Agent's task prompt is execution detail, not another
+            // user turn in the parent Workforce conversation. Keep it in the
+            // trace store so the Agent inspector can still render it live.
+            if (isDelegatedChildEvent) {
+              addDelegatedChildTraceEvent()
+              return
+            }
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             const messageContent = eventData.message || eventData.content || ""
             const userMessageId = stableUserMessageId(
@@ -1794,8 +1815,36 @@ export function AppProvider({
             })
           }
 
+          // Workforce delegation events stay in the manager timeline as compact
+          // summaries. Their child traces are fetched only after the user opens
+          // the agent execution drawer.
+          else if (
+            eventType === "workforce_delegation_start" ||
+            eventType === "workforce_delegation_end" ||
+            eventType === "workforce_delegation_error"
+          ) {
+            dispatch({
+              type: "ADD_TRACE_EVENT",
+              payload: {
+                event_id: message.event_id || eventData.event_id || generateMessageId("trace-workforce-delegation"),
+                event_type: eventType,
+                step_id: message.step_id || eventData.step_id,
+                timestamp: message.timestamp?.toString() || Date.now().toString(),
+                data: eventData,
+              }
+            })
+          }
+
           // Agent-to-user messages, including ask_user_question prompts.
           else if (eventType === "agent_message" || eventType === "ai_message") {
+            // Child Agent output belongs exclusively to the on-demand Agent
+            // inspector. Rendering it as parent chat content makes live state
+            // disagree with historical replay and can expose child clarifiers
+            // as if the Workforce manager asked them.
+            if (isDelegatedChildEvent) {
+              addDelegatedChildTraceEvent()
+              return
+            }
             const rawMessageContent = eventData.message || eventData.content || ""
             const messageContent =
               typeof rawMessageContent === "string"

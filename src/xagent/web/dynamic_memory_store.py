@@ -189,11 +189,11 @@ class DynamicMemoryStoreManager:
 
     def _check_and_update_store(self) -> None:
         """Check if embedding model configuration has changed and update store accordingly."""
-        embedding_model = self._get_embedding_model_from_db()
-        current_model_id = embedding_model.id if embedding_model else None
-        current_fingerprint = _embedding_model_fingerprint(embedding_model)
-
         with self._lock:
+            embedding_model = self._get_embedding_model_from_db()
+            current_model_id = embedding_model.id if embedding_model else None
+            current_fingerprint = _embedding_model_fingerprint(embedding_model)
+
             # Check if we need to update the store
             should_update = False
 

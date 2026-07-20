@@ -100,6 +100,7 @@ from ..services.workforce_runtime import (
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
+from .public_trace_events import public_task_trace_filter
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,7 @@ def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
         db.query(func.max(TraceEvent.id))
         .filter(
             TraceEvent.task_id == task_id,
-            TraceEvent.build_id.is_(None),
+            public_task_trace_filter(TraceEvent),
         )
         .scalar()
         or 0

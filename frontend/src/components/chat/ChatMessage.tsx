@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import { Bot, ChevronDown, ChevronUp, Copy, Check } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { TraceEventRenderer } from "./TraceEventRenderer";
+import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
@@ -74,6 +74,7 @@ export interface ChatMessageProps {
   interactionsActive?: boolean;
   showEmptyStatus?: boolean;
   onOpenExecutionPlan?: () => void;
+  onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
   onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
 }
 
@@ -282,6 +283,7 @@ export function ChatMessage({
   interactionsActive = true,
   showEmptyStatus = true,
   onOpenExecutionPlan,
+  onAgentExecutionClick,
   onSendInteraction,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
@@ -371,6 +373,7 @@ export function ChatMessage({
             events={traceEvents}
             taskStatus={resolvedProcessStatus}
             onOpenExecutionPlan={onOpenExecutionPlan}
+            onAgentExecutionClick={onAgentExecutionClick}
           />
         </div>
       )}

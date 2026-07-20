@@ -43,6 +43,31 @@ const ev = (event_type: string, data: Record<string, unknown>) => ({
 const stepStart = ev("dag_step_start", { step_name: "Search" })
 
 describe("processTraceEvents tool_call_id attribution", () => {
+  it("normalizes malformed trace data before nested access", () => {
+    const malformedEvents = [
+      {
+        event_type: "workforce_delegation_start",
+        step_id: "worker-null",
+        timestamp: 1,
+        data: null,
+      },
+      {
+        event_type: "workforce_delegation_end",
+        step_id: "worker-string",
+        timestamp: 2,
+        data: "not-an-object",
+      },
+      {
+        event_type: "tool_execution_start",
+        step_id: "worker-array",
+        timestamp: 3,
+        data: [],
+      },
+    ]
+
+    expect(() => processTraceEvents(malformedEvents as never, t)).not.toThrow()
+  })
+
   it("attributes concurrent same-name tool results by tool_call_id", () => {
     const events = [
       stepStart,

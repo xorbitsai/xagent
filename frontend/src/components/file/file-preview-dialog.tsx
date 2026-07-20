@@ -10,6 +10,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { FileViewer } from "@/components/file/file-viewer"
 import { FilePreviewActionButtons } from "@/components/file/file-preview-action-buttons"
+import { isTextPreviewFile } from "@/lib/file-preview-utils"
 
 interface FilePreviewDialogProps {
   open: boolean
@@ -57,7 +58,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
           if (response.ok) {
             const contentType = response.headers.get('content-type') || ''
             const mimeType = contentType.split(';')[0].trim().toLowerCase()
-            const isTextType = mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/xml' || mimeType === 'application/javascript'
+            const isTextType = isTextPreviewFile(filePreview.fileName, mimeType)
 
             let fileContent
             if (!isTextType) {

@@ -832,6 +832,81 @@ def test_detail_returns_trace_events() -> None:
     assert events[0]["data"]["tool_name"] == "search"
 
 
+def test_detail_includes_delegated_agent_traces_but_not_builder_traces() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Workforce Manager")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Workforce trace task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        input_text="coordinate workers",
+    )
+
+    db = _direct_db_session()
+    try:
+        now = datetime.now(timezone.utc)
+        db.add_all(
+            [
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="top-level",
+                    event_type="react_task_start",
+                    timestamp=now,
+                    data={"pattern": "ReActPattern"},
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="delegated-child",
+                    event_type="tool_execution_start",
+                    timestamp=now,
+                    build_id="agent_17_run",
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "agent_name": "Video Generation Agent",
+                        "tool_name": "generate_video",
+                        "authorization": "Bearer delegated-secret",
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="audit-only-child",
+                    event_type="tool_execution_start",
+                    timestamp=now,
+                    build_id="agent_17_run",
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "__audit_only__": True,
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="builder-only",
+                    event_type="tool_execution_start",
+                    timestamp=now,
+                    build_id="builder-session",
+                    data={"source": "agent-builder", "tool_name": "internal"},
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+    assert resp.status_code == 200, resp.text
+    events = resp.json()["trace_events"]
+    assert [event["event_id"] for event in events] == [
+        "top-level",
+        "delegated-child",
+    ]
+    assert events[1]["data"]["authorization"] == "[REDACTED_RUNTIME_SECRET]"
+
+
 def test_compaction_notice_sorts_between_messages_on_equal_timestamp() -> None:
     headers = _admin_headers()
     user_id = _user_id("admin")

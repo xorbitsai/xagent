@@ -3005,6 +3005,9 @@ const zh = {
           action_end_compact: "上下文压缩完成",
           skill_select_start: "技能选择开始",
           skill_select_end: "技能选择完成",
+          workforce_delegation_start: "代理委派开始",
+          workforce_delegation_end: "代理委派完成",
+          workforce_delegation_error: "代理委派失败",
         },
         messages: {
           planStart: "开始生成执行计划: {phase}",
@@ -3297,7 +3300,8 @@ const zh = {
     delegateToWorker: "委派给 {worker}",
     workerReturned: "Worker 已返回结果",
     workerFailed: "Worker 执行失败",
-    unknownWorker: "未知 Worker"
+    unknownWorker: "未知 Worker",
+    viewAgentExecution: "查看 Agent 详情"
   },
   deploy_agent: {
     title: "部署 Agent",
@@ -3691,6 +3695,10 @@ const zh = {
       completed: "已完成",
       running: "运行中",
       failed: "失败",
+      pending: "等待中",
+      paused: "已暂停",
+      waitingForUser: "等待输入",
+      interrupted: "已中断",
     },
     sourceTypes: {
       existing: "已有 Agent"
@@ -3894,6 +3902,17 @@ const zh = {
     run: {
       testTitle: "测试 Workforce",
       live: "在线",
+      historyTitle: "运行历史",
+      newRun: "新运行",
+      emptyHistory: "暂无历史运行",
+      untitledRun: "未命名运行",
+      loadMore: "加载更多",
+      closeHistory: "关闭运行历史",
+      loadingAgentExecution: "正在加载 Agent 执行详情...",
+      agentExecutionResult: "Agent 原始输出",
+      emptyAgentExecution: "暂无 Agent 执行详情。",
+      agentExecutionLoadError: "无法加载 Agent 执行详情。",
+      retryAgentExecution: "重试",
       placeholder: "告诉 {manager} 要做什么...",
       inputHint: "你的团队负责人将自动协调各子 Agent。",
       readyTitle: "随时准备就绪",
@@ -3986,6 +4005,8 @@ const zh = {
       updateWorker: "更新 worker 失败",
       removeWorker: "移除 worker 失败",
       run: "运行 Workforce 失败",
+      loadHistory: "加载运行历史失败",
+      download: "下载文件失败",
       notFound: "没有找到 Workforce。",
       loadCanvas: "加载 Workforce 画布失败",
       canvasUnavailable: "画布不可用。",

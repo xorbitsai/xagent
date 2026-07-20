@@ -7,7 +7,9 @@ from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
     get_execution_scope,
 )
-from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
+from xagent.core.tools.adapters.vibe.agent_tool_names import (
+    gen_workforce_agent_tool_name,
+)
 from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
 
@@ -58,7 +60,7 @@ def normalize_text(
 
 
 def build_worker_tool_name(agent_id: int, alias: str | None = None) -> str:
-    return gen_agent_tool_name(agent_id)
+    return gen_workforce_agent_tool_name(agent_id, alias)
 
 
 def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
@@ -124,12 +126,17 @@ def build_manager_system_prompt(snapshot: dict[str, Any]) -> str:
         "4. Consolidate Worker results into one final answer.",
         "5. If Worker outputs conflict, resolve the conflict or explain uncertainty.",
         "6. Do not expose internal tool names unless necessary.",
+        "7. Use the exact tool name shown for each Worker Agent. Never infer a "
+        "tool name from worker order or agent ids.",
         "",
         "Available Worker Agents:",
     ]
     for worker in workers:
         alias = worker.get("alias") or worker["name"]
-        lines.append(f"- {alias}: {worker['assignment_instructions']}")
+        lines.append(
+            f"- {alias} (tool: {worker['tool_name']}): "
+            f"{worker['assignment_instructions']}"
+        )
     return "\n".join(lines)
 
 
@@ -157,13 +164,16 @@ def build_agent_tool_overrides(
     overrides: dict[int, dict[str, Any]] = {}
     for worker in snapshot["workers"]:
         alias = worker.get("alias") or worker["name"]
+        tool_name = worker.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            tool_name = build_worker_tool_name(int(worker["agent_id"]), alias)
         description_parts = []
         if worker.get("description"):
             description_parts.append(worker["description"])
         description_parts.append(f"Workforce role: {alias}.")
         description_parts.append(f"Assignment: {worker['assignment_instructions']}")
         overrides[int(worker["agent_id"])] = {
-            "tool_name": build_worker_tool_name(int(worker["agent_id"])),
+            "tool_name": tool_name,
             "description": " ".join(description_parts),
             "extra_system_prompt": build_worker_system_prompt(
                 workforce_name, worker["assignment_instructions"]

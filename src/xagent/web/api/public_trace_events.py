@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import or_
+
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
@@ -23,6 +25,7 @@ WORKFORCE_DELEGATION_EVENT_TYPES = frozenset(
     }
 )
 WORKFORCE_DELEGATION_INTERNAL_EVENT_TYPE = "task_update_general"
+DELEGATED_AGENT_TRACE_SOURCE = "xagent-agent-tool-child"
 
 WORKFORCE_DELEGATION_PUBLIC_FIELDS = (
     "status",
@@ -40,6 +43,14 @@ WORKFORCE_DELEGATION_PUBLIC_FIELDS = (
     "error",
     "file_outputs",
 )
+
+
+def public_task_trace_filter(trace_model: Any) -> Any:
+    """Include top-level task traces and delegated child-agent traces."""
+    return or_(
+        trace_model.build_id.is_(None),
+        trace_model.data["source"].as_string() == DELEGATED_AGENT_TRACE_SOURCE,
+    )
 
 
 def is_audit_only_trace_data(data: Any) -> bool:

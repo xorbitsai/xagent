@@ -5,6 +5,7 @@ import { FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
+import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
 import { CompactionNotice } from "@/components/chat/CompactionNotice"
 import { ContextUsageRing } from "@/components/chat/ContextUsageRing"
 import { TokenUsageDisplay } from "@/components/chat/TokenUsageDisplay"
@@ -38,6 +39,7 @@ interface TaskConversationPanelProps {
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>
   deferFileUpload?: boolean
   onSend?: (message: string, config?: any, files?: File[]) => Promise<void> | void
+  onAgentExecutionClick?: (execution: AgentExecutionSummary) => void
 }
 
 type CombinedItem = {
@@ -76,6 +78,43 @@ const toTimestampMs = (timestamp: unknown): number => {
   }
 
   return time < 100000000000 ? time * 1000 : time
+}
+
+const isDelegatedChildTraceEvent = (event: unknown): boolean => {
+  if (!event || typeof event !== "object") return false
+  const data = (event as { data?: unknown }).data
+  return Boolean(
+    data &&
+    typeof data === "object" &&
+    (data as Record<string, unknown>).source === "xagent-agent-tool-child",
+  )
+}
+
+const isAgentDelegationToolName = (toolName: string): boolean => (
+  /^agent_(?:[1-9]\d*|[a-z0-9_]+__a[1-9]\d*)$/.test(toolName) ||
+  /^worker_[a-z0-9_]+__a[1-9]\d*$/.test(toolName)
+)
+
+const isWorkforceAgentToolTraceEvent = (event: unknown): boolean => {
+  if (!event || typeof event !== "object") return false
+  const traceEvent = event as { event_type?: unknown; data?: unknown }
+  if (![
+    "tool_execution_start",
+    "tool_execution_end",
+    "tool_execution_failed",
+  ].includes(String(traceEvent.event_type || ""))) {
+    return false
+  }
+
+  const data = traceEvent.data
+  if (!data || typeof data !== "object") return false
+  const record = data as Record<string, unknown>
+  if (record.source === "xagent-agent-tool-child") return false
+  const response = record.response && typeof record.response === "object"
+    ? record.response as Record<string, unknown>
+    : null
+  const toolName = String(record.tool_name || response?.tool_name || "")
+  return isAgentDelegationToolName(toolName)
 }
 
 const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
@@ -148,6 +187,7 @@ export function TaskConversationPanel({
   uploadFile,
   deferFileUpload = false,
   onSend,
+  onAgentExecutionClick,
 }: TaskConversationPanelProps) {
   const { state, sendMessage, pauseTask, resumeTask, openFilePreview, closeFilePreview, requestStatus, dispatch, getFileDownloadUrl } = useApp()
   const { t } = useI18n()
@@ -159,6 +199,23 @@ export function TaskConversationPanel({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const anyPreviewOpen = mode === "page" && (state.filePreview.isOpen || dagPreviewOpen)
+  const hideDelegatedChildTraces = Boolean(onAgentExecutionClick)
+  const shouldHideWorkforceInternalTrace = useCallback(
+    (event: unknown) =>
+      hideDelegatedChildTraces && (
+        isDelegatedChildTraceEvent(event) ||
+        isWorkforceAgentToolTraceEvent(event)
+      ),
+    [hideDelegatedChildTraces],
+  )
+  const managerTraceEvents = useMemo(
+    () => Array.isArray(state.traceEvents)
+      ? state.traceEvents.filter(
+        (event: unknown) => !shouldHideWorkforceInternalTrace(event),
+      )
+      : [],
+    [shouldHideWorkforceInternalTrace, state.traceEvents],
+  )
 
   const openDagPreview = useCallback(() => {
     closeFilePreview()
@@ -187,7 +244,9 @@ export function TaskConversationPanel({
             role: message.role,
             isResult: message.isResult,
           }),
-          traceEvents: message.traceEvents,
+          traceEvents: message.traceEvents?.filter(
+            (event: unknown) => !shouldHideWorkforceInternalTrace(event),
+          ),
           interactions: message.interactions,
           isSystemNotice: message.isSystemNotice,
         }
@@ -195,7 +254,7 @@ export function TaskConversationPanel({
 
     items.sort((a, b) => a.timestamp - b.timestamp)
     return items
-  }, [state.messages])
+  }, [shouldHideWorkforceInternalTrace, state.messages])
 
   const lastMessageItem = [...messageItems]
     .reverse()
@@ -238,8 +297,8 @@ export function TaskConversationPanel({
       }
     }
 
-    if (Array.isArray(state.traceEvents)) {
-      state.traceEvents.forEach((event: unknown, index: number) => {
+    if (managerTraceEvents.length > 0) {
+      managerTraceEvents.forEach((event: unknown, index: number) => {
         addProcessEvent(event, `state-${index}`)
       })
     }
@@ -301,12 +360,16 @@ export function TaskConversationPanel({
         groupIndex >= userTurnCount
       const isCurrentTurnGroup =
         groupIndex >= userTurnCount && groupIndex === latestGroupIndex
+      const inferredProcessStatus = resolveTraceProcessStatus({ traceEvents: events })
       const processStatus = isCurrentTurnGroup
         ? resolveTraceProcessStatus({
             processStatus: state.currentTask?.status,
             traceEvents: events,
           })
-        : resolveTraceProcessStatus({ traceEvents: events })
+        // A later user turn closes this process group. If the old trace has no
+        // terminal event (for example, a server restart interrupted a nested
+        // Agent call), do not leave it spinning forever after replay.
+        : inferredProcessStatus || "completed"
 
       items.push({
         id: `process-${groupIndex}-${firstEvent?.event_id || groupTimestamp}`,
@@ -332,11 +395,11 @@ export function TaskConversationPanel({
     hasFinalAssistantMessage,
     messageItems,
     state.currentTask?.status,
-    state.traceEvents,
+    managerTraceEvents,
   ])
 
   const currentTurnTraceEvents = useMemo(() => {
-    if (!Array.isArray(state.traceEvents) || state.traceEvents.length === 0) {
+    if (managerTraceEvents.length === 0) {
       return []
     }
 
@@ -344,22 +407,22 @@ export function TaskConversationPanel({
     const userTurnAnchors = getUserTimelineAnchors(sortedMessages)
     const userTurnCount = userTurnAnchors.length
     if (userTurnCount === 0) {
-      return state.traceEvents
+      return managerTraceEvents
     }
 
-    return state.traceEvents.filter((event: any) => {
+    return managerTraceEvents.filter((event: any) => {
       const eventTime = toTimestampMs(event?.timestamp)
       return getProcessGroupIndex(userTurnAnchors, eventTime) >= userTurnCount
     })
-  }, [messageItems, state.traceEvents])
+  }, [managerTraceEvents, messageItems])
 
   const waitingPrompt = useMemo(
-    () => findWaitingPrompt(state.currentTask, state.traceEvents as any[]),
-    [state.currentTask, state.traceEvents]
+    () => findWaitingPrompt(state.currentTask, managerTraceEvents as any[]),
+    [managerTraceEvents, state.currentTask]
   )
   const waitingInteractions = useMemo(
-    () => findWaitingInteractions(state.currentTask, state.traceEvents as any[]),
-    [state.currentTask, state.traceEvents]
+    () => findWaitingInteractions(state.currentTask, managerTraceEvents as any[]),
+    [managerTraceEvents, state.currentTask]
   )
 
   const activeWaitingMessageId = useMemo(() => {
@@ -644,6 +707,7 @@ export function TaskConversationPanel({
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
+                        onAgentExecutionClick={onAgentExecutionClick}
                       />
                     )
                   })}
@@ -660,6 +724,7 @@ export function TaskConversationPanel({
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
+                      onAgentExecutionClick={onAgentExecutionClick}
                     />
                   )}
                 </>

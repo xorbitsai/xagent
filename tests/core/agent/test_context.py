@@ -549,6 +549,18 @@ def test_get_messages_for_llm_injects_time_context_without_system_prompt() -> No
     assert result[1] == {"role": "user", "content": "what happened recently?"}
 
 
+def test_get_messages_for_llm_injects_canonical_file_reference_rules() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("Transcribe the generated audio.")
+
+    result = ctx.get_messages_for_llm()
+
+    system_content = result[0]["content"]
+    assert "## FILE REFERENCES" in system_content
+    assert "Treat file_id as the canonical file handle" in system_content
+    assert "Use file_id when reading files or passing files to tools" in system_content
+
+
 def test_get_messages_for_llm_injects_current_request_focus() -> None:
     ctx = ExecutionContext()
     ctx.metadata["task"] = "Compare Mistral, OpenAI, and Anthropic ARR."

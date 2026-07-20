@@ -22,6 +22,11 @@ from ..services.file_reference_output_service import (
     reconcile_assistant_file_references,
 )
 from ..utils.db_timezone import format_datetime_for_api
+from .public_trace_events import (
+    is_audit_only_trace_data,
+    normalize_public_trace_event,
+    public_task_trace_filter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +334,10 @@ def _serialize_trace_events(db: Session, task_id: int) -> list[dict[str, Any]]:
 
     events = (
         db.query(TraceEvent)
-        .filter(TraceEvent.task_id == task_id, TraceEvent.build_id.is_(None))
+        .filter(
+            TraceEvent.task_id == task_id,
+            public_task_trace_filter(TraceEvent),
+        )
         .order_by(TraceEvent.id.asc())
         .all()
     )
@@ -346,17 +354,24 @@ def _serialize_trace_events(db: Session, task_id: int) -> list[dict[str, Any]]:
             "Failed to decode trace events for task %s", task_id, exc_info=True
         )
         return []
-    return [
-        {
-            "event_id": e.event_id,
-            "event_type": e.event_type,
-            "step_id": e.step_id,
-            "timestamp": _event_epoch(e.timestamp),
-            "data": data,
-            "parent_event_id": e.parent_event_id,
-        }
-        for e, data in zip(events, decoded)
-    ]
+    serialized: list[dict[str, Any]] = []
+    for event, data in zip(events, decoded):
+        if is_audit_only_trace_data(data):
+            continue
+        event_type, public_data = normalize_public_trace_event(
+            str(event.event_type), data
+        )
+        serialized.append(
+            {
+                "event_id": event.event_id,
+                "event_type": event_type,
+                "step_id": event.step_id,
+                "timestamp": _event_epoch(event.timestamp),
+                "data": public_data,
+                "parent_event_id": event.parent_event_id,
+            }
+        )
+    return serialized
 
 
 def _serialize_trigger_metadata(

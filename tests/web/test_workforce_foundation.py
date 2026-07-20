@@ -170,7 +170,17 @@ def test_build_workforce_snapshot_for_active_workforce(db_session: Session) -> N
         }
     ]
     assert overrides[worker_agent.id]["workforce_run_id"] == 123
-    assert overrides[worker_agent.id]["tool_name"] == f"agent_{worker_agent.id}"
+    assert overrides[worker_agent.id]["tool_name"] == (
+        f"worker_research_analyst__a{worker_agent.id}"
+    )
+    assert (
+        f"Research Analyst (tool: worker_research_analyst__a{worker_agent.id})"
+        in snapshot["manager"]["runtime_prompt"]
+    )
+
+    snapshot["workers"][0]["tool_name"] = f"agent_{worker_agent.id}"
+    legacy_overrides = build_agent_tool_overrides(snapshot, workforce_run_id=124)
+    assert legacy_overrides[worker_agent.id]["tool_name"] == f"agent_{worker_agent.id}"
 
 
 def test_validate_workforce_run_allows_draft_preview_and_requires_enabled_workers(
@@ -359,7 +369,14 @@ def test_workforce_status_and_tool_name_normalization() -> None:
     assert normalize_workforce_run_status(None) == "pending"
     assert normalize_workforce_run_status(" Paused ") == "paused"
     assert normalize_workforce_run_status(" Completed ") == "completed"
-    assert tool_name == "agent_99"
+    assert tool_name == (
+        "worker_this_worker_alias_is_long_enough_to_require_stable__a99"
+    )
+    assert len(tool_name) <= 64
+    assert build_worker_tool_name(98, "Duplicate Name") != build_worker_tool_name(
+        99, "Duplicate Name"
+    )
+    assert build_worker_tool_name(42, "重复名字") == "worker_chong_fu_ming_zi__a42"
 
     with pytest.raises(HTTPException) as status_error:
         normalize_workforce_status("unknown")

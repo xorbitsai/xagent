@@ -23,7 +23,7 @@ from .....web.tools.config import WebToolConfig
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
-from .agent_tool_names import gen_agent_tool_name
+from .agent_tool_names import gen_agent_tool_name, parse_agent_tool_id
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ def _assignable_tool_categories() -> list[str]:
 
 
 class _DelegatedAgentDatabaseTraceHandler:
-    """Persist child-agent traces without broadcasting them to the parent UI."""
+    """Persist child-agent traces in the parent task history."""
 
     def __init__(
         self,
@@ -64,6 +64,31 @@ class _DelegatedAgentDatabaseTraceHandler:
         self, execution_id: str
     ) -> Optional[dict[str, Any]]:
         return await self._handler.load_latest_checkpoint(execution_id)
+
+
+class _DelegatedAgentWebSocketTraceHandler:
+    """Broadcast safe child-agent traces on the parent task stream."""
+
+    def __init__(
+        self,
+        *,
+        task_id: int,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        from .....web.api.ws_trace_handlers import WebSocketTraceHandler
+
+        self.task_id = task_id
+        self.metadata = dict(metadata)
+        self._handler = WebSocketTraceHandler(task_id)
+
+    async def handle_event(self, event: Any) -> None:
+        original_data = event.data
+        base_data = original_data if isinstance(original_data, dict) else {}
+        event.data = {**base_data, **self.metadata}
+        try:
+            await self._handler.handle_event(event)
+        finally:
+            event.data = original_data
 
 
 def _normalize_agent_ids(agent_ids: Any) -> Optional[list[int]]:
@@ -800,7 +825,7 @@ class CreateAgentTool(AbstractBaseTool):
                 )
 
                 # Generate the tool name and markdown link
-                tool_name = gen_agent_tool_name(agent.id)
+                tool_name = gen_agent_tool_name(agent.id, agent.name)
                 markdown_link = f"[{agent_name}](agent://{agent.id})"
 
                 rename_note = ""
@@ -996,7 +1021,7 @@ class UpdateAgentTool(AbstractBaseTool):
                     return UpdateAgentToolResult(
                         agent_id=agent_id,
                         agent_name=agent.name,
-                        tool_name=gen_agent_tool_name(agent.id),
+                        tool_name=gen_agent_tool_name(agent.id, agent.name),
                         markdown_link=f"[{agent.name}](agent://{agent.id})",
                         status="error",
                         message=(
@@ -1098,7 +1123,7 @@ class UpdateAgentTool(AbstractBaseTool):
                     return UpdateAgentToolResult(
                         agent_id=agent_id,
                         agent_name=agent.name,
-                        tool_name=gen_agent_tool_name(agent.id),
+                        tool_name=gen_agent_tool_name(agent.id, agent.name),
                         markdown_link=f"[{agent.name}](agent://{agent.id})",
                         status="success",
                         message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
@@ -1113,7 +1138,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
                 # Generate the tool name and markdown link
                 agent_name = str(agent.name)
-                tool_name = gen_agent_tool_name(agent.id)
+                tool_name = gen_agent_tool_name(agent.id, agent.name)
                 markdown_link = f"[{agent_name}](agent://{agent.id})"
 
                 logger.info(
@@ -1275,7 +1300,7 @@ class ListAgentsTool(AbstractBaseTool):
                 # Build agent info list
                 agent_infos = []
                 for agent in agents:
-                    tool_name = gen_agent_tool_name(agent.id)
+                    tool_name = gen_agent_tool_name(agent.id, agent.name)
                     markdown_link = f"[{agent.name}](agent://{agent.id})"
 
                     agent_info = AgentInfo(
@@ -1369,8 +1394,8 @@ class AgentTool(AbstractBaseTool):
             user_id: User ID for model access
             task_id: Task ID for workspace isolation
             workspace_base_dir: Base directory for workspace files
-            tool_name: Deprecated delegated tool name override. Agent tools always
-                expose the canonical agent_<id> name.
+            tool_name: Optional delegated tool name override. The target agent id
+                remains bound to this tool independently of its public name.
             tool_description: Optional delegated tool description override
             extra_system_prompt: Optional system prompt appended during execution
             parent_task_id: Parent task ID for delegation metadata
@@ -1387,7 +1412,11 @@ class AgentTool(AbstractBaseTool):
         self._agent_id = agent_id
         self._agent_name = agent_name
         self._agent_description = agent_description
-        self._tool_name = tool_name
+        self._tool_name = (
+            tool_name.strip()
+            if isinstance(tool_name, str) and tool_name.strip()
+            else None
+        )
         self._tool_description = tool_description
         self._extra_system_prompt = extra_system_prompt
         self._session_factory = session_factory
@@ -1431,7 +1460,13 @@ class AgentTool(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Tool name."""
-        return gen_agent_tool_name(self._agent_id)
+        return self._tool_name or gen_agent_tool_name(self._agent_id, self._agent_name)
+
+    def matches_name(self, tool_name: str) -> bool:
+        """Match current and historical names without exposing duplicate schemas."""
+        return (
+            self.name == tool_name or parse_agent_tool_id(tool_name) == self._agent_id
+        )
 
     @property
     def description(self) -> str:
@@ -1559,6 +1594,12 @@ class AgentTool(AbstractBaseTool):
                 _DelegatedAgentDatabaseTraceHandler(
                     task_id=parent_db_task_id,
                     build_id=execution_task_id,
+                    metadata=metadata,
+                )
+            )
+            handlers.append(
+                _DelegatedAgentWebSocketTraceHandler(
+                    task_id=parent_db_task_id,
                     metadata=metadata,
                 )
             )

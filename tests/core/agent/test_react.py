@@ -4135,6 +4135,21 @@ def _tool_names_from_llm_call(call: dict[str, Any]) -> list[str]:
     return [tool["function"]["name"] for tool in list(call.get("tools") or [])]
 
 
+def test_find_tool_accepts_a_compatible_historical_name() -> None:
+    class RenamedTool:
+        name = "agent_research_assistant__a42"
+
+        @staticmethod
+        def matches_name(name: str) -> bool:
+            return name in {"agent_42", "agent_old_name__a42"}
+
+    tool = RenamedTool()
+    pattern = ReActPattern()
+
+    assert pattern._find_tool("agent_42", [tool]) is tool
+    assert pattern._find_tool("agent_old_name__a42", [tool]) is tool
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_exposes_store_memory_tool_with_memory_store() -> None:
     llm = FakeLLM(

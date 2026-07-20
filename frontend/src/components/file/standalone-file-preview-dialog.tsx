@@ -8,6 +8,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { FileViewer } from "@/components/file/file-viewer"
 import { FilePreviewActionButtons } from "@/components/file/file-preview-action-buttons"
+import { isTextPreviewFile } from "@/lib/file-preview-utils"
 
 interface StandaloneFilePreviewDialogProps {
   open: boolean
@@ -53,7 +54,7 @@ export function StandaloneFilePreviewDialog({
 
             // Determine if the response is binary based on MIME type
             // PPTX preview might return application/pdf or text/html
-            const isTextType = mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/xml' || mimeType === 'application/javascript'
+            const isTextType = isTextPreviewFile(fileName, mimeType)
 
             let fileContent
             if (!isTextType) {
@@ -96,7 +97,7 @@ export function StandaloneFilePreviewDialog({
 
       loadFileContent()
     }
-  }, [open, fileId, content, error, t])
+  }, [open, fileId, fileName, content, error, t])
 
   const handleDownload = async () => {
     if (fileId) {

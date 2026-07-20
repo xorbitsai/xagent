@@ -58,3 +58,16 @@ def test_unchanged_model_keeps_store_instance(monkeypatch) -> None:
     first = manager.get_memory_store()
     assert manager.check_embedding_model_change() is False
     assert manager.get_memory_store() is first
+
+
+def test_embedding_configuration_read_happens_under_lock(monkeypatch) -> None:
+    holder = {"model": _model(2, "2026-07-17 10:00:00", "key")}
+    manager = _manager_with_fake_db(monkeypatch, holder)
+
+    def get_model_under_lock() -> Any:
+        assert manager._lock._is_owned()  # type: ignore[attr-defined]
+        return holder["model"]
+
+    monkeypatch.setattr(manager, "_get_embedding_model_from_db", get_model_under_lock)
+
+    assert isinstance(manager.get_memory_store(), FakeLanceStore)

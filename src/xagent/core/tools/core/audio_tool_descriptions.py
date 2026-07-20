@@ -18,10 +18,11 @@ Available models (⭐[DEFAULT] marks the configured default model):
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
 
 Parameters:
-- audio_file_path (required): audio file path, file_id, or URL to transcribe
+- file_path_or_id (required): workspace file ID, audio file path, or URL to transcribe
 - language (optional): language code (e.g., 'zh', 'en', 'yue', 'ja', 'ko')
 - model_id (optional): specific ASR model to use. Omit to use the default model marked with ⭐[DEFAULT].
-- verbose (optional): Set to True if you need segment details in the return value. Default: False
+- verbose (optional): False returns processed, subtitle-friendly timestamp segments.
+  True preserves the ASR provider's raw word/segment timestamps. Default: False
 
 Language support:
 - 'zh': Chinese (Mandarin)
@@ -33,17 +34,23 @@ Language support:
 
 Audio formats: wav, mp3, m4a, flac, ogg, and other common formats
 
+File handling:
+- If an earlier tool returned a file_id, pass that exact file_id directly.
+- Do not copy a registered workspace file or construct a relative path for it.
+- Use a path or URL only when no workspace file_id is available.
+
 Advanced features (if supported by model):
 - Speaker diarization: identify different speakers
 - Timestamps: get word-level or segment-level timing
 - Confidence scores: get transcription confidence
-- Smart segment merging: consecutive segments from same speaker are automatically merged (gap < 1s) to improve readability
+- Raw timestamps: verbose=True preserves the provider's original word/segment timing without processing
+- Readable timestamps: verbose=False groups raw timing into subtitle-friendly cues using punctuation, pauses, speaker changes, duration, and text length
 
 Output:
 - file_id: File ID for accessing the full transcription JSON file in workspace
 - transcription_path: Path to saved transcription JSON file in workspace
 - saved_to_workspace: Whether the transcription was saved to workspace
-- segments: Detailed segment information (only present if verbose=True)
+- segments: Raw provider timing when verbose=True; processed readable timing when verbose=False
 - language: Detected language code
 - model_used: The actual model used for transcription
 - text_length: Length of transcribed text
@@ -69,14 +76,15 @@ JSON Output Format (saved to file specified by file_id):
   "metadata": {{
     "audio_source": "input_audio.mp3",
     "verbose_mode": true,
-    "total_segments": 10
+    "segment_view": "raw",
+    "raw_segment_count": 205,
+    "total_segments": 205
   }}
 }}
 ```
 
-Note: Segments are automatically merged when consecutive segments from
-the same speaker are close together (< 1 second gap) to improve readability
-and reduce fragmentation.
+Use verbose=True for diagnostics or exact provider output. Use the default
+verbose=False mode for downstream subtitle generation and normal display.
 """.strip()
 
 # Description for synthesize_speech tool

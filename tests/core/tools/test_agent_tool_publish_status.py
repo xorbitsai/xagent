@@ -11,6 +11,7 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     create_update_agent_tool,
     get_published_agents_tools,
 )
+from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
@@ -31,6 +32,10 @@ def _create_session() -> tuple[Session, str, sessionmaker]:
 class _Request:
     def __init__(self, user: User):
         self.user = user
+
+
+def _tool_name(agent: Agent) -> str:
+    return gen_agent_tool_name(agent.id, agent.name)
 
 
 def test_delegation_config_defaults_are_noop() -> None:
@@ -95,7 +100,7 @@ def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
         )
         tool_names = {tool.name for tool in tools_for_other}
 
-        assert f"agent_{published_agent.id}" not in tool_names
+        assert _tool_name(published_agent) not in tool_names
     finally:
         db.close()
         try:
@@ -132,8 +137,8 @@ def test_owner_sees_only_own_published_agents_not_drafts() -> None:
         )
         tool_names = {tool.name for tool in tools_for_owner}
 
-        assert f"agent_{published_agent.id}" in tool_names
-        assert f"agent_{draft_agent.id}" not in tool_names
+        assert _tool_name(published_agent) in tool_names
+        assert _tool_name(draft_agent) not in tool_names
     finally:
         db.close()
         try:
@@ -144,7 +149,7 @@ def test_owner_sees_only_own_published_agents_not_drafts() -> None:
             pass
 
 
-def test_published_agent_tool_name_is_id_based_for_non_ascii_names() -> None:
+def test_published_agent_tool_name_romanizes_non_ascii_names() -> None:
     db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner_non_ascii", password_hash="x", is_admin=False)
@@ -165,7 +170,9 @@ def test_published_agent_tool_name_is_id_based_for_non_ascii_names() -> None:
             session_factory=SessionLocal, user_id=owner.id
         )
 
-        assert {tool.name for tool in tools} == {f"agent_{published_agent.id}"}
+        assert {tool.name for tool in tools} == {
+            f"agent_zhong_wen_zheng_li_zhu_shou__a{published_agent.id}"
+        }
     finally:
         db.close()
         try:
@@ -227,10 +234,10 @@ def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None
         )
         tool_names = {tool.name for tool in tools}
 
-        assert f"agent_{selected_published.id}" in tool_names
-        assert f"agent_{selected_draft.id}" not in tool_names
-        assert f"agent_{unselected_published.id}" not in tool_names
-        assert f"agent_{other_users_agent.id}" not in tool_names
+        assert _tool_name(selected_published) in tool_names
+        assert _tool_name(selected_draft) not in tool_names
+        assert _tool_name(unselected_published) not in tool_names
+        assert _tool_name(other_users_agent) not in tool_names
     finally:
         db.close()
         try:
@@ -266,9 +273,7 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
             allowed_agent_ids=[published_agent.id],
             enable_global_agent_tools=False,
         )
-        assert f"agent_{published_agent.id}" not in {
-            tool.name for tool in blocked_tools
-        }
+        assert _tool_name(published_agent) not in {tool.name for tool in blocked_tools}
 
         allowed_tools = get_published_agents_tools(
             session_factory=SessionLocal,
@@ -277,7 +282,7 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
             enable_global_agent_tools=False,
             allow_cross_user_agent_ids=True,
         )
-        assert f"agent_{published_agent.id}" in {tool.name for tool in allowed_tools}
+        assert _tool_name(published_agent) in {tool.name for tool in allowed_tools}
     finally:
         db.close()
         try:
@@ -548,8 +553,8 @@ def test_agent_call_stack_prevents_recursive_agent_tools() -> None:
         )
         tool_names = {tool.name for tool in tools}
 
-        assert f"agent_{active_agent.id}" not in tool_names
-        assert f"agent_{other_agent.id}" in tool_names
+        assert _tool_name(active_agent) not in tool_names
+        assert _tool_name(other_agent) in tool_names
     finally:
         db.close()
         try:
@@ -599,7 +604,7 @@ def test_worker_overrides_inject_selected_agent_tool_metadata() -> None:
             },
         )
 
-        assert [tool.name for tool in tools] == [f"agent_{worker.id}"]
+        assert [tool.name for tool in tools] == ["call_workforce_worker_1_writer"]
         assert tools[0].description == "Write the workforce report."
     finally:
         db.close()

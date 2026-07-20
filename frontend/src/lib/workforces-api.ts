@@ -4,6 +4,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import type {
   WorkforceAgentOption,
+  WorkforceAgentExecution,
   WorkforceArchiveResponse,
   WorkforceCanvasResponse,
   WorkforceCreatePayload,
@@ -225,6 +226,19 @@ export async function runWorkforce(
   return response.json()
 }
 
+export async function getWorkforceAgentExecution(
+  workforceId: number | string,
+  taskId: number | string,
+  workerTaskId: string,
+): Promise<WorkforceAgentExecution> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/runs/${taskId}/agent-executions/${encodeURIComponent(workerTaskId)}`,
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load Agent execution")
+  }
+  return response.json()
+}
 
 export async function listWorkforceRuns(
   workforceId: number | string,
@@ -247,7 +261,6 @@ export async function listWorkforceRuns(
   return response.json()
 }
 
-
 export async function getWorkforceRun(
   workforceId: number | string,
   runId: number | string,
@@ -260,7 +273,6 @@ export async function getWorkforceRun(
   }
   return response.json()
 }
-
 
 export async function getWorkforceCanvas(
   workforceId: number | string,

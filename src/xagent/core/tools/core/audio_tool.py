@@ -221,51 +221,123 @@ class AudioToolCore:
         """Get ASR model by ID or default model."""
         return self._get_model(self._asr_models, self._default_asr_model, model_id)
 
-    def _merge_segments(
-        self, segments: List[Dict[str, Any]], max_gap: float = 1.0
+    @staticmethod
+    def _is_cjk_character(value: str) -> bool:
+        if not value:
+            return False
+        codepoint = ord(value[0])
+        return (
+            0x3400 <= codepoint <= 0x4DBF
+            or 0x4E00 <= codepoint <= 0x9FFF
+            or 0x3040 <= codepoint <= 0x30FF
+            or 0xAC00 <= codepoint <= 0xD7AF
+        )
+
+    @classmethod
+    def _join_segment_text(cls, left: str, right: str) -> str:
+        left = left.rstrip()
+        right = right.lstrip()
+        if not left:
+            return right
+        if not right:
+            return left
+
+        no_leading_space = ",.!?;:，。！？；：、)]}》」』”’"
+        if (
+            right[0] in no_leading_space
+            or cls._is_cjk_character(left[-1])
+            or cls._is_cjk_character(right[0])
+        ):
+            return left + right
+        return f"{left} {right}"
+
+    def _aggregate_segments(
+        self,
+        segments: List[Dict[str, Any]],
+        max_gap: float = 0.5,
+        max_duration: float = 6.0,
+        max_chars: int = 84,
     ) -> List[Dict[str, Any]]:
         """
-        Merge consecutive segments from the same speaker.
+        Aggregate raw provider segments into readable transcript cues.
 
         Args:
-            segments: List of segment dictionaries
-            max_gap: Maximum time gap (seconds) to merge segments
+            segments: Raw provider segment dictionaries
+            max_gap: Pause that starts a new cue
+            max_duration: Maximum cue duration in seconds
+            max_chars: Maximum cue text length
 
         Returns:
-            List of merged segments with combined text and updated time ranges
+            Readable segments bounded by punctuation, pauses, speakers, and size
         """
         if not segments:
             return []
 
-        merged = []
-        current = segments[0].copy()
+        aggregated: List[Dict[str, Any]] = []
+        group: List[Dict[str, Any]] = []
+        group_text = ""
+        sentence_terminators = (".", "?", "!", "。", "？", "！", "…")
 
-        for next_seg in segments[1:]:
-            # Check if segments should be merged
-            gap = next_seg["start"] - current["end"]
-            same_speaker = next_seg.get("speaker") == current.get("speaker")
+        def flush_group() -> None:
+            nonlocal group, group_text
+            if not group:
+                return
 
-            if same_speaker and gap <= max_gap:
-                # Merge segments
-                current["text"] += " " + next_seg["text"]
-                current["end"] = next_seg["end"]
-                # Update confidence to average if both exist
-                if (
-                    current.get("confidence") is not None
-                    and next_seg.get("confidence") is not None
-                ):
-                    current["confidence"] = (
-                        current["confidence"] + next_seg["confidence"]
-                    ) / 2
-                elif next_seg.get("confidence") is not None:
-                    current["confidence"] = next_seg["confidence"]
-            else:
-                # Don't merge, save current segment
-                merged.append(current)
-                current = next_seg.copy()
+            confidences = [
+                float(segment["confidence"])
+                for segment in group
+                if isinstance(segment.get("confidence"), (int, float))
+            ]
+            aggregated.append(
+                {
+                    "text": group_text,
+                    "start": group[0]["start"],
+                    "end": group[-1]["end"],
+                    "speaker": group[0].get("speaker"),
+                    "confidence": (
+                        sum(confidences) / len(confidences) if confidences else None
+                    ),
+                }
+            )
+            group = []
+            group_text = ""
 
-        merged.append(current)
-        return merged
+        for segment in segments:
+            segment_text = str(segment.get("text") or "").strip()
+            if not segment_text:
+                continue
+
+            start_value = segment.get("start")
+            end_value = segment.get("end")
+            if start_value is None or end_value is None:
+                raise ValueError("Segment start or end time is missing or null")
+
+            if group:
+                current_speaker = group[0].get("speaker")
+                next_speaker = segment.get("speaker")
+                speaker_changed = (
+                    current_speaker is not None or next_speaker is not None
+                ) and current_speaker != next_speaker
+                gap = float(start_value) - float(group[-1]["end"])
+                combined_text = self._join_segment_text(group_text, segment_text)
+                exceeds_duration = (
+                    float(end_value) - float(group[0]["start"]) > max_duration
+                )
+                should_start_new_group = (
+                    speaker_changed
+                    or gap >= max_gap
+                    or group_text.rstrip().endswith(sentence_terminators)
+                    or exceeds_duration
+                    or len(combined_text) > max_chars
+                )
+                if should_start_new_group:
+                    flush_group()
+
+            group.append(segment)
+            group_text = self._join_segment_text(group_text, segment_text)
+
+        flush_group()
+        return aggregated
 
     def _get_tts_model(self, model_id: Optional[str] = None) -> Optional[BaseTTS]:
         """Get TTS model by ID or default model."""
@@ -555,12 +627,12 @@ class AudioToolCore:
                 return str(resolved_path)
             except ValueError as e:
                 logger.warning(f"Cannot resolve audio path in workspace: {e}")
-                # Fall back to simple path resolution
+                raise
             except Exception as e:
                 logger.warning(f"Error using workspace path resolution: {e}")
-                # Fall back to simple path resolution
+                raise
 
-        # Fallback: simple path resolution
+        # Without a workspace, fall back to simple path resolution.
         audio_path = Path(audio_input)
 
         # If it's a relative path, resolve it relative to current working directory
@@ -595,7 +667,8 @@ class AudioToolCore:
             audio_file_path: Audio file path, file_id, or URL to transcribe
             language: Language code (e.g., 'zh', 'en', 'yue')
             model_id: Specific ASR model to use (optional, uses default if not provided)
-            verbose: If True, return detailed result with segments and timing
+            verbose: If True, preserve raw provider segments. If False, return
+                processed transcript segments suitable for subtitles.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -604,7 +677,8 @@ class AudioToolCore:
             - file_id (str): File ID for accessing the transcription JSON file
             - transcription_path (str): Path to saved transcription JSON file
             - saved_to_workspace (bool): Whether the transcription was saved
-            - segments (list): Detailed segment information (only if verbose=True)
+            - segments (list): Raw provider segments when verbose=True, otherwise
+              processed transcript segments
             - language (str): Detected language code
             - model_used (str): The actual model used
             - text_length (int): Length of transcribed text
@@ -612,7 +686,8 @@ class AudioToolCore:
             - error (str): Error message if success=False
 
             Note: Complete transcription text is saved in JSON file (use file_id).
-            Segments are only in response when verbose=True.
+            Providers are asked for timestamps in both modes so the default mode
+            can create readable timestamped segments.
         """
         try:
             # Get the ASR model to use
@@ -628,11 +703,12 @@ class AudioToolCore:
             # Resolve audio path
             audio_path = self._resolve_audio_path(audio_file_path)
 
-            # Transcribe the audio (async)
+            # Always request provider timing detail. The public verbose flag controls
+            # whether callers receive raw provider segments or processed cues.
             result = await asr_model.transcribe(
                 audio=audio_path,
                 language=language,
-                verbose=verbose,
+                verbose=True,
                 **kwargs,
             )
 
@@ -643,14 +719,14 @@ class AudioToolCore:
 
             # Handle different result types
             text = None
-            segments = None
+            raw_segments = None
             language_detected = None
 
             if isinstance(result, str):
                 text = result
             elif isinstance(result, ASRResult):
                 text = result.text
-                segments = (
+                raw_segments = (
                     [
                         {
                             "text": seg.text,
@@ -666,13 +742,17 @@ class AudioToolCore:
                 )
                 language_detected = result.language
 
-            # Merge segments to reduce fragmentation
-            if segments:
-                merged_segments = self._merge_segments(segments, max_gap=1.0)
+            segment_view = "raw" if verbose else "processed"
+            segments = raw_segments
+            segments_merged = False
+            if raw_segments and not verbose:
+                segments = self._aggregate_segments(raw_segments)
                 logger.info(
-                    f"Merged {len(segments)} segments into {len(merged_segments)} segments"
+                    "Aggregated %d raw transcription segments into %d readable cues",
+                    len(raw_segments),
+                    len(segments),
                 )
-                segments = merged_segments
+                segments_merged = len(segments) < len(raw_segments)
 
             # Save transcription to JSON file if workspace is available
             file_id: Optional[str] = None
@@ -693,8 +773,12 @@ class AudioToolCore:
                         "metadata": {
                             "audio_source": audio_file_path,
                             "verbose_mode": verbose,
+                            "segment_view": segment_view,
+                            "raw_segment_count": (
+                                len(raw_segments) if raw_segments else 0
+                            ),
                             "total_segments": len(segments) if segments else 0,
-                            "segments_merged": True,
+                            "segments_merged": segments_merged,
                         },
                     }
 

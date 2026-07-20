@@ -123,7 +123,11 @@ from ..services.workforce_runtime import (
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
-from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
+from .public_trace_events import (
+    is_audit_only_trace_data,
+    normalize_public_trace_event,
+    public_task_trace_filter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4534,6 +4538,7 @@ async def send_historical_data_as_stream(
         from ..models.agent import Agent
         from ..models.database import get_db
         from ..models.task import Task, TaskStatus, TraceEvent
+        from ..models.workforce import WorkforceRun
 
         db_gen = get_db()
         db = next(db_gen)
@@ -4562,11 +4567,24 @@ async def send_historical_data_as_stream(
                 if sync_workforce_run_status(db, task, task.status):
                     db.commit()
 
+            is_workforce_run = (
+                db.query(WorkforceRun.id)
+                .filter(WorkforceRun.task_id == task_id)
+                .first()
+                is not None
+            )
+            trace_scope_filter = (
+                TraceEvent.build_id.is_(None)
+                if is_workforce_run
+                else public_task_trace_filter(TraceEvent)
+            )
+            trace_scope = "workforce-top-level-v1" if is_workforce_run else "public-v1"
+
             max_trace_event_id = (
                 db.query(func.max(TraceEvent.id))
                 .filter(
                     TraceEvent.task_id == task_id,
-                    TraceEvent.build_id.is_(None),
+                    trace_scope_filter,
                 )
                 .scalar()
                 or 0
@@ -4582,6 +4600,7 @@ async def send_historical_data_as_stream(
             cached = cache_get(cache_key)
             if (
                 isinstance(cached, dict)
+                and cached.get("trace_scope") == trace_scope
                 and cached.get("updated_at") == task_updated_at
                 and cached.get("max_trace_event_id") == int(max_trace_event_id)
                 and cached.get("max_chat_message_id") == int(max_chat_message_id)
@@ -4650,12 +4669,14 @@ async def send_historical_data_as_stream(
             await manager.send_personal_message(task_event, websocket)
             cached_stream_events.append(task_event)
 
-            # Get unified trace events (only VIBE phase, exclude BUILD phase)
+            # Replay only top-level task events. Delegated Agent internals can
+            # be much larger than the manager trace and are loaded on demand by
+            # the Workforce Agent-execution drawer.
             trace_events = (
                 db.query(TraceEvent)
                 .filter(
                     TraceEvent.task_id == task_id,
-                    TraceEvent.build_id.is_(None),  # ← Only get VIBE events
+                    trace_scope_filter,
                     # Agent checkpoints are persisted as trace rows for
                     # resume/recovery, but they are internal snapshots and can
                     # be megabytes each. Filtering them in SQL avoids loading
@@ -5010,6 +5031,7 @@ async def send_historical_data_as_stream(
             cache_set(
                 cache_key,
                 {
+                    "trace_scope": trace_scope,
                     "updated_at": task_updated_at,
                     "max_trace_event_id": int(max_trace_event_id),
                     "max_chat_message_id": int(max_chat_message_id),

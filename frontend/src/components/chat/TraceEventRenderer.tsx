@@ -58,8 +58,8 @@ interface TraceEvent {
   event_id?: string;
   event_type?: string;
   action_type?: string;
-  step_id?: string;
-  timestamp?: number;
+  step_id?: string | null;
+  timestamp?: number | string | null;
   data?: {
     action?: string;
     step_name?: string;
@@ -93,6 +93,51 @@ interface TraceEvent {
   result_type?: string;
 }
 
+function sanitizeTraceEvents(value: unknown): TraceEvent[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      return [];
+    }
+    const source = candidate as Record<string, unknown>;
+    const event = { ...source };
+    const stringFields = [
+      'event_id',
+      'event_type',
+      'action_type',
+      'tool_name',
+      'result_type',
+    ];
+    for (const field of stringFields) {
+      if (field in event && typeof event[field] !== 'string') {
+        delete event[field];
+      }
+    }
+    if (
+      'step_id' in event &&
+      typeof event.step_id !== 'string' &&
+      event.step_id !== null
+    ) {
+      delete event.step_id;
+    }
+    if (
+      'timestamp' in event &&
+      typeof event.timestamp !== 'number' &&
+      typeof event.timestamp !== 'string' &&
+      event.timestamp !== null
+    ) {
+      delete event.timestamp;
+    }
+    if (
+      'data' in event &&
+      (!event.data || typeof event.data !== 'object' || Array.isArray(event.data))
+    ) {
+      event.data = {};
+    }
+    return [event as TraceEvent];
+  });
+}
+
 interface StepAction {
   id: string;
   type: 'llm' | 'tool' | 'info' | 'error';
@@ -113,6 +158,7 @@ interface StepAction {
     tool_call_id?: string;
     sandboxed?: boolean;
     inline?: boolean;
+    workforceSummary?: boolean;
   };
 }
 
@@ -141,12 +187,23 @@ interface ProcessedStep {
   output: string;
   filePath?: string;
   actions: StepAction[];
+  agentExecution?: AgentExecutionSummary;
 }
 
 interface TraceEventRendererProps {
   events: TraceEvent[];
   taskStatus?: string;
   onOpenExecutionPlan?: () => void;
+  onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
+  defaultExpandSteps?: boolean;
+}
+
+export interface AgentExecutionSummary {
+  workerTaskId: string;
+  agentId?: number;
+  agentName: string;
+  workerAlias?: string;
+  status: 'running' | 'completed' | 'failed';
 }
 
 function isDagExecutionEvent(event: TraceEvent): boolean {
@@ -159,9 +216,12 @@ function isDagExecutionEvent(event: TraceEvent): boolean {
     || eventType.startsWith('dag_step_');
 }
 
-function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> {
-  if (event.data && typeof event.data === 'object') {
+function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> | undefined {
+  if (event.data && typeof event.data === 'object' && !Array.isArray(event.data)) {
     return event.data;
+  }
+  if ('data' in event) {
+    return undefined;
   }
   return event as unknown as NonNullable<TraceEvent['data']>;
 }
@@ -217,7 +277,8 @@ export function processTraceEvents(
     // rely on the per-action outputs instead.
     const concurrentSteps = new Set<string>();
     let currentReactStepId: string | null = null;
-    const orderedEvents = events
+    let lastCompletedWorkforceStepId: string | null = null;
+    const orderedEvents = sanitizeTraceEvents(events)
       .map((event, index) => {
         const timestamp = normalizeTimestampMs(event.timestamp)
         return {
@@ -263,12 +324,26 @@ export function processTraceEvents(
         return;
       }
 
-      const eventData = getTraceData(event);
+      const eventData = getTraceData(event) || {};
       let stepId = event.step_id || (eventData.step_id as string) || 'default';
       const isProgressMessage = isAgentProgressEvent(event);
-      if (event.event_type?.startsWith('workforce_delegation_')) {
+      const workerTaskId = typeof eventData.worker_task_id === 'string'
+        || typeof eventData.worker_task_id === 'number'
+        ? String(eventData.worker_task_id)
+        : '';
+      const isWorkforceDelegation = event.event_type?.startsWith('workforce_delegation_');
+      const isDelegatedChildEvent =
+        eventData.source === 'xagent-agent-tool-child' && Boolean(workerTaskId);
+      const isWorkforceManagerSummary =
+        isProgressMessage &&
+        !isDelegatedChildEvent &&
+        Boolean(lastCompletedWorkforceStepId);
+      if (isWorkforceManagerSummary && lastCompletedWorkforceStepId) {
+        stepId = lastCompletedWorkforceStepId;
+      }
+      if (isWorkforceDelegation || isDelegatedChildEvent) {
         stepId = String(
-          eventData.worker_task_id ||
+          workerTaskId ||
           `workforce-${eventData.workforce_run_id || 'run'}-${eventData.worker_member_id || eventData.agent_id || event.event_id || index}`
         );
       }
@@ -303,9 +378,36 @@ export function processTraceEvents(
       const step = stepsMap.get(stepId)!;
       const eventId = event.event_id || `event-${index}`;
 
+      if ((isWorkforceDelegation || isDelegatedChildEvent) && workerTaskId) {
+        const previousExecution = step.agentExecution;
+        const agentName = String(
+          eventData.worker_alias ||
+          eventData.agent_name ||
+          eventData.tool_name ||
+          previousExecution?.agentName ||
+          t('traceEventRenderer.unknownWorker')
+        );
+        step.agentExecution = {
+          workerTaskId,
+          agentId: typeof eventData.agent_id === 'number' ? eventData.agent_id : previousExecution?.agentId,
+          agentName,
+          workerAlias: typeof eventData.worker_alias === 'string' ? eventData.worker_alias : previousExecution?.workerAlias,
+          status: event.event_type === 'workforce_delegation_error'
+            ? 'failed'
+            : event.event_type === 'workforce_delegation_end'
+              ? 'completed'
+              : previousExecution?.status || 'running',
+        };
+      }
+
       // Process different event types
       if (event.event_type === 'dag_step_start' || event.event_type === 'react_task_start') {
-        step.stepName = (eventData.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
+        const delegatedAgentName = isDelegatedChildEvent && typeof eventData.agent_name === 'string'
+          ? eventData.agent_name
+          : '';
+        step.stepName = delegatedAgentName
+          || (eventData.step_name as string)
+          || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
         step.description = (eventData.description as string) || (eventData.task as string) || '';
         step.status = 'running';
 
@@ -377,12 +479,14 @@ export function processTraceEvents(
             data: {
               output: message.trim(),
               inline: true,
+              workforceSummary: isWorkforceManagerSummary,
             }
           });
         }
       }
 
       if (event.event_type === 'workforce_delegation_start') {
+        lastCompletedWorkforceStepId = null;
         const workerName = String(
           eventData.worker_alias ||
           eventData.agent_name ||
@@ -424,6 +528,7 @@ export function processTraceEvents(
             data: { output: output || eventData }
           });
         }
+        lastCompletedWorkforceStepId = stepId;
       }
 
       if (event.event_type === 'workforce_delegation_error') {
@@ -448,6 +553,7 @@ export function processTraceEvents(
             data: { error: errorMessage }
           });
         }
+        lastCompletedWorkforceStepId = stepId;
       }
 
       if (event.event_type === 'tool_execution_start') {
@@ -1265,27 +1371,54 @@ interface StepItemProps {
   onViewDetail: (action: StepAction) => void;
   onFileClick?: (filePath: string, fileName: string) => void;
   onAgentClick?: (agentId: string, agentName: string) => void;
+  onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
+  defaultExpanded?: boolean;
 }
 
-function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAgentClick }: StepItemProps) {
+function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAgentClick, onAgentExecutionClick, defaultExpanded = false }: StepItemProps) {
   const { t } = useI18n();
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
   const isPaused = step.status === 'paused' || step.status === 'waiting_for_user';
-  const [isExpanded, setIsExpanded] = useState(() => !isCompleted);
+  const [isExpanded, setIsExpanded] = useState(() => defaultExpanded || !isCompleted);
   const wasCompletedRef = useRef(isCompleted);
   const rawTitle = step.description || step.stepName;
   const displayTitle =
     isCompleted && step.stepName === t('traceEventRenderer.taskExecution') && !step.description
       ? t('traceEventRenderer.thoughtProcess')
       : rawTitle;
+  const workforceSummaries = step.actions.filter(
+    (action) =>
+      action.data.workforceSummary &&
+      typeof action.data.output === 'string' &&
+      action.data.output.trim(),
+  );
+  const processActions = step.actions.filter((action) => !action.data.workforceSummary);
+  const usesAgentInspector = Boolean(step.agentExecution && onAgentExecutionClick);
+  const canExpandProcess = processActions.length > 0 && !usesAgentInspector;
+  const stepTitleContent = (
+    <>
+      {isCompleted ? (
+        <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5" />
+      ) : isFailed ? (
+        <Info className="w-5 h-5 text-red-500 mt-0.5" />
+      ) : isPaused ? (
+        <Info className="w-5 h-5 text-yellow-500 mt-0.5" />
+      ) : (
+        <Loader2 className="w-5 h-5 text-primary animate-spin mt-0.5" />
+      )}
+      <h3 className="min-w-0 flex-1 text-sm font-medium text-foreground break-words [overflow-wrap:anywhere]">
+        {displayTitle}
+      </h3>
+    </>
+  );
 
   useEffect(() => {
-    if (isCompleted && !wasCompletedRef.current) {
+    if (isCompleted && !wasCompletedRef.current && !defaultExpanded) {
       setIsExpanded(false);
     }
     wasCompletedRef.current = isCompleted;
-  }, [isCompleted]);
+  }, [defaultExpanded, isCompleted]);
 
   const handleToggle = () => {
     setIsExpanded((expanded) => !expanded);
@@ -1299,39 +1432,60 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
       className="space-y-3"
     >
       {/* Step Title */}
-      <button
-        type="button"
-        className="flex w-full items-start gap-2 rounded-lg px-2 py-1 -ml-2 text-left transition-colors hover:bg-muted/50 group/step"
-        onClick={handleToggle}
-        aria-expanded={isExpanded}
-      >
-        {isCompleted ? (
-          <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5" />
-        ) : isFailed ? (
-          <Info className="w-5 h-5 text-red-500 mt-0.5" />
-        ) : isPaused ? (
-          <Info className="w-5 h-5 text-yellow-500 mt-0.5" />
+      <div className="flex w-full items-start gap-2 rounded-lg px-2 py-1 -ml-2 transition-colors hover:bg-muted/50 group/step">
+        {usesAgentInspector ? (
+          <div className="flex min-w-0 flex-1 items-start gap-2 text-left">
+            {stepTitleContent}
+          </div>
         ) : (
-          <Loader2 className="w-5 h-5 text-primary animate-spin mt-0.5" />
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 items-start gap-2 text-left"
+            onClick={handleToggle}
+            aria-expanded={isExpanded}
+          >
+            {stepTitleContent}
+          </button>
         )}
-
-        <div className="flex-1 min-w-0 flex items-start gap-2">
-          <h3 className="min-w-0 flex-1 text-sm font-medium text-foreground break-words [overflow-wrap:anywhere]">
-            {displayTitle}
-          </h3>
-          <span className="mt-0.5 shrink-0 inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/80 px-2 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors group-hover/step:text-foreground">
+        {step.agentExecution && onAgentExecutionClick && (
+          <button
+            type="button"
+            className="mt-0.5 shrink-0 text-[11px] font-medium text-primary hover:underline"
+            onClick={() => onAgentExecutionClick(step.agentExecution!)}
+          >
+            {t('traceEventRenderer.viewAgentExecution')}
+          </button>
+        )}
+        {canExpandProcess && (
+          <button
+            type="button"
+            className="mt-0.5 shrink-0 inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/80 px-2 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors group-hover/step:text-foreground"
+            onClick={handleToggle}
+            aria-expanded={isExpanded}
+          >
             {isExpanded ? t('traceEventRenderer.hideProcess') : t('traceEventRenderer.showProcess')}
             {isExpanded ? (
               <ChevronDown className="w-3.5 h-3.5" />
             ) : (
               <ChevronRight className="w-3.5 h-3.5" />
             )}
-          </span>
+          </button>
+        )}
+      </div>
+
+      {workforceSummaries.map((action) => (
+        <div key={`${action.id}-summary`} className="ml-7 pr-2 text-sm">
+          <MarkdownRenderer
+            content={String(action.data.output)}
+            className="prose-sm leading-relaxed"
+            onFileClick={onFileClick}
+            onAgentClick={onAgentClick}
+          />
         </div>
-      </button>
+      ))}
 
       <AnimatePresence>
-        {isExpanded && (
+        {isExpanded && canExpandProcess && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
@@ -1341,7 +1495,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
           >
             {/* Actions List (replaces nested Execution Details) */}
             <div className="ml-2.5 pl-6 border-l-2 border-border/40 space-y-2 pt-1 pb-2">
-              {step.actions.map((action) => (
+              {processActions.map((action) => (
                 <StepActionItem
                   key={action.id}
                   action={action}
@@ -1360,13 +1514,14 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
 }
 
 // Main TraceEventRenderer Component
-export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: TraceEventRendererProps) {
+export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, onAgentExecutionClick, defaultExpandSteps = false }: TraceEventRendererProps) {
   const { t } = useI18n();
+  const sanitizedEvents = useMemo(() => sanitizeTraceEvents(events), [events]);
   const processStatus = resolveTraceProcessStatus({
     taskStatus,
-    traceEvents: events,
+    traceEvents: sanitizedEvents,
   });
-  const steps = useProcessedSteps(events, processStatus);
+  const steps = useProcessedSteps(sanitizedEvents, processStatus);
   const router = useRouter();
 
   const { openFilePreview, dispatch } = useApp();
@@ -1376,8 +1531,8 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: 
   }, [router]);
 
   const skillSelection = useMemo(() => {
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i];
+    for (let i = sanitizedEvents.length - 1; i >= 0; i--) {
+      const event = sanitizedEvents[i];
       if (event.event_type === 'skill_select_end') {
         if (event.data?.selected && event.data?.skill_name) {
           return event.data.skill_name as string;
@@ -1386,14 +1541,17 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: 
       }
     }
     return null;
-  }, [events]);
+  }, [sanitizedEvents]);
 
-  const hasExecutionPlan = useMemo(() => events.some(isDagExecutionEvent), [events]);
+  const hasExecutionPlan = useMemo(
+    () => sanitizedEvents.some(isDagExecutionEvent),
+    [sanitizedEvents],
+  );
 
   const executionPlanStepCount = useMemo(() => {
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      if (!isDagExecutionEvent(events[index])) continue;
-      const data = events[index].data;
+    for (let index = sanitizedEvents.length - 1; index >= 0; index -= 1) {
+      if (!isDagExecutionEvent(sanitizedEvents[index])) continue;
+      const data = sanitizedEvents[index].data;
       if (!data || typeof data !== 'object') continue;
 
       const record = data as Record<string, unknown>;
@@ -1408,7 +1566,7 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: 
     }
 
     return steps.length > 0 ? steps.length : null;
-  }, [events, steps.length]);
+  }, [sanitizedEvents, steps.length]);
 
   const executionPlanLabel = executionPlanStepCount === null
     ? t('chatPage.executionPlan.dagSection')
@@ -1515,6 +1673,8 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan }: 
               onViewDetail={handleViewActionDetail}
               onFileClick={openFilePreview}
               onAgentClick={handleAgentClick}
+              onAgentExecutionClick={onAgentExecutionClick}
+              defaultExpanded={defaultExpandSteps}
             />
           ))}
         </div>

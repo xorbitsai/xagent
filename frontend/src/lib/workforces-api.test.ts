@@ -13,6 +13,7 @@ vi.mock("@/lib/utils", () => ({
 import {
   archiveWorkforce,
   createWorkforce,
+  getWorkforceAgentExecution,
   listAgentOptions,
   listWorkforces,
   runWorkforce,
@@ -124,6 +125,23 @@ describe("workforces-api", () => {
       }),
     )
     expect(result.redirect_url).toBe("/task/10")
+  })
+
+  it("loads one delegated Agent execution on demand", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        task_id: 760,
+        worker_task_id: "agent_17 run",
+        status: "completed",
+        trace_events: [],
+      }),
+    )
+
+    await getWorkforceAgentExecution(5, 760, "agent_17 run")
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/workforces/5/runs/760/agent-executions/agent_17%20run",
+    )
   })
 
   it("surfaces backend detail strings for archived edit boundaries", async () => {

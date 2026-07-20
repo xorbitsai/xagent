@@ -96,6 +96,7 @@ class StoreMemoryTool:
         self.max_stores = max_stores
         self.dedup_distance_threshold = dedup_distance_threshold
         self.stored_count = 0
+        self._store_lock = asyncio.Lock()
 
     async def execute(
         self, content: str, kind: str = "domain_insight"
@@ -106,74 +107,79 @@ class StoreMemoryTool:
                 "success": False,
                 "error": "Memory content must be a non-empty string.",
             }
-        if self.stored_count >= self.max_stores:
-            return {
-                "success": False,
-                "error": (
-                    f"Memory storage limit ({self.max_stores}) reached for this "
-                    "task; do not store further memories."
-                ),
-            }
         if kind not in _MEMORY_KINDS:
             kind = "domain_insight"
 
-        task_id = str(_runtime_attr(self.runtime, "execution_id") or "")
-        step_id = _runtime_attr(self.runtime, "active_react_step_id")
-        tracer = _runtime_attr(self.runtime, "tracer")
+        async with self._store_lock:
+            if self.stored_count >= self.max_stores:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Memory storage limit ({self.max_stores}) reached for this "
+                        "task; do not store further memories."
+                    ),
+                }
 
-        if tracer is not None and task_id:
-            await trace_memory_store_start(
-                tracer,
-                task_id,
-                data={
-                    "task": self.task[:200],
-                    "memory_category": self.category,
-                    "memory_kind": kind,
-                    "source": STORE_MEMORY_TOOL_NAME,
-                    "step_id": step_id,
-                },
-            )
+            task_id = str(_runtime_attr(self.runtime, "execution_id") or "")
+            step_id = _runtime_attr(self.runtime, "active_react_step_id")
+            tracer = _runtime_attr(self.runtime, "tracer")
 
-        duplicate = await asyncio.to_thread(self._find_similar, content)
-        if duplicate is not None:
+            if tracer is not None and task_id:
+                await trace_memory_store_start(
+                    tracer,
+                    task_id,
+                    data={
+                        "task": self.task[:200],
+                        "memory_category": self.category,
+                        "memory_kind": kind,
+                        "source": STORE_MEMORY_TOOL_NAME,
+                        "step_id": step_id,
+                    },
+                )
+
+            duplicate = await asyncio.to_thread(self._find_similar, content)
+            if duplicate is not None:
+                if tracer is not None and task_id:
+                    await trace_memory_store_end(
+                        tracer,
+                        task_id,
+                        data={
+                            "storage_success": False,
+                            "decision": "duplicate_skipped",
+                            "source": STORE_MEMORY_TOOL_NAME,
+                            "step_id": step_id,
+                        },
+                    )
+                return {
+                    "success": True,
+                    "stored": False,
+                    "message": (
+                        "A very similar memory already exists; skipped storing a duplicate."
+                    ),
+                }
+
+            memory_id = await asyncio.to_thread(self._add, content, kind)
+            if memory_id:
+                # Account for the created resource before any further await so
+                # trace delivery cannot reopen capacity after a cancellation.
+                self.stored_count += 1
+
             if tracer is not None and task_id:
                 await trace_memory_store_end(
                     tracer,
                     task_id,
                     data={
-                        "storage_success": False,
-                        "decision": "duplicate_skipped",
+                        "storage_success": bool(memory_id),
+                        "memory_id": memory_id,
                         "source": STORE_MEMORY_TOOL_NAME,
                         "step_id": step_id,
                     },
                 )
-            return {
-                "success": True,
-                "stored": False,
-                "message": (
-                    "A very similar memory already exists; skipped storing a duplicate."
-                ),
-            }
 
-        memory_id = await asyncio.to_thread(self._add, content, kind)
+            if not memory_id:
+                return {"success": False, "error": "Failed to store memory."}
 
-        if tracer is not None and task_id:
-            await trace_memory_store_end(
-                tracer,
-                task_id,
-                data={
-                    "storage_success": bool(memory_id),
-                    "memory_id": memory_id,
-                    "source": STORE_MEMORY_TOOL_NAME,
-                    "step_id": step_id,
-                },
-            )
-
-        if not memory_id:
-            return {"success": False, "error": "Failed to store memory."}
-
-        self.stored_count += 1
-        return {"success": True, "stored": True, "memory_id": memory_id}
+            return {"success": True, "stored": True, "memory_id": memory_id}
 
     def _find_similar(self, content: str) -> Any | None:
         search = getattr(self.memory_store, "search", None)
@@ -346,6 +352,8 @@ class UpdateMemoryTool:
                     "error": f"Memory '{memory_id}' has no stored note to update.",
                 }
             note.content = content
+            if note.metadata is None:
+                note.metadata = {}
             if isinstance(note.metadata, dict):
                 note.metadata["updated_by_task"] = self.task
             response = self.memory_store.update(note)

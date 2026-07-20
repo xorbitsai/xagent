@@ -9,7 +9,7 @@ const appState = vi.hoisted(() => ({
   isProcessing: false,
   isHistoryLoading: false,
   taskId: 42,
-  filePreview: { isOpen: false },
+  filePreview: { isOpen: false, fileName: "", viewMode: "preview" },
   dagExecution: null,
   steps: [],
 }))
@@ -119,7 +119,7 @@ vi.mock("@/components/file/task-file-manager", () => ({
 }))
 
 vi.mock("@/components/file/file-preview-content", () => ({
-  FilePreviewContent: () => null,
+  FilePreviewContent: () => <div data-testid="file-preview-content" />,
 }))
 
 vi.mock("@/components/file/file-preview-action-buttons", () => ({
@@ -161,6 +161,7 @@ describe("TaskConversationPanel", () => {
     appState.currentTask = null
     appState.isProcessing = false
     appState.isHistoryLoading = false
+    appState.filePreview = { isOpen: false, fileName: "", viewMode: "preview" }
   })
 
   it("renders waiting-for-user prompts from normal task state", () => {
@@ -237,6 +238,104 @@ describe("TaskConversationPanel", () => {
     render(<TaskConversationPanel mode="embedded-preview" />)
 
     expect(screen.queryByText("Hello! What can I help you with?")).not.toBeInTheDocument()
+  })
+
+  it("hides raw Workforce Agent tool calls and delegated child traces", () => {
+    appState.messages = []
+    appState.traceEvents = [
+      {
+        event_id: "raw-agent-tool",
+        event_type: "tool_execution_start",
+        timestamp: 1000,
+        data: {
+          tool_name: "worker_editor_agent__a20",
+          tool_params: { task: "Delegated task instructions" },
+        },
+      },
+      {
+        event_id: "raw-semantic-agent-tool",
+        event_type: "tool_execution_start",
+        timestamp: 1000.5,
+        data: {
+          tool_name: "agent_reviewer_agent__a7",
+          tool_params: { task: "Review the delegated work" },
+        },
+      },
+      {
+        event_id: "delegation-start",
+        event_type: "workforce_delegation_start",
+        timestamp: 1001,
+        data: {
+          worker_task_id: "agent_20_run",
+          worker_alias: "Editor Agent",
+          tool_name: "worker_editor_agent__a20",
+        },
+      },
+      {
+        event_id: "child-tool",
+        event_type: "tool_execution_start",
+        timestamp: 1002,
+        data: {
+          source: "xagent-agent-tool-child",
+          worker_task_id: "agent_20_run",
+          tool_name: "transcribe_audio",
+        },
+      },
+      {
+        event_id: "manager-progress",
+        event_type: "agent_progress",
+        timestamp: 1003,
+        data: { message: "Editor is working" },
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Workforce run",
+      description: "Workforce run",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+
+    render(
+      <TaskConversationPanel
+        mode="embedded-preview"
+        onAgentExecutionClick={vi.fn()}
+      />
+    )
+
+    const processMessage = screen.getByTestId("chat-message")
+    expect(processMessage).toHaveAttribute("data-trace-count", "2")
+  })
+
+  it("does not leave a closed historical turn running", () => {
+    appState.messages = [
+      { id: "turn-1", role: "user", content: "First turn", timestamp: 1000 },
+      { id: "turn-2", role: "user", content: "Continue", timestamp: 3000 },
+    ] as any
+    appState.traceEvents = [
+      {
+        event_id: "unfinished-tool",
+        event_type: "tool_execution_start",
+        timestamp: 2000,
+        data: { tool_name: "long_running_tool" },
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const processMessage = screen.getAllByTestId("chat-message").find(
+      (element) => element.getAttribute("data-trace-count") === "1",
+    )
+    expect(processMessage).toHaveAttribute("data-process-status", "completed")
   })
 
   it("renders trace process events as separate timeline items between messages", () => {
@@ -374,7 +473,7 @@ describe("TaskConversationPanel", () => {
       .getAllByTestId("chat-message")
       .filter((message) => message.getAttribute("data-trace-count") === "1")
     expect(processMessages).toHaveLength(2)
-    expect(processMessages[0]).toHaveAttribute("data-process-status", "")
+    expect(processMessages[0]).toHaveAttribute("data-process-status", "completed")
     expect(processMessages[1]).toHaveAttribute("data-process-status", "completed")
   })
 
@@ -478,7 +577,7 @@ describe("TaskConversationPanel", () => {
       .getAllByTestId("chat-message")
       .filter((message) => message.getAttribute("data-trace-count") === "1")
     expect(historicalProcessMessages).toHaveLength(1)
-    expect(historicalProcessMessages[0]).toHaveAttribute("data-process-status", "")
+    expect(historicalProcessMessages[0]).toHaveAttribute("data-process-status", "completed")
 
     const virtualProcessMessages = screen
       .getAllByTestId("chat-message")

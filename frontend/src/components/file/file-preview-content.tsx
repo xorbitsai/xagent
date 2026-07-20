@@ -5,6 +5,7 @@ import { useApp } from "@/contexts/app-context-chat"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { FileViewer } from "@/components/file/file-viewer"
+import { isTextPreviewFile } from "@/lib/file-preview-utils"
 
 interface FilePreviewContentProps {
   open: boolean
@@ -45,7 +46,7 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
             const isImage = mimeType.startsWith('image/')
             const isPdf = mimeType.startsWith('application/pdf') || mimeType === 'application/pdf'
             const isDocx = mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-            const isTextType = mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/xml' || mimeType === 'application/javascript'
+            const isTextType = isTextPreviewFile(filePreview.fileName, mimeType)
 
             console.log('File preview debug:', {
               fileName: filePreview.fileName,

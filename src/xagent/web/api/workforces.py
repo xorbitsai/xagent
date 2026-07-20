@@ -1,3 +1,4 @@
+from datetime import timezone
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session, selectinload
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
+from ..models.task import TaskStatus, TraceEvent
 from ..models.user import User
 from ..models.workforce import (
     Workforce,
@@ -24,6 +26,7 @@ from ..services.agent_team_scope import (
     get_agent_team_scope,
     owns_agent,
 )
+from ..services.trace_message_storage import decode_trace_events_data
 from ..services.workforce_access import (
     can_create_workforce,
     ensure_agent_access,
@@ -40,6 +43,11 @@ from ..services.workforce_snapshot import (
     validate_workforce_for_run,
 )
 from ..services.workforce_workers import create_workforce_worker
+from .public_trace_events import (
+    DELEGATED_AGENT_TRACE_SOURCE,
+    is_audit_only_trace_data,
+    normalize_public_trace_event,
+)
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
 
@@ -241,6 +249,121 @@ def _serialize_workforce_list_item(
         "created_at": _serialize_datetime(workforce.created_at),
         "updated_at": _serialize_datetime(workforce.updated_at),
     }
+
+
+def _trace_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return float(value.timestamp())
+
+
+_AGENT_EXECUTION_METADATA_FIELDS = (
+    "agent_id",
+    "agent_name",
+    "worker_member_id",
+    "worker_alias",
+)
+
+
+def _merge_agent_execution_metadata(
+    metadata: dict[str, Any], data: dict[str, Any]
+) -> None:
+    """Keep the first immutable delegation identity observed in trace order."""
+
+    for key in _AGENT_EXECUTION_METADATA_FIELDS:
+        if key in data and key not in metadata:
+            metadata[key] = data[key]
+
+
+def _derive_agent_execution_status(
+    trace_events: list[dict[str, Any]],
+) -> str | None:
+    """Infer a terminal worker status when its parent summary is missing."""
+
+    status_aliases = {
+        "completed": "completed",
+        "failed": "failed",
+        "interrupted": "interrupted",
+        "waiting_for_user": "waiting_for_user",
+    }
+    for event in reversed(trace_events):
+        event_type = str(event.get("event_type") or "")
+        if event_type == "trace_error":
+            return "failed"
+        if event_type not in {
+            "react_task_end",
+            "task_completion",
+            "dag_execute_end",
+        }:
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        result = data.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        for candidate in (result.get("status"), data.get("status")):
+            if isinstance(candidate, str):
+                normalized = status_aliases.get(candidate.strip().lower())
+                if normalized is not None:
+                    return normalized
+        success = result.get("success", data.get("success"))
+        if success is False:
+            return "failed"
+        if success is True or event_type == "task_completion":
+            return "completed"
+    return None
+
+
+def _serialize_agent_execution_traces(
+    db: Session,
+    *,
+    task_id: int,
+    worker_task_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    events = (
+        db.query(TraceEvent)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id == worker_task_id,
+            TraceEvent.data["source"].as_string() == DELEGATED_AGENT_TRACE_SOURCE,
+            TraceEvent.event_type != "agent_checkpoint",
+        )
+        .order_by(TraceEvent.timestamp, TraceEvent.id)
+        .all()
+    )
+    if not events:
+        raise HTTPException(status_code=404, detail="Agent execution not found")
+
+    decoded = decode_trace_events_data(
+        db,
+        task_id=task_id,
+        data_items=[event.data for event in events],
+        strict=False,
+    )
+    public_events: list[dict[str, Any]] = []
+    metadata: dict[str, Any] = {"worker_task_id": worker_task_id}
+    for event, data in zip(events, decoded):
+        if is_audit_only_trace_data(data):
+            continue
+        if isinstance(data, dict):
+            _merge_agent_execution_metadata(metadata, data)
+        event_type, public_data = normalize_public_trace_event(
+            str(event.event_type), data
+        )
+        public_events.append(
+            {
+                "event_id": event.event_id,
+                "event_type": event_type,
+                "step_id": event.step_id,
+                "timestamp": _trace_timestamp(event.timestamp),
+                "data": public_data,
+                "parent_event_id": event.parent_event_id,
+            }
+        )
+    return public_events, metadata
 
 
 def _load_latest_runs_by_workforce(
@@ -487,6 +610,70 @@ async def get_workforce(
     return _serialize_workforce_detail(
         workforce, user, get_agent_team_scope(db, int(user.id))
     )
+
+
+@router.get("/{workforce_id}/runs/{task_id}/agent-executions/{worker_task_id}")
+async def get_workforce_agent_execution(
+    workforce_id: int,
+    task_id: int,
+    worker_task_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    run_query = db.query(WorkforceRun).filter(
+        WorkforceRun.workforce_id == int(workforce.id),
+        WorkforceRun.task_id == task_id,
+    )
+    if not user.is_admin:
+        run_query = run_query.filter(WorkforceRun.user_id == int(user.id))
+    run = run_query.options(selectinload(WorkforceRun.task)).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workforce run not found")
+
+    trace_events, metadata = _serialize_agent_execution_traces(
+        db,
+        task_id=task_id,
+        worker_task_id=worker_task_id,
+    )
+
+    status = _derive_agent_execution_status(trace_events) or "running"
+    if (
+        status == "running"
+        and run.task is not None
+        and run.task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+    ):
+        status = "interrupted"
+    summary_events = (
+        db.query(TraceEvent)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+            TraceEvent.data["worker_task_id"].as_string() == worker_task_id,
+        )
+        .order_by(TraceEvent.id)
+        .all()
+    )
+    for event in summary_events:
+        data: dict[str, Any] = event.data if isinstance(event.data, dict) else {}
+        summary_type = data.get("event_type")
+        _merge_agent_execution_metadata(metadata, data)
+        if summary_type == "workforce_delegation_end":
+            status = "completed"
+        elif summary_type == "workforce_delegation_error":
+            status = "failed"
+
+    return {
+        **metadata,
+        "task_id": task_id,
+        "status": status,
+        "trace_events": trace_events,
+    }
 
 
 @router.patch("/{workforce_id}")

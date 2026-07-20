@@ -6,7 +6,7 @@ import { GripVertical } from "lucide-react"
 
 interface ResizableSplitLayoutProps {
   leftPanel: React.ReactNode
-  rightPanel: React.ReactNode
+  rightPanel?: React.ReactNode
   initialLeftWidth?: number // Percentage (0-100)
   minLeftWidth?: number // Percentage (0-100)
   maxLeftWidth?: number // Percentage (0-100)
@@ -24,6 +24,11 @@ export function ResizableSplitLayout({
   const [leftWidth, setLeftWidth] = useState(initialLeftWidth)
   const [isDragging, setIsDragging] = useState(false)
   const containerRef = React.useRef<HTMLDivElement>(null)
+  const rightPanelOpen = rightPanel !== undefined && rightPanel !== null
+
+  useEffect(() => {
+    if (rightPanelOpen) setLeftWidth(initialLeftWidth)
+  }, [initialLeftWidth, rightPanelOpen])
 
   const handleMouseDown = useCallback(() => {
     setIsDragging(true)
@@ -74,30 +79,34 @@ export function ResizableSplitLayout({
     >
       {/* Left Panel */}
       <div
-        style={{ width: `${leftWidth}%` }}
+        style={{ width: rightPanelOpen ? `${leftWidth}%` : "100%" }}
         className="h-full overflow-auto"
       >
         {leftPanel}
       </div>
 
       {/* Resizer Handle */}
-      <div
-        className="w-1 bg-border hover:bg-primary/50 cursor-col-resize flex items-center justify-center relative transition-colors group z-10"
-        onMouseDown={handleMouseDown}
-      >
-        <div className="absolute inset-y-0 -left-2 -right-2 z-10 cursor-col-resize" />
-        <div className="h-8 w-4 bg-background border rounded flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm">
-          <GripVertical className="h-3 w-3 text-muted-foreground" />
+      {rightPanelOpen ? (
+        <div
+          className="w-1 bg-border hover:bg-primary/50 cursor-col-resize flex items-center justify-center relative transition-colors group z-10"
+          onMouseDown={handleMouseDown}
+        >
+          <div className="absolute inset-y-0 -left-2 -right-2 z-10 cursor-col-resize" />
+          <div className="h-8 w-4 bg-background border rounded flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm">
+            <GripVertical className="h-3 w-3 text-muted-foreground" />
+          </div>
         </div>
-      </div>
+      ) : null}
 
       {/* Right Panel */}
-      <div
-        style={{ width: `${100 - leftWidth}%` }}
-        className="h-full flex-1 overflow-auto"
-      >
-        {rightPanel}
-      </div>
+      {rightPanelOpen ? (
+        <div
+          style={{ width: `${100 - leftWidth}%` }}
+          className="h-full flex-1 overflow-auto"
+        >
+          {rightPanel}
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -2554,6 +2554,13 @@ class ReActPattern(AgentPattern):
         for tool in tools:
             if self._tool_name(tool) == name:
                 return tool
+        # Semantic Agent tool names may change when an Agent is renamed. Keep
+        # historical ``agent_<id>`` calls and prior semantic names executable
+        # without exposing duplicate aliases to the model's tool schema.
+        for tool in tools:
+            matches_name = getattr(tool, "matches_name", None)
+            if callable(matches_name) and matches_name(name):
+                return tool
         raise ValueError(f"Tool not found: {name}")
 
     async def _invoke_callable(self, fn: Any, **kwargs: Any) -> Any:

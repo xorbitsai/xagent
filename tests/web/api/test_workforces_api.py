@@ -8,6 +8,7 @@ from sqlalchemy import event
 from xagent.web.api import workforces as workforces_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import get_engine
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
@@ -144,8 +145,6 @@ def _create_workforce_run(
 
 
 def _create_task(user_id: int, *, title: str, description: str) -> int:
-    from xagent.web.models.task import Task, TaskStatus
-
     db = _direct_db_session()
     try:
         task = Task(
@@ -160,6 +159,47 @@ def _create_task(user_id: int, *, title: str, description: str) -> int:
         db.commit()
         db.refresh(task)
         return int(task.id)
+    finally:
+        db.close()
+
+
+def _create_task_workforce_run(
+    *,
+    workforce_id: int,
+    user_id: int,
+    title: str,
+    description: str,
+    status: TaskStatus,
+    created_at: datetime,
+) -> tuple[int, int]:
+    db = _direct_db_session()
+    try:
+        task = Task(
+            user_id=user_id,
+            title=title,
+            description=description,
+            status=status,
+            created_at=created_at,
+        )
+        db.add(task)
+        db.flush()
+        run = WorkforceRun(
+            workforce_id=workforce_id,
+            task_id=int(task.id),
+            user_id=user_id,
+            status=status.value,
+            snapshot={"workforce": {"id": workforce_id}},
+            created_at=created_at,
+            completed_at=(
+                created_at + timedelta(minutes=1)
+                if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+                else None
+            ),
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        return int(run.id), int(task.id)
     finally:
         db.close()
 
@@ -525,6 +565,219 @@ def test_list_workforces_paginates_visible_query_and_bulk_loads_last_runs() -> N
     assert len(workforce_run_selects) == 1
     for item in payload["items"]:
         assert item["last_run"]["status"] == expected_latest_status[item["id"]]
+
+
+def test_get_workforce_agent_execution_returns_only_requested_worker_trace() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Agent Trace Workforce")
+    owner_id = _user_id()
+    now = datetime.now(timezone.utc)
+    _, task_id = _create_task_workforce_run(
+        workforce_id=int(workforce["id"]),
+        user_id=owner_id,
+        title="Agent trace run",
+        description="Delegate the work",
+        status=TaskStatus.COMPLETED,
+        created_at=now,
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add_all(
+            [
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-start",
+                    event_type="react_task_start",
+                    timestamp=now,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "agent_id": 17,
+                        "agent_name": "Editor Agent",
+                        "worker_alias": "Editor",
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-end",
+                    event_type="react_task_end",
+                    timestamp=now + timedelta(seconds=1),
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "agent_name": "Editor Agent",
+                        "result": {"success": True},
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="delegation-end",
+                    event_type="task_update_general",
+                    timestamp=now + timedelta(seconds=2),
+                    data={
+                        "event_type": "workforce_delegation_end",
+                        "worker_task_id": "agent_17_run",
+                        "agent_id": 17,
+                        "agent_name": "Editor Agent",
+                        "worker_alias": "Editor",
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_18_run",
+                    event_id="other-worker",
+                    event_type="react_task_start",
+                    timestamp=now,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_18_run",
+                    },
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/workforces/{workforce['id']}/runs/{task_id}/agent-executions/agent_17_run",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["worker_task_id"] == "agent_17_run"
+    assert payload["agent_name"] == "Editor Agent"
+    assert payload["worker_alias"] == "Editor"
+    assert payload["status"] == "completed"
+    assert [event["event_id"] for event in payload["trace_events"]] == [
+        "worker-start",
+        "worker-end",
+    ]
+
+
+def test_get_workforce_agent_execution_derives_completed_without_summary() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Derived Agent Trace Workforce")
+    owner_id = _user_id()
+    now = datetime.now(timezone.utc)
+    _, task_id = _create_task_workforce_run(
+        workforce_id=int(workforce["id"]),
+        user_id=owner_id,
+        title="Agent trace run",
+        description="Delegate the work",
+        status=TaskStatus.RUNNING,
+        created_at=now,
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add_all(
+            [
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-start",
+                    event_type="react_task_start",
+                    timestamp=now,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "agent_name": "Editor Agent",
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-end",
+                    event_type="react_task_end",
+                    timestamp=now + timedelta(seconds=1),
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "result": {"success": True},
+                    },
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/workforces/{workforce['id']}/runs/{task_id}/agent-executions/agent_17_run",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+
+
+def test_get_workforce_agent_execution_marks_orphan_interrupted() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Orphan Agent Trace Workforce")
+    owner_id = _user_id()
+    now = datetime.now(timezone.utc)
+    _, task_id = _create_task_workforce_run(
+        workforce_id=int(workforce["id"]),
+        user_id=owner_id,
+        title="Agent trace run",
+        description="Delegate the work",
+        status=TaskStatus.COMPLETED,
+        created_at=now,
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                build_id="agent_17_run",
+                event_id="worker-start",
+                event_type="react_task_start",
+                timestamp=now,
+                data={
+                    "source": "xagent-agent-tool-child",
+                    "worker_task_id": "agent_17_run",
+                    "agent_name": "Editor Agent",
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/workforces/{workforce['id']}/runs/{task_id}/agent-executions/agent_17_run",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "interrupted"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "result", "expected"),
+    [
+        ("dag_execute_end", {"success": True}, "completed"),
+        ("dag_execute_end", {"success": False}, "failed"),
+        ("trace_error", {}, "failed"),
+    ],
+)
+def test_agent_execution_status_recognizes_dag_terminal_events(
+    event_type: str,
+    result: dict[str, Any],
+    expected: str,
+) -> None:
+    assert (
+        workforces_api._derive_agent_execution_status(
+            [{"event_type": event_type, "data": {"result": result}}]
+        )
+        == expected
+    )
 
 
 def test_publish_unpublish_and_active_validation() -> None:

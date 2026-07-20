@@ -289,6 +289,85 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("messages").textContent).not.toContain("Searching")
   })
 
+  it("preserves workforce delegation event types for agent execution links", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        data: {
+          event_id: "delegation-1",
+          event_type: "workforce_delegation_start",
+          data: {
+            worker_task_id: "agent_20_564c4340",
+            agent_name: "Editor Agent",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("trace-events").textContent).toContain(
+        "workforce_delegation_start"
+      )
+    })
+  })
+
+  it("keeps delegated child prompts and answers out of the parent chat", async () => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    for (const [eventType, content] of [
+      ["user_message", "Delegated task instructions"],
+      ["agent_message", "Child Agent clarification"],
+      ["ai_message", "Child Agent final answer"],
+    ] as const) {
+      act(() => {
+        onMessage?.({
+          type: "trace_event",
+          timestamp: "2026-05-27T05:00:03Z",
+          data: {
+            event_id: `child-${eventType}`,
+            event_type: eventType,
+            data: {
+              source: "xagent-agent-tool-child",
+              worker_task_id: "agent_20_run",
+              message: content,
+              content,
+              role: eventType === "user_message" ? "user" : "assistant",
+              display: "chat",
+            },
+          },
+        })
+      })
+    }
+
+    await waitFor(() => {
+      const traceText = screen.getByTestId("trace-events").textContent || ""
+      expect(traceText).toContain("user_message")
+      expect(traceText).toContain("agent_message")
+      expect(traceText).toContain("ai_message")
+    })
+    const messageText = screen.getByTestId("messages").textContent || ""
+    expect(messageText).not.toContain("Delegated task instructions")
+    expect(messageText).not.toContain("Child Agent clarification")
+    expect(messageText).not.toContain("Child Agent final answer")
+  })
+
   it("deduplicates the same user turn when history is replayed after reconnect", async () => {
     render(
       <AppProvider token="token">

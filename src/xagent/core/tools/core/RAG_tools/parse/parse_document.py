@@ -248,7 +248,10 @@ async def _parse_document_internal(
         # Start with parser metadata, then override with authoritative values
         enriched_metadata = {
             **paragraph.metadata,
-            "source": source_path,
+            # Persist the canonical path from the document row, not the physical
+            # path actually read (which for staged ingestion is a transient file
+            # removed after publish). Durable metadata must keep the canonical path.
+            "source": document["source_path"],
             "file_type": file_type,  # Use file_type from database (without dot)
             "parse_method": str(parse_method),
             "parser": f"local:{parse_method}@v1.0.0",

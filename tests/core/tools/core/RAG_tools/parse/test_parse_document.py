@@ -263,6 +263,20 @@ class TestParseDocumentCore:
         joined = " ".join(p["text"] for p in out["paragraphs"])
         assert "staged marker content" in joined
 
+        # Durable metadata keeps the canonical path (acceptance criterion #2):
+        # both the document row and paragraph metadata store the canonical path,
+        # not the transient staged path that gets removed after publish.
+        from xagent.core.tools.core.RAG_tools.parse.parse_document import (
+            _get_document_from_db,
+        )
+
+        document = _get_document_from_db(
+            collection=test_collection, doc_id=test_doc_id, user_id=1, is_admin=True
+        )
+        assert document is not None
+        assert document["source_path"] == str(canonical)
+        assert out["paragraphs"][0]["metadata"]["source"] == str(canonical)
+
     def test_staged_parse_reads_new_staged_bytes_over_existing_canonical(
         self,
         tmp_path,
@@ -299,6 +313,17 @@ class TestParseDocumentCore:
         joined = " ".join(p["text"] for p in out["paragraphs"])
         assert "new staged content" in joined
         assert "old canonical content" not in joined
+
+        # Durable metadata still stores the canonical path (acceptance criterion #2).
+        from xagent.core.tools.core.RAG_tools.parse.parse_document import (
+            _get_document_from_db,
+        )
+
+        document = _get_document_from_db(
+            collection=test_collection, doc_id=test_doc_id, user_id=1, is_admin=True
+        )
+        assert document is not None
+        assert document["source_path"] == str(canonical)
 
 
 class TestParseDocumentFallback:

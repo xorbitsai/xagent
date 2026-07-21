@@ -25,9 +25,13 @@ export function ResizableSplitLayout({
   const [isDragging, setIsDragging] = useState(false)
   const containerRef = React.useRef<HTMLDivElement>(null)
   const rightPanelOpen = rightPanel !== undefined && rightPanel !== null
+  const wasRightPanelOpenRef = React.useRef(rightPanelOpen)
 
   useEffect(() => {
-    if (rightPanelOpen) setLeftWidth(initialLeftWidth)
+    if (rightPanelOpen && !wasRightPanelOpenRef.current) {
+      setLeftWidth(initialLeftWidth)
+    }
+    wasRightPanelOpenRef.current = rightPanelOpen
   }, [initialLeftWidth, rightPanelOpen])
 
   const handleMouseDown = useCallback(() => {
@@ -88,6 +92,9 @@ export function ResizableSplitLayout({
       {/* Resizer Handle */}
       {rightPanelOpen ? (
         <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize panels"
           className="w-1 bg-border hover:bg-primary/50 cursor-col-resize flex items-center justify-center relative transition-colors group z-10"
           onMouseDown={handleMouseDown}
         >

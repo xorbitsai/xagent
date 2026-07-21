@@ -33,7 +33,11 @@ def _semantic_slug(value: Any) -> str:
     # Chinese Agent names retain useful semantics instead of all collapsing to
     # the same generic fallback.
     normalized_name = unicodedata.normalize("NFKD", raw_name.strip())
-    romanized_name = "_".join(lazy_pinyin(normalized_name))
+    romanized_name = (
+        normalized_name
+        if normalized_name.isascii()
+        else "_".join(lazy_pinyin(normalized_name))
+    )
     ascii_name = romanized_name.encode("ascii", "ignore").decode("ascii")
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", ascii_name.lower())
     return re.sub(r"_+", "_", slug).strip("_-") or "agent"

@@ -92,7 +92,8 @@ const isDelegatedChildTraceEvent = (event: unknown): boolean => {
 
 const isAgentDelegationToolName = (toolName: string): boolean => (
   /^agent_(?:[1-9]\d*|[a-z0-9_]+__a[1-9]\d*)$/.test(toolName) ||
-  /^worker_[a-z0-9_]+__a[1-9]\d*$/.test(toolName)
+  /^worker_[a-z0-9_]+__a[1-9]\d*$/.test(toolName) ||
+  /^call_agent_[1-9]\d*$/.test(toolName)
 )
 
 const isWorkforceAgentToolTraceEvent = (event: unknown): boolean => {

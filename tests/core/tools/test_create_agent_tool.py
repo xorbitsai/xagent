@@ -1957,10 +1957,15 @@ class TestAgentToolNameGeneration:
             gen_agent_tool_name("Research Assistant")
 
     def test_gen_agent_tool_name_includes_ascii_semantic_name_and_id(self) -> None:
-        assert (
-            gen_agent_tool_name(42, "Research Assistant")
-            == "agent_research_assistant__a42"
-        )
+        with patch(
+            "xagent.core.tools.adapters.vibe.agent_tool_names.lazy_pinyin"
+        ) as lazy_pinyin:
+            assert (
+                gen_agent_tool_name(42, "Research Assistant")
+                == "agent_research_assistant__a42"
+            )
+
+        lazy_pinyin.assert_not_called()
 
     def test_gen_agent_tool_name_romanizes_non_ascii_names(self) -> None:
         name = gen_agent_tool_name(42, "视频生成 Agent")

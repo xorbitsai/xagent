@@ -262,6 +262,15 @@ describe("TaskConversationPanel", () => {
         },
       },
       {
+        event_id: "raw-legacy-agent-tool",
+        event_type: "tool_execution_start",
+        timestamp: 1000.75,
+        data: {
+          tool_name: "call_agent_7",
+          tool_params: { task: "Review the delegated work" },
+        },
+      },
+      {
         event_id: "delegation-start",
         event_type: "workforce_delegation_start",
         timestamp: 1001,

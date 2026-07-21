@@ -10,7 +10,7 @@ from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import resolve_id_from_url, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-docs-mcp")
@@ -66,10 +66,7 @@ def get_drive_service() -> Any:
 
 def _resolve_document_id(document_id: str) -> str:
     """Accept either a bare document id or a full Google Docs URL."""
-    match = _DOCUMENT_URL_ID_PATTERN.search(document_id)
-    if match:
-        return match.group(1)
-    return document_id.strip()
+    return resolve_id_from_url(document_id, _DOCUMENT_URL_ID_PATTERN)
 
 
 def _paragraph_text(paragraph: dict[str, Any]) -> str:

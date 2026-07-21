@@ -50,6 +50,8 @@ DEFAULT_DEAL_PROPERTIES = [
 # HUBSPOT_DEFINED association type ids for notes.
 _NOTE_ASSOCIATION_TYPE_IDS = {"contact": 202, "company": 190, "deal": 214}
 
+_ASSOCIATION_PAGE_SIZE = 100
+
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
@@ -97,6 +99,30 @@ def _request(
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _list_association_ids(path: str, max_results: int) -> tuple[list[Any], bool]:
+    """Collect associated object ids across pages, up to ``max_results``.
+
+    Follows the ``paging.next.after`` cursor so results beyond the API's
+    default page size are not silently dropped. Returns the collected ids and
+    whether more associations remain on the server.
+    """
+    ids: list[Any] = []
+    after: str | None = None
+    while True:
+        params: dict[str, Any] = {
+            "limit": min(_ASSOCIATION_PAGE_SIZE, max_results - len(ids))
+        }
+        if after:
+            params["after"] = after
+        page = _request("GET", path, params=params)
+        ids.extend(item.get("id") for item in page.get("results", []))
+        after = ((page.get("paging") or {}).get("next") or {}).get("after")
+        if len(ids) >= max_results:
+            return ids[:max_results], bool(after) or len(ids) > max_results
+        if not after:
+            return ids, False
 
 
 def _parse_properties(properties_json: str) -> dict[str, Any]:
@@ -246,18 +272,19 @@ def hubspot_update_company(company_id: str, properties_json: str) -> str:
 
 
 @mcp.tool()
-def hubspot_get_contact_deals(contact_id: str) -> str:
+def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     """
     List the deals associated with a HubSpot contact, including deal stage,
-    pipeline, amount, and close date.
+    pipeline, amount, and close date. Returns at most `limit` deals (max 100);
+    `has_more` is true when the contact has additional deals beyond the result.
     """
     try:
-        associations = _request(
-            "GET", f"/crm/v3/objects/contacts/{contact_id}/associations/deals"
+        deal_ids, has_more = _list_association_ids(
+            f"/crm/v3/objects/contacts/{contact_id}/associations/deals",
+            max(1, min(limit, 100)),
         )
-        deal_ids = [item.get("id") for item in associations.get("results", [])]
         if not deal_ids:
-            return _success(deals=[])
+            return _success(deals=[], has_more=False)
 
         deals = _request(
             "POST",
@@ -271,7 +298,8 @@ def hubspot_get_contact_deals(contact_id: str) -> str:
             deals=[
                 {"id": item.get("id"), "properties": item.get("properties", {})}
                 for item in deals.get("results", [])
-            ]
+            ],
+            has_more=has_more,
         )
     except Exception as e:
         logger.error(f"Error getting contact deals: {e}")
@@ -282,17 +310,16 @@ def hubspot_get_contact_deals(contact_id: str) -> str:
 def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
     """
     List the notes associated with a HubSpot contact (most recent interaction
-    history), including note body and timestamp.
+    history), including note body and timestamp. Returns at most `limit` notes
+    (max 100); `has_more` is true when the contact has additional notes.
     """
     try:
-        associations = _request(
-            "GET", f"/crm/v3/objects/contacts/{contact_id}/associations/notes"
+        note_ids, has_more = _list_association_ids(
+            f"/crm/v3/objects/contacts/{contact_id}/associations/notes",
+            max(1, min(limit, 100)),
         )
-        note_ids = [item.get("id") for item in associations.get("results", [])][
-            : max(1, min(limit, 100))
-        ]
         if not note_ids:
-            return _success(notes=[])
+            return _success(notes=[], has_more=False)
 
         notes = _request(
             "POST",
@@ -306,7 +333,8 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
             notes=[
                 {"id": item.get("id"), "properties": item.get("properties", {})}
                 for item in notes.get("results", [])
-            ]
+            ],
+            has_more=has_more,
         )
     except Exception as e:
         logger.error(f"Error getting contact notes: {e}")

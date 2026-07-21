@@ -196,3 +196,87 @@ def test_downgrade_keeps_provider_when_custom_hubspot_app_exists(tmp_path):
             )
             migration.downgrade()
         assert "hubspot" in _provider_names(connection)
+
+
+def test_downgrade_preserves_admin_created_hubspot_provider(tmp_path):
+    """A pre-existing admin-created "hubspot" provider (different shape than the
+    seeded row) must survive downgrade even when no hubspot apps remain."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO oauth_providers"
+                " (provider_name, name, client_id, client_secret, auth_url, token_url)"
+                " VALUES ('hubspot', 'Custom HubSpot', 'cid', 'secret',"
+                " 'https://custom.example.com/authorize',"
+                " 'https://custom.example.com/token')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert not {"google-docs", "google-slides", "hubspot"} & _app_ids(connection)
+        assert "hubspot" in _provider_names(connection)
+
+
+def test_upgrade_and_downgrade_with_reduced_column_schema(tmp_path):
+    """Exercise _filter_row's column dropping against tables missing optional
+    columns, and the downgrade guard when guard columns are absent."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE,
+                    name VARCHAR(100) NOT NULL,
+                    client_id VARCHAR(500) NOT NULL,
+                    client_secret VARCHAR(500) NOT NULL,
+                    auth_url VARCHAR(500) NOT NULL,
+                    token_url VARCHAR(500) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50)
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            assert "hubspot" in _provider_names(connection)
+            assert {"google-docs", "google-slides", "hubspot"}.issubset(
+                _app_ids(connection)
+            )
+            migration.downgrade()
+        assert not {"google-docs", "google-slides", "hubspot"} & _app_ids(connection)
+        assert "hubspot" not in _provider_names(connection)
+
+
+def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        table_names = set(
+            connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).scalars()
+        )
+        assert "oauth_providers" not in table_names
+        assert "public_mcp_apps" not in table_names

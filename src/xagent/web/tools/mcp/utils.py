@@ -1,5 +1,15 @@
 import os
+import re
 import urllib.request
+
+
+def resolve_id_from_url(value: str, pattern: re.Pattern[str]) -> str:
+    """Return the id captured by ``pattern`` when ``value`` is a matching URL,
+    otherwise the stripped value itself."""
+    match = pattern.search(value)
+    if match:
+        return match.group(1)
+    return value.strip()
 
 
 def setup_proxy_env() -> None:

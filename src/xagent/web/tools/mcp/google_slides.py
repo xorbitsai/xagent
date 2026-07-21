@@ -9,7 +9,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import resolve_id_from_url, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-slides-mcp")
@@ -48,10 +48,7 @@ def get_slides_service() -> Any:
 
 def _resolve_presentation_id(presentation_id: str) -> str:
     """Accept either a bare presentation id or a full Google Slides URL."""
-    match = _PRESENTATION_URL_ID_PATTERN.search(presentation_id)
-    if match:
-        return match.group(1)
-    return presentation_id.strip()
+    return resolve_id_from_url(presentation_id, _PRESENTATION_URL_ID_PATTERN)
 
 
 def _element_text(element: dict[str, Any]) -> str:

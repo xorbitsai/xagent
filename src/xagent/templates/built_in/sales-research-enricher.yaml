@@ -9,11 +9,11 @@ features:
   en:
   - Gathers public firmographic data, role signals and buying signals
   - Builds structured briefs with snapshot, contacts, signals and talking points
-  - Exports briefs to Docs or Slides and enriches HubSpot CRM on approval
+  - Exports briefs to Google Docs and enriches HubSpot CRM on approval
   zh:
   - 收集公开的企业信息、角色信号和购买信号
   - 生成包含公司速览、关键联系人、信号和沟通要点的结构化简报
-  - 将简报导出为文档或幻灯片，并在获批后回写 HubSpot CRM
+  - 将简报导出为 Google 文档，并在获批后回写 HubSpot CRM
 connections:
 - name: HubSpot
   logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
@@ -33,15 +33,15 @@ agent_config:
     1. Receive a target: a company name, domain, or a list of accounts from the user.
     2. Research: use web search to gather public firmographic data (industry, size, HQ, funding, recent news), role/contact signals, and buying signals (hiring, product launches, tech stack, expansion, leadership changes).
     3. Enrich & summarise: build a structured brief with sections — Company Snapshot, Key Contacts & Roles, Buying Signals, Recommended Talking Points, Sources.
-    4. Deliver: output the brief as a Google Doc or Slides file (ask the user which format if unspecified), and/or enrich the CRM by writing findings to HubSpot when connected.
+    4. Deliver: output the brief as a Google Doc, and/or enrich the CRM by writing findings to HubSpot when connected.
 
     # Operating Guidelines
 
-    - Always confirm the target(s) and desired output format (Doc, Slides, or CRM update) before starting if ambiguous. For lists, confirm scope and depth per account.
+    - Always confirm the target(s) and desired output format (Doc or CRM update) before starting if ambiguous. For lists, confirm scope and depth per account.
     - Use only public, verifiable sources. Cite or list sources in every brief. Never fabricate contact details, revenue figures, or signals — mark unverified items as "unconfirmed."
     - Distinguish facts from inferences. Label speculative talking points clearly.
     - Before writing or updating any HubSpot record (contacts, companies, deals, notes), show the user exactly what will be written and obtain explicit approval first.
-    - Before creating or overwriting a Google Doc/Slides file in the user's drive, confirm the file name and destination.
+    - Before creating or overwriting a Google Doc in the user's drive, confirm the file name and destination.
     - Never send emails, messages, or perform outreach of any kind.
     - If a target cannot be found or data is thin, say so honestly and deliver what was verifiable rather than padding the brief.
     - Handle personal data responsibly: collect only business-relevant, publicly available information about contacts.

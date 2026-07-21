@@ -237,6 +237,92 @@ def test_deepseek_codec_repairs_complete_malformed_tool_arguments() -> None:
     }
 
 
+def test_deepseek_codec_repairs_brace_inside_single_quoted_string() -> None:
+    response = {
+        "type": "tool_call",
+        "tool_calls": [
+            {
+                "id": "call_write",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": (
+                        "{'file_path':'artifact.txt','content':'Use {value',}"
+                    ),
+                },
+            }
+        ],
+    }
+
+    normalized = normalize_deepseek_response(
+        response,
+        tools=[WRITE_FILE_TOOL],
+    )
+
+    assert normalized is response
+    repaired = json.loads(response["tool_calls"][0]["function"]["arguments"])
+    assert repaired == {
+        "file_path": "artifact.txt",
+        "content": "Use {value",
+    }
+
+
+def test_deepseek_codec_marks_non_object_repair_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.deepseek_tool_protocol.repair_json_loads",
+        lambda *_args, **_kwargs: [],
+    )
+    normalized = normalize_deepseek_response(
+        {
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{broken}",
+                    }
+                }
+            ],
+        },
+        tools=[WRITE_FILE_TOOL],
+    )
+
+    error = get_tool_protocol_error(normalized)
+    assert error is not None
+    assert error["code"] == "malformed_tool_arguments"
+    assert error["details"]["repair_status"] == "failed_non_dict"
+
+
+def test_deepseek_codec_accepts_empty_object_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.deepseek_tool_protocol.repair_json_loads",
+        lambda *_args, **_kwargs: {},
+    )
+    response = {
+        "type": "tool_call",
+        "tool_calls": [
+            {
+                "function": {
+                    "name": "ping",
+                    "arguments": "{broken}",
+                }
+            }
+        ],
+    }
+
+    normalized = normalize_deepseek_response(
+        response,
+        tools=[_tool_schema("ping", {}, additional_properties=False)],
+    )
+
+    assert normalized is response
+    assert response["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
 def test_deepseek_codec_keeps_original_arguments_when_repair_is_unsafe() -> None:
     original_arguments = '{"file_path":'
 

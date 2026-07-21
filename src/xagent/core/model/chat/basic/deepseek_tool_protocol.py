@@ -272,18 +272,24 @@ def _tool_call_violation(
                     name,
                     details=argument_details,
                 )
-            argument_details["repair_status"] = "repaired"
-            if isinstance(arguments, dict):
-                applied = _set_tool_call_arguments(
-                    tool_call,
-                    json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            if not isinstance(arguments, dict):
+                argument_details["repair_status"] = "failed_non_dict"
+                return _malformed_arguments_violation(
+                    name,
+                    message=f"DeepSeek returned non-object arguments for {name!r}.",
+                    details=argument_details,
                 )
-                if not applied:
-                    argument_details["repair_status"] = "repair_application_failed"
-                    return _malformed_arguments_violation(
-                        name,
-                        details=argument_details,
-                    )
+            argument_details["repair_status"] = "repaired"
+            applied = _set_tool_call_arguments(
+                tool_call,
+                json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            )
+            if not applied:
+                argument_details["repair_status"] = "repair_application_failed"
+                return _malformed_arguments_violation(
+                    name,
+                    details=argument_details,
+                )
     if not isinstance(arguments, dict):
         details = argument_details or _argument_diagnostics(arguments)
         details.setdefault("repair_status", "not_applicable")
@@ -362,27 +368,27 @@ def _is_structurally_complete_json_object(arguments: str) -> bool:
 
     pairs = {"}": "{", "]": "["}
     stack: list[str] = []
-    in_string = False
+    string_quote: str | None = None
     escaped = False
     for char in stripped:
-        if in_string:
+        if string_quote is not None:
             if escaped:
                 escaped = False
             elif char == "\\":
                 escaped = True
-            elif char == '"':
-                in_string = False
+            elif char == string_quote:
+                string_quote = None
             continue
 
-        if char == '"':
-            in_string = True
+        if char in {'"', "'"}:
+            string_quote = char
         elif char in "{[":
             stack.append(char)
         elif char in pairs:
             if not stack or stack.pop() != pairs[char]:
                 return False
 
-    return not in_string and not escaped and not stack
+    return string_quote is None and not escaped and not stack
 
 
 def _set_tool_call_arguments(tool_call: Any, arguments: str) -> bool:

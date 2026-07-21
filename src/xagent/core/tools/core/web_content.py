@@ -196,14 +196,22 @@ class WebContentFetcher:
                     assets: tuple[WebAssetReference, ...] = ()
                     if include_assets:
                         discovered_assets = self._extract_html_assets(soup, final_url)
-                        discovered_assets.extend(
-                            await self._discover_spa_manifest_assets(
-                                client,
-                                soup,
-                                final_url,
-                                asset_query=asset_query,
-                            )
+                        matching_html_assets = self._filter_and_deduplicate_assets(
+                            discovered_assets,
+                            asset_query=asset_query,
                         )
+                        if not any(
+                            asset.kind in {"image", "icon"}
+                            for asset in matching_html_assets
+                        ):
+                            discovered_assets.extend(
+                                await self._discover_spa_manifest_assets(
+                                    client,
+                                    soup,
+                                    final_url,
+                                    asset_query=asset_query,
+                                )
+                            )
                         assets = self._filter_and_deduplicate_assets(
                             discovered_assets,
                             asset_query=asset_query,
@@ -329,14 +337,7 @@ class WebContentFetcher:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return []
         manifest_url = f"{parsed.scheme}://{parsed.netloc}/asset-manifest.json"
-        assets = [
-            WebAssetReference(
-                url=manifest_url,
-                kind="asset_manifest",
-                name="asset-manifest.json",
-                source="spa_convention",
-            )
-        ]
+        assets: list[WebAssetReference] = []
         try:
             response = await client.get(
                 manifest_url,
@@ -347,6 +348,14 @@ class WebContentFetcher:
             response.raise_for_status()
             if len(response.content) > self._max_content_bytes:
                 return assets
+            assets.append(
+                WebAssetReference(
+                    url=manifest_url,
+                    kind="asset_manifest",
+                    name="asset-manifest.json",
+                    source="spa_convention",
+                )
+            )
             decoded = self._decode_text_response(response, response.content)
             assets.extend(
                 self._manifest_asset_references(

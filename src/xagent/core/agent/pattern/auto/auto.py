@@ -1073,9 +1073,7 @@ class AutoPattern(AgentPattern):
         if loaded_names:
             return False
         return any(
-            isinstance(entry, dict)
-            and str(entry.get("name") or "").strip()
-            and str(entry.get("name") or "").strip() not in loaded_names
+            isinstance(entry, dict) and str(entry.get("name") or "").strip()
             for entry in skill_index
         )
 

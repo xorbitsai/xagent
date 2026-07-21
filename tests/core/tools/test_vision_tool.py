@@ -523,6 +523,55 @@ class TestVisionToolUnderstandMedia:
         rasterize.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_understand_remote_svg_downloads_and_sends_source(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        svg_source = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+            '<path fill="#7B0099" d="M0 0h10v10z"/>'
+            "</svg>"
+        )
+
+        class RemoteSvgResponse:
+            headers = {"content-length": str(len(svg_source.encode()))}
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
+                yield svg_source.encode()
+
+        class RemoteSvgStream:
+            async def __aenter__(self):
+                return RemoteSvgResponse()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with patch(
+            "httpx.AsyncClient.stream",
+            return_value=RemoteSvgStream(),
+        ) as stream:
+            result = await vision_tool_without_workspace.understand_media(
+                "https://cdn.example.com/official-logo.svg",
+                "What are the exact brand colors?",
+            )
+
+        assert result.success is True
+        content = mock_vision_model.vision_chat.call_args.kwargs["messages"][0][
+            "content"
+        ]
+        assert svg_source in content[1]["text"]
+        assert "#7B0099" in content[1]["text"]
+        assert all(item["type"] != "image_url" for item in content[1:])
+        stream.assert_called_once_with(
+            "GET",
+            "https://cdn.example.com/official-logo.svg",
+            timeout=10,
+            follow_redirects=True,
+        )
+
+    @pytest.mark.asyncio
     async def test_understand_local_image_offloads_conversion(
         self, vision_tool_without_workspace, mock_vision_model, tmp_path
     ):

@@ -118,6 +118,7 @@ class TestFetchWebContentTool:
           <head>
             <title>Brand</title>
             <link rel="icon" href="/favicon.png">
+            <script defer src="/static/js/main.abc123.js"></script>
           </head>
           <body>
             <img src="/assets/brand-logo.svg" alt="Brand logo">
@@ -131,8 +132,11 @@ class TestFetchWebContentTool:
             url="https://example.com/campaign",
         )
 
-        with patch(
-            "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+        with (
+            patch(
+                "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+            ),
+            patch("httpx.AsyncClient.get") as mock_get,
         ):
             result = await fetch_tool.run_json_async(
                 {
@@ -152,6 +156,7 @@ class TestFetchWebContentTool:
                 "source": "html",
             }
         ]
+        mock_get.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_fetch_discovers_logo_from_spa_asset_manifest(self, fetch_tool):
@@ -205,6 +210,42 @@ class TestFetchWebContentTool:
             "https://simba.example/static/media/simba-logo.958c8ff7.svg",
         ]
         mock_get.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("manifest_case", ["network", "oversized", "not_found"])
+    async def test_fetch_tolerates_unavailable_spa_asset_manifest(self, manifest_case):
+        html = (
+            '<html><script defer src="/static/js/main.js"></script>'
+            "<body>Brand</body></html>"
+        )
+        response = _MockStreamResponse(
+            body=html.encode(),
+            headers={"content-type": "text/html"},
+            url="https://example.com/campaign",
+        )
+        request = httpx.Request("GET", "https://example.com/asset-manifest.json")
+
+        async def get_manifest(*_args, **_kwargs):
+            if manifest_case == "network":
+                raise httpx.ConnectError("manifest unavailable", request=request)
+            if manifest_case == "not_found":
+                return httpx.Response(404, request=request)
+            return httpx.Response(200, content=b"x" * 513, request=request)
+
+        with (
+            patch(
+                "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+            ),
+            patch("httpx.AsyncClient.get", side_effect=get_manifest),
+        ):
+            result = await WebContentFetcher(max_content_bytes=512).fetch(
+                "https://example.com/campaign",
+                include_assets=True,
+                asset_query="logo",
+            )
+
+        assert result.success is True
+        assert result.assets == ()
 
     @pytest.mark.asyncio
     async def test_fetch_follows_redirects(self, fetch_tool):

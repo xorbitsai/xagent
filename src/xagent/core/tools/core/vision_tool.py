@@ -15,12 +15,13 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from urllib.parse import urlsplit
+from urllib.parse import unquote_to_bytes, urlsplit
 
+import httpx
 from pydantic import BaseModel, Field
 
 from ...model.chat.basic.base import BaseLLM
-from ...utils.svg import rasterize_svg_bytes
+from ...utils.svg import MAX_SVG_BYTES, rasterize_svg_bytes
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -170,27 +171,40 @@ class VisionCore:
         except Exception as e:
             raise RuntimeError(f"Failed to read image file {image_path}: {e}")
 
-    def _svg_source_content(
+    async def _svg_source_content(
         self, image_path: str, media_index: int
     ) -> tuple[Optional[Dict[str, str]], Optional[str]]:
         """Return bounded SVG source as quoted model context for exact inspection."""
-        if image_path.startswith(("http://", "https://", "data:")):
-            return None, None
-
-        mime_type = mimetypes.guess_type(image_path)[0]
-        if mime_type != "image/svg+xml" and not image_path.lower().endswith(".svg"):
-            return None, None
-
         try:
-            source = Path(image_path).read_text(encoding="utf-8-sig", errors="replace")
-        except OSError as exc:
+            if image_path.startswith(("http://", "https://")):
+                if Path(urlsplit(image_path).path).suffix.lower() != ".svg":
+                    return None, None
+                source = await self._download_remote_svg_source(image_path)
+                label = Path(urlsplit(image_path).path).name or image_path
+            elif image_path.startswith("data:"):
+                if not image_path.lower().startswith("data:image/svg+xml"):
+                    return None, None
+                source = self._decode_svg_data_url(image_path)
+                label = f"inline-svg-{media_index + 1}"
+            else:
+                mime_type = mimetypes.guess_type(image_path)[0]
+                if mime_type != "image/svg+xml" and not image_path.lower().endswith(
+                    ".svg"
+                ):
+                    return None, None
+                source = await asyncio.to_thread(
+                    Path(image_path).read_text,
+                    encoding="utf-8-sig",
+                    errors="replace",
+                )
+                label = Path(image_path).name
+        except (OSError, ValueError, httpx.HTTPError) as exc:
             return None, f"Failed to read SVG source {image_path}: {exc}"
 
         truncated = len(source) > _MAX_INLINE_SVG_SOURCE_CHARS
         if truncated:
             source = source[:_MAX_INLINE_SVG_SOURCE_CHARS]
 
-        label = Path(image_path).name
         suffix = (
             f"\n[Source truncated after {_MAX_INLINE_SVG_SOURCE_CHARS} characters.]"
             if truncated
@@ -213,6 +227,64 @@ class VisionCore:
             },
             None,
         )
+
+    async def _download_remote_svg_source(self, url: str) -> str:
+        chunks: list[bytes] = []
+        downloaded = 0
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "GET",
+                url,
+                timeout=10,
+                follow_redirects=True,
+            ) as response:
+                response.raise_for_status()
+                declared_length = response.headers.get("content-length")
+                if declared_length:
+                    try:
+                        size = int(declared_length)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid remote SVG content length: {declared_length}"
+                        ) from exc
+                    if size < 0 or size > MAX_SVG_BYTES:
+                        raise ValueError(
+                            f"Remote SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
+                        )
+                async for chunk in response.aiter_bytes():
+                    downloaded += len(chunk)
+                    if downloaded > MAX_SVG_BYTES:
+                        raise ValueError(
+                            f"Remote SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
+                        )
+                    chunks.append(chunk)
+
+        return self._decode_svg_bytes(b"".join(chunks))
+
+    @classmethod
+    def _decode_svg_data_url(cls, data_url: str) -> str:
+        header, separator, payload = data_url.partition(",")
+        if not separator:
+            raise ValueError("SVG data URL has no payload")
+        try:
+            svg_bytes = (
+                base64.b64decode(payload, validate=True)
+                if ";base64" in header.lower()
+                else unquote_to_bytes(payload)
+            )
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError("SVG data URL payload is invalid") from exc
+        return cls._decode_svg_bytes(svg_bytes)
+
+    @staticmethod
+    def _decode_svg_bytes(svg_bytes: bytes) -> str:
+        if not svg_bytes:
+            raise ValueError("SVG source is empty")
+        if len(svg_bytes) > MAX_SVG_BYTES:
+            raise ValueError(f"SVG exceeds maximum size of {MAX_SVG_BYTES} bytes")
+        if b"<svg" not in svg_bytes[:4096].lower():
+            raise ValueError("SVG source does not contain an <svg> root")
+        return svg_bytes.decode("utf-8-sig", errors="replace")
 
     def _convert_video_to_base64(self, video_path: str) -> str:
         """Convert a local video to a provider-neutral Base64 data URL."""
@@ -638,9 +710,10 @@ class VisionCore:
                         processed_videos += 1
                         extracted_frames += len(frames)
                     else:
-                        svg_source_content, svg_source_warning = (
-                            self._svg_source_content(media_path, index)
-                        )
+                        (
+                            svg_source_content,
+                            svg_source_warning,
+                        ) = await self._svg_source_content(media_path, index)
                         if svg_source_warning:
                             logger.warning(svg_source_warning)
                             warnings.append(svg_source_warning)

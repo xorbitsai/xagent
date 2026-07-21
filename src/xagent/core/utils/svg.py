@@ -75,6 +75,7 @@ def rasterize_svg_bytes(
             )
             if completed.stdout:
                 return completed.stdout
+            raise ValueError("rsvg-convert returned empty PNG output")
         except (OSError, subprocess.SubprocessError) as exc:
             raise ValueError(
                 f"Failed to rasterize SVG with rsvg-convert: {exc}"

@@ -19,6 +19,7 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.model.chat.basic.router import RouterLLM
+from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
     ToolProtocolViolation,
     tool_protocol_error_response,
@@ -476,6 +477,111 @@ class StreamingInvalidToolProtocolFinalAnswerLLM:
                     }
                 ],
             )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingUnavailableToolRecoveryLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("unavailable-tool recovery path should stay streaming")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        if call_index == 0:
+            tool_name = "calculator"
+            arguments = '{"expression":"2+2"}'
+            tool_call_id = "call_first_work"
+        elif call_index == 1:
+            raise LLMToolProtocolError(
+                provider="deepseek",
+                code="unavailable_tool_call",
+                message="DeepSeek returned unavailable tool call 'calculator'.",
+            )
+        elif call_index == 2:
+            tool_name = "calculator"
+            arguments = '{"expression":"3+3"}'
+            tool_call_id = "call_recovered_work"
+        else:
+            tool_name = "final_answer"
+            arguments = json.dumps(
+                {
+                    "response_language": "English",
+                    "answer": "The results are 4 and 6.",
+                }
+            )
+            tool_call_id = "call_final"
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": tool_call_id,
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments,
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingMalformedFinalAnswerRecoveryLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("malformed-tool recovery path should stay streaming")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        if call_index == 0:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_transcribe",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        if call_index == 1:
+            raise LLMToolProtocolError(
+                provider="deepseek",
+                code="malformed_tool_arguments",
+                message="DeepSeek returned malformed arguments for 'final_answer'.",
+                details={
+                    "original_arguments_preview": '{"answer":',
+                    "original_arguments_length": 10,
+                    "repair_status": "skipped_incomplete",
+                },
+            )
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final_repaired",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps(
+                            {
+                                "response_language": "Simplified Chinese",
+                                "answer": "音频主要讲运动如何缓解精神疲劳。",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        )
         yield StreamChunk(type=ChunkType.END)
 
 
@@ -969,6 +1075,86 @@ async def test_react_pattern_streams_only_final_answer_after_tool_call() -> None
     ]
 
 
+@pytest.mark.asyncio
+async def test_react_recovers_unavailable_forced_final_with_full_tool_set() -> None:
+    llm = StreamingUnavailableToolRecoveryLLM()
+    pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2 and 3+3")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="task-1", tracer=tracer)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "The results are 4 and 6."
+    assert tool.calls == [{"expression": "2+2"}, {"expression": "3+3"}]
+    assert len(llm.stream_calls) == 4
+    assert [schema["function"]["name"] for schema in llm.stream_calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    recovery_tool_names = [
+        schema["function"]["name"] for schema in llm.stream_calls[2]["tools"]
+    ]
+    assert "calculator" in recovery_tool_names
+    assert "final_answer" in recovery_tool_names
+    assert (
+        "Re-decide this turn using the complete current tool set"
+        in llm.stream_calls[2]["messages"][0]["content"]
+    )
+    recovery_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "unavailable_tool_call_recovery"
+    ]
+    assert len(recovery_starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_repairs_malformed_forced_final_answer_arguments() -> None:
+    llm = StreamingMalformedFinalAnswerRecoveryLLM()
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="780")
+    context.add_user_message("这个音频讲了什么？")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="780", tracer=tracer)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "音频主要讲运动如何缓解精神疲劳。"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.stream_calls) == 3
+    assert [schema["function"]["name"] for schema in llm.stream_calls[2]["tools"]] == [
+        "final_answer"
+    ]
+    retry_prompt = llm.stream_calls[2]["messages"][0]["content"]
+    assert "malformed JSON arguments" in retry_prompt
+    assert "one complete JSON object" in retry_prompt
+    recovery_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "malformed_tool_arguments_recovery"
+    ]
+    assert len(recovery_starts) == 1
+    protocol_errors = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_error_llm"
+        and event["data"].get("protocol_code") == "malformed_tool_arguments"
+    ]
+    assert len(protocol_errors) == 1
+    assert protocol_errors[0]["data"]["protocol_details"] == {
+        "original_arguments_preview": '{"answer":',
+        "original_arguments_length": 10,
+        "repair_status": "skipped_incomplete",
+    }
+
+
 @pytest.mark.parametrize("structured_work_tool", [False, True])
 @pytest.mark.asyncio
 async def test_react_retries_invalid_forced_final_as_final_answer_tool(
@@ -1000,12 +1186,18 @@ async def test_react_retries_invalid_forced_final_as_final_answer_tool(
     ]
     assert llm.stream_calls[1]["tool_choice"] == "required"
     retry_tools = llm.stream_calls[2]["tools"]
-    assert [tool["function"]["name"] for tool in retry_tools] == ["final_answer"]
+    retry_tool_names = [tool["function"]["name"] for tool in retry_tools]
+    if structured_work_tool:
+        assert "calculator" in retry_tool_names
+        assert "final_answer" in retry_tool_names
+    else:
+        assert retry_tool_names == ["final_answer"]
     assert llm.stream_calls[2]["tool_choice"] == "required"
-    assert (
-        "calling the final_answer control tool exactly once"
-        in (llm.stream_calls[2]["messages"][0]["content"])
-    )
+    retry_prompt = llm.stream_calls[2]["messages"][0]["content"]
+    if structured_work_tool:
+        assert "complete current tool set" in retry_prompt
+    else:
+        assert "calling the final_answer control tool exactly once" in retry_prompt
     outbound_text = "".join(
         str(event.get("delta", "")) + str(event.get("content", ""))
         for event in outbound.events
@@ -1179,7 +1371,7 @@ async def test_react_reuses_resolved_route_for_tool_protocol_retry() -> None:
         event
         for event in tracer.events
         if event["event_type"] == "action_start_llm"
-        and event["data"].get("phase") == "tool_protocol_retry"
+        and event["data"].get("phase") == "unavailable_tool_call_recovery"
     ]
     assert len(retry_starts) == 1
     assert retry_starts[0]["data"]["selected_model"] == "test/model-2"

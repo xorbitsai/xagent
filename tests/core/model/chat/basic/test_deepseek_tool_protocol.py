@@ -207,6 +207,92 @@ def test_deepseek_codec_keeps_valid_tool_call() -> None:
     assert normalize_deepseek_response(response, tools=[WRITE_FILE_TOOL]) is response
 
 
+def test_deepseek_codec_repairs_complete_malformed_tool_arguments() -> None:
+    response = {
+        "type": "tool_call",
+        "tool_calls": [
+            {
+                "id": "call_final",
+                "type": "function",
+                "function": {
+                    "name": "final_answer",
+                    "arguments": (
+                        "{'response_language': 'English', 'answer': 'Done.',}"
+                    ),
+                },
+            }
+        ],
+    }
+
+    normalized = normalize_deepseek_response(
+        response,
+        tools=[FINAL_ANSWER_TOOL],
+    )
+
+    assert normalized is response
+    repaired = json.loads(response["tool_calls"][0]["function"]["arguments"])
+    assert repaired == {
+        "response_language": "English",
+        "answer": "Done.",
+    }
+
+
+def test_deepseek_codec_keeps_original_arguments_when_repair_is_unsafe() -> None:
+    original_arguments = '{"file_path":'
+
+    normalized = normalize_deepseek_response(
+        {
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "write_file",
+                        "arguments": original_arguments,
+                    }
+                }
+            ],
+        },
+        tools=[WRITE_FILE_TOOL],
+    )
+
+    error = get_tool_protocol_error(normalized)
+    assert error is not None
+    assert error["code"] == "malformed_tool_arguments"
+    assert error["details"] == {
+        "original_arguments_preview": original_arguments,
+        "original_arguments_length": len(original_arguments),
+        "original_arguments_truncated": False,
+        "json_error": "Expecting value: line 1 column 14 (char 13)",
+        "repair_status": "skipped_incomplete",
+    }
+
+
+def test_deepseek_codec_bounds_original_argument_diagnostics() -> None:
+    original_arguments = '{"answer":"' + ("x" * 5000)
+
+    normalized = normalize_deepseek_response(
+        {
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": original_arguments,
+                    }
+                }
+            ],
+        },
+        tools=[FINAL_ANSWER_TOOL],
+    )
+
+    error = get_tool_protocol_error(normalized)
+    assert error is not None
+    details = error["details"]
+    assert details["original_arguments_length"] == len(original_arguments)
+    assert len(details["original_arguments_preview"]) == 4096
+    assert details["original_arguments_truncated"] is True
+
+
 def test_deepseek_codec_is_inactive_without_requested_tools() -> None:
     response = {
         "type": "text",
@@ -364,6 +450,82 @@ async def test_deepseek_stream_forwards_accumulated_valid_tool_calls() -> None:
     assert tool_chunks[-1].tool_calls[0]["function"]["arguments"] == (
         '{"file_path":"podcast.md","content":"script"}'
     )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_stream_repairs_complete_malformed_tool_arguments() -> None:
+    async def source() -> AsyncIterator[StreamChunk]:
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call_final",
+                    "type": "function",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": (
+                            "{'response_language': 'English', 'answer': 'Done.',}"
+                        ),
+                    },
+                }
+            ],
+            finish_reason="tool_calls",
+        )
+
+    chunks = [
+        chunk
+        async for chunk in adapt_deepseek_stream(
+            source(),
+            tools=[FINAL_ANSWER_TOOL],
+        )
+    ]
+
+    assert not any(chunk.is_protocol_error() for chunk in chunks)
+    tool_chunks = [chunk for chunk in chunks if chunk.is_tool_call()]
+    assert len(tool_chunks) == 1
+    repaired = json.loads(tool_chunks[0].tool_calls[0]["function"]["arguments"])
+    assert repaired == {
+        "response_language": "English",
+        "answer": "Done.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_deepseek_stream_records_truncated_original_arguments() -> None:
+    original_arguments = '{"response_language":"English","answer":'
+
+    async def source() -> AsyncIterator[StreamChunk]:
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call_final",
+                    "type": "function",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": original_arguments,
+                    },
+                }
+            ],
+            finish_reason="tool_calls",
+        )
+
+    chunks = [
+        chunk
+        async for chunk in adapt_deepseek_stream(
+            source(),
+            tools=[FINAL_ANSWER_TOOL],
+        )
+    ]
+
+    protocol_errors = [chunk for chunk in chunks if chunk.is_protocol_error()]
+    assert len(protocol_errors) == 1
+    details = protocol_errors[0].protocol_error["details"]
+    assert details["original_arguments_preview"] == original_arguments
+    assert details["original_arguments_length"] == len(original_arguments)
+    assert details["repair_status"] == "skipped_incomplete"
 
 
 @pytest.mark.asyncio

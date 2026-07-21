@@ -22,6 +22,7 @@ from xagent.core.agent import (
     PlanValidationError,
 )
 from xagent.core.agent.pattern.base import RequiredToolCallError
+from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
 )
@@ -457,6 +458,55 @@ def test_plan_step_serializes_termination_condition() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_step_runtime_forwards_llm_error_with_step_metadata() -> None:
+    class ErrorRecordingRuntime(PatternRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.llm_errors: list[dict[str, Any]] = []
+
+        async def on_llm_error(
+            self,
+            *,
+            context: Any,
+            error: Exception,
+            metadata: dict[str, Any] | None = None,
+        ) -> None:
+            self.llm_errors.append(
+                {"context": context, "error": error, "metadata": metadata}
+            )
+
+    parent = ErrorRecordingRuntime()
+    root_context = ExecutionContext(execution_id="dag-root")
+    child_context = ExecutionContext(execution_id="dag-root:creative")
+    runtime = _DAGStepRuntime(
+        parent=parent,
+        dag_pattern=DAGPattern(lambda **_: build_plan()),
+        root_context=root_context,
+        step_id="creative",
+    )
+    error = RuntimeError("provider rejected tool call")
+
+    await runtime.on_llm_error(
+        context=child_context,
+        error=error,
+        metadata={"phase": "unavailable_tool_call"},
+    )
+
+    assert parent.llm_errors == [
+        {
+            "context": child_context,
+            "error": error,
+            "metadata": {
+                "task_id": "dag-root",
+                "step_id": "creative",
+                "dag_step_id": "creative",
+                "phase": "unavailable_tool_call",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_interrupt_before_plan_skips_plan_generation() -> None:
     plan_calls: list[dict[str, Any]] = []
 
@@ -691,6 +741,32 @@ async def test_dag_completion_assessment_replans_when_goal_incomplete() -> None:
     assert generator.requests[1].replan is True
     assert generator.requests[1].completion_feedback == "Add a second step."
     assert generator.requests[1].completed_step_results == {"first": "first done"}
+
+
+def test_dag_completion_assessment_keeps_user_request_as_scope_authority() -> None:
+    pattern = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="create", task="Create two images"))
+    )
+    pattern.plan = build_plan(PlanStep(id="create", task="Create two images"))
+    pattern.step_results = {
+        "create": (
+            "Created the requested square and story images. An intermediate "
+            "brief also proposed landscape and leaderboard variants."
+        )
+    }
+    context = ExecutionContext(execution_id="dag-user-scope")
+    context.add_user_message("Create two reports.")
+
+    messages = pattern._completion_assessment_messages(context)
+
+    system_prompt = messages[0]["content"]
+    payload = json.loads(messages[1]["content"])
+    assert payload["authoritative_user_requests"] == [
+        {"role": "user", "content": "Create two reports."}
+    ]
+    assert "the only source of required scope" in system_prompt
+    assert "cannot add deliverables" in system_prompt
+    assert "intermediate step proposed extra work" in system_prompt
 
 
 class ReplanningPlanGenerator(PlanGenerator):
@@ -1813,6 +1889,76 @@ async def test_llm_plan_generator_retries_invalid_tool_arguments() -> None:
     assert "invalid JSON" in retry_message
     assert "not json at all" in retry_message
     assert "one complete valid JSON object" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_retries_invalid_replan_dependencies() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-invalid-replan")
+    context.add_user_message("Create two reports.")
+    completed_step = PlanStep(id="2", task="Generate key visual")
+    llm = SequenceLLM(
+        [
+            plan_tool_response(
+                [
+                    {
+                        "id": "6",
+                        "task": "Create an extra banner",
+                        "dependencies": ["2"],
+                        "termination_condition": (
+                            "Stop after final_answer reports the banner."
+                        ),
+                        "completion_evidence": "The banner was returned.",
+                        "tool_names": [],
+                    }
+                ]
+            ),
+            plan_tool_response(
+                [
+                    {
+                        "id": "2",
+                        "task": "Generate key visual",
+                        "dependencies": [],
+                        "termination_condition": (
+                            "Stop after final_answer reports the key visual."
+                        ),
+                        "completion_evidence": "The key visual was returned.",
+                        "tool_names": [],
+                    },
+                    {
+                        "id": "6",
+                        "task": "Create an extra banner",
+                        "dependencies": ["2"],
+                        "termination_condition": (
+                            "Stop after final_answer reports the banner."
+                        ),
+                        "completion_evidence": "The banner was returned.",
+                        "tool_names": [],
+                    },
+                ]
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-llm-invalid-replan",
+            replan=True,
+            completed_step_results={"2": "key visual file"},
+            previous_plan=ExecutionPlan(steps=[completed_step]),
+            completion_feedback="Add a banner using step 2.",
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert [step.id for step in plan.steps] == ["2", "6"]
+    assert llm.calls == 2
+    retry_message = llm.seen_messages[1][-1]["content"]
+    assert "depends on unknown step 2" in retry_message
+    assert "complete, self-contained plan" in retry_message
+    assert "Do not return only the newly added steps" in retry_message
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,14 @@ from xagent.core.model.chat.basic import openrouter as openrouter_module
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.error import retry_on
-from xagent.core.model.chat.exceptions import LLMRetryableError
+from xagent.core.model.chat.exceptions import (
+    LLMRetryableError,
+    LLMToolProtocolError,
+)
+from xagent.core.model.chat.tool_protocol import (
+    TOOL_PROTOCOL_ERROR_KEY,
+    get_tool_protocol_error,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
@@ -202,6 +209,162 @@ async def test_openrouter_deepseek_protocol_error_uses_shared_stream_retry(mocke
         and chunk.tool_calls[0]["function"]["name"] == "select_execution_pattern"
         for chunk in chunks
     )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_does_not_replay_unavailable_tool_call(mocker):
+    unavailable_tool_call = SimpleNamespace(
+        id="call_unavailable",
+        type="function",
+        function=SimpleNamespace(
+            name="calculator",
+            arguments='{"expression":"2+2"}',
+        ),
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="",
+                    tool_calls=[unavailable_tool_call],
+                    reasoning_content=None,
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-deepseek-unavailable-tool"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    inner = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+    llm = create_retry_wrapper(
+        inner,
+        BaseLLM,  # type: ignore[type-abstract]
+        retry_methods={"chat"},
+        strategy=FixedDelay(delay_ms=0),
+        max_retries=10,
+        retry_on=retry_on,
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "Finish this task"}],
+        tools=_single_tool_schema(),
+        tool_choice="required",
+    )
+
+    protocol_error = get_tool_protocol_error(result)
+    assert protocol_error is not None
+    assert protocol_error["code"] == "unavailable_tool_call"
+    assert mock_client.chat.completions.create.await_count == 1
+
+
+def test_retry_filter_defers_unavailable_tool_call_to_agent_pattern() -> None:
+    error = LLMToolProtocolError(
+        provider="deepseek",
+        code="unavailable_tool_call",
+        message="DeepSeek returned an unavailable tool call.",
+    )
+
+    assert retry_on(error) is False
+
+
+def test_retry_filter_defers_malformed_tool_arguments_to_agent_pattern() -> None:
+    error = LLMToolProtocolError(
+        provider="deepseek",
+        code="malformed_tool_arguments",
+        message="DeepSeek returned malformed arguments for 'final_answer'.",
+    )
+
+    assert retry_on(error) is False
+
+
+def test_deepseek_protocol_error_preserves_argument_diagnostics() -> None:
+    details = {
+        "original_arguments_preview": '{"answer":',
+        "original_arguments_length": 10,
+        "repair_status": "skipped_incomplete",
+    }
+
+    error = openrouter_module._deepseek_tool_protocol_retry_error(
+        {
+            TOOL_PROTOCOL_ERROR_KEY: {
+                "provider": "deepseek",
+                "code": "malformed_tool_arguments",
+                "message": "Malformed arguments.",
+                "details": details,
+            }
+        }
+    )
+
+    assert isinstance(error, LLMToolProtocolError)
+    assert error.details == details
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_defers_unavailable_tool_call_without_replay(mocker):
+    attempts = 0
+
+    async def unavailable_stream():
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call_unavailable",
+                    "type": "function",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression":"2+2"}',
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
+
+    def fake_stream(**kwargs):
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        return unavailable_stream()
+
+    inner = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+    mocker.patch.object(
+        inner,
+        "_stream_chat_with_prefix_retry",
+        side_effect=fake_stream,
+    )
+    llm = create_retry_wrapper(
+        inner,
+        BaseLLM,  # type: ignore[type-abstract]
+        retry_methods={"stream_chat"},
+        strategy=FixedDelay(delay_ms=0),
+        max_retries=10,
+        retry_on=retry_on,
+    )
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "Finish this task"}],
+            tools=_single_tool_schema(),
+            tool_choice="required",
+        )
+    ]
+
+    assert attempts == 1
+    protocol_errors = [chunk for chunk in chunks if chunk.is_protocol_error()]
+    assert len(protocol_errors) == 1
+    assert protocol_errors[0].protocol_error["code"] == "unavailable_tool_call"
 
 
 def _deepseek_function_prefix_error() -> openai.BadRequestError:

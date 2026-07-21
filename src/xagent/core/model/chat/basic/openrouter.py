@@ -2,7 +2,7 @@ import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .....config import get_openrouter_official_providers_only
-from ..exceptions import LLMRetryableError
+from ..exceptions import LLMRetryableError, LLMToolProtocolError
 from ..timeout_config import TimeoutConfig
 from ..tool_protocol import TOOL_PROTOCOL_ERROR_KEY, get_tool_protocol_error
 from ..types import StreamChunk
@@ -103,8 +103,20 @@ def _deepseek_tool_protocol_retry_error(response: Any) -> LLMRetryableError | No
     if error is None:
         return None
     code = str(error.get("code") or "invalid_tool_protocol")
+    # Replaying the same narrowed schema cannot make the requested tool
+    # available. Surface this response to the agent pattern so it can restore
+    # the appropriate tool set and re-decide with explicit feedback.
+    if code == "unavailable_tool_call":
+        return None
     message = str(error.get("message") or "DeepSeek returned an invalid tool call.")
-    return LLMRetryableError(f"DeepSeek tool protocol error ({code}): {message}")
+    return LLMToolProtocolError(
+        provider="deepseek",
+        code=code,
+        message=message,
+        details=error.get("details")
+        if isinstance(error.get("details"), dict)
+        else None,
+    )
 
 
 class OpenRouterLLM(OpenAILLM):

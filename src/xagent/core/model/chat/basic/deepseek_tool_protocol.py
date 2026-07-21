@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
 
+from json_repair import loads as repair_json_loads
+
 from ..tool_protocol import (
     ToolProtocolViolation,
     tool_protocol_error_response,
@@ -20,6 +22,8 @@ _SERIALIZED_TOOL_CALL_RE = re.compile(
 _PARTIAL_MARKER_TARGET = "dsmltool_calls"
 _PARTIAL_MARKER_SCAN_LIMIT = 64
 _MARKER_SEPARATOR_RE = re.compile(r"[\s|｜]")
+_ARGUMENTS_PREVIEW_LIMIT = 4096
+_ERROR_PREVIEW_LIMIT = 512
 
 
 def normalize_deepseek_response(
@@ -78,6 +82,11 @@ async def adapt_deepseek_stream(
             buffered_tool_chunk = chunk
             if violation is None:
                 violation = _streaming_tool_call_violation(chunk)
+            if violation is None:
+                violation = _complete_streaming_tool_call_violation(
+                    chunk,
+                    tools=tools,
+                )
             if violation is None:
                 safe_chunk, withheld_tool_tail = _safe_streaming_tool_chunk(chunk)
                 yield safe_chunk
@@ -176,6 +185,22 @@ def _streaming_tool_call_violation(
     return None
 
 
+def _complete_streaming_tool_call_violation(
+    chunk: StreamChunk,
+    *,
+    tools: list[dict[str, Any]] | None,
+) -> ToolProtocolViolation | None:
+    """Validate complete accumulated calls without rejecting partial chunks."""
+    for tool_call in chunk.tool_calls:
+        arguments = _function_payload(tool_call).get("arguments", {})
+        if not _arguments_are_ready_for_validation(arguments):
+            continue
+        violation = _tool_call_violation(tool_call, tools=tools)
+        if violation is not None:
+            return violation
+    return None
+
+
 def _safe_streaming_tool_chunk(
     chunk: StreamChunk,
 ) -> tuple[StreamChunk, bool]:
@@ -215,20 +240,57 @@ def _tool_call_violation(
         )
 
     arguments = function.get("arguments", {})
+    argument_details: dict[str, Any] | None = None
     if isinstance(arguments, str):
+        original_arguments = arguments
         try:
             arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            return ToolProtocolViolation(
-                provider=_PROVIDER,
-                code="malformed_tool_arguments",
-                message=f"DeepSeek returned malformed arguments for {name!r}.",
+        except json.JSONDecodeError as original_error:
+            argument_details = _argument_diagnostics(
+                original_arguments,
+                json_error=original_error,
             )
+            if not _is_structurally_complete_json_object(original_arguments):
+                argument_details["repair_status"] = "skipped_incomplete"
+                return _malformed_arguments_violation(
+                    name,
+                    details=argument_details,
+                )
+            try:
+                arguments = repair_json_loads(
+                    original_arguments,
+                    logging=False,
+                )
+            except Exception as repair_error:  # noqa: BLE001
+                argument_details.update(
+                    {
+                        "repair_status": "failed",
+                        "repair_error": _bounded_text(repair_error),
+                    }
+                )
+                return _malformed_arguments_violation(
+                    name,
+                    details=argument_details,
+                )
+            argument_details["repair_status"] = "repaired"
+            if isinstance(arguments, dict):
+                applied = _set_tool_call_arguments(
+                    tool_call,
+                    json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+                )
+                if not applied:
+                    argument_details["repair_status"] = "repair_application_failed"
+                    return _malformed_arguments_violation(
+                        name,
+                        details=argument_details,
+                    )
     if not isinstance(arguments, dict):
-        return ToolProtocolViolation(
-            provider=_PROVIDER,
-            code="malformed_tool_arguments",
+        details = argument_details or _argument_diagnostics(arguments)
+        details.setdefault("repair_status", "not_applicable")
+        return _malformed_arguments_violation(
+            name,
             message=f"DeepSeek returned non-object arguments for {name!r}.",
+            details=details,
         )
 
     if _contains_serialized_tool_call(arguments):
@@ -236,6 +298,7 @@ def _tool_call_violation(
             provider=_PROVIDER,
             code="nested_serialized_tool_call",
             message=f"DeepSeek embedded serialized tool-call markup inside {name!r}.",
+            details=argument_details,
         )
 
     schemas = _tool_schema_by_name(tools)
@@ -247,6 +310,7 @@ def _tool_call_violation(
             provider=_PROVIDER,
             code="unavailable_tool_call",
             message=f"DeepSeek returned unavailable tool call {name!r}.",
+            details=argument_details,
         )
 
     parameters = schema.get("parameters")
@@ -262,8 +326,104 @@ def _tool_call_violation(
                     f"DeepSeek returned unexpected arguments for {name!r}: "
                     f"{', '.join(sorted(unexpected))}."
                 ),
+                details=argument_details,
             )
     return None
+
+
+def _malformed_arguments_violation(
+    name: str,
+    *,
+    message: str | None = None,
+    details: dict[str, Any],
+) -> ToolProtocolViolation:
+    return ToolProtocolViolation(
+        provider=_PROVIDER,
+        code="malformed_tool_arguments",
+        message=message or f"DeepSeek returned malformed arguments for {name!r}.",
+        details=details,
+    )
+
+
+def _arguments_are_ready_for_validation(arguments: Any) -> bool:
+    if not isinstance(arguments, str):
+        return True
+    try:
+        json.loads(arguments)
+    except json.JSONDecodeError:
+        return _is_structurally_complete_json_object(arguments)
+    return True
+
+
+def _is_structurally_complete_json_object(arguments: str) -> bool:
+    stripped = arguments.strip()
+    if not stripped.startswith("{") or not stripped.endswith("}"):
+        return False
+
+    pairs = {"}": "{", "]": "["}
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in stripped:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in pairs:
+            if not stack or stack.pop() != pairs[char]:
+                return False
+
+    return not in_string and not escaped and not stack
+
+
+def _set_tool_call_arguments(tool_call: Any, arguments: str) -> bool:
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            function["arguments"] = arguments
+            return True
+        if "args" in tool_call:
+            tool_call["args"] = arguments
+            return True
+        tool_call["arguments"] = arguments
+        return True
+
+    function = getattr(tool_call, "function", None)
+    try:
+        setattr(function, "arguments", arguments)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _argument_diagnostics(
+    arguments: Any,
+    *,
+    json_error: json.JSONDecodeError | None = None,
+) -> dict[str, Any]:
+    original = arguments if isinstance(arguments, str) else repr(arguments)
+    preview = original[:_ARGUMENTS_PREVIEW_LIMIT]
+    details: dict[str, Any] = {
+        "original_arguments_preview": preview,
+        "original_arguments_length": len(original),
+        "original_arguments_truncated": len(original) > len(preview),
+    }
+    if json_error is not None:
+        details["json_error"] = _bounded_text(json_error)
+    return details
+
+
+def _bounded_text(value: Any) -> str:
+    return str(value)[:_ERROR_PREVIEW_LIMIT]
 
 
 def _contains_serialized_tool_call(value: Any) -> bool:

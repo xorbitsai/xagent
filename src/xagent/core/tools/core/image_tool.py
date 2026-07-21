@@ -264,6 +264,21 @@ Images are automatically saved to workspace.
                 "No image models with edit capabilities available"
             )
 
+    def _resolve_model_label(
+        self, image_model: Optional[BaseImageModel], model_id: Optional[str]
+    ) -> str:
+        """Best-effort identifier of the model that actually served the request."""
+        if model_id and model_id in self._image_models:
+            return model_id
+        if image_model is not None:
+            for known_id, model in self._image_models.items():
+                if model is image_model:
+                    return known_id
+            model_name = getattr(image_model, "model_name", None)
+            if model_name:
+                return str(model_name)
+        return "default"
+
     def _get_model(self, model_id: Optional[str] = None) -> Optional[BaseImageModel]:
         """Get image model with generate capability by ID or default model."""
         if model_id and model_id in self._image_models:
@@ -549,9 +564,7 @@ Images are automatically saved to workspace.
             result = await image_model.generate_image(**generate_params)
 
             # Determine the actual model used
-            actual_model_id = (
-                model_id if model_id and model_id in self._image_models else "default"
-            )
+            actual_model_id = self._resolve_model_label(image_model, model_id)
 
             image_url = result.get("image_url")
             image_path = None
@@ -600,8 +613,8 @@ Images are automatically saved to workspace.
         except Exception as e:
             logger.error(f"Image generation failed: {e}")
             # Determine the actual model used for error reporting
-            actual_model_id = (
-                model_id if model_id and model_id in self._image_models else "default"
+            actual_model_id = self._resolve_model_label(
+                self._get_model(model_id), model_id
             )
             return {
                 "success": False,
@@ -687,7 +700,7 @@ Images are automatically saved to workspace.
             result = await image_model.edit_image(**edit_params)
 
             # Determine the actual model used
-            actual_model_id = model_id if model_id else "default_edit_model"
+            actual_model_id = self._resolve_model_label(image_model, model_id)
 
             edited_image_url = result.get("image_url")
             image_path = None
@@ -739,7 +752,9 @@ Images are automatically saved to workspace.
         except Exception as e:
             logger.error(f"Image editing failed: {e}")
             # Determine the actual model used for error reporting
-            actual_model_id = model_id if model_id else "default_edit_model"
+            actual_model_id = self._resolve_model_label(
+                self._get_edit_model(model_id), model_id
+            )
             return {
                 "success": False,
                 "error": str(e),

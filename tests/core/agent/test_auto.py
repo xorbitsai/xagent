@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
+from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
@@ -66,6 +68,15 @@ class FakeLLM:
         if not self.responses and has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
             return default_completion_assessment_response(kwargs)
         return self.responses.pop(0)
+
+
+class RaisingFakeLLM(FakeLLM):
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class StreamingDecisionLLM:
@@ -253,6 +264,45 @@ def test_auto_child_runtime_forwards_clear_interrupt() -> None:
 
     assert parent_runtime._interrupt_requested is False
     assert parent_runtime.interrupt_reason is None
+
+
+@pytest.mark.asyncio
+async def test_auto_child_runtime_forwards_llm_errors() -> None:
+    parent_runtime = RecordingRuntime()
+    context = ExecutionContext(execution_id="auto-child-llm-error")
+    child_runtime = _AutoChildRuntime(
+        parent=parent_runtime,
+        auto_pattern=AutoPattern(),
+        root_context=context,
+    )
+
+    await child_runtime.on_llm_error(
+        context=context,
+        error=RuntimeError("provider failed"),
+        metadata={"phase": "dag_step"},
+    )
+
+    assert parent_runtime.hooks == [
+        (
+            "llm_error",
+            {
+                "error": "provider failed",
+                "metadata": {"phase": "dag_step"},
+            },
+        )
+    ]
+
+
+def test_auto_child_runtime_covers_pattern_runtime_async_interface() -> None:
+    missing = [
+        name
+        for name, method in inspect.getmembers(PatternRuntime)
+        if not name.startswith("_")
+        and inspect.iscoroutinefunction(method)
+        and not hasattr(_AutoChildRuntime, name)
+    ]
+
+    assert missing == []
 
 
 def decision_tool_response(
@@ -1425,6 +1475,53 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
     )
     assert "memory for replacement question" in resumed_system_context
     assert "memory for first question" not in resumed_system_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "protocol_code",
+    ["malformed_tool_arguments", "unavailable_tool_call"],
+)
+async def test_auto_pattern_retries_provider_routing_protocol_errors(
+    protocol_code: str,
+) -> None:
+    llm = RaisingFakeLLM(
+        [
+            LLMToolProtocolError(
+                provider="deepseek",
+                code=protocol_code,
+                message="invalid routing tool call",
+            ),
+            decision_tool_response(
+                "final_answer",
+                "Recovered after protocol error.",
+                answer="Recovered routing answer.",
+            ),
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext(execution_id="auto-protocol-retry")
+    context.add_user_message("Answer from the current context")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "Recovered routing answer."
+    assert len(llm.calls) == 2
+    retry_message = llm.calls[1]["messages"][-1]["content"]
+    assert protocol_code.split("_", 1)[0] in retry_message
+    assert "one complete JSON object" in retry_message
+    assert DECISION_TOOL_NAME in retry_message
+    llm_error_hooks = [
+        payload for name, payload in runtime.hooks if name == "llm_error"
+    ]
+    assert llm_error_hooks[-1]["metadata"]["protocol_code"] == protocol_code
 
 
 @pytest.mark.asyncio

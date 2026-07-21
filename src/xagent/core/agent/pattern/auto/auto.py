@@ -8,6 +8,7 @@ from typing import Any
 
 from json_repair import loads as repair_json_loads
 
+from ....model.chat.exceptions import LLMToolProtocolError
 from ...context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     RETRIEVED_MEMORIES_METADATA_KEY,
@@ -306,6 +307,19 @@ class _AutoChildRuntime:
         await self.parent.on_llm_end(
             context=context,
             response=response,
+            metadata=metadata,
+        )
+
+    async def on_llm_error(
+        self,
+        *,
+        context: Any,
+        error: Exception,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.parent.on_llm_error(
+            context=context,
+            error=error,
             metadata=metadata,
         )
 
@@ -776,7 +790,9 @@ class AutoPattern(AgentPattern):
         )
         decision_tools = [self._decision_tool_schema()]
         retry_feedback: str | None = None
-        for attempt in range(MAX_DECISION_PARSE_ATTEMPTS):
+        attempt = 0
+        protocol_retries = 0
+        while attempt < MAX_DECISION_PARSE_ATTEMPTS:
             messages = append_user_message_preserving_turns(
                 base_messages,
                 content=decision_prompt,
@@ -792,8 +808,9 @@ class AutoPattern(AgentPattern):
                 "phase": "auto_decision",
                 **resolved_llm_metadata(call_llm),
             }
-            if attempt:
-                metadata["attempt"] = attempt + 1
+            total_retries = attempt + protocol_retries
+            if total_retries:
+                metadata["attempt"] = total_retries + 1
             await runtime.on_llm_start(
                 context=context,
                 messages=messages,
@@ -821,6 +838,41 @@ class AutoPattern(AgentPattern):
                     thinking={"type": "disabled", "enable": False},
                     on_chunk=answer_streamer.handle_chunk,
                 )
+            except LLMToolProtocolError as exc:
+                await answer_streamer.fail(
+                    f"invalid {exc.code} routing tool protocol, retrying"
+                )
+                await runtime.on_llm_error(
+                    context=context,
+                    error=exc,
+                    metadata={
+                        **metadata,
+                        "phase": exc.code,
+                        "protocol_code": exc.code,
+                    },
+                )
+                if protocol_retries >= 1:
+                    raise
+                protocol_retries += 1
+                retry_feedback = self._tool_protocol_retry_feedback(exc)
+                logger.warning(
+                    "AutoPattern routing received invalid %s tool protocol; "
+                    "retrying decision. execution_id=%s attempt=%s",
+                    exc.code,
+                    getattr(context, "execution_id", None),
+                    attempt + protocol_retries,
+                )
+                await runtime.checkpoint(
+                    "auto_decision_retry",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "attempt": attempt + protocol_retries,
+                        "error": str(exc),
+                        "protocol_code": exc.code,
+                    },
+                )
+                continue
             except Exception as exc:
                 await answer_streamer.fail(str(exc))
                 await runtime.on_llm_error(
@@ -833,7 +885,8 @@ class AutoPattern(AgentPattern):
             try:
                 decision = self._parse_decision(response, attempts=attempt + 1)
             except RequiredToolCallError:
-                if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
+                attempt += 1
+                if attempt >= MAX_DECISION_PARSE_ATTEMPTS:
                     raise
                 retry_feedback = self._required_tool_call_retry_feedback(
                     DECISION_TOOL_NAME
@@ -843,21 +896,22 @@ class AutoPattern(AgentPattern):
                     "retrying decision. execution_id=%s attempt=%s",
                     DECISION_TOOL_NAME,
                     getattr(context, "execution_id", None),
-                    attempt + 1,
+                    attempt,
                 )
                 await runtime.checkpoint(
                     "auto_decision_retry",
                     context=context,
                     pattern=self,
                     metadata={
-                        "attempt": attempt + 1,
+                        "attempt": attempt,
                         "failure_reason": REQUIRED_TOOL_CALL_FAILURE_REASON,
                         "required_tool_name": DECISION_TOOL_NAME,
                     },
                 )
                 continue
             except AutoDecisionArgumentsError as exc:
-                if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
+                attempt += 1
+                if attempt >= MAX_DECISION_PARSE_ATTEMPTS:
                     raise
                 retry_feedback = self._decision_retry_feedback(exc)
                 logger.warning(
@@ -871,7 +925,7 @@ class AutoPattern(AgentPattern):
                     context=context,
                     pattern=self,
                     metadata={
-                        "attempt": attempt + 1,
+                        "attempt": attempt,
                         "error": str(exc),
                     },
                 )
@@ -907,6 +961,26 @@ class AutoPattern(AgentPattern):
                 if argument_preview
                 else ""
             )
+        )
+
+    def _tool_protocol_retry_feedback(self, error: LLMToolProtocolError) -> str:
+        if error.code == "malformed_tool_arguments":
+            correction = (
+                "The provider rejected the previous routing tool call because "
+                "its arguments were malformed."
+            )
+        elif error.code == "unavailable_tool_call":
+            correction = (
+                "The provider rejected the previous response because it called "
+                "a tool that is unavailable during Auto routing."
+            )
+        else:
+            correction = "The provider rejected the previous routing tool call."
+        return (
+            f"{correction} Retry by calling exactly one currently available "
+            f"routing tool: {DECISION_TOOL_NAME}. Use the exact tool name and "
+            "one complete JSON object matching its schema. Do not answer in "
+            "natural language."
         )
 
     def _truncate_retry_preview(self, value: str, *, limit: int = 1200) -> str:

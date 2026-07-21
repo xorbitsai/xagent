@@ -6,11 +6,13 @@ import pytest
 
 from xagent.core.agent import Agent, AgentRunner
 from xagent.core.agent.checkpoint import (
+    CHECKPOINT_EVENT_TYPE,
     CHECKPOINT_TYPE,
     LEGACY_CHECKPOINT_TYPES,
     CheckpointPersistenceError,
     TraceCheckpointStore,
 )
+from xagent.core.agent.trace import TraceEvent, TraceHandler, Tracer
 
 
 class PersistentTraceBackend:
@@ -92,6 +94,11 @@ class LegacyCheckpointBackend:
         }
 
 
+class FailingTraceHandler(TraceHandler):
+    async def handle_event(self, _: TraceEvent) -> None:
+        raise ValueError("checkpoint write failed: secret=supersecret")
+
+
 class FakeLLM:
     async def chat(self, **_: Any) -> str:
         return "done"
@@ -131,6 +138,24 @@ async def test_trace_checkpoint_store_persists_full_snapshot_event() -> None:
     assert backend.events[0]["data"]["checkpoint_type"] == CHECKPOINT_TYPE
     assert backend.events[0]["data"]["snapshot"] == payload
     assert loaded == payload
+
+
+@pytest.mark.asyncio
+async def test_required_trace_error_preserves_redacted_handler_cause() -> None:
+    tracer = Tracer()
+    tracer.add_handler(FailingTraceHandler())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await tracer.trace_event(
+            CHECKPOINT_EVENT_TYPE,
+            task_id="trace-cause",
+            require_persisted=True,
+        )
+
+    message = str(exc_info.value)
+    assert "First failure: ValueError: checkpoint write failed" in message
+    assert "supersecret" not in message
+    assert isinstance(exc_info.value.__cause__, ValueError)
 
 
 @pytest.mark.asyncio

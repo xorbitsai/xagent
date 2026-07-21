@@ -128,7 +128,7 @@ class TestImageGenerationTool:
 
         assert result["success"] is True
         assert result["image_path"] is not None
-        assert result["model_used"] == "default"
+        assert result["model_used"] == "model1"
         assert result["usage"] == {"input_tokens": 10, "output_tokens": 20}
         assert result["request_id"] == "req1"
         assert result["saved_to_workspace"] is True
@@ -226,7 +226,7 @@ class TestImageGenerationTool:
         )
 
         assert result["success"] is True
-        assert result["model_used"] == "default"
+        assert result["model_used"] == "model1"
 
         # Should fall back to first available model
         mock_image_models["model1"].generate_image.assert_called_once()
@@ -353,7 +353,7 @@ class TestImageGenerationTool:
         assert result["success"] is False
         assert result["error"] == "Model error"
         assert result["image_path"] is None
-        assert result["model_used"] == "default"
+        assert result["model_used"] == "model1"
 
     def test_list_available_models(self, image_tool, mock_image_models):
         """Test listing available models"""
@@ -570,7 +570,7 @@ class TestImageGenerationTool:
 
         assert result["success"] is True
         assert result["image_path"] is not None
-        assert result["model_used"] == "default_edit_model"
+        assert result["model_used"] == "model1"
         assert result["usage"] == {"input_tokens": 15, "output_tokens": 25}
         assert result["request_id"] == "edit_req1"
         assert result["saved_to_workspace"] is True

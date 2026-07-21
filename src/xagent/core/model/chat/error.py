@@ -1,7 +1,7 @@
 import httpx
 import openai
 
-from .exceptions import LLMRetryableError
+from .exceptions import LLMRetryableError, LLMToolProtocolError
 
 try:
     from zai.core._errors import APIStatusError as ZaiAPIStatusError  # type: ignore
@@ -19,6 +19,15 @@ def retry_on(e: Exception) -> bool:
     )
 
     def _is_retryable(exc: BaseException) -> bool:
+        # These failures need a changed agent-level decision or repair prompt.
+        # Blindly replaying the identical provider request only burns the retry
+        # budget and hides the structured error from the execution pattern.
+        if isinstance(exc, LLMToolProtocolError):
+            return exc.code not in {
+                "malformed_tool_arguments",
+                "unavailable_tool_call",
+            }
+
         # Handle LLM-specific retryable errors
         # These are explicitly marked as retryable by the LLM implementation
         if isinstance(exc, LLMRetryableError):

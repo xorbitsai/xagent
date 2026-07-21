@@ -3,13 +3,16 @@ from __future__ import annotations
 import copy
 import sqlite3
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from threading import Barrier
 from typing import Any
 
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 from scripts.convert_trace_checkpoint_messages import convert_trace_checkpoint_messages
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
@@ -21,6 +24,7 @@ from xagent.core.agent.trace import (
     TraceScope,
 )
 from xagent.core.tools.adapters.vibe.connector_runtime import REDACTED_RUNTIME_SECRET
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.models.database import Base
 from xagent.web.models.task import (
@@ -783,6 +787,72 @@ def test_database_trace_handler_shares_blobs_across_checkpoints() -> None:
         assert db.query(TraceCheckpointBlob).count() == 2
     finally:
         db.close()
+
+
+def test_database_trace_handler_dedupes_concurrent_checkpoint_blobs(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'concurrent-checkpoints.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+    )
+    apply_sqlite_concurrency_pragmas(engine)
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    messages = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"message-{index}-" + ("x" * 2000),
+        }
+        for index in range(24)
+    ]
+    checkpoint = _checkpoint_data_with_large_fields(
+        str(task_id),
+        messages,
+        tool_ledger={"tool-1": {"result": "r" * 4000}},
+        metadata={"memory": "m" * 4000},
+    )
+    checkpoint["snapshot"]["context"]["system_prompt"] = "system" * 1000
+    start = Barrier(4)
+
+    def save_checkpoint(worker: int) -> None:
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE,
+            task_id=str(task_id),
+            data={**copy.deepcopy(checkpoint), "worker": worker},
+            require_persisted=True,
+        )
+        worker_db = SessionLocal()
+        try:
+            start.wait(timeout=5)
+            DatabaseTraceHandler(task_id)._save_trace_event(worker_db, event)
+        finally:
+            worker_db.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(save_checkpoint, worker) for worker in range(4)]
+            for future in futures:
+                future.result(timeout=15)
+
+        db = SessionLocal()
+        try:
+            assert db.query(DatabaseTraceEvent).filter_by(task_id=task_id).count() == 4
+            assert db.query(TraceMessageBlob).filter_by(task_id=task_id).count() == 24
+            assert db.query(TraceCheckpointBlob).filter_by(task_id=task_id).count() == 3
+        finally:
+            db.close()
+    finally:
+        engine.dispose()
 
 
 def test_database_trace_handler_reads_old_inline_checkpoint(

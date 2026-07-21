@@ -16,6 +16,7 @@ from ..agent.trace import (
     normalize_llm_trace_payload,
 )
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
@@ -1025,6 +1026,14 @@ class PatternRuntime:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         event_metadata = metadata or {}
+        protocol_metadata: dict[str, Any] = {}
+        if isinstance(error, LLMToolProtocolError):
+            protocol_metadata = {
+                "protocol_provider": error.provider,
+                "protocol_code": error.code,
+            }
+            if error.details:
+                protocol_metadata["protocol_details"] = error.details
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.ERROR, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -1034,6 +1043,7 @@ class PatternRuntime:
                 "error": str(error),
                 "error_message": str(error),
                 "success": False,
+                **protocol_metadata,
                 **event_metadata,
             },
         )

@@ -14,6 +14,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from ...config import get_checkpoint_encoding_v2_enabled
@@ -1214,6 +1216,44 @@ def _remember_blob_candidate(
     candidates[blob_hash] = BlobCandidate(data=data, payload_bytes=payload_bytes)
 
 
+def _insert_blob_rows_on_conflict_do_nothing(
+    db: Session,
+    *,
+    model: Any,
+    values: list[dict[str, Any]],
+    index_elements: list[str],
+) -> bool:
+    """Atomically insert deduplicated blobs on supported databases.
+
+    Query-then-insert is unsafe when parallel DAG steps checkpoint the same
+    context: every transaction can observe a missing hash and then race on the
+    unique constraint. SQLite and PostgreSQL both support conflict-safe inserts;
+    executing them immediately also makes SQLite writers wait in the configured
+    busy timeout instead of accumulating duplicate pending ORM rows.
+
+    Returns ``False`` for an unknown dialect so callers can retain the existing
+    compatibility fallback.
+    """
+    if not values:
+        return True
+
+    bind = db.get_bind()
+    dialect = bind.dialect.name if bind is not None else ""
+    statement: Any
+    if dialect == "sqlite":
+        statement = sqlite_insert(model)
+    elif dialect == "postgresql":
+        statement = postgresql_insert(model)
+    else:
+        return False
+
+    db.execute(
+        statement.on_conflict_do_nothing(index_elements=index_elements),
+        values,
+    )
+    return True
+
+
 def _pending_message_hashes(
     db: Session,
     *,
@@ -1257,6 +1297,31 @@ def _upsert_message_blobs(
         blobs_by_hash=blobs_by_hash,
     )
     hashes_to_query = sorted(set(blobs_by_hash) - pending_hashes)
+    candidates_to_insert = {
+        message_hash: blobs_by_hash[message_hash] for message_hash in hashes_to_query
+    }
+    if _insert_blob_rows_on_conflict_do_nothing(
+        db,
+        model=TraceMessageBlob,
+        values=[
+            {
+                "task_id": task_id,
+                "execution_id": execution_id,
+                "message_hash": message_hash,
+                "message_data": copy.deepcopy(candidate.data),
+                "message_bytes": candidate.payload_bytes,
+            }
+            for message_hash, candidate in candidates_to_insert.items()
+        ],
+        index_elements=["task_id", "message_hash"],
+    ):
+        _validate_message_blobs(
+            db,
+            task_id=task_id,
+            blobs_by_hash=candidates_to_insert,
+        )
+        return
+
     existing_hashes: set[str] = set()
     chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
     for hashes_chunk in chunks(hashes_to_query, chunk_size):
@@ -1289,6 +1354,44 @@ def _upsert_message_blobs(
                 message_data=copy.deepcopy(candidate.data),
                 message_bytes=candidate.payload_bytes,
             )
+        )
+
+
+def _validate_message_blobs(
+    db: Session,
+    *,
+    task_id: int,
+    blobs_by_hash: dict[str, BlobCandidate],
+) -> None:
+    if not blobs_by_hash:
+        return
+
+    found: set[str] = set()
+    chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
+    for hashes_chunk in chunks(sorted(blobs_by_hash), chunk_size):
+        rows = (
+            db.query(TraceMessageBlob.message_hash, TraceMessageBlob.message_bytes)
+            .filter(
+                TraceMessageBlob.task_id == task_id,
+                TraceMessageBlob.message_hash.in_(hashes_chunk),
+            )
+            .all()
+        )
+        for message_hash, message_bytes in rows:
+            message_hash = str(message_hash)
+            candidate = blobs_by_hash[message_hash]
+            if message_bytes != candidate.payload_bytes:
+                raise ValueError(
+                    f"trace message blob hash collision for task {task_id}: "
+                    f"{message_hash}"
+                )
+            found.add(message_hash)
+
+    missing = set(blobs_by_hash) - found
+    if missing:
+        raise RuntimeError(
+            f"trace message blob upsert did not persist {len(missing)} row(s) "
+            f"for task {task_id}."
         )
 
 
@@ -1336,6 +1439,32 @@ def _upsert_checkpoint_blobs(
         blobs_by_ref=blobs_by_ref,
     )
     refs_to_query = sorted(set(blobs_by_ref) - pending_refs)
+    candidates_to_insert = {
+        blob_ref: blobs_by_ref[blob_ref] for blob_ref in refs_to_query
+    }
+    if _insert_blob_rows_on_conflict_do_nothing(
+        db,
+        model=TraceCheckpointBlob,
+        values=[
+            {
+                "task_id": task_id,
+                "execution_id": execution_id,
+                "blob_kind": blob_kind,
+                "blob_hash": blob_hash,
+                "blob_data": copy.deepcopy(candidate.data),
+                "blob_bytes": candidate.payload_bytes,
+            }
+            for (blob_kind, blob_hash), candidate in candidates_to_insert.items()
+        ],
+        index_elements=["task_id", "blob_kind", "blob_hash"],
+    ):
+        _validate_checkpoint_blobs(
+            db,
+            task_id=task_id,
+            blobs_by_ref=candidates_to_insert,
+        )
+        return
+
     existing_refs: set[tuple[str, str]] = set()
     if refs_to_query:
         refs_by_kind: dict[str, set[str]] = {}
@@ -1383,4 +1512,52 @@ def _upsert_checkpoint_blobs(
                 blob_data=copy.deepcopy(candidate.data),
                 blob_bytes=candidate.payload_bytes,
             )
+        )
+
+
+def _validate_checkpoint_blobs(
+    db: Session,
+    *,
+    task_id: int,
+    blobs_by_ref: dict[tuple[str, str], BlobCandidate],
+) -> None:
+    if not blobs_by_ref:
+        return
+
+    found: set[tuple[str, str]] = set()
+    refs_by_kind: dict[str, set[str]] = {}
+    for kind, blob_hash in blobs_by_ref:
+        refs_by_kind.setdefault(kind, set()).add(blob_hash)
+
+    for kind, blob_hashes in refs_by_kind.items():
+        chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=2)
+        for hash_chunk in chunks(sorted(blob_hashes), chunk_size):
+            rows = (
+                db.query(
+                    TraceCheckpointBlob.blob_kind,
+                    TraceCheckpointBlob.blob_hash,
+                    TraceCheckpointBlob.blob_bytes,
+                )
+                .filter(
+                    TraceCheckpointBlob.task_id == task_id,
+                    TraceCheckpointBlob.blob_kind == kind,
+                    TraceCheckpointBlob.blob_hash.in_(hash_chunk),
+                )
+                .all()
+            )
+            for blob_kind, blob_hash, blob_bytes in rows:
+                blob_ref = (str(blob_kind), str(blob_hash))
+                candidate = blobs_by_ref[blob_ref]
+                if blob_bytes != candidate.payload_bytes:
+                    raise ValueError(
+                        f"trace checkpoint blob hash collision for task {task_id}: "
+                        f"{blob_ref[0]} {blob_ref[1]}"
+                    )
+                found.add(blob_ref)
+
+    missing = set(blobs_by_ref) - found
+    if missing:
+        raise RuntimeError(
+            f"trace checkpoint blob upsert did not persist {len(missing)} row(s) "
+            f"for task {task_id}."
         )

@@ -154,7 +154,7 @@ class TestImageGenerationToolCore:
 
         assert result["success"] is True
         assert result["image_path"] is not None
-        assert result["model_used"] == "default"
+        assert result["model_used"] == "model1"
         assert result["usage"] == {"input_tokens": 10, "output_tokens": 20}
         assert result["request_id"] == "req1"
         assert result["saved_to_workspace"] is True
@@ -250,7 +250,7 @@ class TestImageGenerationToolCore:
         )
 
         assert result["success"] is True
-        assert result["model_used"] == "default_edit_model"
+        assert result["model_used"] == "model1"
         mock_image_models["model1"].generate_image.assert_not_called()
         mock_image_models["model1"].edit_image.assert_called_once_with(
             prompt="Keep the same cabin composition, but make it a night scene",
@@ -530,7 +530,7 @@ class TestImageGenerationToolCore:
 
         assert result["success"] is True
         assert result["image_path"] is not None
-        assert result["model_used"] == "default_edit_model"
+        assert result["model_used"] == "model1"
         assert result["usage"] == {"input_tokens": 15, "output_tokens": 25}
         assert result["request_id"] == "edit_req1"
         assert result["saved_to_workspace"] is True
@@ -585,7 +585,7 @@ class TestImageGenerationToolCore:
 
         assert result["success"] is False
         assert result["error"] == "Edit model error"
-        assert result["model_used"] == "default_edit_model"
+        assert result["model_used"] == "model1"
 
     @pytest.mark.asyncio
     @patch("aiohttp.ClientSession.get")

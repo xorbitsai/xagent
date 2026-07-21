@@ -11,9 +11,10 @@ class ToolProtocolViolation:
     provider: str
     code: str
     message: str
+    details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {key: value for key, value in asdict(self).items() if value is not None}
 
 
 def tool_protocol_error_response(

@@ -1,5 +1,7 @@
 """LLM-specific exceptions for retry logic."""
 
+from typing import Any
+
 
 class LLMRetryableError(RuntimeError):
     """Base exception for LLM errors that should trigger retry.
@@ -16,6 +18,34 @@ class LLMRetryableError(RuntimeError):
     """
 
     pass
+
+
+class LLMToolProtocolError(LLMRetryableError):
+    """Structured provider tool-protocol failure.
+
+    Most protocol failures can benefit from replaying the same request because
+    the model may emit a valid structured call on the next sample. Failures that
+    require changed agent context, including ``unavailable_tool_call`` and
+    ``malformed_tool_arguments``, are excluded by the retry filter so the agent
+    layer can retry with an explicit correction instead.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.provider = str(provider or "unknown")
+        self.code = str(code or "invalid_tool_protocol")
+        self.protocol_message = str(message or "Invalid tool protocol response.")
+        self.details = dict(details or {})
+        super().__init__(
+            f"{self.provider} tool protocol error ({self.code}): "
+            f"{self.protocol_message}"
+        )
 
 
 class LLMEmptyContentError(LLMRetryableError):

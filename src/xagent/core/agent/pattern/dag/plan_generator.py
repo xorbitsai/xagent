@@ -296,8 +296,12 @@ class LLMPlanGenerator(PlanGenerator):
                     "supporting context only and must not change the plan "
                     "language. "
                     f"{plan_language_rules()} "
-                    "Keep ids stable "
-                    "across replans when a completed step can be reused."
+                    "Keep ids stable across replans when a completed step can "
+                    "be reused. A replan response must be a complete, "
+                    "self-contained execution plan, not a delta: every "
+                    "dependency id must also appear in the returned steps. "
+                    "Include completed steps that new work depends on so their "
+                    "results can be reused."
                 ),
             },
             {"role": "user", "content": self._build_prompt(request)},
@@ -350,7 +354,19 @@ class LLMPlanGenerator(PlanGenerator):
                 )
                 continue
             self._apply_response_language(request.context, plan_arguments)
-            plan = coerce_execution_plan(plan_arguments)
+            try:
+                plan = coerce_execution_plan(plan_arguments)
+            except PlanValidationError as exc:
+                if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    raise
+                retry_feedback = self._invalid_plan_retry_feedback(exc)
+                logger.warning(
+                    "LLMPlanGenerator response contained an invalid DAG plan; "
+                    "retrying plan generation. execution_id=%s error=%s",
+                    request.execution_id,
+                    exc,
+                )
+                continue
             return self._filter_suggested_tools(
                 plan=plan,
                 available_tool_names=request.available_tool_names,
@@ -546,6 +562,16 @@ class LLMPlanGenerator(PlanGenerator):
                 if argument_preview
                 else ""
             )
+        )
+
+    def _invalid_plan_retry_feedback(self, error: PlanValidationError) -> str:
+        return (
+            f"The previous {self.PLAN_TOOL_NAME} call returned an invalid DAG "
+            f"plan: {error} Call {self.PLAN_TOOL_NAME} again exactly once with "
+            "a complete, self-contained plan. Every dependency id must be "
+            "present in the returned steps. On a replan, include any completed "
+            "steps that new work depends on and preserve their ids. Do not "
+            "return only the newly added steps."
         )
 
     def _extract_tool_arguments(

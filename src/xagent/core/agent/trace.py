@@ -9,10 +9,20 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from ..utils.security import redact_sensitive_text
+
 logger = logging.getLogger(__name__)
 
 DISPLAY_MESSAGE_KEY = "display_message"
 DISPLAY_USER_MESSAGE_KEY = "display_user_message"
+TRACE_HANDLER_ERROR_SUMMARY_LIMIT = 1024
+
+
+def _trace_handler_error_summary(error: Exception) -> str:
+    message = redact_sensitive_text(str(error))
+    if len(message) > TRACE_HANDLER_ERROR_SUMMARY_LIMIT:
+        message = f"{message[:TRACE_HANDLER_ERROR_SUMMARY_LIMIT]}…"
+    return f"{type(error).__name__}: {message}"
 
 
 def _display_message_from_metadata(metadata: Any) -> str | None:
@@ -985,10 +995,12 @@ class Tracer:
 
         if require_persisted:
             if handler_errors:
+                first_error = handler_errors[0]
                 raise RuntimeError(
                     f"{len(handler_errors)} trace handler(s) failed while "
-                    "persisting required trace event."
-                ) from handler_errors[0]
+                    "persisting required trace event. First failure: "
+                    f"{_trace_handler_error_summary(first_error)}"
+                ) from first_error
             if not self.handlers:
                 raise RuntimeError(
                     "No trace handlers are configured for required trace persistence."

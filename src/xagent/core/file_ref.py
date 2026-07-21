@@ -9,7 +9,12 @@ FILE_REF_OUTPUT_INSTRUCTIONS = """## FILE REFERENCE OUTPUTS
 When mentioning a generated or uploaded file that has a file_id, render it as a Markdown file reference:
 - Files: [filename](file:file_id)
 - Images intended for inline display: ![filename](file:file_id)
-Do not mention only the filename when a file_id or markdown_link is available. Prefer an existing markdown_link value when one is present."""
+Do not mention only the filename when a file_id or markdown_link is available. Prefer an existing markdown_link value when one is present.
+
+File delivery integrity:
+- Never invent, guess, or construct a file_id or `file:` link. Use only a trusted FileRef supplied for an existing input/attachment, or the exact FileRef or markdown_link returned by a successful tool result. A link mentioned only in prior assistant prose is not provenance.
+- When the user requests a new file or file-based artifact, it is not delivered until a successful tool result returns its registered FileRef or markdown_link.
+- Do not call final_answer claiming that a file was created or delivered unless that result exists."""
 
 FILE_REF_MODEL_INSTRUCTIONS = f"""## FILE REFERENCES
 Files are referenced by FileRef objects. Treat file_id as the canonical file handle.

@@ -197,7 +197,7 @@ def downgrade() -> None:
             sa.select(sa.func.count())
             .select_from(PUBLIC_MCP_APPS_TABLE)
             .where(PUBLIC_MCP_APPS_TABLE.c.provider_name == "hubspot")
-        ).scalar_one()
+        ).scalar()
         if remaining_hubspot_apps:
             return
 

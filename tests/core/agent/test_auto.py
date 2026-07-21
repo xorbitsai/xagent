@@ -1703,7 +1703,7 @@ async def test_auto_pattern_retries_unavailable_tool_call_as_routing_decision() 
     "protocol_code",
     ["malformed_tool_arguments", "unavailable_tool_call"],
 )
-async def test_auto_pattern_retries_provider_routing_protocol_errors(
+async def test_auto_pattern_retries_provider_routing_protocol_errors_after_skill_load(
     protocol_code: str,
 ) -> None:
     llm = RaisingFakeLLM(

@@ -157,6 +157,21 @@ def test_get_contact_deals_single_page_has_no_more(monkeypatch):
     assert result["has_more"] is False
 
 
+def test_association_listing_stops_on_empty_page_with_cursor(monkeypatch):
+    """A page with no results but a next cursor must terminate, not loop."""
+    request_mock = Mock(
+        return_value=MockResponse(
+            json_data={"results": [], "paging": {"next": {"after": "cursor-1"}}}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", request_mock)
+
+    result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+
+    assert result == {"status": "success", "deals": [], "has_more": True}
+    assert request_mock.call_count == 1
+
+
 def test_get_contact_deals_empty_returns_no_more(monkeypatch):
     monkeypatch.setattr(
         hubspot.requests,

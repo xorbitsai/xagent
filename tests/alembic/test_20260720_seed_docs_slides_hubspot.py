@@ -223,7 +223,7 @@ def test_downgrade_preserves_admin_created_hubspot_provider(tmp_path):
 
 def test_upgrade_and_downgrade_with_reduced_column_schema(tmp_path):
     """Exercise _filter_row's column dropping against tables missing optional
-    columns, and the downgrade guard when guard columns are absent."""
+    columns."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -263,6 +263,46 @@ def test_upgrade_and_downgrade_with_reduced_column_schema(tmp_path):
             )
             migration.downgrade()
         assert not {"google-docs", "google-slides", "hubspot"} & _app_ids(connection)
+        assert "hubspot" not in _provider_names(connection)
+
+
+def test_downgrade_guard_falls_back_when_guard_columns_absent(tmp_path):
+    """The downgrade provenance guard skips comparisons for auth_url/token_url
+    when those columns do not exist, still deleting the seeded provider by the
+    remaining name match."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE,
+                    name VARCHAR(100) NOT NULL,
+                    client_id VARCHAR(500) NOT NULL,
+                    client_secret VARCHAR(500) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50)
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            assert "hubspot" in _provider_names(connection)
+            migration.downgrade()
         assert "hubspot" not in _provider_names(connection)
 
 

@@ -117,12 +117,16 @@ def _list_association_ids(path: str, max_results: int) -> tuple[list[Any], bool]
         if after:
             params["after"] = after
         page = _request("GET", path, params=params)
-        ids.extend(item.get("id") for item in page.get("results", []))
+        results = page.get("results", [])
+        ids.extend(item.get("id") for item in results)
         after = ((page.get("paging") or {}).get("next") or {}).get("after")
         if len(ids) >= max_results:
             return ids[:max_results], bool(after) or len(ids) > max_results
         if not after:
             return ids, False
+        if not results:
+            # A page with no results but a next cursor would loop forever.
+            return ids, True
 
 
 def _parse_properties(properties_json: str) -> dict[str, Any]:
@@ -284,7 +288,7 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
             max(1, min(limit, 100)),
         )
         if not deal_ids:
-            return _success(deals=[], has_more=False)
+            return _success(deals=[], has_more=has_more)
 
         deals = _request(
             "POST",
@@ -319,7 +323,7 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
             max(1, min(limit, 100)),
         )
         if not note_ids:
-            return _success(notes=[], has_more=False)
+            return _success(notes=[], has_more=has_more)
 
         notes = _request(
             "POST",

@@ -27,10 +27,11 @@ def rasterize_svg_bytes(
         raise ValueError("SVG content is empty")
     if len(svg_bytes) > MAX_SVG_BYTES:
         raise ValueError(f"SVG exceeds maximum size of {MAX_SVG_BYTES} bytes")
-    lowered_prefix = svg_bytes[:4096].lower()
+    lowered_all = svg_bytes.lower()
+    lowered_prefix = lowered_all[:4096]
     if b"<svg" not in lowered_prefix:
         raise ValueError("SVG content does not contain an <svg> root")
-    if b"<!doctype" in lowered_prefix or b"<!entity" in lowered_prefix:
+    if b"<!doctype" in lowered_all or b"<!entity" in lowered_all:
         raise ValueError("SVG declarations and entities are not supported")
     if _REMOTE_REFERENCE_RE.search(svg_bytes):
         raise ValueError("SVG must be self-contained and cannot load remote resources")

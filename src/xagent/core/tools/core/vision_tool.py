@@ -651,7 +651,9 @@ class VisionCore:
                         image_data = (
                             media_path
                             if media_path.startswith(("http://", "https://", "data:"))
-                            else self._convert_image_to_base64(media_path)
+                            else await asyncio.to_thread(
+                                self._convert_image_to_base64, media_path
+                            )
                         )
                         visual_contents.append(
                             {"type": "image_url", "image_url": {"url": image_data}}

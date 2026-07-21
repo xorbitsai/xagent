@@ -117,3 +117,28 @@ async def test_download_web_asset_rejects_non_image_content(
     assert result["success"] is False
     assert "Unsupported web asset content type" in result["error"]
     assert list(workspace.output_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared_length", ["not-a-number", "-1"])
+async def test_download_web_asset_rejects_invalid_declared_length(
+    workspace: TaskWorkspace,
+    declared_length: str,
+) -> None:
+    response = httpx.Response(
+        200,
+        content=_png_bytes(),
+        headers={
+            "content-type": "image/png",
+            "content-length": declared_length,
+        },
+        request=httpx.Request("GET", "https://brand.example/logo.png"),
+    )
+    tool = DownloadWebAssetTool(workspace)
+
+    with patch("httpx.AsyncClient.stream", return_value=_ResponseContext(response)):
+        result = await tool.run_json_async({"url": "https://brand.example/logo.png"})
+
+    assert result["success"] is False
+    assert result["error"] == f"Invalid declared content length: {declared_length}"
+    assert list(workspace.output_dir.iterdir()) == []

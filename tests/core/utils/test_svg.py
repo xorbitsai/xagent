@@ -42,3 +42,15 @@ def test_rasterize_svg_uses_safe_cairosvg_options(monkeypatch) -> None:
 def test_rasterize_svg_rejects_external_resources(svg: bytes) -> None:
     with pytest.raises(ValueError):
         rasterize_svg_bytes(svg)
+
+
+def test_rasterize_svg_rejects_declaration_after_large_padding() -> None:
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg">'
+        + b"<!-- padding -->" * 400
+        + b'<!ENTITY xxe SYSTEM "file:///etc/passwd">'
+        + b"</svg>"
+    )
+
+    with pytest.raises(ValueError, match="declarations and entities"):
+        rasterize_svg_bytes(svg)

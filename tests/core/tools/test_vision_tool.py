@@ -523,6 +523,39 @@ class TestVisionToolUnderstandMedia:
         rasterize.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_understand_local_image_offloads_conversion(
+        self, vision_tool_without_workspace, mock_vision_model, tmp_path
+    ):
+        image_path = tmp_path / "brand-image.png"
+        image_path.write_bytes(b"fake-image")
+        converted = "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+
+        with (
+            patch.object(
+                vision_tool_without_workspace.core,
+                "_convert_image_to_base64",
+                return_value=converted,
+            ) as convert_image,
+            patch(
+                "xagent.core.tools.core.vision_tool.asyncio.to_thread",
+                new=AsyncMock(return_value=converted),
+            ) as to_thread,
+        ):
+            result = await vision_tool_without_workspace.understand_media(
+                str(image_path), "What is shown?"
+            )
+
+        assert result.success is True
+        to_thread.assert_awaited_once_with(convert_image, str(image_path))
+        content = mock_vision_model.vision_chat.call_args.kwargs["messages"][0][
+            "content"
+        ]
+        assert content[1] == {
+            "type": "image_url",
+            "image_url": {"url": converted},
+        }
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("field_name", "invalid_value"),
         [

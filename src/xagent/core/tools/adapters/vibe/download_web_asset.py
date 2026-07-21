@@ -147,16 +147,22 @@ class DownloadWebAssetTool(AbstractBaseTool):
             ) as response:
                 response.raise_for_status()
                 declared_length = response.headers.get("content-length")
-                if declared_length:
+                if declared_length is not None:
                     try:
-                        if int(declared_length) > self._max_content_bytes:
-                            raise ValueError(
-                                "Remote asset exceeds maximum size of "
-                                f"{self._max_content_bytes} bytes"
-                            )
-                    except ValueError as exc:
-                        if "exceeds maximum" in str(exc):
-                            raise
+                        length = int(declared_length)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Invalid declared content length: {declared_length}"
+                        ) from exc
+                    if length < 0:
+                        raise ValueError(
+                            f"Invalid declared content length: {declared_length}"
+                        )
+                    if length > self._max_content_bytes:
+                        raise ValueError(
+                            "Remote asset exceeds maximum size of "
+                            f"{self._max_content_bytes} bytes"
+                        )
 
                 chunks: list[bytes] = []
                 downloaded = 0

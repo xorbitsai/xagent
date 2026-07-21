@@ -13,53 +13,93 @@ on:
       - 'tests/web/services/test_gmail_provisioning.py'
   pull_request:
     branches: [main]
-    paths:
-      - 'src/xagent/migrations/**'
-      - 'tests/migrations/**'
-      - '.github/workflows/test-migrations.yml'
-      - 'src/xagent/db/**'
-      - 'src/xagent/web/services/gmail_provisioning.py'
-      - 'tests/web/services/test_gmail_provisioning.py'
 
 jobs:
-  test-sqlite-migrations:
-    name: Test SQLite Migrations
+  detect-migration-changes:
+    name: Detect migration changes
     runs-on: ubuntu-latest
+    outputs:
+      should-test: ${{ steps.changes.outputs.should-test }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant changes
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "should-test=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            src/xagent/migrations \
+            tests/migrations \
+            .github/workflows/test-migrations.yml \
+            src/xagent/db \
+            src/xagent/web/services/gmail_provisioning.py \
+            tests/web/services/test_gmail_provisioning.py; then
+            echo "should-test=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-test=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  test-sqlite-migrations:
+    name: Test SQLite Migrations
+    needs: detect-migration-changes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Skip migration tests
+        if: needs.detect-migration-changes.outputs.should-test != 'true'
+        run: echo "No migration-related changes detected."
+
+      - name: Checkout code
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        uses: actions/checkout@v4
 
       - name: Set up Python
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
           cache: "pip"
 
       - name: Install dependencies
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[all]"
           pip install pytest pytest-mock
 
       - name: Test migration upgrade
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db sqlite upgrade
 
       - name: Test migration idempotence
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db sqlite idempotence
 
       - name: Test incremental upgrades
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db sqlite incremental
 
       - name: Test migration downgrade
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db sqlite downgrade
 
   test-postgresql-migrations:
     name: Test PostgreSQL Migrations
+    needs: detect-migration-changes
     runs-on: ubuntu-latest
 
     services:
@@ -78,46 +118,58 @@ jobs:
           --health-retries 5
 
     steps:
+      - name: Skip migration tests
+        if: needs.detect-migration-changes.outputs.should-test != 'true'
+        run: echo "No migration-related changes detected."
+
       - name: Checkout code
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
           cache: "pip"
 
       - name: Install dependencies
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[all]"
           pip install pytest pytest-mock
 
       - name: Test migration upgrade
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db postgresql upgrade
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test migration idempotence
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db postgresql idempotence
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test incremental upgrades
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db postgresql incremental
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test migration downgrade
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           python tests/migrations/test_migration_integration.py --db postgresql downgrade
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
       - name: Test Gmail provisioning row-lock contention (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pip install pytest-asyncio
           pytest tests/web/services/test_gmail_provisioning.py -k contend -q

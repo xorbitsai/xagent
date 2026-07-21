@@ -559,27 +559,13 @@ class ReActPattern(AgentPattern):
                 )
             if requires_protocol_retry:
                 if protocol_retry_performed:
-                    if answer_streamer is not None:
-                        await answer_streamer.fail(
-                            "invalid tool protocol after recovery"
-                        )
-                    await runtime.checkpoint(
-                        "invalid_tool_protocol",
+                    return await self._invalid_tool_protocol_result(
+                        runtime=runtime,
                         context=context,
-                        pattern=self,
-                        metadata={"iteration": iteration},
+                        iteration=iteration,
+                        answer_streamer=answer_streamer,
+                        stream_failure_message=("invalid tool protocol after recovery"),
                     )
-                    return PatternResult(
-                        success=False,
-                        error=(
-                            "The model returned an invalid tool protocol response "
-                            "after one repair attempt."
-                        ),
-                        metadata={
-                            "iterations": iteration + 1,
-                            "status": "invalid_tool_protocol",
-                        },
-                    ).to_dict()
                 if answer_streamer is not None:
                     await answer_streamer.fail("invalid tool protocol, retrying")
                 recover_full_tool_set = self._requires_full_tool_set_recovery(
@@ -622,25 +608,13 @@ class ReActPattern(AgentPattern):
                     force_final_answer=force_final_answer_now,
                     reject_mixed_control_calls=recover_full_tool_set,
                 ):
-                    if answer_streamer is not None:
-                        await answer_streamer.fail("invalid tool protocol after retry")
-                    await runtime.checkpoint(
-                        "invalid_tool_protocol",
+                    return await self._invalid_tool_protocol_result(
+                        runtime=runtime,
                         context=context,
-                        pattern=self,
-                        metadata={"iteration": iteration},
+                        iteration=iteration,
+                        answer_streamer=answer_streamer,
+                        stream_failure_message="invalid tool protocol after retry",
                     )
-                    return PatternResult(
-                        success=False,
-                        error=(
-                            "The model returned an invalid tool protocol response "
-                            "after one repair attempt."
-                        ),
-                        metadata={
-                            "iterations": iteration + 1,
-                            "status": "invalid_tool_protocol",
-                        },
-                    ).to_dict()
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
@@ -696,6 +670,35 @@ class ReActPattern(AgentPattern):
             success=False,
             error="ReActPattern reached max iterations without a final answer.",
             metadata={"iterations": self.max_iterations, "status": self.status},
+        ).to_dict()
+
+    async def _invalid_tool_protocol_result(
+        self,
+        *,
+        runtime: PatternRuntime,
+        context: Any,
+        iteration: int,
+        answer_streamer: ReActFinalAnswerStreamer | None,
+        stream_failure_message: str,
+    ) -> dict[str, Any]:
+        if answer_streamer is not None:
+            await answer_streamer.fail(stream_failure_message)
+        await runtime.checkpoint(
+            "invalid_tool_protocol",
+            context=context,
+            pattern=self,
+            metadata={"iteration": iteration},
+        )
+        return PatternResult(
+            success=False,
+            error=(
+                "The model returned an invalid tool protocol response "
+                "after one repair attempt."
+            ),
+            metadata={
+                "iterations": iteration + 1,
+                "status": "invalid_tool_protocol",
+            },
         ).to_dict()
 
     async def _finish_streamed_answer_if_final(

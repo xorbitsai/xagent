@@ -791,6 +791,7 @@ class AutoPattern(AgentPattern):
         decision_tools = [self._decision_tool_schema()]
         retry_feedback: str | None = None
         attempt = 0
+        # This is a whole-loop budget, independent of the parse attempt budget.
         protocol_retries = 0
         while attempt < MAX_DECISION_PARSE_ATTEMPTS:
             messages = append_user_message_preserving_turns(

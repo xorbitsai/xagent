@@ -31,6 +31,8 @@ def normalize_deepseek_response(
     *,
     tools: list[dict[str, Any]] | None,
 ) -> Any:
+    """Validate a response, repairing malformed tool arguments in place."""
+
     if not tools:
         return response
     violation = _response_violation(response, tools=tools)

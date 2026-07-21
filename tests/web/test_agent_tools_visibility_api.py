@@ -4,6 +4,7 @@ import tempfile
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import tools_router
@@ -99,7 +100,9 @@ def test_published_agent_is_callable_for_owner_and_hidden_from_other_users() -> 
         assert register_response.status_code == 200
         regular_headers = _login("regular", "password123")
 
-        agent_id = _create_agent(admin_headers, "Admin Published Agent")
+        agent_name = "Admin Published Agent"
+        agent_id = _create_agent(admin_headers, agent_name)
+        expected_tool_name = gen_agent_tool_name(agent_id, agent_name)
 
         publish_response = client.post(
             f"/api/agents/{agent_id}/publish",
@@ -110,12 +113,12 @@ def test_published_agent_is_callable_for_owner_and_hidden_from_other_users() -> 
         owner_tools = client.get("/api/tools/available", headers=admin_headers)
         assert owner_tools.status_code == 200
         owner_names = {tool["name"] for tool in owner_tools.json()["tools"]}
-        assert f"agent_{agent_id}" in owner_names
+        assert expected_tool_name in owner_names
 
         other_tools = client.get("/api/tools/available", headers=regular_headers)
         assert other_tools.status_code == 200
         other_names = {tool["name"] for tool in other_tools.json()["tools"]}
-        assert f"agent_{agent_id}" not in other_names
+        assert expected_tool_name not in other_names
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -131,7 +134,9 @@ def test_unpublish_moves_agent_back_to_non_callable_state() -> None:
     try:
         _setup_admin()
         admin_headers = _login("admin", "admin123")
-        agent_id = _create_agent(admin_headers, "Admin Toggle Agent")
+        agent_name = "Admin Toggle Agent"
+        agent_id = _create_agent(admin_headers, agent_name)
+        expected_tool_name = gen_agent_tool_name(agent_id, agent_name)
 
         publish_response = client.post(
             f"/api/agents/{agent_id}/publish",
@@ -144,7 +149,7 @@ def test_unpublish_moves_agent_back_to_non_callable_state() -> None:
         names_after_publish = {
             tool["name"] for tool in tools_after_publish.json()["tools"]
         }
-        assert f"agent_{agent_id}" in names_after_publish
+        assert expected_tool_name in names_after_publish
 
         unpublish_response = client.post(
             f"/api/agents/{agent_id}/unpublish",
@@ -159,7 +164,7 @@ def test_unpublish_moves_agent_back_to_non_callable_state() -> None:
         names_after_unpublish = {
             tool["name"] for tool in tools_after_unpublish.json()["tools"]
         }
-        assert f"agent_{agent_id}" not in names_after_unpublish
+        assert expected_tool_name not in names_after_unpublish
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:

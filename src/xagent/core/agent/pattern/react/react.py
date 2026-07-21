@@ -1588,16 +1588,13 @@ class ReActPattern(AgentPattern):
             None,
         )
         if infra_error is not None or interrupted is not None:
+            completed_call_objects: set[int] = set()
             for tool_call, result in zip(batch, raw_results):
                 if isinstance(result, BaseException):
                     continue
                 self._backfill_result(tool_call, result, context)
+                completed_call_objects.add(id(tool_call))
             self._reorder_ledger_for_batch(batch)
-            completed_call_objects = {
-                id(tool_call)
-                for tool_call, result in zip(batch, raw_results)
-                if not isinstance(result, BaseException)
-            }
             self.pending_tool_calls = [
                 tool_call
                 for tool_call in self.pending_tool_calls

@@ -95,7 +95,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
     {
         "id": "openai",
         "name": "OpenAI",
-        "description": "OpenAI API compatible models",
+        "description": "OpenAI models",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
         "category": ["llm", "embedding"],
@@ -134,6 +134,14 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "name": "DeepSeek",
         "description": "DeepSeek v4 models with tool calling and thinking mode",
         "requires_base_url": False,
+        "category": ["llm"],
+    },
+    {
+        "id": "openai-compatible",
+        "name": "OpenAI-Compatible",
+        "description": "OpenAI-compatible models",
+        "requires_base_url": True,
+        "compatibility": "openai_compatible",
         "category": ["llm"],
     },
     {

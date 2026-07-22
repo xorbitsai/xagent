@@ -1,7 +1,9 @@
-"""Security helpers for redacting sensitive data from logs and errors."""
+"""Security helpers for outbound hosts and sensitive log data."""
 
+import asyncio
 import ipaddress
 import re
+import socket
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 SENSITIVE_QUERY_KEYS = {
@@ -52,6 +54,35 @@ def reject_private_network_host(hostname: str) -> None:
         or address.is_unspecified
     ):
         raise PrivateNetworkHostError("Host must not resolve to a private network.")
+
+
+async def validate_public_http_url(url: str) -> None:
+    """Resolve an HTTP(S) URL and reject every non-public target address."""
+
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("url must be an absolute HTTP or HTTPS URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("url must not contain embedded credentials")
+
+    hostname = parsed.hostname
+    reject_private_network_host(hostname)
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError("url contains an invalid port") from exc
+
+    addresses = await asyncio.to_thread(
+        socket.getaddrinfo,
+        hostname,
+        port,
+        socket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+    )
+    if not addresses:
+        raise ValueError(f"Host {hostname!r} did not resolve to an address")
+    for *_, socket_address in addresses:
+        reject_private_network_host(str(socket_address[0]))
 
 
 def _mask_secret(value: str) -> str:

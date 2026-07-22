@@ -339,31 +339,37 @@ class WebContentFetcher:
         manifest_url = f"{parsed.scheme}://{parsed.netloc}/asset-manifest.json"
         assets: list[WebAssetReference] = []
         try:
-            response = await client.get(
+            async with client.stream(
+                "GET",
                 manifest_url,
                 headers={"User-Agent": DEFAULT_USER_AGENT},
                 timeout=10,
                 follow_redirects=True,
-            )
-            response.raise_for_status()
-            if len(response.content) > self._max_content_bytes:
-                return assets
-            assets.append(
-                WebAssetReference(
-                    url=manifest_url,
-                    kind="asset_manifest",
-                    name="asset-manifest.json",
-                    source="spa_convention",
+            ) as response:
+                response.raise_for_status()
+                if self._validate_content_length(
+                    response.headers.get("content-length")
+                ):
+                    return assets
+                content, error = await self._read_limited_response(response)
+                if error:
+                    return assets
+                assets.append(
+                    WebAssetReference(
+                        url=manifest_url,
+                        kind="asset_manifest",
+                        name="asset-manifest.json",
+                        source="spa_convention",
+                    )
                 )
-            )
-            decoded = self._decode_text_response(response, response.content)
-            assets.extend(
-                self._manifest_asset_references(
-                    decoded,
-                    str(response.url),
-                    asset_query=asset_query,
+                decoded = self._decode_text_response(response, content)
+                assets.extend(
+                    self._manifest_asset_references(
+                        decoded,
+                        str(response.url),
+                        asset_query=asset_query,
+                    )
                 )
-            )
         except Exception as exc:
             logger.debug(
                 "SPA asset manifest discovery failed for %s: %s", page_url, exc

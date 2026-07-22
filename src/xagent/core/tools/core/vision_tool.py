@@ -15,13 +15,15 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from urllib.parse import unquote_to_bytes, urlsplit
+from urllib.parse import unquote_to_bytes, urljoin, urlsplit
 
 import httpx
 from pydantic import BaseModel, Field
 
 from ...model.chat.basic.base import BaseLLM
+from ...utils.security import validate_public_http_url
 from ...utils.svg import MAX_SVG_BYTES, rasterize_svg_bytes
+from .web_content import get_proxy_url
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -229,37 +231,57 @@ class VisionCore:
         )
 
     async def _download_remote_svg_source(self, url: str) -> str:
-        chunks: list[bytes] = []
-        downloaded = 0
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "GET",
-                url,
-                timeout=10,
-                follow_redirects=True,
-            ) as response:
-                response.raise_for_status()
-                declared_length = response.headers.get("content-length")
-                if declared_length:
-                    try:
-                        size = int(declared_length)
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"Invalid remote SVG content length: {declared_length}"
-                        ) from exc
-                    if size < 0 or size > MAX_SVG_BYTES:
-                        raise ValueError(
-                            f"Remote SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
-                        )
-                async for chunk in response.aiter_bytes():
-                    downloaded += len(chunk)
-                    if downloaded > MAX_SVG_BYTES:
-                        raise ValueError(
-                            f"Remote SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
-                        )
-                    chunks.append(chunk)
+        client_kwargs: dict[str, Any] = {}
+        proxy_url = get_proxy_url()
+        if proxy_url:
+            client_kwargs["proxy"] = proxy_url
 
-        return self._decode_svg_bytes(b"".join(chunks))
+        current_url = url
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            for redirect_count in range(6):
+                await validate_public_http_url(current_url)
+                chunks: list[bytes] = []
+                downloaded = 0
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    timeout=10,
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError("Remote SVG redirect has no Location")
+                        if redirect_count >= 5:
+                            raise ValueError("Remote SVG exceeded redirect limit")
+                        current_url = urljoin(current_url, location)
+                        continue
+
+                    response.raise_for_status()
+                    declared_length = response.headers.get("content-length")
+                    if declared_length:
+                        try:
+                            size = int(declared_length)
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Invalid remote SVG content length: {declared_length}"
+                            ) from exc
+                        if size < 0 or size > MAX_SVG_BYTES:
+                            raise ValueError(
+                                "Remote SVG exceeds maximum size of "
+                                f"{MAX_SVG_BYTES} bytes"
+                            )
+                    async for chunk in response.aiter_bytes():
+                        downloaded += len(chunk)
+                        if downloaded > MAX_SVG_BYTES:
+                            raise ValueError(
+                                "Remote SVG exceeds maximum size of "
+                                f"{MAX_SVG_BYTES} bytes"
+                            )
+                        chunks.append(chunk)
+                    return self._decode_svg_bytes(b"".join(chunks))
+
+        raise ValueError("Remote SVG exceeded redirect limit")
 
     @classmethod
     def _decode_svg_data_url(cls, data_url: str) -> str:
@@ -904,7 +926,9 @@ class VisionCore:
                         "image_url": {"url": image_path},
                     }
                 else:
-                    base64_data = self._convert_image_to_base64(image_path)
+                    base64_data = await asyncio.to_thread(
+                        self._convert_image_to_base64, image_path
+                    )
                     image_content = {
                         "type": "image_url",
                         "image_url": {"url": base64_data},

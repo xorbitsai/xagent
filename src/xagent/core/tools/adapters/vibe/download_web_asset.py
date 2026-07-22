@@ -6,13 +6,14 @@ import io
 import mimetypes
 from pathlib import Path
 from typing import Any, Mapping, Type
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from ....file_ref import build_workspace_file_ref
+from ....utils.security import validate_public_http_url
 from ....workspace import TaskWorkspace
 from ...core.web_content import (
     DEFAULT_MAX_CONTENT_BYTES,
@@ -54,6 +55,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
     """Download and register an exact remote image without model reconstruction."""
 
     category = ToolCategory.WEB_SEARCH
+    _MAX_REDIRECTS = 5
 
     def __init__(
         self,
@@ -96,19 +98,23 @@ class DownloadWebAssetTool(AbstractBaseTool):
         download_args = DownloadWebAssetArgs.model_validate(args)
         try:
             content, final_url, content_type = await self._download(download_args.url)
-            self._validate_image(content, content_type, final_url)
+            detected_extension = self._validate_image(content, content_type, final_url)
             filename = self._resolve_filename(
                 download_args.filename,
                 final_url,
                 content_type,
+                detected_extension,
             )
-            target = self._unique_output_path(filename)
             with self._workspace.auto_register_files():
-                target.write_bytes(content)
+                target = self._write_unique_output(filename, content)
             file_ref = build_workspace_file_ref(
                 workspace=self._workspace,
                 file_path=target,
-                mime_type=self._media_type(content_type),
+                mime_type=(
+                    self._media_type(content_type)
+                    or mimetypes.guess_type(target.name)[0]
+                    or ""
+                ),
             )
             return DownloadWebAssetResult(
                 success=True,
@@ -128,60 +134,70 @@ class DownloadWebAssetTool(AbstractBaseTool):
             ).model_dump()
 
     async def _download(self, url: str) -> tuple[bytes, str, str]:
-        parsed = urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("url must be an absolute HTTP or HTTPS URL")
-
         client_kwargs: dict[str, Any] = {}
         proxy_url = get_proxy_url()
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
 
+        current_url = url
         async with httpx.AsyncClient(**client_kwargs) as client:
-            async with client.stream(
-                "GET",
-                url,
-                headers={"User-Agent": DEFAULT_USER_AGENT},
-                timeout=30,
-                follow_redirects=True,
-            ) as response:
-                response.raise_for_status()
-                declared_length = response.headers.get("content-length")
-                if declared_length is not None:
-                    try:
-                        length = int(declared_length)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            f"Invalid declared content length: {declared_length}"
-                        ) from exc
-                    if length < 0:
-                        raise ValueError(
-                            f"Invalid declared content length: {declared_length}"
-                        )
-                    if length > self._max_content_bytes:
-                        raise ValueError(
-                            "Remote asset exceeds maximum size of "
-                            f"{self._max_content_bytes} bytes"
-                        )
+            for redirect_count in range(self._MAX_REDIRECTS + 1):
+                await validate_public_http_url(current_url)
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    headers={"User-Agent": DEFAULT_USER_AGENT},
+                    timeout=30,
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError("Remote asset redirect has no Location")
+                        if redirect_count >= self._MAX_REDIRECTS:
+                            raise ValueError("Remote asset exceeded redirect limit")
+                        current_url = urljoin(current_url, location)
+                        continue
 
-                chunks: list[bytes] = []
-                downloaded = 0
-                async for chunk in response.aiter_bytes():
-                    downloaded += len(chunk)
-                    if downloaded > self._max_content_bytes:
-                        raise ValueError(
-                            "Remote asset exceeds maximum size of "
-                            f"{self._max_content_bytes} bytes"
-                        )
-                    chunks.append(chunk)
-                content = b"".join(chunks)
-                if not content:
-                    raise ValueError("Remote asset response was empty")
-                return (
-                    content,
-                    str(response.url),
-                    response.headers.get("content-type", ""),
-                )
+                    response.raise_for_status()
+                    declared_length = response.headers.get("content-length")
+                    if declared_length is not None:
+                        try:
+                            length = int(declared_length)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                f"Invalid declared content length: {declared_length}"
+                            ) from exc
+                        if length < 0:
+                            raise ValueError(
+                                f"Invalid declared content length: {declared_length}"
+                            )
+                        if length > self._max_content_bytes:
+                            raise ValueError(
+                                "Remote asset exceeds maximum size of "
+                                f"{self._max_content_bytes} bytes"
+                            )
+
+                    chunks: list[bytes] = []
+                    downloaded = 0
+                    async for chunk in response.aiter_bytes():
+                        downloaded += len(chunk)
+                        if downloaded > self._max_content_bytes:
+                            raise ValueError(
+                                "Remote asset exceeds maximum size of "
+                                f"{self._max_content_bytes} bytes"
+                            )
+                        chunks.append(chunk)
+                    content = b"".join(chunks)
+                    if not content:
+                        raise ValueError("Remote asset response was empty")
+                    return (
+                        content,
+                        str(response.url),
+                        response.headers.get("content-type", ""),
+                    )
+
+        raise ValueError("Remote asset exceeded redirect limit")
 
     @classmethod
     def _validate_image(
@@ -189,7 +205,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
         content: bytes,
         content_type: str,
         url: str,
-    ) -> None:
+    ) -> str:
         media_type = cls._media_type(content_type)
         suffix = Path(urlsplit(url).path).suffix.lower()
         if media_type and not media_type.startswith("image/"):
@@ -198,12 +214,25 @@ class DownloadWebAssetTool(AbstractBaseTool):
             prefix = content[:4096].decode("utf-8", errors="ignore").lower()
             if "<svg" not in prefix:
                 raise ValueError("Remote SVG asset does not contain an <svg> root")
-            return
+            return ".svg"
         try:
             with Image.open(io.BytesIO(content)) as image:
+                image_format = image.format
                 image.verify()
         except Exception as exc:
             raise ValueError("Remote asset is not a valid supported image") from exc
+        extension = Image.registered_extensions()
+        for suffix, registered_format in extension.items():
+            if registered_format == image_format and suffix in {
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+                ".gif",
+                ".bmp",
+            }:
+                return ".jpg" if suffix == ".jpeg" else suffix
+        raise ValueError("Remote asset uses an unsupported image format")
 
     @classmethod
     def _resolve_filename(
@@ -211,6 +240,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
         requested: str | None,
         final_url: str,
         content_type: str,
+        detected_extension: str,
     ) -> str:
         raw_name = requested or Path(unquote(urlsplit(final_url).path)).name
         filename = Path(str(raw_name)).name.strip()
@@ -219,28 +249,34 @@ class DownloadWebAssetTool(AbstractBaseTool):
         if "\x00" in filename:
             raise ValueError("filename contains an invalid null byte")
         if not Path(filename).suffix:
-            extension = cls._extension_for_content_type(content_type)
+            extension = (
+                cls._extension_for_content_type(content_type) or detected_extension
+            )
             filename = f"{filename}{extension}"
         return filename
 
-    def _unique_output_path(self, filename: str) -> Path:
-        candidate = self._workspace.output_dir / filename
-        index = 1
-        while candidate.exists():
+    def _write_unique_output(self, filename: str, content: bytes) -> Path:
+        for index in range(10_000):
+            suffix = "" if index == 0 else f"_{index}"
             candidate = (
                 self._workspace.output_dir
-                / f"{Path(filename).stem}_{index}{Path(filename).suffix}"
+                / f"{Path(filename).stem}{suffix}{Path(filename).suffix}"
             )
-            index += 1
-        return candidate
+            try:
+                with candidate.open("xb") as output:
+                    output.write(content)
+                return candidate
+            except FileExistsError:
+                continue
+        raise FileExistsError(f"Could not allocate a unique filename for {filename}")
 
     @staticmethod
     def _media_type(content_type: str) -> str:
         return content_type.split(";", 1)[0].strip().lower()
 
     @classmethod
-    def _extension_for_content_type(cls, content_type: str) -> str:
+    def _extension_for_content_type(cls, content_type: str) -> str | None:
         media_type = cls._media_type(content_type)
         if media_type == "image/svg+xml":
             return ".svg"
-        return mimetypes.guess_extension(media_type) or ".img"
+        return mimetypes.guess_extension(media_type)

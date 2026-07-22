@@ -1,9 +1,33 @@
-"""Tests for security redaction helpers used by model integrations."""
+"""Tests for shared security helpers."""
+
+import socket
+from unittest.mock import patch
+
+import pytest
 
 from xagent.core.utils.security import (
+    PrivateNetworkHostError,
     redact_sensitive_text,
     redact_url_credentials_for_logging,
+    validate_public_http_url,
 )
+
+
+@pytest.mark.asyncio
+async def test_validate_public_http_url_rejects_private_dns_result() -> None:
+    resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    with patch("socket.getaddrinfo", return_value=resolved):
+        with pytest.raises(PrivateNetworkHostError):
+            await validate_public_http_url("https://public.example/logo.png")
+
+
+@pytest.mark.asyncio
+async def test_validate_public_http_url_accepts_only_public_dns_results() -> None:
+    resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+
+    with patch("socket.getaddrinfo", return_value=resolved):
+        await validate_public_http_url("https://public.example/logo.png")
 
 
 def test_redact_url_credentials_for_logging_masks_sensitive_query_values() -> None:

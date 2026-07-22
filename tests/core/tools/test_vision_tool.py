@@ -533,6 +533,7 @@ class TestVisionToolUnderstandMedia:
         )
 
         class RemoteSvgResponse:
+            status_code = 200
             headers = {"content-length": str(len(svg_source.encode()))}
 
             def raise_for_status(self):
@@ -548,10 +549,21 @@ class TestVisionToolUnderstandMedia:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-        with patch(
-            "httpx.AsyncClient.stream",
-            return_value=RemoteSvgStream(),
-        ) as stream:
+        with (
+            patch(
+                "xagent.core.tools.core.vision_tool.validate_public_http_url",
+                new=AsyncMock(),
+            ) as validate_url,
+            patch(
+                "xagent.core.tools.core.vision_tool.get_proxy_url",
+                return_value="http://proxy.example:8080",
+            ),
+            patch(
+                "xagent.core.tools.core.vision_tool.httpx.AsyncClient"
+            ) as async_client,
+        ):
+            client = async_client.return_value.__aenter__.return_value
+            client.stream = Mock(return_value=RemoteSvgStream())
             result = await vision_tool_without_workspace.understand_media(
                 "https://cdn.example.com/official-logo.svg",
                 "What are the exact brand colors?",
@@ -564,11 +576,15 @@ class TestVisionToolUnderstandMedia:
         assert svg_source in content[1]["text"]
         assert "#7B0099" in content[1]["text"]
         assert all(item["type"] != "image_url" for item in content[1:])
-        stream.assert_called_once_with(
+        async_client.assert_called_once_with(proxy="http://proxy.example:8080")
+        validate_url.assert_awaited_once_with(
+            "https://cdn.example.com/official-logo.svg"
+        )
+        client.stream.assert_called_once_with(
             "GET",
             "https://cdn.example.com/official-logo.svg",
             timeout=10,
-            follow_redirects=True,
+            follow_redirects=False,
         )
 
     @pytest.mark.asyncio
@@ -1061,6 +1077,33 @@ class TestVisionToolDetectObjects:
         assert obj2["class"] == "car"
         assert obj2["confidence"] == 0.87
         assert obj2["bbox"] == [0.7, 0.5, 0.95, 0.75]
+
+    @pytest.mark.asyncio
+    async def test_detect_objects_offloads_local_image_conversion(
+        self, mock_vision_model_with_detection, tmp_path
+    ):
+        image_path = tmp_path / "brand.svg"
+        image_path.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+        vision_tool = VisionTool(mock_vision_model_with_detection)
+        converted = "data:image/png;base64,ZmFrZQ=="
+
+        with (
+            patch.object(
+                vision_tool.core,
+                "_convert_image_to_base64",
+                return_value=converted,
+            ) as convert_image,
+            patch(
+                "xagent.core.tools.core.vision_tool.asyncio.to_thread",
+                new=AsyncMock(return_value=converted),
+            ) as to_thread,
+        ):
+            result = await vision_tool.detect_objects(
+                str(image_path), task="Find the logo"
+            )
+
+        assert result.success is True
+        to_thread.assert_awaited_once_with(convert_image, str(image_path))
 
     @pytest.mark.asyncio
     async def test_detect_objects_with_task(self, mock_vision_model_with_detection):

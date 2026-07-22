@@ -174,7 +174,7 @@ class TestFetchWebContentTool:
             headers={"content-type": "text/html"},
             url="https://simba.example/6yearsstrong",
         )
-        manifest_response = httpx.Response(
+        manifest_body = httpx.Response(
             200,
             json={
                 "files": {
@@ -185,16 +185,20 @@ class TestFetchWebContentTool:
                     "static/media/banner.png": "/static/media/banner.1234.png",
                 }
             },
+        ).content
+        manifest_response = _MockStreamResponse(
+            body=manifest_body,
             headers={"content-type": "application/json"},
-            request=httpx.Request("GET", "https://simba.example/asset-manifest.json"),
+            url="https://simba.example/asset-manifest.json",
         )
 
-        with (
-            patch(
-                "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
-            ),
-            patch("httpx.AsyncClient.get", return_value=manifest_response) as mock_get,
-        ):
+        with patch(
+            "httpx.AsyncClient.stream",
+            side_effect=[
+                _MockStreamContext(response),
+                _MockStreamContext(manifest_response),
+            ],
+        ) as mock_stream:
             result = await fetch_tool.run_json_async(
                 {
                     "url": "https://simba.example/6yearsstrong",
@@ -209,7 +213,7 @@ class TestFetchWebContentTool:
             "https://simba.example/asset-manifest.json",
             "https://simba.example/static/media/simba-logo.958c8ff7.svg",
         ]
-        mock_get.assert_awaited_once()
+        assert mock_stream.call_count == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("manifest_case", ["network", "oversized", "not_found"])
@@ -224,19 +228,22 @@ class TestFetchWebContentTool:
             url="https://example.com/campaign",
         )
         request = httpx.Request("GET", "https://example.com/asset-manifest.json")
+        if manifest_case == "network":
+            manifest_result = httpx.ConnectError(
+                "manifest unavailable", request=request
+            )
+        elif manifest_case == "not_found":
+            manifest_result = _MockStreamContext(
+                _MockStreamResponse(status_code=404, raise_status=True)
+            )
+        else:
+            manifest_result = _MockStreamContext(
+                _MockStreamResponse(chunks=[b"x" * 513])
+            )
 
-        async def get_manifest(*_args, **_kwargs):
-            if manifest_case == "network":
-                raise httpx.ConnectError("manifest unavailable", request=request)
-            if manifest_case == "not_found":
-                return httpx.Response(404, request=request)
-            return httpx.Response(200, content=b"x" * 513, request=request)
-
-        with (
-            patch(
-                "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
-            ),
-            patch("httpx.AsyncClient.get", side_effect=get_manifest),
+        with patch(
+            "httpx.AsyncClient.stream",
+            side_effect=[_MockStreamContext(response), manifest_result],
         ):
             result = await WebContentFetcher(max_content_bytes=512).fetch(
                 "https://example.com/campaign",

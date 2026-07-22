@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -38,6 +38,15 @@ def _png_bytes() -> bytes:
 @pytest.fixture
 def workspace(tmp_path: Path) -> TaskWorkspace:
     return TaskWorkspace("asset-test", base_dir=str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
+def allow_public_test_hosts():
+    with patch(
+        "xagent.core.tools.adapters.vibe.download_web_asset.validate_public_http_url",
+        new=AsyncMock(),
+    ) as validate:
+        yield validate
 
 
 def test_download_web_asset_tool_contract(workspace: TaskWorkspace) -> None:
@@ -74,6 +83,86 @@ async def test_download_web_asset_registers_exact_image(
     saved_path = workspace.output_dir / "logo.png"
     assert saved_path.read_bytes() == content
     assert result["file_ref"]["file_path"] == str(saved_path.resolve())
+
+
+@pytest.mark.asyncio
+async def test_download_web_asset_validates_every_redirect_hop(
+    workspace: TaskWorkspace,
+    allow_public_test_hosts: AsyncMock,
+) -> None:
+    content = _png_bytes()
+    redirect = httpx.Response(
+        302,
+        headers={"location": "https://cdn.example/logo.png"},
+        request=httpx.Request("GET", "https://brand.example/logo"),
+    )
+    final = httpx.Response(
+        200,
+        content=content,
+        headers={"content-type": "image/png"},
+        request=httpx.Request("GET", "https://cdn.example/logo.png"),
+    )
+    tool = DownloadWebAssetTool(workspace)
+
+    with patch(
+        "httpx.AsyncClient.stream",
+        side_effect=[_ResponseContext(redirect), _ResponseContext(final)],
+    ) as stream:
+        result = await tool.run_json_async({"url": "https://brand.example/logo"})
+
+    assert result["success"] is True
+    assert result["source_url"] == "https://cdn.example/logo.png"
+    assert allow_public_test_hosts.await_args_list == [
+        (("https://brand.example/logo",),),
+        (("https://cdn.example/logo.png",),),
+    ]
+    assert all(
+        call.kwargs["follow_redirects"] is False for call in stream.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_download_web_asset_infers_extension_from_image_bytes(
+    workspace: TaskWorkspace,
+) -> None:
+    content = _png_bytes()
+    response = httpx.Response(
+        200,
+        content=content,
+        request=httpx.Request("GET", "https://brand.example/logo"),
+    )
+    tool = DownloadWebAssetTool(workspace)
+
+    with patch("httpx.AsyncClient.stream", return_value=_ResponseContext(response)):
+        result = await tool.run_json_async({"url": "https://brand.example/logo"})
+
+    assert result["success"] is True
+    assert result["filename"] == "logo.png"
+    assert result["file_ref"]["mime_type"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_download_web_asset_uses_exclusive_unique_filename(
+    workspace: TaskWorkspace,
+) -> None:
+    content = _png_bytes()
+    existing = workspace.output_dir / "logo.png"
+    existing.write_bytes(b"existing")
+    response = httpx.Response(
+        200,
+        content=content,
+        headers={"content-type": "image/png"},
+        request=httpx.Request("GET", "https://brand.example/logo.png"),
+    )
+    tool = DownloadWebAssetTool(workspace)
+
+    with patch("httpx.AsyncClient.stream", return_value=_ResponseContext(response)):
+        result = await tool.run_json_async({"url": "https://brand.example/logo.png"})
+
+    assert result["success"] is True
+    assert result["filename"] == "logo_1.png"
+    assert existing.read_bytes() == b"existing"
+    assert (workspace.output_dir / "logo_1.png").read_bytes() == content
 
 
 @pytest.mark.asyncio

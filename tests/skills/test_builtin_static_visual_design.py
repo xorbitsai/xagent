@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.xagent.skills.parser import SkillParser
+from xagent.skills.parser import SkillParser
 
 
 def test_static_visual_design_skill_routes_designed_graphics_and_brand_assets() -> None:

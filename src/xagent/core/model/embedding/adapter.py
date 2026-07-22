@@ -46,7 +46,7 @@ class EmbeddingModelAdapter(BaseEmbedding):
         # Normalize provider name: map variants to canonical names
         # Note: 'openai_embedding' is a legacy value that should be treated as 'openai'
         provider = self.model_config.model_provider.lower().strip()
-        if provider in ("openai", "openai_embedding"):
+        if provider in ("openai", "openai_embedding", "openai-compatible"):
             return OpenAIEmbedding(
                 model=self.model_config.model_name,
                 api_key=self.model_config.api_key,

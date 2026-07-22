@@ -988,7 +988,7 @@ export function ModelManagementDialog({
                           <Label className="text-base font-medium">{t('models.form.baseUrl')}</Label>
                           <Input
                             placeholder={t('models.dialog.connect.baseUrlPlaceholder')}
-                            value={formData.base_url}
+                            value={formData.base_url || ""}
                             onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
                           />
                           <div className="p-3 bg-muted/50 rounded-md text-sm text-muted-foreground flex items-center gap-2">
@@ -1006,7 +1006,7 @@ export function ModelManagementDialog({
                             <div className="mt-4 space-y-2 pl-5">
                               <Label className="text-base font-medium">{t('models.form.baseUrl')}</Label>
                               <Input
-                                value={formData.base_url}
+                                value={formData.base_url || ""}
                                 onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
                               />
                             </div>
@@ -1031,7 +1031,7 @@ export function ModelManagementDialog({
                           }}
                           disabled={
                             (!providerAllowsEmptyApiKey(formData.model_provider) && !formData.api_key)
-                            || (baseUrlRequired ? !formData.base_url : false)
+                            || (baseUrlRequired ? !formData.base_url?.trim() : false)
                             || testConnectionStatus === 'testing'
                           }
                         >

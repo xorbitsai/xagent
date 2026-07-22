@@ -142,7 +142,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "OpenAI-compatible models",
         "requires_base_url": True,
         "compatibility": "openai_compatible",
-        "category": ["llm"],
+        "category": ["llm", "embedding"],
     },
     {
         "id": "openrouter",

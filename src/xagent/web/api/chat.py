@@ -47,6 +47,7 @@ from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
+from ..models.user_channel import UserChannel
 from ..sandbox_keys import (
     USER_LIFECYCLE_TYPE,
     make_user_lifecycle_id,
@@ -3245,6 +3246,22 @@ async def get_tasks(
                 agents = db.query(Agent).filter(Agent.id.in_(agent_ids)).all()
                 agents_map = {agent.id: agent for agent in agents}
 
+            # Channel names are user-defined, so clients need the persisted type
+            # to render a reliable platform indicator without guessing from text.
+            channel_ids = {
+                task.channel_id for task in tasks_query if task.channel_id is not None
+            }
+            channels_map = {}
+            if channel_ids:
+                channels = (
+                    db.query(UserChannel.id, UserChannel.channel_type)
+                    .filter(UserChannel.id.in_(channel_ids))
+                    .all()
+                )
+                channels_map = {
+                    channel_id: channel_type for channel_id, channel_type in channels
+                }
+
             # Convert Task objects to dictionaries for JSON serialization
             tasks = []
             for task in tasks_query:
@@ -3282,6 +3299,7 @@ async def get_tasks(
                         "agent_id": task.agent_id,
                         "channel_id": task.channel_id,
                         "channel_name": task.channel_name,
+                        "channel_type": channels_map.get(task.channel_id),
                     }
 
                     if task.agent_id and task.agent_id in agents_map:

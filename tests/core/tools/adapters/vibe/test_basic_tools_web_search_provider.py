@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from xagent.core.tools.adapters.vibe.basic_tools import create_basic_tools
@@ -133,3 +135,26 @@ async def test_web_search_category_selection_keeps_web_fetch_tool(monkeypatch):
     tools = await ToolFactory.create_all_tools(config)
 
     assert _tool_names(tools) == ["fetch_web_content"]
+
+
+@pytest.mark.asyncio
+async def test_basic_tools_include_web_asset_download_with_workspace(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
+
+    tools = await create_basic_tools(
+        ToolConfig(
+            {
+                "workspace": {
+                    "task_id": "web-asset-test",
+                    "base_dir": str(tmp_path),
+                },
+                "tool_credentials": {},
+            }
+        )
+    )
+
+    names = _tool_names(tools)
+    assert "fetch_web_content" in names
+    assert "download_web_asset" in names

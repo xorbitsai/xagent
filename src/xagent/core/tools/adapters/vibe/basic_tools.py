@@ -52,6 +52,11 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
 
     tools.append(FetchWebContentTool())
 
+    if workspace:
+        from .download_web_asset import DownloadWebAssetTool
+
+        tools.append(DownloadWebAssetTool(workspace=workspace))
+
     # Python executor tool (if workspace available)
     if workspace:
         from .python_executor import PythonExecutorToolForBasic

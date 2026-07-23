@@ -173,7 +173,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.read_file,
                 name="read_file",
-                description="Read file content in workspace. Accepts either file paths (e.g., 'filename.txt') or file_ids (e.g., 'abc-123-def'). Automatically detects input type. For large files, results may be truncated in model context; use start_line/end_line to inspect a specific 1-based inclusive line range instead of repeating the same full-file read.",
+                description="Read file content in workspace. Accepts either file paths (e.g., 'filename.txt') or file_ids (e.g., 'abc-123-def'). Automatically detects input type. For large files, results may be truncated in model context; use start_line/end_line to inspect a specific 1-based inclusive line range instead of repeating the same full-file read. SVG files are XML text: use read_file for exact markup, colors, viewBox, paths, fill, stroke, and gradient values.",
             ),
             FileTool(
                 self.write_file,

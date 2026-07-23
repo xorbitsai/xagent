@@ -278,6 +278,7 @@ Analyze images, videos, or a mixture of both with one AI vision tool.
 Use this tool to:
 - Identifying objects, people, and scenes
 - Reading text in images (OCR capabilities)
+- Inspecting SVG markup, exact colors, and the visual design encoded by its source
 - Understanding actions and scene changes across a video
 - Comparing multiple images or videos
 - Answering specific questions about visual content
@@ -298,7 +299,12 @@ Examples:
 - "Does the cat leave the room?"
 - "Compare these two images and this video"
 
-Supported images: JPEG, PNG, WebP, GIF, BMP. Supported local/workspace videos:
+Supported images: JPEG, PNG, WebP, GIF, BMP, and SVG. Local/workspace SVGs are
+sent directly to the model as bounded XML source so it can inspect exact
+viewBox, paths, fill, stroke, gradient, text, and encoded visual structure
+without guessing from a raster image. When only raw SVG/XML source is needed,
+read_file is also available.
+Supported local/workspace videos:
 MP4, MOV, M4V, WebM, AVI, MKV. Models with native video support receive the
 video directly so motion, timing, and audio-capable model inputs are preserved.
 Other vision models use chronologically sampled, timestamped frames.

@@ -317,7 +317,9 @@ def _constrain_remote_path(remote_path: str, remote_root: str | None) -> None:
         return
     normalized = posixpath.normpath(remote_path)
     root = posixpath.normpath(remote_root)
-    if normalized != root and not normalized.startswith(root + "/"):
+    # normpath("/") == "/", so root + "/" would be "//"; guard that case.
+    prefix = root if root.endswith("/") else root + "/"
+    if normalized != root and not normalized.startswith(prefix):
         raise SshError(
             SshErrorCode.OPERATION_NOT_ALLOWED,
             "remote path escapes the target's remote root",

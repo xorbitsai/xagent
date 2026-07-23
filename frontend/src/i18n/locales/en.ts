@@ -4356,6 +4356,31 @@ Build when you need.`,
       livePreviewHint: "Live preview will appear here.",
     },
   },
+  ssh: {
+    bindings: {
+      label: "SSH targets",
+      add: "Bind target",
+      empty: "No SSH targets bound to this agent.",
+      saveFirst: "Save the agent first, then bind SSH targets.",
+      created: "Target bound",
+      deleted: "Binding removed",
+      confirmDelete: "Remove this SSH target binding?",
+      approval: {
+        always: "Always require approval",
+        risk_based: "Risk-based approval",
+        not_required: "No approval required",
+      },
+      dialog: {
+        title: "Bind an SSH target",
+        targetLabel: "Target",
+        targetPlaceholder: "Select a target",
+        capabilitiesLabel: "Capabilities",
+        capabilitiesPlaceholder: "Select capabilities",
+        approvalLabel: "Approval policy",
+        submit: "Bind",
+      },
+    },
+  },
 } as const
 
 export default en

@@ -185,7 +185,9 @@ class ToolRegistry:
         cls._import_tool_modules()
 
         spec: ToolSelectionSpec | None = (
-            config.get_tool_selection_spec() if hasattr(config, "get_tool_selection_spec") else None
+            config.get_tool_selection_spec()
+            if hasattr(config, "get_tool_selection_spec")
+            else None
         )
         tools: list[Tool] = []
         for creator, declared_cats, selection_gate in cls._tool_creators:
@@ -274,7 +276,7 @@ class ToolFactory:
     @staticmethod
     async def create_all_tools(
         config: BaseToolConfig, apply_user_override_filter: bool = True
-    ) -> List[Tool]:
+    ) -> list[Tool]:
         """Create tools within the config's optional prepared-runtime boundary.
 
         Release runs after partial preparation, while an active prepare/build
@@ -310,7 +312,7 @@ class ToolFactory:
     @staticmethod
     async def _create_all_tools_prepared(
         config: BaseToolConfig, apply_user_override_filter: bool = True
-    ) -> List[Tool]:
+    ) -> list[Tool]:
         """
         Create all tools based on configuration.
 
@@ -343,7 +345,9 @@ class ToolFactory:
         # ``None`` vs ``[]`` distinction was a runtime truthiness check.
         # Configs that don't carry a spec default to ALL (full set).
         spec = (
-            config.get_tool_selection_spec() if hasattr(config, "get_tool_selection_spec") else None
+            config.get_tool_selection_spec()
+            if hasattr(config, "get_tool_selection_spec")
+            else None
         )
         if spec is not None:
             # Prefer the spec. If a legacy concrete ``allowed_tools`` list
@@ -351,7 +355,9 @@ class ToolFactory:
             # a possibly-stale list (issue #539): the spec is the source
             # of truth once supplied.
             legacy_when_spec = (
-                config.get_allowed_tools() if hasattr(config, "get_allowed_tools") else None
+                config.get_allowed_tools()
+                if hasattr(config, "get_allowed_tools")
+                else None
             )
             if legacy_when_spec is not None:
                 logger.warning(
@@ -374,7 +380,9 @@ class ToolFactory:
             #   []         — explicit zero tools
             #   [...]      — concrete name allow-list
             legacy_list = (
-                config.get_allowed_tools() if hasattr(config, "get_allowed_tools") else None
+                config.get_allowed_tools()
+                if hasattr(config, "get_allowed_tools")
+                else None
             )
             allowed_names = None if legacy_list is None else frozenset(legacy_list)
 
@@ -390,10 +398,14 @@ class ToolFactory:
             overrides = getattr(config, "get_user_tool_overrides", lambda: {})()
             if overrides:
                 disabled_by_hook = {
-                    name for name, ov in overrides.items() if ov and ov.get("enabled") is False
+                    name
+                    for name, ov in overrides.items()
+                    if ov and ov.get("enabled") is False
                 }
                 if disabled_by_hook:
-                    tools = [tool for tool in tools if tool.name not in disabled_by_hook]
+                    tools = [
+                        tool for tool in tools if tool.name not in disabled_by_hook
+                    ]
 
             # Positive allowlist filter (execution layer). When the hook
             # returns a concrete list, keep only tools whose name is in it.
@@ -737,14 +749,18 @@ class ToolFactory:
                             import shlex
 
                             try:
-                                connection_config["args"] = shlex.split(connection_config["args"])
+                                connection_config["args"] = shlex.split(
+                                    connection_config["args"]
+                                )
                                 logger.info(
                                     f"Converted args string to list: {connection_config['args']}"
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to parse args string: {e}")
                                 # Fallback to simple split
-                                connection_config["args"] = connection_config["args"].split()
+                                connection_config["args"] = connection_config[
+                                    "args"
+                                ].split()
 
                         connections[server_name] = connection_config
                         configs_by_name[server_name] = config
@@ -893,7 +909,9 @@ class ToolFactory:
             except ConnectorRuntimeError:
                 raise
             except Exception as e:
-                logger.warning("Failed to create MCP tools from database (%s)", type(e).__name__)
+                logger.warning(
+                    "Failed to create MCP tools from database (%s)", type(e).__name__
+                )
                 unavailable_tools.extend(
                     cls._create_unavailable_mcp_tool(
                         server_name=server_name,
@@ -926,7 +944,9 @@ class ToolFactory:
         except RequiredMCPUnavailableError:
             raise
         except Exception as e:
-            logger.warning("Failed to create MCP tools from database (%s)", type(e).__name__)
+            logger.warning(
+                "Failed to create MCP tools from database (%s)", type(e).__name__
+            )
             enforce_mcp_failure_policy(
                 mcp_failure_policy,
                 [MCPUnavailableSummary.from_values(None, "config_load_failed")],

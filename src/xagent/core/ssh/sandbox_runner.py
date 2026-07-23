@@ -5,7 +5,7 @@ runs ``ssh``/``sftp`` inside an agent-inaccessible sandbox where the materialize
 put the key. It applies the strict, non-interactive OpenSSH configuration the
 design mandates (§14) via argv (never a local shell), pins the egress-authorized
 IP while verifying the host key under the hostname (``HostKeyAlias``), and clamps
-runtime with the ``timeout`` coreutil.
+runtime with the ``timeout`` utility.
 
 SFTP transfers stage through the sandbox: the sandbox has no task workspace, so
 upload copies the host file into a private sandbox dir first (and download copies
@@ -19,11 +19,13 @@ import secrets
 import shlex
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from typing import cast
 
 from .errors import SshError, SshErrorCode
+from .interfaces import SandboxLike
 from .runner import SshRunResult
 
-_TIMEOUT_EXIT = 124  # `timeout` coreutil signals expiry
+_TIMEOUT_EXIT = 124  # `timeout` utility signals expiry
 _SSH_TRANSPORT_EXIT = 255  # ssh/sftp connection/auth/host-key failure
 _TRANSFER_TIMEOUT_SECONDS = 300
 # Not /dev/shm: Docker's archive API can't extract into a tmpfs mount (see the
@@ -146,7 +148,8 @@ class SandboxSshRunner:
             known_hosts_path=known_hosts_path,
             command=command,
         )
-        result = await sandbox.exec("timeout", str(timeout_seconds), *argv)  # type: ignore[attr-defined]
+        sb = cast(SandboxLike, sandbox)
+        result = await sb.exec("timeout", str(timeout_seconds), *argv)
         _raise_for_transport(result.exit_code, result.stderr or "")
         return SshRunResult(
             exit_code=result.exit_code,
@@ -170,12 +173,13 @@ class SandboxSshRunner:
         overwrite: bool,
         egress_config: object = None,
     ) -> None:
-        async with self._staging(sandbox) as stage:
+        sb = cast(SandboxLike, sandbox)
+        async with self._staging(sb) as stage:
             staged = f"{stage}/payload"
             # Host task-workspace file → sandbox (the sandbox has no workspace).
-            await sandbox.upload_file(local_path, staged, overwrite=True)  # type: ignore[attr-defined]
+            await sb.upload_file(local_path, staged, overwrite=True)
             if not overwrite and await self._remote_exists(
-                sandbox,
+                sb,
                 hostname=hostname,
                 connect_ip=connect_ip,
                 port=port,
@@ -188,9 +192,12 @@ class SandboxSshRunner:
                     SshErrorCode.OPERATION_NOT_ALLOWED,
                     "remote destination already exists",
                 )
-            batch = f"put {shlex.quote(staged)} {shlex.quote(remote_path)}\n"
+            # sftp batch mode isn't shell-parsed: it quotes paths with double
+            # quotes, not shlex's single quotes. Our staged path is a random
+            # name and remote_path is constrained, so neither contains a quote.
+            batch = f'put "{staged}" "{remote_path}"\n'
             await self._run_sftp(
-                sandbox,
+                sb,
                 batch=batch,
                 stage=stage,
                 hostname=hostname,
@@ -220,11 +227,12 @@ class SandboxSshRunner:
             raise SshError(
                 SshErrorCode.OPERATION_NOT_ALLOWED, "local destination already exists"
             )
-        async with self._staging(sandbox) as stage:
+        sb = cast(SandboxLike, sandbox)
+        async with self._staging(sb) as stage:
             staged = f"{stage}/payload"
-            batch = f"get {shlex.quote(remote_path)} {shlex.quote(staged)}\n"
+            batch = f'get "{remote_path}" "{staged}"\n'
             await self._run_sftp(
-                sandbox,
+                sb,
                 batch=batch,
                 stage=stage,
                 hostname=hostname,
@@ -235,15 +243,15 @@ class SandboxSshRunner:
                 known_hosts_path=known_hosts_path,
             )
             # Sandbox → host task workspace.
-            await sandbox.download_file(staged, local_path, overwrite=overwrite)  # type: ignore[attr-defined]
+            await sb.download_file(staged, local_path, overwrite=overwrite)
 
     # --- internals ---------------------------------------------------------
 
     @asynccontextmanager
-    async def _staging(self, sandbox: object) -> AsyncIterator[str]:
+    async def _staging(self, sandbox: SandboxLike) -> AsyncIterator[str]:
         """A private 0700 dir for one transfer, removed on every exit."""
         stage = f"{self._secret_root}/xagent-xfer-{secrets.token_hex(16)}"
-        result = await sandbox.exec("mkdir", "-p", "-m", "700", stage)  # type: ignore[attr-defined]
+        result = await sandbox.exec("mkdir", "-p", "-m", "700", stage)
         if getattr(result, "exit_code", 0) != 0:
             raise SshError(
                 SshErrorCode.SANDBOX_UNAVAILABLE, "could not create staging directory"
@@ -252,11 +260,11 @@ class SandboxSshRunner:
             yield stage
         finally:
             with suppress(Exception):
-                await sandbox.exec("rm", "-rf", stage)  # type: ignore[attr-defined]
+                await sandbox.exec("rm", "-rf", stage)
 
     async def _remote_exists(
         self,
-        sandbox: object,
+        sandbox: SandboxLike,
         *,
         hostname: str,
         connect_ip: str,
@@ -275,13 +283,13 @@ class SandboxSshRunner:
             known_hosts_path=known_hosts_path,
             command=f"test -e {shlex.quote(remote_path)}",
         )
-        result = await sandbox.exec("timeout", str(_TRANSFER_TIMEOUT_SECONDS), *argv)  # type: ignore[attr-defined]
+        result = await sandbox.exec("timeout", str(_TRANSFER_TIMEOUT_SECONDS), *argv)
         _raise_for_transport(result.exit_code, result.stderr or "")
         return bool(result.exit_code == 0)
 
     async def _run_sftp(
         self,
-        sandbox: object,
+        sandbox: SandboxLike,
         *,
         batch: str,
         stage: str,
@@ -293,7 +301,7 @@ class SandboxSshRunner:
         known_hosts_path: str,
     ) -> None:
         batch_path = f"{stage}/batch"
-        await sandbox.write_file(content=batch, remote_path=batch_path, overwrite=True)  # type: ignore[attr-defined]
+        await sandbox.write_file(content=batch, remote_path=batch_path, overwrite=True)
         argv = [
             "sftp",
             "-b",
@@ -306,7 +314,7 @@ class SandboxSshRunner:
             ),
             f"{username}@{connect_ip}",
         ]
-        result = await sandbox.exec("timeout", str(_TRANSFER_TIMEOUT_SECONDS), *argv)  # type: ignore[attr-defined]
+        result = await sandbox.exec("timeout", str(_TRANSFER_TIMEOUT_SECONDS), *argv)
         _raise_for_transport(result.exit_code, result.stderr or "")
         if result.exit_code != 0:
             raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "sftp transfer failed")

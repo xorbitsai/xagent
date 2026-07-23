@@ -17,8 +17,10 @@ from __future__ import annotations
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from typing import cast
 
 from .errors import SshError, SshErrorCode
+from .interfaces import SandboxLike
 from .types import MaterializedSshPaths, SensitiveSshCredential
 
 # Root for the per-call private dir. Not /dev/shm: Docker's archive API (used by
@@ -47,11 +49,12 @@ class SandboxTmpfsSecretMaterializer:
         credential: SensitiveSshCredential,
         known_hosts: str,
     ) -> AsyncIterator[MaterializedSshPaths]:
+        sb = cast(SandboxLike, sandbox)
         directory = f"{self._secret_root}/xagent-ssh-{secrets.token_hex(16)}"
         key_path = f"{directory}/id_key"
         known_hosts_path = f"{directory}/known_hosts"
         # 0700 private dir before any secret lands in it.
-        result = await sandbox.exec("mkdir", "-p", "-m", "700", directory)  # type: ignore[attr-defined]
+        result = await sb.exec("mkdir", "-p", "-m", "700", directory)
         if getattr(result, "exit_code", 0) != 0:
             raise SshError(
                 SshErrorCode.SANDBOX_UNAVAILABLE,
@@ -59,19 +62,19 @@ class SandboxTmpfsSecretMaterializer:
             )
         try:
             # Key material only ever goes through write_file (tar stream), not argv.
-            await sandbox.write_file(  # type: ignore[attr-defined]
+            await sb.write_file(
                 content=credential.private_key.decode("utf-8"),
                 remote_path=key_path,
                 overwrite=True,
             )
-            await sandbox.write_file(  # type: ignore[attr-defined]
+            await sb.write_file(
                 content=known_hosts, remote_path=known_hosts_path, overwrite=True
             )
-            await sandbox.exec("chmod", "600", key_path, known_hosts_path)  # type: ignore[attr-defined]
+            await sb.exec("chmod", "600", key_path, known_hosts_path)
             yield MaterializedSshPaths(
                 private_key_path=key_path, known_hosts_path=known_hosts_path
             )
         finally:
             # rm removes the private dir; sandbox destroy is the final backstop.
             with suppress(Exception):
-                await sandbox.exec("rm", "-rf", directory)  # type: ignore[attr-defined]
+                await sb.exec("rm", "-rf", directory)

@@ -39,7 +39,14 @@ async def resolve_and_authorize(
     policy. Returns the resolved IPs, or raises EGRESS_DENIED if the name does
     not resolve or any resolved address is denied."""
     resolve = resolver or _default_resolver
-    addresses = await resolve(hostname, port)
+    try:
+        addresses = await resolve(hostname, port)
+    except OSError as exc:
+        # socket.gaierror (a subclass) on an unresolvable name would otherwise
+        # bypass the executor's SshError handling and the audit sink.
+        raise SshError(
+            SshErrorCode.EGRESS_DENIED, "hostname did not resolve", cause=exc
+        ) from exc
     if not addresses:
         raise SshError(SshErrorCode.EGRESS_DENIED, "hostname did not resolve")
     for ip in addresses:

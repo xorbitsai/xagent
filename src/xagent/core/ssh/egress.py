@@ -8,7 +8,21 @@ an already-resolved IP is permitted, so it can be exhaustively unit tested.
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+_IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+_IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _parse_cidrs(cidrs: tuple[str, ...]) -> tuple[_IPNetwork, ...]:
+    parsed: list[_IPNetwork] = []
+    for cidr in cidrs:
+        try:
+            parsed.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            continue
+    return tuple(parsed)
+
 
 # Cloud instance metadata endpoints. 169.254.169.254 is link-local (already
 # caught when deny_link_local is on) but is denied explicitly so it stays
@@ -37,6 +51,19 @@ class EgressPolicyConfig:
     default_allow_public: bool = True
     allow_cidrs: tuple[str, ...] = ()
     extra_denied_cidrs: tuple[str, ...] = ()
+    # Pre-parsed once so check_ip doesn't re-parse CIDR strings on every call.
+    _allow_networks: tuple[_IPNetwork, ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _denied_networks: tuple[_IPNetwork, ...] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_allow_networks", _parse_cidrs(self.allow_cidrs))
+        object.__setattr__(
+            self, "_denied_networks", _parse_cidrs(self.extra_denied_cidrs)
+        )
 
 
 @dataclass(frozen=True)
@@ -47,15 +74,10 @@ class EgressDecision:
     reason: str
 
 
-def _in_any(addr: ipaddress._BaseAddress, cidrs: tuple[str, ...]) -> bool:
-    for cidr in cidrs:
-        try:
-            network = ipaddress.ip_network(cidr, strict=False)
-        except ValueError:
-            continue
-        if addr.version == network.version and addr in network:
-            return True
-    return False
+def _in_any(addr: _IPAddress, networks: tuple[_IPNetwork, ...]) -> bool:
+    return any(
+        addr.version == network.version and addr in network for network in networks
+    )
 
 
 def check_ip(ip: str, config: EgressPolicyConfig) -> EgressDecision:
@@ -74,7 +96,7 @@ def check_ip(ip: str, config: EgressPolicyConfig) -> EgressDecision:
         addr = addr.ipv4_mapped
 
     # Explicit allowlist wins over all deny rules.
-    if _in_any(addr, config.allow_cidrs):
+    if _in_any(addr, config._allow_networks):
         return EgressDecision(True, "allowlisted")
 
     if config.deny_metadata and addr in _METADATA_ADDRESSES:
@@ -85,7 +107,7 @@ def check_ip(ip: str, config: EgressPolicyConfig) -> EgressDecision:
         return EgressDecision(False, "link-local address denied")
     if config.deny_private and addr.is_private:
         return EgressDecision(False, "private address denied")
-    if _in_any(addr, config.extra_denied_cidrs):
+    if _in_any(addr, config._denied_networks):
         return EgressDecision(False, "denied by reserved cidr")
 
     if config.default_allow_public:

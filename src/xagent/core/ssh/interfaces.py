@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .types import (
     BoundTargetInfo,
@@ -13,6 +13,30 @@ from .types import (
     SshExecutionContext,
     SshSecretHandle,
 )
+
+
+@runtime_checkable
+class SandboxLike(Protocol):
+    """Structural type for the sandbox methods the SSH runner and sandbox
+    materializer use. Lets them narrow ``object`` without importing a concrete
+    sandbox, so they can drop ``# type: ignore`` on these calls. ``exec``
+    returns Any (its result exposes ``exit_code``/``stdout``/``stderr``)."""
+
+    async def exec(
+        self, command: str, *args: str, env: dict[str, str] | None = None
+    ) -> Any: ...
+
+    async def write_file(
+        self, content: str, remote_path: str, overwrite: bool = False
+    ) -> None: ...
+
+    async def upload_file(
+        self, local_path: str, remote_path: str, overwrite: bool = False
+    ) -> None: ...
+
+    async def download_file(
+        self, remote_path: str, local_path: str, overwrite: bool = False
+    ) -> None: ...
 
 
 @runtime_checkable

@@ -63,6 +63,7 @@ def _best_effort_shred(path: str) -> None:
         fd = os.open(path, os.O_WRONLY)
         try:
             os.write(fd, b"\x00" * size)
+            os.fsync(fd)  # flush zeros to disk before the unlink
         finally:
             os.close(fd)
     except OSError:

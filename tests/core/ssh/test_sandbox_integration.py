@@ -5,7 +5,7 @@ thing that differs from a container is where the process runs), so this exercise
 the whole chain the way production does: SandboxTmpfsSecretMaterializer writes the
 key + known_hosts, SandboxSshRunner builds the strict argv and pins the vetted IP
 with HostKeyAlias, and the executor leases/cleans up. Requires ``ssh``/``sftp`` on
-PATH; the ``timeout`` coreutil wrapper is stripped by the double (absent on macOS,
+PATH; the ``timeout`` wrapper is stripped by the double (absent on macOS,
 its expiry mapping is unit-tested separately).
 """
 
@@ -52,7 +52,7 @@ _ALLOW_LOOPBACK = EgressPolicyConfig(allow_cidrs=("127.0.0.0/8",))
 
 class _LocalExecSandbox:
     """Sandbox double: runs argv as host subprocesses and does file ops on the
-    host fs. Strips a leading ``timeout <n>`` wrapper (macOS lacks the coreutil).
+    host fs. Strips a leading ``timeout <n>`` wrapper (macOS lacks `timeout`).
     Records exec argv so tests can assert no secret ever reaches the command line."""
 
     def __init__(self) -> None:

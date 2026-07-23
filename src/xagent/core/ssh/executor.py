@@ -13,7 +13,8 @@ from __future__ import annotations
 import logging
 import posixpath
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass
 
 from .egress import EgressPolicyConfig
@@ -26,7 +27,12 @@ from .interfaces import (
     SshTargetProvider,
 )
 from .runner import SshRunner
-from .types import ResolvedSshTarget, SshExecutionContext
+from .types import (
+    MaterializedSshPaths,
+    ResolvedSshTarget,
+    SensitiveSshCredential,
+    SshExecutionContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +60,7 @@ class SshExecutor:
         materializer: SandboxSecretMaterializer,
         runner: SshRunner,
         egress_config: EgressPolicyConfig,
-        sandbox: object | None = None,
+        sandbox_lease: Callable[[], AbstractAsyncContextManager[object]] | None = None,
         resolver: Callable[[str, int], Awaitable[list[str]]] | None = None,
         audit_sink: SshAuditSink | None = None,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
@@ -65,7 +71,11 @@ class SshExecutor:
         self._materializer = materializer
         self._runner = runner
         self._egress_config = egress_config
-        self._sandbox = sandbox
+        # A zero-arg callable yielding an async CM over a leased sandbox. When
+        # set (xagent-cloud sandbox deploy), one lease spans materialize+run per call
+        # and the runner executes inside it. When None (self-hosted, no sandbox
+        # subsystem), sandbox is None and the runner runs in-process.
+        self._sandbox_lease = sandbox_lease
         self._resolver = resolver
         self._audit_sink = audit_sink
         self._max_output_bytes = max_output_bytes
@@ -85,20 +95,27 @@ class SshExecutor:
             if "execute" not in resolved.capabilities:
                 raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "binding does not allow execute")
 
-            # Early, fail-closed egress check before any secret is read.
-            await resolve_and_authorize(
+            # Early, fail-closed egress check before any secret is read. The
+            # authorized IP is pinned as connect_ip so the runner connects to
+            # the vetted address (DNS-rebinding defense for the sandbox runner,
+            # which cannot re-check the peer the way the in-process one does).
+            addresses = await resolve_and_authorize(
                 resolved.hostname, resolved.port, self._egress_config, resolver=self._resolver
             )
+            connect_ip = addresses[0]
 
             timeout = min(max(1, timeout_seconds), self._max_timeout_seconds)
             credential = await self._secret_store.read_version(resolved.secret_handle)
 
             start = time.monotonic()
-            async with self._materializer.materialize_ssh(
-                self._sandbox, credential, resolved.known_hosts
-            ) as paths:
+            async with self._sandbox_and_secret(credential, resolved.known_hosts) as (
+                sandbox,
+                paths,
+            ):
                 run = await self._runner.execute(
+                    sandbox=sandbox,
                     hostname=resolved.hostname,
+                    connect_ip=connect_ip,
                     port=resolved.port,
                     username=resolved.username,
                     private_key_path=paths.private_key_path,
@@ -135,13 +152,18 @@ class SshExecutor:
         the caller) to ``remote_path`` on a bound target."""
         resolved: ResolvedSshTarget | None = None
         try:
-            resolved = await self._authorize_transfer(context, target_alias, "upload", remote_path)
+            resolved, connect_ip = await self._authorize_transfer(
+                context, target_alias, "upload", remote_path
+            )
             credential = await self._secret_store.read_version(resolved.secret_handle)
-            async with self._materializer.materialize_ssh(
-                self._sandbox, credential, resolved.known_hosts
-            ) as paths:
+            async with self._sandbox_and_secret(credential, resolved.known_hosts) as (
+                sandbox,
+                paths,
+            ):
                 await self._runner.upload(
+                    sandbox=sandbox,
                     hostname=resolved.hostname,
+                    connect_ip=connect_ip,
                     port=resolved.port,
                     username=resolved.username,
                     private_key_path=paths.private_key_path,
@@ -169,15 +191,18 @@ class SshExecutor:
         resolved within the task workspace by the caller)."""
         resolved: ResolvedSshTarget | None = None
         try:
-            resolved = await self._authorize_transfer(
+            resolved, connect_ip = await self._authorize_transfer(
                 context, target_alias, "download", remote_path
             )
             credential = await self._secret_store.read_version(resolved.secret_handle)
-            async with self._materializer.materialize_ssh(
-                self._sandbox, credential, resolved.known_hosts
-            ) as paths:
+            async with self._sandbox_and_secret(credential, resolved.known_hosts) as (
+                sandbox,
+                paths,
+            ):
                 await self._runner.download(
+                    sandbox=sandbox,
                     hostname=resolved.hostname,
+                    connect_ip=connect_ip,
                     port=resolved.port,
                     username=resolved.username,
                     private_key_path=paths.private_key_path,
@@ -215,25 +240,47 @@ class SshExecutor:
         except Exception:  # noqa: BLE001
             logger.warning("ssh audit sink failed for %s (%s)", operation, status, exc_info=True)
 
+    def _acquire_sandbox(self) -> AbstractAsyncContextManager[object]:
+        """One sandbox for this call: a fresh lease when configured (fail-closed
+        — capacity errors propagate, no host fallback), else a None sandbox for
+        the in-process runner."""
+        if self._sandbox_lease is None:
+            return nullcontext(None)
+        return self._sandbox_lease()
+
+    @asynccontextmanager
+    async def _sandbox_and_secret(
+        self, credential: SensitiveSshCredential, known_hosts: str
+    ) -> AsyncIterator[tuple[object, MaterializedSshPaths]]:
+        """Lease one sandbox and materialize the secret into it, as a single
+        scope so the lease spans materialize+run and both are cleaned up on
+        every exit path. Yields the leased sandbox and the written paths."""
+        async with (
+            self._acquire_sandbox() as sandbox,
+            self._materializer.materialize_ssh(sandbox, credential, known_hosts) as paths,
+        ):
+            yield sandbox, paths
+
     async def _authorize_transfer(
         self,
         context: SshExecutionContext,
         target_alias: str,
         capability: str,
         remote_path: str,
-    ) -> ResolvedSshTarget:
+    ) -> tuple[ResolvedSshTarget, str]:
         """Shared SFTP prologue: resolve, enforce the capability, run the
-        fail-closed egress pre-flight, and constrain the remote path."""
+        fail-closed egress pre-flight, and constrain the remote path. Returns
+        the resolved target and the authorized IP to connect to."""
         resolved = await self._provider.resolve(context, target_alias)
         if capability not in resolved.capabilities:
             raise SshError(
                 SshErrorCode.OPERATION_NOT_ALLOWED, f"binding does not allow {capability}"
             )
-        await resolve_and_authorize(
+        addresses = await resolve_and_authorize(
             resolved.hostname, resolved.port, self._egress_config, resolver=self._resolver
         )
         _constrain_remote_path(remote_path, resolved.remote_root)
-        return resolved
+        return resolved, addresses[0]
 
 
 def _constrain_remote_path(remote_path: str, remote_root: str | None) -> None:

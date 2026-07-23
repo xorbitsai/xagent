@@ -36,7 +36,7 @@ class SshExecutionContext:
 
     The caller cannot submit execution_principal / credential / owner ids
     directly; these must be derived from the authenticated request and the
-    agent scope by the SaaS layer before constructing this context.
+    agent scope by the xagent-cloud layer before constructing this context.
 
     NOTE: the design doc lists a ``sandbox`` field here. We keep it out of the
     resolver context on purpose: the materializer receives the sandbox as an

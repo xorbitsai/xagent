@@ -1,9 +1,9 @@
-"""SSH MCP domain layer: types, errors, interfaces, egress policy.
+"""SSH MCP domain layer: types, errors, interfaces, egress policy, plus the
+execution engine (executor, runners, materializers).
 
-This package is pure domain code. It contains no database access, no HTTP,
-no real sandbox wiring, and no real remote execution. Concrete adapters
-(SaaS storage, real sandbox materialization, real SSH executor) live in
-later phases and in the closed-source SaaS layer.
+It contains no database access, no HTTP, and no credential storage; those —
+along with RBAC and audit persistence — are provided by the closed-source
+xagent-cloud layer through the injected provider/secret-store/audit adapters.
 """
 
 from .egress import EgressDecision, EgressPolicyConfig, check_ip

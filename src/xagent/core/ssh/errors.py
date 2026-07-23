@@ -26,6 +26,7 @@ class SshErrorCode(str, Enum):
     TRANSFER_LIMIT_EXCEEDED = "ssh_transfer_limit_exceeded"
     QUOTA_EXCEEDED = "ssh_quota_exceeded"
     SECRET_UNAVAILABLE = "ssh_secret_unavailable"
+    SANDBOX_UNAVAILABLE = "ssh_sandbox_unavailable"
     CONCURRENT_UPDATE = "ssh_concurrent_update"
 
 

@@ -2,7 +2,7 @@ from xagent.core.ssh.errors import SshError, SshErrorCode
 
 
 def test_error_codes_have_stable_string_values() -> None:
-    # These strings are a public contract with the SaaS layer and clients.
+    # These strings are a public contract with the xagent-cloud layer and clients.
     assert SshErrorCode.TARGET_NOT_FOUND.value == "ssh_target_not_found"
     assert SshErrorCode.HOST_KEY_MISMATCH.value == "ssh_host_key_mismatch"
     assert SshErrorCode.EGRESS_DENIED.value == "ssh_egress_denied"

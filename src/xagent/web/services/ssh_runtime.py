@@ -1,5 +1,6 @@
-"""Process-wide hook for injecting the SSH target provider (closed-source SaaS
-installs a DB-backed provider; open-source/self-hosted can install a local one)."""
+"""Process-wide hook for injecting the SSH target provider (closed-source
+xagent-cloud installs a DB-backed provider; open-source/self-hosted can install
+a local one)."""
 
 from __future__ import annotations
 

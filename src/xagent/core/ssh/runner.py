@@ -37,13 +37,21 @@ class SshRunResult:
 @runtime_checkable
 class SshRunner(Protocol):
     """Runs a command against a materialized key + known_hosts. The asyncssh
-    implementation runs in-process; a sandbox ssh-binary runner can implement
-    the same shape (design §15.2)."""
+    implementation runs in-process; a sandbox ssh-binary runner runs inside a
+    leased sandbox (design §15.2).
+
+    ``sandbox`` is the leased sandbox for this call (None for the in-process
+    runner). ``connect_ip`` is the egress-authorized address the executor
+    resolved; the sandbox runner connects to it (with the hostname as a
+    HostKeyAlias) to pin the vetted IP. The in-process runner ignores it and
+    re-checks the peer itself."""
 
     async def execute(
         self,
         *,
+        sandbox: object | None,
         hostname: str,
+        connect_ip: str,
         port: int,
         username: str,
         private_key_path: str,
@@ -56,7 +64,9 @@ class SshRunner(Protocol):
     async def upload(
         self,
         *,
+        sandbox: object | None,
         hostname: str,
+        connect_ip: str,
         port: int,
         username: str,
         private_key_path: str,
@@ -70,7 +80,9 @@ class SshRunner(Protocol):
     async def download(
         self,
         *,
+        sandbox: object | None,
         hostname: str,
+        connect_ip: str,
         port: int,
         username: str,
         private_key_path: str,
@@ -84,7 +96,11 @@ class SshRunner(Protocol):
 
 class AsyncsshRunner:
     """Runs commands and SFTP transfers over SSH with strict, non-interactive
-    security settings."""
+    security settings, in-process (self-hosted, no sandbox subsystem).
+
+    Accepts ``sandbox`` and ``connect_ip`` for seam parity but ignores them: it
+    connects by hostname and re-checks the actual peer IP (``_authorize_peer``)
+    as its own DNS-rebinding backstop."""
 
     @asynccontextmanager
     async def _connect(
@@ -134,7 +150,9 @@ class AsyncsshRunner:
     async def execute(
         self,
         *,
+        sandbox: object | None = None,
         hostname: str,
+        connect_ip: str | None = None,
         port: int,
         username: str,
         private_key_path: str,
@@ -172,7 +190,9 @@ class AsyncsshRunner:
     async def upload(
         self,
         *,
+        sandbox: object | None = None,
         hostname: str,
+        connect_ip: str | None = None,
         port: int,
         username: str,
         private_key_path: str,
@@ -189,18 +209,19 @@ class AsyncsshRunner:
             private_key_path=private_key_path,
             known_hosts_path=known_hosts_path,
             egress_config=egress_config,
-        ) as conn:
-            async with conn.start_sftp_client() as sftp:
-                if not overwrite and await sftp.exists(remote_path):
-                    raise SshError(
-                        SshErrorCode.OPERATION_NOT_ALLOWED, "remote destination already exists"
-                    )
-                await sftp.put(local_path, remote_path)
+        ) as conn, conn.start_sftp_client() as sftp:
+            if not overwrite and await sftp.exists(remote_path):
+                raise SshError(
+                    SshErrorCode.OPERATION_NOT_ALLOWED, "remote destination already exists"
+                )
+            await sftp.put(local_path, remote_path)
 
     async def download(
         self,
         *,
+        sandbox: object | None = None,
         hostname: str,
+        connect_ip: str | None = None,
         port: int,
         username: str,
         private_key_path: str,
@@ -219,9 +240,8 @@ class AsyncsshRunner:
             private_key_path=private_key_path,
             known_hosts_path=known_hosts_path,
             egress_config=egress_config,
-        ) as conn:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.get(remote_path, local_path)
+        ) as conn, conn.start_sftp_client() as sftp:
+            await sftp.get(remote_path, local_path)
 
 
 def _authorize_peer(conn: asyncssh.SSHClientConnection, config: EgressPolicyConfig) -> None:

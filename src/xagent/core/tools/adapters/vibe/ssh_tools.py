@@ -9,7 +9,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, cast
 
 from pydantic import BaseModel, Field
@@ -27,6 +28,8 @@ from ....ssh.egress import EgressPolicyConfig
 from ....ssh.executor import SshExecutor
 from ....ssh.materializer import LocalTmpSecretMaterializer
 from ....ssh.runner import AsyncsshRunner
+from ....ssh.sandbox_materializer import SandboxTmpfsSecretMaterializer
+from ....ssh.sandbox_runner import SandboxSshRunner
 from .base import AbstractBaseTool, ToolCategory
 from .factory import ToolFactory, register_tool
 
@@ -298,6 +301,42 @@ def _agent_id_for_task(session_factory: Any, numeric_task_id: int | None) -> int
         return _agent_id_from_task(task)
 
 
+def _make_ssh_sandbox_lease(
+    task_id: int | None, agent_id: int
+) -> Callable[[], AbstractAsyncContextManager[object]] | None:
+    """Build a lazy lease over a dedicated per-task ``ssh::<id>`` sandbox, or
+    None when no sandbox subsystem is running (self-hosted → in-process runner).
+
+    The sandbox is distinct from the agent's own code sandbox, so key material
+    and the ssh binary never live where the agent can reach them. Leasing is
+    lazy (only a task that actually runs SSH pays for it) and fail-closed:
+    capacity exhaustion raises SANDBOX_UNAVAILABLE rather than falling back to
+    the backend host (design §15.2)."""
+    from .....web.sandbox_manager import get_sandbox_manager
+
+    manager = get_sandbox_manager()
+    if manager is None:
+        return None
+    # Tie the sandbox lifecycle to the task; fall back to the agent when a task
+    # id is unavailable (e.g. preview) so it stays sandboxed, never host-bound.
+    lifecycle_id = str(task_id) if task_id is not None else f"agent-{agent_id}"
+
+    @asynccontextmanager
+    async def _lease() -> AsyncIterator[object]:
+        from .....web.sandbox_manager import SandboxCapacityError
+
+        try:
+            provider = await manager.get_or_create_lease_provider("ssh", lifecycle_id)
+        except SandboxCapacityError as exc:
+            raise SshError(
+                SshErrorCode.SANDBOX_UNAVAILABLE, "no sandbox capacity available for ssh"
+            ) from exc
+        async with provider.lease(concurrency_safe=False) as sandbox:
+            yield sandbox
+
+    return lambda: _lease()
+
+
 @register_tool(categories={"ssh"})
 async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     """Emit SSH tools only when a provider is installed and the executing agent
@@ -353,14 +392,26 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
         return []
     logger.info("ssh tools: emitting tools for agent %s (%d bound target(s))", agent_id, len(bound))
 
-    # The SaaS provider is also the secret store (resolve + read_version on the
-    # same adapter); the in-process runner materializes to a local private dir.
+    # The provider is also the secret store (resolve + read_version on the
+    # same adapter). When a sandbox subsystem is available (xagent-cloud), SSH
+    # runs inside a dedicated per-task sandbox — isolated from the agent's own
+    # code sandbox, so the agent can neither read the key nor ssh directly
+    # (design §15.2). Without one (self-hosted), the in-process runner
+    # materializes to a local private dir and connects from the backend.
+    sandbox_lease = _make_ssh_sandbox_lease(numeric_task_id, agent_id)
+    if sandbox_lease is not None:
+        materializer: Any = SandboxTmpfsSecretMaterializer()
+        runner: Any = SandboxSshRunner()
+    else:
+        materializer = LocalTmpSecretMaterializer()
+        runner = AsyncsshRunner()
     executor = SshExecutor(
         provider=provider,
         secret_store=cast(SshSecretStore, provider),
-        materializer=LocalTmpSecretMaterializer(),
-        runner=AsyncsshRunner(),
+        materializer=materializer,
+        runner=runner,
         egress_config=_egress_from_env(),
+        sandbox_lease=sandbox_lease,
         audit_sink=get_ssh_audit_sink(session_factory),
     )
     # SFTP tools resolve/containment-check local paths against the task

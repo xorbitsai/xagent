@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from xagent.core.ssh import (
     ActorRef,
     BoundTargetInfo,
@@ -138,7 +137,6 @@ class _FakeWorkspace:
         self.root = root
 
     def _contained(self, p: str):
-        from pathlib import Path
 
         resolved = (self.root / p).resolve()
         if not str(resolved).startswith(str(self.root.resolve())):
@@ -231,6 +229,86 @@ def test_agent_id_from_task_preview_fallback() -> None:
 def test_agent_id_from_task_none_when_unresolvable() -> None:
     assert _agent_id_from_task(None) is None
     assert _agent_id_from_task(SimpleNamespace(agent_id=None, agent_config=None)) is None
+
+
+class _FakeLease:
+    def __init__(self, sandbox) -> None:
+        self._sandbox = sandbox
+
+    async def __aenter__(self):
+        return self._sandbox
+
+    async def __aexit__(self, *a) -> None:
+        return None
+
+
+class _FakeProvider:
+    def __init__(self, sandbox) -> None:
+        self._sandbox = sandbox
+
+    def lease(self, *, concurrency_safe: bool):
+        return _FakeLease(self._sandbox)
+
+
+class _FakeManager:
+    def __init__(self, sandbox=None, *, capacity_error=False) -> None:
+        self._sandbox = sandbox
+        self._capacity_error = capacity_error
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_or_create_lease_provider(self, lifecycle_type, lifecycle_id, **_):
+        self.calls.append((lifecycle_type, lifecycle_id))
+        if self._capacity_error:
+            from xagent.web.sandbox_manager import SandboxCapacityError
+
+            raise SandboxCapacityError(cap=1, in_use=1)
+        return _FakeProvider(self._sandbox)
+
+
+def test_ssh_sandbox_lease_none_without_manager(monkeypatch) -> None:
+    import xagent.web.sandbox_manager as sm
+    from xagent.core.tools.adapters.vibe.ssh_tools import _make_ssh_sandbox_lease
+
+    monkeypatch.setattr(sm, "get_sandbox_manager", lambda: None)
+    assert _make_ssh_sandbox_lease(30, 1) is None
+
+
+async def test_ssh_sandbox_lease_leases_dedicated_ssh_sandbox(monkeypatch) -> None:
+    import xagent.web.sandbox_manager as sm
+    from xagent.core.tools.adapters.vibe.ssh_tools import _make_ssh_sandbox_lease
+
+    sentinel = object()
+    manager = _FakeManager(sentinel)
+    monkeypatch.setattr(sm, "get_sandbox_manager", lambda: manager)
+    factory = _make_ssh_sandbox_lease(30, 1)
+    assert factory is not None
+    async with factory() as sandbox:
+        assert sandbox is sentinel
+    # Leased under a task-scoped ssh lifecycle, distinct from the agent sandbox.
+    assert manager.calls == [("ssh", "30")]
+
+
+async def test_ssh_sandbox_lease_task_none_falls_back_to_agent(monkeypatch) -> None:
+    import xagent.web.sandbox_manager as sm
+    from xagent.core.tools.adapters.vibe.ssh_tools import _make_ssh_sandbox_lease
+
+    manager = _FakeManager(object())
+    monkeypatch.setattr(sm, "get_sandbox_manager", lambda: manager)
+    async with _make_ssh_sandbox_lease(None, 7)():
+        pass
+    assert manager.calls == [("ssh", "agent-7")]
+
+
+async def test_ssh_sandbox_lease_capacity_fails_closed(monkeypatch) -> None:
+    import xagent.web.sandbox_manager as sm
+    from xagent.core.tools.adapters.vibe.ssh_tools import _make_ssh_sandbox_lease
+
+    monkeypatch.setattr(sm, "get_sandbox_manager", lambda: _FakeManager(capacity_error=True))
+    factory = _make_ssh_sandbox_lease(30, 1)
+    with pytest.raises(SshError) as exc:
+        async with factory():
+            pass
+    assert exc.value.code == SshErrorCode.SANDBOX_UNAVAILABLE
 
 
 def test_ssh_creator_registered_under_ssh_category() -> None:

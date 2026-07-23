@@ -653,6 +653,16 @@ async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> Non
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": admin})
+        # ``dispatch_task_command_promptly`` may detach the durable resume
+        # command after its 50ms deadline, so the captured agent build can
+        # land after handle_resume_task returns (same pattern as the pause
+        # test above).
+        for _ in range(100):
+            if "task_owner_user_id" in captured:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable resume command was not dispatched in time")
 
     assert captured["task_owner_user_id"] == int(owner.id)
 
@@ -730,6 +740,16 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
         patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": admin})
+        # ``dispatch_task_command_promptly`` may detach the durable resume
+        # command after its 50ms deadline, so the captured agent build and
+        # the background-resume scheduling can land after handle_resume_task
+        # returns (same pattern as the pause test above).
+        for _ in range(100):
+            if "task_owner_user_id" in captured and resume_bg.call_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable resume command was not dispatched in time")
 
     # Agent built as owner, and the background resume runs as owner.
     assert captured["task_owner_user_id"] == int(owner.id)

@@ -33,6 +33,7 @@ from ..services.agent_access import (
 )
 from ..services.agent_management import (
     AgentManagementService,
+    AgentWorkforceConflictError,
     DuplicateAgentNameError,
     TemplateNotFoundError,
 )
@@ -826,34 +827,64 @@ async def demote_agent_to_personal(
 
 
 @router.delete("/{agent_id}")
-async def delete_agent(
+def delete_agent(
     agent_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     """Delete an agent."""
     try:
-        store = AgentStore(db)
-        user_id = int(current_user.id)
-        agent = store.get_owned_agent(user_id, agent_id)
-
-        if not agent:
+        result = AgentManagementService(db).delete_agent(
+            actor=current_user,
+            agent_id=agent_id,
+        )
+        if result is None:
             raise HTTPException(status_code=404, detail="Agent not found")
 
-        # Delete logo if exists
-        if agent.logo_url:
-            _delete_logo(agent.logo_url)  # type: ignore[arg-type]
-
-        store.delete_agent(user_id, agent_id)
+        if result.logo_url:
+            try:
+                _delete_logo(result.logo_url)
+            except Exception:
+                logger.warning(
+                    "Failed to delete logo after deleting agent %s",
+                    agent_id,
+                    exc_info=True,
+                )
         logger.info(f"Deleted agent {agent_id} for user {current_user.id}")
         return {"message": "Agent deleted successfully"}
 
+    except AgentWorkforceConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agent_in_use_by_workforce",
+                "message": "Agent is used by one or more workforces.",
+                "references": [
+                    {
+                        "workforce_id": reference.workforce_id,
+                        "name": reference.name,
+                        "status": reference.status,
+                        "roles": list(reference.roles),
+                        "can_edit": reference.can_edit,
+                        "can_discard": reference.can_discard,
+                    }
+                    for reference in exc.references
+                ],
+                "has_hidden_references": exc.has_hidden_references,
+            },
+        ) from None
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Failed to delete agent {agent_id}: {e}")
+    except Exception:
+        logger.exception("Failed to delete agent %s", agent_id)
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "agent_delete_failed",
+                "message": "Failed to delete agent",
+            },
+        ) from None
 
 
 @router.post("/{agent_id}/publish", response_model=PublishResponse)

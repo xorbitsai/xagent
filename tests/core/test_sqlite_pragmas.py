@@ -14,7 +14,7 @@ import logging
 from sqlalchemy import create_engine
 
 
-def test_apply_pragmas_enables_wal_and_busy_timeout(tmp_path) -> None:
+def test_apply_pragmas_enables_wal_busy_timeout_and_foreign_keys(tmp_path) -> None:
     from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 
     engine = create_engine(f"sqlite:///{tmp_path / 'wal.db'}")
@@ -23,9 +23,11 @@ def test_apply_pragmas_enables_wal_and_busy_timeout(tmp_path) -> None:
     with engine.connect() as conn:
         journal_mode = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
         busy_timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar()
+        foreign_keys = conn.exec_driver_sql("PRAGMA foreign_keys").scalar()
 
     assert str(journal_mode).lower() == "wal"
     assert busy_timeout == 4000
+    assert foreign_keys == 1
     engine.dispose()
 
 

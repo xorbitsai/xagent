@@ -4,6 +4,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -100,6 +101,17 @@ class WorkforceAgent(Base):  # type: ignore[no-any-unimported]
 
 class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     __tablename__ = "workforce_runs"
+    __table_args__ = (
+        # Unique index (not constraint) so SQLite can gain it without a table
+        # rebuild; NULL keys are exempt on both SQLite and PostgreSQL, so only
+        # callers that opt into idempotency pay the dedup guarantee.
+        Index(
+            "uq_workforce_run_idempotency",
+            "workforce_id",
+            "idempotency_key",
+            unique=True,
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     workforce_id = Column(
@@ -116,6 +128,10 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     )
     status = Column(String(20), nullable=False, default="pending", index=True)
     is_preview = Column(Boolean, nullable=False, default=False, server_default="0")
+    # Caller-supplied dedup token for external channels (webhook retries,
+    # network-retried API calls). Unique per workforce when set; see
+    # ``uq_workforce_run_idempotency``.
+    idempotency_key = Column(String(128), nullable=True)
     snapshot = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)

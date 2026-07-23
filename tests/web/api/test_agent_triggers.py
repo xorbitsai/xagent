@@ -13,7 +13,7 @@ from xagent.core.tools.adapters.vibe.config import (
     RequiredMCPUnavailableError,
 )
 from xagent.core.utils.encryption import decrypt_value
-from xagent.web.models.agent import Agent
+from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
@@ -231,6 +231,74 @@ def test_webhook_trigger_crud_returns_secret_once() -> None:
     assert patched.status_code == 200, patched.text
     assert patched.json()["name"] == "Renamed webhook"
     assert patched.json()["webhook_secret"]
+
+
+def test_trigger_routes_reject_workforce_manager_agent() -> None:
+    # Workforce-generated manager agents are private implementation details
+    # and must not be addressable through trigger management, matching the
+    # exclusion applied by the share/widget/api-key channels.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Workforce Manager Agent")
+
+    # Create a trigger while the agent is still a normal one, so the
+    # trigger-scoped routes below traverse ``get_owned_trigger``'s internal
+    # ``get_owned_agent`` guard rather than short-circuiting on a missing
+    # trigger row.
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "webhook",
+            "name": "Inbound webhook",
+            "prompt_template": "payload={{payload}}",
+            "config": {"source": "crm"},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    # Routes resolving the agent directly through ``get_owned_agent``.
+    listed = client.get(f"/api/agents/{agent_id}/triggers", headers=headers)
+    assert listed.status_code == 404
+
+    recreated = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "webhook",
+            "name": "Another webhook",
+            "prompt_template": "payload={{payload}}",
+            "config": {"source": "crm"},
+        },
+    )
+    assert recreated.status_code == 404
+
+    # Trigger-scoped routes gate through ``get_owned_trigger``, which relies
+    # on its internal ``get_owned_agent`` call for the same exclusion.
+    updated = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={"name": "Renamed"},
+    )
+    assert updated.status_code == 404
+
+    runs = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs", headers=headers
+    )
+    assert runs.status_code == 404
+
+    deleted = client.delete(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}", headers=headers
+    )
+    assert deleted.status_code == 404
 
 
 def test_trigger_config_validation_dispatches_through_provider() -> None:

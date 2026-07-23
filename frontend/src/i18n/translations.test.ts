@@ -83,6 +83,28 @@ describe("translations", () => {
     )
   })
 
+  it("provides localized Agent delete dependency copy", () => {
+    const english = (translations.en.builds.list as Record<string, unknown>).deleteDialog
+    const chinese = (translations.zh.builds.list as Record<string, unknown>).deleteDialog
+
+    expect(english).toEqual(expect.objectContaining({
+      blockedTitle: expect.any(String),
+      hiddenReferences: expect.any(String),
+      readyToRetry: expect.any(String),
+      retryDelete: expect.any(String),
+      discardNotAllowed: expect.any(String),
+      discardHasRuns: expect.any(String),
+    }))
+    expect(chinese).toEqual(expect.objectContaining({
+      blockedTitle: expect.any(String),
+      hiddenReferences: expect.any(String),
+      readyToRetry: expect.any(String),
+      retryDelete: expect.any(String),
+      discardNotAllowed: expect.any(String),
+      discardHasRuns: expect.any(String),
+    }))
+  })
+
   it("reports a missing dynamic key and uses its explicit fallback", () => {
     const onMissing = vi.fn()
 

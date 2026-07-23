@@ -715,6 +715,81 @@ def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
         db.close()
 
 
+def test_get_tasks_returns_channel_type(test_db, user1_headers):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+    from xagent.web.models.user_channel import UserChannel
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        telegram_channel = UserChannel(
+            user_id=user.id,
+            channel_type="telegram",
+            channel_name="Xagent Telegram",
+            config={},
+            is_active=True,
+        )
+        feishu_channel = UserChannel(
+            user_id=user.id,
+            channel_type="feishu",
+            channel_name="Xagent Feishu",
+            config={},
+            is_active=True,
+        )
+        db.add_all([telegram_channel, feishu_channel])
+        db.flush()
+        db.add_all(
+            [
+                Task(
+                    user_id=user.id,
+                    title="telegram task",
+                    description="from channel",
+                    status=TaskStatus.PENDING,
+                    channel_id=telegram_channel.id,
+                    channel_name=telegram_channel.channel_name,
+                ),
+                Task(
+                    user_id=user.id,
+                    title="feishu task",
+                    description="from channel",
+                    status=TaskStatus.PENDING,
+                    channel_id=feishu_channel.id,
+                    channel_name=feishu_channel.channel_name,
+                ),
+                Task(
+                    user_id=user.id,
+                    title="deleted channel task",
+                    description="from deleted channel",
+                    status=TaskStatus.PENDING,
+                    channel_id=None,
+                    channel_name="Deleted Telegram",
+                ),
+            ]
+        )
+        db.commit()
+
+        response = client.get("/api/chat/tasks", headers=user1_headers)
+
+        assert response.status_code == 200
+        tasks_by_title = {
+            item["title"]: item
+            for item in response.json()["tasks"]
+            if item["title"] in {"telegram task", "feishu task", "deleted channel task"}
+        }
+        assert tasks_by_title["telegram task"]["channel_type"] == "telegram"
+        assert tasks_by_title["telegram task"]["channel_name"] == "Xagent Telegram"
+        assert tasks_by_title["feishu task"]["channel_type"] == "feishu"
+        assert tasks_by_title["feishu task"]["channel_name"] == "Xagent Feishu"
+        assert tasks_by_title["deleted channel task"]["channel_type"] is None
+        assert (
+            tasks_by_title["deleted channel task"]["channel_name"] == "Deleted Telegram"
+        )
+    finally:
+        db.close()
+
+
 def test_task_create_skips_stale_user_default(test_db, user1_headers):
     """When a user's default model is no longer visible, task falls back to admin shared."""
     from xagent.web.models.database import get_db

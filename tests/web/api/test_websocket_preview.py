@@ -1,4 +1,6 @@
+import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,8 +9,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
 from xagent.web.api.websocket import (
+    ConnectionManager,
     _normalize_file_outputs,
     handle_build_preview_execution,
 )
@@ -21,6 +25,58 @@ from xagent.web.services.managed_file_ref import (
     DurableStorageOperationError,
     build_task_output_storage_key,
 )
+
+
+class _BlockingPreviewWebSocket:
+    def __init__(self) -> None:
+        self.receive_count = 0
+        self.waiting_for_next_message = asyncio.Event()
+
+    async def accept(self) -> None:
+        return None
+
+    async def receive_text(self) -> str:
+        self.receive_count += 1
+        if self.receive_count == 1:
+            return json.dumps({"type": "preview"})
+        self.waiting_for_next_message.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_build_preview_endpoint_disconnects_when_cancelled(monkeypatch) -> None:
+    task_id = 123
+    websocket = _BlockingPreviewWebSocket()
+    connection_manager = ConnectionManager()
+
+    async def register_preview_connection(*args) -> None:
+        connection_manager.register_connection(websocket, task_id)
+
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(return_value=SimpleNamespace(id=7)),
+    )
+    monkeypatch.setattr(
+        websocket_api,
+        "handle_build_preview_execution",
+        AsyncMock(side_effect=register_preview_connection),
+    )
+
+    endpoint = asyncio.create_task(
+        websocket_api.websocket_build_preview_endpoint(websocket, "token")
+    )
+    await websocket.waiting_for_next_message.wait()
+
+    assert connection_manager.active_connections == {task_id: [websocket]}
+
+    endpoint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+    assert connection_manager.active_connections == {}
 
 
 @pytest.mark.asyncio

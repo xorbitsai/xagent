@@ -1,5 +1,6 @@
 """Integration tests for agent management endpoints."""
 
+import asyncio
 import io
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -7,8 +8,11 @@ from typing import Any
 
 import pytest
 from jose import jwt as jose_jwt
+from sqlalchemy import event
+from sqlalchemy.exc import IntegrityError
 
 from xagent.config import get_uploads_dir
+from xagent.web.api import agents as agents_api
 from xagent.web.api.widget import (
     EMBED_TICKET_TYPE,
     WIDGET_CREDENTIAL_REQUIRED_DETAIL,
@@ -20,8 +24,14 @@ from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
-from xagent.web.models.workforce import Workforce
+from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
+from xagent.web.services.agent_management import (
+    AgentManagementService,
+    AgentWorkforceConflictError,
+    AgentWorkforceReference,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
+from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 
 from .conftest import (
     _admin_headers,
@@ -38,6 +48,16 @@ def _reset_workforce_policy() -> None:
     set_workforce_policy(WorkforcePolicy())
     yield
     set_workforce_policy(WorkforcePolicy())
+
+
+def test_delete_agent_uses_sync_route_boundary() -> None:
+    delete_route = next(
+        route
+        for route in agents_api.router.routes
+        if route.path == "/api/agents/{agent_id}" and "DELETE" in route.methods
+    )
+
+    assert not asyncio.iscoroutinefunction(delete_route.endpoint)
 
 
 def _create_agent(headers: dict[str, str], name: str = "Test Agent") -> int:
@@ -1400,6 +1420,602 @@ def test_share_public_file_download_requires_valid_share_token() -> None:
 
 class TestDeleteAgent:
     """DELETE /api/agents/{agent_id} - remove an agent."""
+
+    def test_rejects_visible_manager_and_worker_references(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        headers = _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(
+            user_id=owner_id,
+            name="Referenced Agent",
+            status=AgentStatus.PUBLISHED,
+        )
+        alternate_manager_id = _create_agent_row(
+            user_id=owner_id,
+            name="Alternate Manager",
+            status=AgentStatus.PUBLISHED,
+        )
+
+        db = _direct_db_session()
+        try:
+            manager_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Manager Reference",
+                manager_agent_id=target_id,
+                status="draft",
+            )
+            worker_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Worker Reference",
+                manager_agent_id=alternate_manager_id,
+                status="draft",
+            )
+            archived_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Archived Reference",
+                manager_agent_id=target_id,
+                status="archived",
+            )
+            db.add_all([manager_workforce, worker_workforce, archived_workforce])
+            db.flush()
+            db.add(
+                WorkforceAgent(
+                    workforce_id=worker_workforce.id,
+                    agent_id=target_id,
+                    assignment_instructions="Handle delegated work.",
+                    source_type="existing",
+                    enabled=True,
+                    sort_order=0,
+                )
+            )
+            db.add(
+                WorkforceRun(
+                    workforce_id=worker_workforce.id,
+                    user_id=owner_id,
+                    status="completed",
+                    snapshot={"version": 1},
+                )
+            )
+            db.commit()
+            manager_workforce_id = int(manager_workforce.id)
+            worker_workforce_id = int(worker_workforce.id)
+            archived_workforce_id = int(archived_workforce.id)
+        finally:
+            db.close()
+
+        logo_calls: list[str] = []
+        cache_calls: list[tuple[object, ...]] = []
+        monkeypatch.setattr("xagent.web.api.agents._delete_logo", logo_calls.append)
+        monkeypatch.setattr(
+            "xagent.web.services.agent_management.invalidate_agent_cache",
+            lambda *args: cache_calls.append(args),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.agent_store.invalidate_agent_cache",
+            lambda *args: cache_calls.append(args),
+        )
+
+        response = client.delete(f"/api/agents/{target_id}", headers=headers)
+
+        assert response.status_code == 409, response.text
+        assert response.json() == {
+            "detail": {
+                "code": "agent_in_use_by_workforce",
+                "message": "Agent is used by one or more workforces.",
+                "references": [
+                    {
+                        "workforce_id": manager_workforce_id,
+                        "name": "Manager Reference",
+                        "status": "draft",
+                        "roles": ["manager"],
+                        "can_edit": True,
+                        "can_discard": True,
+                    },
+                    {
+                        "workforce_id": worker_workforce_id,
+                        "name": "Worker Reference",
+                        "status": "draft",
+                        "roles": ["worker"],
+                        "can_edit": True,
+                        "can_discard": False,
+                    },
+                    {
+                        "workforce_id": archived_workforce_id,
+                        "name": "Archived Reference",
+                        "status": "archived",
+                        "roles": ["manager"],
+                        "can_edit": False,
+                        "can_discard": False,
+                    },
+                ],
+                "has_hidden_references": False,
+            }
+        }
+        assert logo_calls == []
+        assert cache_calls == []
+
+        db = _direct_db_session()
+        try:
+            assert db.get(Agent, target_id) is not None
+            assert (
+                db.query(WorkforceAgent)
+                .filter(
+                    WorkforceAgent.workforce_id == worker_workforce_id,
+                    WorkforceAgent.agent_id == target_id,
+                )
+                .one_or_none()
+                is not None
+            )
+        finally:
+            db.close()
+
+    def test_hidden_only_reference_returns_sanitized_conflict(self) -> None:
+        _admin_headers()
+        bob_headers = _register_second_user("bob", "bobpass1")
+        admin_id = _user_id("admin")
+        bob_id = _user_id("bob")
+        target_id = _create_agent_row(
+            user_id=bob_id,
+            name="Bob Referenced Agent",
+            status=AgentStatus.PUBLISHED,
+        )
+
+        db = _direct_db_session()
+        try:
+            hidden_workforce = Workforce(
+                owner_user_id=admin_id,
+                scope_type="user",
+                scope_id=str(admin_id),
+                name="Hidden Workforce Name",
+                manager_agent_id=target_id,
+                status="draft",
+            )
+            db.add(hidden_workforce)
+            db.commit()
+            hidden_workforce_id = int(hidden_workforce.id)
+        finally:
+            db.close()
+
+        response = client.delete(f"/api/agents/{target_id}", headers=bob_headers)
+
+        assert response.status_code == 409, response.text
+        assert response.json() == {
+            "detail": {
+                "code": "agent_in_use_by_workforce",
+                "message": "Agent is used by one or more workforces.",
+                "references": [],
+                "has_hidden_references": True,
+            }
+        }
+        assert "Hidden Workforce Name" not in response.text
+        assert str(hidden_workforce_id) not in response.text
+
+        db = _direct_db_session()
+        try:
+            assert db.get(Agent, target_id) is not None
+        finally:
+            db.close()
+
+    def test_empty_workforce_reference_state_has_no_conflict(self) -> None:
+        _admin_headers()
+        owner_id = _user_id("admin")
+
+        db = _direct_db_session()
+        try:
+            actor = db.query(User).filter(User.id == owner_id).one()
+
+            conflict = AgentManagementService(db)._workforce_conflict(
+                actor=actor,
+                agent_id=999_999,
+            )
+
+            assert conflict is None
+        finally:
+            db.close()
+
+    def test_reference_snapshot_classifies_policy_visibility_in_one_statement(
+        self,
+    ) -> None:
+        _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Snapshot Target")
+
+        db = _direct_db_session()
+        try:
+            actor = db.query(User).filter(User.id == owner_id).one()
+            visible_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Policy Visible",
+                manager_agent_id=target_id,
+                status="draft",
+            )
+            hidden_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Policy Hidden",
+                manager_agent_id=target_id,
+                status="draft",
+            )
+            db.add_all([visible_workforce, hidden_workforce])
+            db.commit()
+            visible_workforce_id = int(visible_workforce.id)
+            hidden_workforce_id = int(hidden_workforce.id)
+
+            class NameVisibilityPolicy(WorkforcePolicy):
+                filter_calls = 0
+
+                def filter_visible_workforces(
+                    self,
+                    db: Any,
+                    user: User,
+                    query: Any,
+                ) -> Any:
+                    del db, user
+                    self.filter_calls += 1
+                    return query.filter(Workforce.name == "Policy Visible")
+
+            policy = NameVisibilityPolicy()
+            set_workforce_policy(policy)
+            statements: list[str] = []
+            engine = db.get_bind()
+
+            def record_statement(
+                _connection: Any,
+                _cursor: Any,
+                statement: str,
+                _parameters: Any,
+                _context: Any,
+                _executemany: bool,
+            ) -> None:
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", record_statement)
+            try:
+                snapshot = AgentManagementService(db)._workforce_reference_snapshot(
+                    actor=actor,
+                    agent_id=target_id,
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", record_statement)
+
+            snapshot_by_id = {
+                reference.workforce_id: reference for reference in snapshot
+            }
+            assert policy.filter_calls == 1
+            assert len(statements) == 1
+            assert snapshot_by_id[visible_workforce_id].is_visible is True
+            assert snapshot_by_id[hidden_workforce_id].is_visible is False
+        finally:
+            db.close()
+
+    def test_workforce_conflict_requires_blocker_evidence(self) -> None:
+        with pytest.raises(ValueError, match="blocker evidence"):
+            AgentWorkforceConflictError((), has_hidden_references=False)
+
+    def test_visible_workforce_conflict_requires_at_least_one_role(self) -> None:
+        with pytest.raises(ValueError, match="at least one role"):
+            AgentWorkforceConflictError(
+                (
+                    AgentWorkforceReference(
+                        workforce_id=7,
+                        name="Invalid reference",
+                        status="draft",
+                        roles=(),
+                        can_edit=True,
+                        can_discard=False,
+                    ),
+                ),
+                has_hidden_references=False,
+            )
+
+    def test_reference_marks_draft_undiscardable_when_generated_manager_is_shared(
+        self,
+    ) -> None:
+        headers = _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(
+            user_id=owner_id,
+            name="Referenced Worker",
+            status=AgentStatus.PUBLISHED,
+        )
+        generated_manager_id = _create_agent_row(
+            user_id=owner_id,
+            name="Shared Generated Manager",
+            status=AgentStatus.PUBLISHED,
+            origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
+
+        db = _direct_db_session()
+        try:
+            referenced_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Referenced Draft",
+                manager_agent_id=generated_manager_id,
+                status="draft",
+            )
+            other_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Other Manager Reference",
+                manager_agent_id=generated_manager_id,
+                status="draft",
+            )
+            db.add_all([referenced_workforce, other_workforce])
+            db.flush()
+            db.add(
+                WorkforceAgent(
+                    workforce_id=int(referenced_workforce.id),
+                    agent_id=target_id,
+                    assignment_instructions="Handle delegated work.",
+                    source_type="existing",
+                    enabled=True,
+                    sort_order=0,
+                )
+            )
+            db.commit()
+            referenced_workforce_id = int(referenced_workforce.id)
+        finally:
+            db.close()
+
+        response = client.delete(f"/api/agents/{target_id}", headers=headers)
+
+        assert response.status_code == 409, response.text
+        references = response.json()["detail"]["references"]
+        assert references == [
+            {
+                "workforce_id": referenced_workforce_id,
+                "name": "Referenced Draft",
+                "status": "draft",
+                "roles": ["worker"],
+                "can_edit": True,
+                "can_discard": False,
+            }
+        ]
+
+    def test_disappearing_worker_reference_is_gone_before_conflict_classification(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        headers = _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Racing Worker")
+        manager_id = _create_agent_row(user_id=owner_id, name="Race Manager")
+
+        setup_db = _direct_db_session()
+        try:
+            workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Disappearing Worker Reference",
+                manager_agent_id=manager_id,
+                status="draft",
+            )
+            setup_db.add(workforce)
+            setup_db.flush()
+            setup_db.add(
+                WorkforceAgent(
+                    workforce_id=int(workforce.id),
+                    agent_id=target_id,
+                    assignment_instructions="Race with Agent deletion.",
+                    source_type="existing",
+                    enabled=True,
+                    sort_order=0,
+                )
+            )
+            setup_db.commit()
+            workforce_id = int(workforce.id)
+        finally:
+            setup_db.close()
+
+        original_snapshot = AgentManagementService._workforce_reference_snapshot
+
+        def snapshot_then_discard(
+            service: AgentManagementService,
+            *,
+            actor: User,
+            agent_id: int,
+        ):
+            snapshot = original_snapshot(service, actor=actor, agent_id=agent_id)
+            discard_db = _direct_db_session()
+            try:
+                discard_actor = discard_db.query(User).filter(User.id == owner_id).one()
+                discard_draft_workforce(
+                    discard_db,
+                    discard_actor,
+                    discard_db.get(Workforce, workforce_id),
+                )
+            finally:
+                discard_db.close()
+            return snapshot
+
+        monkeypatch.setattr(
+            AgentManagementService,
+            "_workforce_reference_snapshot",
+            snapshot_then_discard,
+        )
+
+        response = client.delete(f"/api/agents/{target_id}", headers=headers)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"message": "Agent deleted successfully"}
+
+        verify_db = _direct_db_session()
+        try:
+            assert verify_db.get(Workforce, workforce_id) is None
+            assert verify_db.get(Agent, target_id) is None
+        finally:
+            verify_db.close()
+
+    def test_maps_commit_time_fk_race_after_rollback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Racing Agent")
+
+        db = _direct_db_session()
+        try:
+            actor = db.query(User).filter(User.id == owner_id).one()
+            service = AgentManagementService(db)
+            conflicts = iter(
+                [
+                    None,
+                    AgentWorkforceConflictError(
+                        (),
+                        has_hidden_references=True,
+                    ),
+                ]
+            )
+            monkeypatch.setattr(
+                service,
+                "_workforce_conflict",
+                lambda **_kwargs: next(conflicts),
+            )
+            monkeypatch.setattr(
+                db,
+                "commit",
+                lambda: (_ for _ in ()).throw(
+                    IntegrityError(
+                        "DELETE FROM agents WHERE id = ?",
+                        {"id": target_id},
+                        RuntimeError("raw fk constraint details"),
+                    )
+                ),
+            )
+
+            with pytest.raises(AgentWorkforceConflictError) as exc_info:
+                service.delete_agent(actor=actor, agent_id=target_id)
+
+            assert "raw fk constraint details" not in str(exc_info.value)
+            assert db.get(Agent, target_id) is not None
+        finally:
+            db.close()
+
+    def test_unrelated_integrity_error_is_not_mapped_to_workforce_conflict(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Unrelated Error Agent")
+
+        db = _direct_db_session()
+        try:
+            actor = db.query(User).filter(User.id == owner_id).one()
+            service = AgentManagementService(db)
+            monkeypatch.setattr(
+                service,
+                "_workforce_conflict",
+                lambda **_kwargs: None,
+            )
+            raw_error = IntegrityError(
+                "DELETE FROM agents WHERE id = ?",
+                {"id": target_id},
+                RuntimeError("unrelated integrity failure"),
+            )
+            monkeypatch.setattr(
+                db,
+                "commit",
+                lambda: (_ for _ in ()).throw(raw_error),
+            )
+
+            with pytest.raises(IntegrityError) as exc_info:
+                service.delete_agent(actor=actor, agent_id=target_id)
+
+            assert exc_info.value is raw_error
+            assert db.get(Agent, target_id) is not None
+        finally:
+            db.close()
+
+    def test_unexpected_delete_failure_returns_structured_sanitized_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        headers = _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Failing Agent")
+
+        def fail_delete(
+            _service: AgentManagementService,
+            *,
+            actor: User,
+            agent_id: int,
+        ) -> None:
+            del actor, agent_id
+            raise RuntimeError("sensitive database detail")
+
+        monkeypatch.setattr(AgentManagementService, "delete_agent", fail_delete)
+
+        response = client.delete(f"/api/agents/{target_id}", headers=headers)
+
+        assert response.status_code == 500, response.text
+        assert response.json() == {
+            "detail": {
+                "code": "agent_delete_failed",
+                "message": "Failed to delete agent",
+            }
+        }
+        assert "sensitive database detail" not in response.text
+
+    def test_logo_and_cache_cleanup_observe_committed_delete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        headers = _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Cleanup Agent")
+        logo_url = f"/uploads/agent_logos/agent_{target_id}.png"
+
+        db = _direct_db_session()
+        try:
+            agent = db.get(Agent, target_id)
+            assert agent is not None
+            agent.logo_url = logo_url
+            db.commit()
+        finally:
+            db.close()
+
+        cleanup_events: list[str] = []
+
+        def assert_committed(event: str) -> None:
+            check_db = _direct_db_session()
+            try:
+                assert check_db.get(Agent, target_id) is None
+            finally:
+                check_db.close()
+            cleanup_events.append(event)
+
+        monkeypatch.setattr(
+            "xagent.web.api.agents._delete_logo",
+            lambda value: (
+                assert_committed("logo")
+                if value == logo_url
+                else pytest.fail("unexpected logo URL")
+            ),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.agent_management.invalidate_agent_cache",
+            lambda *_args: assert_committed("cache"),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.agent_store.invalidate_agent_cache",
+            lambda *_args: assert_committed("cache"),
+        )
+
+        response = client.delete(f"/api/agents/{target_id}", headers=headers)
+
+        assert response.status_code == 200, response.text
+        assert sorted(cleanup_events) == ["cache", "logo"]
 
     def test_with_tasks_keeps_tasks_and_nulls_agent_id(self):
         headers = _admin_headers()

@@ -45,7 +45,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         self.assertIn(2, manager.active_connections)
 
         # 测试断开连接
-        manager.disconnect(websocket1, 1)
+        manager.disconnect(websocket1)
 
         # 验证断开连接
         self.assertEqual(len(manager.active_connections), 1)
@@ -417,7 +417,7 @@ class TestWebSocket(unittest.IsolatedAsyncioTestCase):
         await manager.connect(websocket1, 1)
 
         # 模拟连接断开
-        manager.disconnect(websocket1, 1)
+        manager.disconnect(websocket1)
 
         # 验证连接已断开
         self.assertEqual(len(manager.active_connections), 0)

@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -10,7 +11,12 @@ from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
-from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.models.workforce import (
+    Workforce,
+    WorkforceAgent,
+    WorkforceBuilderMessage,
+    WorkforceRun,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -925,6 +931,339 @@ def test_archived_workforce_rejects_all_edit_boundaries() -> None:
         headers=headers,
     )
     assert remove_worker_response.status_code == 409
+
+
+def test_discard_draft_deletes_graph_and_exclusive_generated_manager() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Discard Generated Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+    worker_agent_ids = [int(worker["agent"]["id"]) for worker in workforce["workers"]]
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.add(
+            WorkforceBuilderMessage(
+                workforce_id=workforce_id,
+                user_id=owner_id,
+                role="assistant",
+                content="Draft plan",
+                status="message",
+            )
+        )
+        task = Task(
+            user_id=owner_id,
+            title="Generated manager task",
+            description="Unrelated task reference",
+            status=TaskStatus.COMPLETED,
+            agent_id=manager_id,
+            source="internal",
+            is_visible=False,
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 204, response.text
+    assert response.content == b""
+
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert (
+            db.query(WorkforceAgent).filter_by(workforce_id=workforce_id).count() == 0
+        )
+        assert (
+            db.query(WorkforceBuilderMessage)
+            .filter_by(workforce_id=workforce_id)
+            .count()
+            == 0
+        )
+        assert db.get(Agent, manager_id) is None
+        assert all(
+            db.get(Agent, worker_id) is not None for worker_id in worker_agent_ids
+        )
+        assert db.get(Task, task_id).agent_id is None
+    finally:
+        db.close()
+
+
+def test_discard_draft_preserves_reusable_manager() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Discard Reusable Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 204, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(Agent, manager_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("status", ["active", "archived"])
+def test_discard_rejects_non_draft_with_structured_conflict(status: str) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name=f"Discard {status.title()} Workforce")
+    workforce_id = int(workforce["id"])
+
+    db = _direct_db_session()
+    try:
+        workforce_row = db.get(Workforce, workforce_id)
+        assert workforce_row is not None
+        workforce_row.status = status
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_not_discardable",
+            "message": "Only draft workforces can be discarded.",
+        }
+    }
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("is_preview", [False, True])
+def test_discard_rejects_all_run_history_with_structured_conflict(
+    is_preview: bool,
+) -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(
+        headers,
+        name=f"Discard {'Preview' if is_preview else 'Run'} History Workforce",
+    )
+    workforce_id = int(workforce["id"])
+    run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=datetime.now(timezone.utc),
+        is_preview=is_preview,
+    )
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_has_runs",
+            "message": "Workforces with run history cannot be discarded.",
+        }
+    }
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+        assert db.get(WorkforceRun, run_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("unsafe_reason", ["shared_reference", "owner_mismatch"])
+def test_discard_rejects_unsafe_generated_manager_without_mutation(
+    unsafe_reason: str,
+) -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Discard Shared Manager Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+    other_id: int | None = None
+    other_owner_id: int | None = None
+    if unsafe_reason == "owner_mismatch":
+        _register_second_user("manager-owner", "managerpass1")
+        other_owner_id = _user_id("manager-owner")
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        if unsafe_reason == "shared_reference":
+            other = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Other Manager Reference",
+                manager_agent_id=manager_id,
+                status="draft",
+            )
+            db.add(other)
+        else:
+            assert other_owner_id is not None
+            manager.user_id = other_owner_id
+        db.commit()
+        if unsafe_reason == "shared_reference":
+            other_id = int(other.id)
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_not_discardable",
+            "message": "The generated manager cannot be safely discarded.",
+        }
+    }
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+        if other_id is not None:
+            assert db.get(Workforce, other_id) is not None
+        assert db.get(Agent, manager_id) is not None
+    finally:
+        db.close()
+
+
+def test_discard_requires_edit_access_without_mutation() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Private Discard Workforce")
+    workforce_id = int(workforce["id"])
+    other_headers = _register_second_user()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=other_headers,
+    )
+
+    assert response.status_code == 403, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+    finally:
+        db.close()
+
+
+def test_discard_rolls_back_when_generated_manager_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Rollback Discard Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    def fail_cleanup(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        "xagent.web.services.agent_store.AgentStore.stage_delete_agent",
+        fail_cleanup,
+        raising=False,
+    )
+    caplog.set_level(logging.ERROR, logger="xagent.web.api.workforces")
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_discard_failed",
+            "message": "Failed to discard workforce",
+        }
+    }
+    assert "cleanup failed" not in response.text
+    assert any(
+        record.name == "xagent.web.api.workforces"
+        and record.getMessage() == f"Failed to discard workforce {workforce_id}"
+        and record.exc_info is not None
+        for record in caplog.records
+    )
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+        assert db.get(Agent, manager_id) is not None
+        assert (
+            db.query(WorkforceAgent).filter_by(workforce_id=workforce_id).count() == 1
+        )
+    finally:
+        db.close()
+
+
+def test_discard_stays_successful_when_post_commit_cache_invalidation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Cache Failure Discard Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        "xagent.web.services.workforce_lifecycle.invalidate_agent_cache",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("cache unavailable")),
+    )
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 204, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(Agent, manager_id) is None
+    finally:
+        db.close()
 
 
 def test_from_prompt_creates_draft_workforce() -> None:

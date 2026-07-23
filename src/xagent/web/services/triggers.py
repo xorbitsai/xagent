@@ -22,7 +22,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ConnectorRuntimeError,
 )
 from ...core.utils.encryption import decrypt_value, encrypt_value
-from ..models.agent import Agent
+from ..models.agent import Agent, AgentOrigin
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
@@ -424,10 +424,14 @@ def _unregister_trigger_binding(
 
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
+    # Workforce-generated manager agents are private implementation details;
+    # they must not be addressable through trigger management, matching the
+    # exclusion every other external channel (share/widget/api-keys) applies.
     return (
         db.query(Agent)
         .filter(
             Agent.id == agent_id,
+            Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
             owned_agent_clause(user_id, get_agent_team_scope(db, user_id)),
         )
         .first()

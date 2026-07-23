@@ -2,9 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 
-vi.mock("@/lib/api-wrapper", () => ({
-  apiRequest: apiRequestMock,
-}))
+vi.mock("@/lib/api-wrapper", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
+    "@/lib/api-wrapper",
+  )
+  return {
+    ...actual,
+    apiRequest: apiRequestMock,
+  }
+})
 
 vi.mock("@/lib/utils", () => ({
   getApiUrl: () => "http://api.local",
@@ -13,6 +19,7 @@ vi.mock("@/lib/utils", () => ({
 import {
   archiveWorkforce,
   createWorkforce,
+  discardWorkforce,
   getWorkforceAgentExecution,
   listAgentOptions,
   listWorkforces,
@@ -154,6 +161,89 @@ describe("workforces-api", () => {
 
     await expect(archiveWorkforce(5)).rejects.toThrow(
       "Archived workforce cannot be edited",
+    )
+  })
+
+  it("discards an eligible draft through the dedicated endpoint", async () => {
+    apiRequestMock.mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    await expect(discardWorkforce(5, "Failed to discard draft")).resolves.toBeUndefined()
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/workforces/5/discard",
+      { method: "POST" },
+    )
+  })
+
+  it.each([
+    "workforce_not_discardable",
+    "workforce_has_runs",
+  ])("returns a typed discard error for stable code %s", async (code) => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: { code, message: "Backend English" } },
+        { status: 409 },
+      ),
+    )
+
+    let caught: unknown
+    try {
+      await discardWorkforce(5, "Localized fallback")
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect(caught).toMatchObject({
+      name: "WorkforceDiscardError",
+      code,
+      message: "Localized fallback",
+    })
+  })
+
+  it.each([
+    { detail: { message: "This draft already has runs" } },
+    { detail: { code: "unknown_discard_error", message: "Backend English" } },
+  ])("uses the localized fallback for malformed structured discard errors", async (payload) => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(payload, { status: 409 }),
+    )
+
+    await expect(discardWorkforce(5, "Failed to discard draft")).rejects.toThrow(
+      "Failed to discard draft",
+    )
+  })
+
+  it("keeps unexpected structured discard failures localized", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          detail: {
+            code: "workforce_discard_failed",
+            message: "Backend English",
+          },
+        },
+        { status: 500 },
+      ),
+    )
+
+    let caught: unknown
+    try {
+      await discardWorkforce(5, "Localized fallback")
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe("Localized fallback")
+    expect((caught as Error).message).not.toContain("Backend English")
+  })
+
+  it("uses the localized fallback when discard cannot reach the API", async () => {
+    apiRequestMock.mockRejectedValueOnce(new Error("Network connection failed"))
+
+    await expect(discardWorkforce(5, "Failed to discard draft")).rejects.toThrow(
+      "Failed to discard draft",
     )
   })
 })

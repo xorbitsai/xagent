@@ -1,9 +1,10 @@
-"""SQLite engine hardening for concurrent access.
+"""SQLite engine hardening for concurrency and relational integrity.
 
 Enables WAL journaling (concurrent readers alongside a single writer) and a
 ``busy_timeout`` (a writer waits for the lock instead of failing immediately
-with "database is locked") on SQLite engines. This lets the shared engine
-tolerate the concurrent writes that in-turn tool concurrency can produce.
+with "database is locked") on SQLite engines. Foreign-key enforcement is also
+enabled per connection so declared relationships behave like databases that
+enforce them by default.
 
 No effect on non-SQLite engines (e.g. Postgres handles this with MVCC and
 row-level locks).
@@ -54,7 +55,7 @@ def ensure_sqlite_parent_directory(database_url: str) -> str:
 def apply_sqlite_concurrency_pragmas(
     engine: Engine, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS
 ) -> None:
-    """Register a connect hook that sets WAL + busy_timeout on SQLite engines.
+    """Register SQLite WAL, busy-timeout, and foreign-key connection pragmas.
 
     Args:
         engine: The SQLAlchemy engine to harden. Non-SQLite engines are ignored.
@@ -75,7 +76,7 @@ def apply_sqlite_concurrency_pragmas(
 
 
 def _apply_concurrency_pragmas(cursor, timeout_ms: int) -> None:  # type: ignore[no-untyped-def]
-    """Set the WAL + busy_timeout pragmas, best-effort.
+    """Set the SQLite runtime pragmas, best-effort.
 
     A connect hook that raises breaks every connection, so a pragma failure must
     never propagate. On a read-only database (or a directory where the -wal/-shm
@@ -95,3 +96,7 @@ def _apply_concurrency_pragmas(cursor, timeout_ms: int) -> None:  # type: ignore
         cursor.execute(f"PRAGMA busy_timeout={timeout_ms}")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not set SQLite busy_timeout: %s", exc)
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not enable SQLite foreign keys: %s", exc)

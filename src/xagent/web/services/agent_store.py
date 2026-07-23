@@ -108,12 +108,29 @@ def _assert_can_set_visibility(
         )
 
 
+def normalize_tool_categories(categories: Any) -> list[str] | None:
+    """Drop non-assignable categories while preserving ``None``.
+
+    ``None`` and ``[]`` are distinct at runtime
+    (:meth:`ToolSelectionSpec.from_raw`): ``None`` is the legacy
+    "unconfigured" value that keeps the full default tool set, while
+    ``[]`` means the caller explicitly selected zero tools. Write paths
+    must use this helper so an omitted selection is not persisted as
+    "zero tools" (issue #944).
+    """
+    parsed = ensure_list(categories)
+    if parsed is None:
+        return None
+    return [c for c in parsed if c not in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES]
+
+
 def clean_tool_categories(categories: Any) -> list[str]:
-    return [
-        c
-        for c in (ensure_list(categories) or [])
-        if c not in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
-    ]
+    """``normalize_tool_categories`` coerced for response payloads.
+
+    Response schemas type ``tool_categories`` as a non-optional list,
+    so ``None`` renders as ``[]`` here. Never use this on a write path.
+    """
+    return normalize_tool_categories(categories) or []
 
 
 def new_widget_key() -> str:
@@ -221,19 +238,23 @@ class AgentStore:
         return response
 
     def get_owned_agent(
-        self, user_id: int, agent_id: int, team_scope: Any = _UNRESOLVED
+        self,
+        user_id: int,
+        agent_id: int,
+        team_scope: Any = _UNRESOLVED,
+        *,
+        for_update: bool = False,
     ) -> Agent | None:
         if team_scope is _UNRESOLVED:
             team_scope = get_agent_team_scope(self.db, user_id)
-        return (
-            self.db.query(Agent)
-            .filter(
-                Agent.id == agent_id,
-                owned_agent_clause(user_id, team_scope),
-                Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
-            )
-            .first()
+        query = self.db.query(Agent).filter(
+            Agent.id == agent_id,
+            owned_agent_clause(user_id, team_scope),
+            Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
         )
+        if for_update:
+            query = query.with_for_update()
+        return query.first()
 
     def get_agent_response_for_admin(self, agent_id: int) -> dict[str, Any] | None:
         """Read any agent's detail regardless of owner (admin-only path).
@@ -369,7 +390,7 @@ class AgentStore:
             models=models,
             knowledge_bases=knowledge_bases or [],
             skills=skills or [],
-            tool_categories=clean_tool_categories(tool_categories),
+            tool_categories=normalize_tool_categories(tool_categories),
             suggested_prompts=suggested_prompts or [],
             origin=origin,
             status=status,
@@ -439,7 +460,7 @@ class AgentStore:
 
         for field, value in updates.items():
             if field == "tool_categories":
-                value = clean_tool_categories(value)
+                value = normalize_tool_categories(value)
             setattr(agent, field, value)
 
         self.db.commit()
@@ -521,20 +542,17 @@ class AgentStore:
         invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
         return agent
 
-    def delete_agent(self, user_id: int, agent_id: int) -> Agent | None:
-        team_scope = get_agent_team_scope(self.db, user_id)
-        agent = self.get_owned_agent(user_id, agent_id, team_scope)
-        if agent is None:
-            return None
-
-        self.db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).delete()
+    def stage_delete_agent(self, agent: Agent) -> None:
+        """Stage the Agent aggregate deletion without committing or caching."""
+        agent_id = int(agent.id)
+        self.db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).delete(
+            synchronize_session=False
+        )
         self.db.query(Task).filter(Task.agent_id == agent_id).update(
-            {Task.agent_id: None}
+            {Task.agent_id: None}, synchronize_session=False
         )
         self.db.delete(agent)
-        self.db.commit()
-        invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
-        return agent
+        self.db.flush()
 
     def publish_agent(self, user_id: int, agent_id: int) -> Agent | None:
         team_scope = get_agent_team_scope(self.db, user_id)

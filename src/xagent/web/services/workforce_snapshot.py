@@ -1,3 +1,5 @@
+import hashlib
+import json
 from typing import Any, Literal, cast, overload
 
 from fastapi import HTTPException
@@ -189,6 +191,93 @@ def build_agent_tool_overrides(
     return overrides
 
 
+# Version of the fingerprint ALGORITHM, stored alongside the pinned value in
+# the run snapshot. The turn-entry guard only compares pinned vs live when the
+# pinned version matches; a version bump therefore exempts runs pinned under an
+# older algorithm instead of spuriously rejecting them with
+# "workforce_config_changed" on deploy. Bump whenever the payload shape or
+# canonicalization below changes. History: 1 = unsorted list fields (never
+# released); 2 = list fields canonicalized via sort.
+WORKFORCE_CONFIG_FINGERPRINT_VERSION = 2
+
+
+def _fingerprint_agent_payload(agent: Agent) -> dict[str, Any]:
+    # knowledge_bases / skills / tool_categories are order-insensitive sets
+    # persisted verbatim from the frontend's multi-selects, which append in
+    # click order. Canonicalize (sort) them so re-saving the same set in a
+    # different array order doesn't change the fingerprint and force-reject
+    # in-flight sessions. json.dumps(sort_keys=True) sorts dict keys only,
+    # not list contents.
+    return {
+        "instructions": agent.instructions,
+        "execution_mode": agent.execution_mode,
+        "models": agent.models or {},
+        "knowledge_bases": sorted(agent.knowledge_bases or [], key=str),
+        "skills": sorted(agent.skills or [], key=str),
+        "tool_categories": sorted(agent.tool_categories or [], key=str),
+    }
+
+
+def compute_workforce_config_fingerprint(
+    workforce: Workforce,
+    manager_agent: Agent,
+    enabled_workers: list[WorkforceAgent],
+) -> str:
+    """Hash the live config that shapes a run's execution.
+
+    The run snapshot only freezes prompt-building data; worker execution
+    re-reads the live Agent per call (instructions, models, KBs, skills,
+    tool categories). A full deep-freeze is impossible — KB content, MCP
+    config and model keys are inherently live — so instead this fingerprint
+    is stored at run creation and re-checked at each new turn's entry:
+    a mismatch rejects the turn ("config changed, start a new session")
+    rather than silently executing with drifted config.
+    """
+    payload = {
+        "version": WORKFORCE_CONFIG_FINGERPRINT_VERSION,
+        "workforce": {"id": workforce.id, "name": workforce.name},
+        "manager": {
+            "agent_id": manager_agent.id,
+            **_fingerprint_agent_payload(manager_agent),
+        },
+        "workers": [
+            {
+                "member_id": worker.id,
+                "agent_id": worker.agent_id,
+                "alias": worker.alias,
+                "assignment_instructions": worker.assignment_instructions,
+                "agent": _fingerprint_agent_payload(worker.agent),
+            }
+            for worker in enabled_workers
+        ],
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_live_workforce_config_fingerprint(workforce: Workforce) -> str | None:
+    """Recompute the fingerprint from the current DB state of a workforce.
+
+    Applies the same enabled-worker filter and ordering as
+    ``build_workforce_snapshot``. Returns ``None`` when the live state cannot
+    produce a comparable fingerprint (e.g. the manager relationship is gone),
+    which callers should treat as a mismatch.
+    """
+    manager_agent = workforce.manager_agent
+    if manager_agent is None:
+        return None
+    enabled_workers = [
+        worker
+        for worker in _sorted_workers(workforce)
+        if worker.enabled and worker.agent is not None
+    ]
+    return compute_workforce_config_fingerprint(
+        workforce, cast(Agent, manager_agent), enabled_workers
+    )
+
+
 def build_workforce_snapshot(
     db: Session,
     user: User,
@@ -253,6 +342,10 @@ def build_workforce_snapshot(
         "workers": snapshot_workers,
     }
     snapshot["manager"]["runtime_prompt"] = build_manager_system_prompt(snapshot)
+    snapshot["config_fingerprint"] = compute_workforce_config_fingerprint(
+        workforce, manager_agent, enabled_workers
+    )
+    snapshot["config_fingerprint_version"] = WORKFORCE_CONFIG_FINGERPRINT_VERSION
     return snapshot
 
 

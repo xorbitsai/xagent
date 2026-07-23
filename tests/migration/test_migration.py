@@ -7,9 +7,362 @@ from sqlalchemy import create_engine, inspect, text
 
 from xagent.db import try_upgrade_db
 from xagent.db.config import create_alembic_config
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 
 
 class TestTryUpgradeDb:
+    def test_sqlite_current_head_preserves_preexisting_fk_violations(self, tmp_path):
+        engine = create_engine(f"sqlite:///{tmp_path / 'legacy-orphan.db'}")
+        apply_sqlite_concurrency_pragmas(engine)
+        script = ScriptDirectory.from_config(create_alembic_config(engine))
+
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 0
+                conn.exec_driver_sql(
+                    "CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)"
+                )
+                conn.exec_driver_sql(
+                    "INSERT INTO alembic_version (version_num) VALUES (?)",
+                    (script.get_current_head(),),
+                )
+                conn.exec_driver_sql("CREATE TABLE agents (id INTEGER PRIMARY KEY)")
+                conn.exec_driver_sql(
+                    "CREATE TABLE workforces ("
+                    "id INTEGER PRIMARY KEY, "
+                    "manager_agent_id INTEGER NOT NULL, "
+                    "FOREIGN KEY(manager_agent_id) REFERENCES agents(id) "
+                    "ON DELETE RESTRICT)"
+                )
+                conn.exec_driver_sql(
+                    "INSERT INTO workforces (id, manager_agent_id) VALUES (1, 99)"
+                )
+                conn.commit()
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                conn.rollback()
+
+            try_upgrade_db(engine)
+
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                assert (
+                    conn.exec_driver_sql("SELECT COUNT(*) FROM workforces").scalar_one()
+                    == 1
+                )
+                assert conn.exec_driver_sql("PRAGMA foreign_key_check").all() == [
+                    ("workforces", 1, "agents", 0)
+                ]
+        finally:
+            engine.dispose()
+
+    @pytest.mark.parametrize("with_existing_violation", [False, True])
+    def test_sqlite_upgrade_rejects_new_fk_violations(
+        self,
+        tmp_path,
+        monkeypatch,
+        with_existing_violation,
+    ):
+        engine = create_engine(f"sqlite:///{tmp_path / 'new-orphan.db'}")
+        apply_sqlite_concurrency_pragmas(engine)
+
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 0
+                conn.exec_driver_sql("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+                conn.exec_driver_sql(
+                    "CREATE TABLE children ("
+                    "key TEXT PRIMARY KEY, "
+                    "parent_id INTEGER NOT NULL, "
+                    "FOREIGN KEY(parent_id) REFERENCES parents(id)) "
+                    "WITHOUT ROWID"
+                )
+                if with_existing_violation:
+                    conn.exec_driver_sql(
+                        "INSERT INTO children (key, parent_id) VALUES ('legacy', 99)"
+                    )
+                conn.commit()
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                conn.rollback()
+
+            def introduce_new_violation(config, revision):
+                assert revision == "head"
+                connection = config.attributes["connection"]
+                assert (
+                    connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 0
+                )
+                connection.exec_driver_sql(
+                    "INSERT INTO children (key, parent_id) VALUES ('new', 99)"
+                )
+
+            monkeypatch.setattr(
+                "xagent.db.migration.get_alembic_revision", lambda _engine: "abc123"
+            )
+            monkeypatch.setattr(
+                "xagent.db.migration._check_revision_is_known",
+                lambda _config, _engine, _version: None,
+            )
+            monkeypatch.setattr(
+                "xagent.db.migration.command.upgrade", introduce_new_violation
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="SQLite migration produced new foreign-key violations",
+            ):
+                try_upgrade_db(engine)
+
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                assert conn.exec_driver_sql(
+                    "SELECT key FROM children ORDER BY key"
+                ).scalars().all() == (["legacy"] if with_existing_violation else [])
+        finally:
+            engine.dispose()
+
+    def test_sqlite_upgrade_distinguishes_without_rowid_violation_rows(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = create_engine(f"sqlite:///{tmp_path / 'without-rowid-swap.db'}")
+        apply_sqlite_concurrency_pragmas(engine)
+
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                conn.exec_driver_sql("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+                conn.exec_driver_sql(
+                    "CREATE TABLE children ("
+                    "key TEXT PRIMARY KEY, "
+                    "parent_id INTEGER NOT NULL, "
+                    "FOREIGN KEY(parent_id) REFERENCES parents(id)) "
+                    "WITHOUT ROWID"
+                )
+                conn.exec_driver_sql("INSERT INTO parents (id) VALUES (2)")
+                conn.exec_driver_sql(
+                    "INSERT INTO children (key, parent_id) VALUES "
+                    "('legacy', 99), ('was-valid', 2)"
+                )
+                conn.commit()
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                conn.rollback()
+
+            def swap_violation_row(config, revision):
+                assert revision == "head"
+                connection = config.attributes["connection"]
+                connection.exec_driver_sql("INSERT INTO parents (id) VALUES (99)")
+                connection.exec_driver_sql("DELETE FROM parents WHERE id = 2")
+
+            monkeypatch.setattr(
+                "xagent.db.migration.get_alembic_revision", lambda _engine: "abc123"
+            )
+            monkeypatch.setattr(
+                "xagent.db.migration._check_revision_is_known",
+                lambda _config, _engine, _version: None,
+            )
+            monkeypatch.setattr(
+                "xagent.db.migration.command.upgrade", swap_violation_row
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="SQLite migration produced new foreign-key violations",
+            ):
+                try_upgrade_db(engine)
+
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                assert conn.exec_driver_sql(
+                    "SELECT id FROM parents ORDER BY id"
+                ).scalars().all() == [2]
+                assert conn.exec_driver_sql(
+                    "SELECT key, parent_id FROM children ORDER BY key"
+                ).all() == [("legacy", 99), ("was-valid", 2)]
+        finally:
+            engine.dispose()
+
+    def test_sqlite_upgrade_distinguishes_fks_to_the_same_parent(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = create_engine(f"sqlite:///{tmp_path / 'changed-orphan.db'}")
+        apply_sqlite_concurrency_pragmas(engine)
+
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                conn.exec_driver_sql("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+                conn.exec_driver_sql(
+                    "CREATE TABLE child ("
+                    "id INTEGER PRIMARY KEY, "
+                    "created_by INTEGER NOT NULL, "
+                    "updated_by INTEGER NOT NULL, "
+                    "FOREIGN KEY(created_by) REFERENCES users(id), "
+                    "FOREIGN KEY(updated_by) REFERENCES users(id))"
+                )
+                conn.exec_driver_sql("INSERT INTO users (id) VALUES (2)")
+                conn.exec_driver_sql(
+                    "INSERT INTO child (id, created_by, updated_by) VALUES (1, 1, 2)"
+                )
+                conn.commit()
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                conn.rollback()
+
+            def move_violation_to_other_fk(config, revision):
+                assert revision == "head"
+                connection = config.attributes["connection"]
+                connection.exec_driver_sql("INSERT INTO users (id) VALUES (1)")
+                connection.exec_driver_sql("DELETE FROM users WHERE id = 2")
+
+            monkeypatch.setattr(
+                "xagent.db.migration.get_alembic_revision", lambda _engine: "abc123"
+            )
+            monkeypatch.setattr(
+                "xagent.db.migration._check_revision_is_known",
+                lambda _config, _engine, _version: None,
+            )
+            monkeypatch.setattr(
+                "xagent.db.migration.command.upgrade", move_violation_to_other_fk
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="SQLite migration produced new foreign-key violations",
+            ):
+                try_upgrade_db(engine)
+
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                assert conn.exec_driver_sql(
+                    "SELECT id FROM users ORDER BY id"
+                ).scalars().all() == [2]
+                assert conn.exec_driver_sql("PRAGMA foreign_key_check").all() == [
+                    ("child", 1, "users", 1)
+                ]
+        finally:
+            engine.dispose()
+
+    def test_sqlite_upgrade_preserves_inbound_fk_rows_when_enforcement_is_enabled(
+        self, tmp_path
+    ):
+        engine = create_engine(f"sqlite:///{tmp_path / 'workforce-upgrade.db'}")
+        apply_sqlite_concurrency_pragmas(engine)
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "CREATE TABLE alembic_version "
+                        "(version_num VARCHAR(255) NOT NULL)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO alembic_version (version_num) "
+                        "VALUES ('20260715_add_public_mcp_app_audits')"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE TABLE workforces ("
+                        "id INTEGER PRIMARY KEY, "
+                        "name VARCHAR(200) NOT NULL, "
+                        "manager_instructions TEXT)"
+                    )
+                )
+                for table_name in (
+                    "workforce_agents",
+                    "workforce_runs",
+                    "workforce_builder_messages",
+                ):
+                    conn.execute(
+                        text(
+                            f"CREATE TABLE {table_name} ("
+                            "id INTEGER PRIMARY KEY, "
+                            "workforce_id INTEGER NOT NULL, "
+                            "FOREIGN KEY(workforce_id) REFERENCES workforces(id) "
+                            "ON DELETE CASCADE)"
+                        )
+                    )
+                conn.execute(
+                    text(
+                        "INSERT INTO workforces "
+                        "(id, name, manager_instructions) "
+                        "VALUES (1, 'Existing Workforce', 'legacy instructions')"
+                    )
+                )
+                for table_name in (
+                    "workforce_agents",
+                    "workforce_runs",
+                    "workforce_builder_messages",
+                ):
+                    conn.execute(
+                        text(
+                            f"INSERT INTO {table_name} (id, workforce_id) VALUES (1, 1)"
+                        )
+                    )
+
+            try_upgrade_db(engine)
+
+            columns = {
+                column["name"] for column in inspect(engine).get_columns("workforces")
+            }
+            assert "manager_instructions" not in columns
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+                assert conn.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+                assert (
+                    conn.execute(text("SELECT COUNT(*) FROM workforces")).scalar() == 1
+                )
+                for table_name in (
+                    "workforce_agents",
+                    "workforce_runs",
+                    "workforce_builder_messages",
+                ):
+                    assert (
+                        conn.execute(
+                            text(f"SELECT COUNT(*) FROM {table_name}")
+                        ).scalar()
+                        == 1
+                    )
+        finally:
+            engine.dispose()
+
+    def test_sqlite_upgrade_restores_fk_enforcement_after_failure(
+        self, tmp_path, monkeypatch
+    ):
+        engine = create_engine(f"sqlite:///{tmp_path / 'failed-upgrade.db'}")
+        apply_sqlite_concurrency_pragmas(engine)
+
+        def fail_upgrade(config, revision):
+            assert revision == "head"
+            connection = config.attributes["connection"]
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 0
+            raise RuntimeError("Upgrade failed")
+
+        monkeypatch.setattr(
+            "xagent.db.migration.get_alembic_revision", lambda _engine: "abc123"
+        )
+        monkeypatch.setattr(
+            "xagent.db.migration._check_revision_is_known",
+            lambda _config, _engine, _version: None,
+        )
+        monkeypatch.setattr("xagent.db.migration.command.upgrade", fail_upgrade)
+
+        try:
+            with pytest.raises(RuntimeError, match="Upgrade failed"):
+                try_upgrade_db(engine)
+
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+        finally:
+            engine.dispose()
+
     def test_stamps_new_database_with_persistent_wide_version_table(self):
         engine = create_engine("sqlite:///:memory:")
 

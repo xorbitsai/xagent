@@ -5,19 +5,40 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from xagent.web.models.task import Task, TaskStatus
 
-from ..models.workforce import WorkforceRun
+from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from .task_lease_service import (
     TaskLease,
     release_current_runner_task_lease,
     release_task_lease,
 )
-from .workforce_snapshot import build_agent_tool_overrides
+from .workforce_snapshot import (
+    WORKFORCE_CONFIG_FINGERPRINT_VERSION,
+    build_agent_tool_overrides,
+    compute_live_workforce_config_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
+
+# Run statuses that still hold (or can reclaim) execution resources.
+ACTIVE_WORKFORCE_RUN_STATUSES = frozenset({"pending", "running", "paused"})
+
+
+class WorkforceTurnRejectedError(Exception):
+    """A new turn on a workforce task must not start.
+
+    Raised by :func:`ensure_workforce_turn_allowed` when the owning workforce
+    was archived or its live config no longer matches the run's pinned
+    fingerprint. The turn orchestrator maps this onto its transport-facing
+    ``TaskTurnError`` with the same reason string.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -131,6 +152,206 @@ def resolve_workforce_task_runtime(
     )
 
 
+def _load_workforce_for_fingerprint(db: Session, workforce_id: int) -> Workforce | None:
+    return (
+        db.query(Workforce)
+        .options(
+            selectinload(Workforce.manager_agent),
+            selectinload(Workforce.workers).selectinload(WorkforceAgent.agent),
+        )
+        .filter(Workforce.id == int(workforce_id))
+        .first()
+    )
+
+
+def ensure_workforce_turn_allowed(
+    db: Session,
+    *,
+    task_id: int,
+    task_owner_user_id: int,
+    agent_config: dict[str, Any] | None = None,
+) -> None:
+    """Gate a new turn on a workforce task against the live workforce state.
+
+    Called at the shared turn-entry point for every turn kind. CREATE turns
+    are already validated upstream by ``validate_workforce_for_run``, but an
+    archive can commit between ``create_workforce_run``'s commit and the
+    claim — its cancellation sweep marks the run cancelled yet cannot stop a
+    turn that never started — so this check is the last line before
+    execution. Rejects with :class:`WorkforceTurnRejectedError` when:
+
+    - ``workforce_archived``: the owning workforce was archived (or its row
+      is gone). Archive terminates external exposure; long-lived sessions
+      must not keep executing past it.
+    - ``workforce_config_changed``: the live config no longer matches the
+      fingerprint pinned in the run snapshot. The snapshot only freezes
+      prompt-building data while worker execution re-reads live Agent rows,
+      so a drifted config silently changes behavior mid-session; reject and
+      require a fresh session instead.
+    - ``workforce_run_not_found``: ``agent_config`` names a run that does
+      not exist (or belongs to another task/user). The runtime resolver
+      would silently degrade such a task to a bare manager agent with zero
+      delegation ability; fail loudly instead of executing it.
+
+    No-op for non-workforce tasks and for runs whose snapshot predates the
+    fingerprint (backwards compatibility). Preview runs skip the fingerprint
+    check: the builder edits config while previewing by design.
+
+    ``agent_config`` may be passed by callers that already read the task row
+    (the turn orchestrator reads it in its post-claim snapshot SELECT) to
+    save a redundant round-trip; when omitted it is read here, scoped to the
+    owner.
+    """
+    if agent_config is None:
+        row = (
+            db.query(Task.agent_config)
+            .filter(Task.id == int(task_id), Task.user_id == int(task_owner_user_id))
+            .first()
+        )
+        if row is None or not isinstance(row[0], dict):
+            return
+        agent_config = row[0]
+    workforce_run_id = agent_config.get("workforce_run_id")
+    if not isinstance(workforce_run_id, int):
+        return
+
+    run = (
+        db.query(WorkforceRun)
+        .filter(
+            WorkforceRun.id == workforce_run_id,
+            WorkforceRun.task_id == int(task_id),
+            WorkforceRun.user_id == int(task_owner_user_id),
+        )
+        .first()
+    )
+    if run is None:
+        raise WorkforceTurnRejectedError("workforce_run_not_found")
+
+    workforce = _load_workforce_for_fingerprint(db, int(run.workforce_id))
+    if workforce is None or workforce.status == "archived":
+        raise WorkforceTurnRejectedError("workforce_archived")
+
+    if bool(run.is_preview):
+        return
+    snapshot: dict[str, Any] = run.snapshot if isinstance(run.snapshot, dict) else {}
+    pinned = snapshot.get("config_fingerprint")
+    if not isinstance(pinned, str) or not pinned:
+        return
+    # Only compare fingerprints pinned by the CURRENT algorithm: a version
+    # bump (algorithm change) would otherwise make every pre-existing run's
+    # pinned value mismatch the freshly computed live one and spuriously
+    # reject those sessions on deploy — the exact failure the fingerprint
+    # exists to prevent. Runs pinned under an older version are exempt.
+    if snapshot.get("config_fingerprint_version") != (
+        WORKFORCE_CONFIG_FINGERPRINT_VERSION
+    ):
+        return
+    live = compute_live_workforce_config_fingerprint(workforce)
+    if live != pinned:
+        raise WorkforceTurnRejectedError("workforce_config_changed")
+
+
+@dataclass(frozen=True)
+class WorkforceRunPauseTarget:
+    """A previously RUNNING task that still needs a PAUSE after archive."""
+
+    run_id: int
+    task_id: int
+
+
+def cancel_active_workforce_runs(
+    db: Session,
+    workforce_id: int,
+) -> list[WorkforceRunPauseTarget]:
+    """Mark every in-flight run of a workforce terminal ``cancelled``.
+
+    Archiving only flips ``Workforce.status``; without this, in-flight runs
+    keep executing because turn resolution never re-checks live workforce
+    state. ``cancelled`` is non-overwritable in ``sync_workforce_run_status``,
+    so a PAUSE landing later cannot flip the run back to ``paused``. New
+    turns are rejected separately by ``ensure_workforce_turn_allowed``.
+
+    Deliberately does NOT commit and does NOT touch the command transport:
+    the caller commits the archive flip and these cancellations in one
+    atomic transaction, then dispatches PAUSE to the returned targets via
+    :func:`pause_workforce_tasks_after_archive`. (The durable enqueue commits
+    internally, so calling it on this session mid-loop would leak a partial
+    archive state.)
+    """
+    runs = (
+        db.query(WorkforceRun)
+        .options(selectinload(WorkforceRun.task))
+        .filter(
+            WorkforceRun.workforce_id == int(workforce_id),
+            WorkforceRun.status.in_(ACTIVE_WORKFORCE_RUN_STATUSES),
+        )
+        .all()
+    )
+
+    pause_targets: list[WorkforceRunPauseTarget] = []
+    for run in runs:
+        task = run.task
+        if task is not None and task.status == TaskStatus.RUNNING:
+            pause_targets.append(
+                WorkforceRunPauseTarget(run_id=int(run.id), task_id=int(task.id))
+            )
+        setattr(run, "status", "cancelled")
+        if run.completed_at is None:
+            setattr(run, "completed_at", datetime.now(timezone.utc))
+    return pause_targets
+
+
+async def pause_workforce_tasks_after_archive(
+    pause_targets: list[WorkforceRunPauseTarget],
+    *,
+    workforce_id: int,
+    actor_user_id: int | None,
+) -> None:
+    """Best-effort PAUSE dispatch for tasks left running by an archive.
+
+    Runs AFTER the caller committed the archive/cancel transaction, on its
+    own short-lived sessions, so the durable enqueue's internal commit can
+    never leak a partial archive state. A failed pause is logged and skipped:
+    the run is already terminal and the turn-entry guard blocks new turns,
+    so the orphaned execution can only run its current turn to completion.
+    """
+    if not pause_targets:
+        return
+
+    from ..models.database import get_session_local
+    from .task_command_transport import (
+        TaskCommandKind,
+        dispatch_task_command_promptly,
+        enqueue_task_command,
+    )
+
+    SessionLocal = get_session_local()
+    for target in pause_targets:
+        try:
+            with SessionLocal() as command_db:
+                enqueued = enqueue_task_command(
+                    command_db,
+                    task_id=target.task_id,
+                    actor_user_id=actor_user_id,
+                    command_id=f"workforce-archive-{target.run_id}",
+                    kind=TaskCommandKind.PAUSE,
+                    payload={},
+                )
+            from ..api.websocket import execute_durable_task_command
+
+            await dispatch_task_command_promptly(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to pause running task %s while archiving workforce %s",
+                target.task_id,
+                workforce_id,
+                exc_info=True,
+            )
+
+
 def _map_task_status(status: Any) -> str | None:
     if isinstance(status, str):
         try:
@@ -173,6 +394,12 @@ def sync_workforce_run_status(
         .first()
     )
     if run is None:
+        return False
+
+    # "cancelled" is terminal and only ever set explicitly (workforce
+    # archive). A late task-status projection (e.g. the PAUSE issued during
+    # archive landing as "paused") must not resurrect the run.
+    if run.status == "cancelled":
         return False
 
     changed = False

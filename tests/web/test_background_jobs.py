@@ -661,6 +661,15 @@ def test_kb_document_job_skips_canonical_rollback_when_generation_turns_stale(
                 "collection_existed_before": True,
             },
         )
+        newer_payload = dict(job.payload)
+        newer_payload["generation_id"] = generation_b
+        newer_payload["file_sha256"] = generation_b
+        newer_job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload=newer_payload,
+        )
         admit_kb_ingest_target(
             db,
             user_id=int(user.id),
@@ -686,7 +695,7 @@ def test_kb_document_job_skips_canonical_rollback_when_generation_turns_stale(
                 target_path=str(target_file),
                 file_id=file_id,
                 generation_id=generation_b,
-                job_id="newer-job",
+                job_id=str(newer_job.id),
                 file_sha256=generation_b,
             )
             return IngestionResult(

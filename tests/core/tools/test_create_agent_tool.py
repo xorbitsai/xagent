@@ -962,6 +962,134 @@ class TestCreateAgentTool:
                 pass
 
     @pytest.mark.asyncio
+    async def test_create_agent_omitted_tool_categories_persists_none(self) -> None:
+        """Omitted ``tool_categories`` persists NULL, not ``[]`` (#944).
+
+        ``ToolSelectionSpec.from_raw`` reads ``None`` as the full default
+        tool set and ``[]`` as explicitly zero tools, so coercing the
+        omitted value to ``[]`` would create an agent with no tools.
+        """
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(username="testuser_no_cats", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            user_id = user.id
+            db.close()
+
+            mock_llm = Mock()
+            mock_llm.model_id = "gpt-4"
+
+            with patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as mock_storage_class:
+                mock_storage = Mock()
+                mock_storage.get_configured_defaults.return_value = (
+                    mock_llm,
+                    None,
+                    None,
+                    None,
+                )
+                mock_storage_class.return_value = mock_storage
+
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
+
+                result = await tool.run_json_async(
+                    {
+                        "name": "default_tools_agent",
+                        "description": "Agent without explicit tool selection",
+                        "instructions": "Agent without explicit tool selection",
+                    }
+                )
+
+                assert result["status"] == "success"
+
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "default_tools_agent")
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.tool_categories is None
+                finally:
+                    verify_db.close()
+
+        finally:
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_create_agent_explicit_empty_tool_categories_persists_empty(
+        self,
+    ) -> None:
+        """Explicit ``tool_categories=[]`` still persists ``[]`` (zero tools)."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(
+                username="testuser_empty_cats", password_hash="x", is_admin=False
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            user_id = user.id
+            db.close()
+
+            mock_llm = Mock()
+            mock_llm.model_id = "gpt-4"
+
+            with patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as mock_storage_class:
+                mock_storage = Mock()
+                mock_storage.get_configured_defaults.return_value = (
+                    mock_llm,
+                    None,
+                    None,
+                    None,
+                )
+                mock_storage_class.return_value = mock_storage
+
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
+
+                result = await tool.run_json_async(
+                    {
+                        "name": "zero_tools_agent",
+                        "description": "Agent with explicitly zero tools",
+                        "instructions": "Agent with explicitly zero tools",
+                        "tool_categories": [],
+                    }
+                )
+
+                assert result["status"] == "success"
+
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "zero_tools_agent")
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.tool_categories == []
+                finally:
+                    verify_db.close()
+
+        finally:
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
     async def test_create_agent_duplicate_name_auto_renames(self) -> None:
         """Test that duplicate agent names are auto-renamed and created."""
         db, db_path, SessionLocal = _create_session()

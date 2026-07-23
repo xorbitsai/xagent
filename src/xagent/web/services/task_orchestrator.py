@@ -559,7 +559,15 @@ def _begin_turn_atomic_sync(
         # in the same transaction). Keeps commit as the last fallible DB op,
         # so there is no post-commit window where the row is RUNNING but this
         # helper still raises.
-        status, updated_at, source, stored_run_id, state_version, control_state = (
+        (
+            status,
+            updated_at,
+            source,
+            stored_run_id,
+            state_version,
+            control_state,
+            agent_config,
+        ) = (
             db.query(
                 Task.status,
                 Task.updated_at,
@@ -567,10 +575,41 @@ def _begin_turn_atomic_sync(
                 Task.run_id,
                 Task.state_version,
                 Task.control_state,
+                Task.agent_config,
             )
             .filter(Task.id == task_id)
             .one()
         )
+
+        if isinstance(agent_config, dict) and isinstance(
+            agent_config.get("workforce_run_id"), int
+        ):
+            # Workforce tasks: reject turns whose owning workforce was
+            # archived or whose live config drifted from the run's pinned
+            # fingerprint. CREATE turns are also gated: although
+            # ``create_workforce_run`` validates upstream, an archive can
+            # commit between that commit and this claim (its cancellation
+            # sweep marks the run cancelled but cannot stop a turn that never
+            # started) — this check is the last line before execution. The
+            # workforce_run_id probe piggybacks on the snapshot SELECT above,
+            # so non-workforce tasks pay zero extra roundtrips; a rejection
+            # raises before commit, rolling the claim back and preserving the
+            # "only raises before commit" invariant.
+            from .workforce_runtime import (
+                WorkforceTurnRejectedError,
+                ensure_workforce_turn_allowed,
+            )
+
+            try:
+                ensure_workforce_turn_allowed(
+                    db,
+                    task_id=task_id,
+                    task_owner_user_id=task_owner_user_id,
+                    agent_config=agent_config,
+                )
+            except WorkforceTurnRejectedError as exc:
+                db.rollback()
+                raise TaskTurnError(exc.reason) from exc
 
         db.commit()
     except (TaskTurnError, TaskTurnNotFoundError):

@@ -1,6 +1,11 @@
 "use client"
 
-import { apiRequest } from "@/lib/api-wrapper"
+import {
+  apiRequest,
+  getApiErrorMessage,
+  isJsonRecord,
+  parseApiResponse,
+} from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import type {
   WorkforceAgentOption,
@@ -20,6 +25,26 @@ import type {
   WorkforceWorkerPayload,
   WorkforceWorkerUpdatePayload,
 } from "@/types/workforce"
+
+export type WorkforceDiscardErrorCode =
+  | "workforce_not_discardable"
+  | "workforce_has_runs"
+
+export class WorkforceDiscardError extends Error {
+  readonly code: WorkforceDiscardErrorCode
+
+  constructor(code: WorkforceDiscardErrorCode, message: string) {
+    super(message)
+    this.name = "WorkforceDiscardError"
+    this.code = code
+  }
+}
+
+function isWorkforceDiscardErrorCode(
+  value: unknown,
+): value is WorkforceDiscardErrorCode {
+  return value === "workforce_not_discardable" || value === "workforce_has_runs"
+}
 
 function formatApiDetail(detail: unknown, fallback: string): string {
   if (typeof detail === "string" && detail.trim()) {
@@ -42,12 +67,14 @@ function formatApiDetail(detail: unknown, fallback: string): string {
 }
 
 async function parseApiError(response: Response, fallback: string): Promise<Error> {
-  try {
-    const data = await response.json()
-    return new Error(formatApiDetail(data?.detail, fallback))
-  } catch {
-    return new Error(fallback)
+  const parsed = await parseApiResponse(response)
+  if (isJsonRecord(parsed.data)) {
+    const detailMessage = formatApiDetail(parsed.data.detail, "")
+    if (detailMessage) {
+      return new Error(detailMessage)
+    }
   }
+  return new Error(getApiErrorMessage(response, parsed, fallback))
 }
 
 function jsonHeaders(): HeadersInit {
@@ -135,6 +162,40 @@ export async function archiveWorkforce(
     throw await parseApiError(response, "Failed to archive workforce")
   }
   return response.json()
+}
+
+export async function discardWorkforce(
+  workforceId: number | string,
+  fallbackErrorMessage: string,
+): Promise<void> {
+  let response: Response
+  try {
+    response = await apiRequest(
+      `${getApiUrl()}/api/workforces/${workforceId}/discard`,
+      { method: "POST" },
+    )
+  } catch {
+    throw new Error(fallbackErrorMessage)
+  }
+  if (!response.ok) {
+    let parsed: Awaited<ReturnType<typeof parseApiResponse>>
+    try {
+      parsed = await parseApiResponse(response)
+    } catch {
+      throw new Error(fallbackErrorMessage)
+    }
+    if (
+      isJsonRecord(parsed.data) &&
+      isJsonRecord(parsed.data.detail) &&
+      isWorkforceDiscardErrorCode(parsed.data.detail.code)
+    ) {
+      throw new WorkforceDiscardError(
+        parsed.data.detail.code,
+        fallbackErrorMessage,
+      )
+    }
+    throw new Error(fallbackErrorMessage)
+  }
 }
 
 export async function publishWorkforce(

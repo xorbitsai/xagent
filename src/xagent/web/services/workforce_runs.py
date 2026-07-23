@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus
@@ -19,6 +20,7 @@ from .connector_runtime import (
 )
 from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 from .workforce_access import ensure_workforce_access, get_workforce_policy
+from .workforce_lifecycle import acquire_workforce_lifecycle_fence
 from .workforce_runtime import mark_workforce_task_status, sync_workforce_run_status
 from .workforce_snapshot import (
     build_workforce_snapshot,
@@ -31,7 +33,10 @@ from .workforce_snapshot import (
 class WorkforceRunStartResult:
     workforce_run: WorkforceRun
     task: Task
-    background_task: asyncio.Task[None]
+    # None when an idempotency_key matched an existing run and no new turn
+    # was started (created is False in that case).
+    background_task: asyncio.Task[None] | None
+    created: bool = True
 
 
 def normalize_execution_mode(value: str | None) -> str:
@@ -59,6 +64,55 @@ def _normalize_selected_file_ids(values: list[str] | None) -> list[str]:
 def _build_task_title(workforce: Workforce, message: str) -> str:
     title = f"{workforce.name}: {message}"
     return title[:50] + "..." if len(title) > 50 else title
+
+
+def _normalize_run_source(value: str | None) -> str:
+    normalized = (value or "internal").strip().lower()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Invalid run source")
+    return normalized
+
+
+def _normalize_idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 128:
+        raise HTTPException(status_code=400, detail="Invalid idempotency key")
+    return normalized
+
+
+def _replay_existing_run_by_idempotency_key(
+    db: Session, workforce: Workforce, idempotency_key: str
+) -> WorkforceRunStartResult | None:
+    """Resolve an idempotency-key replay to the original run, if any.
+
+    Raises 409 when the key was already used but its task is gone
+    (``task_id`` is ``SET NULL`` on task deletion): the original result can
+    no longer be replayed, and inserting a fresh run under the same key
+    would only trip the unique index.
+    """
+    existing = (
+        db.query(WorkforceRun)
+        .filter(
+            WorkforceRun.workforce_id == int(workforce.id),
+            WorkforceRun.idempotency_key == idempotency_key,
+        )
+        .first()
+    )
+    if existing is None:
+        return None
+    if existing.task is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency key was already used by a run whose task no longer exists",
+        )
+    return WorkforceRunStartResult(
+        workforce_run=existing,
+        task=cast(Task, existing.task),
+        background_task=None,
+        created=False,
+    )
 
 
 def _bind_selected_files_to_task(
@@ -101,24 +155,49 @@ async def create_workforce_run(
     execution_mode: str | None = None,
     is_preview: bool = False,
     is_visible: bool = True,
+    source: str | None = None,
+    idempotency_key: str | None = None,
 ) -> WorkforceRunStartResult:
     workforce = ensure_workforce_access(db, user, workforce, action="run")
+    workforce_id = int(workforce.id)
     normalized_message = normalize_text(message, "message", required=True)
+    normalized_source = _normalize_run_source(source)
+    normalized_idempotency_key = _normalize_idempotency_key(idempotency_key)
+
+    if normalized_idempotency_key is not None:
+        replayed = _replay_existing_run_by_idempotency_key(
+            db, workforce, normalized_idempotency_key
+        )
+        if replayed is not None:
+            return replayed
 
     selected_files = _normalize_selected_file_ids(selected_file_ids)
-    snapshot = build_workforce_snapshot(
-        db,
-        user,
-        workforce,
-        is_preview=is_preview,
-    )
-    policy = get_workforce_policy()
-    policy.before_workforce_run(db, user, workforce)
-    manager_execution_mode = normalize_execution_mode(
-        execution_mode or cast(Any, workforce.manager_agent).execution_mode
-    )
 
     try:
+        # The lifecycle fence takes a real row lock (a no-op UPDATE, so it
+        # also locks on SQLite where SELECT FOR UPDATE is ignored) and
+        # re-reads the current row; building the snapshot below re-validates
+        # archived/active UNDER that lock, closing the TOCTOU window against
+        # a concurrent archive whose cancellation sweep could not see this
+        # run's uncommitted insert.
+        workforce = ensure_workforce_access(
+            db,
+            user,
+            acquire_workforce_lifecycle_fence(db, workforce_id),
+            action="run",
+        )
+        snapshot = build_workforce_snapshot(
+            db,
+            user,
+            workforce,
+            is_preview=is_preview,
+        )
+        policy = get_workforce_policy()
+        policy.before_workforce_run(db, user, workforce)
+        manager_execution_mode = normalize_execution_mode(
+            execution_mode or cast(Any, workforce.manager_agent).execution_mode
+        )
+
         task = Task(
             user_id=int(user.id),
             title=_build_task_title(workforce, normalized_message),
@@ -130,7 +209,7 @@ async def create_workforce_run(
                 selected_file_ids=selected_files,
             ),
             execution_mode=manager_execution_mode,
-            source="internal",
+            source=normalized_source,
             is_visible=is_visible,
         )
         selected_refs = prepare_connector_runtime_selection_snapshot(
@@ -152,6 +231,7 @@ async def create_workforce_run(
             user_id=int(user.id),
             status="pending",
             is_preview=is_preview,
+            idempotency_key=normalized_idempotency_key,
             snapshot=snapshot,
         )
         db.add(workforce_run)
@@ -169,6 +249,18 @@ async def create_workforce_run(
         )
         policy.after_workforce_run_created(db, user, workforce, workforce_run, task)
         db.commit()
+    except IntegrityError:
+        # Two concurrent calls with the same idempotency_key both passed the
+        # pre-insert lookup; the unique index let exactly one win. Return the
+        # winner's run instead of surfacing the constraint violation.
+        db.rollback()
+        if normalized_idempotency_key is not None:
+            replayed = _replay_existing_run_by_idempotency_key(
+                db, workforce, normalized_idempotency_key
+            )
+            if replayed is not None:
+                return replayed
+        raise
     except Exception:
         db.rollback()
         raise

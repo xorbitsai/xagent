@@ -20,6 +20,7 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import task_orchestrator as task_orchestrator_module
+from xagent.web.services import workforce_runs as workforce_runs_module
 from xagent.web.services.task_lease_service import acquire_task_lease
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_runs import create_workforce_run
@@ -277,6 +278,50 @@ async def test_create_workforce_run_allows_draft_only_for_preview(
     assert result.task.is_visible is False
     assert result.workforce_run.status == "running"
     assert result.workforce_run.is_preview is True
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_revalidates_after_lifecycle_fence(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    worker_agent = _create_agent(db_session, user, "Analyst")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, worker_agent)
+    db_session.commit()
+
+    fence_calls: list[int] = []
+
+    def fake_fence(db: Session, workforce_id: int) -> Workforce:
+        assert db is db_session
+        fence_calls.append(workforce_id)
+        workforce.status = "archived"
+        return workforce
+
+    monkeypatch.setattr(
+        workforce_runs_module,
+        "acquire_workforce_lifecycle_fence",
+        fake_fence,
+        raising=False,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_workforce_run(
+            db_session,
+            user,
+            workforce,
+            message="Run after archive wins",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Archived workforce cannot run"
+    assert fence_calls == [int(workforce.id)]
+    assert db_session.query(Task).count() == 0
+    assert db_session.query(WorkforceRun).count() == 0
 
 
 @pytest.mark.asyncio

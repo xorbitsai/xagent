@@ -1,5 +1,6 @@
 "use client"
 
+import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
@@ -11,6 +12,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { getChannelTooltip, getCompactChannelName } from "@/lib/channel-display"
 import { toast } from "@/components/ui/sonner"
 import extraNav from "@/lib/extra-nav"
 import {
@@ -39,6 +41,8 @@ import {
   MoreHorizontal,
   Edit2,
   Search,
+  Radio,
+  Send,
   ChevronsUpDown,
 } from "lucide-react"
 import {
@@ -69,6 +73,7 @@ interface Task {
   agent_logo_url?: string
   channel_id?: number
   channel_name?: string
+  channel_type?: string
 }
 
 interface VersionInfo {
@@ -81,6 +86,35 @@ interface VersionInfo {
 }
 
 const TASKS_PER_PAGE = 10
+
+const CHANNEL_ICON_PATHS: Record<string, string> = {
+  feishu: "/icons/channels/feishu.svg",
+}
+
+function ChannelTypeIcon({ channelType }: { channelType?: string }) {
+  const normalizedType = channelType?.trim().toLowerCase()
+  if (!normalizedType) return null
+
+  if (normalizedType === "telegram") {
+    return <Send className="h-3 w-3 flex-shrink-0 text-[#229ED9]" aria-hidden="true" />
+  }
+
+  const iconPath = CHANNEL_ICON_PATHS[normalizedType]
+  if (iconPath) {
+    return (
+      <Image
+        src={iconPath}
+        alt=""
+        width={12}
+        height={12}
+        className="h-3 w-3 flex-shrink-0"
+        unoptimized
+        aria-hidden="true"
+      />
+    )
+  }
+  return <Radio className="h-3 w-3 flex-shrink-0" aria-hidden="true" />
+}
 
 function formatStars(stars: number): string {
   if (stars >= 1000000) return `${(stars / 1000000).toFixed(1)}M`
@@ -847,6 +881,9 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                 <>
                   {tasks.map(task => {
                     const currentTaskId = getCurrentTaskId();
+                    const compactChannelName = task.channel_name
+                      ? getCompactChannelName(task.channel_name, task.channel_type)
+                      : null
                     return (
                       <Link
                         key={task.task_id}
@@ -898,9 +935,14 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                         ) : (
                           <span className="truncate flex-1 text-left flex items-center gap-2">
                             <span className="truncate">{task.title || "Untitled Task"}</span>
-                            {task.channel_name && (
-                              <span className="text-[10px] text-muted-foreground bg-accent/50 px-1.5 rounded flex-shrink-0 border border-border/50">
-                                {task.channel_name}
+                            {task.channel_name && compactChannelName && (
+                              <span
+                                className="inline-flex max-w-[88px] flex-shrink-0 items-center gap-1 rounded border border-border/50 bg-accent/50 px-1.5 text-[10px] text-muted-foreground"
+                                title={getChannelTooltip(task.channel_name, task.channel_type)}
+                                aria-label={getChannelTooltip(task.channel_name, task.channel_type)}
+                              >
+                                <ChannelTypeIcon channelType={task.channel_type} />
+                                <span className="truncate">{compactChannelName}</span>
                               </span>
                             )}
                           </span>

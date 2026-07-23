@@ -10,6 +10,10 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Textarea } from "@/components/ui/textarea"
 import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
 import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
+import {
+  AgentDeleteDialog,
+  type AgentDeletePendingAction,
+} from "@/components/build/agent-delete-dialog"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -23,7 +27,15 @@ import {
   canRunAgent,
   getAgentChatHref,
 } from "@/lib/agent-ui-access"
-import { ConfirmDialog } from "@/components/ui/confirm-dialog"
+import {
+  requestAgentDeletion,
+  type AgentDeleteConflictDetail,
+  type AgentDeleteWorkforceReference,
+} from "@/lib/agent-delete"
+import {
+  discardWorkforce,
+  WorkforceDiscardError,
+} from "@/lib/workforces-api"
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { useVoiceInputControls } from "@/components/voice-input-controller"
@@ -72,6 +84,9 @@ export default function BuildsPage() {
   const searchParams = useSearchParams()
   const hasAutoOpenedCreateRef = useRef(false)
   const createPromptRef = useRef<HTMLTextAreaElement | null>(null)
+  const isMountedRef = useRef(false)
+  const agentListRequestGenerationRef = useRef(0)
+  const agentDeleteActionGenerationRef = useRef(0)
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
@@ -104,22 +119,48 @@ export default function BuildsPage() {
 
   // Fetch agents on mount
   const fetchAgents = async () => {
+    if (!isMountedRef.current) return
+    const requestGeneration = agentListRequestGenerationRef.current + 1
+    agentListRequestGenerationRef.current = requestGeneration
+
     try {
       setLoading(true)
       const response = await apiRequest(`${getApiUrl()}/api/agents`)
       if (response.ok) {
         const data = await response.json()
+        if (
+          !isMountedRef.current ||
+          requestGeneration !== agentListRequestGenerationRef.current
+        ) {
+          return
+        }
         setAgents(data)
       }
     } catch (error) {
-      console.error("Failed to fetch agents:", error)
+      if (
+        isMountedRef.current &&
+        requestGeneration === agentListRequestGenerationRef.current
+      ) {
+        console.error("Failed to fetch agents:", error)
+      }
     } finally {
-      setLoading(false)
+      if (
+        isMountedRef.current &&
+        requestGeneration === agentListRequestGenerationRef.current
+      ) {
+        setLoading(false)
+      }
     }
   }
 
   useEffect(() => {
-    fetchAgents()
+    isMountedRef.current = true
+    void fetchAgents()
+    return () => {
+      isMountedRef.current = false
+      agentListRequestGenerationRef.current += 1
+      agentDeleteActionGenerationRef.current += 1
+    }
   }, [])
 
   const handlePublish = async (agentId: number) => {
@@ -148,34 +189,135 @@ export default function BuildsPage() {
     }
   }
 
-  const [agentToDelete, setAgentToDelete] = useState<number | null>(null)
-  const [isDeletingAgent, setIsDeletingAgent] = useState(false)
+  const [agentDeleteSession, setAgentDeleteSession] = useState<{
+    target: { id: number; name: string }
+    conflict: AgentDeleteConflictDetail | null
+  } | null>(null)
+  const [agentDeletePendingAction, setAgentDeletePendingAction] =
+    useState<AgentDeletePendingAction>(null)
 
   const confirmDeleteAgent = async () => {
-    if (agentToDelete === null) return
-    const agentId = agentToDelete
-    setIsDeletingAgent(true)
+    if (!agentDeleteSession || agentDeletePendingAction) return
+    const session = agentDeleteSession
+    const actionGeneration = agentDeleteActionGenerationRef.current + 1
+    agentDeleteActionGenerationRef.current = actionGeneration
+    const isCurrentAction = () =>
+      isMountedRef.current &&
+      actionGeneration === agentDeleteActionGenerationRef.current
+    setAgentDeletePendingAction({ kind: "delete" })
 
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}`, {
-        method: "DELETE",
-      })
-      if (response.ok) {
-        fetchAgents() // Refresh list
-        setAgentToDelete(null)
-      } else {
-        toast.error(t('common.deleteFailed'))
+      const result = await requestAgentDeletion(
+        session.target.id,
+        t("common.deleteFailed"),
+      )
+      if (!isCurrentAction()) return
+      if (result.kind === "blocked") {
+        setAgentDeleteSession((current) =>
+          current?.target.id === session.target.id
+            ? { ...current, conflict: result.conflict }
+            : current,
+        )
+        toast.error(
+          t("builds.list.deleteDialog.blockedToast", {
+            name: session.target.name,
+          }),
+        )
+        return
       }
+
+      setAgents((current) =>
+        current.filter((agent) => agent.id !== session.target.id),
+      )
+      setAgentDeleteSession((current) =>
+        current?.target.id === session.target.id ? null : current,
+      )
+      void fetchAgents()
     } catch (error) {
+      if (!isCurrentAction()) return
       console.error("Failed to delete agent:", error)
-      toast.error(t('common.deleteFailed'))
+      toast.error(
+        error instanceof Error ? error.message : t("common.deleteFailed"),
+      )
     } finally {
-      setIsDeletingAgent(false)
+      if (isCurrentAction()) {
+        setAgentDeletePendingAction(null)
+      }
     }
   }
 
-  const handleDelete = (agentId: number) => {
-    setAgentToDelete(agentId)
+  const handleDiscardWorkforce = async (
+    reference: AgentDeleteWorkforceReference,
+  ) => {
+    if (!agentDeleteSession || agentDeletePendingAction) return
+    const session = agentDeleteSession
+    const actionGeneration = agentDeleteActionGenerationRef.current + 1
+    agentDeleteActionGenerationRef.current = actionGeneration
+    const isCurrentAction = () =>
+      isMountedRef.current &&
+      actionGeneration === agentDeleteActionGenerationRef.current
+    setAgentDeletePendingAction({
+      kind: "discard",
+      workforceId: reference.workforce_id,
+    })
+
+    try {
+      await discardWorkforce(
+        reference.workforce_id,
+        t("builds.list.deleteDialog.discardFailed", {
+          name: reference.name,
+        }),
+      )
+      if (!isCurrentAction()) return
+      setAgentDeleteSession((current) => {
+        if (
+          current?.target.id !== session.target.id ||
+          current.conflict === null
+        ) {
+          return current
+        }
+
+        return {
+          ...current,
+          conflict: {
+            ...current.conflict,
+            references: current.conflict.references.filter(
+              (item) => item.workforce_id !== reference.workforce_id,
+            ),
+          },
+        }
+      })
+    } catch (error) {
+      if (!isCurrentAction()) return
+      if (error instanceof WorkforceDiscardError) {
+        toast.error(t(
+          error.code === "workforce_has_runs"
+            ? "builds.list.deleteDialog.discardHasRuns"
+            : "builds.list.deleteDialog.discardNotAllowed",
+          { name: reference.name },
+        ))
+      } else {
+        console.error("Failed to discard workforce:", error)
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : t("builds.list.deleteDialog.discardFailed", {
+                name: reference.name,
+              }),
+        )
+      }
+    } finally {
+      if (isCurrentAction()) {
+        setAgentDeletePendingAction(null)
+      }
+    }
+  }
+
+  const handleDelete = (agent: Agent) => {
+    setAgentDeleteSession({
+      target: { id: agent.id, name: agent.name },
+      conflict: null,
+    })
   }
 
   // Filter agents based on search term
@@ -479,7 +621,7 @@ export default function BuildsPage() {
                                       className="justify-start px-2 py-1.5 h-auto font-normal text-sm text-destructive hover:text-destructive hover:bg-destructive/10"
                                       onClick={(e) => {
                                         e.stopPropagation()
-                                        handleDelete(agent.id)
+                                        handleDelete(agent)
                                       }}
                                     >
                                       <Trash2 className="mr-2 h-4 w-4" />
@@ -599,12 +741,15 @@ export default function BuildsPage() {
         )}
       </div>
 
-      <ConfirmDialog
-        isOpen={agentToDelete !== null}
-        onOpenChange={(open) => !open && setAgentToDelete(null)}
-        onConfirm={confirmDeleteAgent}
-        isLoading={isDeletingAgent}
-        description={t('builds.list.actions.deleteConfirm')}
+      <AgentDeleteDialog
+        target={agentDeleteSession?.target ?? null}
+        conflict={agentDeleteSession?.conflict ?? null}
+        pendingAction={agentDeletePendingAction}
+        onOpenChange={(open) => {
+          if (!open) setAgentDeleteSession(null)
+        }}
+        onConfirmDelete={confirmDeleteAgent}
+        onDiscardWorkforce={handleDiscardWorkforce}
       />
 
       {/* Deploy Agent Dialog */}

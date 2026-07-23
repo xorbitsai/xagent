@@ -22,6 +22,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { toast } from "@/components/ui/sonner"
+import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
@@ -55,8 +56,8 @@ interface AgentSshBindingsProps {
 
 /**
  * SSH target bindings for an agent. Bindings are a per-agent sub-resource
- * (POST/GET/DELETE /api/agents/{id}/ssh-targets, SaaS-only), managed inline
- * rather than folded into the agent save — so they need an existing agent.
+ * (POST/GET/DELETE /api/agents/{id}/ssh-targets), managed inline rather than
+ * folded into the agent save — so they need an existing agent.
  */
 export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSshBindingsProps) {
   const { t } = useI18n()
@@ -67,6 +68,7 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
   const [capabilities, setCapabilities] = useState<string[]>(["execute"])
   const [approvalPolicy, setApprovalPolicy] = useState<string>("always")
   const [submitting, setSubmitting] = useState(false)
+  const { inTeam } = useAuth()
 
   const load = useCallback(async () => {
     if (!agentId) return
@@ -78,7 +80,7 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
         onCount?.(data.length)
       }
     } catch {
-      // ponytail: silent load failure; section just shows empty
+      // Silent load failure; the section just shows empty.
     }
   }, [agentId, onCount])
 
@@ -93,7 +95,7 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
         const res = await apiRequest(`${getApiUrl()}/api/ssh/targets?scope=user`)
         if (res.ok) setTargets(await res.json())
       } catch {
-        // ponytail: silent picker-load failure; dropdown stays empty
+        // Silent picker-load failure; the dropdown stays empty.
       }
     })()
   }, [dialogOpen])
@@ -158,6 +160,8 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
       toast.error(e instanceof Error ? e.message : String(e))
     }
   }
+
+  if (!inTeam) return null
 
   return (
     <div className="space-y-2">

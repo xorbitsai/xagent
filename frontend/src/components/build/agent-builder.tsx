@@ -49,6 +49,7 @@ import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches } from "@/lib
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
+import { AgentSshBindings } from "./agent-ssh-bindings"
 import { AgentFlowView } from "./agent-flow-view"
 import {
   AgentTrigger,
@@ -269,6 +270,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [selectedSkills, setSelectedSkills] = useState<string[]>([])
   const [selectedToolCategories, setSelectedToolCategories] = useState<string[]>([])
   const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([])
+  // Whether this agent has any bound SSH target. Like connectors, an SSH
+  // binding auto-enables its tool category ("ssh") at save/preview time
+  // without the user picking it in the tool-category selector.
+  const [hasSshBindings, setHasSshBindings] = useState(false)
+  const handleSshBindingCount = useCallback((n: number) => setHasSshBindings(n > 0), [])
   const [logoFile, setLogoFile] = useState<File | null>(null)
   const [logoUrl, setLogoUrl] = useState<string | null>(null)  // Existing logo URL
   const [isCreating, setIsCreating] = useState(false)
@@ -1060,6 +1066,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       selectedMcpServers.forEach(server => {
         finalToolCategories.push(`mcp:${server}`)
       })
+      if (hasSshBindings && !finalToolCategories.includes("ssh")) {
+        finalToolCategories.push("ssh")
+      }
 
       if (!previewTaskId) {
         const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
@@ -1340,6 +1349,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     let finalToolCategories = [...selectedToolCategories]
     if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
       finalToolCategories.push("knowledge")
+    }
+    if (hasSshBindings && !finalToolCategories.includes("ssh")) {
+      finalToolCategories.push("ssh")
     }
 
     // Add selected MCP servers back into tool_categories
@@ -2543,6 +2555,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             <Zap className="mr-1 h-3.5 w-3.5" />
             {t("triggers.builder.open")}
           </Button>
+        </div>
+
+        {/* SSH targets — per-agent bindings (SaaS; managed inline, needs a saved agent) */}
+        <div className={getConfigSectionClasses(false)}>
+          <AgentSshBindings
+            agentId={localAgentId}
+            readOnly={readOnly}
+            onCount={handleSshBindingCount}
+          />
         </div>
 
         {/* Suggested Prompts */}

@@ -1146,6 +1146,65 @@ class TestModelAPI:
         assert openai["category"] == ["llm", "embedding"]
         assert openai["default_base_url"] == "https://api.openai.com/v1"
 
+    def test_list_supported_providers_includes_openai_compatible(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        openai_compatible = next(
+            (
+                provider
+                for provider in providers
+                if provider["id"] == "openai-compatible"
+            ),
+            None,
+        )
+        assert openai_compatible is not None
+        assert openai_compatible["name"] == "OpenAI-Compatible"
+        assert openai_compatible["category"] == ["llm", "embedding"]
+        assert openai_compatible["requires_base_url"] is True
+        assert openai_compatible.get("default_base_url") is None
+
+    def test_fetch_openai_compatible_provider_models_is_wired(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """Regression test: openai-compatible must be registered in
+        PROVIDER_FETCHERS, or this endpoint 400s with "Unsupported provider".
+        Only the network-facing SDK call is faked; the real PROVIDER_FETCHERS
+        entry (or absence of one) is exercised as-is."""
+        from xagent.core.model.chat.basic.openai import OpenAILLM
+
+        async def fake_list_available_models(api_key, base_url=None):
+            return [
+                {
+                    "id": "custom-model",
+                    "object": "model",
+                    "owned_by": "openai-compatible",
+                }
+            ]
+
+        monkeypatch.setattr(
+            OpenAILLM, "list_available_models", fake_list_available_models
+        )
+
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={
+                "api_key": "test-api-key",
+                "base_url": "https://custom.example.com/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [model["id"] for model in data["models"]] == ["custom-model"]
+
     def test_list_supported_providers_includes_elevenlabs_audio_generation(
         self, test_db, regular_user, regular_headers
     ):

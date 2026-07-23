@@ -261,6 +261,14 @@ class ModelConnectionTestRequest(BaseModel):
     top_n: Optional[int] = None
     instruct: Optional[str] = None
 
+    @field_validator("model_name", "base_url", "api_key", mode="before")
+    @classmethod
+    def strip_string_fields(cls, v: Any) -> Any:
+        """Strip whitespace from string fields"""
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
 
 class UserDefaultModelCreate(BaseModel):
     """User default model configuration creation schema"""
@@ -386,6 +394,14 @@ class FetchProviderModelsRequest(BaseModel):
     provider: str
     api_key: str
     base_url: Optional[str] = None
+
+    @field_validator("base_url", "api_key", mode="before")
+    @classmethod
+    def strip_string_fields(cls, v: Any) -> Any:
+        """Strip whitespace from string fields"""
+        if isinstance(v, str):
+            return v.strip()
+        return v
 
 
 class FetchMultipleProvidersRequest(BaseModel):

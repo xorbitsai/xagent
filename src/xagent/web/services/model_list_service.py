@@ -408,6 +408,7 @@ async def fetch_byteplus_ark_video_models(
 # Provider registry mapping provider names to their fetch functions
 PROVIDER_FETCHERS: Dict[str, Any] = {
     "openai": fetch_openai_models,
+    "openai-compatible": fetch_openai_models,
     "openrouter": fetch_openai_models,
     "deepseek": fetch_deepseek_models,
     "dashscope": fetch_openai_models,

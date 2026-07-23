@@ -733,6 +733,9 @@ export function ModelManagementDialog({
     }
   }
 
+  const selectedProvider = providers.find(p => p.id === formData.model_provider)
+  const baseUrlRequired = !!selectedProvider?.requires_base_url
+
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onOpenChange}>
@@ -955,10 +958,7 @@ export function ModelManagementDialog({
                 },
                 {
                   label: t('models.dialog.connect.step2'),
-                  content: (() => {
-                    const selectedProvider = providers.find(p => p.id === formData.model_provider)
-                    const baseUrlRequired = !!selectedProvider?.requires_base_url
-                    return (
+                  content: (
                     <div className="flex flex-col gap-6">
                       {selectedProvider && (
                         <div className="flex items-center gap-3 p-4 border rounded-md">
@@ -1040,8 +1040,7 @@ export function ModelManagementDialog({
                         </Button>
                       </div>
                     </div>
-                    )
-                  })()
+                  )
                 },
                 {
                   label: t('models.dialog.connect.step3'),

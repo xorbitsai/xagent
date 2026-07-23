@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 
 import asyncssh
 
 from xagent.core.ssh.errors import SshError, SshErrorCode
+
+# Re-exported so existing tests keep importing it from helpers; the real
+# implementation now lives in core as the runner-local materializer.
+from xagent.core.ssh.materializer import LocalTmpSecretMaterializer  # noqa: F401
 from xagent.core.ssh.types import (
     BoundTargetInfo,
-    MaterializedSshPaths,
     ResolvedSshTarget,
     SensitiveSshCredential,
     SshExecutionContext,
@@ -59,60 +59,6 @@ class InMemorySshSecretStore:
         return credential
 
 
-class LocalTmpSecretMaterializer:
-    """Materializes secrets to a local private temp dir (test/reference impl).
-
-    Ignores the sandbox argument: Phase 0 has no real sandbox. It exists to
-    lock down the security-critical behavior — 0700 dir, 0600 files, cleanup
-    on every exit path — before real sandbox adapters land in Phase 3.
-    """
-
-    @asynccontextmanager
-    async def materialize_ssh(
-        self,
-        sandbox: object,
-        credential: SensitiveSshCredential,
-        known_hosts: str,
-    ) -> AsyncIterator[MaterializedSshPaths]:
-        directory = tempfile.mkdtemp(prefix="xagent-ssh-")
-        os.chmod(directory, 0o700)
-        key_path = os.path.join(directory, "id_key")
-        known_hosts_path = os.path.join(directory, "known_hosts")
-        try:
-            _write_private(key_path, credential.private_key)
-            _write_private(known_hosts_path, known_hosts.encode("utf-8"))
-            yield MaterializedSshPaths(private_key_path=key_path, known_hosts_path=known_hosts_path)
-        finally:
-            for path in (key_path, known_hosts_path):
-                _best_effort_shred(path)
-            if os.path.isdir(directory):
-                os.rmdir(directory)
-
-
-def _write_private(path: str, data: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
-
-
-def _best_effort_shred(path: str) -> None:
-    if not os.path.exists(path):
-        return
-    try:
-        size = os.path.getsize(path)
-        fd = os.open(path, os.O_WRONLY)
-        try:
-            os.write(fd, b"\x00" * size)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-    with suppress(OSError):
-        os.unlink(path)
-
-
 @dataclass
 class RunningSshServer:
     """A local test SSH server bound to loopback."""
@@ -138,8 +84,14 @@ class _EchoServer(asyncssh.SSHServer):
 
 
 async def _handle_session(process: asyncssh.SSHServerProcess) -> None:
-    # Echo the requested command back; enough to prove connectivity.
+    # Echo the requested command back; enough to prove connectivity. A
+    # "sleep <secs>" command blocks first, so tests can exercise timeouts.
     command = process.command or ""
+    if command.startswith("sleep "):
+        import asyncio
+
+        with suppress(IndexError, ValueError):
+            await asyncio.sleep(float(command.split()[1]))
     process.stdout.write(f"ran: {command}")
     process.exit(0)
 

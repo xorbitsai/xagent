@@ -32,6 +32,7 @@ class ToolCategory(str, Enum):
     MCP = "mcp"
     DATABASE = "database"
     SKILL = "skill"
+    SSH = "ssh"
     OTHER = "other"
 
 
@@ -122,8 +123,7 @@ class AbstractBaseTool(ABC, Tool):
             read_only=getattr(self, "read_only", False),
             # read_only implies concurrency_safe; fall back to the explicit flag.
             concurrency_safe=(
-                getattr(self, "concurrency_safe", False)
-                or getattr(self, "read_only", False)
+                getattr(self, "concurrency_safe", False) or getattr(self, "read_only", False)
             ),
         )
 

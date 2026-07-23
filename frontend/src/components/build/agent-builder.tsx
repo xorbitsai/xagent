@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, isJsonRecord } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
 import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
@@ -139,6 +139,37 @@ interface TemplateRequirements {
 // write): `agent` (multi-agent delegation) is configured through Workforce
 // instead (issue #802), and `other` is an internal fallback bucket.
 const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
+function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
+  if (!isJsonRecord(error)) return fallback
+
+  const detail = error.detail
+  const detailMessage = readNonEmptyString(detail)
+  if (detailMessage) return detailMessage
+
+  if (isJsonRecord(detail)) {
+    const message = readNonEmptyString(detail.message)
+    if (message) return message
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        const itemMessage = readNonEmptyString(item)
+        if (itemMessage) return itemMessage
+        if (!isJsonRecord(item)) return null
+        return readNonEmptyString(item.msg) ?? readNonEmptyString(item.message)
+      })
+      .filter((message): message is string => message !== null)
+    if (messages.length > 0) return messages.join("; ")
+  }
+
+  return readNonEmptyString(error.message) ?? fallback
+}
 
 // One-time reveal of auto-generated webhook secrets. Rendered both inside the
 // creation success dialog and inline in the config form (retry path / while
@@ -1443,8 +1474,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // But for the dialog purpose, we have what we need.
         }
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.unknown"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getAgentUpdateErrorMessage(error, t("builds.editor.error.unknown"))
+        )
       }
     } catch (error) {
       console.error("Failed to save agent:", error)

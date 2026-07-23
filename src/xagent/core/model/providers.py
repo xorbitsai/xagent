@@ -318,6 +318,20 @@ def provider_compatibility_for_provider(provider: str) -> Optional[str]:
     return None
 
 
+def provider_requires_base_url(provider: str) -> bool:
+    """True when the provider's metadata marks base_url as mandatory.
+
+    Unregistered providers (including provider+category combos like
+    "xinference-rerank") default to False rather than raising, since
+    callers already validate the provider exists via PROVIDER_FETCHERS.
+    """
+    provider_id = canonical_provider_name(provider)
+    for provider_info in _SUPPORTED_PROVIDER_METADATA:
+        if provider_info["id"] == provider_id:
+            return bool(provider_info.get("requires_base_url", False))
+    return False
+
+
 def get_supported_provider_metadata() -> list[dict[str, Any]]:
     providers: list[dict[str, Any]] = []
     for provider in _SUPPORTED_PROVIDER_METADATA:

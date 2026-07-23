@@ -29,11 +29,14 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: routerPushMock }),
 }))
 
+const toastMocks = vi.hoisted(() => ({
+  error: vi.fn(),
+  success: vi.fn(),
+  info: vi.fn(),
+}))
+
 vi.mock("@/components/ui/sonner", () => ({
-  toast: {
-    error: vi.fn(),
-    success: vi.fn(),
-  },
+  toast: toastMocks,
 }))
 
 vi.mock("@/lib/clipboard", () => ({
@@ -265,6 +268,260 @@ describe("AgentTriggersDialog", () => {
 
     expect(await screen.findByText("triggers.gmail.accountMissing")).toBeInTheDocument()
   })
+
+  it("persists the detail switch immediately without pressing save", async () => {
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    await screen.findByLabelText("triggers.form.watchLabel")
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    fireEvent.click(detailSwitch)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/agents/42/triggers/9",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({ enabled: false }),
+        }),
+      )
+    })
+    expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+  })
+
+  it("shows the one-time webhook secret on the overview after a quick-toggle create", async () => {
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers" && options?.method === "POST") {
+        return Promise.resolve(
+          jsonResponse({
+            id: 11,
+            user_id: 1,
+            agent_id: 42,
+            type: "webhook",
+            name: "API / Webhook",
+            enabled: true,
+            config: {},
+            prompt_template: null,
+            webhook_token: "tok",
+            webhook_secret: "wh_secret_once",
+            next_run_at: null,
+            last_run_at: null,
+            last_error: null,
+            created_at: null,
+            updated_at: null,
+          }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    await screen.findByText("triggers.cards.webhook.title")
+    const [webhookSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(webhookSwitch)
+
+    // The secret alert appears on the overview itself — no navigation happens.
+    expect(await screen.findByText("wh_secret_once")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "common.back" })).not.toBeInTheDocument()
+  })
+
+  it("calls onChanged exactly once for a Done that commits an edit (no redundant refetch on close)", async () => {
+    // Mirrors the builder's wiring: onChanged is the sole resync signal:
+    // onOpenChange(false) must not ALSO trigger a refetch, or every Done
+    // commits fires the same GET twice.
+    const onChanged = vi.fn()
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        onChanged={onChanged}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    const nameInput = await screen.findByLabelText("triggers.form.name")
+    fireEvent.change(nameInput, { target: { value: "Renamed inbox" } })
+    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
+
+    await waitFor(() => {
+      expect(onChanged).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it("creates the trigger when the switch is turned on in the creation state (live)", async () => {
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    // The webhook type has no triggers yet, so this opens the creation form.
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.secret")
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+    fireEvent.click(detailSwitch)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/agents/42/triggers",
+        expect.objectContaining({
+          method: "POST",
+          body: expect.stringContaining("\"enabled\":true"),
+        }),
+      )
+    })
+  })
+
+  it("keeps the dialog open on Escape when a fresh create just revealed a webhook secret", async () => {
+    const onOpenChange = vi.fn()
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers" && options?.method === "POST") {
+        return Promise.resolve(
+          jsonResponse({
+            id: 12,
+            user_id: 1,
+            agent_id: 42,
+            type: "webhook",
+            name: "API / Webhook",
+            enabled: true,
+            config: {},
+            prompt_template: null,
+            webhook_token: "tok",
+            webhook_secret: "wh_escape_secret",
+            next_run_at: null,
+            last_run_at: null,
+            last_error: null,
+            created_at: null,
+            updated_at: null,
+          }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={onOpenChange}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.secret")
+    const [detailSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(detailSwitch)
+
+    expect(await screen.findByText("wh_escape_secret")).toBeInTheDocument()
+
+    // Escape must not drop a secret that only exists because it was just
+    // generated — unlike an ordinary validation failure, it is unrecoverable.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    await waitFor(() => {
+      expect(screen.getByText("wh_escape_secret")).toBeInTheDocument()
+    })
+    expect(onOpenChange).not.toHaveBeenCalledWith(false)
+
+    // Only once the secret is explicitly acknowledged does Escape close.
+    fireEvent.click(screen.getByRole("button", { name: "triggers.secret.dismiss" }))
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    await waitFor(() => {
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+  })
+
+  it("clears the dirty flag when the Gmail quick-toggle intent is reversed, so Done closes cleanly", async () => {
+    const onOpenChange = vi.fn()
+    // Zero connected accounts: the quick toggle must open the creation form
+    // instead of silently auto-binding (the default mock has exactly one).
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={onOpenChange}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    await screen.findByText("triggers.cards.webhook.title")
+    const switches = screen.getAllByRole("switch")
+    fireEvent.click(switches[2]) // Gmail card: no accounts connected
+
+    await screen.findByLabelText("triggers.form.watchLabel")
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+
+    // Reverse the intent before picking an account.
+    fireEvent.click(detailSwitch)
+    expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+
+    // Nothing else was edited, so Done must close without attempting (and
+    // failing) a phantom create.
+    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
+    await waitFor(() => {
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+    expect(toastMocks.error).not.toHaveBeenCalled()
+  })
+
+  it("keeps unsaved field edits when the detail switch is toggled", async () => {
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    const nameInput = await screen.findByLabelText("triggers.form.name")
+    fireEvent.change(nameInput, { target: { value: "Edited but unsaved" } })
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(detailSwitch)
+
+    await waitFor(() => {
+      expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+    })
+    expect(nameInput).toHaveValue("Edited but unsaved")
+  })
 })
 
 describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
@@ -294,6 +551,36 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
     return onChange
   }
 
+  // Unlike renderStaging's vi.fn(), this harness feeds onChange back into the
+  // staged prop like agent-builder does, so list updates round-trip and the
+  // form-sync behavior under real re-renders is exercised.
+  function StatefulStagingHarness({
+    initial,
+    onChangeSpy,
+    onOpenChange,
+  }: {
+    initial: StagedTrigger[]
+    onChangeSpy?: (next: StagedTrigger[]) => void
+    onOpenChange?: (open: boolean) => void
+  }) {
+    const [triggers, setTriggers] = React.useState(initial)
+    return (
+      <AgentTriggersDialog
+        agentId={null}
+        open
+        onOpenChange={onOpenChange ?? vi.fn()}
+        staged={{
+          triggers,
+          onChange: (next) => {
+            onChangeSpy?.(next)
+            setTriggers(next)
+          },
+        }}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />
+    )
+  }
+
   beforeEach(() => {
     apiRequestMock.mockReset()
     apiRequestMock.mockResolvedValue(jsonResponse([]))
@@ -321,6 +608,59 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
         }),
       ])
     })
+
+    // The toggle stays on the overview instead of jumping into the config view.
+    expect(screen.getByText("triggers.staging.info")).toBeInTheDocument()
+    expect(screen.queryByLabelText("triggers.form.name")).not.toBeInTheDocument()
+  })
+
+  it("starts a new trigger form with the switch off, matching the overview", async () => {
+    renderStaging([])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.name")
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+  })
+
+  it("stages the trigger when the switch is turned on in the creation state", async () => {
+    const onChange = renderStaging([])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    const nameInput = await screen.findByLabelText("triggers.form.name")
+    fireEvent.change(nameInput, { target: { value: "Toggled hook" } })
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(detailSwitch)
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({
+          clientId: -1,
+          type: "webhook",
+          name: "Toggled hook",
+          enabled: true,
+        }),
+      ])
+    })
+  })
+
+  it("applies the detail switch to the staged trigger without pressing save", async () => {
+    const onChange = renderStaging([stagedWebhook(-1, "Hook one")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.name")
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    fireEvent.click(detailSwitch)
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -1, enabled: false }),
+      ])
+    })
   })
 
   it("appends a new staged trigger via Add instead of overwriting the selected one", async () => {
@@ -331,20 +671,24 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /triggers.actions.addAnother/ }))
 
-    // Creation state: empty form and the create label, no leaked delete action.
-    expect(screen.getByLabelText("triggers.form.name")).toHaveValue("")
-    expect(screen.getByRole("button", { name: "triggers.actions.enable" })).toBeInTheDocument()
-    expect(screen.queryByRole("button", { name: "triggers.actions.delete" })).not.toBeInTheDocument()
+    // Creation state: empty form; delete lives on each existing pill's X
+    // button, so exactly one remains (for "First hook").
+    await waitFor(() => {
+      expect(screen.getByLabelText("triggers.form.name")).toHaveValue("")
+    })
+    expect(screen.getAllByRole("button", { name: "triggers.actions.delete" })).toHaveLength(1)
 
     fireEvent.change(screen.getByLabelText("triggers.form.name"), {
       target: { value: "Second hook" },
     })
-    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.enable" }))
+    // No Save button: Done commits the pending creation.
+    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
 
     await waitFor(() => {
       expect(onChange).toHaveBeenCalledWith([
         expect.objectContaining({ clientId: -1, name: "First hook" }),
-        expect.objectContaining({ clientId: -2, name: "Second hook", type: "webhook" }),
+        // New forms default to disabled; the switch was not touched here.
+        expect.objectContaining({ clientId: -2, name: "Second hook", type: "webhook", enabled: false }),
       ])
     })
   })
@@ -364,20 +708,154 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
     ).toBeTruthy()
   })
 
-  it("removes a staged trigger after delete confirmation", async () => {
+  it("removes a staged trigger after confirming in the pill's popover", async () => {
     const onChange = renderStaging([stagedWebhook(-1, "Doomed hook")])
 
     fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
 
+    // The X opens a confirmation popover; the destructive button deletes.
     fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.delete" }))
-    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.confirmDelete" }))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.confirmDelete" }))
 
     await waitFor(() => {
       expect(onChange).toHaveBeenCalledWith([])
     })
   })
 
-  it("updates the selected staged trigger in place on save", async () => {
+  it("keeps the trigger when the delete popover is cancelled", async () => {
+    const onChange = renderStaging([stagedWebhook(-1, "Kept hook")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.delete" }))
+    fireEvent.click(await screen.findByRole("button", { name: "common.cancel" }))
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "triggers.actions.confirmDelete" }),
+      ).not.toBeInTheDocument()
+    })
+    expect(onChange).not.toHaveBeenCalled()
+    expect(screen.getByText("Kept hook")).toBeInTheDocument()
+  })
+
+  it("keeps unsaved edits when another pill is deleted and the staged list round-trips", async () => {
+    render(
+      <StatefulStagingHarness
+        initial={[stagedWebhook(-1, "Old hook"), stagedWebhook(-2, "New hook")]}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    const nameInput = await screen.findByLabelText("triggers.form.name")
+    expect(nameInput).toHaveValue("New hook")
+    fireEvent.change(nameInput, { target: { value: "Unsaved edit" } })
+
+    // Delete the non-selected pill ("Old hook"); the parent state update
+    // re-renders the dialog with fresh pseudo-trigger identities.
+    const [, oldHookDelete] = screen.getAllByRole("button", { name: "triggers.actions.delete" })
+    fireEvent.click(oldHookDelete)
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.confirmDelete" }))
+
+    await waitFor(() => {
+      expect(screen.queryByText("Old hook")).not.toBeInTheDocument()
+    })
+    expect(screen.getByLabelText("triggers.form.name")).toHaveValue("Unsaved edit")
+  })
+
+  it("keeps the detail switch usable alongside unsaved edits after a round-trip", async () => {
+    render(<StatefulStagingHarness initial={[stagedWebhook(-1, "Hook")]} />)
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    const nameInput = await screen.findByLabelText("triggers.form.name")
+    fireEvent.change(nameInput, { target: { value: "Renamed but unsaved" } })
+
+    // The immediate enabled toggle round-trips the staged list; the pending
+    // name edit must survive it.
+    const [detailSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(detailSwitch)
+    await waitFor(() => {
+      expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+    })
+    expect(screen.getByLabelText("triggers.form.name")).toHaveValue("Renamed but unsaved")
+  })
+
+  it("commits pending edits when the dialog is dismissed via Escape", async () => {
+    const onChangeSpy = vi.fn()
+    const onOpenChange = vi.fn()
+    render(
+      <StatefulStagingHarness
+        initial={[stagedWebhook(-1, "Old name")]}
+        onChangeSpy={onChangeSpy}
+        onOpenChange={onOpenChange}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    const nameInput = await screen.findByLabelText("triggers.form.name")
+    fireEvent.change(nameInput, { target: { value: "Saved on escape" } })
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+
+    await waitFor(() => {
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+    expect(onChangeSpy).toHaveBeenCalledWith([
+      expect.objectContaining({ clientId: -1, name: "Saved on escape" }),
+    ])
+  })
+
+  it("keeps the Gmail quick-toggle intent as a dirty preset that Done cannot silently drop", async () => {
+    const onOpenChange = vi.fn()
+    render(
+      <StatefulStagingHarness initial={[]} onOpenChange={onOpenChange} />,
+    )
+
+    await screen.findByText("triggers.staging.info")
+    // No Gmail accounts connected: the quick toggle opens the creation form
+    // with the enable intent preset instead of creating anything.
+    const switches = screen.getAllByRole("switch")
+    fireEvent.click(switches[2])
+
+    await screen.findByLabelText("triggers.form.watchLabel")
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+
+    // Done must attempt the creation and fail validation (no account picked),
+    // keeping the dialog open rather than silently dropping the intent.
+    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
+    await waitFor(() => {
+      expect(toastMocks.error).toHaveBeenCalled()
+    })
+    expect(onOpenChange).not.toHaveBeenCalledWith(false)
+  })
+
+  it("keeps the form being edited when another pill is deleted", async () => {
+    const onChange = renderStaging([
+      stagedWebhook(-1, "Old hook"),
+      stagedWebhook(-2, "New hook"),
+    ])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    // Newest (-2) is selected; edit its name without saving.
+    const nameInput = await screen.findByLabelText("triggers.form.name")
+    expect(nameInput).toHaveValue("New hook")
+    fireEvent.change(nameInput, { target: { value: "Unsaved edit" } })
+
+    // Delete the other pill (-1, "Old hook") via its X button.
+    const [, oldHookDelete] = screen.getAllByRole("button", { name: "triggers.actions.delete" })
+    fireEvent.click(oldHookDelete)
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.confirmDelete" }))
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -2, name: "New hook" }),
+      ])
+    })
+    expect(screen.getByLabelText("triggers.form.name")).toHaveValue("Unsaved edit")
+  })
+
+  it("commits pending edits to the selected staged trigger on Done", async () => {
     const onChange = renderStaging([stagedWebhook(-1, "Old name")])
 
     fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
@@ -386,13 +864,56 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
     fireEvent.change(screen.getByLabelText("triggers.form.name"), {
       target: { value: "New name" },
     })
-    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.save" }))
+    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
 
     await waitFor(() => {
       expect(onChange).toHaveBeenCalledWith([
         expect.objectContaining({ clientId: -1, name: "New name", type: "webhook" }),
       ])
     })
+  })
+
+  it("commits pending edits when navigating back to the overview", async () => {
+    const onChange = renderStaging([stagedWebhook(-1, "Old name")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("Old name")
+
+    fireEvent.change(screen.getByLabelText("triggers.form.name"), {
+      target: { value: "Renamed on back" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "common.back" }))
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -1, name: "Renamed on back" }),
+      ])
+    })
+    // Back landed on the overview.
+    expect(screen.queryByLabelText("triggers.form.name")).not.toBeInTheDocument()
+  })
+
+  it("closes without changes when Done is pressed on an untouched form", async () => {
+    const onOpenChange = vi.fn()
+    const onChange = vi.fn()
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        open
+        onOpenChange={onOpenChange}
+        staged={{ triggers: [stagedWebhook(-1, "Untouched hook")], onChange }}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.name")
+    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
+
+    await waitFor(() => {
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+    expect(onChange).not.toHaveBeenCalled()
   })
 
   it("disables every staged trigger of a type when its switch is toggled off", async () => {

@@ -275,6 +275,42 @@ export async function deleteOwnerTrigger(
   }
 }
 
+// Disables every enabled trigger of one type. Shared by the builder summary
+// card and the triggers dialog so both switches keep identical semantics.
+// Owner-based (not agentId) so it works for both agent- and workforce-owned
+// triggers (#950). Returns the updated triggers so callers can patch local
+// state without a full list reload. Promise.all is not atomic: on rejection
+// some triggers may already be disabled server-side, so callers should
+// resync in their catch.
+export async function disableOwnerTriggersOfType(
+  owner: TriggerOwnerRef,
+  triggers: Pick<AgentTrigger, "id" | "type" | "enabled">[],
+  type: AgentTriggerType,
+): Promise<AgentTrigger[]> {
+  const enabled = triggers.filter((trigger) => trigger.type === type && trigger.enabled)
+  return Promise.all(
+    enabled.map((trigger) => updateOwnerTrigger(owner, trigger.id, { enabled: false })),
+  )
+}
+
+export async function disableAgentTriggersOfType(
+  agentId: number | string,
+  triggers: Pick<AgentTrigger, "id" | "type" | "enabled">[],
+  type: AgentTriggerType,
+): Promise<AgentTrigger[]> {
+  return disableOwnerTriggersOfType({ kind: "agent", id: agentId }, triggers, type)
+}
+
+// Patches a trigger list with freshly fetched/updated rows, keyed by id.
+// Shared by the builder summary card and the triggers dialog, both of which
+// apply disableAgentTriggersOfType's response the same way.
+export function mergeUpdatedTriggers(
+  current: AgentTrigger[],
+  updated: AgentTrigger[],
+): AgentTrigger[] {
+  return current.map((item) => updated.find((next) => next.id === item.id) ?? item)
+}
+
 export async function listOwnerTriggerRuns(
   owner: TriggerOwnerRef,
   triggerId: number | string,

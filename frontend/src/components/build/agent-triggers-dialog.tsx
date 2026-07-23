@@ -16,8 +16,8 @@ import {
   Plus,
   RefreshCcw,
   RotateCcw,
-  Trash2,
   Webhook,
+  X,
   Zap,
 } from "lucide-react"
 
@@ -27,6 +27,7 @@ import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Select } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
@@ -41,9 +42,11 @@ import {
   TriggerOwnerRef,
   createOwnerTrigger,
   deleteOwnerTrigger,
+  disableOwnerTriggersOfType,
   listGmailAccounts,
   listOwnerTriggerRuns,
   listOwnerTriggers,
+  mergeUpdatedTriggers,
   stagedToPseudoTrigger,
   testOwnerTrigger,
   updateOwnerTrigger,
@@ -91,13 +94,32 @@ interface TriggerFormState {
 }
 
 const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled", "gmail"]
+// Field labels follow the design refresh: small, semibold, muted.
+const FIELD_LABEL_CLASS = "text-xs font-semibold text-muted-foreground"
 const DEFAULT_TEST_PAYLOAD = "{\n  \"message\": \"test trigger\"\n}"
+
+// True when `form` has no pending edits beyond `enabled` — i.e. reversing a
+// not-yet-submitted enable intent (the only way a fresh creation form gets
+// marked dirty without the user touching any other field) leaves nothing to
+// commit.
+function formMatchesEmptyIgnoringEnabled(
+  form: TriggerFormState,
+  type: AgentTriggerType,
+): boolean {
+  const empty = emptyForm(type)
+  return (Object.keys(empty) as Array<keyof TriggerFormState>).every(
+    (key) => key === "enabled" || form[key] === empty[key],
+  )
+}
 
 function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
   return {
     type,
     name: "",
-    enabled: true,
+    // New triggers start disabled so the detail switch matches the overview
+    // switch (which is off while no trigger of the type exists). Quick-toggle
+    // creation from the overview passes enabled=true explicitly.
+    enabled: false,
     intervalSeconds: "3600",
     nextRunAt: "",
     secret: "",
@@ -216,6 +238,11 @@ export function AgentTriggersDialog({
   const [busy, setBusy] = useState(false)
   const [busyType, setBusyType] = useState<AgentTriggerType | null>(null)
   const [form, setForm] = useState<TriggerFormState>(emptyForm)
+  // True when the form holds field edits that have not been persisted yet.
+  // There is no explicit Save button: pending edits are committed on Done,
+  // Back, and when switching to another trigger. The enabled switch persists
+  // itself immediately and never marks the form dirty.
+  const [formDirty, setFormDirty] = useState(false)
   const [testPayload, setTestPayload] = useState(DEFAULT_TEST_PAYLOAD)
   const [sourceEventId, setSourceEventId] = useState("")
   const [secretReveal, setSecretReveal] = useState<string | null>(null)
@@ -225,6 +252,14 @@ export function AgentTriggersDialog({
   const [gmailAccountsLoading, setGmailAccountsLoading] = useState(false)
   const selectedTriggerIdRef = useRef<number | null>(null)
   const activeTypeRef = useRef<AgentTriggerType | null>(null)
+  // Identity of the trigger the form was last synced from ("type:id", or
+  // "type:new" for a creation form). The form-sync effect only resyncs when
+  // this changes, so list refreshes that merely replace the selected
+  // trigger's object identity never wipe unsaved field edits. Navigation
+  // functions that set the form explicitly stamp the key themselves.
+  const syncedFormKeyRef = useRef<string | null>(null)
+  const formKeyFor = (type: AgentTriggerType, triggerId: number | null) =>
+    `${type}:${triggerId ?? "new"}`
 
   const stagedTriggersProp = staged?.triggers ?? null
   const isStaging = !isValidAgentId(agentId) && stagedTriggersProp !== null
@@ -329,21 +364,28 @@ export function AgentTriggersDialog({
     }
   }, [resolvedOwner, setSelectedTriggerId, t])
 
-  const loadRuns = useCallback(async () => {
-    if (!resolvedOwner || !selectedTrigger) {
+  // Takes the target trigger explicitly so navigation handlers can load runs
+  // for a selection they just made (before the state round-trips).
+  const loadRunsFor = useCallback(async (trigger: AgentTrigger | null) => {
+    if (!resolvedOwner || !trigger || trigger.id < 0) {
       setRuns([])
       return
     }
     setRunsLoading(true)
     try {
-      setRuns(await listOwnerTriggerRuns(resolvedOwner, selectedTrigger.id))
+      setRuns(await listOwnerTriggerRuns(resolvedOwner, trigger.id))
     } catch (err) {
       console.error(err)
       toast.error(err instanceof Error ? err.message : t("triggers.messages.runsLoadFailed"))
     } finally {
       setRunsLoading(false)
     }
-  }, [resolvedOwner, selectedTrigger, t])
+  }, [resolvedOwner, t])
+
+  const loadRuns = useCallback(
+    () => loadRunsFor(selectedTrigger),
+    [loadRunsFor, selectedTrigger],
+  )
 
   useEffect(() => {
     if (!open) return
@@ -404,43 +446,68 @@ export function AgentTriggersDialog({
   }, [activeType, gmailAccounts, open, selectedTrigger])
 
   useEffect(() => {
-    if (!open || !activeType) return
+    if (!open || !activeType) {
+      syncedFormKeyRef.current = null
+      return
+    }
+    const key = formKeyFor(activeType, selectedTrigger?.id ?? null)
+    if (syncedFormKeyRef.current === key) return
+    syncedFormKeyRef.current = key
     if (selectedTrigger) {
       setForm(formFromTrigger(selectedTrigger))
-      void loadRuns()
+      setFormDirty(false)
+      void loadRunsFor(selectedTrigger)
     } else {
       setForm(emptyForm(activeType))
+      setFormDirty(false)
       setRuns([])
     }
-  }, [activeType, loadRuns, open, selectedTrigger])
+  }, [activeType, loadRunsFor, open, selectedTrigger])
 
+  // Navigation helpers set the form synchronously (no flash of stale values)
+  // and stamp syncedFormKeyRef so the form-sync effect treats the target as
+  // already synced. secretReveal deliberately survives navigation: it is a
+  // one-time value the user must copy, so only closing the dialog or deleting
+  // a trigger clears it.
   const openType = (type: AgentTriggerType) => {
     const primary =
       triggerGroups[type].find((trigger) => trigger.enabled) ??
       triggerGroups[type][0] ??
       null
+    syncedFormKeyRef.current = formKeyFor(type, primary?.id ?? null)
     setActiveType(type)
     setSelectedTriggerId(primary?.id ?? null)
-    setSecretReveal(null)
     setDeleteConfirmId(null)
     setForm(primary ? formFromTrigger(primary) : emptyForm(type))
+    setFormDirty(false)
+    if (primary) {
+      void loadRunsFor(primary)
+    } else {
+      setRuns([])
+    }
   }
 
-  const beginCreateForType = (type: AgentTriggerType) => {
+  const beginCreateForType = (type: AgentTriggerType, initial?: Partial<TriggerFormState>) => {
+    syncedFormKeyRef.current = formKeyFor(type, null)
     setActiveType(type)
     setSelectedTriggerId(null)
-    setSecretReveal(null)
     setDeleteConfirmId(null)
-    setForm(emptyForm(type))
+    setForm({ ...emptyForm(type), ...initial })
+    // Preset values carry real user intent (e.g. the Gmail quick toggle's
+    // enabled=true); mark them dirty so Done/Back attempts the creation
+    // instead of silently dropping them.
+    setFormDirty(Boolean(initial && Object.keys(initial).length > 0))
     setRuns([])
   }
 
   const beginEdit = (trigger: AgentTrigger) => {
+    syncedFormKeyRef.current = formKeyFor(trigger.type, trigger.id)
     setActiveType(trigger.type)
     setSelectedTriggerId(trigger.id)
-    setSecretReveal(null)
     setDeleteConfirmId(null)
     setForm(formFromTrigger(trigger))
+    setFormDirty(false)
+    void loadRunsFor(trigger)
   }
 
   const setFormValue = <K extends keyof TriggerFormState>(
@@ -448,6 +515,9 @@ export function AgentTriggersDialog({
     value: TriggerFormState[K],
   ) => {
     setForm((current) => ({ ...current, [key]: value }))
+    // The enabled switch persists immediately (handleDetailToggle); every
+    // other field is a pending edit committed on Done/Back/selection change.
+    if (key !== "enabled") setFormDirty(true)
   }
 
   const buildConfig = (): Record<string, unknown> => {
@@ -562,7 +632,10 @@ export function AgentTriggersDialog({
     if (checked && type === "gmail" && !triggerGroups.gmail.length) {
       const accountCount = gmailAccounts?.length ?? 0
       if (accountCount !== 1) {
-        beginCreateForType("gmail")
+        // The user asked to enable; carry that intent into the creation form
+        // as a dirty preset, so Done/Back attempts the creation and surfaces
+        // the missing-account validation instead of silently dropping it.
+        beginCreateForType("gmail", { enabled: true })
         toast.info(
           accountCount === 0
             ? t("triggers.gmail.notConnectedDescription")
@@ -573,6 +646,8 @@ export function AgentTriggersDialog({
     }
     setBusyType(type)
     try {
+      // Toggling from the overview never navigates into the config view; it
+      // only flips (or creates) the trigger and stays on the list.
       if (isStaging && staged) {
         if (checked) {
           if (primary) {
@@ -581,14 +656,8 @@ export function AgentTriggersDialog({
                 item.clientId === primary.id ? { ...item, enabled: true } : item,
               ),
             )
-            setSelectedTriggerId(primary.id)
           } else {
-            const created = await createDefaultTrigger(type, true)
-            if (created) {
-              setActiveType(type)
-              setSelectedTriggerId(created.id)
-              setForm(formFromTrigger(created))
-            }
+            await createDefaultTrigger(type, true)
           }
         } else {
           staged.onChange(
@@ -602,49 +671,126 @@ export function AgentTriggersDialog({
         return
       }
       if (!resolvedOwner) return
-      let preferredId: number | null = primary?.id ?? null
       if (checked) {
         if (primary) {
-          const updated = await updateOwnerTrigger(resolvedOwner, primary.id, {
-            enabled: true,
-          })
-          preferredId = updated.id
+          const updated = await updateOwnerTrigger(resolvedOwner, primary.id, { enabled: true })
+          setLiveTriggers((current) =>
+            current.map((item) => (item.id === updated.id ? updated : item)),
+          )
         } else {
           const created = await createDefaultTrigger(type, true)
-          preferredId = created?.id ?? null
           if (created) {
-            setActiveType(type)
-            setSelectedTriggerId(created.id)
-            setForm(formFromTrigger(created))
+            setLiveTriggers((current) => [...current, created])
           }
         }
       } else {
-        const enabledTriggers = typeTriggers.filter((trigger) => trigger.enabled)
-        await Promise.all(
-          enabledTriggers.map((trigger) =>
-            updateOwnerTrigger(resolvedOwner, trigger.id, { enabled: false }),
-          ),
-        )
+        const updatedList = await disableOwnerTriggersOfType(resolvedOwner, typeTriggers, type)
+        setLiveTriggers((current) => mergeUpdatedTriggers(current, updatedList))
       }
-      await loadTriggers(preferredId)
       notifyChanged()
       toast.success(checked ? t("triggers.messages.enabled") : t("triggers.messages.disabled"))
     } catch (err) {
       console.error(err)
       toast.error(err instanceof Error ? err.message : t("triggers.messages.saveFailed"))
+      // A batch disable is not atomic: some triggers may already be disabled
+      // server-side, so resync rather than trusting the local list.
+      if (resolvedOwner) void loadTriggers(selectedTriggerIdRef.current)
     } finally {
       setBusyType(null)
     }
   }
 
-  const handleSubmit = async () => {
+  // The enabled switch in the detail view applies immediately — no Save
+  // needed. Toggling on in the creation state creates the trigger right away
+  // from the current form values (delegated to handleSubmit so the two create
+  // paths cannot drift), mirroring the overview quick toggle.
+  const handleDetailToggle = async (checked: boolean) => {
+    setFormValue("enabled", checked)
     if (!canOperate) return
+
+    // Identity of the form this toggle started on. If the user navigates
+    // away (Back/pill switch/Add) before an in-flight request settles, the
+    // failure handlers below check this before touching `form` — otherwise a
+    // late rejection would silently mutate whatever unrelated form is now on
+    // screen.
+    const formKeyAtStart = syncedFormKeyRef.current
+
+    if (!selectedTrigger) {
+      if (!checked) {
+        // Reversing a not-yet-submitted enable intent (the Gmail quick
+        // toggle's only way to mark a fresh creation form dirty). If nothing
+        // else was edited, there is nothing left to commit — clear the flag
+        // so Done/Back don't attempt a phantom, unvalidated create.
+        if (activeType && formMatchesEmptyIgnoringEnabled(form, activeType)) {
+          setFormDirty(false)
+        }
+        return
+      }
+      const result = await handleSubmit({ enabled: true })
+      if (!result.ok && syncedFormKeyRef.current === formKeyAtStart) {
+        setForm((current) => ({ ...current, enabled: false }))
+      }
+      return
+    }
+
+    // Existing trigger: a minimal enabled-only update that leaves any other
+    // unsaved field edits (and formDirty) untouched. The form-sync effect
+    // keys on the trigger id, so the list patch below cannot wipe them.
+    if (isStaging && staged) {
+      staged.onChange(
+        staged.triggers.map((item) =>
+          item.clientId === selectedTrigger.id ? { ...item, enabled: checked } : item,
+        ),
+      )
+      notifyChanged()
+      toast.success(checked ? t("triggers.messages.enabled") : t("triggers.messages.disabled"))
+      return
+    }
+
+    if (!resolvedOwner) return
+    setBusy(true)
+    try {
+      await updateOwnerTrigger(resolvedOwner, selectedTrigger.id, { enabled: checked })
+      setLiveTriggers((current) =>
+        current.map((item) =>
+          item.id === selectedTrigger.id ? { ...item, enabled: checked } : item,
+        ),
+      )
+      notifyChanged()
+      toast.success(checked ? t("triggers.messages.enabled") : t("triggers.messages.disabled"))
+    } catch (err) {
+      console.error(err)
+      if (syncedFormKeyRef.current === formKeyAtStart) {
+        setForm((current) => ({ ...current, enabled: !checked }))
+      }
+      toast.error(err instanceof Error ? err.message : t("triggers.messages.saveFailed"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  interface SubmitResult {
+    ok: boolean
+    // One-time webhook secret generated by this submit, if any. Callers that
+    // close the dialog check it so the reveal alert is seen before closing.
+    secret: string | null
+  }
+
+  // Persists the current form (update selected / create new). `overrides`
+  // lets callers force fields on top of the form state (the detail switch
+  // passes enabled=true when creating). Returns success plus any freshly
+  // generated webhook secret so commit-on-navigation callers can stay put on
+  // failure or on a pending secret reveal.
+  const handleSubmit = async (
+    overrides?: Partial<Pick<TriggerFormState, "enabled">>,
+  ): Promise<SubmitResult> => {
+    if (!canOperate) return { ok: false, secret: null }
     let payload
     try {
-      payload = buildPayload()
+      payload = { ...buildPayload(), ...overrides }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("triggers.messages.saveFailed"))
-      return
+      return { ok: false, secret: null }
     }
 
     if (isStaging && staged) {
@@ -664,6 +810,7 @@ export function AgentTriggersDialog({
               : item,
           ),
         )
+        setForm((current) => ({ ...current, enabled: payload.enabled }))
       } else {
         const clientId = nextStagedClientId()
         staged.onChange([
@@ -678,31 +825,89 @@ export function AgentTriggersDialog({
             secret: payload.secret,
           },
         ])
+        // No key stamp here: when the staged list round-trips through the
+        // parent, the form-sync effect re-syncs from the normalized pseudo
+        // trigger (default name etc.). The merge below keeps the switch
+        // correct in the meantime.
         setSelectedTriggerId(clientId)
+        setForm((current) => ({ ...current, enabled: payload.enabled }))
       }
+      setFormDirty(false)
       notifyChanged()
       toast.success(t("triggers.messages.staged"))
-      return
+      return { ok: true, secret: null }
     }
 
-    if (!resolvedOwner) return
+    if (!resolvedOwner) return { ok: false, secret: null }
     setBusy(true)
     try {
       const saved = selectedTrigger
         ? await updateOwnerTrigger(resolvedOwner, selectedTrigger.id, payload)
         : await createOwnerTrigger(resolvedOwner, payload)
-      setSecretReveal(saved.webhook_secret ?? null)
+      const revealedSecret = saved.webhook_secret ?? null
+      setSecretReveal(revealedSecret)
+      // Patch the local list from the response instead of refetching it; the
+      // form is synced here, so stamp the key to keep the effect from
+      // re-syncing (and re-fetching runs) for the same trigger.
+      syncedFormKeyRef.current = formKeyFor(saved.type, saved.id)
       setSelectedTriggerId(saved.id)
       setForm(formFromTrigger(saved))
-      await loadTriggers(saved.id)
+      setFormDirty(false)
+      setLiveTriggers((current) =>
+        selectedTrigger
+          ? current.map((item) => (item.id === saved.id ? saved : item))
+          : [...current, saved],
+      )
       notifyChanged()
       toast.success(selectedTrigger ? t("triggers.messages.updated") : t("triggers.messages.created"))
+      return { ok: true, secret: revealedSecret }
     } catch (err) {
       console.error(err)
       toast.error(err instanceof Error ? err.message : t("triggers.messages.saveFailed"))
+      return { ok: false, secret: null }
     } finally {
       setBusy(false)
     }
+  }
+
+  // There is no Save button: pending field edits are committed when leaving
+  // the form (Done, Back, switching pills, Add, or dismissing the dialog).
+  // Callers keep the user on the current form when ok is false.
+  const commitPendingEdits = async (): Promise<SubmitResult> => {
+    if (!activeType || !formDirty || !canOperate) return { ok: true, secret: null }
+    return handleSubmit()
+  }
+
+  // A pending secret blocks close whether it was just generated by this very
+  // commit (`result.secret` — `secretReveal` itself is a stale closure value
+  // mid-await here, since the setState that wrote it happened inside the same
+  // call) or was already sitting in state from an earlier action, like the
+  // detail switch's own create (a fresh closure per render sees that fine).
+  // The alert's explicit dismiss (which clears secretReveal) is what lets a
+  // later Done/dismissal actually close.
+  const secretPending = (result: SubmitResult) => Boolean(result.secret || secretReveal)
+
+  const handleDone = async () => {
+    const result = await commitPendingEdits()
+    if (!result.ok) return
+    if (secretPending(result)) return
+    closeDialog(false)
+  }
+
+  const handleBack = async () => {
+    if (!(await commitPendingEdits()).ok) return
+    setActiveType(null)
+  }
+
+  const handleSelectTrigger = async (trigger: AgentTrigger) => {
+    if (trigger.id === selectedTriggerId) return
+    if (!(await commitPendingEdits()).ok) return
+    beginEdit(trigger)
+  }
+
+  const handleAddAnother = async (type: AgentTriggerType) => {
+    if (!(await commitPendingEdits()).ok) return
+    beginCreateForType(type)
   }
 
   const handleRotateSecret = async () => {
@@ -713,7 +918,9 @@ export function AgentTriggersDialog({
         rotate_secret: true,
       })
       setSecretReveal(updated.webhook_secret ?? null)
-      await loadTriggers(updated.id)
+      setLiveTriggers((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      )
       notifyChanged()
       toast.success(t("triggers.messages.secretRotated"))
     } catch (err) {
@@ -724,16 +931,24 @@ export function AgentTriggersDialog({
     }
   }
 
+  // Confirmation happens in the pill's popover; by the time this runs the
+  // user has already clicked the destructive button there.
   const handleDelete = async (trigger: AgentTrigger) => {
     if (!canOperate) return
-    if (deleteConfirmId !== trigger.id) {
-      setDeleteConfirmId(trigger.id)
-      return
-    }
     if (isStaging && staged) {
-      staged.onChange(staged.triggers.filter((item) => item.clientId !== trigger.id))
-      setSelectedTriggerId(null)
-      setRuns([])
+      const remaining = staged.triggers.filter((item) => item.clientId !== trigger.id)
+      staged.onChange(remaining)
+      // Deleting a pill other than the selected one must not reset the form
+      // being edited; when the selected one goes, fall back to the next
+      // trigger of the type (newest first), mirroring the live flow.
+      if (selectedTriggerIdRef.current === trigger.id) {
+        const next = remaining
+          .map(stagedToPseudoTrigger)
+          .filter((item) => item.type === trigger.type)
+          .sort(newestFirst)[0]
+        setSelectedTriggerId(next?.id ?? null)
+        setRuns([])
+      }
       setDeleteConfirmId(null)
       notifyChanged()
       toast.success(t("triggers.messages.deleted"))
@@ -743,11 +958,20 @@ export function AgentTriggersDialog({
     setBusy(true)
     try {
       await deleteOwnerTrigger(resolvedOwner, trigger.id)
-      setSelectedTriggerId(null)
-      setRuns([])
+      const remaining = liveTriggers.filter((item) => item.id !== trigger.id)
+      setLiveTriggers(remaining)
+      // Deleting a pill other than the selected one must not reset the form
+      // being edited; when the selected one goes, fall back to the next
+      // trigger of the type (newest first), like the staging branch.
+      if (selectedTriggerIdRef.current === trigger.id) {
+        const next = remaining
+          .filter((item) => item.type === trigger.type)
+          .sort(newestFirst)[0]
+        setSelectedTriggerId(next?.id ?? null)
+        setRuns([])
+      }
       setSecretReveal(null)
       setDeleteConfirmId(null)
-      await loadTriggers(null)
       notifyChanged()
       toast.success(t("triggers.messages.deleted"))
     } catch (err) {
@@ -813,44 +1037,64 @@ export function AgentTriggersDialog({
     onOpenChange(nextOpen)
   }
 
+  // Dismissal (Esc, overlay click, header X) commits pending edits like every
+  // other exit path. A failed commit is surfaced via its toast but does not
+  // trap the user — dismissal still closes rather than forcing them to fix
+  // an invalid form just to leave. A freshly generated webhook secret is the
+  // one thing dismissal must not drop: unlike a form validation error, it
+  // already exists server-side and is unrecoverable once unseen, so — like
+  // handleDone — closing waits until it has been shown.
+  const handleDismiss = (nextOpen: boolean) => {
+    if (nextOpen) {
+      onOpenChange(true)
+      return
+    }
+    void (async () => {
+      const result = await commitPendingEdits()
+      if (secretPending(result)) return
+      closeDialog(false)
+    })()
+  }
+
   const renderTypeIcon = (type: AgentTriggerType, className?: string) => {
     if (type === "webhook") return <Webhook className={className} />
     if (type === "gmail") return <Mail className={className} />
     return <CalendarClock className={className} />
   }
 
+  const typeIconClass = (type: AgentTriggerType) =>
+    type === "webhook"
+      ? "bg-fuchsia-50 text-fuchsia-600 dark:bg-fuchsia-950/40 dark:text-fuchsia-300"
+      : type === "gmail"
+        ? "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300"
+        : "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300"
+
   const renderTypeCard = (type: AgentTriggerType) => {
     const typeTriggers = triggerGroups[type]
     const enabledCount = typeTriggers.filter((trigger) => trigger.enabled).length
     const hasTriggers = typeTriggers.length > 0
     const isEnabled = enabledCount > 0
-    const iconClass =
-      type === "webhook"
-        ? "bg-fuchsia-50 text-fuchsia-600 dark:bg-fuchsia-950/40 dark:text-fuchsia-300"
-        : type === "gmail"
-          ? "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300"
-          : "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300"
 
     return (
       <div
         key={type}
         className={cn(
-          "group flex w-full items-center gap-3.5 rounded-xl border bg-background p-3.5 text-left transition-colors",
-          "hover:border-primary/50 hover:bg-muted/30",
-          isEnabled && "border-primary/40 bg-primary/[0.03]",
+          "group flex w-full items-center gap-3 rounded-[10px] border bg-background px-4 py-3 text-left transition-colors",
+          "hover:border-primary/50",
+          isEnabled && "border-primary/40",
         )}
       >
         <button
           type="button"
-          className="flex min-w-0 flex-1 items-center gap-3.5 text-left"
+          className="flex min-w-0 flex-1 items-center gap-3 text-left"
           onClick={() => openType(type)}
         >
-          <div className={cn("flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-lg", iconClass)}>
+          <div className={cn("flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-lg", typeIconClass(type))}>
             {renderTypeIcon(type, "h-4 w-4")}
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <div className="truncate text-sm font-semibold">{t(`triggers.cards.${type}.title`)}</div>
+              <div className="truncate text-[13px] font-semibold">{t(`triggers.cards.${type}.title`)}</div>
               {hasTriggers && (
                 <Badge variant={isEnabled ? "default" : "secondary"} className="h-5 px-1.5 text-[10px]">
                   {isEnabled
@@ -859,12 +1103,12 @@ export function AgentTriggersDialog({
                 </Badge>
               )}
             </div>
-            <div className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+            <div className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
               {t(`triggers.cards.${type}.description`)}
             </div>
           </div>
         </button>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
           <Switch
             checked={isEnabled}
             disabled={busyType === type || !canOperate}
@@ -883,24 +1127,53 @@ export function AgentTriggersDialog({
     )
   }
 
-  const renderOverview = () => (
-    <div className="space-y-4">
-      <Alert className="border-primary/20 bg-primary/5 text-primary">
-        <Info className="h-4 w-4" />
-        <AlertDescription className="text-sm text-foreground">
-          {t(isStaging ? "triggers.staging.info" : "triggers.overview.info")}
-        </AlertDescription>
-      </Alert>
-
-      <div className="space-y-3">
-        {loading ? (
-          <div className="flex items-center justify-center rounded-lg border border-dashed py-16 text-muted-foreground">
-            <Loader2 className="h-5 w-5 animate-spin" />
+  // One-time reveal for a freshly generated webhook secret. Rendered on both
+  // the overview (quick-toggle creation stays there) and the detail view.
+  // The explicit dismiss is what lets Done/Back/dismissal close the dialog
+  // afterward — see handleDone/handleDismiss, which refuse to close while
+  // secretReveal is still set so the secret is never lost unseen.
+  const renderSecretReveal = () =>
+    secretReveal && (
+      <Alert className="relative border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
+        <AlertCircle className="h-4 w-4" />
+        <AlertTitle>{t("triggers.secret.title")}</AlertTitle>
+        <AlertDescription>
+          <div className="mt-2 flex gap-2">
+            <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
+              {secretReveal}
+            </code>
+            <Button
+              size="icon"
+              variant="secondary"
+              onClick={() => void handleCopy("secret", secretReveal)}
+              title={t("common.copy")}
+            >
+              {copied === "secret" ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+            </Button>
           </div>
-        ) : (
-          TRIGGER_TYPES.map(renderTypeCard)
-        )}
-      </div>
+        </AlertDescription>
+        <button
+          type="button"
+          className="absolute right-3 top-3 rounded p-0.5 text-amber-700 hover:bg-amber-100 dark:text-amber-200 dark:hover:bg-amber-900/40"
+          onClick={() => setSecretReveal(null)}
+          aria-label={t("triggers.secret.dismiss")}
+          title={t("triggers.secret.dismiss")}
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </Alert>
+    )
+
+  const renderOverview = () => (
+    <div className="space-y-2.5">
+      {renderSecretReveal()}
+      {loading ? (
+        <div className="flex items-center justify-center rounded-lg border border-dashed py-16 text-muted-foreground">
+          <Loader2 className="h-5 w-5 animate-spin" />
+        </div>
+      ) : (
+        TRIGGER_TYPES.map(renderTypeCard)
+      )}
     </div>
   )
 
@@ -909,27 +1182,76 @@ export function AgentTriggersDialog({
     return (
       <div className="flex flex-wrap items-center gap-2 border-b pb-4">
         {activeTypeTriggers.map((trigger) => (
-          <button
+          <div
             key={trigger.id}
-            type="button"
             className={cn(
-              "inline-flex max-w-full items-center gap-2 rounded-md border px-3 py-2 text-sm transition-colors",
+              "inline-flex max-w-full items-center rounded-full border text-xs transition-colors",
               selectedTrigger?.id === trigger.id
-                ? "border-primary bg-primary/5 text-foreground"
-                : "bg-background text-muted-foreground hover:text-foreground",
+                ? "border-primary bg-primary/10 font-medium text-primary"
+                : "bg-background text-muted-foreground hover:border-primary/50 hover:text-foreground",
             )}
-            onClick={() => beginEdit(trigger)}
           >
-            <span className={cn("h-2 w-2 rounded-full", trigger.enabled ? "bg-emerald-500" : "bg-muted-foreground/40")} />
-            <span className="truncate">{trigger.name}</span>
-          </button>
+            <button
+              type="button"
+              className="flex min-w-0 items-center gap-1.5 py-1.5 pl-3 pr-1"
+              onClick={() => void handleSelectTrigger(trigger)}
+              disabled={busy}
+            >
+              <span className={cn("h-2 w-2 rounded-full", trigger.enabled ? "bg-emerald-500" : "bg-muted-foreground/40")} />
+              <span className="truncate">{trigger.name}</span>
+            </button>
+            <Popover
+              open={deleteConfirmId === trigger.id}
+              onOpenChange={(nextOpen) => setDeleteConfirmId(nextOpen ? trigger.id : null)}
+            >
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={t("triggers.actions.delete")}
+                  title={t("triggers.actions.delete")}
+                  className={cn(
+                    "mr-1 rounded-full p-1 transition-colors",
+                    deleteConfirmId === trigger.id
+                      ? "bg-destructive/10 text-destructive"
+                      : "text-muted-foreground/60 hover:bg-muted hover:text-destructive",
+                  )}
+                  disabled={busy}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-auto max-w-64 p-3">
+                <div className="text-sm">{t("triggers.deleteConfirm")}</div>
+                <div className="mt-2.5 flex justify-end gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDeleteConfirmId(null)}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => void handleDelete(trigger)}
+                  >
+                    {t("triggers.actions.confirmDelete")}
+                  </Button>
+                </div>
+              </PopoverContent>
+            </Popover>
+          </div>
         ))}
         <Button
           type="button"
           variant="outline"
           size="sm"
-          onClick={() => beginCreateForType(activeType)}
-          className="border-dashed border-primary/45 bg-primary/5 text-primary hover:border-primary hover:bg-primary/10"
+          onClick={() => void handleAddAnother(activeType)}
+          disabled={busy}
+          className="h-7 rounded-full border-dashed border-primary/45 bg-primary/5 text-xs text-primary hover:border-primary hover:bg-primary/10"
         >
           <Plus className="mr-1.5 h-4 w-4" />
           {t("triggers.actions.addAnother")}
@@ -953,25 +1275,29 @@ export function AgentTriggersDialog({
       : !isNew
 
     return (
-      <div className="space-y-5">
+      <div className="space-y-4">
         <div className="flex items-center justify-between gap-3 border-b pb-4">
-          <div className="flex min-w-0 items-center gap-3">
-            <Button variant="ghost" size="sm" className="-ml-2" onClick={() => setActiveType(null)}>
+          <div className="flex min-w-0 items-center gap-2.5">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-2 h-8 px-2 text-muted-foreground hover:text-foreground"
+              onClick={() => void handleBack()}
+              disabled={busy}
+            >
               <ChevronLeft className="mr-1 h-4 w-4" />
               {t("common.back")}
             </Button>
-            <div className="flex min-w-0 items-center gap-2 border-l pl-3">
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted">
-                {renderTypeIcon(activeType, "h-4 w-4")}
-              </div>
-              <div className="truncate text-sm font-semibold">
-                {t(`triggers.cards.${activeType}.title`)}
-              </div>
+            <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded-md", typeIconClass(activeType))}>
+              {renderTypeIcon(activeType, "h-3.5 w-3.5")}
+            </div>
+            <div className="truncate text-sm font-bold">
+              {t(`triggers.cards.${activeType}.title`)}
             </div>
           </div>
           <Switch
             checked={form.enabled}
-            onCheckedChange={(checked) => setFormValue("enabled", checked)}
+            onCheckedChange={(checked) => void handleDetailToggle(checked)}
             disabled={busy}
           />
         </div>
@@ -980,7 +1306,7 @@ export function AgentTriggersDialog({
 
         <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_220px]">
           <div className="space-y-2">
-            <Label htmlFor="trigger-name">{t("triggers.form.name")}</Label>
+            <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-name">{t("triggers.form.name")}</Label>
             <Input
               id="trigger-name"
               value={form.name}
@@ -992,7 +1318,7 @@ export function AgentTriggersDialog({
 
           {activeType === "scheduled" ? (
             <div className="space-y-2">
-              <Label htmlFor="trigger-interval">{t("triggers.form.intervalSeconds")}</Label>
+              <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-interval">{t("triggers.form.intervalSeconds")}</Label>
               <Input
                 id="trigger-interval"
                 type="number"
@@ -1003,7 +1329,7 @@ export function AgentTriggersDialog({
             </div>
           ) : activeType === "gmail" ? (
             <div className="space-y-2">
-              <Label htmlFor="trigger-watch-label">{t("triggers.form.watchLabel")}</Label>
+              <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-watch-label">{t("triggers.form.watchLabel")}</Label>
               <Input
                 id="trigger-watch-label"
                 value={form.watchLabel}
@@ -1014,7 +1340,7 @@ export function AgentTriggersDialog({
             </div>
           ) : (
             <div className="space-y-2">
-              <Label htmlFor="trigger-secret">{t("triggers.form.secret")}</Label>
+              <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-secret">{t("triggers.form.secret")}</Label>
               <Input
                 id="trigger-secret"
                 type="password"
@@ -1032,7 +1358,7 @@ export function AgentTriggersDialog({
 
         {activeType === "scheduled" && (
           <div className="space-y-2">
-            <Label htmlFor="trigger-next-run">{t("triggers.form.nextRunAt")}</Label>
+            <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-next-run">{t("triggers.form.nextRunAt")}</Label>
             <Input
               id="trigger-next-run"
               type="datetime-local"
@@ -1044,7 +1370,7 @@ export function AgentTriggersDialog({
 
         {activeType === "gmail" && (
           <div className="space-y-2">
-            <Label id="trigger-gmail-account-label">{t("triggers.form.gmailAccount")}</Label>
+            <Label className={FIELD_LABEL_CLASS} id="trigger-gmail-account-label">{t("triggers.form.gmailAccount")}</Label>
             <div aria-labelledby="trigger-gmail-account-label">
               <Select
                 value={form.oauthAccountId || undefined}
@@ -1081,7 +1407,7 @@ export function AgentTriggersDialog({
         {activeType === "gmail" && (
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="trigger-sender-filter">{t("triggers.form.senderFilter")}</Label>
+              <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-sender-filter">{t("triggers.form.senderFilter")}</Label>
               <Input
                 id="trigger-sender-filter"
                 value={form.senderFilter}
@@ -1090,7 +1416,7 @@ export function AgentTriggersDialog({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="trigger-subject-keyword">{t("triggers.form.subjectKeyword")}</Label>
+              <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-subject-keyword">{t("triggers.form.subjectKeyword")}</Label>
               <Input
                 id="trigger-subject-keyword"
                 value={form.subjectKeyword}
@@ -1138,7 +1464,7 @@ export function AgentTriggersDialog({
         )}
 
         <div className="space-y-2">
-          <Label htmlFor="trigger-prompt">{t("triggers.form.promptTemplate")}</Label>
+          <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-prompt">{t("triggers.form.promptTemplate")}</Label>
           <Textarea
             id="trigger-prompt"
             value={form.promptTemplate}
@@ -1148,27 +1474,7 @@ export function AgentTriggersDialog({
           />
         </div>
 
-        {secretReveal && (
-          <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>{t("triggers.secret.title")}</AlertTitle>
-            <AlertDescription>
-              <div className="mt-2 flex gap-2">
-                <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
-                  {secretReveal}
-                </code>
-                <Button
-                  size="icon"
-                  variant="secondary"
-                  onClick={() => void handleCopy("secret", secretReveal)}
-                  title={t("common.copy")}
-                >
-                  {copied === "secret" ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                </Button>
-              </div>
-            </AlertDescription>
-          </Alert>
-        )}
+        {renderSecretReveal()}
 
         {isStaging && activeType === "webhook" && (
           <Alert className="border-primary/20 bg-primary/5">
@@ -1180,57 +1486,42 @@ export function AgentTriggersDialog({
         )}
 
         {!isStaging && selectedTrigger?.type === "webhook" && (
-          <section className="space-y-3 rounded-lg border bg-muted/20 p-4">
-            <div className="text-sm font-medium">{t("triggers.webhook.title")}</div>
-            <div className="flex gap-2">
-              <Input readOnly value={selectedWebhookUrl} className="font-mono text-xs" />
-              <Button
-                variant="secondary"
+          <section className="space-y-1.5">
+            <div className={FIELD_LABEL_CLASS}>{t("triggers.webhook.title")}</div>
+            <div className="flex items-center gap-2 rounded-lg border bg-muted/50 px-3 py-2">
+              <code className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
+                {selectedWebhookUrl}
+              </code>
+              <button
+                type="button"
+                className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:text-primary"
                 onClick={() => void handleCopy("webhook-url", selectedWebhookUrl)}
+                aria-label={t("common.copy")}
+                title={t("common.copy")}
               >
-                {copied === "webhook-url" ? <Check className="mr-2 h-4 w-4" /> : <Copy className="mr-2 h-4 w-4" />}
-                {t("common.copy")}
-              </Button>
+                {copied === "webhook-url" ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              </button>
             </div>
-            <div className="text-xs text-muted-foreground">
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
               {t("triggers.webhook.secretHeader")}
-            </div>
+            </p>
           </section>
         )}
 
-        <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4">
-          <div className="flex flex-wrap gap-2">
-            <Button onClick={handleSubmit} disabled={busy || !canOperate}>
-              {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {isNew ? t("triggers.actions.enable") : t("triggers.actions.save")}
+        {!isStaging && selectedTrigger && (
+          <div className="flex flex-wrap items-center gap-2 border-t pt-4">
+            <Button variant="outline" onClick={handleTest} disabled={busy}>
+              <Play className="mr-2 h-4 w-4" />
+              {t("triggers.actions.test")}
             </Button>
-            {!isStaging && selectedTrigger && (
-              <Button variant="outline" onClick={handleTest} disabled={busy}>
-                <Play className="mr-2 h-4 w-4" />
-                {t("triggers.actions.test")}
-              </Button>
-            )}
-            {!isStaging && selectedTrigger?.type === "webhook" && (
+            {selectedTrigger.type === "webhook" && (
               <Button variant="outline" onClick={handleRotateSecret} disabled={busy}>
                 <RotateCcw className="mr-2 h-4 w-4" />
                 {t("triggers.actions.rotateSecret")}
               </Button>
             )}
           </div>
-          {selectedTrigger && (
-            <Button
-              variant={deleteConfirmId === selectedTrigger.id ? "destructive" : "ghost"}
-              className={cn(deleteConfirmId !== selectedTrigger.id && "text-destructive hover:text-destructive")}
-              onClick={() => void handleDelete(selectedTrigger)}
-              disabled={busy}
-            >
-              <Trash2 className="mr-2 h-4 w-4" />
-              {deleteConfirmId === selectedTrigger.id
-                ? t("triggers.actions.confirmDelete")
-                : t("triggers.actions.delete")}
-            </Button>
-          )}
-        </div>
+        )}
 
         {!isStaging && selectedTrigger && (
           <section className="space-y-3 rounded-lg border p-4">
@@ -1296,7 +1587,7 @@ export function AgentTriggersDialog({
                 className="min-h-[112px] font-mono text-xs"
               />
               <div className="space-y-2">
-                <Label htmlFor="trigger-source-event">{t("triggers.test.sourceEventId")}</Label>
+                <Label className={FIELD_LABEL_CLASS} htmlFor="trigger-source-event">{t("triggers.test.sourceEventId")}</Label>
                 <Input
                   id="trigger-source-event"
                   value={sourceEventId}
@@ -1312,30 +1603,37 @@ export function AgentTriggersDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={closeDialog}>
+    <Dialog open={open} onOpenChange={handleDismiss}>
       <DialogContent
         aria-describedby="agent-triggers-dialog-description"
-        className="flex max-h-[88vh] w-[calc(100vw-2rem)] max-w-none flex-col overflow-hidden p-0 sm:max-w-[680px]"
+        className="flex max-h-[88vh] w-[calc(100vw-2rem)] max-w-none flex-col overflow-hidden rounded-2xl p-0 sm:max-w-[560px]"
       >
         <DialogHeader className="border-b px-5 py-4 pr-12">
-          <DialogTitle className="flex items-center gap-2 text-base">
+          <DialogTitle className="flex items-center gap-2 text-[15px] font-bold">
             <Zap className="h-4 w-4 text-primary" />
             {t("triggers.title")}
           </DialogTitle>
-          <DialogDescription id="agent-triggers-dialog-description">
+          <DialogDescription id="agent-triggers-dialog-description" className="text-xs">
             {agentName ? `${agentName} · ${t("triggers.subtitle")}` : t("triggers.subtitle")}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-5">
+        <div className="min-h-0 flex-1 overflow-y-auto p-5 pt-4">
+          <Alert className="mb-4 rounded-lg border-primary/25 bg-primary/[0.07] px-3.5 py-2.5 text-primary">
+            <Info className="h-4 w-4" />
+            <AlertDescription className="text-xs leading-relaxed text-muted-foreground">
+              {t(isStaging ? "triggers.staging.info" : "triggers.overview.info")}
+            </AlertDescription>
+          </Alert>
           {activeType ? renderDetail() : renderOverview()}
         </div>
 
-        {!activeType && (
-          <DialogFooter className="border-t px-5 py-4">
-            <Button onClick={() => closeDialog(false)}>{t("common.done")}</Button>
-          </DialogFooter>
-        )}
+        <DialogFooter className="border-t px-5 py-3.5">
+          <Button onClick={() => void handleDone()} disabled={busy}>
+            {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {t("common.done")}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   )

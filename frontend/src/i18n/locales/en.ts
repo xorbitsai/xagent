@@ -3555,6 +3555,7 @@ Build when you need.`,
   triggers: {
     title: "Triggers",
     subtitle: "Choose how this agent gets activated",
+    deleteConfirm: "Delete this trigger?",
     defaults: {
       webhookName: "API / Webhook",
       scheduledName: "Schedule",
@@ -3637,9 +3638,6 @@ Build when you need.`,
     },
     actions: {
       new: "New",
-      create: "Create trigger",
-      enable: "Enable trigger",
-      save: "Save changes",
       delete: "Delete",
       confirmDelete: "Confirm delete",
       rotateSecret: "Rotate secret",
@@ -3650,7 +3648,8 @@ Build when you need.`,
       confirmDiscard: "Confirm discard"
     },
     secret: {
-      title: "Copy this secret now. It is shown only once."
+      title: "Copy this secret now. It is shown only once.",
+      dismiss: "I've saved this secret"
     },
     webhook: {
       title: "Webhook endpoint",

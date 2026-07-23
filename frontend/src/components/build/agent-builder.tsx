@@ -57,7 +57,9 @@ import {
   StagedTrigger,
   createAgentTrigger,
   createStagedTriggers,
+  disableAgentTriggersOfType,
   listAgentTriggers,
+  mergeUpdatedTriggers,
   stagedToCreatePayload,
   stagedToPseudoTrigger,
 } from "@/lib/agent-triggers-api"
@@ -425,6 +427,40 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const dismissWebhookSecrets = () => {
     setCreatedWebhookSecrets([])
     reconcileDeferredNavigation(failedStagedTriggers, [])
+  }
+
+  // Builder card switch: toggling it off disables every enabled trigger of
+  // that type in place — no dialog. The card disappears afterwards because
+  // the summary section only lists types with enabled > 0. A Set (not a
+  // single value) so two types disabling concurrently keep their own guard.
+  const [disablingTriggerTypes, setDisablingTriggerTypes] = useState<ReadonlySet<AgentTriggerType>>(
+    new Set(),
+  )
+  const disableTriggerType = async (type: AgentTriggerType) => {
+    if (!localAgentId) {
+      setStagedTriggers((prev) =>
+        prev.map((item) => (item.type === type ? { ...item, enabled: false } : item)),
+      )
+      toast.success(t("triggers.messages.disabled"))
+      return
+    }
+    setDisablingTriggerTypes((prev) => new Set(prev).add(type))
+    try {
+      const updated = await disableAgentTriggersOfType(localAgentId, triggerSummary, type)
+      setTriggerSummary((prev) => mergeUpdatedTriggers(prev, updated))
+      toast.success(t("triggers.messages.disabled"))
+    } catch (error) {
+      console.error(error)
+      toast.error(error instanceof Error ? error.message : t("triggers.messages.saveFailed"))
+      // A partial failure may have disabled some triggers; resync the summary.
+      void refreshTriggerSummary()
+    } finally {
+      setDisablingTriggerTypes((prev) => {
+        const next = new Set(prev)
+        next.delete(type)
+        return next
+      })
+    }
   }
 
   // During creation the agent has no server-side triggers yet; the summary
@@ -2438,7 +2474,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                           </div>
                         </div>
                       </button>
-                      <Switch checked onCheckedChange={openDialog} className="scale-75" />
+                      <Switch
+                        checked
+                        disabled={disablingTriggerTypes.has(item.type)}
+                        onCheckedChange={(checked) => {
+                          if (!checked) void disableTriggerType(item.type)
+                        }}
+                        className="scale-75"
+                      />
                       <Button
                         type="button"
                         variant="ghost"
@@ -2857,10 +2900,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         open={isTriggersDialogOpen}
         onOpenChange={(dialogOpen) => {
           setIsTriggersDialogOpen(dialogOpen)
-          if (!dialogOpen) {
-            setTriggerDialogInitialType(null)
-            void refreshTriggerSummary()
-          }
+          // No refetch here: every mutation inside the dialog already calls
+          // onChanged (refreshTriggerSummary) as it happens, so closing the
+          // dialog has nothing left to resync — doing it anyway doubled the
+          // request for every Done/dismiss that just committed an edit.
+          if (!dialogOpen) setTriggerDialogInitialType(null)
         }}
         onChanged={refreshTriggerSummary}
         initialType={triggerDialogInitialType}

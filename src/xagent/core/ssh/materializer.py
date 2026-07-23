@@ -37,7 +37,9 @@ class LocalTmpSecretMaterializer:
         try:
             _write_private(key_path, credential.private_key)
             _write_private(known_hosts_path, known_hosts.encode("utf-8"))
-            yield MaterializedSshPaths(private_key_path=key_path, known_hosts_path=known_hosts_path)
+            yield MaterializedSshPaths(
+                private_key_path=key_path, known_hosts_path=known_hosts_path
+            )
         finally:
             for path in (key_path, known_hosts_path):
                 _best_effort_shred(path)

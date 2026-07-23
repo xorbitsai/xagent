@@ -11,6 +11,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import pytest
+
+from tests.core.ssh.helpers import InMemorySshSecretStore, InMemorySshTargetProvider
 from xagent.core.ssh import SshError, SshErrorCode
 from xagent.core.ssh.egress import EgressPolicyConfig
 from xagent.core.ssh.executor import SshExecutor
@@ -24,8 +26,6 @@ from xagent.core.ssh.types import (
     SshExecutionContext,
     SshSecretHandle,
 )
-
-from tests.core.ssh.helpers import InMemorySshSecretStore, InMemorySshTargetProvider
 
 _ALLOW = EgressPolicyConfig(allow_cidrs=("203.0.113.0/24",))
 
@@ -153,7 +153,9 @@ async def test_execute_leases_sandbox_and_threads_it_to_both() -> None:
 async def test_lease_exited_on_runner_failure() -> None:
     lease = _RecordingLease(_FakeSandbox())
     await_raises = _executor(
-        runner=_RecordingRunner(boom=True), materializer=_RecordingMaterializer(), lease=lease
+        runner=_RecordingRunner(boom=True),
+        materializer=_RecordingMaterializer(),
+        lease=lease,
     )
     with pytest.raises(SshError):
         await await_raises.execute(
@@ -186,9 +188,9 @@ async def test_upload_threads_sandbox_and_connect_ip() -> None:
     sandbox = _FakeSandbox()
     lease = _RecordingLease(sandbox)
     runner = _RecordingRunner()
-    await _executor(runner=runner, materializer=_RecordingMaterializer(), lease=lease).upload(
-        _ctx(), target_alias="prod", local_path="/tmp/x", remote_path="/tmp/y"
-    )
+    await _executor(
+        runner=runner, materializer=_RecordingMaterializer(), lease=lease
+    ).upload(_ctx(), target_alias="prod", local_path="/tmp/x", remote_path="/tmp/y")
     assert runner.sandbox is sandbox
     assert runner.connect_ip == "203.0.113.7"
     assert lease.exited == 1

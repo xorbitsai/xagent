@@ -9,6 +9,7 @@ get 0700/0600, and the dir is removed on every exit path.
 from __future__ import annotations
 
 import pytest
+
 from xagent.core.ssh.sandbox_materializer import SandboxTmpfsSecretMaterializer
 from xagent.core.ssh.types import SensitiveSshCredential
 from xagent.sandbox.base import ExecResult
@@ -29,7 +30,9 @@ class _FakeSandbox:
             return ExecResult(exit_code=1, stdout="", stderr="cannot create")
         return ExecResult(exit_code=0, stdout="", stderr="")
 
-    async def write_file(self, content: str, remote_path: str, overwrite: bool = False) -> None:
+    async def write_file(
+        self, content: str, remote_path: str, overwrite: bool = False
+    ) -> None:
         self.writes.append((remote_path, content))
 
 
@@ -53,7 +56,9 @@ async def test_materializes_key_and_known_hosts_into_private_dir() -> None:
 
 async def test_secret_never_in_exec_argv() -> None:
     sandbox = _FakeSandbox()
-    async with SandboxTmpfsSecretMaterializer().materialize_ssh(sandbox, _cred(), _KNOWN_HOSTS):
+    async with SandboxTmpfsSecretMaterializer().materialize_ssh(
+        sandbox, _cred(), _KNOWN_HOSTS
+    ):
         pass
     joined = " ".join(part for call in sandbox.execs for part in call)
     assert "secret-bytes" not in joined
@@ -102,7 +107,9 @@ async def test_dir_removed_on_exception() -> None:
 async def test_mkdir_failure_raises_before_yield() -> None:
     sandbox = _FakeSandbox(fail_mkdir=True)
     with pytest.raises(Exception):  # noqa: B017,PT011
-        async with SandboxTmpfsSecretMaterializer().materialize_ssh(sandbox, _cred(), _KNOWN_HOSTS):
+        async with SandboxTmpfsSecretMaterializer().materialize_ssh(
+            sandbox, _cred(), _KNOWN_HOSTS
+        ):
             pass
     # No secret was written if the private dir could not be created.
     assert sandbox.writes == []

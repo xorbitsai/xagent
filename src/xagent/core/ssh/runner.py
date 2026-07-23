@@ -202,17 +202,21 @@ class AsyncsshRunner:
         overwrite: bool,
         egress_config: EgressPolicyConfig,
     ) -> None:
-        async with self._connect(
-            hostname=hostname,
-            port=port,
-            username=username,
-            private_key_path=private_key_path,
-            known_hosts_path=known_hosts_path,
-            egress_config=egress_config,
-        ) as conn, conn.start_sftp_client() as sftp:
+        async with (
+            self._connect(
+                hostname=hostname,
+                port=port,
+                username=username,
+                private_key_path=private_key_path,
+                known_hosts_path=known_hosts_path,
+                egress_config=egress_config,
+            ) as conn,
+            conn.start_sftp_client() as sftp,
+        ):
             if not overwrite and await sftp.exists(remote_path):
                 raise SshError(
-                    SshErrorCode.OPERATION_NOT_ALLOWED, "remote destination already exists"
+                    SshErrorCode.OPERATION_NOT_ALLOWED,
+                    "remote destination already exists",
                 )
             await sftp.put(local_path, remote_path)
 
@@ -232,26 +236,35 @@ class AsyncsshRunner:
         egress_config: EgressPolicyConfig,
     ) -> None:
         if not overwrite and os.path.exists(local_path):
-            raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "local destination already exists")
-        async with self._connect(
-            hostname=hostname,
-            port=port,
-            username=username,
-            private_key_path=private_key_path,
-            known_hosts_path=known_hosts_path,
-            egress_config=egress_config,
-        ) as conn, conn.start_sftp_client() as sftp:
+            raise SshError(
+                SshErrorCode.OPERATION_NOT_ALLOWED, "local destination already exists"
+            )
+        async with (
+            self._connect(
+                hostname=hostname,
+                port=port,
+                username=username,
+                private_key_path=private_key_path,
+                known_hosts_path=known_hosts_path,
+                egress_config=egress_config,
+            ) as conn,
+            conn.start_sftp_client() as sftp,
+        ):
             await sftp.get(remote_path, local_path)
 
 
-def _authorize_peer(conn: asyncssh.SSHClientConnection, config: EgressPolicyConfig) -> None:
+def _authorize_peer(
+    conn: asyncssh.SSHClientConnection, config: EgressPolicyConfig
+) -> None:
     """Re-check the connected peer IP against the egress policy. Raises
     EGRESS_DENIED if the actual peer is not permitted (closes on context exit)."""
     peername = conn.get_extra_info("peername")
     peer_ip = peername[0] if peername else ""
     decision = check_ip(peer_ip, config)
     if not decision.allowed:
-        raise SshError(SshErrorCode.EGRESS_DENIED, "connection peer denied by egress policy")
+        raise SshError(
+            SshErrorCode.EGRESS_DENIED, "connection peer denied by egress policy"
+        )
 
 
 def _as_text(value: object) -> str:

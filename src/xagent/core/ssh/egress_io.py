@@ -44,5 +44,7 @@ async def resolve_and_authorize(
         raise SshError(SshErrorCode.EGRESS_DENIED, "hostname did not resolve")
     for ip in addresses:
         if not check_ip(ip, config).allowed:
-            raise SshError(SshErrorCode.EGRESS_DENIED, "destination denied by egress policy")
+            raise SshError(
+                SshErrorCode.EGRESS_DENIED, "destination denied by egress policy"
+            )
     return addresses

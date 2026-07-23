@@ -93,14 +93,19 @@ class SshExecutor:
         try:
             resolved = await self._provider.resolve(context, target_alias)
             if "execute" not in resolved.capabilities:
-                raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "binding does not allow execute")
+                raise SshError(
+                    SshErrorCode.OPERATION_NOT_ALLOWED, "binding does not allow execute"
+                )
 
             # Early, fail-closed egress check before any secret is read. The
             # authorized IP is pinned as connect_ip so the runner connects to
             # the vetted address (DNS-rebinding defense for the sandbox runner,
             # which cannot re-check the peer the way the in-process one does).
             addresses = await resolve_and_authorize(
-                resolved.hostname, resolved.port, self._egress_config, resolver=self._resolver
+                resolved.hostname,
+                resolved.port,
+                self._egress_config,
+                resolver=self._resolver,
             )
             connect_ip = addresses[0]
 
@@ -126,11 +131,15 @@ class SshExecutor:
                 )
             duration_ms = int((time.monotonic() - start) * 1000)
         except SshError as exc:
-            await self._audit(context, "ssh_execute", "failure", resolved, exc.code.value)
+            await self._audit(
+                context, "ssh_execute", "failure", resolved, exc.code.value
+            )
             raise
 
         await self._audit(context, "ssh_execute", "success", resolved, None)
-        stdout, stderr, capped = _cap_outputs(run.stdout, run.stderr, self._max_output_bytes)
+        stdout, stderr, capped = _cap_outputs(
+            run.stdout, run.stderr, self._max_output_bytes
+        )
         return SshExecuteOutcome(
             exit_code=run.exit_code,
             stdout=stdout,
@@ -174,7 +183,9 @@ class SshExecutor:
                     egress_config=self._egress_config,
                 )
         except SshError as exc:
-            await self._audit(context, "ssh_upload", "failure", resolved, exc.code.value)
+            await self._audit(
+                context, "ssh_upload", "failure", resolved, exc.code.value
+            )
             raise
         await self._audit(context, "ssh_upload", "success", resolved, None)
 
@@ -213,7 +224,9 @@ class SshExecutor:
                     egress_config=self._egress_config,
                 )
         except SshError as exc:
-            await self._audit(context, "ssh_download", "failure", resolved, exc.code.value)
+            await self._audit(
+                context, "ssh_download", "failure", resolved, exc.code.value
+            )
             raise
         await self._audit(context, "ssh_download", "success", resolved, None)
 
@@ -238,7 +251,9 @@ class SshExecutor:
                 error_code=error_code,
             )
         except Exception:  # noqa: BLE001
-            logger.warning("ssh audit sink failed for %s (%s)", operation, status, exc_info=True)
+            logger.warning(
+                "ssh audit sink failed for %s (%s)", operation, status, exc_info=True
+            )
 
     def _acquire_sandbox(self) -> AbstractAsyncContextManager[object]:
         """One sandbox for this call: a fresh lease when configured (fail-closed
@@ -257,7 +272,9 @@ class SshExecutor:
         every exit path. Yields the leased sandbox and the written paths."""
         async with (
             self._acquire_sandbox() as sandbox,
-            self._materializer.materialize_ssh(sandbox, credential, known_hosts) as paths,
+            self._materializer.materialize_ssh(
+                sandbox, credential, known_hosts
+            ) as paths,
         ):
             yield sandbox, paths
 
@@ -274,10 +291,14 @@ class SshExecutor:
         resolved = await self._provider.resolve(context, target_alias)
         if capability not in resolved.capabilities:
             raise SshError(
-                SshErrorCode.OPERATION_NOT_ALLOWED, f"binding does not allow {capability}"
+                SshErrorCode.OPERATION_NOT_ALLOWED,
+                f"binding does not allow {capability}",
             )
         addresses = await resolve_and_authorize(
-            resolved.hostname, resolved.port, self._egress_config, resolver=self._resolver
+            resolved.hostname,
+            resolved.port,
+            self._egress_config,
+            resolver=self._resolver,
         )
         _constrain_remote_path(remote_path, resolved.remote_root)
         return resolved, addresses[0]
@@ -289,14 +310,17 @@ def _constrain_remote_path(remote_path: str, remote_root: str | None) -> None:
     filesystem is not consulted — so a symlink on the remote could still escape;
     this is the conservative first guard, not a full remote realpath check."""
     if not remote_path.startswith("/"):
-        raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "remote path must be absolute")
+        raise SshError(
+            SshErrorCode.OPERATION_NOT_ALLOWED, "remote path must be absolute"
+        )
     if remote_root is None:
         return
     normalized = posixpath.normpath(remote_path)
     root = posixpath.normpath(remote_root)
     if normalized != root and not normalized.startswith(root + "/"):
         raise SshError(
-            SshErrorCode.OPERATION_NOT_ALLOWED, "remote path escapes the target's remote root"
+            SshErrorCode.OPERATION_NOT_ALLOWED,
+            "remote path escapes the target's remote root",
         )
 
 

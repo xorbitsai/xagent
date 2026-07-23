@@ -17,6 +17,13 @@ import shutil
 from contextlib import asynccontextmanager
 
 import pytest
+
+from tests.core.ssh.helpers import (
+    InMemorySshSecretStore,
+    InMemorySshTargetProvider,
+    RunningSshServer,
+    start_test_ssh_server,
+)
 from xagent.core.ssh import SshError, SshErrorCode
 from xagent.core.ssh.egress import EgressPolicyConfig
 from xagent.core.ssh.executor import SshExecutor
@@ -31,13 +38,6 @@ from xagent.core.ssh.types import (
     SshSecretHandle,
 )
 from xagent.sandbox.base import ExecResult
-
-from tests.core.ssh.helpers import (
-    InMemorySshSecretStore,
-    InMemorySshTargetProvider,
-    RunningSshServer,
-    start_test_ssh_server,
-)
 
 pytestmark = [
     pytest.mark.integration,
@@ -73,12 +73,16 @@ class _LocalExecSandbox:
             stderr=err.decode("utf-8", "replace"),
         )
 
-    async def write_file(self, content: str, remote_path: str, overwrite: bool = False) -> None:
+    async def write_file(
+        self, content: str, remote_path: str, overwrite: bool = False
+    ) -> None:
         os.makedirs(os.path.dirname(remote_path), exist_ok=True)
         with open(remote_path, "w") as fh:
             fh.write(content)
 
-    async def upload_file(self, local_path: str, remote_path: str, overwrite: bool = False) -> None:
+    async def upload_file(
+        self, local_path: str, remote_path: str, overwrite: bool = False
+    ) -> None:
         os.makedirs(os.path.dirname(remote_path), exist_ok=True)
         shutil.copyfile(local_path, remote_path)
 
@@ -108,7 +112,9 @@ def _known_hosts(server: RunningSshServer, *, host_key: str | None = None) -> st
     return f"{server.host} {algo} {blob}\n"
 
 
-def _target(server: RunningSshServer, *, capabilities, known_hosts=None) -> ResolvedSshTarget:
+def _target(
+    server: RunningSshServer, *, capabilities, known_hosts=None
+) -> ResolvedSshTarget:
     return ResolvedSshTarget(
         target_public_id="t",
         hostname=server.host,
@@ -135,7 +141,11 @@ def _executor(
     return SshExecutor(
         provider=InMemorySshTargetProvider({(1, "prod"): target}),
         secret_store=InMemorySshSecretStore(
-            {"v": SensitiveSshCredential(server.client_private_key.encode(), "", "ssh-ed25519")}
+            {
+                "v": SensitiveSshCredential(
+                    server.client_private_key.encode(), "", "ssh-ed25519"
+                )
+            }
         ),
         materializer=SandboxTmpfsSecretMaterializer(secret_root=str(tmp_path)),
         runner=SandboxSshRunner(secret_root=str(tmp_path)),
@@ -149,7 +159,10 @@ async def test_execute_end_to_end_over_real_ssh(tmp_path) -> None:
     sandbox = _LocalExecSandbox()
     try:
         outcome = await _executor(
-            server, _target(server, capabilities=frozenset({"execute"})), sandbox, tmp_path
+            server,
+            _target(server, capabilities=frozenset({"execute"})),
+            sandbox,
+            tmp_path,
         ).execute(_ctx(), target_alias="prod", command="uptime", timeout_seconds=10)
         assert outcome.exit_code == 0
         assert "ran: uptime" in outcome.stdout
@@ -208,7 +221,10 @@ async def test_upload_then_download_roundtrip(tmp_path) -> None:
         )
         assert remote.read_text() == "payload-via-sandbox"
         await ex.download(
-            _ctx(), target_alias="prod", remote_path=str(remote), local_path=str(fetched)
+            _ctx(),
+            target_alias="prod",
+            remote_path=str(remote),
+            local_path=str(fetched),
         )
         assert fetched.read_text() == "payload-via-sandbox"
     finally:

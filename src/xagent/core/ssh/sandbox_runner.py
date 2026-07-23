@@ -107,7 +107,9 @@ def _raise_for_transport(exit_code: int, stderr: str) -> None:
         raise SshError(SshErrorCode.COMMAND_TIMEOUT, "operation timed out")
     if exit_code == _SSH_TRANSPORT_EXIT:
         if "Host key verification failed" in stderr:
-            raise SshError(SshErrorCode.HOST_KEY_MISMATCH, "host key verification failed")
+            raise SshError(
+                SshErrorCode.HOST_KEY_MISMATCH, "host key verification failed"
+            )
         # Refused / unreachable / auth failure: one stable code, no raw detail.
         raise SshError(SshErrorCode.CONNECTION_TIMEOUT, "ssh connection failed")
 
@@ -183,7 +185,8 @@ class SandboxSshRunner:
                 remote_path=remote_path,
             ):
                 raise SshError(
-                    SshErrorCode.OPERATION_NOT_ALLOWED, "remote destination already exists"
+                    SshErrorCode.OPERATION_NOT_ALLOWED,
+                    "remote destination already exists",
                 )
             batch = f"put {shlex.quote(staged)} {shlex.quote(remote_path)}\n"
             await self._run_sftp(
@@ -214,7 +217,9 @@ class SandboxSshRunner:
         egress_config: object = None,
     ) -> None:
         if not overwrite and os.path.exists(local_path):
-            raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "local destination already exists")
+            raise SshError(
+                SshErrorCode.OPERATION_NOT_ALLOWED, "local destination already exists"
+            )
         async with self._staging(sandbox) as stage:
             staged = f"{stage}/payload"
             batch = f"get {shlex.quote(remote_path)} {shlex.quote(staged)}\n"
@@ -240,7 +245,9 @@ class SandboxSshRunner:
         stage = f"{self._secret_root}/xagent-xfer-{secrets.token_hex(16)}"
         result = await sandbox.exec("mkdir", "-p", "-m", "700", stage)  # type: ignore[attr-defined]
         if getattr(result, "exit_code", 0) != 0:
-            raise SshError(SshErrorCode.SANDBOX_UNAVAILABLE, "could not create staging directory")
+            raise SshError(
+                SshErrorCode.SANDBOX_UNAVAILABLE, "could not create staging directory"
+            )
         try:
             yield stage
         finally:

@@ -54,7 +54,8 @@ class SandboxTmpfsSecretMaterializer:
         result = await sandbox.exec("mkdir", "-p", "-m", "700", directory)  # type: ignore[attr-defined]
         if getattr(result, "exit_code", 0) != 0:
             raise SshError(
-                SshErrorCode.SANDBOX_UNAVAILABLE, "could not create sandbox secret directory"
+                SshErrorCode.SANDBOX_UNAVAILABLE,
+                "could not create sandbox secret directory",
             )
         try:
             # Key material only ever goes through write_file (tar stream), not argv.
@@ -67,7 +68,9 @@ class SandboxTmpfsSecretMaterializer:
                 content=known_hosts, remote_path=known_hosts_path, overwrite=True
             )
             await sandbox.exec("chmod", "600", key_path, known_hosts_path)  # type: ignore[attr-defined]
-            yield MaterializedSshPaths(private_key_path=key_path, known_hosts_path=known_hosts_path)
+            yield MaterializedSshPaths(
+                private_key_path=key_path, known_hosts_path=known_hosts_path
+            )
         finally:
             # rm removes the private dir; sandbox destroy is the final backstop.
             with suppress(Exception):

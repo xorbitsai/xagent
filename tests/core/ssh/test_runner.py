@@ -50,7 +50,9 @@ async def _materialized(
         public_key="",
         key_algorithm="ssh-ed25519",
     )
-    async with LocalTmpSecretMaterializer().materialize_ssh(None, cred, known_hosts) as paths:
+    async with LocalTmpSecretMaterializer().materialize_ssh(
+        None, cred, known_hosts
+    ) as paths:
         yield paths.private_key_path, paths.known_hosts_path
 
 
@@ -196,7 +198,10 @@ async def test_execute_wrong_host_key_fails_before_auth() -> None:
 
     bogus = asyncssh.generate_private_key("ssh-ed25519").export_public_key().decode()
     try:
-        async with _materialized(server, host_public_key=bogus) as (key_path, known_hosts_path):
+        async with _materialized(server, host_public_key=bogus) as (
+            key_path,
+            known_hosts_path,
+        ):
             with pytest.raises(SshError) as exc:
                 await AsyncsshRunner().execute(
                     hostname=server.host,

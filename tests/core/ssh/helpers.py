@@ -27,14 +27,18 @@ class InMemorySshTargetProvider:
     def __init__(self, targets: dict[tuple[int, str], ResolvedSshTarget]) -> None:
         self._targets = targets
 
-    async def resolve(self, context: SshExecutionContext, target_alias: str) -> ResolvedSshTarget:
+    async def resolve(
+        self, context: SshExecutionContext, target_alias: str
+    ) -> ResolvedSshTarget:
         key = (context.agent_id, target_alias)
         target = self._targets.get(key)
         if target is None:
             raise SshError(SshErrorCode.TARGET_NOT_FOUND, "target alias is not bound")
         return target
 
-    async def list_bound_targets(self, context: SshExecutionContext) -> list[BoundTargetInfo]:
+    async def list_bound_targets(
+        self, context: SshExecutionContext
+    ) -> list[BoundTargetInfo]:
         return [
             BoundTargetInfo(
                 alias=alias,
@@ -52,10 +56,14 @@ class InMemorySshSecretStore:
     def __init__(self, versions: dict[str, SensitiveSshCredential]) -> None:
         self._versions = versions
 
-    async def read_version(self, secret_handle: SshSecretHandle) -> SensitiveSshCredential:
+    async def read_version(
+        self, secret_handle: SshSecretHandle
+    ) -> SensitiveSshCredential:
         credential = self._versions.get(secret_handle.version_id)
         if credential is None:
-            raise SshError(SshErrorCode.SECRET_UNAVAILABLE, "credential version unavailable")
+            raise SshError(
+                SshErrorCode.SECRET_UNAVAILABLE, "credential version unavailable"
+            )
         return credential
 
 

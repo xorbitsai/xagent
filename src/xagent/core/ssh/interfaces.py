@@ -23,14 +23,18 @@ class SshTargetProvider(Protocol):
         self, context: SshExecutionContext, target_alias: str
     ) -> ResolvedSshTarget: ...
 
-    async def list_bound_targets(self, context: SshExecutionContext) -> list[BoundTargetInfo]: ...
+    async def list_bound_targets(
+        self, context: SshExecutionContext
+    ) -> list[BoundTargetInfo]: ...
 
 
 @runtime_checkable
 class SshSecretStore(Protocol):
     """Exchanges a secret handle for decrypted credential material."""
 
-    async def read_version(self, secret_handle: SshSecretHandle) -> SensitiveSshCredential: ...
+    async def read_version(
+        self, secret_handle: SshSecretHandle
+    ) -> SensitiveSshCredential: ...
 
 
 @runtime_checkable

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from xagent.core.ssh import (
     ActorRef,
     BoundTargetInfo,
@@ -72,7 +73,9 @@ def _resolved(caps=("execute",)) -> ResolvedSshTarget:
 async def test_list_targets_returns_aliases() -> None:
     provider = _Provider(
         targets=[
-            BoundTargetInfo(alias="prod", display_name="Prod", capabilities=frozenset({"execute"})),
+            BoundTargetInfo(
+                alias="prod", display_name="Prod", capabilities=frozenset({"execute"})
+            ),
         ]
     )
     tool = SshListTargetsTool(provider=provider, context=_ctx())
@@ -93,7 +96,9 @@ class _Executor:
 
 
 async def test_execute_returns_outcome() -> None:
-    outcome = SshExecuteOutcome(exit_code=0, stdout="ok", stderr="", truncated=False, duration_ms=5)
+    outcome = SshExecuteOutcome(
+        exit_code=0, stdout="ok", stderr="", truncated=False, duration_ms=5
+    )
     tool = SshExecuteTool(executor=_Executor(outcome=outcome), context=_ctx())
     out = await tool.run_json_async({"target": "prod", "command": "uptime"})
     assert out["ok"] is True
@@ -122,11 +127,17 @@ class _RecordingTransferExecutor:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    async def upload(self, context, *, target_alias, local_path, remote_path, overwrite):
+    async def upload(
+        self, context, *, target_alias, local_path, remote_path, overwrite
+    ):
         self.calls.append(("upload", target_alias, local_path, remote_path, overwrite))
 
-    async def download(self, context, *, target_alias, remote_path, local_path, overwrite):
-        self.calls.append(("download", target_alias, remote_path, local_path, overwrite))
+    async def download(
+        self, context, *, target_alias, remote_path, local_path, overwrite
+    ):
+        self.calls.append(
+            ("download", target_alias, remote_path, local_path, overwrite)
+        )
 
 
 class _FakeWorkspace:
@@ -137,7 +148,6 @@ class _FakeWorkspace:
         self.root = root
 
     def _contained(self, p: str):
-
         resolved = (self.root / p).resolve()
         if not str(resolved).startswith(str(self.root.resolve())):
             raise ValueError("path escapes workspace")
@@ -156,7 +166,9 @@ class _FakeWorkspace:
 async def test_upload_tool_passes_resolved_path_to_executor(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("x")
     ex = _RecordingTransferExecutor()
-    tool = SshUploadTool(executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx())
+    tool = SshUploadTool(
+        executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx()
+    )
     out = await tool.run_json_async(
         {"target": "prod", "local_path": "f.txt", "remote_path": "/srv/f.txt"}
     )
@@ -167,7 +179,9 @@ async def test_upload_tool_passes_resolved_path_to_executor(tmp_path) -> None:
 
 async def test_upload_tool_rejects_workspace_escape(tmp_path) -> None:
     ex = _RecordingTransferExecutor()
-    tool = SshUploadTool(executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx())
+    tool = SshUploadTool(
+        executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx()
+    )
     out = await tool.run_json_async(
         {"target": "prod", "local_path": "../../etc/passwd", "remote_path": "/srv/x"}
     )
@@ -178,7 +192,9 @@ async def test_upload_tool_rejects_workspace_escape(tmp_path) -> None:
 
 async def test_download_tool_writes_into_workspace(tmp_path) -> None:
     ex = _RecordingTransferExecutor()
-    tool = SshDownloadTool(executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx())
+    tool = SshDownloadTool(
+        executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx()
+    )
     out = await tool.run_json_async(
         {"target": "prod", "remote_path": "/srv/f", "local_path": "out.txt"}
     )
@@ -189,7 +205,9 @@ async def test_download_tool_writes_into_workspace(tmp_path) -> None:
 async def test_transfer_tool_without_workspace_fails_closed() -> None:
     ex = _RecordingTransferExecutor()
     tool = SshUploadTool(executor=ex, workspace=None, context=_ctx())
-    out = await tool.run_json_async({"target": "prod", "local_path": "f", "remote_path": "/srv/f"})
+    out = await tool.run_json_async(
+        {"target": "prod", "local_path": "f", "remote_path": "/srv/f"}
+    )
     assert out["ok"] is False
     assert ex.calls == []
 
@@ -228,7 +246,9 @@ def test_agent_id_from_task_preview_fallback() -> None:
 
 def test_agent_id_from_task_none_when_unresolvable() -> None:
     assert _agent_id_from_task(None) is None
-    assert _agent_id_from_task(SimpleNamespace(agent_id=None, agent_config=None)) is None
+    assert (
+        _agent_id_from_task(SimpleNamespace(agent_id=None, agent_config=None)) is None
+    )
 
 
 class _FakeLease:
@@ -303,7 +323,9 @@ async def test_ssh_sandbox_lease_capacity_fails_closed(monkeypatch) -> None:
     import xagent.web.sandbox_manager as sm
     from xagent.core.tools.adapters.vibe.ssh_tools import _make_ssh_sandbox_lease
 
-    monkeypatch.setattr(sm, "get_sandbox_manager", lambda: _FakeManager(capacity_error=True))
+    monkeypatch.setattr(
+        sm, "get_sandbox_manager", lambda: _FakeManager(capacity_error=True)
+    )
     factory = _make_ssh_sandbox_lease(30, 1)
     with pytest.raises(SshError) as exc:
         async with factory():
@@ -317,12 +339,20 @@ def test_ssh_creator_registered_under_ssh_category() -> None:
     from xagent.core.tools.adapters.vibe.factory import ToolRegistry
 
     ToolRegistry._import_tool_modules()
-    entry = next(e for e in ToolRegistry._tool_creators if e[0].__name__ == "create_ssh_tools")
+    entry = next(
+        e for e in ToolRegistry._tool_creators if e[0].__name__ == "create_ssh_tools"
+    )
     assert entry[1] == frozenset({"ssh"})
 
 
 def test_ssh_tools_carry_ssh_category() -> None:
     # Category must be SSH (not OTHER) so compute_allowed_names admits them
     # when the "ssh" category is selected.
-    assert SshExecuteTool(executor=_Executor(), context=_ctx()).metadata.category.value == "ssh"
-    assert SshListTargetsTool(provider=_Provider(), context=_ctx()).metadata.category.value == "ssh"
+    assert (
+        SshExecuteTool(executor=_Executor(), context=_ctx()).metadata.category.value
+        == "ssh"
+    )
+    assert (
+        SshListTargetsTool(provider=_Provider(), context=_ctx()).metadata.category.value
+        == "ssh"
+    )

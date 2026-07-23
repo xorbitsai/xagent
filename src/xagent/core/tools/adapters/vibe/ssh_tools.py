@@ -83,7 +83,9 @@ class SshOpResult(BaseModel):
 class _SshToolBase(AbstractBaseTool):
     category: ToolCategory = ToolCategory.SSH
 
-    def __init__(self, *, provider: SshTargetProvider, context: SshExecutionContext) -> None:
+    def __init__(
+        self, *, provider: SshTargetProvider, context: SshExecutionContext
+    ) -> None:
         self._provider = provider
         self._context = context
 
@@ -188,7 +190,9 @@ class SshExecuteTool(AbstractBaseTool):
                 timeout_seconds=int(args.get("timeout_seconds", 60)),
             )
         except SshError as exc:
-            return SshOpResult(ok=False, error_code=exc.code.value, message=str(exc)).model_dump()
+            return SshOpResult(
+                ok=False, error_code=exc.code.value, message=str(exc)
+            ).model_dump()
         return SshOpResult(
             ok=True,
             exit_code=outcome.exit_code,
@@ -214,7 +218,9 @@ class SshUploadTool(_SshTransferTool):
         # The source must exist inside the task workspace; resolve_path_with_search
         # raises on a missing file or a path that escapes the workspace.
         try:
-            local = self._workspace.resolve_path_with_search(str(args.get("local_path", "")))
+            local = self._workspace.resolve_path_with_search(
+                str(args.get("local_path", ""))
+            )
         except (ValueError, FileNotFoundError) as exc:
             return self._fail(
                 SshErrorCode.OPERATION_NOT_ALLOWED.value, f"local path rejected: {exc}"
@@ -329,7 +335,8 @@ def _make_ssh_sandbox_lease(
             provider = await manager.get_or_create_lease_provider("ssh", lifecycle_id)
         except SandboxCapacityError as exc:
             raise SshError(
-                SshErrorCode.SANDBOX_UNAVAILABLE, "no sandbox capacity available for ssh"
+                SshErrorCode.SANDBOX_UNAVAILABLE,
+                "no sandbox capacity available for ssh",
             ) from exc
         async with provider.lease(concurrency_safe=False) as sandbox:
             yield sandbox
@@ -341,7 +348,10 @@ def _make_ssh_sandbox_lease(
 async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     """Emit SSH tools only when a provider is installed and the executing agent
     has at least one bound target."""
-    from .....web.services.ssh_runtime import get_ssh_audit_sink, get_ssh_target_provider
+    from .....web.services.ssh_runtime import (
+        get_ssh_audit_sink,
+        get_ssh_target_provider,
+    )
 
     try:
         session_factory = config.get_session_factory()
@@ -373,7 +383,9 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
 
     context = SshExecutionContext(
         actor=ActorRef(actor_type="user", actor_id=str(user_id)),
-        execution_principal=PrincipalRef(principal_type="user", principal_id=str(user_id)),
+        execution_principal=PrincipalRef(
+            principal_type="user", principal_id=str(user_id)
+        ),
         agent_id=agent_id,
         task_id=numeric_task_id,
         turn_id=None,
@@ -390,7 +402,11 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     if not bound:
         logger.info("ssh tools: skip (agent %s has no bound targets)", agent_id)
         return []
-    logger.info("ssh tools: emitting tools for agent %s (%d bound target(s))", agent_id, len(bound))
+    logger.info(
+        "ssh tools: emitting tools for agent %s (%d bound target(s))",
+        agent_id,
+        len(bound),
+    )
 
     # The provider is also the secret store (resolve + read_version on the
     # same adapter). When a sandbox subsystem is available (xagent-cloud), SSH

@@ -8,6 +8,7 @@ exit-code → result/error mapping.
 from __future__ import annotations
 
 import pytest
+
 from xagent.core.ssh.egress import EgressPolicyConfig
 from xagent.core.ssh.errors import SshError, SshErrorCode
 from xagent.core.ssh.sandbox_runner import SandboxSshRunner, _ssh_argv
@@ -90,7 +91,9 @@ def test_ssh_argv_connects_to_ip_with_hostname_alias() -> None:
     )
     assert "HostKeyAlias=host.example" in " ".join(argv)
     assert "deploy@203.0.113.7" in argv
-    assert "host.example" not in [a for a in argv if a == "host.example"]  # not a target
+    assert "host.example" not in [
+        a for a in argv if a == "host.example"
+    ]  # not a target
     assert argv[-1] == "uptime"
 
 
@@ -130,7 +133,13 @@ async def test_execute_host_key_mismatch_maps() -> None:
 
 async def test_execute_generic_transport_error_no_leak() -> None:
     sandbox = _FakeSandbox(
-        [ExecResult(exit_code=255, stdout="", stderr="ssh: connect to host ... port 22: refused")]
+        [
+            ExecResult(
+                exit_code=255,
+                stdout="",
+                stderr="ssh: connect to host ... port 22: refused",
+            )
+        ]
     )
     with pytest.raises(SshError) as exc:
         await SandboxSshRunner().execute(**_run_kwargs(sandbox=sandbox))
@@ -167,15 +176,21 @@ class _XferSandbox:
         self.execs.append((command, *args))
         argv = (command, *args)
         if "ssh" in argv and any("test -e" in a for a in argv):
-            return ExecResult(exit_code=0 if self._remote_exists else 1, stdout="", stderr="")
+            return ExecResult(
+                exit_code=0 if self._remote_exists else 1, stdout="", stderr=""
+            )
         if "sftp" in argv:
             return ExecResult(exit_code=self._sftp_exit, stdout="", stderr="")
         return ExecResult(exit_code=0, stdout="", stderr="")
 
-    async def write_file(self, content: str, remote_path: str, overwrite: bool = False) -> None:
+    async def write_file(
+        self, content: str, remote_path: str, overwrite: bool = False
+    ) -> None:
         self.writes.append((remote_path, content))
 
-    async def upload_file(self, local_path: str, remote_path: str, overwrite: bool = False) -> None:
+    async def upload_file(
+        self, local_path: str, remote_path: str, overwrite: bool = False
+    ) -> None:
         self.uploads.append((local_path, remote_path))
 
     async def download_file(
@@ -203,7 +218,9 @@ def _xfer_kwargs(**over):
 async def test_upload_stages_host_file_then_sftp_put() -> None:
     sandbox = _XferSandbox(remote_exists=False)
     await SandboxSshRunner().upload(
-        **_xfer_kwargs(sandbox=sandbox, local_path="/host/ws/a.txt", remote_path="/srv/a.txt")
+        **_xfer_kwargs(
+            sandbox=sandbox, local_path="/host/ws/a.txt", remote_path="/srv/a.txt"
+        )
     )
     # Host file was staged into the sandbox first.
     assert sandbox.uploads and sandbox.uploads[0][0] == "/host/ws/a.txt"
@@ -217,7 +234,9 @@ async def test_upload_overwrite_false_rejects_existing_remote() -> None:
     sandbox = _XferSandbox(remote_exists=True)
     with pytest.raises(SshError) as exc:
         await SandboxSshRunner().upload(
-            **_xfer_kwargs(sandbox=sandbox, local_path="/host/a", remote_path="/srv/a.txt")
+            **_xfer_kwargs(
+                sandbox=sandbox, local_path="/host/a", remote_path="/srv/a.txt"
+            )
         )
     assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
     # No sftp put was attempted.
@@ -242,7 +261,9 @@ async def test_download_overwrite_false_rejects_existing_local(tmp_path) -> None
     sandbox = _XferSandbox()
     with pytest.raises(SshError) as exc:
         await SandboxSshRunner().download(
-            **_xfer_kwargs(sandbox=sandbox, remote_path="/srv/a.txt", local_path=str(local))
+            **_xfer_kwargs(
+                sandbox=sandbox, remote_path="/srv/a.txt", local_path=str(local)
+            )
         )
     assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
 
@@ -251,7 +272,9 @@ async def test_sftp_failure_maps_to_error() -> None:
     sandbox = _XferSandbox(sftp_exit=1)
     with pytest.raises(SshError):
         await SandboxSshRunner().upload(
-            **_xfer_kwargs(sandbox=sandbox, local_path="/host/a", remote_path="/srv/a.txt")
+            **_xfer_kwargs(
+                sandbox=sandbox, local_path="/host/a", remote_path="/srv/a.txt"
+            )
         )
 
 

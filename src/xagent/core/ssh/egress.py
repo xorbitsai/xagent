@@ -16,8 +16,8 @@ from dataclasses import dataclass
 #
 # Cloud instance metadata endpoints, parsed so matching is numeric (a raw
 # string compare would miss the IPv4-mapped form ::ffff:169.254.169.254).
-_METADATA_ADDRESSES: frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address] = frozenset(
-    ipaddress.ip_address(a) for a in ("169.254.169.254", "fd00:ec2::254")
+_METADATA_ADDRESSES: frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address] = (
+    frozenset(ipaddress.ip_address(a) for a in ("169.254.169.254", "fd00:ec2::254"))
 )
 
 

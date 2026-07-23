@@ -74,11 +74,15 @@ async def test_resolve_read_materialize_round_trip() -> None:
     resolved = await provider.resolve(_ctx(), "prod")
     credential = await store.read_version(resolved.secret_handle)
 
-    async with materializer.materialize_ssh(object(), credential, resolved.known_hosts) as paths:
+    async with materializer.materialize_ssh(
+        object(), credential, resolved.known_hosts
+    ) as paths:
         with open(paths.private_key_path, "rb") as handle:
             assert handle.read() == b"PRIVATEKEYBYTES"
         key_mode = stat.S_IMODE(os.stat(paths.private_key_path).st_mode)
-        dir_mode = stat.S_IMODE(os.stat(os.path.dirname(paths.private_key_path)).st_mode)
+        dir_mode = stat.S_IMODE(
+            os.stat(os.path.dirname(paths.private_key_path)).st_mode
+        )
         assert key_mode == 0o600
         assert dir_mode == 0o700
         saved_dir = os.path.dirname(paths.private_key_path)
@@ -91,7 +95,9 @@ async def test_materializer_cleans_up_on_exception() -> None:
     materializer = LocalTmpSecretMaterializer()
     saved_dir = ""
     with pytest.raises(RuntimeError):
-        async with materializer.materialize_ssh(object(), _credential(), "known\n") as paths:
+        async with materializer.materialize_ssh(
+            object(), _credential(), "known\n"
+        ) as paths:
             saved_dir = os.path.dirname(paths.private_key_path)
             raise RuntimeError("boom")
     assert saved_dir
@@ -115,7 +121,9 @@ async def test_unknown_version_raises_secret_unavailable() -> None:
 async def test_list_bound_targets_filters_by_agent() -> None:
     from xagent.core.ssh import BoundTargetInfo  # noqa: F401
 
-    provider = InMemorySshTargetProvider({(1, "prod"): _target(), (2, "other"): _target()})
+    provider = InMemorySshTargetProvider(
+        {(1, "prod"): _target(), (2, "other"): _target()}
+    )
     infos = await provider.list_bound_targets(_ctx(agent_id=1))
     assert [i.alias for i in infos] == ["prod"]
     assert "execute" in infos[0].capabilities

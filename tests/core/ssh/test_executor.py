@@ -69,11 +69,17 @@ def _target(
     )
 
 
-def _executor(server: RunningSshServer, target: ResolvedSshTarget, **kwargs) -> SshExecutor:
+def _executor(
+    server: RunningSshServer, target: ResolvedSshTarget, **kwargs
+) -> SshExecutor:
     return SshExecutor(
         provider=InMemorySshTargetProvider({(1, "prod"): target}),
         secret_store=InMemorySshSecretStore(
-            {"v": SensitiveSshCredential(server.client_private_key.encode(), "", "ssh-ed25519")}
+            {
+                "v": SensitiveSshCredential(
+                    server.client_private_key.encode(), "", "ssh-ed25519"
+                )
+            }
         ),
         materializer=LocalTmpSecretMaterializer(),
         runner=AsyncsshRunner(),
@@ -101,7 +107,9 @@ async def test_execute_capability_denied() -> None:
     try:
         ex = _executor(server, _target(server, capabilities=frozenset({"download"})))
         with pytest.raises(SshError) as exc:
-            await ex.execute(_ctx(), target_alias="prod", command="uptime", timeout_seconds=10)
+            await ex.execute(
+                _ctx(), target_alias="prod", command="uptime", timeout_seconds=10
+            )
         assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
     finally:
         await server.close()
@@ -124,7 +132,9 @@ async def test_execute_egress_preflight_denies_private_host() -> None:
             egress_config=EgressPolicyConfig(),
         )
         with pytest.raises(SshError) as exc:
-            await ex.execute(_ctx(), target_alias="prod", command="uptime", timeout_seconds=10)
+            await ex.execute(
+                _ctx(), target_alias="prod", command="uptime", timeout_seconds=10
+            )
         assert exc.value.code == SshErrorCode.EGRESS_DENIED
     finally:
         await server.close()
@@ -150,7 +160,9 @@ async def test_upload_happy_path(tmp_path) -> None:
     remote = tmp_path / "remote.txt"
     try:
         ex = _executor(server, _target(server, capabilities=frozenset({"upload"})))
-        await ex.upload(_ctx(), target_alias="prod", local_path=str(local), remote_path=str(remote))
+        await ex.upload(
+            _ctx(), target_alias="prod", local_path=str(local), remote_path=str(remote)
+        )
         assert remote.read_text() == "via-executor"
     finally:
         await server.close()
@@ -177,7 +189,10 @@ async def test_upload_capability_denied(tmp_path) -> None:
         ex = _executor(server, _target(server, capabilities=frozenset({"execute"})))
         with pytest.raises(SshError) as exc:
             await ex.upload(
-                _ctx(), target_alias="prod", local_path=str(tmp_path / "x"), remote_path="/tmp/x"
+                _ctx(),
+                target_alias="prod",
+                local_path=str(tmp_path / "x"),
+                remote_path="/tmp/x",
             )
         assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
     finally:
@@ -209,7 +224,9 @@ class _RecordingAuditSink:
         self.events: list[dict] = []
         self._boom = boom
 
-    async def record(self, *, context, operation, status, target=None, error_code=None) -> None:
+    async def record(
+        self, *, context, operation, status, target=None, error_code=None
+    ) -> None:
         if self._boom:
             raise RuntimeError("audit backend down")
         self.events.append(
@@ -246,10 +263,14 @@ async def test_execute_emits_failure_audit_with_error_code() -> None:
     sink = _RecordingAuditSink()
     try:
         ex = _executor(
-            server, _target(server, capabilities=frozenset({"download"})), audit_sink=sink
+            server,
+            _target(server, capabilities=frozenset({"download"})),
+            audit_sink=sink,
         )
         with pytest.raises(SshError):
-            await ex.execute(_ctx(), target_alias="prod", command="uptime", timeout_seconds=10)
+            await ex.execute(
+                _ctx(), target_alias="prod", command="uptime", timeout_seconds=10
+            )
         assert len(sink.events) == 1
         assert sink.events[0]["status"] == "failure"
         assert sink.events[0]["error_code"] == "ssh_operation_not_allowed"
@@ -278,7 +299,9 @@ async def test_upload_emits_audit(tmp_path) -> None:
     try:
         await _executor(
             server, _target(server, capabilities=frozenset({"upload"})), audit_sink=sink
-        ).upload(_ctx(), target_alias="prod", local_path=str(local), remote_path=str(remote))
+        ).upload(
+            _ctx(), target_alias="prod", local_path=str(local), remote_path=str(remote)
+        )
         assert sink.events[0]["operation"] == "ssh_upload"
         assert sink.events[0]["status"] == "success"
     finally:
@@ -301,14 +324,20 @@ async def test_execute_timeout_clamped_to_max() -> None:
         ex = SshExecutor(
             provider=InMemorySshTargetProvider({(1, "prod"): _target(server)}),
             secret_store=InMemorySshSecretStore(
-                {"v": SensitiveSshCredential(server.client_private_key.encode(), "", "ssh-ed25519")}
+                {
+                    "v": SensitiveSshCredential(
+                        server.client_private_key.encode(), "", "ssh-ed25519"
+                    )
+                }
             ),
             materializer=LocalTmpSecretMaterializer(),
             runner=runner,
             egress_config=_ALLOW_LOOPBACK,
             max_timeout_seconds=5,
         )
-        await ex.execute(_ctx(), target_alias="prod", command="uptime", timeout_seconds=100)
+        await ex.execute(
+            _ctx(), target_alias="prod", command="uptime", timeout_seconds=100
+        )
         assert runner.timeout_seconds == 5
     finally:
         await server.close()

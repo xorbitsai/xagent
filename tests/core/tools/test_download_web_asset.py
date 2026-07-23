@@ -43,7 +43,7 @@ def workspace(tmp_path: Path) -> TaskWorkspace:
 @pytest.fixture(autouse=True)
 def allow_public_test_hosts():
     with patch(
-        "xagent.core.tools.adapters.vibe.download_web_asset.validate_public_http_url",
+        "xagent.core.utils.security.validate_public_http_url",
         new=AsyncMock(),
     ) as validate:
         yield validate
@@ -129,6 +129,7 @@ async def test_download_web_asset_infers_extension_from_image_bytes(
     response = httpx.Response(
         200,
         content=content,
+        headers={"content-type": "image/jpeg"},
         request=httpx.Request("GET", "https://brand.example/logo"),
     )
     tool = DownloadWebAssetTool(workspace)
@@ -139,6 +140,7 @@ async def test_download_web_asset_infers_extension_from_image_bytes(
     assert result["success"] is True
     assert result["filename"] == "logo.png"
     assert result["file_ref"]["mime_type"] == "image/png"
+    assert result["content_type"] == "image/jpeg"
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 """Tests for FetchWebContent tool."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -11,11 +11,21 @@ from xagent.core.tools.adapters.vibe.fetch_web_content import (
     FetchWebContentTool,
 )
 from xagent.core.tools.core.web_content import WebContentFetcher
+from xagent.core.utils.security import PrivateNetworkHostError
 
 
 @pytest.fixture
 def fetch_tool():
     return FetchWebContentTool()
+
+
+@pytest.fixture(autouse=True)
+def allow_public_test_hosts():
+    with patch(
+        "xagent.core.utils.security.validate_public_http_url",
+        new=AsyncMock(),
+    ) as validate:
+        yield validate
 
 
 class _MockStreamResponse:
@@ -255,8 +265,15 @@ class TestFetchWebContentTool:
         assert result.assets == ()
 
     @pytest.mark.asyncio
-    async def test_fetch_follows_redirects(self, fetch_tool):
+    async def test_fetch_follows_redirects(
+        self, fetch_tool, allow_public_test_hosts: AsyncMock
+    ):
         html = "<html><body><p>Redirect target</p></body></html>"
+        redirect = _MockStreamResponse(
+            headers={"location": "https://example.com/final"},
+            status_code=302,
+            url="https://example.com/start",
+        )
         response = _MockStreamResponse(
             body=html.encode("utf-8"),
             headers={"content-type": "text/html"},
@@ -264,7 +281,11 @@ class TestFetchWebContentTool:
         )
 
         with patch(
-            "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+            "httpx.AsyncClient.stream",
+            side_effect=[
+                _MockStreamContext(redirect),
+                _MockStreamContext(response),
+            ],
         ) as mock_stream:
             result = await fetch_tool.run_json_async(
                 {"url": "https://example.com/start"}
@@ -273,7 +294,31 @@ class TestFetchWebContentTool:
         assert result["success"] is True
         assert result["url"] == "https://example.com/final"
         assert "Redirect target" in result["content"]
-        assert mock_stream.call_args.kwargs["follow_redirects"] is True
+        assert allow_public_test_hosts.await_args_list == [
+            (("https://example.com/start",),),
+            (("https://example.com/final",),),
+        ]
+        assert all(
+            call.kwargs["follow_redirects"] is False
+            for call in mock_stream.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_rejects_private_network_before_request(
+        self, fetch_tool, allow_public_test_hosts: AsyncMock
+    ):
+        allow_public_test_hosts.side_effect = PrivateNetworkHostError(
+            "Host must not resolve to a private network."
+        )
+
+        with patch("httpx.AsyncClient.stream") as mock_stream:
+            result = await fetch_tool.run_json_async(
+                {"url": "http://169.254.169.254/latest/meta-data/"}
+            )
+
+        assert result["success"] is False
+        assert "private network" in result["error"]
+        mock_stream.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fetch_plain_text_content(self, fetch_tool):

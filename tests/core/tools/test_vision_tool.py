@@ -535,6 +535,8 @@ class TestVisionToolUnderstandMedia:
         class RemoteSvgResponse:
             status_code = 200
             headers = {"content-length": str(len(svg_source.encode()))}
+            url = "https://cdn.example.com/official-logo.svg"
+            encoding = "utf-8"
 
             def raise_for_status(self):
                 return None
@@ -551,7 +553,7 @@ class TestVisionToolUnderstandMedia:
 
         with (
             patch(
-                "xagent.core.tools.core.vision_tool.validate_public_http_url",
+                "xagent.core.utils.security.validate_public_http_url",
                 new=AsyncMock(),
             ) as validate_url,
             patch(

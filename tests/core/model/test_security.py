@@ -9,8 +9,14 @@ from xagent.core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
     redact_url_credentials_for_logging,
+    reject_private_network_host,
     validate_public_http_url,
 )
+
+
+def test_reject_private_network_host_rejects_cgnat_range() -> None:
+    with pytest.raises(PrivateNetworkHostError):
+        reject_private_network_host("100.64.0.1")
 
 
 @pytest.mark.asyncio

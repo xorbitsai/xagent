@@ -383,8 +383,16 @@ def _delete_logo(logo_url: str) -> None:
         # logo_url is a URL path (e.g. "/uploads/agent_logos/agent_1_ab12cd34.png"),
         # not a filesystem path - resolve it against the configured uploads
         # root rather than the process's CWD, which get_uploads_dir() may not match.
-        filepath = get_uploads_dir() / logo_url[len("/uploads/") :]
-        if filepath.exists():
+        uploads_dir = get_uploads_dir().resolve()
+        try:
+            filepath = (uploads_dir / logo_url[len("/uploads/") :]).resolve()
+            filepath.relative_to(uploads_dir)
+        except ValueError:
+            # Path escapes the uploads directory (e.g. via "..") - refuse rather
+            # than delete an arbitrary file outside the intended root.
+            logger.warning(f"Refused to delete logo outside uploads dir: {logo_url}")
+            return
+        if filepath.is_file():
             filepath.unlink()
     except Exception as e:
         logger.error(f"Failed to delete logo {logo_url}: {e}")

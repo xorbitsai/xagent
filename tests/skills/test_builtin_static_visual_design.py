@@ -66,10 +66,8 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     assert "Include it as a generation reference" in content
     assert "Stable cues may include the official logo" in content
     assert "datedness is not a brand requirement" in content
-    assert "download_web_asset" in content
-    assert "SVG is source text" in content
-    assert "passes local/workspace SVG XML directly" in content
-    assert "Do not repeatedly call it for the same SVG" in content
+    assert "download_web_asset" not in content
+    assert "SVG is source text" not in content
     assert "Cosmetic resizes are not distinct concepts" in content
     assert "Each direction must differ on at least three" in content
     assert "stacked display effects as a warning sign" in content

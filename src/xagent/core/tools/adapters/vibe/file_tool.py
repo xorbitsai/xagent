@@ -40,9 +40,7 @@ read_file_tool = FileTool(
     description=(
         "Read file content. For large files, results may be truncated in model "
         "context; use start_line/end_line to inspect a specific 1-based "
-        "inclusive line range instead of repeating the same full-file read. "
-        "SVG files are XML text: use read_file for exact markup, colors, viewBox, "
-        "paths, fill, stroke, and gradient values."
+        "inclusive line range instead of repeating the same full-file read."
     ),
     read_only=True,
 )

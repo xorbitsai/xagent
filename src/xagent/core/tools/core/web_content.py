@@ -2,25 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import html2text
 import httpx
 from bs4 import BeautifulSoup
 
-from ...utils.security import fetch_public_http_bytes
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024
-MAX_DISCOVERED_ASSETS = 50
-IDENTITY_ASSET_TERMS = ("logo", "brand", "wordmark")
 HTML_CONTENT_TYPES = frozenset(
     {
         "",
@@ -41,26 +36,6 @@ PLAIN_TEXT_CONTENT_TYPES = frozenset(
 
 
 @dataclass(frozen=True)
-class WebAssetReference:
-    """One static asset reference discovered from an official webpage."""
-
-    url: str
-    kind: str
-    name: str = ""
-    alt: str = ""
-    source: str = "html"
-
-    def as_dict(self) -> dict[str, str]:
-        return {
-            "url": self.url,
-            "kind": self.kind,
-            "name": self.name,
-            "alt": self.alt,
-            "source": self.source,
-        }
-
-
-@dataclass(frozen=True)
 class WebContentFetchResult:
     """Structured result for fetching and extracting one webpage."""
 
@@ -70,7 +45,6 @@ class WebContentFetchResult:
     status_code: int | None = None
     content_type: str = ""
     error: str | None = None
-    assets: tuple[WebAssetReference, ...] = ()
 
     @property
     def success(self) -> bool:
@@ -92,7 +66,6 @@ class WebContentFetchResult:
             "status_code": self.status_code,
             "content_type": self.content_type,
             "error": self.error,
-            "assets": [asset.as_dict() for asset in self.assets],
         }
 
 
@@ -115,13 +88,7 @@ class WebContentFetcher:
         self._proxy_url = proxy_url
         self._max_content_bytes = max_content_bytes
 
-    async def fetch(
-        self,
-        url: str,
-        *,
-        include_assets: bool = False,
-        asset_query: str | None = None,
-    ) -> WebContentFetchResult:
+    async def fetch(self, url: str) -> WebContentFetchResult:
         logger.info("Fetching webpage content from: %s", url)
 
         headers = {"User-Agent": DEFAULT_USER_AGENT}
@@ -132,80 +99,67 @@ class WebContentFetcher:
                 logger.info("Using proxy for webpage fetch: %s", self._proxy_url)
 
             async with httpx.AsyncClient(**client_kwargs) as client:
-                response = await fetch_public_http_bytes(
-                    client,
+                async with client.stream(
+                    "GET",
                     url,
                     headers=headers,
                     timeout=10,
-                    max_content_bytes=self._max_content_bytes,
-                )
-                content_type = response.content_type
-                final_url = response.url
-                content = response.content
+                    follow_redirects=True,
+                ) as response:
+                    response.raise_for_status()
 
-                if not self._is_html_content(content_type):
-                    if self._is_plain_text_content(content_type):
-                        decoded = self._decode_text_response(response.encoding, content)
-                        manifest_assets = (
-                            self._manifest_asset_references(
-                                decoded,
-                                final_url,
-                                asset_query=asset_query,
-                            )
-                            if include_assets
-                            else ()
-                        )
+                    content_type = response.headers.get("content-type", "")
+                    final_url = str(response.url)
+                    error = self._validate_content_length(
+                        response.headers.get("content-length")
+                    )
+                    if error:
                         return WebContentFetchResult(
                             url=final_url,
-                            content=decoded,
+                            content="",
                             status_code=response.status_code,
                             content_type=content_type,
-                            assets=manifest_assets,
+                            error=error,
                         )
+
+                    content, error = await self._read_limited_response(response)
+                    if error:
+                        return WebContentFetchResult(
+                            url=final_url,
+                            content="",
+                            status_code=response.status_code,
+                            content_type=content_type,
+                            error=error,
+                        )
+
+                    if not self._is_html_content(content_type):
+                        if self._is_plain_text_content(content_type):
+                            return WebContentFetchResult(
+                                url=final_url,
+                                content=self._decode_text_response(response, content),
+                                status_code=response.status_code,
+                                content_type=content_type,
+                            )
+
+                        return WebContentFetchResult(
+                            url=final_url,
+                            content="",
+                            status_code=response.status_code,
+                            content_type=content_type,
+                            error=f"Unsupported non-text content type: {content_type}",
+                        )
+
+                    soup = BeautifulSoup(content, "html.parser")
+                    title = self._extract_title(soup)
+                    markdown = self._soup_to_markdown(soup, final_url)
 
                     return WebContentFetchResult(
                         url=final_url,
-                        content="",
+                        title=title,
+                        content=markdown,
                         status_code=response.status_code,
                         content_type=content_type,
-                        error=f"Unsupported non-text content type: {content_type}",
                     )
-
-                soup = BeautifulSoup(content, "html.parser")
-                title = self._extract_title(soup)
-                assets: tuple[WebAssetReference, ...] = ()
-                if include_assets:
-                    discovered_assets = self._extract_html_assets(soup, final_url)
-                    matching_html_assets = self._filter_and_deduplicate_assets(
-                        discovered_assets,
-                        asset_query=asset_query,
-                    )
-                    if not any(
-                        asset.kind in {"image", "icon"}
-                        for asset in matching_html_assets
-                    ):
-                        discovered_assets.extend(
-                            await self._discover_spa_manifest_assets(
-                                client,
-                                soup,
-                                final_url,
-                                asset_query=asset_query,
-                            )
-                        )
-                    assets = self._filter_and_deduplicate_assets(
-                        discovered_assets,
-                        asset_query=asset_query,
-                    )
-                markdown = self._soup_to_markdown(soup, final_url)
-
-                return WebContentFetchResult(
-                    url=final_url,
-                    title=title,
-                    content=markdown,
-                    status_code=response.status_code,
-                    content_type=content_type,
-                    assets=assets,
-                )
 
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
@@ -232,186 +186,34 @@ class WebContentFetcher:
 
         return (await self.fetch(url)).as_search_content()
 
-    @staticmethod
-    def _extract_html_assets(
-        soup: BeautifulSoup,
-        base_url: str,
-    ) -> list[WebAssetReference]:
-        assets: list[WebAssetReference] = []
-
-        def add(
-            raw_url: str | None,
-            *,
-            kind: str,
-            name: str = "",
-            alt: str = "",
-        ) -> None:
-            if not raw_url:
-                return
-            normalized = str(raw_url).strip()
-            if not normalized or normalized.startswith(("data:", "javascript:")):
-                return
-            assets.append(
-                WebAssetReference(
-                    url=urljoin(base_url, normalized),
-                    kind=kind,
-                    name=name,
-                    alt=alt,
-                )
-            )
-
-        for image in soup.find_all("img"):
-            add(
-                image.get("src") or image.get("data-src"),
-                kind="image",
-                name=str(image.get("id") or image.get("class") or ""),
-                alt=str(image.get("alt") or ""),
-            )
-
-        for source in soup.find_all("source"):
-            srcset = str(source.get("srcset") or source.get("data-srcset") or "")
-            for candidate in srcset.split(","):
-                add(candidate.strip().split(" ", 1)[0], kind="image")
-
-        for link in soup.find_all("link"):
-            rel_values = {str(value).lower() for value in (link.get("rel") or [])}
-            kind = "link"
-            if "manifest" in rel_values:
-                kind = "manifest"
-            elif rel_values & {"icon", "shortcut", "apple-touch-icon"}:
-                kind = "icon"
-            elif "stylesheet" in rel_values:
-                kind = "stylesheet"
-            elif link.get("as") == "image":
-                kind = "image"
-            add(link.get("href"), kind=kind, name=" ".join(sorted(rel_values)))
-
-        for script in soup.find_all("script"):
-            add(script.get("src"), kind="script")
-
-        for meta in soup.find_all("meta"):
-            property_name = str(meta.get("property") or meta.get("name") or "").lower()
-            if property_name in {"og:image", "twitter:image", "twitter:image:src"}:
-                add(meta.get("content"), kind="image", name=property_name)
-
-        return assets
-
-    async def _discover_spa_manifest_assets(
-        self,
-        client: httpx.AsyncClient,
-        soup: BeautifulSoup,
-        page_url: str,
-        *,
-        asset_query: str | None,
-    ) -> list[WebAssetReference]:
-        """Discover identity assets exported by a Create React App manifest."""
-
-        has_static_bundle = any(
-            "/static/js/" in str(script.get("src") or "")
-            for script in soup.find_all("script")
-        )
-        if not has_static_bundle:
-            return []
-
-        parsed = urlsplit(page_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return []
-        manifest_url = f"{parsed.scheme}://{parsed.netloc}/asset-manifest.json"
-        assets: list[WebAssetReference] = []
+    def _validate_content_length(self, content_length: str | None) -> str | None:
+        if not content_length:
+            return None
         try:
-            response = await fetch_public_http_bytes(
-                client,
-                manifest_url,
-                headers={"User-Agent": DEFAULT_USER_AGENT},
-                timeout=10,
-                max_content_bytes=self._max_content_bytes,
+            size = int(content_length)
+        except ValueError:
+            return None
+        if size > self._max_content_bytes:
+            return (
+                f"Response body size exceeds maximum of {self._max_content_bytes} bytes"
             )
-            assets.append(
-                WebAssetReference(
-                    url=manifest_url,
-                    kind="asset_manifest",
-                    name="asset-manifest.json",
-                    source="spa_convention",
-                )
-            )
-            decoded = self._decode_text_response(response.encoding, response.content)
-            assets.extend(
-                self._manifest_asset_references(
-                    decoded,
-                    response.url,
-                    asset_query=asset_query,
-                )
-            )
-        except Exception as exc:
-            logger.debug(
-                "SPA asset manifest discovery failed for %s: %s", page_url, exc
-            )
-        return assets
+        return None
 
-    @classmethod
-    def _manifest_asset_references(
-        cls,
-        content: str,
-        manifest_url: str,
-        *,
-        asset_query: str | None,
-    ) -> tuple[WebAssetReference, ...]:
-        try:
-            payload = json.loads(content)
-        except (TypeError, ValueError):
-            return ()
-        if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
-            return ()
-
-        query = str(asset_query or "").strip().lower()
-        references: list[WebAssetReference] = []
-        for raw_name, raw_url in payload["files"].items():
-            if not isinstance(raw_name, str) or not isinstance(raw_url, str):
-                continue
-            haystack = f"{raw_name} {raw_url}".lower()
-            if query:
-                if query not in haystack:
-                    continue
-            elif not any(term in haystack for term in IDENTITY_ASSET_TERMS):
-                continue
-            suffix = urlsplit(raw_url).path.lower()
-            if not suffix.endswith(
-                (".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
-            ):
-                continue
-            references.append(
-                WebAssetReference(
-                    url=urljoin(manifest_url, raw_url),
-                    kind="manifest_asset",
-                    name=raw_name,
-                    source="asset_manifest",
+    async def _read_limited_response(
+        self, response: httpx.Response
+    ) -> tuple[bytes, str | None]:
+        chunks: list[bytes] = []
+        downloaded = 0
+        async for chunk in response.aiter_bytes():
+            downloaded += len(chunk)
+            if downloaded > self._max_content_bytes:
+                return (
+                    b"",
+                    "Response body size exceeds maximum of "
+                    f"{self._max_content_bytes} bytes",
                 )
-            )
-            if len(references) >= MAX_DISCOVERED_ASSETS:
-                break
-        return tuple(references)
-
-    @staticmethod
-    def _filter_and_deduplicate_assets(
-        assets: list[WebAssetReference],
-        *,
-        asset_query: str | None,
-    ) -> tuple[WebAssetReference, ...]:
-        query = str(asset_query or "").strip().lower()
-        result: list[WebAssetReference] = []
-        seen: set[str] = set()
-        for asset in assets:
-            if asset.url in seen:
-                continue
-            if query and asset.kind not in {"manifest", "asset_manifest"}:
-                haystack = f"{asset.url} {asset.name} {asset.alt}".lower()
-                if query not in haystack:
-                    continue
-            seen.add(asset.url)
-            result.append(asset)
-            if len(result) >= MAX_DISCOVERED_ASSETS:
-                break
-        return tuple(result)
+            chunks.append(chunk)
+        return b"".join(chunks), None
 
     @staticmethod
     def _content_media_type(content_type: str) -> str:
@@ -432,9 +234,9 @@ class WebContentFetcher:
         )
 
     @staticmethod
-    def _decode_text_response(encoding: str | None, content: bytes) -> str:
+    def _decode_text_response(response: httpx.Response, content: bytes) -> str:
         try:
-            return content.decode(encoding or "utf-8", errors="replace")
+            return content.decode(response.encoding or "utf-8", errors="replace")
         except LookupError:
             return content.decode("utf-8", errors="replace")
 
@@ -470,19 +272,10 @@ class WebContentFetcher:
         return markdown
 
 
-async def fetch_web_content(
-    url: str,
-    *,
-    include_assets: bool = False,
-    asset_query: str | None = None,
-) -> WebContentFetchResult:
+async def fetch_web_content(url: str) -> WebContentFetchResult:
     """Fetch a webpage using the default proxy configuration."""
 
-    return await WebContentFetcher(proxy_url=get_proxy_url()).fetch(
-        url,
-        include_assets=include_assets,
-        asset_query=asset_query,
-    )
+    return await WebContentFetcher(proxy_url=get_proxy_url()).fetch(url)
 
 
 async def fetch_web_content_text(url: str) -> str:

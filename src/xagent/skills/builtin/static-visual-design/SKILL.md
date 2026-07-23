@@ -174,22 +174,14 @@ and do not make reading a required reference document its own deliverable step.
 
 ## Use brand and reference assets intentionally
 
-Inspect relevant uploaded or workspace images with `understand_media`. SVG is
-source text: `understand_media` passes local/workspace SVG XML directly to the
-model so it can inspect exact markup, `viewBox`, paths, text, `fill`, `stroke`,
-gradients, and the encoded visual structure without guessing from a raster.
-Do not repeatedly call it for the same SVG. Use `read_file` only when the raw
-file content itself is the required result. Pass useful product, campaign,
-style, or layout references to image generation or editing so the result belongs
-to the intended visual world.
+Inspect relevant uploaded or workspace images with `understand_media`. Pass
+useful product, campaign, style, or layout references to image generation or
+editing so the result belongs to the intended visual world.
 
 For work naming a real brand, resolve the brand identity before rendering final
-candidates. Look first in user uploads and the task workspace. When browsing is
-available, use only an official brand site or brand kit as an external source.
-Use `fetch_web_content` with `include_assets=true` and an `asset_query` such as
-`logo` to discover official static assets, then use `download_web_asset` on the
-exact returned URL. Otherwise ask the user for the asset. A visually plausible
-search result is not proof that a logo is authentic.
+candidates. Look in user uploads and the task workspace. If no verified asset is
+available, ask the user for it. A visually plausible search result is not proof
+that a logo is authentic.
 
 Treat identity-critical assets differently:
 

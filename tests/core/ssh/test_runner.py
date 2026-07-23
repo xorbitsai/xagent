@@ -117,6 +117,78 @@ async def test_execute_times_out() -> None:
         await server.close()
 
 
+async def test_upload_transfers_local_file_to_remote(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    local = tmp_path / "local.txt"
+    local.write_text("payload-up")
+    remote = tmp_path / "remote.txt"
+    try:
+        async with _materialized(server) as (key_path, known_hosts_path):
+            await AsyncsshRunner().upload(
+                hostname=server.host,
+                port=server.port,
+                username="deploy",
+                private_key_path=key_path,
+                known_hosts_path=known_hosts_path,
+                local_path=str(local),
+                remote_path=str(remote),
+                overwrite=False,
+                egress_config=_ALLOW_LOOPBACK,
+            )
+        assert remote.read_text() == "payload-up"
+    finally:
+        await server.close()
+
+
+async def test_download_transfers_remote_file_to_local(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    remote = tmp_path / "remote.txt"
+    remote.write_text("payload-down")
+    local = tmp_path / "local.txt"
+    try:
+        async with _materialized(server) as (key_path, known_hosts_path):
+            await AsyncsshRunner().download(
+                hostname=server.host,
+                port=server.port,
+                username="deploy",
+                private_key_path=key_path,
+                known_hosts_path=known_hosts_path,
+                remote_path=str(remote),
+                local_path=str(local),
+                overwrite=False,
+                egress_config=_ALLOW_LOOPBACK,
+            )
+        assert local.read_text() == "payload-down"
+    finally:
+        await server.close()
+
+
+async def test_upload_refuses_existing_remote_without_overwrite(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    local = tmp_path / "local.txt"
+    local.write_text("new")
+    remote = tmp_path / "remote.txt"
+    remote.write_text("existing")
+    try:
+        async with _materialized(server) as (key_path, known_hosts_path):
+            with pytest.raises(SshError) as exc:
+                await AsyncsshRunner().upload(
+                    hostname=server.host,
+                    port=server.port,
+                    username="deploy",
+                    private_key_path=key_path,
+                    known_hosts_path=known_hosts_path,
+                    local_path=str(local),
+                    remote_path=str(remote),
+                    overwrite=False,
+                    egress_config=_ALLOW_LOOPBACK,
+                )
+        assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
+        assert remote.read_text() == "existing"  # unchanged
+    finally:
+        await server.close()
+
+
 async def test_execute_wrong_host_key_fails_before_auth() -> None:
     server = await start_test_ssh_server()
     # Pin a different (bogus) host key so verification must fail.

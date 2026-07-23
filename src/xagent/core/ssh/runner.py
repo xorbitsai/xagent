@@ -3,14 +3,17 @@
 Establishes a connection with the strict security configuration required by the
 design (§14): host-key verification against a pinned known_hosts file,
 public-key-only auth, no ssh-agent, no forwarding, and no reading of the user's
-ssh config. Command execution only for now; SFTP transfer arrives in a later
-part. This is one implementation of the runner seam; a sandbox ssh-binary
-runner (design §15.2) can implement the same shape later.
+ssh config. Supports command execution and SFTP upload/download. This is one
+implementation of the runner seam; a sandbox ssh-binary runner (design §15.2)
+can implement the same shape later.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -50,9 +53,83 @@ class SshRunner(Protocol):
         egress_config: EgressPolicyConfig,
     ) -> SshRunResult: ...
 
+    async def upload(
+        self,
+        *,
+        hostname: str,
+        port: int,
+        username: str,
+        private_key_path: str,
+        known_hosts_path: str,
+        local_path: str,
+        remote_path: str,
+        overwrite: bool,
+        egress_config: EgressPolicyConfig,
+    ) -> None: ...
+
+    async def download(
+        self,
+        *,
+        hostname: str,
+        port: int,
+        username: str,
+        private_key_path: str,
+        known_hosts_path: str,
+        remote_path: str,
+        local_path: str,
+        overwrite: bool,
+        egress_config: EgressPolicyConfig,
+    ) -> None: ...
+
 
 class AsyncsshRunner:
-    """Runs commands over SSH with strict, non-interactive security settings."""
+    """Runs commands and SFTP transfers over SSH with strict, non-interactive
+    security settings."""
+
+    @asynccontextmanager
+    async def _connect(
+        self,
+        *,
+        hostname: str,
+        port: int,
+        username: str,
+        private_key_path: str,
+        known_hosts_path: str,
+        egress_config: EgressPolicyConfig,
+    ) -> AsyncIterator[asyncssh.SSHClientConnection]:
+        # Imported lazily so merely loading this module (and thus the SSH MCP
+        # tools) never hard-requires asyncssh: agents that don't execute SSH,
+        # and environments without the dep, still load every other tool.
+        import asyncssh
+
+        try:
+            async with asyncssh.connect(
+                hostname,
+                port=port,
+                username=username,
+                # Pinned host key file → strict verification; a mismatch or an
+                # unknown host raises before anything runs.
+                known_hosts=known_hosts_path,
+                client_keys=[private_key_path],
+                # No ssh-agent, no ssh config, no forwarding, public-key only.
+                agent_path=None,
+                config=None,
+                agent_forwarding=False,
+                x509_trusted_certs=None,
+                x509_trusted_cert_paths=None,
+                preferred_auth=["publickey"],
+            ) as conn:
+                # DNS-rebinding defense: re-check the IP actually connected to,
+                # and refuse before doing anything if the policy denies it.
+                _authorize_peer(conn, egress_config)
+                yield conn
+        except asyncssh.HostKeyNotVerifiable as exc:
+            # Message is deliberately generic — no host key material.
+            raise SshError(
+                SshErrorCode.HOST_KEY_MISMATCH,
+                "host key verification failed",
+                cause=exc,
+            ) from exc
 
     async def execute(
         self,
@@ -66,47 +143,24 @@ class AsyncsshRunner:
         timeout_seconds: int,
         egress_config: EgressPolicyConfig,
     ) -> SshRunResult:
-        # Imported lazily so merely loading this module (and thus the SSH MCP
-        # tools) never hard-requires asyncssh: agents that don't execute SSH,
-        # and environments without the dep, still load every other tool.
-        import asyncssh
-
-        try:
-            async with asyncssh.connect(
-                hostname,
-                port=port,
-                username=username,
-                # Pinned host key file → strict verification; a mismatch or an
-                # unknown host raises before any command runs.
-                known_hosts=known_hosts_path,
-                client_keys=[private_key_path],
-                # No ssh-agent, no ssh config, no forwarding, public-key only.
-                agent_path=None,
-                config=None,
-                agent_forwarding=False,
-                x509_trusted_certs=None,
-                x509_trusted_cert_paths=None,
-                preferred_auth=["publickey"],
-            ) as conn:
-                # DNS-rebinding defense: re-check the IP actually connected to,
-                # and refuse before running anything if the policy denies it.
-                _authorize_peer(conn, egress_config)
+        async with self._connect(
+            hostname=hostname,
+            port=port,
+            username=username,
+            private_key_path=private_key_path,
+            known_hosts_path=known_hosts_path,
+            egress_config=egress_config,
+        ) as conn:
+            try:
                 result = await asyncio.wait_for(
                     conn.run(command, check=False), timeout=timeout_seconds
                 )
-        except asyncssh.HostKeyNotVerifiable as exc:
-            # Message is deliberately generic — no host key material.
-            raise SshError(
-                SshErrorCode.HOST_KEY_MISMATCH,
-                "host key verification failed",
-                cause=exc,
-            ) from exc
-        except TimeoutError as exc:
-            raise SshError(
-                SshErrorCode.COMMAND_TIMEOUT,
-                "command timed out",
-                cause=exc,
-            ) from exc
+            except TimeoutError as exc:
+                raise SshError(
+                    SshErrorCode.COMMAND_TIMEOUT,
+                    "command timed out",
+                    cause=exc,
+                ) from exc
 
         return SshRunResult(
             exit_code=result.exit_status if result.exit_status is not None else -1,
@@ -114,6 +168,60 @@ class AsyncsshRunner:
             stderr=_as_text(result.stderr),
             truncated=False,
         )
+
+    async def upload(
+        self,
+        *,
+        hostname: str,
+        port: int,
+        username: str,
+        private_key_path: str,
+        known_hosts_path: str,
+        local_path: str,
+        remote_path: str,
+        overwrite: bool,
+        egress_config: EgressPolicyConfig,
+    ) -> None:
+        async with self._connect(
+            hostname=hostname,
+            port=port,
+            username=username,
+            private_key_path=private_key_path,
+            known_hosts_path=known_hosts_path,
+            egress_config=egress_config,
+        ) as conn:
+            async with conn.start_sftp_client() as sftp:
+                if not overwrite and await sftp.exists(remote_path):
+                    raise SshError(
+                        SshErrorCode.OPERATION_NOT_ALLOWED, "remote destination already exists"
+                    )
+                await sftp.put(local_path, remote_path)
+
+    async def download(
+        self,
+        *,
+        hostname: str,
+        port: int,
+        username: str,
+        private_key_path: str,
+        known_hosts_path: str,
+        remote_path: str,
+        local_path: str,
+        overwrite: bool,
+        egress_config: EgressPolicyConfig,
+    ) -> None:
+        if not overwrite and os.path.exists(local_path):
+            raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "local destination already exists")
+        async with self._connect(
+            hostname=hostname,
+            port=port,
+            username=username,
+            private_key_path=private_key_path,
+            known_hosts_path=known_hosts_path,
+            egress_config=egress_config,
+        ) as conn:
+            async with conn.start_sftp_client() as sftp:
+                await sftp.get(remote_path, local_path)
 
 
 def _authorize_peer(conn: asyncssh.SSHClientConnection, config: EgressPolicyConfig) -> None:

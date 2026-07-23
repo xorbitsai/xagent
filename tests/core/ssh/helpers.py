@@ -109,6 +109,9 @@ async def start_test_ssh_server() -> RunningSshServer:
         server_host_keys=[host_key],
         authorized_client_keys=asyncssh.import_authorized_keys(authorized),
         process_factory=_handle_session,
+        # Serve the real filesystem over SFTP so transfer tests can round-trip
+        # through a tmp_path; command execution still goes through _handle_session.
+        sftp_factory=True,
     )
     port = server.get_addresses()[0][1]
     return RunningSshServer(

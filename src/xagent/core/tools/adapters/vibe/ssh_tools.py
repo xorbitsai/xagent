@@ -1,7 +1,8 @@
-"""Managed SSH MCP tools (in-process). ``execute`` runs for real via the
-SshExecutor; ``upload``/``download`` are still stubbed (SFTP arrives in a later
-part). ``list_targets`` works via the injected SshTargetProvider. Secrets never
-touch env/argv/tool-serialization."""
+"""Managed SSH MCP tools (in-process). ``execute`` runs commands and
+``upload``/``download`` transfer files (SFTP) for real via the SshExecutor;
+``list_targets`` works via the injected SshTargetProvider. Local transfer paths
+are containment-checked against the task workspace. Secrets never touch
+env/argv/tool-serialization."""
 
 from __future__ import annotations
 
@@ -27,11 +28,9 @@ from ....ssh.executor import SshExecutor
 from ....ssh.materializer import LocalTmpSecretMaterializer
 from ....ssh.runner import AsyncsshRunner
 from .base import AbstractBaseTool, ToolCategory
-from .factory import register_tool
+from .factory import ToolFactory, register_tool
 
 logger = logging.getLogger(__name__)
-
-_NOT_ENABLED = "SSH execution is not enabled yet (arrives in Phase 3)."
 
 _ALLOW_CIDRS_ENV = "XAGENT_SSH_ALLOW_CIDRS"
 
@@ -121,23 +120,33 @@ class SshListTargetsTool(_SshToolBase):
         ).model_dump()
 
 
-class _SshOpTool(_SshToolBase):
-    _capability: str = ""
+class _SshTransferTool(AbstractBaseTool):
+    """Base for the SFTP tools: executor-backed and workspace-aware. The
+    workspace resolves and containment-checks the local path (no escaping the
+    task workspace) before any transfer; the executor enforces capability,
+    egress, and the remote_root constraint."""
 
-    async def _resolve_or_error(self, target: str) -> tuple[Any | None, dict[str, Any] | None]:
-        try:
-            resolved = await self._provider.resolve(self._context, target)
-        except SshError as exc:
-            return None, SshOpResult(
-                ok=False, error_code=exc.code.value, message=str(exc)
-            ).model_dump()
-        if self._capability not in resolved.capabilities:
-            return None, SshOpResult(
-                ok=False,
-                error_code=SshErrorCode.OPERATION_NOT_ALLOWED.value,
-                message=f"binding does not allow {self._capability}",
-            ).model_dump()
-        return resolved, None
+    category: ToolCategory = ToolCategory.SSH
+
+    def __init__(
+        self, *, executor: SshExecutor, workspace: Any, context: SshExecutionContext
+    ) -> None:
+        self._executor = executor
+        self._workspace = workspace
+        self._context = context
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        raise NotImplementedError("SSH tools are async-only.")
+
+    def args_type(self) -> type[BaseModel]:
+        return TransferArgs
+
+    def return_type(self) -> type[BaseModel]:
+        return SshOpResult
+
+    @staticmethod
+    def _fail(code: str | None, message: str) -> Any:
+        return SshOpResult(ok=False, error_code=code, message=message).model_dump()
 
 
 class SshExecuteTool(AbstractBaseTool):
@@ -187,9 +196,7 @@ class SshExecuteTool(AbstractBaseTool):
         ).model_dump()
 
 
-class SshUploadTool(_SshOpTool):
-    _capability = "upload"
-
+class SshUploadTool(_SshTransferTool):
     @property
     def name(self) -> str:
         return "ssh_upload"
@@ -198,19 +205,31 @@ class SshUploadTool(_SshOpTool):
     def description(self) -> str:
         return "Upload a workspace file to a bound SSH target via SFTP."
 
-    def args_type(self) -> type[BaseModel]:
-        return TransferArgs
-
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        _resolved, err = await self._resolve_or_error(str(args.get("target", "")))
-        if err is not None:
-            return err
-        return SshOpResult(ok=False, error_code=None, message=_NOT_ENABLED).model_dump()
+        if self._workspace is None:
+            return self._fail(None, "no task workspace available for file transfer")
+        # The source must exist inside the task workspace; resolve_path_with_search
+        # raises on a missing file or a path that escapes the workspace.
+        try:
+            local = self._workspace.resolve_path_with_search(str(args.get("local_path", "")))
+        except (ValueError, FileNotFoundError) as exc:
+            return self._fail(
+                SshErrorCode.OPERATION_NOT_ALLOWED.value, f"local path rejected: {exc}"
+            )
+        try:
+            await self._executor.upload(
+                self._context,
+                target_alias=str(args.get("target", "")),
+                local_path=str(local),
+                remote_path=str(args.get("remote_path", "")),
+                overwrite=bool(args.get("overwrite", False)),
+            )
+        except SshError as exc:
+            return self._fail(exc.code.value, str(exc))
+        return SshOpResult(ok=True, message="uploaded").model_dump()
 
 
-class SshDownloadTool(_SshOpTool):
-    _capability = "download"
-
+class SshDownloadTool(_SshTransferTool):
     @property
     def name(self) -> str:
         return "ssh_download"
@@ -219,14 +238,30 @@ class SshDownloadTool(_SshOpTool):
     def description(self) -> str:
         return "Download a file from a bound SSH target into the task workspace."
 
-    def args_type(self) -> type[BaseModel]:
-        return TransferArgs
-
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        _resolved, err = await self._resolve_or_error(str(args.get("target", "")))
-        if err is not None:
-            return err
-        return SshOpResult(ok=False, error_code=None, message=_NOT_ENABLED).model_dump()
+        if self._workspace is None:
+            return self._fail(None, "no task workspace available for file transfer")
+        # The destination need not exist yet, but must resolve within the
+        # workspace (defaults under output/); resolve_path raises on escape.
+        try:
+            local = self._workspace.resolve_path(
+                str(args.get("local_path", "")), default_dir="output"
+            )
+        except ValueError as exc:
+            return self._fail(
+                SshErrorCode.OPERATION_NOT_ALLOWED.value, f"local path rejected: {exc}"
+            )
+        try:
+            await self._executor.download(
+                self._context,
+                target_alias=str(args.get("target", "")),
+                remote_path=str(args.get("remote_path", "")),
+                local_path=str(local),
+                overwrite=bool(args.get("overwrite", False)),
+            )
+        except SshError as exc:
+            return self._fail(exc.code.value, str(exc))
+        return SshOpResult(ok=True, message="downloaded").model_dump()
 
 
 def _agent_id_from_task(task: Any) -> int | None:
@@ -327,9 +362,12 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
         runner=AsyncsshRunner(),
         egress_config=_egress_from_env(),
     )
+    # SFTP tools resolve/containment-check local paths against the task
+    # workspace; None (e.g. tool-listing) disables transfers, not execute.
+    workspace = ToolFactory._create_workspace(config.get_workspace_config())
     return [
         SshListTargetsTool(provider=provider, context=context),
         SshExecuteTool(executor=executor, context=context),
-        SshUploadTool(provider=provider, context=context),
-        SshDownloadTool(provider=provider, context=context),
+        SshUploadTool(executor=executor, workspace=workspace, context=context),
+        SshDownloadTool(executor=executor, workspace=workspace, context=context),
     ]

@@ -10,6 +10,7 @@ timeout, and cancellation).
 
 from __future__ import annotations
 
+import posixpath
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from .egress_io import resolve_and_authorize
 from .errors import SshError, SshErrorCode
 from .interfaces import SandboxSecretMaterializer, SshSecretStore, SshTargetProvider
 from .runner import SshRunner
-from .types import SshExecutionContext
+from .types import ResolvedSshTarget, SshExecutionContext
 
 DEFAULT_MAX_OUTPUT_BYTES = 1 << 20  # 1 MiB, combined stdout + stderr
 DEFAULT_MAX_TIMEOUT_SECONDS = 600
@@ -103,6 +104,99 @@ class SshExecutor:
             stderr=stderr,
             truncated=run.truncated or capped,
             duration_ms=duration_ms,
+        )
+
+    async def upload(
+        self,
+        context: SshExecutionContext,
+        *,
+        target_alias: str,
+        local_path: str,
+        remote_path: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Upload ``local_path`` (already resolved within the task workspace by
+        the caller) to ``remote_path`` on a bound target."""
+        resolved = await self._authorize_transfer(context, target_alias, "upload", remote_path)
+        credential = await self._secret_store.read_version(resolved.secret_handle)
+        async with self._materializer.materialize_ssh(
+            self._sandbox, credential, resolved.known_hosts
+        ) as paths:
+            await self._runner.upload(
+                hostname=resolved.hostname,
+                port=resolved.port,
+                username=resolved.username,
+                private_key_path=paths.private_key_path,
+                known_hosts_path=paths.known_hosts_path,
+                local_path=local_path,
+                remote_path=remote_path,
+                overwrite=overwrite,
+                egress_config=self._egress_config,
+            )
+
+    async def download(
+        self,
+        context: SshExecutionContext,
+        *,
+        target_alias: str,
+        remote_path: str,
+        local_path: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Download ``remote_path`` from a bound target to ``local_path`` (already
+        resolved within the task workspace by the caller)."""
+        resolved = await self._authorize_transfer(context, target_alias, "download", remote_path)
+        credential = await self._secret_store.read_version(resolved.secret_handle)
+        async with self._materializer.materialize_ssh(
+            self._sandbox, credential, resolved.known_hosts
+        ) as paths:
+            await self._runner.download(
+                hostname=resolved.hostname,
+                port=resolved.port,
+                username=resolved.username,
+                private_key_path=paths.private_key_path,
+                known_hosts_path=paths.known_hosts_path,
+                remote_path=remote_path,
+                local_path=local_path,
+                overwrite=overwrite,
+                egress_config=self._egress_config,
+            )
+
+    async def _authorize_transfer(
+        self,
+        context: SshExecutionContext,
+        target_alias: str,
+        capability: str,
+        remote_path: str,
+    ) -> ResolvedSshTarget:
+        """Shared SFTP prologue: resolve, enforce the capability, run the
+        fail-closed egress pre-flight, and constrain the remote path."""
+        resolved = await self._provider.resolve(context, target_alias)
+        if capability not in resolved.capabilities:
+            raise SshError(
+                SshErrorCode.OPERATION_NOT_ALLOWED, f"binding does not allow {capability}"
+            )
+        await resolve_and_authorize(
+            resolved.hostname, resolved.port, self._egress_config, resolver=self._resolver
+        )
+        _constrain_remote_path(remote_path, resolved.remote_root)
+        return resolved
+
+
+def _constrain_remote_path(remote_path: str, remote_root: str | None) -> None:
+    """Remote paths must be absolute; when the target pins a ``remote_root`` the
+    path (with ``..`` collapsed) must stay within it. Lexical only — the remote
+    filesystem is not consulted — so a symlink on the remote could still escape;
+    this is the conservative first guard, not a full remote realpath check."""
+    if not remote_path.startswith("/"):
+        raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "remote path must be absolute")
+    if remote_root is None:
+        return
+    normalized = posixpath.normpath(remote_path)
+    root = posixpath.normpath(remote_root)
+    if normalized != root and not normalized.startswith(root + "/"):
+        raise SshError(
+            SshErrorCode.OPERATION_NOT_ALLOWED, "remote path escapes the target's remote root"
         )
 
 

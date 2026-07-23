@@ -14,8 +14,10 @@ from xagent.core.ssh import (
 )
 from xagent.core.ssh.executor import SshExecuteOutcome
 from xagent.core.tools.adapters.vibe.ssh_tools import (
+    SshDownloadTool,
     SshExecuteTool,
     SshListTargetsTool,
+    SshUploadTool,
     _agent_id_from_task,
     _egress_from_env,
     _numeric_task_id,
@@ -115,6 +117,83 @@ def test_execute_sync_not_supported() -> None:
     tool = SshExecuteTool(executor=_Executor(), context=_ctx())
     with pytest.raises(NotImplementedError):
         tool.run_json_sync({"target": "prod", "command": "x"})
+
+
+class _RecordingTransferExecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def upload(self, context, *, target_alias, local_path, remote_path, overwrite):
+        self.calls.append(("upload", target_alias, local_path, remote_path, overwrite))
+
+    async def download(self, context, *, target_alias, remote_path, local_path, overwrite):
+        self.calls.append(("download", target_alias, remote_path, local_path, overwrite))
+
+
+class _FakeWorkspace:
+    """Minimal workspace: resolves under a root and rejects escapes / missing
+    files, mirroring TaskWorkspace's containment contract for these tools."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def _contained(self, p: str):
+        from pathlib import Path
+
+        resolved = (self.root / p).resolve()
+        if not str(resolved).startswith(str(self.root.resolve())):
+            raise ValueError("path escapes workspace")
+        return resolved
+
+    def resolve_path_with_search(self, p: str):
+        resolved = self._contained(p)
+        if not resolved.exists():
+            raise FileNotFoundError(p)
+        return resolved
+
+    def resolve_path(self, p: str, default_dir: str = "output"):
+        return self._contained(p)
+
+
+async def test_upload_tool_passes_resolved_path_to_executor(tmp_path) -> None:
+    (tmp_path / "f.txt").write_text("x")
+    ex = _RecordingTransferExecutor()
+    tool = SshUploadTool(executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx())
+    out = await tool.run_json_async(
+        {"target": "prod", "local_path": "f.txt", "remote_path": "/srv/f.txt"}
+    )
+    assert out["ok"] is True
+    assert ex.calls[0][0] == "upload"
+    assert ex.calls[0][3] == "/srv/f.txt"
+
+
+async def test_upload_tool_rejects_workspace_escape(tmp_path) -> None:
+    ex = _RecordingTransferExecutor()
+    tool = SshUploadTool(executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx())
+    out = await tool.run_json_async(
+        {"target": "prod", "local_path": "../../etc/passwd", "remote_path": "/srv/x"}
+    )
+    assert out["ok"] is False
+    assert out["error_code"] == "ssh_operation_not_allowed"
+    assert ex.calls == []  # executor never reached — no connection, no secret
+
+
+async def test_download_tool_writes_into_workspace(tmp_path) -> None:
+    ex = _RecordingTransferExecutor()
+    tool = SshDownloadTool(executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx())
+    out = await tool.run_json_async(
+        {"target": "prod", "remote_path": "/srv/f", "local_path": "out.txt"}
+    )
+    assert out["ok"] is True
+    assert ex.calls[0][0] == "download"
+
+
+async def test_transfer_tool_without_workspace_fails_closed() -> None:
+    ex = _RecordingTransferExecutor()
+    tool = SshUploadTool(executor=ex, workspace=None, context=_ctx())
+    out = await tool.run_json_async({"target": "prod", "local_path": "f", "remote_path": "/srv/f"})
+    assert out["ok"] is False
+    assert ex.calls == []
 
 
 def test_egress_from_env_allowlist(monkeypatch) -> None:

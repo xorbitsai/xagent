@@ -143,6 +143,67 @@ async def test_execute_output_capped() -> None:
         await server.close()
 
 
+async def test_upload_happy_path(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    local = tmp_path / "local.txt"
+    local.write_text("via-executor")
+    remote = tmp_path / "remote.txt"
+    try:
+        ex = _executor(server, _target(server, capabilities=frozenset({"upload"})))
+        await ex.upload(_ctx(), target_alias="prod", local_path=str(local), remote_path=str(remote))
+        assert remote.read_text() == "via-executor"
+    finally:
+        await server.close()
+
+
+async def test_download_happy_path(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    remote = tmp_path / "remote.txt"
+    remote.write_text("fetched")
+    local = tmp_path / "local.txt"
+    try:
+        ex = _executor(server, _target(server, capabilities=frozenset({"download"})))
+        await ex.download(
+            _ctx(), target_alias="prod", remote_path=str(remote), local_path=str(local)
+        )
+        assert local.read_text() == "fetched"
+    finally:
+        await server.close()
+
+
+async def test_upload_capability_denied(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    try:
+        ex = _executor(server, _target(server, capabilities=frozenset({"execute"})))
+        with pytest.raises(SshError) as exc:
+            await ex.upload(
+                _ctx(), target_alias="prod", local_path=str(tmp_path / "x"), remote_path="/tmp/x"
+            )
+        assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
+    finally:
+        await server.close()
+
+
+async def test_upload_remote_root_escape_denied(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    local = tmp_path / "local.txt"
+    local.write_text("x")
+    try:
+        target = _target(server, capabilities=frozenset({"upload"}))
+        confined = ResolvedSshTarget(**{**target.__dict__, "remote_root": "/srv/app"})
+        ex = _executor(server, confined)
+        with pytest.raises(SshError) as exc:
+            await ex.upload(
+                _ctx(),
+                target_alias="prod",
+                local_path=str(local),
+                remote_path="/srv/app/../../etc/passwd",
+            )
+        assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
+    finally:
+        await server.close()
+
+
 class _RecordingRunner:
     def __init__(self) -> None:
         self.timeout_seconds: int | None = None

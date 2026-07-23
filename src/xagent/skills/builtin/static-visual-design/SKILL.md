@@ -1,16 +1,31 @@
 ---
 name: static-visual-design
 description: |
-  Generate polished static visual designs as complete PNG or JPEG assets using
-  image generation and editing as the primary creative engine. Use for posters,
-  social media graphics, advertising creatives, campaign key visuals, event or
-  announcement cards, banners, and placement variants where art direction,
-  typography, hierarchy, brand fidelity, and visual quality matter. Do not use
-  it to invent a logo, create video, manage ad accounts, generate a standalone
-  illustration or photo with no designed layout, or answer copy-only requests.
+  Create polished commercial and brand-facing static visual designs as complete
+  PNG or JPEG assets. Use only for advertising creatives, campaign posters,
+  promotional social posts, event or announcement cards, banners, and placement
+  variants where art direction, typography, hierarchy, brand fidelity, and
+  visual quality matter.
+when_to_use: |
+  Use only for marketing, campaign, event, or brand communication. Do not use
+  for educational infographics, technical diagrams, concept explainers, charts,
+  data visualizations, or standalone illustrations or photos.
 ---
 
 # Static Visual Design
+
+## Stay within the commercial-creative scope
+
+Use this skill only when the requested deliverable communicates marketing,
+promotional, campaign, event, or brand-facing material. A request to explain a
+concept with an image, comparison graphic, educational infographic, technical
+diagram, chart, or data visualization is outside this skill even when the user
+asks for a polished PNG or JPEG. Use the general image-generation workflow or a
+more specific explanatory-visual skill instead.
+
+Do not use this skill to invent a logo, create video, manage ad accounts,
+generate a standalone illustration or photo with no designed commercial
+layout, or answer copy-only requests.
 
 Produce the finished visual with image generation and editing. Let the image
 model solve the composition, type treatment, atmosphere, and graphic language

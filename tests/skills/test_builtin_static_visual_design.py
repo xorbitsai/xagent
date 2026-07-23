@@ -1,9 +1,10 @@
 from pathlib import Path
 
+from xagent.core.agent.context.skill_tool import _index_text
 from xagent.skills.parser import SkillParser
 
 
-def test_static_visual_design_skill_routes_designed_graphics_and_brand_assets() -> None:
+def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     skill_dir = (
         Path(__file__).parents[2]
         / "src"
@@ -16,12 +17,33 @@ def test_static_visual_design_skill_routes_designed_graphics_and_brand_assets() 
     skill = SkillParser.parse(skill_dir)
 
     assert skill["name"] == "static-visual-design"
-    assert "complete PNG or JPEG assets" in skill["description"]
-    assert "posters" in skill["description"]
-    assert "advertising creatives" in skill["description"]
-    assert "placement variants" in skill["description"]
+    description = " ".join(skill["description"].split())
+    when_to_use = " ".join(skill["when_to_use"].split())
+    assert "complete PNG or JPEG assets" in description
+    assert "commercial and brand-facing" in description
+    assert "campaign posters" in description
+    assert "advertising creatives" in description
+    assert "placement variants" in description
+    assert "marketing, campaign, event, or brand communication" in when_to_use
+    assert "educational infographics" in when_to_use
+    assert "technical diagrams" in when_to_use
+    assert "concept explainers" in when_to_use
+
+    # Auto routing sees bounded one-line versions of these fields. Keep the
+    # positive commercial scope and the important exclusions inside that
+    # actual routing surface instead of only in the full skill body.
+    routing_description = _index_text(skill["description"])
+    routing_when_to_use = _index_text(skill["when_to_use"])
+    assert "commercial and brand-facing" in routing_description
+    assert "advertising creatives" in routing_description
+    assert "Use only for marketing" in routing_when_to_use
+    assert "educational infographics" in routing_when_to_use
+    assert "concept explainers" in routing_when_to_use
 
     content = " ".join(skill["content"].split())
+    assert "Stay within the commercial-creative scope" in content
+    assert "A request to explain a concept with an image" in content
+    assert "is outside this skill" in content
     assert "Use `generate_image` to create the full designed asset" in content
     assert "references/static-ad-art-direction.md" in content
     assert "concepts materially different" in content

@@ -1389,6 +1389,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
       if (response.ok) {
         if (isEditMode) {
+          const updatedAgent = await response.json()
           const trimmedName = name.trim()
           const trimmedDesc = description.trim()
           const trimmedInstr = instructions.trim()
@@ -1417,10 +1418,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             knowledge_bases: selectedKbs,
             skills: selectedSkills,
             tool_categories: finalToolCategories,
+            logo_url: updatedAgent.logo_url,
             ...(ownershipResult ?? {}),
           })
+          // Sync the saved logo URL so the preview doesn't fall back to the
+          // stale URL captured at initial load once logoFile is cleared below.
+          setLogoUrl(updatedAgent.logo_url || null)
           setLogoFile(null)
-          // Optional: Reload agent to get updated logo URL if needed, but avoiding it keeps it fast
         } else {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)

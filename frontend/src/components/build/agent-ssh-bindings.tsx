@@ -186,9 +186,10 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
           {bindings.map((b) => (
             <div key={b.public_id} className="flex items-center gap-3 rounded-md border p-2">
               <div className="min-w-0">
-                <div className="text-sm font-medium">{b.tool_alias}</div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {b.target_display_name || b.target_alias || b.target_public_id}
+                {/* tool_alias is auto-derived from the target alias, so showing
+                    both is redundant — show the single alias the user configured. */}
+                <div className="truncate text-sm font-medium">
+                  {b.target_display_name || b.target_alias || b.tool_alias}
                 </div>
               </div>
               <div className="flex flex-wrap gap-1">

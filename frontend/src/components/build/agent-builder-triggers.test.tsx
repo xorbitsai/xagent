@@ -245,4 +245,106 @@ describe("AgentBuilder trigger summary cards", () => {
       expect(screen.queryByText("triggers.cards.webhook.title")).not.toBeInTheDocument()
     })
   })
+
+  it("resyncs the summary via refreshTriggerSummary when a batch disable partially fails", async () => {
+    let triggers = [
+      {
+        id: 9,
+        user_id: 1,
+        agent_id: 42,
+        type: "webhook",
+        name: "Hook A",
+        enabled: true,
+        config: {},
+        prompt_template: null,
+        webhook_token: "tok",
+        webhook_secret: null,
+        next_run_at: null,
+        last_run_at: null,
+        last_error: null,
+        created_at: null,
+        updated_at: null,
+      },
+      {
+        id: 10,
+        user_id: 1,
+        agent_id: 42,
+        type: "webhook",
+        name: "Hook B",
+        enabled: true,
+        config: {},
+        prompt_template: null,
+        webhook_token: "tok",
+        webhook_secret: null,
+        next_run_at: null,
+        last_run_at: null,
+        last_error: null,
+        created_at: null,
+        updated_at: null,
+      },
+    ]
+    let getCallsAfterFailure = 0
+    let patchAttempted = false
+
+    apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === "http://api.local/api/agents/42") {
+        return Promise.resolve(
+          jsonResponse({
+            id: 42,
+            name: "Trigger agent",
+            description: "",
+            instructions: "",
+            execution_mode: "balanced",
+            suggested_prompts: [],
+            visibility: "team",
+            team_id: null,
+            knowledge_bases: [],
+            skills: [],
+            tool_categories: [],
+            can_edit: true,
+          }),
+        )
+      }
+      if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        if (patchAttempted) getCallsAfterFailure += 1
+        return Promise.resolve(jsonResponse(triggers))
+      }
+      if (url === `${TRIGGERS_URL}/9` && init?.method === "PATCH") {
+        triggers = triggers.map((item) => (item.id === 9 ? { ...item, enabled: false } : item))
+        return Promise.resolve(jsonResponse(triggers[0]))
+      }
+      if (url === `${TRIGGERS_URL}/10` && init?.method === "PATCH") {
+        patchAttempted = true
+        return Promise.reject(new Error("boom"))
+      }
+      if (url.endsWith("/api/kb/collections")) {
+        return Promise.resolve(jsonResponse({ collections: [] }))
+      }
+      if (url.endsWith("/api/tools/available")) {
+        return Promise.resolve(jsonResponse({ tools: [] }))
+      }
+      if (url.endsWith("/api/skills/") || url.endsWith("/api/mcp/servers")) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url.endsWith("/api/models/?category=llm") || url.endsWith("/api/models/user-default")) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      return Promise.resolve(jsonResponse({}))
+    })
+
+    render(<AgentBuilder agentId="42" />)
+
+    const cardSwitch = (
+      await screen.findAllByRole("switch")
+    ).find((el) => el.getAttribute("aria-checked") === "true")
+    expect(cardSwitch).toBeDefined()
+    fireEvent.click(cardSwitch!)
+
+    // One PATCH in the batch rejected: disableTriggerType's catch resyncs via
+    // refreshTriggerSummary (a fresh GET) instead of trusting the optimistic
+    // merge, which would otherwise wrongly report both hooks disabled.
+    await waitFor(() => {
+      expect(getCallsAfterFailure).toBeGreaterThan(0)
+    })
+  })
 })

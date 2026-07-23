@@ -211,6 +211,14 @@ function newestFirst(a: AgentTrigger, b: AgentTrigger): number {
   return Math.abs(b.id) - Math.abs(a.id)
 }
 
+// After deleting the selected trigger, the next one to show — same type,
+// newest first — or null if none remain. Shared by handleDelete's staged and
+// live branches, which otherwise differ only in whether the list still needs
+// stagedToPseudoTrigger mapping before this runs.
+function pickNextAfterDelete(remaining: AgentTrigger[], type: AgentTriggerType): number | null {
+  return remaining.filter((item) => item.type === type).sort(newestFirst)[0]?.id ?? null
+}
+
 function isValidAgentId(agentId: number | null): agentId is number {
   return typeof agentId === "number" && Number.isFinite(agentId)
 }
@@ -750,11 +758,12 @@ export function AgentTriggersDialog({
     if (!resolvedOwner) return
     setBusy(true)
     try {
-      await updateOwnerTrigger(resolvedOwner, selectedTrigger.id, { enabled: checked })
+      const updated = await updateOwnerTrigger(resolvedOwner, selectedTrigger.id, { enabled: checked })
+      // Patch from the response, not a hand-set `enabled` — a scheduled
+      // trigger's next_run_at/last_run_at can change server-side on
+      // enable/disable, matching the overview toggle's own patch.
       setLiveTriggers((current) =>
-        current.map((item) =>
-          item.id === selectedTrigger.id ? { ...item, enabled: checked } : item,
-        ),
+        current.map((item) => (item.id === updated.id ? updated : item)),
       )
       notifyChanged()
       toast.success(checked ? t("triggers.messages.enabled") : t("triggers.messages.disabled"))
@@ -942,11 +951,7 @@ export function AgentTriggersDialog({
       // being edited; when the selected one goes, fall back to the next
       // trigger of the type (newest first), mirroring the live flow.
       if (selectedTriggerIdRef.current === trigger.id) {
-        const next = remaining
-          .map(stagedToPseudoTrigger)
-          .filter((item) => item.type === trigger.type)
-          .sort(newestFirst)[0]
-        setSelectedTriggerId(next?.id ?? null)
+        setSelectedTriggerId(pickNextAfterDelete(remaining.map(stagedToPseudoTrigger), trigger.type))
         setRuns([])
       }
       setDeleteConfirmId(null)
@@ -964,10 +969,7 @@ export function AgentTriggersDialog({
       // being edited; when the selected one goes, fall back to the next
       // trigger of the type (newest first), like the staging branch.
       if (selectedTriggerIdRef.current === trigger.id) {
-        const next = remaining
-          .filter((item) => item.type === trigger.type)
-          .sort(newestFirst)[0]
-        setSelectedTriggerId(next?.id ?? null)
+        setSelectedTriggerId(pickNextAfterDelete(remaining, trigger.type))
         setRuns([])
       }
       setSecretReveal(null)

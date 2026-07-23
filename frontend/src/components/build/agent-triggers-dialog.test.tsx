@@ -500,6 +500,186 @@ describe("AgentTriggersDialog", () => {
     expect(toastMocks.error).not.toHaveBeenCalled()
   })
 
+  it("disables navigation while a detail toggle is in flight, and rolls back cleanly on rejection", async () => {
+    const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
+    let rejectPatch: (err: Error) => void = () => {}
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL) {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 20,
+              user_id: 1,
+              agent_id: 42,
+              type: "webhook",
+              name: "Backup hook",
+              enabled: true,
+              config: {},
+              prompt_template: null,
+              webhook_token: null,
+              webhook_secret: null,
+              next_run_at: null,
+              last_run_at: null,
+              last_error: null,
+              created_at: null,
+              updated_at: null,
+            },
+            {
+              id: 21,
+              user_id: 1,
+              agent_id: 42,
+              type: "webhook",
+              name: "Primary hook",
+              enabled: true,
+              config: {},
+              prompt_template: null,
+              webhook_token: null,
+              webhook_secret: null,
+              next_run_at: null,
+              last_run_at: null,
+              last_error: null,
+              created_at: null,
+              updated_at: null,
+            },
+          ]),
+        )
+      }
+      if (url === `${TRIGGERS_URL}/20/runs` || url === `${TRIGGERS_URL}/21/runs`) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === `${TRIGGERS_URL}/21` && init?.method === "PATCH") {
+        // Never resolves on its own — held open so navigation controls can be
+        // asserted disabled, then rejected explicitly below.
+        return new Promise<Response>((_resolve, reject) => {
+          rejectPatch = reject
+        })
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    // Newest enabled trigger (21) is auto-selected as primary.
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("Primary hook")
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    fireEvent.click(detailSwitch)
+
+    // While the PATCH is pending, every navigation control that could land
+    // the eventual rollback on an unrelated form is disabled — this is what
+    // makes the formKeyAtStart guard in handleDetailToggle unreachable via
+    // normal interaction, not just a theoretical race.
+    await waitFor(() => {
+      expect(detailSwitch).toBeDisabled()
+    })
+    expect(screen.getByRole("button", { name: "common.back" })).toBeDisabled()
+    expect(screen.getByText("Backup hook").closest("button")).toBeDisabled()
+
+    rejectPatch(new Error("network error"))
+
+    // Nothing navigated in the meantime, so the rollback correctly lands
+    // back on the same (still-selected) trigger's switch.
+    await waitFor(() => {
+      expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    })
+    expect(toastMocks.error).toHaveBeenCalled()
+    expect(screen.getByLabelText("triggers.form.name")).toHaveValue("Primary hook")
+  })
+
+  it("resyncs the trigger list when a batch disable partially fails", async () => {
+    const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
+    let triggers = [
+      {
+        id: 30,
+        user_id: 1,
+        agent_id: 42,
+        type: "webhook",
+        name: "Hook A",
+        enabled: true,
+        config: {},
+        prompt_template: null,
+        webhook_token: null,
+        webhook_secret: null,
+        next_run_at: null,
+        last_run_at: null,
+        last_error: null,
+        created_at: null,
+        updated_at: null,
+      },
+      {
+        id: 31,
+        user_id: 1,
+        agent_id: 42,
+        type: "webhook",
+        name: "Hook B",
+        enabled: true,
+        config: {},
+        prompt_template: null,
+        webhook_token: null,
+        webhook_secret: null,
+        next_run_at: null,
+        last_run_at: null,
+        last_error: null,
+        created_at: null,
+        updated_at: null,
+      },
+    ]
+    let getCallsAfterFailure = 0
+    let patchAttempted = false
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        if (patchAttempted) getCallsAfterFailure += 1
+        return Promise.resolve(jsonResponse(triggers))
+      }
+      if (url === `${TRIGGERS_URL}/30` && init?.method === "PATCH") {
+        triggers = triggers.map((item) => (item.id === 30 ? { ...item, enabled: false } : item))
+        return Promise.resolve(jsonResponse(triggers[0]))
+      }
+      if (url === `${TRIGGERS_URL}/31` && init?.method === "PATCH") {
+        patchAttempted = true
+        return Promise.reject(new Error("boom"))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    const cardSwitch = (
+      await screen.findAllByRole("switch")
+    ).find((el) => el.getAttribute("aria-checked") === "true")
+    fireEvent.click(cardSwitch!)
+
+    // One PATCH in the batch rejected: the catch resyncs via a fresh GET
+    // instead of trusting the local list (which would otherwise wrongly
+    // report both triggers disabled).
+    await waitFor(() => {
+      expect(toastMocks.error).toHaveBeenCalled()
+    })
+    await waitFor(() => {
+      expect(getCallsAfterFailure).toBeGreaterThan(0)
+    })
+  })
+
   it("keeps unsaved field edits when the detail switch is toggled", async () => {
     render(
       <AgentTriggersDialog
@@ -803,6 +983,31 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
     expect(onChangeSpy).toHaveBeenCalledWith([
       expect.objectContaining({ clientId: -1, name: "Saved on escape" }),
     ])
+  })
+
+  it("still closes on Escape when the pending commit fails validation (no secret at stake)", async () => {
+    const onChangeSpy = vi.fn()
+    const onOpenChange = vi.fn()
+    render(
+      <StatefulStagingHarness initial={[]} onChangeSpy={onChangeSpy} onOpenChange={onOpenChange} />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    const intervalInput = await screen.findByLabelText("triggers.form.intervalSeconds")
+    // Clearing the only schedule field makes buildConfig() throw
+    // scheduleRequired on commit, while still marking the form dirty.
+    fireEvent.change(intervalInput, { target: { value: "" } })
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+
+    // Unlike Done (which stays open on a failed commit), dismissal is "I
+    // don't want this saved" — it drops the invalid edit and closes anyway.
+    // Only an unrevealed one-time secret is allowed to block close.
+    await waitFor(() => {
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+    expect(toastMocks.error).toHaveBeenCalled()
+    expect(onChangeSpy).not.toHaveBeenCalled()
   })
 
   it("keeps the Gmail quick-toggle intent as a dirty preset that Done cannot silently drop", async () => {

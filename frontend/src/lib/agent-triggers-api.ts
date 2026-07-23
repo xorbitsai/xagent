@@ -284,7 +284,7 @@ export async function deleteOwnerTrigger(
 // resync in their catch.
 export async function disableOwnerTriggersOfType(
   owner: TriggerOwnerRef,
-  triggers: Pick<AgentTrigger, "id" | "type" | "enabled">[],
+  triggers: AgentTrigger[],
   type: AgentTriggerType,
 ): Promise<AgentTrigger[]> {
   const enabled = triggers.filter((trigger) => trigger.type === type && trigger.enabled)
@@ -295,7 +295,7 @@ export async function disableOwnerTriggersOfType(
 
 export async function disableAgentTriggersOfType(
   agentId: number | string,
-  triggers: Pick<AgentTrigger, "id" | "type" | "enabled">[],
+  triggers: AgentTrigger[],
   type: AgentTriggerType,
 ): Promise<AgentTrigger[]> {
   return disableOwnerTriggersOfType({ kind: "agent", id: agentId }, triggers, type)

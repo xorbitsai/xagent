@@ -44,7 +44,7 @@ def workspace(tmp_path: Path) -> TaskWorkspace:
 def allow_public_test_hosts():
     with patch(
         "xagent.core.utils.security.validate_public_http_url",
-        new=AsyncMock(),
+        new=AsyncMock(return_value=["93.184.216.34"]),
     ) as validate:
         yield validate
 
@@ -191,6 +191,69 @@ async def test_download_web_asset_preserves_official_svg(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+        b'<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg />',
+        b'<svg xmlns="http://www.w3.org/2000/svg">'
+        b'<image href="https://evil.example/x" /></svg>',
+    ],
+)
+async def test_download_web_asset_rejects_svg_with_script(
+    workspace: TaskWorkspace,
+    content: bytes,
+) -> None:
+    response = httpx.Response(
+        200,
+        content=content,
+        headers={"content-type": "image/svg+xml"},
+        request=httpx.Request("GET", "https://brand.example/logo.svg"),
+    )
+    tool = DownloadWebAssetTool(workspace)
+
+    with patch("httpx.AsyncClient.stream", return_value=_ResponseContext(response)):
+        result = await tool.run_json_async({"url": "https://brand.example/logo.svg"})
+
+    assert result["success"] is False
+    assert list(workspace.output_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_web_asset_accepts_clean_svg(
+    workspace: TaskWorkspace,
+) -> None:
+    content = b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" />'
+    response = httpx.Response(
+        200,
+        content=content,
+        headers={"content-type": "image/svg+xml"},
+        request=httpx.Request("GET", "https://brand.example/logo.svg"),
+    )
+    tool = DownloadWebAssetTool(workspace)
+
+    with patch("httpx.AsyncClient.stream", return_value=_ResponseContext(response)):
+        result = await tool.run_json_async({"url": "https://brand.example/logo.svg"})
+
+    assert result["success"] is True
+    assert (workspace.output_dir / "logo.svg").read_bytes() == content
+
+
+def test_resolve_filename_corrects_mismatched_suffix() -> None:
+    filename = DownloadWebAssetTool._resolve_filename(
+        "x.html", "https://brand.example/x.html", ".png"
+    )
+    assert filename == "x.png"
+
+
+def test_resolve_filename_keeps_jpg_jpeg_alias() -> None:
+    filename = DownloadWebAssetTool._resolve_filename(
+        "photo.jpeg", "https://brand.example/photo.jpeg", ".jpg"
+    )
+    assert filename == "photo.jpeg"
+
+
+@pytest.mark.asyncio
 async def test_download_web_asset_rejects_non_image_content(
     workspace: TaskWorkspace,
 ) -> None:
@@ -231,5 +294,5 @@ async def test_download_web_asset_rejects_invalid_declared_length(
         result = await tool.run_json_async({"url": "https://brand.example/logo.png"})
 
     assert result["success"] is False
-    assert result["error"] == f"Invalid declared content length: {declared_length}"
+    assert result["error"] == f"Invalid remote asset content length: {declared_length}"
     assert list(workspace.output_dir.iterdir()) == []

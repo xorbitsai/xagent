@@ -27,6 +27,7 @@ from ...config import (
 from ...core.file_storage import get_user_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
+from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..config import (
@@ -104,6 +105,8 @@ def _content_disposition_header(disposition: str, filename: str) -> str:
 
 
 def _inline_download_disposition(media_type: str) -> str:
+    if media_type == "image/svg+xml":
+        return "attachment"
     return (
         "inline"
         if media_type.startswith(("image/", "video/", "audio/", "text/"))
@@ -115,6 +118,74 @@ def _preview_can_redirect(path: Path, media_type: str) -> bool:
     if path.suffix.lower() in {".pptx", ".ppt"}:
         return False
     return media_type not in {"text/html", "application/xhtml+xml", "image/svg+xml"}
+
+
+def _svg_png_cache_path(svg_path: Path, file_id: Optional[str] = None) -> Path:
+    """Return the on-disk cache path for a rasterized SVG preview.
+
+    Mirrors ``_pptx_pdf_cache_path``'s cache-dir-outside-uploads pattern.
+    """
+    import hashlib
+
+    cache_dir = get_storage_root() / "svg_png_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if file_id:
+        return cache_dir / f"{file_id}.preview.png"
+    key = hashlib.sha256(str(svg_path.resolve()).encode()).hexdigest()[:24]
+    return cache_dir / f"{key}.preview.png"
+
+
+def _rasterize_svg_preview(svg_path: Path, file_id: Optional[str] = None) -> Path:
+    cache_path = _svg_png_cache_path(svg_path, file_id)
+    try:
+        if (
+            cache_path.exists()
+            and cache_path.stat().st_mtime >= svg_path.stat().st_mtime
+        ):
+            return cache_path
+    except OSError:
+        pass
+    png = rasterize_svg_bytes(svg_path.read_bytes())
+    tmp = cache_path.with_suffix(".png.tmp")
+    tmp.write_bytes(png)
+    tmp.replace(cache_path)
+    return cache_path
+
+
+def _inline_preview_response(
+    path: Path, *, filename: str, media_type: str, file_id: Optional[str] = None
+) -> FileResponse:
+    """Build the final inline preview FileResponse, rasterizing SVG to PNG.
+
+    Raw SVG bytes are never served inline — an embedded ``<script>`` would
+    execute on direct top-level navigation to this response. Every other
+    media type is served as-is.
+    """
+    if media_type == "image/svg+xml":
+        try:
+            png_path = _rasterize_svg_preview(path, file_id=file_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422, detail="SVG cannot be safely previewed"
+            ) from exc
+        return FileResponse(
+            path=str(png_path),
+            filename=Path(filename).with_suffix(".png").name,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": "inline",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    return FileResponse(
+        path=str(path),
+        filename=filename,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": "inline",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _durable_redirect_response(
@@ -1115,7 +1186,8 @@ async def download_file(
                 headers={
                     "Content-Disposition": _content_disposition_header(
                         content_disposition, file_name
-                    )
+                    ),
+                    "X-Content-Type-Options": "nosniff",
                 },
             )
         if file_ref.has_durable_object:
@@ -1140,7 +1212,8 @@ async def download_file(
                     headers={
                         "Content-Disposition": _content_disposition_header(
                             content_disposition, file_name
-                        )
+                        ),
+                        "X-Content-Type-Options": "nosniff",
                     },
                 )
             except DurableObjectIntegrityError as exc:
@@ -1155,7 +1228,8 @@ async def download_file(
                     headers={
                         "Content-Disposition": _content_disposition_header(
                             content_disposition, file_name
-                        )
+                        ),
+                        "X-Content-Type-Options": "nosniff",
                     },
                 )
             except DurableStorageOperationError as exc:
@@ -1193,7 +1267,8 @@ async def download_file(
         headers={
             "Content-Disposition": _content_disposition_header(
                 content_disposition, file_name
-            )
+            ),
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -1246,11 +1321,11 @@ async def preview_file(
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
                 _ensure_under_uploads(materialized_path, owner_user_id)
-            return FileResponse(
-                path=str(materialized_path),
+            return _inline_preview_response(
+                materialized_path,
                 filename=file_name,
                 media_type=media_type,
-                headers={"Content-Disposition": "inline"},
+                file_id=file_id if is_valid_uuid(file_id) else None,
             )
     else:
         # For legacy files without records, check ownership
@@ -1275,11 +1350,11 @@ async def preview_file(
         if accel_response is not None:
             return accel_response
 
-    return FileResponse(
-        path=str(full_path),
+    return _inline_preview_response(
+        full_path,
         filename=file_name,
         media_type=media_type,
-        headers={"Content-Disposition": "inline"},
+        file_id=file_id if is_valid_uuid(file_id) else None,
     )
 
 
@@ -1488,11 +1563,11 @@ async def public_preview_file(
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
                 _ensure_under_uploads(target_path, owner_user_id)
-            return FileResponse(
-                path=str(target_path),
+            return _inline_preview_response(
+                target_path,
                 filename=str(file_record.filename),
                 media_type=guess_media_type(str(file_record.filename)),
-                headers={"Content-Disposition": "inline"},
+                file_id=file_id if is_valid_uuid(file_id) else None,
             )
     else:
         # Try to resolve as legacy path across all user directories
@@ -1535,11 +1610,11 @@ async def public_preview_file(
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(
-        path=str(target_path),
+    return _inline_preview_response(
+        target_path,
         filename=target_path.name,
         media_type=guess_media_type(target_path.name),
-        headers={"Content-Disposition": "inline"},
+        file_id=file_id if is_valid_uuid(file_id) else None,
     )
 
 

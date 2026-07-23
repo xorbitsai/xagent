@@ -3,10 +3,12 @@
 import socket
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from xagent.core.utils.security import (
     PrivateNetworkHostError,
+    fetch_public_http_bytes,
     redact_sensitive_text,
     redact_url_credentials_for_logging,
     reject_private_network_host,
@@ -33,7 +35,103 @@ async def test_validate_public_http_url_accepts_only_public_dns_results() -> Non
     resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
 
     with patch("socket.getaddrinfo", return_value=resolved):
-        await validate_public_http_url("https://public.example/logo.png")
+        assert await validate_public_http_url("https://public.example/logo.png") == [
+            "93.184.216.34"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_public_http_bytes_pins_validated_ip() -> None:
+    """The connection must use the IP resolved at validation time, not a
+    second, independently-resolved IP — this is what closes the DNS
+    rebinding / TOCTOU window."""
+
+    getaddrinfo_calls: list[tuple] = []
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        getaddrinfo_calls.append((host, port))
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["host"] = request.url.host
+        captured["host_header"] = request.headers.get("host")
+        captured["sni_hostname"] = request.extensions.get("sni_hostname")
+        return httpx.Response(200, content=b"ok")
+
+    transport = httpx.MockTransport(handler)
+
+    with patch("socket.getaddrinfo", side_effect=fake_getaddrinfo):
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await fetch_public_http_bytes(
+                client,
+                "https://rebind.example/x",
+                max_content_bytes=1024,
+                timeout=5,
+            )
+
+    assert response.content == b"ok"
+    assert captured["host"] == "93.184.216.34"
+    assert captured["host_header"] == "rebind.example"
+    assert captured["sni_hostname"] == "rebind.example"
+    assert len(getaddrinfo_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_public_http_bytes_revalidates_redirect_target() -> None:
+    """Each redirect hop must be re-validated — a redirect to an internal
+    host must be rejected even though the initial hop was public."""
+
+    resolutions = iter(
+        [
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
+        ]
+    )
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        return next(resolutions)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "93.184.216.34":
+            return httpx.Response(
+                302, headers={"location": "https://internal.example/"}
+            )
+        raise AssertionError("second hop must be rejected before connecting")
+
+    transport = httpx.MockTransport(handler)
+
+    with patch("socket.getaddrinfo", side_effect=fake_getaddrinfo):
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(PrivateNetworkHostError):
+                await fetch_public_http_bytes(
+                    client,
+                    "https://rebind.example/x",
+                    max_content_bytes=1024,
+                    timeout=5,
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [300, 305])
+async def test_fetch_rejects_unhandled_3xx(status_code: int) -> None:
+    resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code)
+
+    transport = httpx.MockTransport(handler)
+
+    with patch("socket.getaddrinfo", return_value=resolved):
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(ValueError):
+                await fetch_public_http_bytes(
+                    client,
+                    "https://public.example/x",
+                    max_content_bytes=1024,
+                    timeout=5,
+                )
 
 
 def test_redact_url_credentials_for_logging_masks_sensitive_query_values() -> None:

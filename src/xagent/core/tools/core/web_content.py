@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import html2text
 import httpx
@@ -20,7 +19,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024
 MAX_DISCOVERED_ASSETS = 50
-IDENTITY_ASSET_TERMS = ("logo", "brand", "wordmark")
 HTML_CONTENT_TYPES = frozenset(
     {
         "",
@@ -146,21 +144,12 @@ class WebContentFetcher:
                 if not self._is_html_content(content_type):
                     if self._is_plain_text_content(content_type):
                         decoded = self._decode_text_response(response.encoding, content)
-                        manifest_assets = (
-                            self._manifest_asset_references(
-                                decoded,
-                                final_url,
-                                asset_query=asset_query,
-                            )
-                            if include_assets
-                            else ()
-                        )
                         return WebContentFetchResult(
                             url=final_url,
                             content=decoded,
                             status_code=response.status_code,
                             content_type=content_type,
-                            assets=manifest_assets,
+                            assets=(),
                         )
 
                     return WebContentFetchResult(
@@ -176,22 +165,6 @@ class WebContentFetcher:
                 assets: tuple[WebAssetReference, ...] = ()
                 if include_assets:
                     discovered_assets = self._extract_html_assets(soup, final_url)
-                    matching_html_assets = self._filter_and_deduplicate_assets(
-                        discovered_assets,
-                        asset_query=asset_query,
-                    )
-                    if not any(
-                        asset.kind in {"image", "icon"}
-                        for asset in matching_html_assets
-                    ):
-                        discovered_assets.extend(
-                            await self._discover_spa_manifest_assets(
-                                client,
-                                soup,
-                                final_url,
-                                asset_query=asset_query,
-                            )
-                        )
                     assets = self._filter_and_deduplicate_assets(
                         discovered_assets,
                         asset_query=asset_query,
@@ -296,101 +269,6 @@ class WebContentFetcher:
 
         return assets
 
-    async def _discover_spa_manifest_assets(
-        self,
-        client: httpx.AsyncClient,
-        soup: BeautifulSoup,
-        page_url: str,
-        *,
-        asset_query: str | None,
-    ) -> list[WebAssetReference]:
-        """Discover identity assets exported by a Create React App manifest."""
-
-        has_static_bundle = any(
-            "/static/js/" in str(script.get("src") or "")
-            for script in soup.find_all("script")
-        )
-        if not has_static_bundle:
-            return []
-
-        parsed = urlsplit(page_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return []
-        manifest_url = f"{parsed.scheme}://{parsed.netloc}/asset-manifest.json"
-        assets: list[WebAssetReference] = []
-        try:
-            response = await fetch_public_http_bytes(
-                client,
-                manifest_url,
-                headers={"User-Agent": DEFAULT_USER_AGENT},
-                timeout=10,
-                max_content_bytes=self._max_content_bytes,
-            )
-            assets.append(
-                WebAssetReference(
-                    url=manifest_url,
-                    kind="asset_manifest",
-                    name="asset-manifest.json",
-                    source="spa_convention",
-                )
-            )
-            decoded = self._decode_text_response(response.encoding, response.content)
-            assets.extend(
-                self._manifest_asset_references(
-                    decoded,
-                    response.url,
-                    asset_query=asset_query,
-                )
-            )
-        except Exception as exc:
-            logger.debug(
-                "SPA asset manifest discovery failed for %s: %s", page_url, exc
-            )
-        return assets
-
-    @classmethod
-    def _manifest_asset_references(
-        cls,
-        content: str,
-        manifest_url: str,
-        *,
-        asset_query: str | None,
-    ) -> tuple[WebAssetReference, ...]:
-        try:
-            payload = json.loads(content)
-        except (TypeError, ValueError):
-            return ()
-        if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
-            return ()
-
-        query = str(asset_query or "").strip().lower()
-        references: list[WebAssetReference] = []
-        for raw_name, raw_url in payload["files"].items():
-            if not isinstance(raw_name, str) or not isinstance(raw_url, str):
-                continue
-            haystack = f"{raw_name} {raw_url}".lower()
-            if query:
-                if query not in haystack:
-                    continue
-            elif not any(term in haystack for term in IDENTITY_ASSET_TERMS):
-                continue
-            suffix = urlsplit(raw_url).path.lower()
-            if not suffix.endswith(
-                (".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
-            ):
-                continue
-            references.append(
-                WebAssetReference(
-                    url=urljoin(manifest_url, raw_url),
-                    kind="manifest_asset",
-                    name=raw_name,
-                    source="asset_manifest",
-                )
-            )
-            if len(references) >= MAX_DISCOVERED_ASSETS:
-                break
-        return tuple(references)
-
     @staticmethod
     def _filter_and_deduplicate_assets(
         assets: list[WebAssetReference],
@@ -403,7 +281,7 @@ class WebContentFetcher:
         for asset in assets:
             if asset.url in seen:
                 continue
-            if query and asset.kind not in {"manifest", "asset_manifest"}:
+            if query and asset.kind != "manifest":
                 haystack = f"{asset.url} {asset.name} {asset.alt}".lower()
                 if query not in haystack:
                     continue

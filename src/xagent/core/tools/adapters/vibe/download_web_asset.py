@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ....file_ref import build_workspace_file_ref
 from ....utils.security import fetch_public_http_bytes
+from ....utils.svg import validate_svg_bytes
 from ....workspace import TaskWorkspace
 from ...core.web_content import (
     DEFAULT_MAX_CONTENT_BYTES,
@@ -140,7 +141,6 @@ class DownloadWebAssetTool(AbstractBaseTool):
                 timeout=30,
                 max_content_bytes=self._max_content_bytes,
                 resource_name="remote asset",
-                content_length_name="declared",
                 require_non_empty=True,
             )
         return response.content, response.url, response.content_type
@@ -157,9 +157,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
         if media_type and not media_type.startswith("image/"):
             raise ValueError(f"Unsupported web asset content type: {content_type}")
         if media_type == "image/svg+xml" or url_suffix == ".svg":
-            prefix = content[:4096].decode("utf-8", errors="ignore").lower()
-            if "<svg" not in prefix:
-                raise ValueError("Remote SVG asset does not contain an <svg> root")
+            validate_svg_bytes(content)
             return ".svg"
         try:
             with Image.open(io.BytesIO(content)) as image:
@@ -193,8 +191,14 @@ class DownloadWebAssetTool(AbstractBaseTool):
             filename = "web_asset"
         if "\x00" in filename:
             raise ValueError("filename contains an invalid null byte")
-        if not Path(filename).suffix:
+        existing = Path(filename).suffix.lower()
+        jpeg_aliases = {".jpg", ".jpeg"}
+        if not existing:
             filename = f"{filename}{detected_extension}"
+        elif existing != detected_extension and not (
+            existing in jpeg_aliases and detected_extension in jpeg_aliases
+        ):
+            filename = f"{Path(filename).stem}{detected_extension}"
         return filename
 
     def _write_unique_output(self, filename: str, content: bytes) -> Path:

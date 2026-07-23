@@ -6,7 +6,14 @@ import re
 import socket
 from dataclasses import dataclass
 from typing import Mapping
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import (
+    SplitResult,
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 import httpx
 
@@ -72,8 +79,8 @@ def reject_private_network_host(hostname: str) -> None:
         raise PrivateNetworkHostError("Host must not resolve to a private network.")
 
 
-async def validate_public_http_url(url: str) -> None:
-    """Resolve an HTTP(S) URL and reject every non-public target address."""
+async def validate_public_http_url(url: str) -> list[str]:
+    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
 
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -97,8 +104,38 @@ async def validate_public_http_url(url: str) -> None:
     )
     if not addresses:
         raise ValueError(f"Host {hostname!r} did not resolve to an address")
+    resolved: list[str] = []
     for *_, socket_address in addresses:
-        reject_private_network_host(str(socket_address[0]))
+        ip = str(socket_address[0])
+        reject_private_network_host(ip)
+        resolved.append(ip)
+    return resolved
+
+
+def _pin_url_to_ip(parsed: SplitResult, ip: str) -> tuple[str, str, str]:
+    """Return (connect_url_on_ip, host_header, sni_hostname) for a validated IP."""
+
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("url must have a hostname")
+    default_port = 443 if parsed.scheme == "https" else 80
+    port = parsed.port or default_port
+    host_literal = f"[{hostname}]" if ":" in hostname else hostname
+    host_header = host_literal if port == default_port else f"{host_literal}:{port}"
+    ip_literal = f"[{ip}]" if ":" in ip else ip
+    connect_url = urlunsplit(
+        (
+            parsed.scheme,
+            f"{ip_literal}:{port}",
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+    return connect_url, host_header, hostname
+
+
+_MAX_REDIRECTS = 5
 
 
 async def fetch_public_http_bytes(
@@ -108,44 +145,47 @@ async def fetch_public_http_bytes(
     max_content_bytes: int,
     timeout: float,
     headers: Mapping[str, str] | None = None,
-    max_redirects: int = 5,
     resource_name: str = "response body",
-    content_length_name: str | None = None,
     require_non_empty: bool = False,
 ) -> PublicHttpResponse:
-    """Fetch a bounded HTTP body, validating every redirect target before I/O."""
+    """Fetch a bounded HTTP body, validating and pinning every redirect hop.
 
-    current_url = url
+    The IP validated by ``validate_public_http_url`` is the same IP the
+    connection is made to (via a URL rewrite plus an explicit ``Host``
+    header and TLS SNI override) — this closes the DNS-rebinding /
+    TOCTOU window where a second, independent DNS lookup at connect
+    time could return a different (private) address.
+    """
+
+    logical_url = url
     display_name = resource_name[:1].upper() + resource_name[1:]
-    length_name = content_length_name or resource_name
-    for redirect_count in range(max_redirects + 1):
-        await validate_public_http_url(current_url)
-        stream = (
-            client.stream(
-                "GET",
-                current_url,
-                headers=headers,
-                timeout=timeout,
-                follow_redirects=False,
-            )
-            if headers
-            else client.stream(
-                "GET",
-                current_url,
-                timeout=timeout,
-                follow_redirects=False,
-            )
-        )
-        async with stream as response:
+    for redirect_count in range(_MAX_REDIRECTS + 1):
+        resolved_ips = await validate_public_http_url(logical_url)
+        parsed = urlsplit(logical_url)
+        connect_url, host_header, sni = _pin_url_to_ip(parsed, resolved_ips[0])
+        request_headers = dict(headers or {})
+        request_headers["Host"] = host_header
+        async with client.stream(
+            "GET",
+            connect_url,
+            headers=request_headers,
+            timeout=timeout,
+            follow_redirects=False,
+            extensions={"sni_hostname": sni},
+        ) as response:
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")
                 if not location:
                     raise ValueError(f"{display_name} redirect has no Location")
-                if redirect_count >= max_redirects:
+                if redirect_count >= _MAX_REDIRECTS:
                     raise ValueError(f"{display_name} exceeded redirect limit")
-                current_url = urljoin(current_url, location)
+                logical_url = urljoin(logical_url, location)
                 continue
-
+            if 300 <= response.status_code < 400:
+                raise ValueError(
+                    f"{display_name} returned unsupported redirect status "
+                    f"{response.status_code}"
+                )
             response.raise_for_status()
             declared_length = response.headers.get("content-length")
             if declared_length is not None:
@@ -153,11 +193,11 @@ async def fetch_public_http_bytes(
                     length = int(declared_length)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
-                        f"Invalid {length_name} content length: {declared_length}"
+                        f"Invalid {resource_name} content length: {declared_length}"
                     ) from exc
                 if length < 0:
                     raise ValueError(
-                        f"Invalid {length_name} content length: {declared_length}"
+                        f"Invalid {resource_name} content length: {declared_length}"
                     )
                 if length > max_content_bytes:
                     raise ValueError(
@@ -180,7 +220,7 @@ async def fetch_public_http_bytes(
                 raise ValueError(f"{display_name} response was empty")
             return PublicHttpResponse(
                 content=content,
-                url=str(response.url),
+                url=logical_url,
                 status_code=response.status_code,
                 content_type=response.headers.get("content-type", ""),
                 encoding=getattr(response, "encoding", None),

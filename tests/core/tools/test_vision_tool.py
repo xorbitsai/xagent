@@ -554,7 +554,7 @@ class TestVisionToolUnderstandMedia:
         with (
             patch(
                 "xagent.core.utils.security.validate_public_http_url",
-                new=AsyncMock(),
+                new=AsyncMock(return_value=["93.184.216.34"]),
             ) as validate_url,
             patch(
                 "xagent.core.tools.core.vision_tool.get_proxy_url",
@@ -584,9 +584,11 @@ class TestVisionToolUnderstandMedia:
         )
         client.stream.assert_called_once_with(
             "GET",
-            "https://cdn.example.com/official-logo.svg",
+            "https://93.184.216.34:443/official-logo.svg",
+            headers={"Host": "cdn.example.com"},
             timeout=10,
             follow_redirects=False,
+            extensions={"sni_hostname": "cdn.example.com"},
         )
 
     @pytest.mark.asyncio
@@ -1277,6 +1279,11 @@ class TestVisionToolHelperMethods:
             "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
         )
         rasterize.assert_called_once_with(svg_path.read_bytes())
+
+    def test_decode_svg_bytes_rejects_script(self, vision_tool_without_workspace):
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+        with pytest.raises(ValueError, match="script"):
+            vision_tool_without_workspace.core._decode_svg_bytes(svg)
 
     def test_validate_images_string_input(self, vision_tool_without_workspace):
         """Test _validate_images method with string input"""

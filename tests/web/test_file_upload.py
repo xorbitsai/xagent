@@ -1818,3 +1818,71 @@ class TestFileUploadSecurity:
         data = response.json()
         assert data["total_count"] == 1
         assert [item["filename"] for item in data["files"]] == ["task-alpha.txt"]
+
+
+_CLEAN_SVG = b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" />'
+_MALICIOUS_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+    b"<script>alert(document.domain)</script></svg>"
+)
+
+
+class TestSvgPreviewSecurity:
+    """SVG previews must never render raw, script-bearing bytes in-browser."""
+
+    def _upload_svg(self, client, auth_headers, content: bytes = _CLEAN_SVG):
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("logo.svg", content, "image/svg+xml")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        return response.json()["file_id"]
+
+    def test_preview_svg_returns_png_not_raw(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        file_id = self._upload_svg(client, auth_headers)
+
+        preview = client.get(f"/api/files/preview/{file_id}", headers=auth_headers)
+
+        assert preview.status_code == 200
+        assert preview.headers["content-type"] == "image/png"
+        assert preview.content.startswith(b"\x89PNG")
+
+    def test_public_preview_svg_returns_png(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        file_id = self._upload_svg(client, auth_headers)
+
+        preview = client.get(f"/api/files/public/preview/{file_id}")
+
+        assert preview.status_code == 200
+        assert preview.headers["content-type"] == "image/png"
+        assert preview.content.startswith(b"\x89PNG")
+
+    def test_preview_svg_with_script_never_leaks_raw_bytes(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """A pre-existing malicious SVG (e.g. uploaded before this fix, or via
+        the generic /upload endpoint that download_web_asset's validation
+        never sees) must fail closed rather than ever serve raw script bytes.
+        """
+        file_id = self._upload_svg(client, auth_headers, content=_MALICIOUS_SVG)
+
+        preview = client.get(f"/api/files/preview/{file_id}", headers=auth_headers)
+
+        assert preview.status_code == 422
+        assert b"<script" not in preview.content
+
+    def test_download_svg_forces_attachment(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        file_id = self._upload_svg(client, auth_headers, content=_CLEAN_SVG)
+
+        download = client.get(f"/api/files/download/{file_id}", headers=auth_headers)
+
+        assert download.status_code == 200
+        assert download.headers["content-disposition"].startswith("attachment")
+        assert download.headers["x-content-type-options"] == "nosniff"

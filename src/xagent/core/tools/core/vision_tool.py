@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from ...model.chat.basic.base import BaseLLM
 from ...utils.security import fetch_public_http_bytes
-from ...utils.svg import MAX_SVG_BYTES, rasterize_svg_bytes
+from ...utils.svg import MAX_SVG_BYTES, rasterize_svg_bytes, validate_svg_bytes
 from .web_content import get_proxy_url
 
 try:
@@ -264,12 +264,7 @@ class VisionCore:
 
     @staticmethod
     def _decode_svg_bytes(svg_bytes: bytes) -> str:
-        if not svg_bytes:
-            raise ValueError("SVG source is empty")
-        if len(svg_bytes) > MAX_SVG_BYTES:
-            raise ValueError(f"SVG exceeds maximum size of {MAX_SVG_BYTES} bytes")
-        if b"<svg" not in svg_bytes[:4096].lower():
-            raise ValueError("SVG source does not contain an <svg> root")
+        validate_svg_bytes(svg_bytes)
         return svg_bytes.decode("utf-8-sig", errors="replace")
 
     def _convert_video_to_base64(self, video_path: str) -> str:

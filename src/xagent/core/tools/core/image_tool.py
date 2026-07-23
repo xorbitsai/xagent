@@ -93,7 +93,7 @@ Parameters:
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
 - aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
-- negative_prompt (optional): undesired elements; ignored by some providers, so critical constraints belong in the prompt
+- negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
@@ -143,7 +143,7 @@ Available models (⭐[DEFAULT] marks the configured default model):
 Parameters:
 - image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
 - prompt (required): description of the desired edits and changes
-- negative_prompt (optional): undesired elements in the result; ignored by some providers, so critical constraints belong in the prompt
+- negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
 - size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)

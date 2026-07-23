@@ -13,11 +13,9 @@ description: |
   printable to PDF via the browser, with keyboard navigation. Prefer this over
   native .pptx when the user wants visual quality over Office compatibility.
 when_to_use: |
-  Only when the current request explicitly asks for a slide-style HTML
-  deliverable with editorial polish — pitch decks, talks, internal review decks
-  — and visual quality matters more than Office compatibility. A request for a
-  campaign, creative concept, poster, banner, or generated image does not imply
-  a deck. Prefer over `pptx-editorial` only when HTML output is requested.
+  Use for the explicit slide-style HTML requests described above when editorial
+  polish matters more than Office compatibility. Prefer over `pptx-editorial`
+  only when HTML output is requested.
 tags:
   - presentation
   - html

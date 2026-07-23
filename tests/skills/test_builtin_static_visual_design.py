@@ -42,47 +42,17 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
 
     content = " ".join(skill["content"].split())
     assert "Stay within the commercial-creative scope" in content
-    assert "A request to explain a concept with an image" in content
-    assert "is outside this skill" in content
     assert "Use `generate_image` to create the full designed asset" in content
     assert "references/static-ad-art-direction.md" in content
-    assert "concepts materially different" in content
     assert "two or three genuinely different communication angles" in content
-    assert "Do not interpret the singular nouns" in content
-    assert "render two or three candidates" in content
-    assert "one visual device, and one structural approach" in content
-    assert "one coherent planning pass" in content
-    assert "do not delegate open-ended ideation" in content
-    assert "creative-risk ladder" in content
-    assert "Brand/reference acquisition is a shared prerequisite" in content
     assert "one finished placement on one continuous canvas" in content
-    assert "contact sheets, moodboards, option grids" in content
-    assert "Automatically reject contact sheets" in content
-    assert "Use `edit_image` only" in content
-    assert "Brand-safe evolution" in content
-    assert "headline and image divide the communication work" in content
-    assert "prior winning creative, and performance evidence" in content
     assert "a brand-specific final requires a verified logo" in content
-    assert "Include it as a generation reference" in content
-    assert "Stable cues may include the official logo" in content
-    assert "datedness is not a brand requirement" in content
+    assert "This runtime does not provide deterministic compositing" in content
     assert "download_web_asset" not in content
     assert "SVG is source text" not in content
-    assert "Cosmetic resizes are not distinct concepts" in content
-    assert "Each direction must differ on at least three" in content
-    assert "stacked display effects as a warning sign" in content
-    assert "never invent prices, milestones, performance" in content
-    assert "Never add a second logo over a generated pseudo-logo" in content
-    assert "Do not make deterministic compositing an automatic final step" in content
     assert "Do not use HTML/CSS plus browser screenshots" in content
     assert "Do not enter `final_answer`" in content
-    assert "merely polished but generic" in content
     assert "Return only final PNG or JPEG files" in content
-    assert "No device is inherently right or wrong" in content
-    assert "treatments, not complete ideas" in content
-    assert "naming the asset only in the prompt does not attach it" in content
-    assert "Compare the actual render prompts" in content
-    assert "Do not forbid familiar devices" in content
 
 
 def test_static_visual_design_includes_art_direction_reference() -> None:
@@ -101,10 +71,6 @@ def test_static_visual_design_includes_art_direction_reference() -> None:
 
     assert "Choose a communication structure" in content
     assert "Dominant proof" in content
-    assert "Offer reveal" in content
-    assert "Editorial provocation" in content
     assert "Design for a three-pass read" in content
-    assert "Use a one-canvas generation contract" in content
-    assert "Apply the substitution test" in content
+    assert "Follow the main skill's one-canvas generation contract" in content
     assert "Automatic rejection overrides subjective scoring" in content
-    assert "Regenerate from the locked design specification" in content

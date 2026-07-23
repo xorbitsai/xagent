@@ -200,19 +200,11 @@ weight, position, color, and whitespace; do not depend on glow, bevel, shadow,
 outline, and extrusion simultaneously. Display type may be expressive, but body
 and qualification text must remain calm and legible.
 
-## Use a one-canvas generation contract
+## Follow the main skill's one-canvas generation contract
 
-Each generation call must request one finished composition for one placement.
-State this positively and negatively:
-
-> Create one single final ad on one continuous canvas. Show one composition
-> only. Do not create a contact sheet, moodboard, grid of options, multiple
-> versions, before-and-after panels, repeated layouts, mockup presentation, or
-> duplicated headline.
-
-Do not use prompt phrases such as "three concepts," "two variations,"
-"split-frame," "option A/B," or "layout exploration" inside a render call.
-Those belong in planning; render each locked direction in a separate call.
+Use the one-canvas render contract from `SKILL.md` without adding a competing
+version here. Compare multiple directions during planning, then render each
+locked direction in a separate generation call.
 
 References must already be resolved before rendering begins. Every generation
 step must depend on the shared brand-and-brief step and receive the locked

@@ -192,8 +192,12 @@ Treat identity-critical assets differently:
   `images` argument (or use `edit_image` directly); naming the asset only in the
   prompt does not attach it. Still do not trust a generated or edited recreation
   as the final logo.
-- Preserve QR codes, certification marks, sponsor marks, UI screenshots, and
-  other exact assets pixel-for-pixel.
+- Treat QR codes, certification marks, sponsor marks, UI screenshots, and other
+  exact assets as non-generative inputs. This runtime does not provide
+  deterministic compositing, and generative rendering cannot preserve these
+  assets pixel-for-pixel. If the final placement requires exact reproduction,
+  explain the limitation and ask the user to arrange deterministic
+  post-processing; never claim the generated candidate is an exact final.
 - Unless the user explicitly requests an unbranded or logo-free concept, a
   brand-specific final requires a verified logo. If none is available, ask for
   it and keep any interim output clearly labeled as a concept draft. Do not mark
@@ -334,9 +338,8 @@ when the image model supports them. Inspect the result closely. Never add a
 second logo over a generated pseudo-logo, and never treat a generic typed brand
 name as proof of fidelity; remove the artifact or regenerate the creative.
 
-Do not make deterministic compositing an automatic final step for every branded
-visual. If the user explicitly requires pixel-identical reproduction, use an
-available deterministic asset-processing workflow or explain the limitation;
+Do not add a deterministic compositing step for ordinary branded visuals.
+Apply the identity-asset rule above whenever exact reproduction is required;
 do not pretend a generative result is exact.
 
 Do not use HTML/CSS plus browser screenshots for ordinary poster, ad, banner,

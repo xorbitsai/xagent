@@ -1205,6 +1205,38 @@ class TestModelAPI:
         data = response.json()
         assert [model["id"] for model in data["models"]] == ["custom-model"]
 
+    def test_fetch_provider_models_strips_whitespace_from_api_key_and_base_url(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """A base_url/api_key padded with whitespace must reach the fetcher
+        trimmed, not verbatim — otherwise a value like " https://foo.com "
+        would silently reach the downstream provider with stray whitespace."""
+        from xagent.core.model.chat.basic.openai import OpenAILLM
+
+        captured = {}
+
+        async def fake_list_available_models(api_key, base_url=None):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            return []
+
+        monkeypatch.setattr(
+            OpenAILLM, "list_available_models", fake_list_available_models
+        )
+
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={
+                "api_key": "  test-api-key  ",
+                "base_url": "  https://custom.example.com/v1  ",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert captured["api_key"] == "test-api-key"
+        assert captured["base_url"] == "https://custom.example.com/v1"
+
     def test_list_supported_providers_includes_elevenlabs_audio_generation(
         self, test_db, regular_user, regular_headers
     ):

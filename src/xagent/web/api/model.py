@@ -2112,6 +2112,8 @@ async def fetch_provider_models(
     base_url is also required. When category helps route to the correct fetcher
     for provider+category combinations (e.g. xinference+rerank).
     """
+    api_key = api_key.strip()
+    base_url = base_url.strip() if base_url else base_url
 
     # Validate provider
     from ..services.model_list_service import (

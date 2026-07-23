@@ -271,6 +271,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([])
   const [logoFile, setLogoFile] = useState<File | null>(null)
   const [logoUrl, setLogoUrl] = useState<string | null>(null)  // Existing logo URL
+  const [logoRemoved, setLogoRemoved] = useState(false)  // User explicitly cleared the logo
   const [isCreating, setIsCreating] = useState(false)
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [loadingAgent, setLoadingAgent] = useState(false)
@@ -830,6 +831,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           }
 
           setLogoUrl(agent.logo_url || null)
+          setLogoRemoved(false)
 
           // Load models
           if (agent.models) {
@@ -1147,6 +1149,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       setLogoFile(e.target.files[0])
+      setLogoRemoved(false)
+    }
+  }
+
+  const handleRemoveLogo = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setLogoFile(null)
+    setLogoUrl(null)
+    setLogoRemoved(true)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ""
     }
   }
 
@@ -1185,6 +1198,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
     // Compare logo
     if (logoFile) return true
+    if (logoRemoved) return true
 
     // Compare arrays
     if (normalizePrompts(suggestedPrompts) !== normalizePrompts(originalData.suggested_prompts)) return true
@@ -1210,7 +1224,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
-  }, [name, description, instructions, executionMode, ownership, visibility, logoFile, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+  }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
 
   // After a successful save, align server-side ownership with the chosen control:
   // promote a personal agent to team (with visibility) or demote a team agent back
@@ -1352,10 +1366,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     setIsCreating(true)
 
     try {
-      // Convert logo to base64 if provided
+      // Convert logo to base64 if provided; an empty string tells the
+      // backend to clear an existing logo (vs. undefined, meaning "no change").
       let logo_base64: string | undefined
       if (logoFile) {
         logo_base64 = await fileToBase64(logoFile)
+      } else if (logoRemoved) {
+        logo_base64 = ""
       }
 
       const url = isEditMode && localAgentId
@@ -1425,6 +1442,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // stale URL captured at initial load once logoFile is cleared below.
           setLogoUrl(updatedAgent.logo_url || null)
           setLogoFile(null)
+          setLogoRemoved(false)
         } else {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)
@@ -1903,16 +1921,28 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         <div className="space-y-2">
           <Label>{t("builds.configForm.logo.label")}</Label>
           <div className="flex items-center gap-4">
-            <div
-              className={`h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden transition-colors ${readOnly ? "cursor-default" : "cursor-pointer hover:bg-muted/50"}`}
-              onClick={readOnly ? undefined : () => fileInputRef.current?.click()}
-            >
-              {logoFile ? (
-                <img src={URL.createObjectURL(logoFile)} alt="Logo" className="h-full w-full object-cover" />
-              ) : logoUrl ? (
-                <img src={`${getApiUrl()}${logoUrl}`} alt="Logo" className="h-full w-full object-cover" />
-              ) : (
-                <Upload className="h-6 w-6 text-muted-foreground" />
+            <div className="relative h-16 w-16">
+              <div
+                className={`h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden transition-colors ${readOnly ? "cursor-default" : "cursor-pointer hover:bg-muted/50"}`}
+                onClick={readOnly ? undefined : () => fileInputRef.current?.click()}
+              >
+                {logoFile ? (
+                  <img src={URL.createObjectURL(logoFile)} alt="Logo" className="h-full w-full object-cover" />
+                ) : logoUrl ? (
+                  <img src={`${getApiUrl()}${logoUrl}`} alt="Logo" className="h-full w-full object-cover" />
+                ) : (
+                  <Upload className="h-6 w-6 text-muted-foreground" />
+                )}
+              </div>
+              {!readOnly && (logoFile || logoUrl) && (
+                <button
+                  type="button"
+                  onClick={handleRemoveLogo}
+                  aria-label={t("builds.configForm.logo.remove")}
+                  className="absolute -top-2 -right-2 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground"
+                >
+                  <X className="h-3 w-3" />
+                </button>
               )}
             </div>
             <input

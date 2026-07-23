@@ -30,7 +30,6 @@ interface SshBinding {
   public_id: string
   target_public_id: string | null
   target_alias: string | null
-  target_display_name: string | null
   tool_alias: string
   capabilities: string[]
   approval_policy: string
@@ -189,7 +188,7 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
                 {/* tool_alias is auto-derived from the target alias, so showing
                     both is redundant — show the single alias the user configured. */}
                 <div className="truncate text-sm font-medium">
-                  {b.target_display_name || b.target_alias || b.tool_alias}
+                  {b.target_alias || b.tool_alias}
                 </div>
               </div>
               <div className="flex flex-wrap gap-1">

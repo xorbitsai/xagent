@@ -10,6 +10,7 @@ from .egress import EgressDecision, EgressPolicyConfig, check_ip
 from .errors import SshError, SshErrorCode
 from .interfaces import (
     SandboxSecretMaterializer,
+    SshAuditSink,
     SshSecretStore,
     SshTargetProvider,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "PrincipalRef",
     "ResolvedSshTarget",
     "SandboxSecretMaterializer",
+    "SshAuditSink",
     "SensitiveSshCredential",
     "SshCapability",
     "SshError",

@@ -34,6 +34,24 @@ class SshSecretStore(Protocol):
 
 
 @runtime_checkable
+class SshAuditSink(Protocol):
+    """Records one append-only audit event per SSH operation. The executor calls
+    it after each operation resolves — on success and on failure. Auditing is
+    best-effort: implementations must not raise into the caller (the executor
+    swallows sink errors so a logging failure never fails the operation)."""
+
+    async def record(
+        self,
+        *,
+        context: SshExecutionContext,
+        operation: str,
+        status: str,
+        target: ResolvedSshTarget | None = None,
+        error_code: str | None = None,
+    ) -> None: ...
+
+
+@runtime_checkable
 class SandboxSecretMaterializer(Protocol):
     """Materializes one credential + known_hosts into a sandbox for one call.
 

@@ -10,6 +10,7 @@ timeout, and cancellation).
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import time
 from collections.abc import Awaitable, Callable
@@ -18,9 +19,16 @@ from dataclasses import dataclass
 from .egress import EgressPolicyConfig
 from .egress_io import resolve_and_authorize
 from .errors import SshError, SshErrorCode
-from .interfaces import SandboxSecretMaterializer, SshSecretStore, SshTargetProvider
+from .interfaces import (
+    SandboxSecretMaterializer,
+    SshAuditSink,
+    SshSecretStore,
+    SshTargetProvider,
+)
 from .runner import SshRunner
 from .types import ResolvedSshTarget, SshExecutionContext
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_OUTPUT_BYTES = 1 << 20  # 1 MiB, combined stdout + stderr
 DEFAULT_MAX_TIMEOUT_SECONDS = 600
@@ -48,6 +56,7 @@ class SshExecutor:
         egress_config: EgressPolicyConfig,
         sandbox: object | None = None,
         resolver: Callable[[str, int], Awaitable[list[str]]] | None = None,
+        audit_sink: SshAuditSink | None = None,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_timeout_seconds: int = DEFAULT_MAX_TIMEOUT_SECONDS,
     ) -> None:
@@ -58,6 +67,7 @@ class SshExecutor:
         self._egress_config = egress_config
         self._sandbox = sandbox
         self._resolver = resolver
+        self._audit_sink = audit_sink
         self._max_output_bytes = max_output_bytes
         self._max_timeout_seconds = max_timeout_seconds
 
@@ -69,34 +79,40 @@ class SshExecutor:
         command: str,
         timeout_seconds: int = 60,
     ) -> SshExecuteOutcome:
-        resolved = await self._provider.resolve(context, target_alias)
-        if "execute" not in resolved.capabilities:
-            raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "binding does not allow execute")
+        resolved: ResolvedSshTarget | None = None
+        try:
+            resolved = await self._provider.resolve(context, target_alias)
+            if "execute" not in resolved.capabilities:
+                raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "binding does not allow execute")
 
-        # Early, fail-closed egress check before any secret is read.
-        await resolve_and_authorize(
-            resolved.hostname, resolved.port, self._egress_config, resolver=self._resolver
-        )
-
-        timeout = min(max(1, timeout_seconds), self._max_timeout_seconds)
-        credential = await self._secret_store.read_version(resolved.secret_handle)
-
-        start = time.monotonic()
-        async with self._materializer.materialize_ssh(
-            self._sandbox, credential, resolved.known_hosts
-        ) as paths:
-            run = await self._runner.execute(
-                hostname=resolved.hostname,
-                port=resolved.port,
-                username=resolved.username,
-                private_key_path=paths.private_key_path,
-                known_hosts_path=paths.known_hosts_path,
-                command=command,
-                timeout_seconds=timeout,
-                egress_config=self._egress_config,
+            # Early, fail-closed egress check before any secret is read.
+            await resolve_and_authorize(
+                resolved.hostname, resolved.port, self._egress_config, resolver=self._resolver
             )
-        duration_ms = int((time.monotonic() - start) * 1000)
 
+            timeout = min(max(1, timeout_seconds), self._max_timeout_seconds)
+            credential = await self._secret_store.read_version(resolved.secret_handle)
+
+            start = time.monotonic()
+            async with self._materializer.materialize_ssh(
+                self._sandbox, credential, resolved.known_hosts
+            ) as paths:
+                run = await self._runner.execute(
+                    hostname=resolved.hostname,
+                    port=resolved.port,
+                    username=resolved.username,
+                    private_key_path=paths.private_key_path,
+                    known_hosts_path=paths.known_hosts_path,
+                    command=command,
+                    timeout_seconds=timeout,
+                    egress_config=self._egress_config,
+                )
+            duration_ms = int((time.monotonic() - start) * 1000)
+        except SshError as exc:
+            await self._audit(context, "ssh_execute", "failure", resolved, exc.code.value)
+            raise
+
+        await self._audit(context, "ssh_execute", "success", resolved, None)
         stdout, stderr, capped = _cap_outputs(run.stdout, run.stderr, self._max_output_bytes)
         return SshExecuteOutcome(
             exit_code=run.exit_code,
@@ -117,22 +133,28 @@ class SshExecutor:
     ) -> None:
         """Upload ``local_path`` (already resolved within the task workspace by
         the caller) to ``remote_path`` on a bound target."""
-        resolved = await self._authorize_transfer(context, target_alias, "upload", remote_path)
-        credential = await self._secret_store.read_version(resolved.secret_handle)
-        async with self._materializer.materialize_ssh(
-            self._sandbox, credential, resolved.known_hosts
-        ) as paths:
-            await self._runner.upload(
-                hostname=resolved.hostname,
-                port=resolved.port,
-                username=resolved.username,
-                private_key_path=paths.private_key_path,
-                known_hosts_path=paths.known_hosts_path,
-                local_path=local_path,
-                remote_path=remote_path,
-                overwrite=overwrite,
-                egress_config=self._egress_config,
-            )
+        resolved: ResolvedSshTarget | None = None
+        try:
+            resolved = await self._authorize_transfer(context, target_alias, "upload", remote_path)
+            credential = await self._secret_store.read_version(resolved.secret_handle)
+            async with self._materializer.materialize_ssh(
+                self._sandbox, credential, resolved.known_hosts
+            ) as paths:
+                await self._runner.upload(
+                    hostname=resolved.hostname,
+                    port=resolved.port,
+                    username=resolved.username,
+                    private_key_path=paths.private_key_path,
+                    known_hosts_path=paths.known_hosts_path,
+                    local_path=local_path,
+                    remote_path=remote_path,
+                    overwrite=overwrite,
+                    egress_config=self._egress_config,
+                )
+        except SshError as exc:
+            await self._audit(context, "ssh_upload", "failure", resolved, exc.code.value)
+            raise
+        await self._audit(context, "ssh_upload", "success", resolved, None)
 
     async def download(
         self,
@@ -145,22 +167,53 @@ class SshExecutor:
     ) -> None:
         """Download ``remote_path`` from a bound target to ``local_path`` (already
         resolved within the task workspace by the caller)."""
-        resolved = await self._authorize_transfer(context, target_alias, "download", remote_path)
-        credential = await self._secret_store.read_version(resolved.secret_handle)
-        async with self._materializer.materialize_ssh(
-            self._sandbox, credential, resolved.known_hosts
-        ) as paths:
-            await self._runner.download(
-                hostname=resolved.hostname,
-                port=resolved.port,
-                username=resolved.username,
-                private_key_path=paths.private_key_path,
-                known_hosts_path=paths.known_hosts_path,
-                remote_path=remote_path,
-                local_path=local_path,
-                overwrite=overwrite,
-                egress_config=self._egress_config,
+        resolved: ResolvedSshTarget | None = None
+        try:
+            resolved = await self._authorize_transfer(
+                context, target_alias, "download", remote_path
             )
+            credential = await self._secret_store.read_version(resolved.secret_handle)
+            async with self._materializer.materialize_ssh(
+                self._sandbox, credential, resolved.known_hosts
+            ) as paths:
+                await self._runner.download(
+                    hostname=resolved.hostname,
+                    port=resolved.port,
+                    username=resolved.username,
+                    private_key_path=paths.private_key_path,
+                    known_hosts_path=paths.known_hosts_path,
+                    remote_path=remote_path,
+                    local_path=local_path,
+                    overwrite=overwrite,
+                    egress_config=self._egress_config,
+                )
+        except SshError as exc:
+            await self._audit(context, "ssh_download", "failure", resolved, exc.code.value)
+            raise
+        await self._audit(context, "ssh_download", "success", resolved, None)
+
+    async def _audit(
+        self,
+        context: SshExecutionContext,
+        operation: str,
+        status: str,
+        target: ResolvedSshTarget | None,
+        error_code: str | None,
+    ) -> None:
+        """Emit one audit event, best-effort. A sink failure is logged and
+        swallowed so auditing can never fail the operation itself."""
+        if self._audit_sink is None:
+            return
+        try:
+            await self._audit_sink.record(
+                context=context,
+                operation=operation,
+                status=status,
+                target=target,
+                error_code=error_code,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("ssh audit sink failed for %s (%s)", operation, status, exc_info=True)
 
     async def _authorize_transfer(
         self,

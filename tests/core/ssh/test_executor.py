@@ -204,6 +204,87 @@ async def test_upload_remote_root_escape_denied(tmp_path) -> None:
         await server.close()
 
 
+class _RecordingAuditSink:
+    def __init__(self, *, boom: bool = False) -> None:
+        self.events: list[dict] = []
+        self._boom = boom
+
+    async def record(self, *, context, operation, status, target=None, error_code=None) -> None:
+        if self._boom:
+            raise RuntimeError("audit backend down")
+        self.events.append(
+            {
+                "operation": operation,
+                "status": status,
+                "error_code": error_code,
+                "target_public_id": target.target_public_id if target else None,
+            }
+        )
+
+
+async def test_execute_emits_success_audit() -> None:
+    server = await start_test_ssh_server()
+    sink = _RecordingAuditSink()
+    try:
+        await _executor(server, _target(server), audit_sink=sink).execute(
+            _ctx(), target_alias="prod", command="uptime", timeout_seconds=10
+        )
+        assert sink.events == [
+            {
+                "operation": "ssh_execute",
+                "status": "success",
+                "error_code": None,
+                "target_public_id": "t",
+            }
+        ]
+    finally:
+        await server.close()
+
+
+async def test_execute_emits_failure_audit_with_error_code() -> None:
+    server = await start_test_ssh_server()
+    sink = _RecordingAuditSink()
+    try:
+        ex = _executor(
+            server, _target(server, capabilities=frozenset({"download"})), audit_sink=sink
+        )
+        with pytest.raises(SshError):
+            await ex.execute(_ctx(), target_alias="prod", command="uptime", timeout_seconds=10)
+        assert len(sink.events) == 1
+        assert sink.events[0]["status"] == "failure"
+        assert sink.events[0]["error_code"] == "ssh_operation_not_allowed"
+    finally:
+        await server.close()
+
+
+async def test_audit_sink_failure_never_breaks_execution() -> None:
+    server = await start_test_ssh_server()
+    try:
+        # A sink that raises must not fail the operation — auditing is best-effort.
+        outcome = await _executor(
+            server, _target(server), audit_sink=_RecordingAuditSink(boom=True)
+        ).execute(_ctx(), target_alias="prod", command="uptime", timeout_seconds=10)
+        assert outcome.exit_code == 0
+    finally:
+        await server.close()
+
+
+async def test_upload_emits_audit(tmp_path) -> None:
+    server = await start_test_ssh_server()
+    local = tmp_path / "local.txt"
+    local.write_text("x")
+    remote = tmp_path / "remote.txt"
+    sink = _RecordingAuditSink()
+    try:
+        await _executor(
+            server, _target(server, capabilities=frozenset({"upload"})), audit_sink=sink
+        ).upload(_ctx(), target_alias="prod", local_path=str(local), remote_path=str(remote))
+        assert sink.events[0]["operation"] == "ssh_upload"
+        assert sink.events[0]["status"] == "success"
+    finally:
+        await server.close()
+
+
 class _RecordingRunner:
     def __init__(self) -> None:
         self.timeout_seconds: int | None = None

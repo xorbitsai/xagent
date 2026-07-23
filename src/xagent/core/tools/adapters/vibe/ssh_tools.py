@@ -302,7 +302,7 @@ def _agent_id_for_task(session_factory: Any, numeric_task_id: int | None) -> int
 async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     """Emit SSH tools only when a provider is installed and the executing agent
     has at least one bound target."""
-    from .....web.services.ssh_runtime import get_ssh_target_provider
+    from .....web.services.ssh_runtime import get_ssh_audit_sink, get_ssh_target_provider
 
     try:
         session_factory = config.get_session_factory()
@@ -361,6 +361,7 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
         materializer=LocalTmpSecretMaterializer(),
         runner=AsyncsshRunner(),
         egress_config=_egress_from_env(),
+        audit_sink=get_ssh_audit_sink(session_factory),
     )
     # SFTP tools resolve/containment-check local paths against the task
     # workspace; None (e.g. tool-listing) disables transfers, not execute.

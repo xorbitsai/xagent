@@ -6,14 +6,18 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from xagent.core.ssh import SshTargetProvider
+from xagent.core.ssh import SshAuditSink, SshTargetProvider
 
 # factory(session_factory) -> SshTargetProvider. The provider is long-lived and
 # opens its own one-shot session per call from the factory the tool passes in;
 # it must NOT be handed a single live session (unsafe under tool concurrency).
 SshTargetProviderFactory = Callable[[Any], SshTargetProvider]
+# factory(session_factory) -> SshAuditSink. Same session discipline as above:
+# the sink opens its own one-shot session per audit event.
+SshAuditSinkFactory = Callable[[Any], SshAuditSink]
 
 _ssh_target_provider_factory: SshTargetProviderFactory | None = None
+_ssh_audit_sink_factory: SshAuditSinkFactory | None = None
 
 
 def set_ssh_target_provider_hook(factory: SshTargetProviderFactory | None) -> None:
@@ -27,3 +31,16 @@ def get_ssh_target_provider(session_factory: Any) -> SshTargetProvider | None:
     if _ssh_target_provider_factory is None:
         return None
     return _ssh_target_provider_factory(session_factory)
+
+
+def set_ssh_audit_sink_hook(factory: SshAuditSinkFactory | None) -> None:
+    """Register (or clear) the SSH audit sink factory."""
+    global _ssh_audit_sink_factory
+    _ssh_audit_sink_factory = factory
+
+
+def get_ssh_audit_sink(session_factory: Any) -> SshAuditSink | None:
+    """Build the audit sink for this call, or None if no hook is installed."""
+    if _ssh_audit_sink_factory is None:
+        return None
+    return _ssh_audit_sink_factory(session_factory)

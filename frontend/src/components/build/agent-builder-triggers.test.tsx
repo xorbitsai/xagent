@@ -3,6 +3,35 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+// Stable references across renders — an inline `t: (key) => key` (or a fresh
+// `apps: []`/`dispatch: vi.fn()`) recreated on every useI18n()/useMcpApps()/
+// useApp() call defeats every useCallback/useMemo keyed on it throughout the
+// real component tree (e.g. AgentTriggersDialog's loadRunsFor depends on
+// `t`), making dependent effects re-run on every render instead of only when
+// something real changed.
+const translateMock = vi.hoisted(() => (key: string) => key)
+const mcpAppsMock = vi.hoisted(() => ({ apps: [] as unknown[], getAppIcon: () => null }))
+const appContextMock = vi.hoisted(() => ({
+  state: {
+    messages: [],
+    traceEvents: [],
+    currentTask: null,
+    isProcessing: false,
+    isHistoryLoading: false,
+    taskId: null,
+    filePreview: { isOpen: false },
+    dagExecution: null,
+    steps: [],
+  },
+  setTaskId: vi.fn(),
+  sendMessage: vi.fn(),
+  dispatch: vi.fn(),
+  closeFilePreview: vi.fn(),
+  pauseTask: vi.fn(),
+  resumeTask: vi.fn(),
+  openFilePreview: vi.fn(),
+  requestStatus: vi.fn(),
+}))
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -25,27 +54,7 @@ vi.mock("@/lib/utils", async () => {
 })
 
 vi.mock("@/contexts/app-context-chat", () => ({
-  useApp: () => ({
-    state: {
-      messages: [],
-      traceEvents: [],
-      currentTask: null,
-      isProcessing: false,
-      isHistoryLoading: false,
-      taskId: null,
-      filePreview: { isOpen: false },
-      dagExecution: null,
-      steps: [],
-    },
-    setTaskId: vi.fn(),
-    sendMessage: vi.fn(),
-    dispatch: vi.fn(),
-    closeFilePreview: vi.fn(),
-    pauseTask: vi.fn(),
-    resumeTask: vi.fn(),
-    openFilePreview: vi.fn(),
-    requestStatus: vi.fn(),
-  }),
+  useApp: () => appContextMock,
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
@@ -55,12 +64,12 @@ vi.mock("@/contexts/auth-context", () => ({
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     locale: "en",
-    t: (key: string) => key,
+    t: translateMock,
   }),
 }))
 
 vi.mock("@/contexts/mcp-apps-context", () => ({
-  useMcpApps: () => ({ apps: [], getAppIcon: () => null }),
+  useMcpApps: () => mcpAppsMock,
 }))
 
 vi.mock("@/lib/branding", () => ({
@@ -141,6 +150,7 @@ function jsonResponse(body: unknown): Response {
 }
 
 const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
+const GMAIL_ACCOUNTS_URL = "http://api.local/api/cloud/accounts?provider=gmail"
 
 describe("AgentBuilder trigger summary cards", () => {
   const originalWebSocket = globalThis.WebSocket
@@ -346,5 +356,74 @@ describe("AgentBuilder trigger summary cards", () => {
     await waitFor(() => {
       expect(getCallsAfterFailure).toBeGreaterThan(0)
     })
+  })
+})
+
+describe("AgentBuilder trigger summary cards (agent not created yet)", () => {
+  const originalWebSocket = globalThis.WebSocket
+
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    globalThis.WebSocket = vi.fn() as unknown as typeof WebSocket
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url.endsWith("/api/kb/collections")) {
+        return Promise.resolve(jsonResponse({ collections: [] }))
+      }
+      if (url.endsWith("/api/tools/available")) {
+        return Promise.resolve(jsonResponse({ tools: [] }))
+      }
+      if (url.endsWith("/api/skills/") || url.endsWith("/api/mcp/servers")) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url.endsWith("/api/models/?category=llm") || url.endsWith("/api/models/user-default")) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      return Promise.resolve(jsonResponse({}))
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    globalThis.WebSocket = originalWebSocket
+  })
+
+  it("disables a staged trigger type in place, without any network call, before the agent exists", async () => {
+    render(<AgentBuilder />)
+
+    // Stage an enabled webhook trigger via the dialog (no agentId yet, so
+    // creation only touches the parent-owned staged list, no API call).
+    fireEvent.click(await screen.findByText("triggers.builder.open"))
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.name")
+    const [detailSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(detailSwitch)
+    await waitFor(() => {
+      expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    })
+    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
+
+    // The summary card appears once the staged trigger is enabled.
+    expect(await screen.findByText("triggers.cards.webhook.title")).toBeInTheDocument()
+    apiRequestMock.mockClear()
+
+    const cardSwitch = screen
+      .getAllByRole("switch")
+      .find((el) => el.getAttribute("aria-checked") === "true")
+    expect(cardSwitch).toBeDefined()
+    fireEvent.click(cardSwitch!)
+
+    // disableTriggerType's `!localAgentId` branch patches stagedTriggers
+    // directly — no PATCH/GET to any trigger endpoint.
+    await waitFor(() => {
+      expect(screen.queryByText("triggers.cards.webhook.title")).not.toBeInTheDocument()
+    })
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/triggers"),
+      expect.anything(),
+    )
   })
 })

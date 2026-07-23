@@ -59,46 +59,51 @@ const GMAIL_ACCOUNTS_URL = "http://api.local/api/cloud/accounts?provider=gmail"
 describe("AgentTriggersDialog", () => {
   let gmailAccounts: Array<{ id: number; provider: string; email: string | null }>
 
+  const baseTrigger9 = {
+    id: 9,
+    user_id: 1,
+    agent_id: 42,
+    type: "gmail" as const,
+    name: "Support inbox",
+    enabled: true,
+    config: {
+      watch_label: "INBOX",
+      sender_filter: "boss@company.com",
+      subject_keyword: "urgent",
+      oauth_account_id: 7,
+    },
+    prompt_template: "Reply to {{payload}}",
+    webhook_token: null,
+    webhook_secret: null,
+    next_run_at: null,
+    last_run_at: null,
+    last_error: null,
+    created_at: null,
+    updated_at: null,
+  }
+
   beforeEach(() => {
     apiRequestMock.mockReset()
     routerPushMock.mockReset()
     gmailAccounts = [
       { id: 7, provider: "gmail", email: "gerard.santos@gmail.com" },
     ]
-    apiRequestMock.mockImplementation((url: string) => {
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string; body?: string }) => {
       if (url === GMAIL_ACCOUNTS_URL) {
         return Promise.resolve(jsonResponse(gmailAccounts))
       }
       if (url === "http://api.local/api/agents/42/triggers") {
-        return Promise.resolve(
-          jsonResponse([
-            {
-              id: 9,
-              user_id: 1,
-              agent_id: 42,
-              type: "gmail",
-              name: "Support inbox",
-              enabled: true,
-              config: {
-                watch_label: "INBOX",
-                sender_filter: "boss@company.com",
-                subject_keyword: "urgent",
-                oauth_account_id: 7,
-              },
-              prompt_template: "Reply to {{payload}}",
-              webhook_token: null,
-              webhook_secret: null,
-              next_run_at: null,
-              last_run_at: null,
-              last_error: null,
-              created_at: null,
-              updated_at: null,
-            },
-          ]),
-        )
+        return Promise.resolve(jsonResponse([baseTrigger9]))
       }
       if (url === "http://api.local/api/agents/42/triggers/9/runs") {
         return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9" && init?.method === "PATCH") {
+        // Echo the base trigger merged with the PATCH body, like a real
+        // backend would — a bare `[]` fallback here would make `updated`
+        // shapeless for any code that reads fields off the response.
+        const patch = init.body ? JSON.parse(init.body) : {}
+        return Promise.resolve(jsonResponse({ ...baseTrigger9, ...patch }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -296,6 +301,48 @@ describe("AgentTriggersDialog", () => {
       )
     })
     expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+  })
+
+  it("reconciles the detail switch from the PATCH response, not just the requested value", async () => {
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9" && init?.method === "PATCH") {
+        // A backend that (hypothetically) overrides the requested value —
+        // the switch must reflect this, not the optimistic `checked` it was
+        // set to before the request resolved.
+        return Promise.resolve(jsonResponse({ ...baseTrigger9, enabled: true }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    await screen.findByLabelText("triggers.form.watchLabel")
+
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    fireEvent.click(detailSwitch)
+
+    // Optimistic: flips to false immediately.
+    expect(detailSwitch).toHaveAttribute("aria-checked", "false")
+    // Reconciled: the response said `enabled: true`, so it flips back.
+    await waitFor(() => {
+      expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    })
   })
 
   it("shows the one-time webhook secret on the overview after a quick-toggle create", async () => {
@@ -677,6 +724,105 @@ describe("AgentTriggersDialog", () => {
     })
     await waitFor(() => {
       expect(getCallsAfterFailure).toBeGreaterThan(0)
+    })
+  })
+
+  it("keeps each overview switch's busy guard independent across two types toggled back-to-back", async () => {
+    const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
+    const triggers = [
+      {
+        id: 40,
+        user_id: 1,
+        agent_id: 42,
+        type: "webhook",
+        name: "Hook",
+        enabled: true,
+        config: {},
+        prompt_template: null,
+        webhook_token: null,
+        webhook_secret: null,
+        next_run_at: null,
+        last_run_at: null,
+        last_error: null,
+        created_at: null,
+        updated_at: null,
+      },
+      {
+        id: 41,
+        user_id: 1,
+        agent_id: 42,
+        type: "scheduled",
+        name: "Schedule",
+        enabled: true,
+        config: { interval_seconds: 3600 },
+        prompt_template: null,
+        webhook_token: null,
+        webhook_secret: null,
+        next_run_at: null,
+        last_run_at: null,
+        last_error: null,
+        created_at: null,
+        updated_at: null,
+      },
+    ]
+
+    let resolveWebhookPatch: ((value: Response) => void) | undefined
+    const webhookPatchPromise = new Promise<Response>((resolve) => {
+      resolveWebhookPatch = resolve
+    })
+    let resolveScheduledPatch: ((value: Response) => void) | undefined
+    const scheduledPatchPromise = new Promise<Response>((resolve) => {
+      resolveScheduledPatch = resolve
+    })
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse(triggers))
+      }
+      if (url === `${TRIGGERS_URL}/40` && init?.method === "PATCH") return webhookPatchPromise
+      if (url === `${TRIGGERS_URL}/41` && init?.method === "PATCH") return scheduledPatchPromise
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    // TRIGGER_TYPES order is webhook, scheduled, gmail.
+    const [webhookSwitch, scheduledSwitch] = await screen.findAllByRole("switch")
+    expect(webhookSwitch).toHaveAttribute("aria-checked", "true")
+    expect(scheduledSwitch).toHaveAttribute("aria-checked", "true")
+
+    fireEvent.click(webhookSwitch)
+    await waitFor(() => {
+      expect(webhookSwitch).toBeDisabled()
+    })
+    expect(scheduledSwitch).not.toBeDisabled()
+
+    fireEvent.click(scheduledSwitch)
+    await waitFor(() => {
+      expect(scheduledSwitch).toBeDisabled()
+    })
+
+    // Resolve the scheduled toggle first. A scalar busy-guard would have
+    // cleared entirely here and wrongly re-enabled webhook's switch while
+    // its own PATCH was still in flight — the Set-based guard keeps them
+    // independent.
+    resolveScheduledPatch?.(jsonResponse({ ...triggers[1], enabled: false }))
+    await waitFor(() => {
+      expect(scheduledSwitch).not.toBeDisabled()
+    })
+    expect(webhookSwitch).toBeDisabled()
+
+    resolveWebhookPatch?.(jsonResponse({ ...triggers[0], enabled: false }))
+    await waitFor(() => {
+      expect(webhookSwitch).not.toBeDisabled()
     })
   })
 

@@ -244,7 +244,10 @@ export function AgentTriggersDialog({
   const [loading, setLoading] = useState(false)
   const [runsLoading, setRunsLoading] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [busyType, setBusyType] = useState<AgentTriggerType | null>(null)
+  // A Set, not a scalar: two overview switches toggled back-to-back must each
+  // keep their own guard, or one PATCH resolving would re-enable the other
+  // type's still-in-flight switch (matches agent-builder.tsx's summary cards).
+  const [busyTypes, setBusyTypes] = useState<ReadonlySet<AgentTriggerType>>(new Set())
   const [form, setForm] = useState<TriggerFormState>(emptyForm)
   // True when the form holds field edits that have not been persisted yet.
   // There is no explicit Save button: pending edits are committed on Done,
@@ -652,7 +655,7 @@ export function AgentTriggersDialog({
         return
       }
     }
-    setBusyType(type)
+    setBusyTypes((current) => new Set(current).add(type))
     try {
       // Toggling from the overview never navigates into the config view; it
       // only flips (or creates) the trigger and stays on the list.
@@ -704,7 +707,11 @@ export function AgentTriggersDialog({
       // server-side, so resync rather than trusting the local list.
       if (resolvedOwner) void loadTriggers(selectedTriggerIdRef.current)
     } finally {
-      setBusyType(null)
+      setBusyTypes((current) => {
+        const next = new Set(current)
+        next.delete(type)
+        return next
+      })
     }
   }
 
@@ -765,6 +772,12 @@ export function AgentTriggersDialog({
       setLiveTriggers((current) =>
         current.map((item) => (item.id === updated.id ? updated : item)),
       )
+      // Reconcile the switch itself from the response too, in case a future
+      // backend rule ever returns an `enabled` that differs from what was
+      // requested — only while still on the same form (see the guard above).
+      if (syncedFormKeyRef.current === formKeyAtStart) {
+        setForm((current) => ({ ...current, enabled: updated.enabled }))
+      }
       notifyChanged()
       toast.success(checked ? t("triggers.messages.enabled") : t("triggers.messages.disabled"))
     } catch (err) {
@@ -1113,7 +1126,7 @@ export function AgentTriggersDialog({
         <div className="flex items-center gap-2.5">
           <Switch
             checked={isEnabled}
-            disabled={busyType === type || !canOperate}
+            disabled={busyTypes.has(type) || !canOperate}
             onCheckedChange={(checked) => void handleTypeToggle(type, checked)}
           />
           <button

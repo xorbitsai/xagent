@@ -9,11 +9,20 @@ from xagent.core.model.music.elevenlabs import ElevenLabsMusicModel
 from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.web.services.model_list_service import (
+    PROVIDER_FETCHERS,
     fetch_dashscope_embedding_models,
     fetch_elevenlabs_models,
     fetch_elevenlabs_music_models,
     fetch_elevenlabs_sound_effect_models,
+    fetch_openai_models,
 )
+
+
+def test_openai_compatible_is_registered_in_provider_fetchers() -> None:
+    """Guards the openai-compatible provider against silently 400ing on
+    "fetch models" — every provider in _SUPPORTED_PROVIDER_METADATA that can
+    list models must also appear in PROVIDER_FETCHERS."""
+    assert PROVIDER_FETCHERS.get("openai-compatible") is fetch_openai_models
 
 
 async def test_fetch_dashscope_embedding_models_returns_curated_text_models() -> None:

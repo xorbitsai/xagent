@@ -123,6 +123,9 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
     icon: <img src="/openai.svg" alt="OpenAI" className="w-6 h-6" />,
     defaultBaseUrl: "https://api.openai.com/v1",
   },
+  "openai-compatible": {
+    icon: <img src="/openai.svg" alt="OpenAI-Compatible" className="w-6 h-6" />,
+  },
   openrouter: {
     icon: <img src="/openrouter.jpg" alt="OpenRouter" className="w-6 h-6" />,
     defaultBaseUrl: "https://openrouter.ai/api/v1",

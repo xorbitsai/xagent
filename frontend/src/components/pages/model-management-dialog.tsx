@@ -733,6 +733,9 @@ export function ModelManagementDialog({
     }
   }
 
+  const selectedProvider = providers.find(p => p.id === formData.model_provider)
+  const baseUrlRequired = !!selectedProvider?.requires_base_url
+
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onOpenChange}>
@@ -957,17 +960,17 @@ export function ModelManagementDialog({
                   label: t('models.dialog.connect.step2'),
                   content: (
                     <div className="flex flex-col gap-6">
-                      {providers.find(p => p.id === formData.model_provider) && (
+                      {selectedProvider && (
                         <div className="flex items-center gap-3 p-4 border rounded-md">
                           <div className="p-2 border rounded bg-background">
-                            {providers.find(p => p.id === formData.model_provider)?.icon}
+                            {selectedProvider.icon}
                           </div>
-                          <span className="font-medium text-lg">{providers.find(p => p.id === formData.model_provider)?.name}</span>
+                          <span className="font-medium text-lg">{selectedProvider.name}</span>
                         </div>
                       )}
 
                       <div className="space-y-2">
-                        <Label className="text-base">{t('models.dialog.connect.apiKeyTitle', { provider: providers.find(p => p.id === formData.model_provider)?.name || '' })}</Label>
+                        <Label className="text-base">{t('models.dialog.connect.apiKeyTitle', { provider: selectedProvider?.name || '' })}</Label>
                         <Input
                           type="password"
                           placeholder={t('models.dialog.connect.apiKeyPlaceholder')}
@@ -980,21 +983,36 @@ export function ModelManagementDialog({
                         </div>
                       </div>
 
-                      <div className="space-y-2">
-                        <details className="group">
-                          <summary className="flex items-center gap-1 cursor-pointer text-sm text-muted-foreground font-medium hover:text-black list-none [&::-webkit-details-marker]:hidden">
-                            <ChevronRight className="w-4 h-4 transition-transform group-open:rotate-90" />
-                            {t('models.dialog.connect.advancedSettings')}
-                          </summary>
-                          <div className="mt-4 space-y-2 pl-5">
-                            <Label className="text-base font-medium">{t('models.form.baseUrl')}</Label>
-                            <Input
-                              value={formData.base_url}
-                              onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
-                            />
+                      {baseUrlRequired ? (
+                        <div className="space-y-2">
+                          <Label className="text-base font-medium">{t('models.form.baseUrl')}</Label>
+                          <Input
+                            placeholder={t('models.dialog.connect.baseUrlPlaceholder')}
+                            value={formData.base_url || ""}
+                            onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+                          />
+                          <div className="p-3 bg-muted/50 rounded-md text-sm text-muted-foreground flex items-center gap-2">
+                            <div className="w-4 h-4 rounded-full border border-current flex items-center justify-center text-[10px]">i</div>
+                            {t('models.dialog.connect.baseUrlHint')}
                           </div>
-                        </details>
-                      </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <details className="group">
+                            <summary className="flex items-center gap-1 cursor-pointer text-sm text-muted-foreground font-medium hover:text-black list-none [&::-webkit-details-marker]:hidden">
+                              <ChevronRight className="w-4 h-4 transition-transform group-open:rotate-90" />
+                              {t('models.dialog.connect.advancedSettings')}
+                            </summary>
+                            <div className="mt-4 space-y-2 pl-5">
+                              <Label className="text-base font-medium">{t('models.form.baseUrl')}</Label>
+                              <Input
+                                value={formData.base_url || ""}
+                                onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+                              />
+                            </div>
+                          </details>
+                        </div>
+                      )}
 
                       <div className="flex justify-between mt-4">
                         <Button variant="outline" onClick={() => setConnectStep(1)}>&larr; {t('common.back')}</Button>
@@ -1013,7 +1031,7 @@ export function ModelManagementDialog({
                           }}
                           disabled={
                             (!providerAllowsEmptyApiKey(formData.model_provider) && !formData.api_key)
-                            || (providers.find(p => p.id === formData.model_provider)?.requires_base_url ? !formData.base_url : false)
+                            || (baseUrlRequired ? !formData.base_url?.trim() : false)
                             || testConnectionStatus === 'testing'
                           }
                         >

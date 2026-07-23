@@ -1725,6 +1725,8 @@ const zh = {
         apiKeyPlaceholder: "sk-...",
         apiKeyHint: "转到提供商设置 → API 密钥 → 创建新的密钥 → 粘贴到上方。",
         advancedSettings: "高级设置",
+        baseUrlPlaceholder: "https://your-endpoint.example.com/v1",
+        baseUrlHint: "填写任何兼容 OpenAI API 协议的服务地址,例如 vLLM、Together 或自建的本地服务。",
         testConnection: "测试模型连接",
         testSuccess: "连接成功！模型工作正常。",
         selectModelWarning: "请选择一个模型",

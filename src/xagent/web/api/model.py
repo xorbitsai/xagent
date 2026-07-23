@@ -34,6 +34,7 @@ from xagent.core.model.providers import (
     canonical_provider_name,
     default_base_url_for_provider,
     is_auto_router_model,
+    provider_requires_base_url,
 )
 from xagent.core.utils.security import redact_sensitive_text
 
@@ -2112,6 +2113,8 @@ async def fetch_provider_models(
     base_url is also required. When category helps route to the correct fetcher
     for provider+category combinations (e.g. xinference+rerank).
     """
+    api_key = api_key.strip()
+    base_url = base_url.strip() if base_url else base_url
 
     # Validate provider
     from ..services.model_list_service import (
@@ -2132,11 +2135,15 @@ async def fetch_provider_models(
     else:
         provider_to_use = provider.lower()
 
-    # For Azure OpenAI, base_url is required
-    if provider_to_use == "azure_openai" and not base_url:
+    # Providers that mark base_url as mandatory (e.g. Azure OpenAI,
+    # Xinference, OpenAI-Compatible) must not silently fall back to a
+    # provider-side default when it's omitted.
+    if not base_url and (
+        provider_to_use == "azure_openai" or provider_requires_base_url(provider)
+    ):
         raise HTTPException(
             status_code=400,
-            detail="base_url is required for Azure OpenAI provider",
+            detail=f"base_url is required for the {provider} provider",
         )
 
     try:

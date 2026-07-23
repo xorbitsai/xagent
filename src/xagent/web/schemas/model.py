@@ -4,6 +4,13 @@ from typing import Any, List, Optional, Set
 from pydantic import BaseModel, field_validator
 
 
+def _strip_whitespace(v: Any) -> Any:
+    """Strip whitespace from a string field; pass non-strings through unchanged."""
+    if isinstance(v, str):
+        return v.strip()
+    return v
+
+
 def _validate_abilities_for_category(abilities: List[str], category: str) -> List[str]:
     """
     Validate abilities based on model category.
@@ -133,10 +140,7 @@ class ModelCreate(BaseModel):
     @field_validator("model_id", "model_name", "base_url", "api_key", mode="before")
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
-        """Strip whitespace from string fields"""
-        if isinstance(v, str):
-            return v.strip()
-        return v
+        return _strip_whitespace(v)
 
     @field_validator("abilities")
     @classmethod
@@ -174,10 +178,7 @@ class ModelUpdate(BaseModel):
     @field_validator("model_name", "base_url", "api_key", mode="before")
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
-        """Strip whitespace from string fields"""
-        if isinstance(v, str):
-            return v.strip()
-        return v
+        return _strip_whitespace(v)
 
     @field_validator("abilities")
     @classmethod
@@ -260,6 +261,11 @@ class ModelConnectionTestRequest(BaseModel):
     abilities: Optional[List[str]] = None
     top_n: Optional[int] = None
     instruct: Optional[str] = None
+
+    @field_validator("model_name", "base_url", "api_key", mode="before")
+    @classmethod
+    def strip_string_fields(cls, v: Any) -> Any:
+        return _strip_whitespace(v)
 
 
 class UserDefaultModelCreate(BaseModel):

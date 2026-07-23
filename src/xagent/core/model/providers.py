@@ -95,7 +95,7 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
     {
         "id": "openai",
         "name": "OpenAI",
-        "description": "OpenAI API compatible models",
+        "description": "OpenAI models",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
         "category": ["llm", "embedding"],
@@ -135,6 +135,14 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "DeepSeek v4 models with tool calling and thinking mode",
         "requires_base_url": False,
         "category": ["llm"],
+    },
+    {
+        "id": "openai-compatible",
+        "name": "OpenAI-Compatible",
+        "description": "OpenAI-compatible models",
+        "requires_base_url": True,
+        "compatibility": "openai_compatible",
+        "category": ["llm", "embedding"],
     },
     {
         "id": "openrouter",
@@ -308,6 +316,20 @@ def provider_compatibility_for_provider(provider: str) -> Optional[str]:
             compatibility = provider_info.get("compatibility")
             return str(compatibility) if compatibility is not None else None
     return None
+
+
+def provider_requires_base_url(provider: str) -> bool:
+    """True when the provider's metadata marks base_url as mandatory.
+
+    Unregistered providers (including provider+category combos like
+    "xinference-rerank") default to False rather than raising, since
+    callers already validate the provider exists via PROVIDER_FETCHERS.
+    """
+    provider_id = canonical_provider_name(provider)
+    for provider_info in _SUPPORTED_PROVIDER_METADATA:
+        if provider_info["id"] == provider_id:
+            return bool(provider_info.get("requires_base_url", False))
+    return False
 
 
 def get_supported_provider_metadata() -> list[dict[str, Any]]:

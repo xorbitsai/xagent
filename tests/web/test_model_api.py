@@ -253,6 +253,45 @@ class TestModelAPI:
         assert data["status"] == "passed"
         embedding_model.encode.assert_called_once_with("hello")
 
+    def test_test_connection_strips_whitespace_from_request_fields(
+        self, test_db, regular_user, regular_headers
+    ):
+        """model_name/api_key/base_url padded with whitespace must reach the
+        chat adapter trimmed — guards ModelConnectionTestRequest's
+        strip_string_fields validator, which nothing else exercises."""
+        captured = {}
+
+        class FakeLLM:
+            async def chat(self, messages, **kwargs):
+                return {"content": "hi"}
+
+        def fake_create_base_llm(config):
+            captured["model_name"] = config.model_name
+            captured["api_key"] = config.api_key
+            captured["base_url"] = config.base_url
+            return FakeLLM()
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            side_effect=fake_create_base_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "openai",
+                    "model_name": "  gpt-4o-mini  ",
+                    "api_key": "  test-api-key  ",
+                    "base_url": "  https://api.openai.com/v1  ",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert captured["model_name"] == "gpt-4o-mini"
+        assert captured["api_key"] == "test-api-key"
+        assert captured["base_url"] == "https://api.openai.com/v1"
+
     def test_test_connection_image_fails_when_requested_ability_is_unsupported(
         self, test_db, regular_user, regular_headers
     ):
@@ -1145,6 +1184,124 @@ class TestModelAPI:
         assert openai["name"] == "OpenAI"
         assert openai["category"] == ["llm", "embedding"]
         assert openai["default_base_url"] == "https://api.openai.com/v1"
+
+    def test_list_supported_providers_includes_openai_compatible(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        openai_compatible = next(
+            (
+                provider
+                for provider in providers
+                if provider["id"] == "openai-compatible"
+            ),
+            None,
+        )
+        assert openai_compatible is not None
+        assert openai_compatible["name"] == "OpenAI-Compatible"
+        assert openai_compatible["category"] == ["llm", "embedding"]
+        assert openai_compatible["requires_base_url"] is True
+        assert openai_compatible.get("default_base_url") is None
+
+    def test_fetch_openai_compatible_provider_models_is_wired(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """Regression test: openai-compatible must be registered in
+        PROVIDER_FETCHERS, or this endpoint 400s with "Unsupported provider".
+        Only the network-facing SDK call is faked; the real PROVIDER_FETCHERS
+        entry (or absence of one) is exercised as-is."""
+        from xagent.core.model.chat.basic.openai import OpenAILLM
+
+        async def fake_list_available_models(api_key, base_url=None):
+            return [
+                {
+                    "id": "custom-model",
+                    "object": "model",
+                    "owned_by": "openai-compatible",
+                }
+            ]
+
+        monkeypatch.setattr(
+            OpenAILLM, "list_available_models", fake_list_available_models
+        )
+
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={
+                "api_key": "test-api-key",
+                "base_url": "https://custom.example.com/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [model["id"] for model in data["models"]] == ["custom-model"]
+
+    def test_fetch_provider_models_strips_whitespace_from_api_key_and_base_url(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """A base_url/api_key padded with whitespace must reach the fetcher
+        trimmed, not verbatim — otherwise a value like " https://foo.com "
+        would silently reach the downstream provider with stray whitespace."""
+        from xagent.core.model.chat.basic.openai import OpenAILLM
+
+        captured = {}
+
+        async def fake_list_available_models(api_key, base_url=None):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            return []
+
+        monkeypatch.setattr(
+            OpenAILLM, "list_available_models", fake_list_available_models
+        )
+
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={
+                "api_key": "  test-api-key  ",
+                "base_url": "  https://custom.example.com/v1  ",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert captured["api_key"] == "test-api-key"
+        assert captured["base_url"] == "https://custom.example.com/v1"
+
+    def test_fetch_provider_models_requires_base_url_for_openai_compatible(
+        self, test_db, regular_user, regular_headers
+    ):
+        """openai-compatible is marked requires_base_url in provider metadata;
+        omitting base_url must be rejected server-side rather than silently
+        falling back to the OpenAI SDK's default endpoint."""
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={"api_key": "test-api-key"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "base_url is required" in response.json()["detail"]
+
+    def test_fetch_provider_models_requires_base_url_for_xinference(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/providers/xinference/models",
+            json={"api_key": "test-api-key"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "base_url is required" in response.json()["detail"]
 
     def test_list_supported_providers_includes_elevenlabs_audio_generation(
         self, test_db, regular_user, regular_headers

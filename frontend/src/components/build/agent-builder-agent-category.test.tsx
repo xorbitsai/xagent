@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 // shows it as selected nor writes it back on save.
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -71,7 +72,7 @@ vi.mock("@/lib/branding", () => ({
   getBrandingFromEnv: () => ({ appName: "Xagent" }),
 }))
 
-vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }))
+vi.mock("sonner", () => ({ toast: { error: toastErrorMock, success: vi.fn() } }))
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
@@ -157,12 +158,14 @@ function agentResponse(toolCategories: string[]) {
   }
 }
 
-function installApi(toolCategories: string[]) {
+function installApi(
+  toolCategories: string[],
+  putResponse: () => Response = () =>
+    new Response(JSON.stringify(agentResponse(toolCategories)), { status: 200 })
+) {
   apiRequestMock.mockImplementation((url: string, opts?: { method?: string }) => {
     if (opts?.method === "PUT")
-      return Promise.resolve(
-        new Response(JSON.stringify(agentResponse(toolCategories)), { status: 200 })
-      )
+      return Promise.resolve(putResponse())
     if (url.endsWith("/api/kb/collections"))
       return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
     if (url.endsWith("/api/skills/"))
@@ -192,14 +195,15 @@ const toolCategorySelector = () =>
     .getAllByTestId("multi-select")
     .find((el) => el.getAttribute("data-placeholder") === "builds.configForm.tools.placeholder")
 
+beforeEach(() => {
+  apiRequestMock.mockReset()
+  toastErrorMock.mockReset()
+  ;(globalThis as any).WebSocket = vi.fn()
+})
+
+afterEach(() => cleanup())
+
 describe("AgentBuilder agent tool category (issue #802)", () => {
-  beforeEach(() => {
-    apiRequestMock.mockReset()
-    ;(globalThis as any).WebSocket = vi.fn()
-  })
-
-  afterEach(() => cleanup())
-
   it("does not offer unassignable categories even when such tools exist", async () => {
     installApi(["basic"])
     render(<AgentBuilder agentId={AGENT_ID} />)
@@ -235,5 +239,135 @@ describe("AgentBuilder agent tool category (issue #802)", () => {
       const body = JSON.parse((putCall![1] as any).body)
       expect(body.tool_categories).toEqual(["basic"])
     })
+  })
+})
+
+describe("AgentBuilder update error handling (issue #956)", () => {
+  it.each([
+    {
+      name: "a plain string detail",
+      payload: { detail: " Agent update failed with string detail " },
+      expected: "Agent update failed with string detail",
+    },
+    {
+      name: "a top-level message",
+      payload: { message: " Agent update failed with top-level message " },
+      expected: "Agent update failed with top-level message",
+    },
+    {
+      name: "a detail object without a readable message",
+      payload: { detail: { code: 123 } },
+      expected: "builds.editor.error.unknown",
+    },
+    {
+      name: "a detail array without readable entries",
+      payload: {
+        detail: [1, true, null, { msg: " " }, { message: " " }],
+      },
+      expected: "builds.editor.error.unknown",
+    },
+  ])("handles $name without unmounting the builder", async ({ payload, expected }) => {
+    installApi(
+      ["basic"],
+      () =>
+        new Response(JSON.stringify(payload), {
+          status: 422,
+          headers: { "Content-Type": "application/json" },
+        })
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    const nameInput = await screen.findByPlaceholderText(
+      "builds.configForm.name.placeholder"
+    )
+    fireEvent.change(nameInput, { target: { value: "Updated Agent" } })
+    fireEvent.click(screen.getByText("builds.editor.header.update"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalled()
+      expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe(expected)
+    })
+    expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
+  })
+
+  it("renders a structured detail message without unmounting the builder", async () => {
+    installApi(
+      ["basic"],
+      () =>
+        new Response(
+          JSON.stringify({
+            detail: {
+              message: "Agent update failed",
+              context: [],
+            },
+          }),
+          { status: 422, headers: { "Content-Type": "application/json" } }
+        )
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    const nameInput = await screen.findByPlaceholderText(
+      "builds.configForm.name.placeholder"
+    )
+    fireEvent.change(nameInput, { target: { value: "Updated Agent" } })
+    fireEvent.click(screen.getByText("builds.editor.header.update"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalled()
+      expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe("Agent update failed")
+    })
+    expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
+  })
+
+  it("uses the localized fallback for an empty response without unmounting the builder", async () => {
+    installApi(["basic"], () => new Response(null, { status: 500 }))
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    const nameInput = await screen.findByPlaceholderText(
+      "builds.configForm.name.placeholder"
+    )
+    fireEvent.change(nameInput, { target: { value: "Updated Agent" } })
+    fireEvent.click(screen.getByText("builds.editor.header.update"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalled()
+      expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe(
+        "builds.editor.error.unknown"
+      )
+    })
+    expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
+  })
+
+  it("renders FastAPI validation detail messages without unmounting the builder", async () => {
+    installApi(
+      ["basic"],
+      () =>
+        new Response(
+          JSON.stringify({
+            detail: [
+              { msg: " Name must be 200 characters or fewer " },
+              " Invalid model selection ",
+              { message: " Unsupported execution mode " },
+              { msg: " " },
+            ],
+          }),
+          { status: 422, headers: { "Content-Type": "application/json" } }
+        )
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    const nameInput = await screen.findByPlaceholderText(
+      "builds.configForm.name.placeholder"
+    )
+    fireEvent.change(nameInput, { target: { value: "Updated Agent" } })
+    fireEvent.click(screen.getByText("builds.editor.header.update"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalled()
+      expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe(
+        "Name must be 200 characters or fewer; Invalid model selection; Unsupported execution mode"
+      )
+    })
+    expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
   })
 })

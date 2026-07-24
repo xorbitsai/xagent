@@ -74,6 +74,7 @@ from xagent.config import (
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
+    TRUSTED_EGRESS_PROXY,
     UPLOADS_DIR,
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
@@ -149,6 +150,7 @@ from xagent.config import (
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trusted_egress_proxy_enabled,
     get_uploads_dir,
     get_web_crawl_tls_impersonate,
     get_web_dir,
@@ -406,6 +408,25 @@ class TestMCPOAuthConfig:
         monkeypatch.setenv(MCP_OAUTH_PROXY_URL, value)
         with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_PROXY_URL"):
             get_mcp_oauth_proxy_url()
+
+
+class TestTrustedEgressProxyConfig:
+    def test_trusted_egress_proxy_constant(self):
+        assert TRUSTED_EGRESS_PROXY == "XAGENT_TRUSTED_EGRESS_PROXY"
+
+    def test_trusted_egress_proxy_defaults_false(self, monkeypatch):
+        monkeypatch.delenv(TRUSTED_EGRESS_PROXY, raising=False)
+        assert get_trusted_egress_proxy_enabled() is False
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", " TRUE "])
+    def test_trusted_egress_proxy_true_values(self, monkeypatch, value):
+        monkeypatch.setenv(TRUSTED_EGRESS_PROXY, value)
+        assert get_trusted_egress_proxy_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "", "unknown"])
+    def test_trusted_egress_proxy_false_values(self, monkeypatch, value):
+        monkeypatch.setenv(TRUSTED_EGRESS_PROXY, value)
+        assert get_trusted_egress_proxy_enabled() is False
 
 
 class TestHotPathCacheConfig:

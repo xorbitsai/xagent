@@ -557,7 +557,7 @@ class TestVisionToolUnderstandMedia:
                 new=AsyncMock(return_value=["93.184.216.34"]),
             ) as validate_url,
             patch(
-                "xagent.core.tools.core.vision_tool.get_proxy_url",
+                "xagent.core.tools.core.vision_tool.get_trusted_proxy_url",
                 return_value="http://proxy.example:8080",
             ),
             patch(

@@ -129,6 +129,53 @@ def test_delete_svg_png_cache_removes_all_previews_for_file_id(monkeypatch, tmp_
     assert other_file_cache.exists()
 
 
+def test_delete_svg_png_cache_removes_legacy_path_keyed_preview(monkeypatch, tmp_path):
+    """Legacy (non-UUID) files have no file_id, so ``_svg_png_cache_path``
+    falls back to a bare ``<path-hash>.preview.png`` name with no file_id
+    prefix. Passing the resolved source path must find and remove that
+    entry too, since the file_id glob alone can never match it."""
+    import hashlib
+
+    storage_root = tmp_path / "storage"
+    cache_dir = storage_root / "svg_png_cache"
+    cache_dir.mkdir(parents=True)
+
+    legacy_source = tmp_path / "legacy" / "notes.svg"
+    legacy_source.parent.mkdir(parents=True)
+    legacy_source.write_text("<svg></svg>", encoding="utf-8")
+
+    path_key = hashlib.sha256(str(legacy_source.resolve()).encode()).hexdigest()[:24]
+    legacy_cache_path = cache_dir / f"{path_key}.preview.png"
+    legacy_cache_path.write_bytes(b"legacy-png")
+
+    unrelated_cache = cache_dir / "some-other-hash.preview.png"
+    unrelated_cache.write_bytes(b"unrelated-png")
+
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(storage_root))
+
+    delete_svg_png_cache(None, source_path=legacy_source)
+
+    assert not legacy_cache_path.exists()
+    assert unrelated_cache.exists()
+
+
+def test_delete_svg_png_cache_uuid_case_unaffected_by_source_path_arg(
+    monkeypatch, tmp_path
+):
+    """A UUID file_id must keep cleaning up via the glob prefix regardless
+    of whether a source_path is also supplied (regression guard)."""
+    storage_root = tmp_path / "storage"
+    cache_dir = storage_root / "svg_png_cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "file-svg.aaa111.preview.png").write_bytes(b"png-a")
+
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(storage_root))
+
+    delete_svg_png_cache("file-svg", source_path=None)
+
+    assert not list(cache_dir.glob("file-svg.*.preview.png"))
+
+
 def test_delete_removes_svg_png_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path / "storage"))

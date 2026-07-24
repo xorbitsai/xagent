@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, cast
@@ -159,9 +160,14 @@ def _rasterize_svg_preview(svg_path: Path, file_id: Optional[str] = None) -> Pat
     except OSError:
         pass
     png = rasterize_svg_bytes(svg_path.read_bytes())
-    tmp = cache_path.with_suffix(".png.tmp")
+    # Use a per-call unique temp name: concurrent previews of the same
+    # cache-miss SVG would otherwise race on one fixed ".png.tmp" path,
+    # where the first replace() consumes the file the second is about to
+    # rename, raising FileNotFoundError. Renaming distinct temp files onto
+    # the same destination is itself atomic and needs no extra locking.
+    tmp = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
     tmp.write_bytes(png)
-    tmp.replace(cache_path)
+    os.replace(tmp, cache_path)
     return cache_path
 
 
@@ -1709,7 +1715,7 @@ async def delete_file(
     # so this HTTP route and every other deletion path (reconcile, orphan cleanup)
     # behave identically.  Non-UUID ids are silently ignored by the helper.
     delete_pptx_pdf_cache(file_id)
-    delete_svg_png_cache(file_id)
+    delete_svg_png_cache(file_id, source_path=None if file_record else file_path)
 
     return {
         "success": True,

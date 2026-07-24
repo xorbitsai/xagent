@@ -10,7 +10,7 @@ from xagent.core.tools.adapters.vibe.fetch_web_content import (
     FetchWebContentResult,
     FetchWebContentTool,
 )
-from xagent.core.tools.core.web_content import WebContentFetcher
+from xagent.core.tools.core.web_content import WebContentFetcher, get_trusted_proxy_url
 from xagent.core.utils.security import PrivateNetworkHostError
 
 
@@ -369,3 +369,57 @@ class TestFetchWebContentTool:
         assert args.url == "https://example.com"
         assert args.include_assets is False
         assert args.asset_query is None
+
+
+class TestGetTrustedProxyUrl:
+    """An ambient HTTP(S)_PROXY must not silently reopen the DNS-rebinding
+    TOCTOU window that ``via_proxy`` pinning gives up on: proxied requests
+    only get IP pinning's protection if the proxy is explicitly marked
+    trusted to enforce its own private-range egress policy."""
+
+    def test_untrusted_proxy_raises(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+
+        with pytest.raises(PrivateNetworkHostError):
+            get_trusted_proxy_url()
+
+    def test_trusted_proxy_returns_url(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+
+        assert get_trusted_proxy_url() == "http://proxy.example.com:8080"
+
+    def test_no_proxy_configured_returns_none_regardless_of_trust_flag(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.delenv("http_proxy", raising=False)
+        monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+
+        assert get_trusted_proxy_url() is None
+
+        monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+        assert get_trusted_proxy_url() is None
+
+    @pytest.mark.asyncio
+    async def test_fetch_web_content_surfaces_untrusted_proxy_as_tool_error(
+        self, fetch_tool, monkeypatch
+    ):
+        """End-to-end: an ambient but untrusted proxy must fail the tool
+        call with a clear error instead of silently fetching through it
+        with DNS pinning disabled."""
+        monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+
+        with patch("httpx.AsyncClient.stream") as mock_stream:
+            result = await fetch_tool.run_json_async({"url": "https://example.com"})
+
+        assert result["success"] is False
+        assert "XAGENT_TRUSTED_EGRESS_PROXY" in result["error"]
+        mock_stream.assert_not_called()

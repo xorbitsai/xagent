@@ -129,6 +129,7 @@ SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
+TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -341,6 +342,19 @@ def get_mcp_oauth_allow_private_hosts() -> bool:
     servers. Production deployments should leave it disabled.
     """
     return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
+
+
+def get_trusted_egress_proxy_enabled() -> bool:
+    """Return whether the ambient HTTP(S)_PROXY may be used for public fetches.
+
+    Outbound SSRF guarding pins the DNS resolution used at validation time
+    to the one used at connect time. Routing through a proxy breaks that
+    guarantee, since the proxy performs its own, independent DNS resolution
+    of the target host. This flag is an explicit opt-in acknowledging that
+    the configured proxy is trusted to enforce its own private-range egress
+    policy; leave it disabled unless that is true.
+    """
+    return _get_bool_env(TRUSTED_EGRESS_PROXY, False)
 
 
 def get_mcp_oauth_proxy_url() -> str | None:

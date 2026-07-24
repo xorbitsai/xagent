@@ -31,7 +31,7 @@ def delete_pptx_pdf_cache(file_id: str) -> None:
         logger.warning("Failed to remove PDF preview cache for %s", file_id)
 
 
-def delete_svg_png_cache(file_id: str) -> None:
+def delete_svg_png_cache(file_id: str, source_path: Optional[Path] = None) -> None:
     """Remove all rasterized SVG preview PNGs cached for an upload.
 
     Unlike the PPTX preview cache (one fixed file per ``file_id``), an SVG
@@ -41,20 +41,34 @@ def delete_svg_png_cache(file_id: str) -> None:
     Must be called from every path that deletes an ``UploadedFile`` row so
     none of those derived previews outlive the source artifact. Silently
     no-ops when there is nothing cached.
+
+    Legacy (non-UUID) files have no ``file_id`` to key on, so
+    ``_svg_png_cache_path`` falls back to a bare ``<path-hash>.preview.png``
+    name. Pass the resolved ``source_path`` for those so that entry can be
+    found and removed too — otherwise it never matches the ``file_id``
+    glob below and outlives the deleted source file.
     """
-    if not file_id:
-        return
     cache_dir = get_storage_root() / "svg_png_cache"
-    try:
-        matches = list(cache_dir.glob(f"{file_id}.*.preview.png"))
-    except OSError:
-        logger.warning("Failed to list SVG preview cache for %s", file_id)
-        return
-    for cache_path in matches:
+    if file_id:
         try:
-            cache_path.unlink(missing_ok=True)
+            matches = list(cache_dir.glob(f"{file_id}.*.preview.png"))
         except OSError:
-            logger.warning("Failed to remove SVG preview cache %s", cache_path)
+            logger.warning("Failed to list SVG preview cache for %s", file_id)
+            matches = []
+        for cache_path in matches:
+            try:
+                cache_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Failed to remove SVG preview cache %s", cache_path)
+    if source_path is not None:
+        path_key = hashlib.sha256(str(source_path.resolve()).encode()).hexdigest()[:24]
+        legacy_cache_path = cache_dir / f"{path_key}.preview.png"
+        try:
+            legacy_cache_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Failed to remove legacy SVG preview cache %s", legacy_cache_path
+            )
 
 
 def create_unbound_uploaded_file_from_local_path(

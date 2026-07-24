@@ -1,9 +1,11 @@
 """Tests for the on-disk SVG preview rasterization cache.
 
-Covers two review findings from PR #977:
+Covers review findings from PR #977:
  - the cache key must not alias distinct SVG assets that share a base
    ``file_id`` (e.g. relative-path assets under one uploaded file);
- - rasterization must not block the asyncio event loop.
+ - rasterization must not block the asyncio event loop;
+ - concurrent cache-miss requests for the same SVG must not race on a
+   shared temp file.
 """
 
 import asyncio
@@ -110,3 +112,49 @@ async def test_inline_preview_response_does_not_block_event_loop(
         "rasterization delay — the SVG preview is still running "
         "synchronously on the event loop thread"
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_rasterize_does_not_race(
+    storage_root, tmp_path
+) -> None:
+    """Two concurrent cache-miss previews of the *same* SVG must not race
+    on a shared temp file: offloading rasterization via ``asyncio.to_thread``
+    lets multiple requests enter ``_rasterize_svg_preview`` for the same
+    cache key at once, and a temp filename that isn't unique per call means
+    the first ``replace()`` can consume the file the second is about to
+    rename onto the cache path, raising ``FileNotFoundError``."""
+
+    svg_path = tmp_path / "shared.svg"
+    svg_path.write_bytes(SVG_A)
+
+    async def run_once():
+        return await asyncio.to_thread(
+            _rasterize_svg_preview, svg_path, "shared-file-id"
+        )
+
+    # Run several rounds: a fresh svg per round forces a real cache miss
+    # (and thus a real concurrent write) every time, since a hit from a
+    # prior round would just short-circuit to the existing cache file.
+    for round_index in range(20):
+        round_svg = tmp_path / f"shared_{round_index}.svg"
+        round_svg.write_bytes(SVG_A)
+
+        results = await asyncio.gather(
+            asyncio.to_thread(
+                _rasterize_svg_preview, round_svg, f"shared-file-id-{round_index}"
+            ),
+            asyncio.to_thread(
+                _rasterize_svg_preview, round_svg, f"shared-file-id-{round_index}"
+            ),
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+        cache_a, cache_b = results
+        assert cache_a == cache_b
+        assert cache_a.exists()
+        assert cache_a.read_bytes()

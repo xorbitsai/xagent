@@ -12,7 +12,8 @@ import html2text
 import httpx
 from bs4 import BeautifulSoup
 
-from ...utils.security import fetch_public_http_bytes
+from ....config import get_trusted_egress_proxy_enabled
+from ...utils.security import PrivateNetworkHostError, fetch_public_http_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,27 @@ def get_proxy_url() -> str | None:
     https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
     http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
     return https_proxy or http_proxy
+
+
+def get_trusted_proxy_url() -> str | None:
+    """Return the ambient proxy URL, requiring an explicit trust opt-in.
+
+    Fetches that go through ``fetch_public_http_bytes(..., via_proxy=True)``
+    skip client-side IP pinning, since the proxy performs its own DNS
+    resolution of the target host. That reopens the DNS-rebinding TOCTOU
+    window this module's SSRF guarding is meant to close, unless the proxy
+    itself is trusted to enforce private-range egress policy. Raise instead
+    of silently trusting every ambient ``HTTP(S)_PROXY``.
+    """
+
+    proxy_url = get_proxy_url()
+    if proxy_url and not get_trusted_egress_proxy_enabled():
+        raise PrivateNetworkHostError(
+            "An HTTP(S) proxy is configured but not marked as trusted for "
+            "public-network egress; set XAGENT_TRUSTED_EGRESS_PROXY=1 only "
+            "if the proxy itself enforces private-range egress policy."
+        )
+    return proxy_url
 
 
 class WebContentFetcher:
@@ -365,7 +387,13 @@ async def fetch_web_content(
 ) -> WebContentFetchResult:
     """Fetch a webpage using the default proxy configuration."""
 
-    return await WebContentFetcher(proxy_url=get_proxy_url()).fetch(
+    try:
+        proxy_url = get_trusted_proxy_url()
+    except PrivateNetworkHostError as exc:
+        logger.error("Webpage fetch failed: %s", exc)
+        return WebContentFetchResult(url=url, content="", error=str(exc))
+
+    return await WebContentFetcher(proxy_url=proxy_url).fetch(
         url,
         include_assets=include_assets,
         asset_query=asset_query,

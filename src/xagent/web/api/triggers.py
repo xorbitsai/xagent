@@ -14,6 +14,7 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
+from ..models.workforce import Workforce
 from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
 from ..services.trigger_providers import (
     CallbackRequestContext,
@@ -33,15 +34,20 @@ from ..services.triggers import (
     TriggerSecretError,
     TriggerServiceError,
     create_agent_trigger,
+    create_workforce_trigger,
     decrypt_trigger_run_payload,
     delete_agent_trigger,
+    delete_workforce_trigger,
     find_webhook_trigger,
     fire_trigger,
     get_owned_agent,
     get_owned_trigger,
+    get_workforce_trigger,
     update_agent_trigger,
+    update_workforce_trigger,
     verify_webhook_secret,
 )
+from ..services.workforce_access import ensure_workforce_access
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +80,8 @@ class TriggerTestRequest(BaseModel):
 class TriggerResponse(BaseModel):
     id: int
     user_id: int
-    agent_id: int
+    agent_id: int | None
+    workforce_id: int | None = None
     type: str
     name: str
     enabled: bool
@@ -125,7 +132,10 @@ def _serialize_trigger(
     return TriggerResponse(
         id=int(trigger.id),
         user_id=int(trigger.user_id),
-        agent_id=int(trigger.agent_id),
+        agent_id=int(trigger.agent_id) if trigger.agent_id is not None else None,
+        workforce_id=(
+            int(trigger.workforce_id) if trigger.workforce_id is not None else None
+        ),
         type=str(trigger.type),
         name=str(trigger.name),
         enabled=bool(trigger.enabled),
@@ -362,6 +372,25 @@ async def get_trigger_run(
         agent_id=agent_id,
         trigger_id=trigger_id,
     )
+    return _trigger_run_detail(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        include_payload=include_payload,
+        request=request,
+        user_id=int(current_user.id),
+    )
+
+
+def _trigger_run_detail(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+    include_payload: bool,
+    request: Request,
+    user_id: int,
+) -> TriggerRunResponse:
     run = (
         db.query(TriggerRun)
         .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
@@ -391,7 +420,7 @@ async def get_trigger_run(
                     trigger_id=int(trigger.id),
                     detail={
                         "trigger_run_id": int(run.id),
-                        "user_id": int(current_user.id),
+                        "user_id": user_id,
                         "success": False,
                         "error": f"{type(exc).__name__}: {exc}",
                     },
@@ -406,7 +435,7 @@ async def get_trigger_run(
             trigger_id=int(trigger.id),
             detail={
                 "trigger_run_id": int(run.id),
-                "user_id": int(current_user.id),
+                "user_id": user_id,
                 "success": True,
             },
             remote_ip=request.client.host if request.client else None,
@@ -443,6 +472,241 @@ async def test_trigger(
         return TriggerFireResponse(
             trigger_run=_serialize_run(run), duplicate=not created
         )
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+# --- Workforce trigger management -----------------------------------------
+#
+# Workforce triggers reuse the AgentTrigger model with workforce_id set and
+# agent_id NULL. The existing agent routes embed agent_id in the path and
+# resolve ownership through get_owned_agent, so they cannot serve workforce
+# triggers; this parallel group scopes everything to an authorized workforce.
+
+
+def _workforce_or_404(
+    db: Session,
+    *,
+    user: User,
+    workforce_id: int,
+    action: str,
+) -> Workforce:
+    workforce = db.get(Workforce, workforce_id)
+    return ensure_workforce_access(db, user, workforce, action=action)
+
+
+def _workforce_trigger_or_404(
+    db: Session,
+    *,
+    user: User,
+    workforce_id: int,
+    trigger_id: int,
+    action: str,
+) -> AgentTrigger:
+    _workforce_or_404(db, user=user, workforce_id=workforce_id, action=action)
+    trigger = get_workforce_trigger(
+        db, workforce_id=workforce_id, trigger_id=trigger_id
+    )
+    if trigger is None:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+    return trigger
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers",
+    response_model=list[TriggerResponse],
+)
+async def list_workforce_triggers_route(
+    workforce_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TriggerResponse]:
+    _workforce_or_404(db, user=current_user, workforce_id=workforce_id, action="view")
+    rows = (
+        db.query(AgentTrigger)
+        .filter(AgentTrigger.workforce_id == workforce_id)
+        .order_by(AgentTrigger.created_at.desc(), AgentTrigger.id.desc())
+        .all()
+    )
+    await asyncio.to_thread(reconcile_gmail_trigger_provisioning, db, rows)
+    return [_serialize_trigger(row) for row in rows]
+
+
+@router.post(
+    "/api/workforces/{workforce_id}/triggers",
+    response_model=TriggerResponse,
+)
+async def create_workforce_trigger_route(
+    workforce_id: int,
+    request: TriggerCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
+    workforce = _workforce_or_404(
+        db, user=current_user, workforce_id=workforce_id, action="edit"
+    )
+    try:
+        trigger, secret = await asyncio.to_thread(
+            create_workforce_trigger,
+            db,
+            user_id=int(current_user.id),
+            workforce_id=int(workforce.id),
+            trigger_type=request.type,
+            name=request.name,
+            enabled=request.enabled,
+            config=request.config,
+            prompt_template=request.prompt_template,
+            secret=request.secret,
+        )
+        return _serialize_trigger(trigger, webhook_secret=secret)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.patch(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}",
+    response_model=TriggerResponse,
+)
+async def update_workforce_trigger_route(
+    workforce_id: int,
+    trigger_id: int,
+    request: TriggerUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
+    _workforce_or_404(db, user=current_user, workforce_id=workforce_id, action="edit")
+    try:
+        trigger, secret = await asyncio.to_thread(
+            update_workforce_trigger,
+            db,
+            user_id=int(current_user.id),
+            workforce_id=workforce_id,
+            trigger_id=trigger_id,
+            updates=request.model_dump(exclude_unset=True),
+        )
+        return _serialize_trigger(trigger, webhook_secret=secret)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.delete("/api/workforces/{workforce_id}/triggers/{trigger_id}")
+async def delete_workforce_trigger_route(
+    workforce_id: int,
+    trigger_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    _enforce_crud_rate_limit(int(current_user.id))
+    _workforce_or_404(db, user=current_user, workforce_id=workforce_id, action="edit")
+    try:
+        await asyncio.to_thread(
+            delete_workforce_trigger,
+            db,
+            workforce_id=workforce_id,
+            trigger_id=trigger_id,
+        )
+        return {"message": "Trigger deleted"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs",
+    response_model=list[TriggerRunResponse],
+)
+def list_workforce_trigger_runs_route(
+    workforce_id: int,
+    trigger_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TriggerRunResponse]:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="view",
+    )
+    rows = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.trigger_id == int(trigger.id))
+        .order_by(TriggerRun.created_at.desc(), TriggerRun.id.desc())
+        .limit(100)
+        .all()
+    )
+    return [_serialize_run(row) for row in rows]
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs/{run_id}",
+    response_model=TriggerRunResponse,
+)
+def get_workforce_trigger_run_route(
+    workforce_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    include_payload: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunResponse:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="view",
+    )
+    return _trigger_run_detail(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        include_payload=include_payload,
+        request=request,
+        user_id=int(current_user.id),
+    )
+
+
+@router.post(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/test",
+    response_model=TriggerFireResponse,
+)
+async def test_workforce_trigger_route(
+    workforce_id: int,
+    trigger_id: int,
+    request: TriggerTestRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerFireResponse:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="run",
+    )
+    try:
+        run, created = await fire_trigger(
+            db,
+            trigger=trigger,
+            event_payload=request.payload,
+            source_event_id=request.source_event_id,
+            test=True,
+            event_type="test",
+        )
+        return TriggerFireResponse(
+            trigger_run=_serialize_run(run), duplicate=not created
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise _handle_service_error(exc)
 

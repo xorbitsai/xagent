@@ -6,10 +6,20 @@ import { getApiUrl } from "@/lib/utils"
 export type AgentTriggerType = "webhook" | "scheduled" | "gmail"
 export type AgentTriggerRunStatus = "pending" | "running" | "completed" | "failed"
 
+// Triggers can be owned by an agent or a workforce (issue #950). Workforce
+// triggers live under /api/workforces/{id}/triggers and have agent_id null.
+export type TriggerOwnerKind = "agent" | "workforce"
+
+export interface TriggerOwnerRef {
+  kind: TriggerOwnerKind
+  id: number | string
+}
+
 export interface AgentTrigger {
   id: number
   user_id: number
-  agent_id: number
+  agent_id: number | null
+  workforce_id?: number | null
   type: AgentTriggerType
   name: string
   enabled: boolean
@@ -162,8 +172,14 @@ function jsonHeaders(): HeadersInit {
   }
 }
 
-function triggerUrl(agentId: number | string, triggerId?: number | string): string {
-  const base = `${getApiUrl()}/api/agents/${agentId}/triggers`
+function ownerTriggerUrl(
+  owner: TriggerOwnerRef,
+  triggerId?: number | string,
+): string {
+  const base =
+    owner.kind === "workforce"
+      ? `${getApiUrl()}/api/workforces/${owner.id}/triggers`
+      : `${getApiUrl()}/api/agents/${owner.id}/triggers`
   return triggerId === undefined ? base : `${base}/${triggerId}`
 }
 
@@ -206,21 +222,21 @@ export async function listGmailAccounts(): Promise<GmailAccount[]> {
   return response.json()
 }
 
-export async function listAgentTriggers(
-  agentId: number | string,
+export async function listOwnerTriggers(
+  owner: TriggerOwnerRef,
 ): Promise<AgentTrigger[]> {
-  const response = await apiRequest(triggerUrl(agentId))
+  const response = await apiRequest(ownerTriggerUrl(owner))
   if (!response.ok) {
     throw await parseApiError(response, "Failed to load triggers")
   }
   return response.json()
 }
 
-export async function createAgentTrigger(
-  agentId: number | string,
+export async function createOwnerTrigger(
+  owner: TriggerOwnerRef,
   payload: AgentTriggerPayload & { type: AgentTriggerType },
 ): Promise<AgentTrigger> {
-  const response = await apiRequest(triggerUrl(agentId), {
+  const response = await apiRequest(ownerTriggerUrl(owner), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -231,12 +247,12 @@ export async function createAgentTrigger(
   return response.json()
 }
 
-export async function updateAgentTrigger(
-  agentId: number | string,
+export async function updateOwnerTrigger(
+  owner: TriggerOwnerRef,
   triggerId: number | string,
   payload: AgentTriggerPayload,
 ): Promise<AgentTrigger> {
-  const response = await apiRequest(triggerUrl(agentId, triggerId), {
+  const response = await apiRequest(ownerTriggerUrl(owner, triggerId), {
     method: "PATCH",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -247,11 +263,11 @@ export async function updateAgentTrigger(
   return response.json()
 }
 
-export async function deleteAgentTrigger(
-  agentId: number | string,
+export async function deleteOwnerTrigger(
+  owner: TriggerOwnerRef,
   triggerId: number | string,
 ): Promise<void> {
-  const response = await apiRequest(triggerUrl(agentId, triggerId), {
+  const response = await apiRequest(ownerTriggerUrl(owner, triggerId), {
     method: "DELETE",
   })
   if (!response.ok) {
@@ -259,23 +275,23 @@ export async function deleteAgentTrigger(
   }
 }
 
-export async function listAgentTriggerRuns(
-  agentId: number | string,
+export async function listOwnerTriggerRuns(
+  owner: TriggerOwnerRef,
   triggerId: number | string,
 ): Promise<AgentTriggerRun[]> {
-  const response = await apiRequest(`${triggerUrl(agentId, triggerId)}/runs`)
+  const response = await apiRequest(`${ownerTriggerUrl(owner, triggerId)}/runs`)
   if (!response.ok) {
     throw await parseApiError(response, "Failed to load trigger runs")
   }
   return response.json()
 }
 
-export async function testAgentTrigger(
-  agentId: number | string,
+export async function testOwnerTrigger(
+  owner: TriggerOwnerRef,
   triggerId: number | string,
   payload: AgentTriggerTestPayload,
 ): Promise<AgentTriggerTestResponse> {
-  const response = await apiRequest(`${triggerUrl(agentId, triggerId)}/test`, {
+  const response = await apiRequest(`${ownerTriggerUrl(owner, triggerId)}/test`, {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -284,4 +300,47 @@ export async function testAgentTrigger(
     throw await parseApiError(response, "Failed to test trigger")
   }
   return response.json()
+}
+
+export async function listAgentTriggers(
+  agentId: number | string,
+): Promise<AgentTrigger[]> {
+  return listOwnerTriggers({ kind: "agent", id: agentId })
+}
+
+export async function createAgentTrigger(
+  agentId: number | string,
+  payload: AgentTriggerPayload & { type: AgentTriggerType },
+): Promise<AgentTrigger> {
+  return createOwnerTrigger({ kind: "agent", id: agentId }, payload)
+}
+
+export async function updateAgentTrigger(
+  agentId: number | string,
+  triggerId: number | string,
+  payload: AgentTriggerPayload,
+): Promise<AgentTrigger> {
+  return updateOwnerTrigger({ kind: "agent", id: agentId }, triggerId, payload)
+}
+
+export async function deleteAgentTrigger(
+  agentId: number | string,
+  triggerId: number | string,
+): Promise<void> {
+  return deleteOwnerTrigger({ kind: "agent", id: agentId }, triggerId)
+}
+
+export async function listAgentTriggerRuns(
+  agentId: number | string,
+  triggerId: number | string,
+): Promise<AgentTriggerRun[]> {
+  return listOwnerTriggerRuns({ kind: "agent", id: agentId }, triggerId)
+}
+
+export async function testAgentTrigger(
+  agentId: number | string,
+  triggerId: number | string,
+  payload: AgentTriggerTestPayload,
+): Promise<AgentTriggerTestResponse> {
+  return testOwnerTrigger({ kind: "agent", id: agentId }, triggerId, payload)
 }

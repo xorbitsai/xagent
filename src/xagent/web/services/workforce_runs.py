@@ -20,6 +20,7 @@ from .connector_runtime import (
 )
 from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 from .workforce_access import ensure_workforce_access, get_workforce_policy
+from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
 from .workforce_lifecycle import acquire_workforce_lifecycle_fence
 from .workforce_runtime import mark_workforce_task_status, sync_workforce_run_status
 from .workforce_snapshot import (
@@ -43,7 +44,11 @@ def normalize_execution_mode(value: str | None) -> str:
     normalized = (value or ExecutionMode.BALANCED.value).strip().lower()
     allowed = {mode.value for mode in ExecutionMode}
     if normalized not in allowed:
-        raise HTTPException(status_code=400, detail="Invalid execution mode")
+        raise WorkforceRunError(
+            status_code=400,
+            detail="Invalid execution mode",
+            code=WorkforceRunErrorCode.INVALID_EXECUTION_MODE,
+        )
     return normalized
 
 
@@ -66,6 +71,18 @@ def _build_task_title(workforce: Workforce, message: str) -> str:
     return title[:50] + "..." if len(title) > 50 else title
 
 
+def _merge_agent_config(
+    task_config: dict[str, Any], extra_agent_config: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Overlay caller-supplied config keys (e.g. share-channel markers) onto
+    the snapshot-built task config. The built config wins on key collisions so
+    callers can never clobber runtime-critical keys like ``workforce_run_id``.
+    """
+    if not extra_agent_config:
+        return task_config
+    return {**extra_agent_config, **task_config}
+
+
 def _normalize_run_source(value: str | None) -> str:
     normalized = (value or "internal").strip().lower()
     if not normalized:
@@ -78,7 +95,11 @@ def _normalize_idempotency_key(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     if not normalized or len(normalized) > 128:
-        raise HTTPException(status_code=400, detail="Invalid idempotency key")
+        raise WorkforceRunError(
+            status_code=400,
+            detail="Invalid idempotency key",
+            code=WorkforceRunErrorCode.INVALID_IDEMPOTENCY_KEY,
+        )
     return normalized
 
 
@@ -103,9 +124,10 @@ def _replay_existing_run_by_idempotency_key(
     if existing is None:
         return None
     if existing.task is None:
-        raise HTTPException(
+        raise WorkforceRunError(
             status_code=409,
             detail="Idempotency key was already used by a run whose task no longer exists",
+            code=WorkforceRunErrorCode.IDEMPOTENCY_CONFLICT,
         )
     return WorkforceRunStartResult(
         workforce_run=existing,
@@ -138,14 +160,18 @@ def _bind_selected_files_to_task(
         file_id for file_id in selected_file_ids if file_id not in found_file_ids
     ]
     if missing_file_ids:
-        raise HTTPException(status_code=404, detail="Selected file not found")
+        raise WorkforceRunError(
+            status_code=404,
+            detail="Selected file not found",
+            code=WorkforceRunErrorCode.FILE_NOT_FOUND,
+        )
 
     for uploaded_file in uploaded_files:
         if uploaded_file.task_id is None:
             uploaded_file.task_id = int(task.id)
 
 
-async def create_workforce_run(
+def create_workforce_run_record(
     db: Session,
     user: User,
     workforce: Workforce | None,
@@ -157,7 +183,15 @@ async def create_workforce_run(
     is_visible: bool = True,
     source: str | None = None,
     idempotency_key: str | None = None,
+    extra_agent_config: dict[str, Any] | None = None,
 ) -> WorkforceRunStartResult:
+    """Create the WorkforceRun + pending Task without starting the turn.
+
+    Synchronous creation half of ``create_workforce_run``; callers with their
+    own dispatch phase (the trigger pipeline's prepare step) use this directly
+    and start the turn later through the orchestrator. ``background_task`` is
+    always None in the returned result.
+    """
     workforce = ensure_workforce_access(db, user, workforce, action="run")
     workforce_id = int(workforce.id)
     normalized_message = normalize_text(message, "message", required=True)
@@ -204,9 +238,12 @@ async def create_workforce_run(
             description=normalized_message,
             status=TaskStatus.PENDING,
             agent_id=int(workforce.manager_agent_id),
-            agent_config=build_workforce_task_config(
-                snapshot,
-                selected_file_ids=selected_files,
+            agent_config=_merge_agent_config(
+                build_workforce_task_config(
+                    snapshot,
+                    selected_file_ids=selected_files,
+                ),
+                extra_agent_config,
             ),
             execution_mode=manager_execution_mode,
             source=normalized_source,
@@ -241,10 +278,13 @@ async def create_workforce_run(
         setattr(
             task,
             "agent_config",
-            build_workforce_task_config(
-                snapshot,
-                selected_file_ids=selected_files,
-                workforce_run_id=workforce_run_id,
+            _merge_agent_config(
+                build_workforce_task_config(
+                    snapshot,
+                    selected_file_ids=selected_files,
+                    workforce_run_id=workforce_run_id,
+                ),
+                extra_agent_config,
             ),
         )
         policy.after_workforce_run_created(db, user, workforce, workforce_run, task)
@@ -267,6 +307,46 @@ async def create_workforce_run(
 
     db.refresh(task)
     db.refresh(workforce_run)
+
+    return WorkforceRunStartResult(
+        workforce_run=workforce_run,
+        task=task,
+        background_task=None,
+    )
+
+
+async def create_workforce_run(
+    db: Session,
+    user: User,
+    workforce: Workforce | None,
+    *,
+    message: str,
+    selected_file_ids: list[str] | None = None,
+    execution_mode: str | None = None,
+    is_preview: bool = False,
+    is_visible: bool = True,
+    source: str | None = None,
+    idempotency_key: str | None = None,
+    extra_agent_config: dict[str, Any] | None = None,
+) -> WorkforceRunStartResult:
+    record = create_workforce_run_record(
+        db,
+        user,
+        workforce,
+        message=message,
+        selected_file_ids=selected_file_ids,
+        execution_mode=execution_mode,
+        is_preview=is_preview,
+        is_visible=is_visible,
+        source=source,
+        idempotency_key=idempotency_key,
+        extra_agent_config=extra_agent_config,
+    )
+    if not record.created:
+        return record
+
+    task = record.task
+    workforce_run = record.workforce_run
     task_id = int(task.id)
 
     try:
@@ -275,7 +355,11 @@ async def create_workforce_run(
             task_owner_user_id=int(user.id),
             # Workforce runs as the requesting user; actor == owner here.
             actor_user_id=int(user.id),
-            payload=TaskTurnPayload(transcript_message=normalized_message),
+            # Intentionally equal to the normalized message: create_workforce_run_record
+            # sets task.description = normalize_text(message). Read it back from the
+            # record so this wrapper stays a thin dispatch layer; keep them in sync if
+            # description derivation ever changes.
+            payload=TaskTurnPayload(transcript_message=str(task.description or "")),
             kind=TurnKind.CREATE,
             force_fresh=False,
         )

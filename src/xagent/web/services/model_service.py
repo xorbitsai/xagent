@@ -7,7 +7,8 @@ across the xagent system with multi-tenant support.
 
 import json
 import logging
-from typing import Any, Dict, Optional, cast
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional, cast
 
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,23 @@ from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _default_model_session(db: Session | None) -> Iterator[Session]:
+    """Yield a caller-owned Session or deterministically close a local one."""
+    if db is not None:
+        yield db
+        return
+
+    from ..models.database import get_session_local
+
+    owned_db = get_session_local()()
+    try:
+        yield owned_db
+    finally:
+        owned_db.close()
+
 
 # ---------------------------------------------------------------------------
 # Hook infrastructure for dynamic model sharing
@@ -117,7 +135,11 @@ def _is_model_visible_to_user(
         return False
 
 
-def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
+def get_default_vision_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[BaseLLM]:
     """
     Get the default vision model for a specific user.
 
@@ -129,48 +151,49 @@ def get_default_vision_model(user_id: Optional[int] = None) -> Optional[BaseLLM]
     """
     try:
         # Try to get from database (requires web context)
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
         from .llm_utils import _create_llm_instance
 
         # This won't work in non-web contexts, so we'll fallback to environment
         try:
-            # Try to get a database session (this might fail in CLI contexts)
-            db = next(get_db())
-
-            # If user_id is provided, get user-specific default
-            if user_id:
-                vision_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                    .filter(
-                        UserDefaultModel.user_id == user_id,
-                        UserDefaultModel.config_type == "visual",
-                        DBModel.is_active,
+            with _default_model_session(db) as model_db:
+                # If user_id is provided, get user-specific default
+                if user_id:
+                    vision_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "visual",
+                            DBModel.is_active,
+                        )
+                        .first()
                     )
-                    .first()
+
+                    if vision_default and vision_default.model:
+                        if _is_model_visible_to_user(
+                            model_db, vision_default.model.id, user_id
+                        ):
+                            return _create_llm_instance(vision_default.model)
+
+                # Fallback to visible users' shared defaults
+                admin_vision_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .filter(
+                        UserDefaultModel.config_type == "visual",
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
+                    )
+                    .limit(1)
+                    .all()
                 )
 
-                if vision_default and vision_default.model:
-                    if _is_model_visible_to_user(db, vision_default.model.id, user_id):
-                        return _create_llm_instance(vision_default.model)
-
-            # Fallback to visible users' shared defaults
-            admin_vision_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(
-                    UserDefaultModel.config_type == "visual",
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                )
-                .limit(1)
-                .all()
-            )
-
-            if admin_vision_defaults:
-                return _create_llm_instance(admin_vision_defaults[0].model)
+                if admin_vision_defaults:
+                    return _create_llm_instance(admin_vision_defaults[0].model)
 
         except Exception as e:
             logger.warning(f"Failed to get vision model from database: {e}")
@@ -652,6 +675,8 @@ def get_models_by_category(category: str, db: Session) -> list:
 
 def get_default_image_generate_model(
     user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
 ) -> Optional[BaseImageModel]:
     """
     Get the default image generation model for a specific user.
@@ -666,66 +691,72 @@ def get_default_image_generate_model(
         from sqlalchemy import String, cast
 
         from ...core.model.image.adapter import get_image_model_instance
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
         try:
-            db = next(get_db())
+            with _default_model_session(db) as model_db:
+                # If user_id is provided, get user-specific default
+                if user_id:
+                    image_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "image",
+                            DBModel.is_active,
+                            cast(DBModel.abilities, String).contains('"generate"'),
+                        )
+                        .first()
+                    )
 
-            # If user_id is provided, get user-specific default
-            if user_id:
-                image_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    if image_default and image_default.model:
+                        if _is_model_visible_to_user(
+                            model_db, image_default.model.id, user_id
+                        ):
+                            try:
+                                instance = get_image_model_instance(image_default.model)
+                                setattr(
+                                    instance,
+                                    "model_id",
+                                    str(image_default.model.model_id),
+                                )
+                                return instance
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to create image model instance: {e}"
+                                )
+
+                # Fallback to visible users' shared defaults
+                admin_image_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
-                        UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "image",
-                        DBModel.is_active,
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
                         cast(DBModel.abilities, String).contains('"generate"'),
                     )
-                    .first()
+                    .limit(1)
+                    .all()
                 )
 
-                if image_default and image_default.model:
-                    if _is_model_visible_to_user(db, image_default.model.id, user_id):
-                        try:
-                            instance = get_image_model_instance(image_default.model)
-                            setattr(
-                                instance, "model_id", str(image_default.model.model_id)
-                            )
-                            return instance
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to create image model instance: {e}"
-                            )
-
-            # Fallback to visible users' shared defaults
-            admin_image_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.config_type == "image",
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                    cast(DBModel.abilities, String).contains('"generate"'),
-                )
-                .limit(1)
-                .all()
-            )
-
-            if admin_image_defaults:
-                try:
-                    instance = get_image_model_instance(admin_image_defaults[0].model)
-                    setattr(
-                        instance,
-                        "model_id",
-                        str(admin_image_defaults[0].model.model_id),
-                    )
-                    return instance
-                except Exception as e:
-                    logger.warning(f"Failed to create image model instance: {e}")
+                if admin_image_defaults:
+                    try:
+                        instance = get_image_model_instance(
+                            admin_image_defaults[0].model
+                        )
+                        setattr(
+                            instance,
+                            "model_id",
+                            str(admin_image_defaults[0].model.model_id),
+                        )
+                        return instance
+                    except Exception as e:
+                        logger.warning(f"Failed to create image model instance: {e}")
 
         except Exception as e:
             logger.warning(
@@ -741,6 +772,8 @@ def get_default_image_generate_model(
 
 def get_default_image_edit_model(
     user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
 ) -> Optional[BaseImageModel]:
     """
     Get the default image editing model for a specific user.
@@ -753,63 +786,69 @@ def get_default_image_edit_model(
     """
     try:
         from ...core.model.image.adapter import get_image_model_instance
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
         try:
-            db = next(get_db())
+            with _default_model_session(db) as model_db:
+                # If user_id is provided, get user-specific default
+                if user_id:
+                    image_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "image_edit",
+                            DBModel.is_active,
+                        )
+                        .first()
+                    )
 
-            # If user_id is provided, get user-specific default
-            if user_id:
-                image_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    if image_default and image_default.model:
+                        if _is_model_visible_to_user(
+                            model_db, image_default.model.id, user_id
+                        ):
+                            try:
+                                instance = get_image_model_instance(image_default.model)
+                                setattr(
+                                    instance,
+                                    "model_id",
+                                    str(image_default.model.model_id),
+                                )
+                                return instance
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to create image model instance: {e}"
+                                )
+
+                # Fallback to visible users' shared defaults
+                admin_image_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
                     .filter(
-                        UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "image_edit",
-                        DBModel.is_active,
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
                     )
-                    .first()
+                    .limit(1)
+                    .all()
                 )
 
-                if image_default and image_default.model:
-                    if _is_model_visible_to_user(db, image_default.model.id, user_id):
-                        try:
-                            instance = get_image_model_instance(image_default.model)
-                            setattr(
-                                instance, "model_id", str(image_default.model.model_id)
-                            )
-                            return instance
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to create image model instance: {e}"
-                            )
-
-            # Fallback to visible users' shared defaults
-            admin_image_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .filter(
-                    UserDefaultModel.config_type == "image_edit",
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                )
-                .limit(1)
-                .all()
-            )
-
-            if admin_image_defaults:
-                try:
-                    instance = get_image_model_instance(admin_image_defaults[0].model)
-                    setattr(
-                        instance,
-                        "model_id",
-                        str(admin_image_defaults[0].model.model_id),
-                    )
-                    return instance
-                except Exception as e:
-                    logger.warning(f"Failed to create image model instance: {e}")
+                if admin_image_defaults:
+                    try:
+                        instance = get_image_model_instance(
+                            admin_image_defaults[0].model
+                        )
+                        setattr(
+                            instance,
+                            "model_id",
+                            str(admin_image_defaults[0].model.model_id),
+                        )
+                        return instance
+                    except Exception as e:
+                        logger.warning(f"Failed to create image model instance: {e}")
 
         except Exception as e:
             logger.warning(
@@ -825,6 +864,8 @@ def get_default_image_edit_model(
 
 def get_default_video_model(
     user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
 ) -> Optional[BaseVideoModel]:
     """
     Get the default video generation model for a specific user.
@@ -839,67 +880,73 @@ def get_default_video_model(
         from sqlalchemy import String, cast
 
         from ...core.model.video.adapter import get_video_model_instance
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
         try:
-            db = next(get_db())
+            with _default_model_session(db) as model_db:
+                if user_id:
+                    video_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "video",
+                            DBModel.category == "video",
+                            DBModel.is_active,
+                            cast(DBModel.abilities, String).contains('"generate"'),
+                        )
+                        .first()
+                    )
 
-            if user_id:
-                video_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    if video_default and video_default.model:
+                        if _is_model_visible_to_user(
+                            model_db, video_default.model.id, user_id
+                        ):
+                            try:
+                                instance = get_video_model_instance(video_default.model)
+                                setattr(
+                                    instance,
+                                    "model_id",
+                                    str(video_default.model.model_id),
+                                )
+                                return instance
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to create video model instance: {e}"
+                                )
+
+                shared_video_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
-                        UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "video",
                         DBModel.category == "video",
                         DBModel.is_active,
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
                         cast(DBModel.abilities, String).contains('"generate"'),
                     )
-                    .first()
+                    .limit(1)
+                    .all()
                 )
 
-                if video_default and video_default.model:
-                    if _is_model_visible_to_user(db, video_default.model.id, user_id):
-                        try:
-                            instance = get_video_model_instance(video_default.model)
-                            setattr(
-                                instance, "model_id", str(video_default.model.model_id)
-                            )
-                            return instance
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to create video model instance: {e}"
-                            )
-
-            shared_video_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.config_type == "video",
-                    DBModel.category == "video",
-                    DBModel.is_active,
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                    cast(DBModel.abilities, String).contains('"generate"'),
-                )
-                .limit(1)
-                .all()
-            )
-
-            if shared_video_defaults:
-                try:
-                    instance = get_video_model_instance(shared_video_defaults[0].model)
-                    setattr(
-                        instance,
-                        "model_id",
-                        str(shared_video_defaults[0].model.model_id),
-                    )
-                    return instance
-                except Exception as e:
-                    logger.warning(f"Failed to create video model instance: {e}")
+                if shared_video_defaults:
+                    try:
+                        instance = get_video_model_instance(
+                            shared_video_defaults[0].model
+                        )
+                        setattr(
+                            instance,
+                            "model_id",
+                            str(shared_video_defaults[0].model.model_id),
+                        )
+                        return instance
+                    except Exception as e:
+                        logger.warning(f"Failed to create video model instance: {e}")
 
         except Exception as e:
             logger.warning(f"Failed to get default video model from database: {e}")
@@ -911,103 +958,113 @@ def get_default_video_model(
     return None
 
 
-def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
+def get_default_embedding_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[str]:
     """
     Get the default embedding model ID for a specific user.
 
     Args:
         user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+        db: Optional caller-owned database session.
 
     Returns:
         The embedding model ID or None if not available
     """
-    from ..models.database import get_db
     from ..models.model import Model as DBModel
     from ..models.user import UserDefaultModel, UserModel
 
-    db = next(get_db())
-
-    # If user_id is provided, get user-specific default
-    if user_id:
-        embedding_default = (
-            db.query(UserDefaultModel)
-            .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-            .filter(
-                UserDefaultModel.user_id == user_id,
-                UserDefaultModel.config_type == "embedding",
-                DBModel.is_active,
+    with _default_model_session(db) as model_db:
+        # If user_id is provided, get user-specific default
+        if user_id:
+            embedding_default = (
+                model_db.query(UserDefaultModel)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.user_id == user_id,
+                    UserDefaultModel.config_type == "embedding",
+                    DBModel.is_active,
+                )
+                .first()
             )
-            .first()
+
+            if embedding_default and embedding_default.model:
+                if _is_model_visible_to_user(
+                    model_db, embedding_default.model.id, user_id
+                ):
+                    return str(embedding_default.model.model_id)
+
+        # Visible users' shared defaults
+        admin_embedding_defaults = (
+            model_db.query(UserDefaultModel)
+            .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+            .filter(
+                UserDefaultModel.config_type == "embedding",
+                UserModel.is_shared.is_(True),
+                UserDefaultModel.user_id.in_(_get_visible_user_ids(model_db, user_id)),
+            )
+            .limit(1)
+            .all()
         )
 
-        if embedding_default and embedding_default.model:
-            if _is_model_visible_to_user(db, embedding_default.model.id, user_id):
-                return str(embedding_default.model.model_id)
-
-    # Visible users' shared defaults
-    admin_embedding_defaults = (
-        db.query(UserDefaultModel)
-        .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-        .filter(
-            UserDefaultModel.config_type == "embedding",
-            UserModel.is_shared.is_(True),
-            UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-        )
-        .limit(1)
-        .all()
-    )
-
-    if admin_embedding_defaults:
-        return str(admin_embedding_defaults[0].model.model_id)
+        if admin_embedding_defaults:
+            return str(admin_embedding_defaults[0].model.model_id)
 
     return None
 
 
-def get_default_rerank_model(user_id: Optional[int] = None) -> Optional[str]:
+def get_default_rerank_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[str]:
     """Get the default rerank model ID for a specific user.
 
     Mirrors :func:`get_default_embedding_model` for rerank models. Looks up
     the user's configured default rerank model from ``UserDefaultModel``
     and returns the underlying ``Model.model_id`` (string).
     """
-    from ..models.database import get_db
     from ..models.model import Model as DBModel
     from ..models.user import UserDefaultModel, UserModel
 
-    db = next(get_db())
-    try:
-        if user_id:
-            rerank_default = (
-                db.query(UserDefaultModel)
-                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.user_id == user_id,
-                    UserDefaultModel.config_type == "rerank",
-                    DBModel.is_active,
+    with _default_model_session(db) as model_db:
+        try:
+            if user_id:
+                rerank_default = (
+                    model_db.query(UserDefaultModel)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "rerank",
+                        DBModel.is_active,
+                    )
+                    .first()
                 )
-                .first()
-            )
-            if rerank_default and rerank_default.model:
-                if _is_model_visible_to_user(db, rerank_default.model.id, user_id):
-                    return str(rerank_default.model.model_id)
+                if rerank_default and rerank_default.model:
+                    if _is_model_visible_to_user(
+                        model_db, rerank_default.model.id, user_id
+                    ):
+                        return str(rerank_default.model.model_id)
 
-        admin_rerank_defaults = (
-            db.query(UserDefaultModel)
-            .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-            .filter(
-                UserDefaultModel.config_type == "rerank",
-                UserModel.is_shared.is_(True),
-                UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
+            admin_rerank_defaults = (
+                model_db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .filter(
+                    UserDefaultModel.config_type == "rerank",
+                    UserModel.is_shared.is_(True),
+                    UserDefaultModel.user_id.in_(
+                        _get_visible_user_ids(model_db, user_id)
+                    ),
+                )
+                .limit(1)
+                .all()
             )
-            .limit(1)
-            .all()
-        )
-        if admin_rerank_defaults:
-            return str(admin_rerank_defaults[0].model.model_id)
-    except Exception:
-        logger.exception("get_default_rerank_model failed")
-    finally:
-        db.close()
+            if admin_rerank_defaults:
+                return str(admin_rerank_defaults[0].model.model_id)
+        except Exception:
+            logger.exception("get_default_rerank_model failed")
     return None
 
 
@@ -1217,7 +1274,11 @@ def get_music_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
     return models
 
 
-def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
+def get_default_asr_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[Any]:
     """
     Get the default ASR model for a specific user.
 
@@ -1229,52 +1290,56 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
     """
     try:
         from ...core.model.asr.adapter import get_asr_model_instance
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
         try:
-            db = next(get_db())
-
-            # If user_id is provided, get user-specific default
-            if user_id:
-                asr_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                    .filter(
-                        UserDefaultModel.user_id == user_id,
-                        UserDefaultModel.config_type == "asr",
-                        DBModel.is_active,
+            with _default_model_session(db) as model_db:
+                # If user_id is provided, get user-specific default
+                if user_id:
+                    asr_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "asr",
+                            DBModel.is_active,
+                        )
+                        .first()
                     )
-                    .first()
+
+                    if asr_default and asr_default.model:
+                        if _is_model_visible_to_user(
+                            model_db, asr_default.model.id, user_id
+                        ):
+                            try:
+                                return get_asr_model_instance(asr_default.model)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to create ASR model instance: {e}"
+                                )
+
+                # Visible users' shared defaults
+                admin_asr_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.config_type == "asr",
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
+                    )
+                    .limit(1)
+                    .all()
                 )
 
-                if asr_default and asr_default.model:
-                    if _is_model_visible_to_user(db, asr_default.model.id, user_id):
-                        try:
-                            return get_asr_model_instance(asr_default.model)
-                        except Exception as e:
-                            logger.warning(f"Failed to create ASR model instance: {e}")
-
-            # Visible users' shared defaults
-            admin_asr_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.config_type == "asr",
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                )
-                .limit(1)
-                .all()
-            )
-
-            if admin_asr_defaults:
-                try:
-                    return get_asr_model_instance(admin_asr_defaults[0].model)
-                except Exception as e:
-                    logger.warning(f"Failed to create ASR model instance: {e}")
+                if admin_asr_defaults:
+                    try:
+                        return get_asr_model_instance(admin_asr_defaults[0].model)
+                    except Exception as e:
+                        logger.warning(f"Failed to create ASR model instance: {e}")
 
         except Exception as e:
             logger.warning(f"Database query failed for ASR model: {e}")
@@ -1285,7 +1350,11 @@ def get_default_asr_model(user_id: Optional[int] = None) -> Optional[Any]:
     return None
 
 
-def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
+def get_default_tts_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[Any]:
     """
     Get the default TTS model for a specific user.
 
@@ -1297,52 +1366,56 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
     """
     try:
         from ...core.model.tts.adapter import get_tts_model_instance
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
         try:
-            db = next(get_db())
-
-            # If user_id is provided, get user-specific default
-            if user_id:
-                tts_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                    .filter(
-                        UserDefaultModel.user_id == user_id,
-                        UserDefaultModel.config_type == "tts",
-                        DBModel.is_active,
+            with _default_model_session(db) as model_db:
+                # If user_id is provided, get user-specific default
+                if user_id:
+                    tts_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "tts",
+                            DBModel.is_active,
+                        )
+                        .first()
                     )
-                    .first()
+
+                    if tts_default and tts_default.model:
+                        if _is_model_visible_to_user(
+                            model_db, tts_default.model.id, user_id
+                        ):
+                            try:
+                                return get_tts_model_instance(tts_default.model)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to create TTS model instance: {e}"
+                                )
+
+                # Visible users' shared defaults
+                admin_tts_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.config_type == "tts",
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
+                    )
+                    .limit(1)
+                    .all()
                 )
 
-                if tts_default and tts_default.model:
-                    if _is_model_visible_to_user(db, tts_default.model.id, user_id):
-                        try:
-                            return get_tts_model_instance(tts_default.model)
-                        except Exception as e:
-                            logger.warning(f"Failed to create TTS model instance: {e}")
-
-            # Visible users' shared defaults
-            admin_tts_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.config_type == "tts",
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                )
-                .limit(1)
-                .all()
-            )
-
-            if admin_tts_defaults:
-                try:
-                    return get_tts_model_instance(admin_tts_defaults[0].model)
-                except Exception as e:
-                    logger.warning(f"Failed to create TTS model instance: {e}")
+                if admin_tts_defaults:
+                    try:
+                        return get_tts_model_instance(admin_tts_defaults[0].model)
+                    except Exception as e:
+                        logger.warning(f"Failed to create TTS model instance: {e}")
 
         except Exception as e:
             logger.warning(f"Database query failed for TTS model: {e}")
@@ -1353,119 +1426,127 @@ def get_default_tts_model(user_id: Optional[int] = None) -> Optional[Any]:
     return None
 
 
-def get_default_sound_effect_model(user_id: Optional[int] = None) -> Optional[Any]:
+def get_default_sound_effect_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[Any]:
     """Get the user or shared default sound effect model."""
     try:
         from sqlalchemy import String
         from sqlalchemy import cast as sa_cast
 
         from ...core.model.sound_effect import get_sound_effect_model_instance
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
-        db_gen = get_db()
         try:
-            db = next(db_gen)
-            if user_id:
-                user_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+            with _default_model_session(db) as model_db:
+                if user_id:
+                    user_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "sound_effect",
+                            DBModel.category == "sound_effect",
+                            DBModel.is_active,
+                            sa_cast(DBModel.abilities, String).contains('"generate"'),
+                        )
+                        .first()
+                    )
+                    if (
+                        user_default
+                        and user_default.model
+                        and _is_model_visible_to_user(
+                            model_db, user_default.model.id, user_id
+                        )
+                    ):
+                        return get_sound_effect_model_instance(user_default.model)
+
+                shared_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
-                        UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "sound_effect",
                         DBModel.category == "sound_effect",
-                        DBModel.is_active,
                         sa_cast(DBModel.abilities, String).contains('"generate"'),
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
                     )
-                    .first()
+                    .limit(1)
+                    .all()
                 )
-                if (
-                    user_default
-                    and user_default.model
-                    and _is_model_visible_to_user(db, user_default.model.id, user_id)
-                ):
-                    return get_sound_effect_model_instance(user_default.model)
-
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.config_type == "sound_effect",
-                    DBModel.category == "sound_effect",
-                    sa_cast(DBModel.abilities, String).contains('"generate"'),
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                )
-                .limit(1)
-                .all()
-            )
-            if shared_defaults:
-                return get_sound_effect_model_instance(shared_defaults[0].model)
+                if shared_defaults:
+                    return get_sound_effect_model_instance(shared_defaults[0].model)
         except Exception as exc:
             logger.warning("Database query failed for sound effect model: %s", exc)
-        finally:
-            db_gen.close()
     except Exception as exc:
         logger.error("Failed to get default sound effect model: %s", exc)
     return None
 
 
-def get_default_music_model(user_id: Optional[int] = None) -> Optional[Any]:
+def get_default_music_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[Any]:
     """Get the user or shared default music model."""
     try:
         from sqlalchemy import String
         from sqlalchemy import cast as sa_cast
 
         from ...core.model.music import get_music_model_instance
-        from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
 
-        db_gen = get_db()
         try:
-            db = next(db_gen)
-            if user_id:
-                user_default = (
-                    db.query(UserDefaultModel)
-                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+            with _default_model_session(db) as model_db:
+                if user_id:
+                    user_default = (
+                        model_db.query(UserDefaultModel)
+                        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                        .filter(
+                            UserDefaultModel.user_id == user_id,
+                            UserDefaultModel.config_type == "music",
+                            DBModel.category == "music",
+                            DBModel.is_active,
+                            sa_cast(DBModel.abilities, String).contains('"generate"'),
+                        )
+                        .first()
+                    )
+                    if (
+                        user_default
+                        and user_default.model
+                        and _is_model_visible_to_user(
+                            model_db, user_default.model.id, user_id
+                        )
+                    ):
+                        return get_music_model_instance(user_default.model)
+
+                shared_defaults = (
+                    model_db.query(UserDefaultModel)
+                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
-                        UserDefaultModel.user_id == user_id,
                         UserDefaultModel.config_type == "music",
                         DBModel.category == "music",
-                        DBModel.is_active,
                         sa_cast(DBModel.abilities, String).contains('"generate"'),
+                        UserModel.is_shared.is_(True),
+                        UserDefaultModel.user_id.in_(
+                            _get_visible_user_ids(model_db, user_id)
+                        ),
                     )
-                    .first()
+                    .limit(1)
+                    .all()
                 )
-                if (
-                    user_default
-                    and user_default.model
-                    and _is_model_visible_to_user(db, user_default.model.id, user_id)
-                ):
-                    return get_music_model_instance(user_default.model)
-
-            shared_defaults = (
-                db.query(UserDefaultModel)
-                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-                .join(DBModel, UserModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.config_type == "music",
-                    DBModel.category == "music",
-                    sa_cast(DBModel.abilities, String).contains('"generate"'),
-                    UserModel.is_shared.is_(True),
-                    UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-                )
-                .limit(1)
-                .all()
-            )
-            if shared_defaults:
-                return get_music_model_instance(shared_defaults[0].model)
+                if shared_defaults:
+                    return get_music_model_instance(shared_defaults[0].model)
         except Exception as exc:
             logger.warning("Database query failed for music model: %s", exc)
-        finally:
-            db_gen.close()
     except Exception as exc:
         logger.error("Failed to get default music model: %s", exc)
     return None

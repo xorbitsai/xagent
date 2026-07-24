@@ -1,11 +1,17 @@
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 
-// Mirrors the backend ``AgentApiKeyListItem``.
+// Mirrors the backend ``AgentApiKeyListItem``. A key is bound to exactly
+// one owner: ``owner_type`` says which identity pair is populated
+// (agent_id/agent_name for "agent", workforce_id/workforce_name for
+// "workforce"); the unset pair is null.
 export interface AgentApiKeyListItem {
   id: number
-  agent_id: number
-  agent_name: string
+  owner_type: "agent" | "workforce"
+  agent_id: number | null
+  agent_name: string | null
+  workforce_id: number | null
+  workforce_name: string | null
   label: string | null
   key_prefix: string
   masked_key: string
@@ -33,9 +39,15 @@ export interface AgentApiKeyCreated {
 const BASE_URL = `${getApiUrl()}/api/agent-api-keys`
 
 export async function listAgentApiKeys(
-  agentId?: number
+  filter?: { agentId?: number; workforceId?: number }
 ): Promise<AgentApiKeyListItem[]> {
-  const url = agentId ? `${BASE_URL}?agent_id=${agentId}` : BASE_URL
+  const params = new URLSearchParams()
+  if (filter?.agentId != null) params.set("agent_id", String(filter.agentId))
+  if (filter?.workforceId != null) {
+    params.set("workforce_id", String(filter.workforceId))
+  }
+  const query = params.toString()
+  const url = query ? `${BASE_URL}?${query}` : BASE_URL
   const res = await apiRequest(url, { method: "GET" })
   if (!res.ok) throw new Error(`Failed to load API keys (${res.status})`)
   return (await res.json()) as AgentApiKeyListItem[]
@@ -56,6 +68,20 @@ export async function createAgentApiKey(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ agent_id: agentId, label }),
+  })
+  if (!res.ok) throw new Error(`Failed to create API key (${res.status})`)
+  return (await res.json()) as AgentApiKeyCreated
+}
+
+/** Add a new key for a workforce. Does not touch its other keys. */
+export async function createWorkforceApiKey(
+  workforceId: number,
+  label: string | null
+): Promise<AgentApiKeyCreated> {
+  const res = await apiRequest(BASE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ workforce_id: workforceId, label }),
   })
   if (!res.ok) throw new Error(`Failed to create API key (${res.status})`)
   return (await res.json()) as AgentApiKeyCreated

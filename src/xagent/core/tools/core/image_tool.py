@@ -39,15 +39,45 @@ If generate_image is called with images, it will delegate to edit_image automati
 When given a user request, rewrite and enrich the prompt into a **professional image generation prompt**:
 - Expand with **visual details** (style, composition, lighting, colors, textures, atmosphere)
 - Transform abstract concepts into **concrete visual scenes**
-- Text handling priority:
-  1. **Direct text display**: User-specified text content, names, dates, numbers, and quotes must appear directly as readable text in the image
-  2. **Visual description**: Brand names, abstract concepts, and style descriptions should be represented visually
-  3. **Mixed approach**: When users provide both specific text and style requirements, include both the exact text and visual elements
-
-- For greeting cards, posters, banners, and similar text-focused designs: Always preserve user-specified text content as readable text elements
-- Use vivid keywords (comma-separated) for better results
-- Always generate **positive prompt** (desired content) and **negative prompt** (avoid: low quality, blur, text artifacts, distorted text, misspelled words, fake logos, brand logos, trademark symbols)
-- For brands/logos: use visual descriptions like "tech company logo" rather than specific names
+- Organize designed graphics around one focal device, a clear hierarchy, and one
+  coherent production finish. Do not use vague words such as "professional" or
+  "premium" as substitutes for a specific visual idea.
+- For multiple creative directions, vary the proposition, structure, focal
+  subject, and treatment materially before varying colors or crops.
+- Text and brand handling:
+  1. The tool can generate complete designed graphics such as ads, posters,
+     banners, and cards, including typography and user-supplied copy; it is not
+     limited to producing text-free backgrounds.
+  2. Quote required copy clearly and keep unnecessary text out.
+  3. Reference images can guide product identity, visual language, palette, and
+     composition.
+     When a reference file has already been acquired, pass its path, URL, or
+     file_id through the images parameter. Mentioning a reference only in the
+     prompt does not attach it to the model request.
+  4. Generated depictions are not suitable when a supplied logo, QR code,
+     certification mark, or other exact asset must remain pixel-identical.
+- For a poster, ad, banner, or social graphic, create one single final
+  composition on one continuous canvas per call. Do not generate a contact
+  sheet, moodboard, option grid, multiple versions, repeated layouts, split
+  frames, presentation mockups, or duplicated headlines unless the user
+  explicitly asks for that output format.
+- Keep designed-graphic copy sparse: normally one exact headline, at most one
+  short support line, one concise CTA, and only required fine print. Do not
+  render alternative copy, strategy labels, markdown, prompt annotations, or
+  design rationale.
+- Treat reference images as evidence of recurring brand cues, not an instruction
+  to copy every gradient, metallic effect, ribbon, swoosh, or decorative motif
+  from one campaign.
+- Use precise, concept-specific visual language rather than keyword soup.
+- Express every constraint that matters in the **positive prompt**: some
+  providers ignore negative_prompt entirely, so anything the image must show
+  or avoid needs to be stated positively in the prompt itself.
+- If you use **negative_prompt**, keep it short and quality-focused (low
+  quality, blur, distorted or misspelled text, watermarks, fake logos,
+  contact sheets, extra panels), plus at most a few exclusions this specific
+  request needs. Do not blanket-ban whole families of imagery such as people,
+  crowds, skylines, glow, or 3D as a routine list; that strips legitimate
+  content and flattens the result.
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 
 Available models (⭐[DEFAULT] marks the configured default model):
@@ -57,13 +87,13 @@ Available models (⭐[DEFAULT] marks the configured default model):
 
 Parameters:
 - prompt (required): optimized image description with visual details
-- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1280*720", "1920*1080")
+- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024"). Defaults to a square when omitted, so for ads, posters, and social graphics always pass the placement's real dimensions or aspect_ratio explicitly instead of relying on the default.
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
-- aspect_ratio (optional): aspect ratio (e.g. "1:1", "3:2", "16:9", "21:9") - overrides calculated aspect ratio from size
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
-- negative_prompt (optional): undesired elements, auto-generated if empty
+- negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
@@ -100,6 +130,10 @@ Text handling in edited images:
 - **Text modifications**: If you want to change existing text in the image, clearly describe what text should be changed and what it should become
 - **New text addition**: Specify exactly what text should appear and where (e.g., "add 'Happy Birthday' text at the top")
 - **Text removal**: Request to remove specific text elements
+- **Brand fidelity**: Use supplied logos, QR codes, or trademarks as references,
+  but do not claim that a generative edit preserved them pixel-for-pixel. If
+  exact fidelity is explicitly required, use a deterministic asset-processing
+  workflow when one is available or explain the limitation.
 
 Available models (⭐[DEFAULT] marks the configured default model):
 {}
@@ -109,12 +143,12 @@ Available models (⭐[DEFAULT] marks the configured default model):
 Parameters:
 - image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
 - prompt (required): description of the desired edits and changes
-- negative_prompt (optional): undesired elements in the result
-- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1280*720", "1920*1080")
+- negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
+- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
-- aspect_ratio (optional): aspect ratio (e.g. "1:1", "3:2", "16:9", "21:9") - overrides calculated aspect ratio from size
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**

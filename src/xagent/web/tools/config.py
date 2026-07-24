@@ -13,7 +13,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    TypeVar,
+)
 
 import httpx
 
@@ -37,10 +47,13 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     binding_target,
     runtime_bindings_from_config,
 )
+from ...core.tools.adapters.vibe.db_session import tool_session_scope
 from ..services.tool_credentials import (
+    TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
     get_user_tool_allowlist,
     get_user_tool_overrides,
+    has_user_tool_policy_hooks,
     resolve_tool_credential,
 )
 
@@ -197,6 +210,60 @@ class _OAuthLaunchConfigInvalid(Exception):
     def __init__(self, *, field: str) -> None:
         super().__init__(field)
         self.field = field
+
+
+@dataclass(frozen=True)
+class _ToolFactoryRuntimeLoadPlan:
+    """Detached inputs describing the synchronous factory reads to prefetch."""
+
+    user_id: int | None
+    task_id: str | None
+    connector_runtime_turn_id: str | None
+    load_policy: bool
+    load_basic: bool
+    load_sql: bool
+    load_custom_api: bool
+    load_vision: bool
+    load_image: bool
+    load_video: bool
+    load_audio: bool
+    published_agent_policy: Any | None
+
+
+@dataclass(frozen=True)
+class _ToolRuntimePolicySnapshot:
+    """Detached per-turn policy loaded by a worker-owned Session."""
+
+    tool_overrides: dict[str, Any] = field(default_factory=dict)
+    tool_allowlist: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class _ToolFactoryRuntimeSnapshot:
+    """Worker-produced values consumed synchronously by tool creators."""
+
+    plan: _ToolFactoryRuntimeLoadPlan
+    tool_credentials: dict[tuple[str, str], str | None] = field(default_factory=dict)
+    sql_connections: dict[str, str] = field(default_factory=dict)
+    failed_inputs: frozenset[str] = frozenset()
+    custom_api_configs: list[dict[str, Any]] = field(default_factory=list)
+    tool_overrides: dict[str, Any] = field(default_factory=dict)
+    tool_allowlist: list[str] | None = None
+    vision_model: Any | None = None
+    image_models: dict[str, Any] = field(default_factory=dict)
+    image_generate_model: Any | None = None
+    image_edit_model: Any | None = None
+    video_models: dict[str, Any] = field(default_factory=dict)
+    video_model: Any | None = None
+    asr_models: dict[str, Any] = field(default_factory=dict)
+    asr_model: Any | None = None
+    tts_models: dict[str, Any] = field(default_factory=dict)
+    tts_model: Any | None = None
+    sound_effect_models: dict[str, Any] = field(default_factory=dict)
+    sound_effect_model: Any | None = None
+    music_models: dict[str, Any] = field(default_factory=dict)
+    music_model: Any | None = None
+    published_agent_records: list[Any] = field(default_factory=list)
 
 
 def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
@@ -443,6 +510,443 @@ async def refresh_oauth_token_if_needed(
     return False
 
 
+def _parse_custom_api_task_id(task_id: str | None) -> int | None:
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    if task_id.startswith("web_task_"):
+        task_id = task_id.removeprefix("web_task_")
+    try:
+        return int(task_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_custom_api_runtime_view_sync(
+    db: Any,
+    *,
+    task_id: str | None,
+    connector_runtime_turn_id: str | None,
+    user_id: int | None,
+) -> dict[str, Any]:
+    numeric_task_id = _parse_custom_api_task_id(task_id)
+    if numeric_task_id is None or user_id is None:
+        return {}
+    try:
+        from ..services.connector_runtime import load_connector_runtime_view
+
+        return load_connector_runtime_view(
+            db=db,
+            task_id=numeric_task_id,
+            turn_id=connector_runtime_turn_id,
+            user_id=user_id,
+        )
+    except ConnectorRuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve connector runtime view for task %s",
+            task_id,
+            exc_info=True,
+        )
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector runtime context is unavailable.",
+            details={"reason": "runtime_view_resolution_failed"},
+            status_code=503,
+        ) from exc
+
+
+def _load_custom_api_factory_inputs(
+    db: Any,
+    *,
+    user_id: int | None,
+    task_id: str | None,
+    connector_runtime_turn_id: str | None,
+) -> list[dict[str, Any]]:
+    if user_id is None:
+        return []
+
+    from ..models.custom_api import UserCustomApi
+
+    user_apis = (
+        db.query(UserCustomApi)
+        .filter(
+            UserCustomApi.user_id == user_id,
+            UserCustomApi.is_active,
+        )
+        .all()
+    )
+    if not user_apis:
+        return []
+
+    runtime_view = _load_custom_api_runtime_view_sync(
+        db,
+        task_id=task_id,
+        connector_runtime_turn_id=connector_runtime_turn_id,
+        user_id=user_id,
+    )
+    configs: list[dict[str, Any]] = []
+    for user_api in user_apis:
+        api = user_api.custom_api
+        if api is None:
+            continue
+        runtime_values = runtime_view.get(f"custom_api:{int(api.id)}")
+        configs.append(
+            _custom_api_config_from_model(
+                api,
+                dict(runtime_values) if isinstance(runtime_values, dict) else None,
+            )
+        )
+    return configs
+
+
+def _custom_api_config_from_model(
+    api: Any,
+    connector_runtime: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "id": int(api.id),
+        "name": api.name,
+        "description": api.description or "",
+        "url": api.url,
+        "method": api.method or "GET",
+        "headers": api.headers or {},
+        "body": api.body,
+        "env": api.env or {},
+        "runtime_input_schema": getattr(api, "runtime_input_schema", None),
+        "runtime_bindings": getattr(api, "runtime_bindings", None),
+        "allow_delegated_authorization": bool(
+            getattr(api, "allow_delegated_authorization", False)
+        ),
+        "connector_runtime": connector_runtime,
+    }
+
+
+_SessionResultT = TypeVar("_SessionResultT")
+_CreatorFailedInputKey = Literal["basic", "database"]
+
+
+def _run_with_checked_out_session(
+    session_factory: Any,
+    operation: Callable[[Any], _SessionResultT],
+) -> _SessionResultT:
+    """Run one operation through a newly checked-out, always-closed Session."""
+    with tool_session_scope(session_factory) as db:
+        # Eager checkout keeps pool exhaustion outside callers' fallback
+        # handlers, so it cannot be mistaken for an absent optional input.
+        db.connection()
+        return operation(db)
+
+
+def _load_tool_factory_runtime_snapshot(
+    session_factory: Any,
+    plan: _ToolFactoryRuntimeLoadPlan,
+    policy_snapshot: _ToolRuntimePolicySnapshot | None = None,
+) -> _ToolFactoryRuntimeSnapshot:
+    """Load factory-only DB inputs using worker-owned sessions.
+
+    This function accepts only a session factory plus detached scalar policy. It
+    never receives the caller's ``WebToolConfig``, request Session, or ORM user.
+    """
+    from ..services.db_runtime import is_database_pool_timeout
+
+    tool_credentials: dict[tuple[str, str], str | None] = {}
+    sql_connections: dict[str, str] = {}
+    failed_inputs: set[str] = set()
+    custom_api_configs: list[dict[str, Any]] = []
+    runtime_policy = policy_snapshot or _ToolRuntimePolicySnapshot()
+    vision_model: Any | None = None
+    image_models: dict[str, Any] = {}
+    image_generate_model: Any | None = None
+    image_edit_model: Any | None = None
+    video_models: dict[str, Any] = {}
+    video_model: Any | None = None
+    asr_models: dict[str, Any] = {}
+    asr_model: Any | None = None
+    tts_models: dict[str, Any] = {}
+    tts_model: Any | None = None
+    sound_effect_models: dict[str, Any] = {}
+    sound_effect_model: Any | None = None
+    music_models: dict[str, Any] = {}
+    music_model: Any | None = None
+    published_agent_records: list[Any] = []
+
+    def load_snapshot_input(
+        input_name: str,
+        loader: Callable[[Any], Any],
+        default: Any,
+        *,
+        failed_input_key: _CreatorFailedInputKey | None = None,
+        propagated_exceptions: tuple[type[Exception], ...] = (),
+        log_level: int = logging.WARNING,
+        log_message: str | None = None,
+    ) -> Any:
+        """Load one logical input through an isolated Session boundary.
+
+        ``basic`` credentials and ``database`` connections are the only
+        creator-scoped fail-closed inputs: a plain loader failure records their
+        key so that the matching creator raises while unrelated creators can
+        continue. Custom API, published-agent, and model discovery retain their
+        legacy soft defaults. Pool timeouts always propagate, and callers can
+        name additional typed exceptions that must propagate.
+        """
+
+        def load(db: Any) -> Any:
+            try:
+                return loader(db)
+            except Exception as exc:
+                if isinstance(exc, propagated_exceptions):
+                    raise
+                if is_database_pool_timeout(exc):
+                    raise
+                if failed_input_key is not None:
+                    failed_inputs.add(failed_input_key)
+                if log_message is None:
+                    logger.log(
+                        log_level,
+                        "Failed to prefetch %s tool input",
+                        input_name,
+                        exc_info=True,
+                    )
+                else:
+                    logger.log(log_level, log_message, exc_info=True)
+                return default
+
+        return _run_with_checked_out_session(session_factory, load)
+
+    if plan.load_policy and policy_snapshot is None:
+        runtime_policy = _load_tool_runtime_policy_snapshot(
+            session_factory,
+            plan.user_id,
+        )
+
+    if plan.load_basic:
+
+        def load_tool_credentials(db: Any) -> dict[tuple[str, str], str | None]:
+            loaded_credentials: dict[tuple[str, str], str | None] = {}
+            for tool_name, field_specs in TOOL_CREDENTIAL_SPECS.items():
+                for field_name in field_specs:
+                    loaded_credentials[(tool_name, field_name)] = (
+                        resolve_tool_credential(db, tool_name, field_name)
+                    )
+            return loaded_credentials
+
+        tool_credentials = load_snapshot_input(
+            "tool credentials",
+            load_tool_credentials,
+            {},
+            failed_input_key="basic",
+            log_message="Failed to prefetch tool credentials",
+        )
+
+    if plan.load_sql:
+        sql_connections = load_snapshot_input(
+            "SQL connections",
+            lambda db: get_sql_connection_map(db, plan.user_id),
+            {},
+            failed_input_key="database",
+            log_message="Failed to prefetch SQL connections",
+        )
+
+    if plan.load_custom_api:
+        custom_api_configs = load_snapshot_input(
+            "Custom API configs",
+            lambda db: _load_custom_api_factory_inputs(
+                db,
+                user_id=plan.user_id,
+                task_id=plan.task_id,
+                connector_runtime_turn_id=plan.connector_runtime_turn_id,
+            ),
+            [],
+            propagated_exceptions=(ConnectorRuntimeError,),
+            log_level=logging.ERROR,
+            log_message="Failed to get Custom API configs from database",
+        )
+
+    if (
+        plan.published_agent_policy is not None
+        and plan.published_agent_policy.query_required
+        and plan.user_id is not None
+    ):
+        from ...core.tools.adapters.vibe.agent_tool import (
+            load_published_agent_tool_records,
+        )
+
+        published_agent_user_id = plan.user_id
+        published_agent_policy = plan.published_agent_policy
+        published_agent_records = load_snapshot_input(
+            "published-agent tools",
+            lambda db: load_published_agent_tool_records(
+                db,
+                user_id=published_agent_user_id,
+                policy=published_agent_policy,
+            ),
+            [],
+            log_message="Failed to prefetch published-agent tools",
+        )
+
+    from ..services import model_service
+
+    if plan.load_image:
+        image_models = load_snapshot_input(
+            "image",
+            lambda db: model_service.get_image_models(db, plan.user_id),
+            {},
+        )
+    if plan.load_video:
+        video_models = load_snapshot_input(
+            "video",
+            lambda db: model_service.get_video_models(db, plan.user_id),
+            {},
+        )
+    if plan.load_audio:
+        asr_models = load_snapshot_input(
+            "audio:asr-models",
+            lambda db: model_service.get_asr_models(db, plan.user_id),
+            {},
+        )
+        tts_models = load_snapshot_input(
+            "audio:tts-models",
+            lambda db: model_service.get_tts_models(db, plan.user_id),
+            {},
+        )
+        sound_effect_models = load_snapshot_input(
+            "audio:sound-effect-models",
+            lambda db: model_service.get_sound_effect_models(db, plan.user_id),
+            {},
+        )
+        music_models = load_snapshot_input(
+            "audio:music-models",
+            lambda db: model_service.get_music_models(db, plan.user_id),
+            {},
+        )
+
+    if plan.load_vision:
+        vision_model = load_snapshot_input(
+            "vision",
+            lambda db: model_service.get_default_vision_model(plan.user_id, db=db),
+            None,
+        )
+    if plan.load_image and image_models:
+        image_generate_model = load_snapshot_input(
+            "image",
+            lambda db: model_service.get_default_image_generate_model(
+                plan.user_id, db=db
+            ),
+            None,
+        )
+        image_edit_model = load_snapshot_input(
+            "image",
+            lambda db: model_service.get_default_image_edit_model(plan.user_id, db=db),
+            None,
+        )
+    if plan.load_video and video_models:
+        video_model = load_snapshot_input(
+            "video",
+            lambda db: model_service.get_default_video_model(plan.user_id, db=db),
+            None,
+        )
+    if plan.load_audio:
+        if asr_models or tts_models:
+            asr_model = load_snapshot_input(
+                "audio:default-asr",
+                lambda db: model_service.get_default_asr_model(plan.user_id, db=db),
+                None,
+            )
+            tts_model = load_snapshot_input(
+                "audio:default-tts",
+                lambda db: model_service.get_default_tts_model(plan.user_id, db=db),
+                None,
+            )
+        if sound_effect_models:
+            sound_effect_model = load_snapshot_input(
+                "audio:default-sound-effect",
+                lambda db: model_service.get_default_sound_effect_model(
+                    plan.user_id, db=db
+                ),
+                None,
+            )
+        if music_models:
+            music_model = load_snapshot_input(
+                "audio:default-music",
+                lambda db: model_service.get_default_music_model(plan.user_id, db=db),
+                None,
+            )
+
+    return _ToolFactoryRuntimeSnapshot(
+        plan=plan,
+        tool_credentials=tool_credentials,
+        sql_connections=sql_connections,
+        failed_inputs=frozenset(failed_inputs),
+        custom_api_configs=custom_api_configs,
+        tool_overrides=runtime_policy.tool_overrides,
+        tool_allowlist=runtime_policy.tool_allowlist,
+        vision_model=vision_model,
+        image_models=image_models,
+        image_generate_model=image_generate_model,
+        image_edit_model=image_edit_model,
+        video_models=video_models,
+        video_model=video_model,
+        asr_models=asr_models,
+        asr_model=asr_model,
+        tts_models=tts_models,
+        tts_model=tts_model,
+        sound_effect_models=sound_effect_models,
+        sound_effect_model=sound_effect_model,
+        music_models=music_models,
+        music_model=music_model,
+        published_agent_records=published_agent_records,
+    )
+
+
+def _load_tool_runtime_policy_snapshot(
+    session_factory: Any,
+    user_id: int | None,
+) -> _ToolRuntimePolicySnapshot:
+    """Load each detached policy input through its own worker-owned Session."""
+    from ..services.db_runtime import is_database_pool_timeout
+
+    if user_id is None:
+        return _ToolRuntimePolicySnapshot()
+
+    from ..models.user import User
+
+    def load_policy_input(
+        input_name: str,
+        loader: Callable[[Any, Any], Any],
+        default: Any,
+    ) -> Any:
+        def load(db: Any) -> Any:
+            try:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user is None:
+                    return default
+                return loader(db, user)
+            except Exception as exc:
+                if is_database_pool_timeout(exc):
+                    raise
+                logger.exception("Failed to get user tool %s", input_name)
+                return default
+
+        return _run_with_checked_out_session(session_factory, load)
+
+    overrides = load_policy_input(
+        "overrides",
+        lambda db, user: get_user_tool_overrides(db, user),
+        {},
+    )
+    tool_overrides = dict(overrides) if isinstance(overrides, dict) else {}
+    tool_allowlist = load_policy_input(
+        "allowlist",
+        lambda db, user: normalize_tool_allowlist(get_user_tool_allowlist(db, user)),
+        None,
+    )
+    return _ToolRuntimePolicySnapshot(
+        tool_overrides=tool_overrides,
+        tool_allowlist=tool_allowlist,
+    )
+
+
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
@@ -602,6 +1106,8 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_hook_resolution_failed = False
         self._cached_embedding_model: Optional[str] = None
         self._cached_rerank_model: Optional[str] = None
+        self._factory_runtime_snapshot: _ToolFactoryRuntimeSnapshot | None = None
+        self._pending_runtime_policy: _ToolRuntimePolicySnapshot | None = None
 
     def _build_mcp_file_allowed_dirs(self) -> str:
         """Build comma-separated file roots that local MCP tools may read."""
@@ -684,36 +1190,54 @@ class WebToolConfig(BaseToolConfig):
         if hasattr(self, "_explicit_vision_model") and self._explicit_vision_model:
             return self._explicit_vision_model
 
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_vision:
+            return snapshot.vision_model
         if self._cached_vision_config is None:
             self._cached_vision_config = self._load_vision_model()
         return self._cached_vision_config
 
     def get_image_models(self) -> Dict[str, Any]:
         """Load image models from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_image:
+            return snapshot.image_models
         if self._cached_image_configs is None:
             self._cached_image_configs = self._load_image_models()
         return self._cached_image_configs
 
     def get_video_models(self) -> Dict[str, Any]:
         """Load video models from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_video:
+            return snapshot.video_models
         if self._cached_video_configs is None:
             self._cached_video_configs = self._load_video_models()
         return self._cached_video_configs
 
     def get_image_generate_model(self) -> Optional[Any]:
         """Get default image generation model from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_image:
+            return snapshot.image_generate_model
         if self._cached_image_generate_model is None:
             self._cached_image_generate_model = self._load_image_generate_model()
         return self._cached_image_generate_model
 
     def get_image_edit_model(self) -> Optional[Any]:
         """Get default image editing model from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_image:
+            return snapshot.image_edit_model
         if self._cached_image_edit_model is None:
             self._cached_image_edit_model = self._load_image_edit_model()
         return self._cached_image_edit_model
 
     def get_video_model(self) -> Optional[Any]:
         """Get default video generation model from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_video:
+            return snapshot.video_model
         if self._cached_video_model is None:
             self._cached_video_model = self._load_video_model()
         return self._cached_video_model
@@ -825,6 +1349,8 @@ class WebToolConfig(BaseToolConfig):
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
         self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
         return True
 
     def _parse_numeric_task_id(self) -> Optional[int]:
@@ -1045,6 +1571,13 @@ class WebToolConfig(BaseToolConfig):
         """Get per-agent tool metadata/runtime overrides for delegation."""
         return self._agent_tool_overrides
 
+    def get_published_agent_tool_records(self) -> Optional[List[Any]]:
+        """Return worker-prefetched, ORM-free published-agent rows."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is None or snapshot.plan.published_agent_policy is None:
+            return None
+        return list(snapshot.published_agent_records)
+
     def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
         """Get remote A2A agent tool configurations."""
         return self._a2a_agent_configs
@@ -1086,6 +1619,150 @@ class WebToolConfig(BaseToolConfig):
             logger.exception("Failed to get user tool overrides")
             self._cached_tool_overrides = {}
         return self._cached_tool_overrides
+
+    def _build_factory_runtime_load_plan(self) -> _ToolFactoryRuntimeLoadPlan:
+        spec = self._tool_selection_spec
+
+        def wants_category(category: str) -> bool:
+            if spec is None:
+                return True
+            includes_category = getattr(spec, "includes_category", None)
+            if callable(includes_category):
+                return bool(includes_category(category))
+            return True
+
+        includes_custom_api = (
+            getattr(spec, "includes_custom_api", None) if spec is not None else None
+        )
+        includes_published_agent = (
+            getattr(spec, "includes_published_agent", None)
+            if spec is not None
+            else None
+        )
+        published_agent_policy = None
+        if (
+            self._user_id
+            and self.get_enable_agent_tools()
+            and (
+                spec is None
+                or not callable(includes_published_agent)
+                or bool(includes_published_agent())
+            )
+        ):
+            from ...core.tools.adapters.vibe.agent_tool import (
+                build_published_agent_tool_query_policy,
+            )
+
+            published_agent_policy = build_published_agent_tool_query_policy(
+                excluded_agent_id=self.get_excluded_agent_id(),
+                include_draft=False,
+                allowed_agent_ids=self.get_allowed_agent_ids(),
+                agent_tool_overrides=self.get_agent_tool_overrides(),
+                enable_global_agent_tools=self.get_enable_global_agent_tools(),
+                allow_cross_user_agent_ids=self.get_allow_cross_user_agent_ids(),
+                agent_call_stack=self.get_agent_call_stack(),
+            )
+        return _ToolFactoryRuntimeLoadPlan(
+            user_id=int(self._user_id) if self._user_id is not None else None,
+            task_id=self._task_id,
+            connector_runtime_turn_id=self._connector_runtime_turn_id,
+            load_policy=(self._user_id is not None and has_user_tool_policy_hooks()),
+            load_basic=(wants_category("basic") or wants_category("web_search")),
+            load_sql=wants_category("database"),
+            load_custom_api=(
+                True
+                if spec is None or not callable(includes_custom_api)
+                else bool(includes_custom_api())
+            ),
+            load_vision=(
+                wants_category("vision") and not bool(self._explicit_vision_model)
+            ),
+            load_image=wants_category("image"),
+            load_video=wants_category("video"),
+            load_audio=wants_category("audio"),
+            published_agent_policy=published_agent_policy,
+        )
+
+    def _apply_factory_runtime_snapshot(
+        self, snapshot: _ToolFactoryRuntimeSnapshot
+    ) -> None:
+        self._factory_runtime_snapshot = snapshot
+        self._cached_tool_overrides = snapshot.tool_overrides
+        self._cached_tool_allowlist = snapshot.tool_allowlist
+        self._tool_allowlist_cached = True
+
+    async def prepare_factory_runtime(self) -> None:
+        """Prefetch synchronous ToolFactory inputs without blocking its loop.
+
+        The worker receives only a session factory and a detached load plan. It
+        owns and closes every Session it creates; the request Session and ORM
+        user retained by this config never cross the thread boundary.
+        """
+        if self._db_factory is None:
+            from sqlalchemy.orm import Session
+
+            # Some standalone/test configs supply duck-typed DB objects rather
+            # than a real SQLAlchemy Session. They retain the legacy synchronous
+            # getter contract; there is no safe engine from which to mint a
+            # worker-owned Session.
+            if not isinstance(self._live_db, Session):
+                return
+
+        from ..services.db_runtime import run_db_io_cancellation_safe
+
+        plan = self._build_factory_runtime_load_plan()
+        policy_snapshot = self._pending_runtime_policy
+        self._pending_runtime_policy = None
+        session_factory = self.get_session_factory()
+        # The worker mints its own Session from the same engine. A live request
+        # Session may already hold the pool's only connection after a SELECT,
+        # so release clean read transactions before the worker checks out.
+        self.release_db_connection()
+        snapshot = await run_db_io_cancellation_safe(
+            lambda: _load_tool_factory_runtime_snapshot(
+                session_factory,
+                plan,
+                policy_snapshot,
+            )
+        )
+        self._apply_factory_runtime_snapshot(snapshot)
+
+    def release_prepared_factory_runtime(self) -> None:
+        """Discard construction-only detached state after a factory build."""
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+
+    async def refresh_runtime_policy(self) -> None:
+        """Refresh only detached per-turn policy before signature comparison."""
+        self.release_prepared_factory_runtime()
+        if self._user_id is None or not has_user_tool_policy_hooks():
+            policy_snapshot = _ToolRuntimePolicySnapshot()
+        else:
+            from sqlalchemy.orm import Session
+
+            if self._db_factory is None and not isinstance(self._live_db, Session):
+                self._cached_tool_overrides = None
+                self._tool_allowlist_cached = False
+                self._cached_tool_allowlist = None
+                self.refresh_user_tool_overrides()
+                self.refresh_user_tool_allowlist()
+                return
+
+            from ..services.db_runtime import run_db_io_cancellation_safe
+
+            session_factory = self.get_session_factory()
+            self.release_db_connection()
+            policy_snapshot = await run_db_io_cancellation_safe(
+                lambda: _load_tool_runtime_policy_snapshot(
+                    session_factory,
+                    int(self._user_id),
+                )
+            )
+
+        self._cached_tool_overrides = policy_snapshot.tool_overrides
+        self._cached_tool_allowlist = policy_snapshot.tool_allowlist
+        self._tool_allowlist_cached = True
+        self._pending_runtime_policy = policy_snapshot
 
     def refresh_user_tool_overrides(self) -> dict:
         """Reload per-user tool overrides from the registered hook."""
@@ -1133,6 +1810,16 @@ class WebToolConfig(BaseToolConfig):
         """Return the sessionmaker used to mint per-call tool sessions."""
         if self._db_factory is not None:
             return self._db_factory
+        from sqlalchemy.orm import Session, sessionmaker
+
+        if isinstance(self._live_db, Session):
+            bind = self._live_db.get_bind()
+            engine = getattr(bind, "engine", bind)
+            return sessionmaker(
+                bind=engine,
+                autocommit=False,
+                autoflush=False,
+            )
         from ..models.database import get_session_local
 
         return get_session_local()
@@ -1164,6 +1851,7 @@ class WebToolConfig(BaseToolConfig):
 
     def close(self) -> None:
         """Close the lazily-opened factory session, if any."""
+        self.release_prepared_factory_runtime()
         if self._lazy_db is not None:
             self._lazy_db.close()
             self._lazy_db = None
@@ -1197,9 +1885,19 @@ class WebToolConfig(BaseToolConfig):
         return self._sandbox
 
     def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_basic:
+            if "basic" in snapshot.failed_inputs:
+                raise RuntimeError("Tool credential snapshot is unavailable")
+            return snapshot.tool_credentials.get((tool_name, field_name))
         return resolve_tool_credential(self.db, tool_name, field_name)
 
     def get_sql_connections(self) -> Dict[str, str]:
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_sql:
+            if "database" in snapshot.failed_inputs:
+                raise RuntimeError("SQL connection snapshot is unavailable")
+            return snapshot.sql_connections
         return get_sql_connection_map(self.db, self._user_id)
 
     def set_sandbox(self, sandbox: Any) -> None:
@@ -1294,6 +1992,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_asr_models(self) -> Dict[str, Any]:
         """Load ASR models from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.asr_models
         if self._cached_asr_models is None:
             self._cached_asr_models = self._load_asr_models()
         return self._cached_asr_models
@@ -1312,6 +2013,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_asr_model(self) -> Optional[Any]:
         """Get default ASR model from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.asr_model
         if self._cached_asr_model is None:
             self._cached_asr_model = self._load_asr_model()
         return self._cached_asr_model
@@ -1330,6 +2034,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_tts_models(self) -> Dict[str, Any]:
         """Load TTS models from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.tts_models
         if self._cached_tts_models is None:
             self._cached_tts_models = self._load_tts_models()
         return self._cached_tts_models
@@ -1348,12 +2055,18 @@ class WebToolConfig(BaseToolConfig):
 
     def get_tts_model(self) -> Optional[Any]:
         """Get default TTS model from database."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.tts_model
         if self._cached_tts_model is None:
             self._cached_tts_model = self._load_tts_model()
         return self._cached_tts_model
 
     def get_sound_effect_models(self) -> Dict[str, Any]:
         """Load sound effect models from the independent model category."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.sound_effect_models
         if self._cached_sound_effect_models is None:
             self._cached_sound_effect_models = self._load_sound_effect_models()
         return self._cached_sound_effect_models
@@ -1370,6 +2083,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_sound_effect_model(self) -> Optional[Any]:
         """Get the user's default sound effect model."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.sound_effect_model
         if self._cached_sound_effect_model is None:
             self._cached_sound_effect_model = self._load_sound_effect_model()
         return self._cached_sound_effect_model
@@ -1386,6 +2102,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_music_models(self) -> Dict[str, Any]:
         """Load music models from the independent model category."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.music_models
         if self._cached_music_models is None:
             self._cached_music_models = self._load_music_models()
         return self._cached_music_models
@@ -1402,6 +2121,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_music_model(self) -> Optional[Any]:
         """Get the user's default music model."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_audio:
+            return snapshot.music_model
         if self._cached_music_model is None:
             self._cached_music_model = self._load_music_model()
         return self._cached_music_model
@@ -2290,6 +3012,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_custom_api_configs(self) -> List[Dict[str, Any]]:
         """Get custom API configurations."""
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and snapshot.plan.load_custom_api:
+            return snapshot.custom_api_configs
         if not self._user_id:
             return []
 
@@ -2311,29 +3036,14 @@ class WebToolConfig(BaseToolConfig):
             custom_api_configs = []
             for user_api in user_apis:
                 api = user_api.custom_api
-                if api:
-                    custom_api_configs.append(
-                        {
-                            "id": int(api.id),
-                            "name": api.name,
-                            "description": api.description or "",
-                            "url": api.url,
-                            "method": api.method or "GET",
-                            "headers": api.headers or {},
-                            "body": api.body,
-                            "env": api.env or {},
-                            "runtime_input_schema": getattr(
-                                api, "runtime_input_schema", None
-                            ),
-                            "runtime_bindings": getattr(api, "runtime_bindings", None),
-                            "allow_delegated_authorization": bool(
-                                getattr(api, "allow_delegated_authorization", False)
-                            ),
-                            "connector_runtime": self._get_connector_runtime_for(
-                                "custom_api", int(api.id)
-                            ),
-                        }
+                if api is None:
+                    continue
+                custom_api_configs.append(
+                    _custom_api_config_from_model(
+                        api,
+                        self._get_connector_runtime_for("custom_api", int(api.id)),
                     )
+                )
             return custom_api_configs
 
         except ConnectorRuntimeError:

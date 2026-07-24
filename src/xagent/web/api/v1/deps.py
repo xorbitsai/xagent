@@ -4,7 +4,9 @@
 xag_<prefix>_<secret>`` header to the bound :class:`Agent` row,
 returning ``(Agent, AgentApiKey)`` on success and raising
 :class:`V1ApiError` ``invalid_api_key`` (HTTP 401) on every failure
-path.
+path. ``get_workforce_from_api_key`` is the workforce-bound
+counterpart, and ``get_principal_from_api_key`` accepts either owner
+type for endpoints shared by both (the ``/v1/chat/tasks/*`` family).
 
 Failure paths intentionally share the same response code and burn the
 same ~100ms of bcrypt work (via :func:`verify_dummy`) regardless of
@@ -22,8 +24,9 @@ auth flow) and §10 (security considerations).
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -41,6 +44,7 @@ from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db, get_session_local
 from ...models.user import User
 from ...models.user_api_key import UserApiKey
+from ...models.workforce import Workforce
 from ...utils.db_timezone import normalize_datetime_from_db
 from .errors import V1ApiError, V1ErrorCode
 
@@ -50,26 +54,36 @@ from .errors import V1ApiError, V1ErrorCode
 _bearer = HTTPBearer(auto_error=False)
 
 
-async def get_agent_from_api_key(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    db: Session = Depends(get_db),
-) -> Tuple[Agent, AgentApiKey]:
-    """Resolve an SDK API key to ``(Agent, AgentApiKey)``.
+@dataclass(frozen=True)
+class ApiKeyPrincipal:
+    """Resolved owner of a presented SDK API key.
+
+    Exactly one of ``agent`` / ``workforce`` is set, mirroring the
+    exactly-one-FK invariant on :class:`AgentApiKey`.
+    """
+
+    key_row: AgentApiKey
+    agent: Optional[Agent] = None
+    workforce: Optional[Workforce] = None
+
+    @property
+    def owner_user_id(self) -> int:
+        """The user identity SDK calls act as: the owner of the bound
+        agent or workforce."""
+        if self.agent is not None:
+            return int(self.agent.user_id)
+        assert self.workforce is not None
+        return int(self.workforce.owner_user_id)
+
+
+def _resolve_principal_from_credentials(
+    credentials: HTTPAuthorizationCredentials | None, db: Session
+) -> ApiKeyPrincipal:
+    """Shared key-resolution core for the runtime-key dependencies.
 
     All failure paths spend ~100ms of bcrypt work and return the same
     ``invalid_api_key`` code, so an attacker cannot enumerate live
     prefixes by either error code or response timing.
-
-    Returns:
-        Tuple ``(agent, key_row)`` where ``agent`` is the bound Agent
-        ORM row and ``key_row`` is the matching active AgentApiKey row.
-        Use the key_row for downstream operations that need to know
-        which prefix was presented (e.g. ``/v1/me``).
-
-    Raises:
-        V1ApiError(INVALID_API_KEY, 401): on any auth failure -- one
-            opaque code so caller cannot distinguish *which* check
-            failed.
     """
     # Missing header. Still burn bcrypt time so a curl-with-no-header
     # response can't be timed apart from a curl-with-bad-secret one.
@@ -80,7 +94,8 @@ async def get_agent_from_api_key(
     raw = credentials.credentials
 
     # Format check. parse_api_key returns None for anything not shaped
-    # like ``xag_<6 alnum>_<32 alnum>``.
+    # like ``xag_<6 alnum>_<32 alnum>``. Workforce keys share the AGENT
+    # wire format -- the owner type is a DB fact, not a key-shape fact.
     parsed = parse_api_key(raw)
     if parsed is None:
         verify_dummy()
@@ -94,15 +109,18 @@ async def get_agent_from_api_key(
 
     # Index lookup is O(1) on ix_agent_api_keys_key_prefix; revoked (and,
     # below, paused) rows are excluded by the filter, not by any DB
-    # constraint -- an agent can hold multiple simultaneously-active
+    # constraint -- an owner can hold multiple simultaneously-active
     # keys, so uniqueness is no longer enforced at the schema level.
-    # ``joinedload`` pulls the bound Agent row in the same SELECT so we
-    # don't pay a second round-trip on the success path (the relationship
-    # defaults to lazy='select', which would otherwise emit a separate
-    # query when we access ``key_row.agent`` below).
+    # ``joinedload`` pulls the bound owner rows in the same SELECT so we
+    # don't pay a second round-trip on the success path (the relationships
+    # default to lazy='select', which would otherwise emit a separate
+    # query when we access ``key_row.agent`` / ``key_row.workforce``).
     key_row = (
         db.query(AgentApiKey)
-        .options(joinedload(AgentApiKey.agent))
+        .options(
+            joinedload(AgentApiKey.agent),
+            joinedload(AgentApiKey.workforce),
+        )
         .filter(
             AgentApiKey.key_prefix == prefix,
             AgentApiKey.revoked_at.is_(None),
@@ -126,6 +144,15 @@ async def get_agent_from_api_key(
     if not verify_api_key(raw, key_row.key_hash):  # type: ignore[arg-type]
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
+    # Workforce-bound key: resolves to the workforce itself, never to
+    # its generated manager agent (which stays 401 below for
+    # agent-bound keys).
+    if key_row.workforce_id is not None:
+        workforce = key_row.workforce
+        if workforce is None:
+            raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+        return ApiKeyPrincipal(key_row=key_row, workforce=workforce)
+
     # Bound agent. Should always exist (CASCADE on agents -> api_keys),
     # but defend against an out-of-band DELETE that somehow leaves a
     # dangling key row. The relationship was eagerly loaded above, so
@@ -136,7 +163,61 @@ async def get_agent_from_api_key(
     if agent is None or is_workforce_generated_manager_agent(agent):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
-    return agent, key_row
+    return ApiKeyPrincipal(key_row=key_row, agent=agent)
+
+
+async def get_principal_from_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> ApiKeyPrincipal:
+    """Resolve an SDK API key to its owner, agent- or workforce-bound.
+
+    Used by endpoints shared by both owner types (the
+    ``/v1/chat/tasks/*`` family); owner-specific endpoints use
+    :func:`get_agent_from_api_key` / :func:`get_workforce_from_api_key`.
+    """
+    return _resolve_principal_from_credentials(credentials, db)
+
+
+async def get_agent_from_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> Tuple[Agent, AgentApiKey]:
+    """Resolve an SDK API key to ``(Agent, AgentApiKey)``.
+
+    Workforce-bound keys are rejected with the same opaque 401 --
+    endpoints using this dependency are agent-only surfaces.
+
+    Returns:
+        Tuple ``(agent, key_row)`` where ``agent`` is the bound Agent
+        ORM row and ``key_row`` is the matching active AgentApiKey row.
+        Use the key_row for downstream operations that need to know
+        which prefix was presented (e.g. ``/v1/me``).
+
+    Raises:
+        V1ApiError(INVALID_API_KEY, 401): on any auth failure -- one
+            opaque code so caller cannot distinguish *which* check
+            failed.
+    """
+    principal = _resolve_principal_from_credentials(credentials, db)
+    if principal.agent is None:
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+    return principal.agent, principal.key_row
+
+
+async def get_workforce_from_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> Tuple[Workforce, AgentApiKey]:
+    """Resolve an SDK API key to ``(Workforce, AgentApiKey)``.
+
+    Agent-bound keys are rejected with the same opaque 401 --
+    endpoints using this dependency are workforce-only surfaces.
+    """
+    principal = _resolve_principal_from_credentials(credentials, db)
+    if principal.workforce is None:
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+    return principal.workforce, principal.key_row
 
 
 def record_key_usage(key_prefix: str) -> None:

@@ -7,15 +7,20 @@ Phase 1 surface this module owns:
   - GET  /v1/chat/tasks/{id}
   - GET  /v1/chat/tasks/{id}/steps
 
-All endpoints authenticate via ``get_agent_from_api_key`` and use the
-stable ``V1ApiError`` envelope. Task turn lifecycle (claim RUNNING,
-persist messages, schedule bg, sync output) is delegated to
-``services.task_orchestrator.TaskTurnOrchestrator``, which is also used
-by the WebSocket UI path so both transports share one state machine.
+All endpoints authenticate via ``get_principal_from_api_key`` -- an
+agent-bound key scopes to its agent's SDK tasks, a workforce-bound key
+scopes to the tasks behind its workforce's runs (``WorkforceRun.task_id``
+is a 1:1 unique binding; runs are created via
+``POST /v1/workforces/{id}/runs``). Task creation stays agent-only.
+All responses use the stable ``V1ApiError`` envelope. Task turn
+lifecycle (claim RUNNING, persist messages, schedule bg, sync output)
+is delegated to ``services.task_orchestrator.TaskTurnOrchestrator``,
+which is also used by the WebSocket UI path so both transports share
+one state machine.
 """
 
 import logging
-from typing import Any, NoReturn, Optional, Tuple, cast
+from typing import Any, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func
@@ -24,10 +29,10 @@ from sqlalchemy.orm import Session
 from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...config import is_allowed_file
 from ...models.agent import Agent
-from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
 from ...models.task import Task, TaskStatus, TraceEvent
 from ...models.user import User
+from ...models.workforce import WorkforceRun
 from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
@@ -75,8 +80,8 @@ from ...services.task_orchestrator import (
     TurnKind,
 )
 from ._step_mapping import map_trace_events_to_public_steps
-from .deps import get_agent_from_api_key, record_key_usage
-from .errors import V1ApiError, V1ErrorCode
+from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
+from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -95,7 +100,7 @@ async def upload_task_files(
             "the uploaded files."
         ),
     ),
-    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
     db: Session = Depends(get_db),
 ) -> UploadFilesResponse:
     """Store files for later attachment to a task turn.
@@ -103,21 +108,21 @@ async def upload_task_files(
     API-key-gated counterpart to the JWT-only ``POST /api/files/upload``.
     Files are stored unbound (``UploadedFile.task_id`` NULL); the returned
     ``file_id`` values are passed back in ``message.files`` on
-    ``POST /v1/chat/tasks`` (or ``.../messages``), where they get bound to
-    the task and exposed to the agent.
+    ``POST /v1/chat/tasks`` / ``POST /v1/workforces/{id}/runs`` (or
+    ``.../messages``), where they get bound to the task and exposed to
+    the agent.
 
-    When ``task_id`` is omitted, the upload is owned by the agent's current
-    user for a future create request. When ``task_id`` is provided, the task
-    is authorized through the key-bound agent and its persisted ``Task.user_id``
-    owns the upload. This keeps historical tasks usable after agent ownership
-    changes without transferring file ownership during append.
+    When ``task_id`` is omitted, the upload is owned by the key owner's
+    current user for a future create request. When ``task_id`` is provided,
+    the task is authorized through the key-bound owner and its persisted
+    ``Task.user_id`` owns the upload. This keeps historical tasks usable
+    after owner changes without transferring file ownership during append.
     """
     from ..files import store_uploaded_files
 
-    agent, _key = authed
-    upload_owner_user_id = int(agent.user_id)
+    upload_owner_user_id = principal.owner_user_id
     if task_id is not None:
-        task = _resolve_task_or_404(task_id, agent, db)
+        task = _resolve_task_or_404(task_id, principal, db)
         upload_owner_user_id = int(task.user_id)
 
     owner = db.query(User).filter(User.id == upload_owner_user_id).first()
@@ -313,7 +318,7 @@ def _store_connector_runtime_values_or_fail(
 )
 async def create_chat_task(
     request: CreateTaskRequest,
-    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
     db: Session = Depends(get_db),
 ) -> CreateTaskResponse:
     """Create a new SDK-driven task and kick off its first turn.
@@ -362,10 +367,14 @@ async def create_chat_task(
             ``{"error": {"code": "internal_error", ...}}`` and the raw
             exception message stays out of the response.
     """
-    agent, _key = authed
+    # Task creation is agent-only: workforce runs are created via
+    # ``POST /v1/workforces/{id}/runs`` (the manager-delegation flow
+    # cannot be entered through a bare agent task). A workforce-bound
+    # key therefore never matches ``request.agent_id`` -- same 404 as
+    # any other unbound agent_id.
+    agent = principal.agent
+    _key = principal.key_row
     task_source = "sdk"
-    task_owner_user_id = int(agent.user_id)
-    actor_user_id = int(agent.user_id)
 
     # Server-side agent_id consistency check. The key already binds an
     # agent; ``body.agent_id`` is required by the SDK contract for
@@ -373,8 +382,11 @@ async def create_chat_task(
     # agent is the only authority. Mismatch is a 404 -- never a 403
     # -- so the existence of agent_id=N elsewhere in the system isn't
     # observable to this caller.
-    if request.agent_id != agent.id:
+    if agent is None or request.agent_id != agent.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+
+    task_owner_user_id = int(agent.user_id)
+    actor_user_id = int(agent.user_id)
 
     # Validate any attached file ids BEFORE creating the task, so a bad id
     # fails with 400 without leaving an orphan PENDING task behind. Binding
@@ -456,9 +468,9 @@ async def create_chat_task(
     except TaskTurnNotFoundError:
         pop_ephemeral_runtime_values(payload.turn_id)
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
-    except TaskTurnError:
+    except TaskTurnError as exc:
         pop_ephemeral_runtime_values(payload.turn_id)
-        raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
+        raise_for_turn_rejection(exc.reason)
     except Exception:
         pop_ephemeral_runtime_values(payload.turn_id)
         raise
@@ -506,50 +518,57 @@ async def create_chat_task(
 _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
 
 
-def _resolve_task_or_404(task_id: int, agent: Agent, db: Session) -> Task:
-    """Resolve a task_id against the calling agent's ownership AND
+def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) -> Task:
+    """Resolve a task_id against the calling key's ownership AND
     SDK-source scope.
 
     Returns the :class:`Task` row when the task:
 
       1. Exists.
-      2. Belongs to ``agent``.
+      2. Belongs to the key's owner -- directly (``Task.agent_id`` for
+         an agent-bound key) or through a workforce run
+         (``WorkforceRun.task_id`` for a workforce-bound key; the
+         binding is 1:1 unique).
       3. Was created by the SDK (``source == "sdk"``).
 
-    Any other case — missing row, row belongs to a different agent,
+    Any other case — missing row, row belongs to a different owner,
     or row was created by the Web UI / internal paths — raises
     :class:`V1ApiError` with ``task_not_found`` (404 not 403, so the
-    existence of tasks under other agents / other surfaces isn't
+    existence of tasks under other owners / other surfaces isn't
     observable through error code).
 
     The ``source == "sdk"`` filter exists because an SDK API key
-    binds to an agent, not to a particular product surface. Without
+    binds to an owner, not to a particular product surface. Without
     it, an SDK client could read or append to any task the Web UI
-    created under the same agent (the user's own historical Web UI
-    chats, for example). Whether that's intentional is a product
-    decision, but the safe default for a public SDK is to scope
-    lookups to tasks the SDK itself created — ``POST /v1/chat/tasks``
-    writes ``source="sdk"`` so this is well-defined.
+    created under the same owner (the user's own historical Web UI
+    chats or workforce runs, for example). Whether that's intentional
+    is a product decision, but the safe default for a public SDK is to
+    scope lookups to tasks the SDK itself created — ``POST
+    /v1/chat/tasks`` and ``POST /v1/workforces/{id}/runs`` both write
+    ``source="sdk"`` so this is well-defined.
 
     Args:
         task_id: Path parameter from the route.
-        agent: The key-bound agent resolved by
-            ``get_agent_from_api_key``.
+        principal: The key-bound owner resolved by
+            ``get_principal_from_api_key``.
         db: SQLAlchemy session.
 
     Raises:
         V1ApiError(TASK_NOT_FOUND, 404): task missing, not owned by
-            the calling agent, or not created by the SDK.
+            the calling key, or not created by the SDK.
     """
-    task = (
-        db.query(Task)
-        .filter(
-            Task.id == task_id,
-            Task.agent_id == agent.id,
-            Task.source == "sdk",
-        )
-        .first()
+    query = db.query(Task).filter(
+        Task.id == task_id,
+        Task.source == "sdk",
     )
+    if principal.agent is not None:
+        query = query.filter(Task.agent_id == principal.agent.id)
+    else:
+        assert principal.workforce is not None
+        query = query.join(WorkforceRun, WorkforceRun.task_id == Task.id).filter(
+            WorkforceRun.workforce_id == principal.workforce.id
+        )
+    task = query.first()
     if task is None:
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     return task
@@ -563,23 +582,33 @@ def _resolve_task_or_404(task_id: int, agent: Agent, db: Session) -> Task:
 async def append_message_to_task(
     task_id: int,
     request: AppendMessageRequest,
-    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
     db: Session = Depends(get_db),
 ) -> AppendMessageResponse:
     """Append the next user message to an existing task and kick off its next turn.
 
     Phase 1 multi-turn model is task-centric: subsequent user inputs
     extend the same ``task_id`` rather than creating a new task or a
-    new ``conversation_id``. This endpoint:
+    new ``conversation_id``. Works for both key owner types: an
+    agent-bound key appends to its agent's SDK tasks, a workforce-bound
+    key appends to the manager tasks behind its workforce's SDK runs
+    (the workforce turn guard revalidates archive/config drift on every
+    append). This endpoint:
 
       1. Validates the path ``task_id`` exists and belongs to the
-         key-bound agent (404 ``task_not_found`` otherwise).
+         key-bound owner (404 ``task_not_found`` otherwise).
       2. Validates ``body.agent_id`` matches the key-bound agent
-         (404 ``agent_not_found`` otherwise).
+         (404 ``agent_not_found`` otherwise; required for agent keys,
+         rejected for workforce keys). ``body.workforce_id``, when
+         provided with a workforce key, must match the bound workforce
+         (404 ``workforce_not_found`` otherwise).
       3. Rejects the call with 409 ``task_busy`` if the task is
          currently ``RUNNING`` -- the SDK client should poll
          ``GET /v1/chat/tasks/{id}`` until status leaves RUNNING and
-         retry.
+         retry. Workforce turn rejections map to their own stable
+         codes (``workforce_archived`` / ``workforce_config_changed``,
+         409 -- NOT retryable) so clients aren't told to retry a
+         permanently-rejected conversation.
       4. Otherwise persists the new user message to
          ``task_chat_messages``, updates ``task.input`` to record
          this turn's input, and kicks off the next background turn
@@ -589,7 +618,7 @@ async def append_message_to_task(
         task_id: Path parameter; the target task's primary key.
         request: Validated :class:`AppendMessageRequest`. ``message.content``
             is guaranteed non-empty by Pydantic.
-        authed: ``(Agent, AgentApiKey)`` from the auth dependency.
+        principal: Key-bound owner from the auth dependency.
         db: SQLAlchemy session.
 
     Returns:
@@ -598,30 +627,66 @@ async def append_message_to_task(
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
-        V1ApiError 404: task not found OR not owned by the agent OR
-            body.agent_id doesn't match the bound agent.
-        V1ApiError 409: ``task_busy`` -- task currently RUNNING.
+        V1ApiError 404: task not found OR not owned by the key OR
+            body.agent_id / body.workforce_id doesn't match the bound
+            owner.
+        V1ApiError 409: ``task_busy`` (retryable) or a workforce
+            rejection code (not retryable).
         500: any other unexpected error (V1 envelope via global handler).
     """
-    agent, _key = authed
-
-    # Resolve task first so cross-agent leak protection (404 instead
+    # Resolve task first so cross-owner leak protection (404 instead
     # of 403 for "not yours") fires before any body-level checks.
-    task = _resolve_task_or_404(task_id, agent, db)
+    task = _resolve_task_or_404(task_id, principal, db)
     task_owner_user_id = int(task.user_id)
-    actor_user_id = int(agent.user_id)
+    actor_user_id = principal.owner_user_id
+    _key = principal.key_row
 
-    # body.agent_id mismatch is also a 404 -- but agent_not_found,
-    # not task_not_found, because that's the field the caller got
-    # wrong. Choosing AGENT_NOT_FOUND keeps it consistent with the
-    # POST /v1/chat/tasks behavior for the same condition.
-    if request.agent_id != agent.id:
-        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    if principal.agent is not None:
+        # ``body.agent_id`` was a required field before workforce keys
+        # existed; keep that contract for agent keys (422, matching the
+        # old Pydantic required-field failure) now that the schema field
+        # is optional for the workforce case.
+        if request.agent_id is None:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                422,
+                message="agent_id is required",
+            )
+        # body.agent_id mismatch is also a 404 -- but agent_not_found,
+        # not task_not_found, because that's the field the caller got
+        # wrong. Choosing AGENT_NOT_FOUND keeps it consistent with the
+        # POST /v1/chat/tasks behavior for the same condition.
+        if request.agent_id != principal.agent.id:
+            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+        if request.workforce_id is not None:
+            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+    else:
+        assert principal.workforce is not None
+        # A workforce key never speaks for a bare agent: naming one is
+        # the same "field you got wrong" 404 as an agent-key mismatch.
+        if request.agent_id is not None:
+            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+        # ``workforce_id`` is optional (the key already binds one) but
+        # must match when provided -- symmetry with the agent contract.
+        if (
+            request.workforce_id is not None
+            and request.workforce_id != principal.workforce.id
+        ):
+            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+
+    # Connector runtime preparation always runs against the task's
+    # executing agent: the key-bound agent for agent keys, the
+    # workforce's manager agent (== task.agent_id) for workforce keys.
+    runtime_agent = principal.agent
+    if runtime_agent is None:
+        runtime_agent = db.get(Agent, int(task.agent_id))
+        if runtime_agent is None:
+            raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
 
     try:
         runtime_plan = prepare_append_connector_runtime(
             db=db,
-            agent=agent,
+            agent=runtime_agent,
             task=task,
             connector_user_id=task_owner_user_id,
             payload_items=request.connector_runtime_context,
@@ -666,9 +731,9 @@ async def append_message_to_task(
     except TaskTurnNotFoundError:
         pop_ephemeral_runtime_values(payload.turn_id)
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
-    except TaskTurnError:
+    except TaskTurnError as exc:
         pop_ephemeral_runtime_values(payload.turn_id)
-        raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
+        raise_for_turn_rejection(exc.reason)
     except Exception:
         pop_ephemeral_runtime_values(payload.turn_id)
         raise
@@ -696,7 +761,10 @@ async def append_message_to_task(
     # a value matching what GET /v1/chat/tasks/{id} would return.
     return AppendMessageResponse(
         task_id=int(task.id),
-        agent_id=int(agent.id),
+        agent_id=int(task.agent_id),
+        workforce_id=(
+            int(principal.workforce.id) if principal.workforce is not None else None
+        ),
         status=started.status.value,
         accepted_at=started.updated_at,
         run_id=started.run_id,
@@ -708,7 +776,7 @@ async def append_message_to_task(
 @router.get("/chat/tasks/{task_id}", response_model=TaskInfoResponse)
 async def get_chat_task(
     task_id: int,
-    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
     db: Session = Depends(get_db),
 ) -> TaskInfoResponse:
     """Return a snapshot of one task's current state.
@@ -731,10 +799,9 @@ async def get_chat_task(
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
-        V1ApiError 404: task missing or not owned by the calling agent.
+        V1ApiError 404: task missing or not owned by the calling key.
     """
-    agent, _key = authed
-    task = _resolve_task_or_404(task_id, agent, db)
+    task = _resolve_task_or_404(task_id, principal, db)
 
     # completed_at is derived from updated_at when the task is in a
     # terminal state. Pre-terminal states return None so SDK clients
@@ -750,6 +817,12 @@ async def get_chat_task(
     response = TaskInfoResponse(
         task_id=int(task.id),
         agent_id=int(task.agent_id),
+        # A task is reachable by exactly one owner type (manager agents
+        # can't hold keys), so caching the workforce identity inside the
+        # per-task snapshot can't leak across principals.
+        workforce_id=(
+            int(principal.workforce.id) if principal.workforce is not None else None
+        ),
         status=task.status.value,
         run_id=task.run_id,
         state_version=int(task.state_version or 0),
@@ -774,7 +847,7 @@ async def get_chat_task(
 @router.get("/chat/tasks/{task_id}/steps", response_model=StepsResponse)
 async def get_chat_task_steps(
     task_id: int,
-    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
     db: Session = Depends(get_db),
 ) -> StepsResponse:
     """Return the public-timeline steps for a task.
@@ -805,10 +878,9 @@ async def get_chat_task_steps(
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
-        V1ApiError 404: task missing or not owned by the calling agent.
+        V1ApiError 404: task missing or not owned by the calling key.
     """
-    agent, _key = authed
-    task = _resolve_task_or_404(task_id, agent, db)
+    task = _resolve_task_or_404(task_id, principal, db)
 
     max_event_id = (
         db.query(func.max(TraceEvent.id))

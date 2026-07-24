@@ -22,11 +22,13 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ConnectorRuntimeError,
 )
 from ...core.utils.encryption import decrypt_value, encrypt_value
-from ..models.agent import Agent, AgentOrigin
+from ..models.agent import Agent, AgentOrigin, is_workforce_generated_manager_agent
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
+from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..models.workforce import Workforce
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .background_jobs import create_background_job, enqueue_background_job
 from .connector_runtime import (
@@ -366,6 +368,23 @@ def _trigger_connector_runtime_payload(config: dict[str, Any] | None) -> Any:
     return config.get("connector_runtime_context")
 
 
+def _reject_workforce_connector_runtime(config: dict[str, Any] | None) -> None:
+    """Reject connector-runtime payloads on workforce-owned triggers.
+
+    Workforce runs are created through ``create_workforce_run_record``, whose
+    connector-runtime handling is selection-only (see
+    ``prepare_connector_runtime_selection_snapshot``): the non-/v1 creation
+    path does not accept per-invocation runtime payloads. The shared trigger
+    ``config`` schema would otherwise let such a payload validate and then be
+    silently dropped at fire time, so reject it up front instead.
+    """
+    if _trigger_connector_runtime_payload(config):
+        raise TriggerServiceError(
+            "Workforce triggers do not support connector_runtime_context; "
+            "the workforce run resolves connectors from its manager agent."
+        )
+
+
 def _validate_persisted_connector_runtime_config(config: dict[str, Any]) -> None:
     try:
         reject_ephemeral_connector_runtime_payload(
@@ -460,6 +479,28 @@ def get_owned_trigger(
     )
 
 
+def get_workforce_trigger(
+    db: Session,
+    *,
+    workforce_id: int,
+    trigger_id: int,
+) -> AgentTrigger | None:
+    """Resolve a trigger owned by a workforce.
+
+    Workforce access (view/edit, including admin override) is the route
+    layer's responsibility via ``ensure_workforce_access``; this helper only
+    scopes the lookup to the already-authorized workforce.
+    """
+    return (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.id == trigger_id,
+            AgentTrigger.workforce_id == workforce_id,
+        )
+        .first()
+    )
+
+
 def create_agent_trigger(
     db: Session,
     *,
@@ -475,9 +516,76 @@ def create_agent_trigger(
     agent = get_owned_agent(db, user_id=user_id, agent_id=agent_id)
     if agent is None:
         raise TriggerNotFoundError("Agent not found")
+    return _create_trigger(
+        db,
+        user_id=user_id,
+        agent_id=agent_id,
+        trigger_type=trigger_type,
+        name=name,
+        enabled=enabled,
+        config=config,
+        prompt_template=prompt_template,
+        secret=secret,
+    )
+
+
+def create_workforce_trigger(
+    db: Session,
+    *,
+    user_id: int,
+    workforce_id: int,
+    trigger_type: str,
+    name: str | None = None,
+    enabled: bool = True,
+    config: dict[str, Any] | None = None,
+    prompt_template: str | None = None,
+    secret: str | None = None,
+) -> tuple[AgentTrigger, str | None]:
+    """Create a workforce-owned trigger (workforce access checked by caller).
+
+    Note on execution identity: unlike agent triggers (which only their agent's
+    owner can create), a workforce trigger can be created by anyone with
+    workforce ``edit`` access, and ``user_id`` — the creator — is persisted as
+    the identity the eventual workforce run executes as. This is not an
+    escalation: the firing path re-checks ``ensure_workforce_access(action=
+    "run")`` in ``create_workforce_run_record``, so a creator who later loses
+    access is rejected at fire time.
+    """
+    return _create_trigger(
+        db,
+        user_id=user_id,
+        workforce_id=workforce_id,
+        trigger_type=trigger_type,
+        name=name,
+        enabled=enabled,
+        config=config,
+        prompt_template=prompt_template,
+        secret=secret,
+    )
+
+
+def _create_trigger(
+    db: Session,
+    *,
+    user_id: int,
+    agent_id: int | None = None,
+    workforce_id: int | None = None,
+    trigger_type: str,
+    name: str | None = None,
+    enabled: bool = True,
+    config: dict[str, Any] | None = None,
+    prompt_template: str | None = None,
+    secret: str | None = None,
+) -> tuple[AgentTrigger, str | None]:
+    if (agent_id is None) == (workforce_id is None):
+        raise TriggerServiceError(
+            "Trigger must be owned by exactly one of agent or workforce"
+        )
 
     resolved_type = _normalize_trigger_type(trigger_type)
     resolved_config = dict(config or {})
+    if workforce_id is not None:
+        _reject_workforce_connector_runtime(resolved_config)
     resource_id = _validate_config(
         db,
         user_id=user_id,
@@ -500,6 +608,7 @@ def create_agent_trigger(
     trigger = AgentTrigger(
         user_id=user_id,
         agent_id=agent_id,
+        workforce_id=workforce_id,
         type=resolved_type,
         name=_normalize_trigger_name(
             name, default=_default_trigger_name(resolved_type)
@@ -533,7 +642,33 @@ def update_agent_trigger(
     )
     if trigger is None:
         raise TriggerNotFoundError("Trigger not found")
+    return _apply_trigger_updates(db, trigger, user_id=user_id, updates=updates)
 
+
+def update_workforce_trigger(
+    db: Session,
+    *,
+    user_id: int,
+    workforce_id: int,
+    trigger_id: int,
+    updates: dict[str, Any],
+) -> tuple[AgentTrigger, str | None]:
+    """Update a workforce-owned trigger (workforce access checked by caller)."""
+    trigger = get_workforce_trigger(
+        db, workforce_id=workforce_id, trigger_id=trigger_id
+    )
+    if trigger is None:
+        raise TriggerNotFoundError("Trigger not found")
+    return _apply_trigger_updates(db, trigger, user_id=user_id, updates=updates)
+
+
+def _apply_trigger_updates(
+    db: Session,
+    trigger: AgentTrigger,
+    *,
+    user_id: int,
+    updates: dict[str, Any],
+) -> tuple[AgentTrigger, str | None]:
     old_type = str(trigger.type)
     old_enabled = bool(trigger.enabled)
     old_config = dict(trigger.config or {})
@@ -547,6 +682,8 @@ def update_agent_trigger(
         setattr(trigger, "prompt_template", updates["prompt_template"])
     if "config" in updates and updates["config"] is not None:
         config = dict(updates["config"])
+        if trigger.workforce_id is not None:
+            _reject_workforce_connector_runtime(config)
         resource_id = _validate_config(
             db,
             user_id=user_id,
@@ -603,6 +740,25 @@ def delete_agent_trigger(
     )
     if trigger is None:
         raise TriggerNotFoundError("Trigger not found")
+    _delete_trigger(db, trigger)
+
+
+def delete_workforce_trigger(
+    db: Session,
+    *,
+    workforce_id: int,
+    trigger_id: int,
+) -> None:
+    """Delete a workforce-owned trigger (workforce access checked by caller)."""
+    trigger = get_workforce_trigger(
+        db, workforce_id=workforce_id, trigger_id=trigger_id
+    )
+    if trigger is None:
+        raise TriggerNotFoundError("Trigger not found")
+    _delete_trigger(db, trigger)
+
+
+def _delete_trigger(db: Session, trigger: AgentTrigger) -> None:
     trigger_type = str(trigger.type)
     binding_config = dict(trigger.config or {})
     db.delete(trigger)
@@ -762,6 +918,80 @@ def _trigger_execution_context(
     }
 
 
+def _attach_workforce_task_to_trigger_run(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run: TriggerRun,
+    prompt: str,
+    test: bool,
+) -> TriggerRun:
+    """Prepare a workforce run + pending task for a workforce trigger.
+
+    Routes through ``create_workforce_run_record`` so every guard that
+    protects interactive runs (``ensure_workforce_access``,
+    ``validate_workforce_for_run``, snapshot/fingerprint pinning) applies to
+    trigger firings too; a plain Task bound to the manager agent would
+    silently lose all delegation ability. Failures propagate to
+    ``prepare_trigger_run``, which marks the run FAILED for idempotent retry.
+    """
+    # Local import: workforce_runs pulls in the orchestrator stack, which
+    # would otherwise risk an import cycle with this module.
+    from .workforce_runs import create_workforce_run_record
+
+    user = db.get(User, int(trigger.user_id))
+    if user is None:
+        raise TriggerServiceError("Trigger owner not found")
+    workforce = db.get(Workforce, int(trigger.workforce_id))
+    if workforce is None:
+        raise TriggerServiceError("Workforce not found")
+    record = create_workforce_run_record(
+        db,
+        user,
+        workforce,
+        message=prompt,
+        is_visible=False,
+        source="trigger",
+        # TriggerRun-level dedup already guarantees one run per event; this
+        # workforce-level key makes a retried attachment after a partial
+        # failure replay the same workforce run instead of creating another.
+        # (If the replayed run's task was hard-deleted in between, the record
+        # helper raises 409 and the run is marked FAILED — replay is
+        # impossible, so failing is correct rather than starting a fresh run.)
+        idempotency_key=f"trigger:{run.id}",
+    )
+    # Idempotent re-attach. create_workforce_run_record commits the
+    # WorkforceRun+Task before this function's own commit below, so a crash in
+    # between leaves run.task_id unset; a retry replays the same workforce run
+    # (record.created is False) and re-enters here. Only apply what is still
+    # missing and never knock a run that already advanced back to PENDING.
+    task = record.task
+    task_id = int(task.id)
+    merged_config = {
+        **dict(task.agent_config or {}),
+        **_trigger_execution_context(trigger=trigger, run=run, test=test),
+    }
+    if merged_config != dict(task.agent_config or {}):
+        setattr(task, "agent_config", merged_config)
+        db.add(task)
+    if run.task_id is None or int(run.task_id) != task_id:
+        setattr(run, "task_id", task_id)
+        db.add(run)
+    # Arm only a run that has not moved past preparation; a replay must not
+    # regress a RUNNING/COMPLETED run, and re-writing an already-PENDING run
+    # is a no-op we skip.
+    if str(run.status) not in (
+        TriggerRunStatus.RUNNING.value,
+        TriggerRunStatus.COMPLETED.value,
+        TriggerRunStatus.PENDING.value,
+    ):
+        setattr(run, "status", TriggerRunStatus.PENDING.value)
+        db.add(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
 def _attach_task_to_trigger_run(
     db: Session,
     *,
@@ -780,9 +1010,20 @@ def _attach_task_to_trigger_run(
         source_event_id=source_event_id,
         test=test,
     )
-    agent = db.query(Agent).filter(Agent.id == trigger.agent_id).first()
+    if trigger.workforce_id is not None:
+        return _attach_workforce_task_to_trigger_run(
+            db, trigger=trigger, run=run, prompt=prompt, test=test
+        )
+    agent = db.get(Agent, trigger.agent_id)
     if agent is None:
         raise TriggerServiceError("Agent not found")
+    if is_workforce_generated_manager_agent(agent):
+        # Defense in depth (#950): even if a row bound to a generated manager
+        # agent slips past ownership resolution and the migration cleanup, it
+        # must never construct a plain Task — that path drops delegation.
+        raise TriggerServiceError(
+            "Trigger is bound to a workforce manager agent and cannot fire"
+        )
     missing_secret_error_code = (
         ERROR_SCHEDULED_SECRET_UNAVAILABLE
         if str(trigger.type) == TriggerType.SCHEDULED.value

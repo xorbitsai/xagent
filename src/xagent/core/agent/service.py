@@ -95,7 +95,12 @@ class AgentService:
         self._tool_policy_signature: Any | None = None
         if self._tools_initialized and self.tool_config:
             try:
-                self._tool_policy_signature = self._current_tool_policy_signature()
+                has_async_policy_refresh = callable(
+                    getattr(self.tool_config, "refresh_runtime_policy", None)
+                )
+                self._tool_policy_signature = self._current_tool_policy_signature(
+                    refresh_policy=not has_async_policy_refresh
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to capture initial tool policy signature for "
@@ -639,11 +644,27 @@ class AgentService:
                 ):
                     self.tool_config._workspace_config["task_id"] = self.id
 
-                policy_signature = self._current_tool_policy_signature()
+                refresh_runtime_policy = getattr(
+                    self.tool_config, "refresh_runtime_policy", None
+                )
+                if callable(refresh_runtime_policy):
+                    await refresh_runtime_policy()
+                    policy_signature = self._current_tool_policy_signature(
+                        refresh_policy=False
+                    )
+                else:
+                    policy_signature = self._current_tool_policy_signature()
                 if (
                     self._tools_initialized
                     and policy_signature == self._tool_policy_signature
                 ):
+                    release_factory_runtime = getattr(
+                        self.tool_config,
+                        "release_prepared_factory_runtime",
+                        None,
+                    )
+                    if callable(release_factory_runtime):
+                        release_factory_runtime()
                     return
 
                 # Rebuild the tool list so disabled tools disappear from reused agents.
@@ -675,7 +696,11 @@ class AgentService:
                     f"Tool initialization failed for AgentService '{self.name}': {exc}"
                 ) from exc
 
-    def _current_tool_policy_signature(self) -> tuple[Any, ...]:
+    def _current_tool_policy_signature(
+        self,
+        *,
+        refresh_policy: bool = True,
+    ) -> tuple[Any, ...]:
         if not self.tool_config:
             return ()
 
@@ -686,14 +711,14 @@ class AgentService:
         refresh_overrides = getattr(
             self.tool_config, "refresh_user_tool_overrides", None
         )
-        if callable(refresh_overrides):
+        if refresh_policy and callable(refresh_overrides):
             # Re-read the hook-backed policy before comparing signatures.
             refresh_overrides()
 
         refresh_allowlist = getattr(
             self.tool_config, "refresh_user_tool_allowlist", None
         )
-        if callable(refresh_allowlist):
+        if refresh_policy and callable(refresh_allowlist):
             # The CA allowlist is resolved from the active execution scope, so
             # it can change between turns even when the config is reused.
             refresh_allowlist()

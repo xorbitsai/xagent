@@ -62,6 +62,11 @@ class Workforce(Base):  # type: ignore[no-any-unimported]
         back_populates="workforce",
         cascade="all, delete-orphan",
     )
+    triggers = relationship(
+        "AgentTrigger",
+        back_populates="workforce",
+        cascade="all, delete-orphan",
+    )
 
 
 class WorkforceAgent(Base):  # type: ignore[no-any-unimported]

@@ -1191,15 +1191,10 @@ class TestGetVisionTool:
 class TestGetDefaultVisionModel:
     """Test cases for get_default_vision_model function"""
 
-    @patch("xagent.web.models.database.get_db")
     @patch("xagent.web.services.llm_utils._create_llm_instance")
-    def test_get_default_vision_model_from_db_success(
-        self, mock_create_llm, mock_get_db
-    ):
+    def test_get_default_vision_model_from_db_success(self, mock_create_llm):
         """Test get_default_vision_model successful creation from database"""
-        # Mock database session generator
         mock_db = Mock()
-        mock_get_db.return_value = iter([mock_db])
 
         # Mock database model
         mock_db_model = Mock()
@@ -1223,24 +1218,21 @@ class TestGetDefaultVisionModel:
         mock_llm = Mock(spec=BaseLLM)
         mock_create_llm.return_value = mock_llm
 
-        result = get_default_vision_model(user_id=1)
+        result = get_default_vision_model(user_id=1, db=mock_db)
 
         assert result == mock_llm
         mock_create_llm.assert_called_once_with(mock_db_model)
 
-    @patch("xagent.web.models.database.get_db")
-    def test_get_default_vision_model_no_db_model(self, mock_get_db):
+    def test_get_default_vision_model_no_db_model(self):
         """Test get_default_vision_model when no database model found"""
-        # Mock database session generator
         mock_db = Mock()
-        mock_get_db.return_value = iter([mock_db])
 
         # Mock empty query result
         mock_query = Mock()
         mock_query.filter.return_value.first.return_value = None
         mock_db.query.return_value = mock_query
 
-        result = get_default_vision_model()
+        result = get_default_vision_model(db=mock_db)
 
         assert result is None
 

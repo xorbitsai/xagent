@@ -38,14 +38,15 @@ import {
   AgentTriggerType,
   GmailAccount,
   StagedTrigger,
-  createAgentTrigger,
-  deleteAgentTrigger,
-  listAgentTriggerRuns,
-  listAgentTriggers,
+  TriggerOwnerRef,
+  createOwnerTrigger,
+  deleteOwnerTrigger,
   listGmailAccounts,
+  listOwnerTriggerRuns,
+  listOwnerTriggers,
   stagedToPseudoTrigger,
-  testAgentTrigger,
-  updateAgentTrigger,
+  testOwnerTrigger,
+  updateOwnerTrigger,
 } from "@/lib/agent-triggers-api"
 import { copyToClipboard } from "@/lib/clipboard"
 import { cn, getApiUrl } from "@/lib/utils"
@@ -58,6 +59,10 @@ interface GmailConnectionState {
 interface AgentTriggersDialogProps {
   agentId: number | null
   agentName?: string
+  // Workforce triggers (#950): when set, all live CRUD targets this owner
+  // instead of the agent. Takes precedence over agentId; agentId is still
+  // used for the agent-creation staging flow (workforces never stage).
+  owner?: TriggerOwnerRef | null
   open: boolean
   onOpenChange: (open: boolean) => void
   onChanged?: () => void
@@ -191,6 +196,7 @@ function isValidAgentId(agentId: number | null): agentId is number {
 export function AgentTriggersDialog({
   agentId,
   agentName,
+  owner = null,
   open,
   onOpenChange,
   onChanged,
@@ -222,7 +228,21 @@ export function AgentTriggersDialog({
 
   const stagedTriggersProp = staged?.triggers ?? null
   const isStaging = !isValidAgentId(agentId) && stagedTriggersProp !== null
-  const canOperate = isValidAgentId(agentId) || isStaging
+  // The live-CRUD target. Explicit owner (e.g. a workforce) wins; otherwise
+  // fall back to the agent. Memoized on the owner's primitive fields (not the
+  // `owner` object identity) so an inline object literal from the caller still
+  // yields a referentially stable value safe for effect/callback deps.
+  //
+  // ASSUMPTION: callers pass owner by value (kind + id), never relying on a
+  // stable object reference. If a future caller memoizes `owner` and expects
+  // identity-based change detection, revisit these deps — an owner whose
+  // primitives are unchanged but whose reference changed will NOT re-run this.
+  const resolvedOwner = useMemo<TriggerOwnerRef | null>(() => {
+    if (owner) return owner
+    if (isValidAgentId(agentId)) return { kind: "agent", id: agentId }
+    return null
+  }, [owner?.kind, owner?.id, agentId]) // eslint-disable-line react-hooks/exhaustive-deps
+  const canOperate = resolvedOwner !== null || isStaging
 
   // Ref mirror so the dialog-open effect can pick a default selection without
   // re-running whenever the staged list changes.
@@ -286,10 +306,10 @@ export function AgentTriggersDialog({
   }, [t])
 
   const loadTriggers = useCallback(async (preferredTriggerId?: number | null) => {
-    if (!isValidAgentId(agentId)) return
+    if (!resolvedOwner) return
     setLoading(true)
     try {
-      const data = await listAgentTriggers(agentId)
+      const data = await listOwnerTriggers(resolvedOwner)
       setLiveTriggers(data)
 
       const currentSelectedId = preferredTriggerId ?? selectedTriggerIdRef.current
@@ -307,23 +327,23 @@ export function AgentTriggersDialog({
     } finally {
       setLoading(false)
     }
-  }, [agentId, setSelectedTriggerId, t])
+  }, [resolvedOwner, setSelectedTriggerId, t])
 
   const loadRuns = useCallback(async () => {
-    if (!isValidAgentId(agentId) || !selectedTrigger) {
+    if (!resolvedOwner || !selectedTrigger) {
       setRuns([])
       return
     }
     setRunsLoading(true)
     try {
-      setRuns(await listAgentTriggerRuns(agentId, selectedTrigger.id))
+      setRuns(await listOwnerTriggerRuns(resolvedOwner, selectedTrigger.id))
     } catch (err) {
       console.error(err)
       toast.error(err instanceof Error ? err.message : t("triggers.messages.runsLoadFailed"))
     } finally {
       setRunsLoading(false)
     }
-  }, [agentId, selectedTrigger, t])
+  }, [resolvedOwner, selectedTrigger, t])
 
   useEffect(() => {
     if (!open) return
@@ -516,8 +536,8 @@ export function AgentTriggersDialog({
       notifyChanged()
       return stagedToPseudoTrigger(stagedTrigger)
     }
-    if (!isValidAgentId(agentId)) return null
-    const saved = await createAgentTrigger(agentId, {
+    if (!resolvedOwner) return null
+    const saved = await createOwnerTrigger(resolvedOwner, {
       type,
       name: defaultNameForType(type),
       enabled,
@@ -581,11 +601,13 @@ export function AgentTriggersDialog({
         toast.success(checked ? t("triggers.messages.enabled") : t("triggers.messages.disabled"))
         return
       }
-      if (!isValidAgentId(agentId)) return
+      if (!resolvedOwner) return
       let preferredId: number | null = primary?.id ?? null
       if (checked) {
         if (primary) {
-          const updated = await updateAgentTrigger(agentId, primary.id, { enabled: true })
+          const updated = await updateOwnerTrigger(resolvedOwner, primary.id, {
+            enabled: true,
+          })
           preferredId = updated.id
         } else {
           const created = await createDefaultTrigger(type, true)
@@ -600,7 +622,7 @@ export function AgentTriggersDialog({
         const enabledTriggers = typeTriggers.filter((trigger) => trigger.enabled)
         await Promise.all(
           enabledTriggers.map((trigger) =>
-            updateAgentTrigger(agentId, trigger.id, { enabled: false }),
+            updateOwnerTrigger(resolvedOwner, trigger.id, { enabled: false }),
           ),
         )
       }
@@ -663,12 +685,12 @@ export function AgentTriggersDialog({
       return
     }
 
-    if (!isValidAgentId(agentId)) return
+    if (!resolvedOwner) return
     setBusy(true)
     try {
       const saved = selectedTrigger
-        ? await updateAgentTrigger(agentId, selectedTrigger.id, payload)
-        : await createAgentTrigger(agentId, payload)
+        ? await updateOwnerTrigger(resolvedOwner, selectedTrigger.id, payload)
+        : await createOwnerTrigger(resolvedOwner, payload)
       setSecretReveal(saved.webhook_secret ?? null)
       setSelectedTriggerId(saved.id)
       setForm(formFromTrigger(saved))
@@ -684,10 +706,10 @@ export function AgentTriggersDialog({
   }
 
   const handleRotateSecret = async () => {
-    if (!isValidAgentId(agentId) || !selectedTrigger || selectedTrigger.type !== "webhook") return
+    if (!resolvedOwner || !selectedTrigger || selectedTrigger.type !== "webhook") return
     setBusy(true)
     try {
-      const updated = await updateAgentTrigger(agentId, selectedTrigger.id, {
+      const updated = await updateOwnerTrigger(resolvedOwner, selectedTrigger.id, {
         rotate_secret: true,
       })
       setSecretReveal(updated.webhook_secret ?? null)
@@ -717,10 +739,10 @@ export function AgentTriggersDialog({
       toast.success(t("triggers.messages.deleted"))
       return
     }
-    if (!isValidAgentId(agentId)) return
+    if (!resolvedOwner) return
     setBusy(true)
     try {
-      await deleteAgentTrigger(agentId, trigger.id)
+      await deleteOwnerTrigger(resolvedOwner, trigger.id)
       setSelectedTriggerId(null)
       setRuns([])
       setSecretReveal(null)
@@ -737,7 +759,7 @@ export function AgentTriggersDialog({
   }
 
   const handleTest = async () => {
-    if (!isValidAgentId(agentId) || !selectedTrigger) return
+    if (!resolvedOwner || !selectedTrigger) return
     let payload: Record<string, unknown>
     try {
       const parsed = JSON.parse(testPayload || "{}")
@@ -752,7 +774,7 @@ export function AgentTriggersDialog({
 
     setBusy(true)
     try {
-      const result = await testAgentTrigger(agentId, selectedTrigger.id, {
+      const result = await testOwnerTrigger(resolvedOwner, selectedTrigger.id, {
         payload,
         source_event_id: sourceEventId.trim() || null,
       })

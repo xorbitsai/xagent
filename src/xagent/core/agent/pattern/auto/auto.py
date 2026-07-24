@@ -17,6 +17,13 @@ from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
 )
+from ...context.skill_tool import (
+    LOAD_SKILL_TOOL_NAME,
+    LOADED_SKILLS_METADATA_KEY,
+    SKILL_INDEX_METADATA_KEY,
+    LoadSkillTool,
+    build_load_skill_tool,
+)
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -37,6 +44,7 @@ from ..base import (
     RequiredToolCallError,
     append_user_message_preserving_turns,
     extract_required_tool_arguments,
+    iter_tool_function_payloads,
     truncate_prompt_preview,
 )
 from ..dag import DAGPattern
@@ -122,6 +130,7 @@ class AutoDecisionResult:
 
 DECISION_TOOL_NAME = "select_execution_pattern"
 MAX_DECISION_PARSE_ATTEMPTS = 2
+MAX_AUTO_ROUTING_SKILL_LOAD_FAILURES = 2
 AUTO_DECISION_REQUIRED_TOOL_MESSAGE = (
     "Auto routing failed because the model did not return the required "
     "decision tool call. Please retry."
@@ -417,6 +426,8 @@ class AutoPattern(AgentPattern):
         self.status = "idle"
         self.decision: AutoDecision | None = None
         self.decision_user_messages: dict[str, Any] | None = None
+        self.routing_skill_loads = 0
+        self.routing_skill_load_failures = 0
         self.selected_pattern: str | None = None
         self.react_state: dict[str, Any] | None = None
         self.dag_state: dict[str, Any] | None = None
@@ -504,6 +515,11 @@ class AutoPattern(AgentPattern):
                 "auto_before_decision", context=context, pattern=self
             )
             try:
+                load_skill_tool = await build_load_skill_tool(
+                    skill_manager=skill_manager,
+                    context=context,
+                    allowed_skills=allowed_skills,
+                )
                 decision_result = await self._decide(
                     context=context,
                     tools=tools,
@@ -511,6 +527,7 @@ class AutoPattern(AgentPattern):
                     compact_llm=compact_llm,
                     runtime=runtime,
                     memory_tools_available=memory_store is not None,
+                    load_skill_tool=load_skill_tool,
                 )
                 self.decision = decision_result.decision
                 final_answer_stream = decision_result.final_answer_stream
@@ -760,6 +777,7 @@ class AutoPattern(AgentPattern):
         compact_llm: Any | None,
         runtime: PatternRuntime,
         memory_tools_available: bool = False,
+        load_skill_tool: LoadSkillTool | None = None,
     ) -> AutoDecisionResult:
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
@@ -767,33 +785,35 @@ class AutoPattern(AgentPattern):
         # Re-derive the request-scoped language before routing so stale metadata
         # cannot bias the current decision prompt.
         self._clear_response_language(context)
-        call_llm = await prepare_llm_for_context(
-            llm=llm,
-            messages=context.get_messages_for_llm(),
-            context=context,
-        )
         await runtime.compact_context_if_needed(
             context=context,
             llm=compact_llm,
             metadata={"phase": "auto_decision"},
         )
 
-        base_messages = context.get_messages_for_llm()
         current_request = truncate_prompt_preview(
             latest_user_text(context) or "",
             limit=400,
         )
-        decision_prompt = self._decision_prompt(
-            tools,
-            current_request=current_request,
-            memory_tools_available=memory_tools_available,
-        )
-        decision_tools = [self._decision_tool_schema()]
         retry_feedback: str | None = None
         attempt = 0
         # This is a whole-loop budget, independent of the parse attempt budget.
         protocol_retries = 0
         while attempt < MAX_DECISION_PARSE_ATTEMPTS:
+            skill_loading_available = self._can_load_another_routing_skill(
+                context=context,
+                load_skill_tool=load_skill_tool,
+            )
+            decision_prompt = self._decision_prompt(
+                tools,
+                current_request=current_request,
+                memory_tools_available=memory_tools_available,
+                skill_loading_available=skill_loading_available,
+            )
+            routing_tools = [self._decision_tool_schema()]
+            if skill_loading_available and load_skill_tool is not None:
+                routing_tools.append(self._load_skill_tool_schema(load_skill_tool))
+            base_messages = context.get_messages_for_llm()
             messages = append_user_message_preserving_turns(
                 base_messages,
                 content=decision_prompt,
@@ -805,17 +825,28 @@ class AutoPattern(AgentPattern):
                     content=retry_feedback,
                     section_title="Auto routing retry feedback",
                 )
+            call_llm = await prepare_llm_for_context(
+                llm=llm,
+                messages=messages,
+                context=context,
+            )
             metadata: dict[str, Any] = {
                 "phase": "auto_decision",
                 **resolved_llm_metadata(call_llm),
             }
+            if self.routing_skill_loads:
+                metadata["routing_skill_loads"] = self.routing_skill_loads
+            if self.routing_skill_load_failures:
+                metadata["routing_skill_load_failures"] = (
+                    self.routing_skill_load_failures
+                )
             total_retries = attempt + protocol_retries
             if total_retries:
                 metadata["attempt"] = total_retries + 1
             await runtime.on_llm_start(
                 context=context,
                 messages=messages,
-                tools=decision_tools,
+                tools=routing_tools,
                 metadata=metadata,
             )
             answer_emitter = FinalAnswerStreamSession(
@@ -834,7 +865,7 @@ class AutoPattern(AgentPattern):
                 response = await runtime.run_streaming_llm_call(
                     call_llm,
                     messages=messages,
-                    tools=decision_tools,
+                    tools=routing_tools,
                     tool_choice="required",
                     thinking={"type": "disabled", "enable": False},
                     on_chunk=answer_streamer.handle_chunk,
@@ -855,7 +886,10 @@ class AutoPattern(AgentPattern):
                 if protocol_retries >= 1:
                     raise
                 protocol_retries += 1
-                retry_feedback = self._tool_protocol_retry_feedback(exc)
+                retry_feedback = self._tool_protocol_retry_feedback(
+                    exc,
+                    skill_loading_available=skill_loading_available,
+                )
                 logger.warning(
                     "AutoPattern routing received invalid %s tool protocol; "
                     "retrying decision. execution_id=%s attempt=%s",
@@ -863,12 +897,11 @@ class AutoPattern(AgentPattern):
                     getattr(context, "execution_id", None),
                     attempt + protocol_retries,
                 )
-                await runtime.checkpoint(
-                    "auto_decision_retry",
+                await self._checkpoint_decision_retry(
                     context=context,
-                    pattern=self,
+                    runtime=runtime,
+                    attempt=attempt + protocol_retries,
                     metadata={
-                        "attempt": attempt + protocol_retries,
                         "error": str(exc),
                         "protocol_code": exc.code,
                     },
@@ -883,6 +916,90 @@ class AutoPattern(AgentPattern):
             await runtime.on_llm_end(
                 context=context, response=response, metadata=metadata
             )
+            function_payloads = iter_tool_function_payloads(response)
+            if skill_loading_available and len(function_payloads) != 1:
+                attempt += 1
+                if attempt >= MAX_DECISION_PARSE_ATTEMPTS:
+                    raise RequiredToolCallError(
+                        owner="AutoPattern routing",
+                        tool_name="exactly one routing tool",
+                        attempts=attempt,
+                        user_message=AUTO_DECISION_REQUIRED_TOOL_MESSAGE,
+                    )
+                retry_feedback = (
+                    "The previous response must call exactly one routing tool. "
+                    f"Call {LOAD_SKILL_TOOL_NAME} alone to load one clearly "
+                    "relevant skill, or call "
+                    f"{DECISION_TOOL_NAME} alone to choose the execution pattern."
+                )
+                await self._checkpoint_decision_retry(
+                    context=context,
+                    runtime=runtime,
+                    attempt=attempt,
+                    metadata={"error": "expected exactly one routing tool call"},
+                )
+                continue
+
+            function_payload = (
+                function_payloads[0] if len(function_payloads) == 1 else None
+            )
+            if (
+                skill_loading_available
+                and load_skill_tool is not None
+                and function_payload is not None
+                and function_payload.get("name") == LOAD_SKILL_TOOL_NAME
+            ):
+                try:
+                    arguments = self._coerce_arguments(
+                        function_payload.get("arguments", {})
+                    )
+                except (AutoDecisionArgumentsError, TypeError) as exc:
+                    attempt += 1
+                    if attempt >= MAX_DECISION_PARSE_ATTEMPTS:
+                        raise
+                    retry_feedback = (
+                        f"The previous {LOAD_SKILL_TOOL_NAME} arguments were "
+                        f"invalid: {exc}. Call it with one exact skill_name from "
+                        "the available skill index, or choose the execution "
+                        f"pattern with {DECISION_TOOL_NAME}."
+                    )
+                    await self._checkpoint_decision_retry(
+                        context=context,
+                        runtime=runtime,
+                        attempt=attempt,
+                        metadata={"error": str(exc)},
+                    )
+                    continue
+
+                skill_load_result = await self._execute_routing_skill_load(
+                    context=context,
+                    runtime=runtime,
+                    load_skill_tool=load_skill_tool,
+                    arguments=arguments,
+                )
+                if skill_load_result.get("success"):
+                    # A successful load changes the routing context, so the model
+                    # receives fresh parse/protocol budgets for the new decision.
+                    retry_feedback = None
+                    attempt = 0
+                    protocol_retries = 0
+                elif (
+                    self.routing_skill_load_failures
+                    >= MAX_AUTO_ROUTING_SKILL_LOAD_FAILURES
+                ):
+                    retry_feedback = (
+                        f"The {LOAD_SKILL_TOOL_NAME} call failed again. Skill "
+                        "loading is unavailable for the rest of this routing cycle; "
+                        f"call {DECISION_TOOL_NAME} to continue without it."
+                    )
+                else:
+                    retry_feedback = (
+                        f"The {LOAD_SKILL_TOOL_NAME} call failed. Retry it once if "
+                        "the skill is still clearly relevant, or call "
+                        f"{DECISION_TOOL_NAME} to continue without it."
+                    )
+                continue
+
             try:
                 decision = self._parse_decision(response, attempts=attempt + 1)
             except RequiredToolCallError:
@@ -899,10 +1016,10 @@ class AutoPattern(AgentPattern):
                     getattr(context, "execution_id", None),
                     attempt,
                 )
-                await runtime.checkpoint(
-                    "auto_decision_retry",
+                await self._checkpoint_decision_retry(
                     context=context,
-                    pattern=self,
+                    runtime=runtime,
+                    attempt=attempt,
                     metadata={
                         "attempt": attempt,
                         "failure_reason": REQUIRED_TOOL_CALL_FAILURE_REASON,
@@ -921,10 +1038,10 @@ class AutoPattern(AgentPattern):
                     getattr(context, "execution_id", None),
                     exc,
                 )
-                await runtime.checkpoint(
-                    "auto_decision_retry",
+                await self._checkpoint_decision_retry(
                     context=context,
-                    pattern=self,
+                    runtime=runtime,
+                    attempt=attempt,
                     metadata={
                         "attempt": attempt,
                         "error": str(exc),
@@ -940,6 +1057,126 @@ class AutoPattern(AgentPattern):
                 ),
             )
         raise RuntimeError("AutoPattern decision retry loop exited unexpectedly.")
+
+    async def _checkpoint_decision_retry(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        attempt: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        await runtime.checkpoint(
+            "auto_decision_retry",
+            context=context,
+            pattern=self,
+            metadata={"attempt": attempt, **metadata},
+        )
+
+    def _can_load_another_routing_skill(
+        self,
+        *,
+        context: Any,
+        load_skill_tool: LoadSkillTool | None,
+    ) -> bool:
+        if (
+            load_skill_tool is None
+            or self.routing_skill_loads
+            or self.routing_skill_load_failures >= MAX_AUTO_ROUTING_SKILL_LOAD_FAILURES
+        ):
+            return False
+        metadata = self._context_metadata(context)
+        if metadata is None:
+            return False
+        skill_index = metadata.get(SKILL_INDEX_METADATA_KEY)
+        if not isinstance(skill_index, list):
+            return False
+        loaded = metadata.get(LOADED_SKILLS_METADATA_KEY)
+        loaded_names = set(loaded) if isinstance(loaded, list) else set()
+        if loaded_names:
+            return False
+        return any(
+            isinstance(entry, dict) and str(entry.get("name") or "").strip()
+            for entry in skill_index
+        )
+
+    async def _execute_routing_skill_load(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        load_skill_tool: LoadSkillTool,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        skill_name = str(arguments.get("skill_name") or "").strip()
+        tool_call_id = (
+            "auto_load_skill_"
+            f"{self.routing_skill_loads + self.routing_skill_load_failures + 1}"
+        )
+        assistant_tool_call = {
+            "id": tool_call_id,
+            "type": "function",
+            "function": {
+                "name": LOAD_SKILL_TOOL_NAME,
+                "arguments": json.dumps({"skill_name": skill_name}, ensure_ascii=False),
+            },
+        }
+        trace_tool_call = {
+            "id": tool_call_id,
+            "name": LOAD_SKILL_TOOL_NAME,
+            "args": {"skill_name": skill_name},
+        }
+        context.add_assistant_message(
+            "",
+            tool_calls=[assistant_tool_call],
+            metadata={"source": "auto_routing"},
+        )
+        await runtime.on_tool_start(tool_call=trace_tool_call)
+        try:
+            result = await load_skill_tool.execute(skill_name=skill_name)
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                "success": False,
+                "skill_name": skill_name,
+                "error": str(exc),
+            }
+            await runtime.on_tool_error(
+                tool_call=trace_tool_call,
+                error=exc,
+                result=result,
+            )
+        else:
+            if result.get("success"):
+                await runtime.on_tool_end(tool_call=trace_tool_call, result=result)
+            else:
+                await runtime.on_tool_error(
+                    tool_call=trace_tool_call,
+                    error=RuntimeError(
+                        str(result.get("error") or "Skill loading failed.")
+                    ),
+                    result=result,
+                )
+        context.add_tool_result(
+            LOAD_SKILL_TOOL_NAME,
+            result,
+            tool_call_id=tool_call_id,
+        )
+        if result.get("success"):
+            self.routing_skill_loads += 1
+        else:
+            self.routing_skill_load_failures += 1
+        await runtime.checkpoint(
+            "auto_skill_loaded" if result.get("success") else "auto_skill_load_failed",
+            context=context,
+            pattern=self,
+            metadata={
+                "skill_name": skill_name,
+                "routing_skill_loads": self.routing_skill_loads,
+                "routing_skill_load_failures": self.routing_skill_load_failures,
+                "success": bool(result.get("success")),
+            },
+        )
+        return result
 
     def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
         return (
@@ -964,7 +1201,16 @@ class AutoPattern(AgentPattern):
             )
         )
 
-    def _tool_protocol_retry_feedback(self, error: LLMToolProtocolError) -> str:
+    def _tool_protocol_retry_feedback(
+        self,
+        error: LLMToolProtocolError,
+        *,
+        skill_loading_available: bool,
+    ) -> str:
+        available_tools = [DECISION_TOOL_NAME]
+        if skill_loading_available:
+            available_tools.append(LOAD_SKILL_TOOL_NAME)
+        available_tool_text = ", ".join(available_tools)
         if error.code == "malformed_tool_arguments":
             correction = (
                 "The provider rejected the previous routing tool call because "
@@ -979,9 +1225,10 @@ class AutoPattern(AgentPattern):
             correction = "The provider rejected the previous routing tool call."
         return (
             f"{correction} Retry by calling exactly one currently available "
-            f"routing tool: {DECISION_TOOL_NAME}. Use the exact tool name and "
+            f"routing tool: {available_tool_text}. Use the exact tool name and "
             "one complete JSON object matching its schema. Do not answer in "
-            "natural language."
+            "natural language. Do not repeat load_skill for a skill already "
+            "loaded into the system context."
         )
 
     def _truncate_retry_preview(self, value: str, *, limit: int = 1200) -> str:
@@ -993,6 +1240,7 @@ class AutoPattern(AgentPattern):
         *,
         current_request: str = "",
         memory_tools_available: bool = False,
+        skill_loading_available: bool = False,
     ) -> str:
         memory_rule = (
             "If the latest user message asks to remember, store, forget, or "
@@ -1025,10 +1273,34 @@ class AutoPattern(AgentPattern):
             "response_language from retrieved memories, source documents, "
             "tool results, or earlier turns. "
         )
+        skill_rule = (
+            "The system context lists available skills. Before choosing an "
+            "execution pattern, if one skill clearly matches the full current "
+            f"request, call {LOAD_SKILL_TOOL_NAME} as the only tool call so its "
+            "complete guidance can inform routing and planning. The router will "
+            "run again after the skill loads. Do not load a skill merely because "
+            "it matches one incidental word. If no available skill clearly "
+            "matches, choose the execution pattern now. Call exactly one routing "
+            "tool in this response. "
+            if skill_loading_available
+            else "Use any relevant skill guidance already present in the system "
+            "context to inform this routing decision. Call "
+            f"{DECISION_TOOL_NAME} exactly once now. "
+        )
+        routing_requirement = (
+            f"Call exactly one routing tool. If calling {DECISION_TOOL_NAME}, "
+            if skill_loading_available
+            else f"You must call the {DECISION_TOOL_NAME} tool exactly once. "
+        )
+        action_requirement = (
+            f"action must be one of: {available_actions}. "
+            if not skill_loading_available
+            else f"its action must be one of: {available_actions}. "
+        )
         return (
             "Choose how the agent should handle the user request. "
-            f"You must call the {DECISION_TOOL_NAME} tool exactly once. "
-            f"action must be one of: {available_actions}. "
+            f"{routing_requirement}"
+            f"{action_requirement}"
             f"{language_anchor}"
             "Use final_answer for simple conversational replies that need no tools; "
             "when action is final_answer, you must include a complete non-empty "
@@ -1043,6 +1315,7 @@ class AutoPattern(AgentPattern):
             "Traditional Chinese to match the request script; do not use generic "
             "Chinese. This is a routing decision field only; do not translate or "
             "rewrite the request. "
+            f"{skill_rule}"
             "If the latest user message explicitly asks to call or use an available "
             "tool, to pause for user input, or to wait for a user choice, choose "
             "react; do not choose final_answer merely to restate or paraphrase the "
@@ -1091,8 +1364,8 @@ class AutoPattern(AgentPattern):
             "multi-step planning, dependency management, parallel subtask execution, "
             "multiple coordinated deliverables, or user-visible DAG execution. "
             f"{tool_capability_summary} Do not call those execution tools during "
-            "this routing decision; only call the routing tool provided in this "
-            "request."
+            "this routing decision; call exactly one of the routing tools provided "
+            "in this request."
         )
 
     @staticmethod
@@ -1216,6 +1489,19 @@ class AutoPattern(AgentPattern):
                     ],
                     "additionalProperties": False,
                 },
+            },
+        }
+
+    @staticmethod
+    def _load_skill_tool_schema(load_skill_tool: LoadSkillTool) -> dict[str, Any]:
+        parameters = load_skill_tool.args_schema.model_json_schema()
+        parameters.pop("title", None)
+        return {
+            "type": "function",
+            "function": {
+                "name": load_skill_tool.name,
+                "description": load_skill_tool.description,
+                "parameters": parameters,
             },
         }
 
@@ -1356,6 +1642,8 @@ class AutoPattern(AgentPattern):
             "status": self.status,
             "decision": self.decision.to_dict() if self.decision is not None else None,
             "decision_user_messages": self.decision_user_messages,
+            "routing_skill_loads": self.routing_skill_loads,
+            "routing_skill_load_failures": self.routing_skill_load_failures,
             "selected_pattern": self.selected_pattern,
             "react_state": self.react_state,
             "dag_state": self.dag_state,
@@ -1373,6 +1661,10 @@ class AutoPattern(AgentPattern):
             dict(decision_user_messages)
             if isinstance(decision_user_messages, dict)
             else None
+        )
+        self.routing_skill_loads = int(state.get("routing_skill_loads", 0) or 0)
+        self.routing_skill_load_failures = int(
+            state.get("routing_skill_load_failures", 0) or 0
         )
         self.selected_pattern = state.get("selected_pattern")
         self.react_state = state.get("react_state")
@@ -1486,6 +1778,8 @@ class AutoPattern(AgentPattern):
         )
         self.decision = None
         self.decision_user_messages = None
+        self.routing_skill_loads = 0
+        self.routing_skill_load_failures = 0
         self.selected_pattern = None
         self.last_result = None
         self.status = "idle"
@@ -1500,6 +1794,8 @@ class AutoPattern(AgentPattern):
             MEMORY_CONTEXT_METADATA_KEY,
             SELECTED_SKILL_METADATA_KEY,
             SKILL_CONTEXT_METADATA_KEY,
+            SKILL_INDEX_METADATA_KEY,
+            LOADED_SKILLS_METADATA_KEY,
         ):
             metadata.pop(key, None)
 

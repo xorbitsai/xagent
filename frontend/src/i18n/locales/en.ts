@@ -3405,6 +3405,16 @@ Build when you need.`,
       manage_key: "Manage API Key"
     }
   },
+  deploy_workforce: {
+    title: "Deploy via REST API / SDK",
+    desc: "Create runs on this workforce with a workforce API key, then poll GET /v1/chat/tasks/{id} for results.",
+    copy: "Copy",
+    new_key: "Copy this key now — it won't be shown again.",
+    keys_title: "API keys",
+    label_placeholder: "Label (optional), e.g. CI pipeline",
+    create_key: "Create key",
+    no_keys: "No API keys yet."
+  },
   api_key: {
     title: "API Key",
     subtitle: "SDK / REST API credential",
@@ -3482,6 +3492,10 @@ Build when you need.`,
     never: "Never",
     filteredByAgent: "Filtered agent",
     clearFilter: "Clear filter",
+    tabs: {
+      agent: "Agent Keys",
+      personal: "Personal Keys"
+    },
     stats: {
       totalKeys: "Total Keys",
       totalKeysHint: "across all agents",
@@ -3538,6 +3552,56 @@ Build when you need.`,
       regenerated: "API key regenerated",
       deleted: "API key deleted",
       actionFailed: "Action failed",
+      copied: "Copied to clipboard",
+      copyFailed: "Failed to copy to clipboard"
+    }
+  },
+  personalApiKeys: {
+    title: "Personal Keys",
+    description: "Manage your personal SDK and REST API keys.",
+    create: "Create Personal Key",
+    createForMe: "Create Personal Key for Me",
+    noData: "No personal API keys yet.",
+    noResults: "No keys match your search.",
+    searchPlaceholder: "Search keys or owners...",
+    stats: {
+      totalKeys: "Total Keys",
+      totalKeysHint: "personal keys",
+      activeKeys: "Active Keys",
+      activeKeysHint: "accepting requests"
+    },
+    columns: {
+      key: "Secret Key",
+      owner: "Owner",
+      status: "Status",
+      expires: "Expiry",
+      created: "Created"
+    },
+    status: {
+      active: "Active",
+      expired: "Expired",
+      revoked: "Revoked"
+    },
+    neverExpires: "Never",
+    actions: {
+      copy: "Copy personal API key",
+      revoke: "Revoke"
+    },
+    reveal: {
+      title: "Personal API Key Created",
+      warning: "Copy this key now — it is shown only once."
+    },
+    confirm: {
+      revokeTitle: "Revoke personal API key?",
+      revokeOwnDescription: "Revoking immediately invalidates this key.",
+      revokeOtherDescription: "Revoke this personal key for {owner}?"
+    },
+    messages: {
+      loadFailed: "Failed to load personal API keys",
+      created: "Personal API key created",
+      createFailed: "Failed to create personal API key",
+      revoked: "Personal API key revoked",
+      revokeFailed: "Failed to revoke personal API key",
       copied: "Copied to clipboard",
       copyFailed: "Failed to copy to clipboard"
     }
@@ -3749,9 +3813,57 @@ Build when you need.`,
       publish: "Publish",
       unpublish: "Unpublish",
       archive: "Archive",
+      deploy: "Deploy",
+      triggers: "Triggers",
+      share: "Share",
+      embed: "Embed",
       createTeam: "Create Team",
       change: "Change",
       addAgent: "Add Agent",
+    },
+    share_link: {
+      title: "Share Workforce",
+      section_title: "Public Share Link",
+      desc: "Generate a public page anyone can open to chat with this workforce.",
+      publish_required: "Please publish this workforce before generating a share link.",
+      public_url: "Public URL",
+      anyone_access: "Anyone with this link can start a public chat with this workforce.",
+      generate_btn: "Generate Link",
+      rotate_btn: "Reset Link",
+      disable_btn: "Disable Link",
+      messages: {
+        enabled: "Share link generated",
+        rotated: "Share link rotated",
+        disabled: "Share link disabled",
+        failed: "Share link action failed",
+        link_copied: "Link copied to clipboard",
+      },
+    },
+    widget: {
+      title: "Embed Widget",
+      widget_enabled: "Widget Enabled",
+      widget_enabled_desc: "Allow this widget to be embedded on external sites.",
+      allowed_domains: "Allowed Domains",
+      allowed_domains_desc: "Restrict widget embedding to specific domains. Use * for any domain.",
+      domain_placeholder: "e.g. example.com",
+      add_btn: "Add",
+      invalid_domain: "Enter a valid host, e.g. example.com (no scheme or path), or * for any domain.",
+      no_domains: "No domains configured. The widget will block all embeds unless * is added.",
+      snippet_title: "Embed Snippet",
+      snippet_desc: "Copy and paste this script tag into the <body> of your website.",
+      rotate_btn: "Rotate Key",
+      rotating: "Rotating…",
+      rotate_confirm: "Rotating the widget key will immediately break all existing embeds. Re-copy and redeploy the snippet after rotation. Continue?",
+      copy_btn: "Copy Snippet",
+      publish_required: "Please publish this workforce before enabling the widget.",
+      messages: {
+        enabled: "Widget enabled",
+        disabled: "Widget disabled",
+        updated: "Widget configuration updated",
+        rotated: "Widget key rotated",
+        failed: "Widget action failed",
+        copied: "Copied to clipboard",
+      },
     },
     fields: {
       name: "Name",

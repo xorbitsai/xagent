@@ -6,14 +6,16 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from ...core.utils.api_key import ApiKeyKind, generate_api_key
 from ..models.agent import Agent, AgentOrigin
 from ..models.agent_api_key import AgentApiKey
+from ..models.user import User
 from ..models.user_api_key import UserApiKey
+from ..models.workforce import Workforce
 from ..schemas.agent_api_key import (
     AgentApiKeyListItem,
     AgentApiKeyStats,
@@ -23,10 +25,15 @@ from ..schemas.agent_api_key import (
 )
 from ..schemas.user_api_key import (
     PersonalAPIKeyCreateResponse,
+    PersonalAPIKeyListItem,
     PersonalAPIKeyMetadata,
+    PersonalAPIKeyOwner,
     PersonalAPIKeyRevokeResponse,
+    PersonalAPIKeyStatus,
 )
+from ..utils.db_timezone import normalize_datetime_from_db
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
+from .personal_key_scope import PersonalKeyAccessScope
 
 logger = logging.getLogger(__name__)
 
@@ -194,29 +201,73 @@ class AgentApiKeyService:
             Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
         )
 
+    def _owned_workforces_query(self, user_id: int) -> Any:
+        # Workforce ownership is owner-only (no team co-ownership concept,
+        # matching WorkforcePolicy.can_edit_workforce for non-admins). The
+        # admin override in the policy is deliberately NOT mirrored here:
+        # an admin's personal API Keys page should not surface every
+        # workforce key in the system.
+        return self.db.query(Workforce.id).filter(Workforce.owner_user_id == user_id)
+
+    def _owned_key_clause(self, user_id: int) -> Any:
+        """Filter matching keys bound to an owned agent OR an owned workforce.
+
+        A key row has exactly one of ``agent_id`` / ``workforce_id`` set,
+        so the two IN-branches are disjoint.
+        """
+        return or_(
+            AgentApiKey.agent_id.in_(self._owned_agents_query(user_id)),
+            AgentApiKey.workforce_id.in_(self._owned_workforces_query(user_id)),
+        )
+
     def create_key(
-        self, user_id: int, agent_id: int, label: str | None
+        self,
+        user_id: int,
+        agent_id: int | None,
+        label: str | None,
+        workforce_id: int | None = None,
     ) -> tuple[AgentApiKeyListItem, str] | None:
-        """Add a new key for ``agent_id`` without touching existing ones.
+        """Add a new key for the given owner without touching existing ones.
+
+        Exactly one of ``agent_id`` / ``workforce_id`` must be provided
+        (the request schema enforces this; repeated here so non-endpoint
+        callers can't create an ownerless or double-owned row).
 
         Returns ``(list_item, full_key)`` where ``full_key`` is the
-        one-shot plaintext, or ``None`` if the agent doesn't exist / isn't
+        one-shot plaintext, or ``None`` if the owner doesn't exist / isn't
         owned by ``user_id`` (the caller should map that to 404).
         """
-        agent = (
-            self.db.query(Agent)
-            .filter(Agent.id == agent_id)
-            .filter(Agent.id.in_(self._owned_agents_query(user_id)))
-            .first()
-        )
-        if agent is None:
-            return None
+        if (agent_id is None) == (workforce_id is None):
+            raise ValueError("Exactly one of agent_id or workforce_id must be provided")
+
+        owner_name: str
+        if agent_id is not None:
+            agent = (
+                self.db.query(Agent)
+                .filter(Agent.id == agent_id)
+                .filter(Agent.id.in_(self._owned_agents_query(user_id)))
+                .first()
+            )
+            if agent is None:
+                return None
+            owner_name = str(agent.name)
+        else:
+            workforce = (
+                self.db.query(Workforce)
+                .filter(Workforce.id == workforce_id)
+                .filter(Workforce.owner_user_id == user_id)
+                .first()
+            )
+            if workforce is None:
+                return None
+            owner_name = str(workforce.name)
 
         full_key, key_prefix, key_hash = generate_api_key(
             self.db, kind=ApiKeyKind.AGENT
         )
         row = AgentApiKey(
             agent_id=agent_id,
+            workforce_id=workforce_id,
             label=label,
             key_prefix=key_prefix,
             key_hash=key_hash,
@@ -229,18 +280,23 @@ class AgentApiKeyService:
             raise KeyRotationConflict(str(exc)) from exc
         self.db.refresh(row)
         logger.info(
-            "Created API key for agent %s (prefix=%s, label=%r)",
-            agent_id,
+            "Created API key for %s %s (prefix=%s, label=%r)",
+            "agent" if agent_id is not None else "workforce",
+            agent_id if agent_id is not None else workforce_id,
             key_prefix,
             label,
         )
-        return self._to_list_item(row, str(agent.name)), full_key
+        return self._to_list_item(row, owner_name), full_key
 
-    def _to_list_item(self, row: AgentApiKey, agent_name: str) -> AgentApiKeyListItem:
+    def _to_list_item(self, row: AgentApiKey, owner_name: str) -> AgentApiKeyListItem:
+        is_agent_key = row.agent_id is not None
         return AgentApiKeyListItem(
             id=int(row.id),
-            agent_id=int(row.agent_id),
-            agent_name=agent_name,
+            owner_type="agent" if is_agent_key else "workforce",
+            agent_id=int(row.agent_id) if is_agent_key else None,
+            agent_name=owner_name if is_agent_key else None,
+            workforce_id=None if is_agent_key else int(row.workforce_id),
+            workforce_name=None if is_agent_key else owner_name,
             label=row.label,
             key_prefix=row.key_prefix,
             masked_key=_masked_key(row),
@@ -249,28 +305,47 @@ class AgentApiKeyService:
             created_at=row.created_at,
         )
 
+    def _owner_name(self, row: AgentApiKey) -> str:
+        """Display name of the key's owner (agent or workforce).
+
+        Callers load the row via :meth:`_find_owned_key`, which eager-loads
+        both relationships, so this is a memory access either way.
+        """
+        owner = row.agent if row.agent_id is not None else row.workforce
+        return str(owner.name) if owner is not None else ""
+
     def list_keys_for_user(
-        self, user_id: int, agent_id: int | None = None
+        self,
+        user_id: int,
+        agent_id: int | None = None,
+        workforce_id: int | None = None,
     ) -> list[AgentApiKeyListItem]:
         query = (
-            self.db.query(AgentApiKey, Agent.name)
-            .join(Agent, Agent.id == AgentApiKey.agent_id)
-            .filter(Agent.id.in_(self._owned_agents_query(user_id)))
+            self.db.query(AgentApiKey, Agent.name, Workforce.name)
+            .outerjoin(Agent, Agent.id == AgentApiKey.agent_id)
+            .outerjoin(Workforce, Workforce.id == AgentApiKey.workforce_id)
+            .filter(self._owned_key_clause(user_id))
         )
         if agent_id is not None:
             query = query.filter(AgentApiKey.agent_id == agent_id)
+        if workforce_id is not None:
+            query = query.filter(AgentApiKey.workforce_id == workforce_id)
         rows = query.order_by(
             AgentApiKey.created_at.desc(), AgentApiKey.id.desc()
         ).all()
-        return [self._to_list_item(row, agent_name) for row, agent_name in rows]
+        return [
+            self._to_list_item(
+                row, agent_name if row.agent_id is not None else workforce_name
+            )
+            for row, agent_name, workforce_name in rows
+        ]
 
     def get_stats_for_user(self, user_id: int) -> AgentApiKeyStats:
         # Aggregate in SQL rather than loading every row into memory --
         # revoked keys are kept forever as an audit trail, so this table
         # only grows for an active user.
-        owned = self._owned_agents_query(user_id)
         current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-        base_filter = AgentApiKey.agent_id.in_(owned)
+        base_filter = self._owned_key_clause(user_id)
 
         total_keys = (
             self.db.query(func.count(AgentApiKey.id)).filter(base_filter).scalar() or 0
@@ -305,13 +380,16 @@ class AgentApiKeyService:
 
     def _find_owned_key(self, user_id: int, key_id: int) -> AgentApiKey | None:
         # joinedload avoids an N+1 lazy-load: every caller of this method
-        # (pause_key/resume_key/regenerate_key) reads ``row.agent.name``
-        # to build the response.
+        # (pause_key/resume_key/regenerate_key) reads the owner's name via
+        # ``_owner_name`` to build the response.
         return (
             self.db.query(AgentApiKey)
-            .options(joinedload(AgentApiKey.agent))
+            .options(
+                joinedload(AgentApiKey.agent),
+                joinedload(AgentApiKey.workforce),
+            )
             .filter(AgentApiKey.id == key_id)
-            .filter(AgentApiKey.agent_id.in_(self._owned_agents_query(user_id)))
+            .filter(self._owned_key_clause(user_id))
             .first()
         )
 
@@ -323,7 +401,7 @@ class AgentApiKeyService:
             row.paused_at = datetime.now(timezone.utc)
             self.db.commit()
             self.db.refresh(row)
-        return self._to_list_item(row, row.agent.name)
+        return self._to_list_item(row, self._owner_name(row))
 
     def resume_key(self, user_id: int, key_id: int) -> AgentApiKeyListItem | None:
         row = self._find_owned_key(user_id, key_id)
@@ -333,7 +411,7 @@ class AgentApiKeyService:
             row.paused_at = None  # type: ignore[assignment]
             self.db.commit()
             self.db.refresh(row)
-        return self._to_list_item(row, row.agent.name)
+        return self._to_list_item(row, self._owner_name(row))
 
     def regenerate_key(
         self, user_id: int, key_id: int
@@ -364,7 +442,7 @@ class AgentApiKeyService:
             raise KeyRotationConflict(str(exc)) from exc
         self.db.refresh(row)
         logger.info("Regenerated API key %s (prefix=%s)", key_id, key_prefix)
-        return self._to_list_item(row, row.agent.name), full_key
+        return self._to_list_item(row, self._owner_name(row)), full_key
 
     def delete_key(self, user_id: int, key_id: int) -> bool:
         """Soft-revoke a key by id. Returns False if not found/not owned."""
@@ -462,3 +540,64 @@ class UserApiKeyService:
         self.db.refresh(row)
         logger.info("Revoked personal API key %s for user %s", key_id, user_id)
         return PersonalAPIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)
+
+
+class PersonalApiKeyManagementService:
+    """Lists and revokes personal keys within an application-resolved scope."""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    @staticmethod
+    def _status(row: UserApiKey, now: datetime) -> PersonalAPIKeyStatus:
+        if row.revoked_at is not None:
+            return "revoked"
+        if (
+            row.expires_at is not None
+            and normalize_datetime_from_db(row.expires_at) <= now
+        ):
+            return "expired"
+        return "active"
+
+    def list_keys(self, scope: PersonalKeyAccessScope) -> list[PersonalAPIKeyListItem]:
+        rows = (
+            self.db.query(UserApiKey, User)
+            .join(User, User.id == UserApiKey.user_id)
+            .filter(UserApiKey.user_id.in_(scope.owner_user_ids))
+            .order_by(UserApiKey.created_at.desc(), UserApiKey.id.desc())
+            .all()
+        )
+        now = datetime.now(timezone.utc)
+        return [
+            PersonalAPIKeyListItem(
+                id=int(row.id),
+                key_prefix=row.key_prefix,
+                masked_key=f"xag_personal_{row.key_prefix}_••••••••",
+                revoked_at=row.revoked_at,
+                expires_at=row.expires_at,
+                created_at=row.created_at,
+                status=self._status(row, now),
+                owner=PersonalAPIKeyOwner(
+                    id=int(owner.id), username=owner.username, email=owner.email
+                ),
+            )
+            for row, owner in rows
+        ]
+
+    def revoke_key(
+        self, scope: PersonalKeyAccessScope, key_id: int
+    ) -> PersonalAPIKeyRevokeResponse | None:
+        row = (
+            self.db.query(UserApiKey)
+            .filter(
+                UserApiKey.id == key_id,
+                UserApiKey.user_id.in_(scope.owner_user_ids),
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        result = UserApiKeyService(self.db).revoke_key(int(row.user_id), key_id)
+        if not result.revoked and result.revoked_at is None:
+            return None
+        return result

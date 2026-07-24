@@ -137,7 +137,6 @@ class ToolRegistry:
                 pptx_tool,
                 skill_tools,
                 sound_effect_tool,
-                special_image_tools,
                 sql_tool,
                 translate_json,
                 video_tool,
@@ -281,6 +280,42 @@ class ToolFactory:
 
     @staticmethod
     async def create_all_tools(
+        config: BaseToolConfig, apply_user_override_filter: bool = True
+    ) -> List[Tool]:
+        """Create tools within the config's optional prepared-runtime boundary.
+
+        Release runs after partial preparation, while an active prepare/build
+        failure remains primary if ordinary cleanup also fails.
+        """
+        prepare_factory_runtime = getattr(type(config), "prepare_factory_runtime", None)
+        release_factory_runtime = getattr(
+            type(config), "release_prepared_factory_runtime", None
+        )
+        primary_error: BaseException | None = None
+        try:
+            if callable(prepare_factory_runtime):
+                await prepare_factory_runtime(config)
+            return await ToolFactory._create_all_tools_prepared(
+                config,
+                apply_user_override_filter=apply_user_override_filter,
+            )
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if callable(release_factory_runtime):
+                try:
+                    release_factory_runtime(config)
+                except Exception:
+                    if primary_error is None:
+                        raise
+                    logger.warning(
+                        "Failed to release prepared tool-factory runtime",
+                        exc_info=True,
+                    )
+
+    @staticmethod
+    async def _create_all_tools_prepared(
         config: BaseToolConfig, apply_user_override_filter: bool = True
     ) -> List[Tool]:
         """

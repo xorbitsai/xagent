@@ -3,6 +3,7 @@ Agent Tool - Convert published agents into callable tools
 """
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 from uuid import uuid4
@@ -237,6 +238,123 @@ def _string_override(overrides: Mapping[str, Any], *keys: str) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value
     return None
+
+
+@dataclass(frozen=True)
+class PublishedAgentToolQueryPolicy:
+    """Detached, normalized policy for published-agent enumeration."""
+
+    injected_agent_ids: tuple[int, ...] | None
+    call_stack: tuple[int, ...]
+    excluded_agent_ids: tuple[int, ...]
+    include_draft: bool
+    draft_agent_ids: tuple[int, ...]
+    enable_global_agent_tools: bool
+    allow_cross_user_agent_ids: bool
+
+    @property
+    def query_required(self) -> bool:
+        if self.injected_agent_ids is not None:
+            return bool(self.injected_agent_ids)
+        return self.enable_global_agent_tools
+
+
+@dataclass(frozen=True)
+class PublishedAgentToolRecord:
+    """ORM-free fields needed to construct one published-agent tool."""
+
+    id: int
+    name: str
+    description: str | None
+    instructions: str | None
+    status: str
+
+
+def _resolve_published_agent_tool_policy(
+    *,
+    excluded_agent_id: Optional[int],
+    include_draft: bool,
+    draft_agent_ids_to_include: Optional[list[int]],
+    allowed_agent_ids: Optional[list[int]],
+    agent_tool_overrides: Optional[Mapping[Any, Any]],
+    enable_global_agent_tools: bool,
+    allow_cross_user_agent_ids: bool,
+    agent_call_stack: Optional[list[int]],
+) -> tuple[PublishedAgentToolQueryPolicy, dict[int, dict[str, Any]]]:
+    normalized_overrides = _normalize_agent_tool_overrides(agent_tool_overrides)
+    normalized_injected_agent_ids = _normalize_agent_ids(allowed_agent_ids)
+    normalized_call_stack = _normalize_agent_ids(agent_call_stack) or []
+    excluded_agent_ids = set(normalized_call_stack)
+
+    if excluded_agent_id is not None:
+        try:
+            excluded_agent_ids.add(int(excluded_agent_id))
+        except (TypeError, ValueError):
+            pass
+
+    if (
+        normalized_injected_agent_ids is None
+        and not enable_global_agent_tools
+        and normalized_overrides
+    ):
+        normalized_injected_agent_ids = list(normalized_overrides.keys())
+
+    if normalized_injected_agent_ids is not None:
+        normalized_injected_agent_ids = [
+            agent_id
+            for agent_id in normalized_injected_agent_ids
+            if agent_id not in excluded_agent_ids
+        ]
+
+    normalized_draft_agent_ids = _normalize_agent_ids(draft_agent_ids_to_include) or []
+    normalized_draft_agent_ids = [
+        agent_id
+        for agent_id in normalized_draft_agent_ids
+        if agent_id not in excluded_agent_ids
+    ]
+
+    return (
+        PublishedAgentToolQueryPolicy(
+            injected_agent_ids=(
+                tuple(normalized_injected_agent_ids)
+                if normalized_injected_agent_ids is not None
+                else None
+            ),
+            call_stack=tuple(normalized_call_stack),
+            excluded_agent_ids=tuple(sorted(excluded_agent_ids)),
+            include_draft=include_draft,
+            draft_agent_ids=tuple(normalized_draft_agent_ids),
+            enable_global_agent_tools=enable_global_agent_tools,
+            allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+        ),
+        normalized_overrides,
+    )
+
+
+def build_published_agent_tool_query_policy(
+    *,
+    excluded_agent_id: Optional[int] = None,
+    include_draft: bool = False,
+    draft_agent_ids_to_include: Optional[list[int]] = None,
+    allowed_agent_ids: Optional[list[int]] = None,
+    agent_tool_overrides: Optional[Mapping[Any, Any]] = None,
+    enable_global_agent_tools: bool = True,
+    allow_cross_user_agent_ids: bool = False,
+    agent_call_stack: Optional[list[int]] = None,
+) -> PublishedAgentToolQueryPolicy:
+    """Normalize construction inputs into an immutable worker-safe policy."""
+
+    policy, _ = _resolve_published_agent_tool_policy(
+        excluded_agent_id=excluded_agent_id,
+        include_draft=include_draft,
+        draft_agent_ids_to_include=draft_agent_ids_to_include,
+        allowed_agent_ids=allowed_agent_ids,
+        agent_tool_overrides=agent_tool_overrides,
+        enable_global_agent_tools=enable_global_agent_tools,
+        allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+        agent_call_stack=agent_call_stack,
+    )
+    return policy
 
 
 async def _missing_knowledge_bases_for_user(
@@ -1997,6 +2115,205 @@ class AgentTool(AbstractBaseTool):
             return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
 
 
+def load_published_agent_tool_records(
+    db: Any,
+    *,
+    user_id: int,
+    policy: PublishedAgentToolQueryPolicy,
+) -> list[PublishedAgentToolRecord]:
+    """Load detached construction rows using the caller-owned DB session."""
+    from .....web.models.agent import Agent, AgentStatus
+
+    if not policy.query_required:
+        return []
+
+    normalized_injected_agent_ids = (
+        list(policy.injected_agent_ids)
+        if policy.injected_agent_ids is not None
+        else None
+    )
+    if normalized_injected_agent_ids is not None:
+        query = db.query(Agent).filter(
+            Agent.status.in_(["published"]),  # type: ignore[attr-defined]
+        )
+        query = _apply_agent_visibility_filters(
+            query,
+            Agent,
+            user_id=user_id,
+            allowed_agent_ids=normalized_injected_agent_ids,
+            allow_cross_user_agent_ids=policy.allow_cross_user_agent_ids,
+            db=db,
+        )
+        if query is None:
+            return []
+    elif policy.include_draft:
+        query = db.query(Agent).filter(
+            Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
+        )
+        query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id, db=db)
+    else:
+        query = db.query(Agent).filter(Agent.status == "published")
+        query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id, db=db)
+
+    if policy.excluded_agent_ids:
+        query = query.filter(Agent.id.notin_(policy.excluded_agent_ids))
+
+    agents = query.all()
+
+    if policy.draft_agent_ids:
+        draft_agents = _apply_owned_agent_tool_filters(
+            db.query(Agent).filter(
+                Agent.id.in_(policy.draft_agent_ids),
+                Agent.status == "draft",
+            ),
+            Agent,
+            user_id=user_id,
+            db=db,
+        ).all()
+        existing_ids = {agent.id for agent in agents}
+        for draft_agent in draft_agents:
+            if draft_agent.id not in existing_ids:
+                agents.append(draft_agent)
+
+    if normalized_injected_agent_ids is not None:
+        agent_types = "selected PUBLISHED"
+    else:
+        agent_types = "PUBLISHED and DRAFT" if policy.include_draft else "PUBLISHED"
+    logger.info(
+        "Found %s %s agents (excluded: %s)",
+        len(agents),
+        agent_types,
+        list(policy.excluded_agent_ids),
+    )
+
+    records: list[PublishedAgentToolRecord] = []
+    for agent in agents:
+        status = agent.status
+        records.append(
+            PublishedAgentToolRecord(
+                id=int(agent.id),
+                name=str(agent.name),
+                description=agent.description,
+                instructions=agent.instructions,
+                status=(
+                    status.value if isinstance(status, AgentStatus) else str(status)
+                ),
+            )
+        )
+    return records
+
+
+def build_published_agent_tools_from_records(
+    records: list[PublishedAgentToolRecord],
+    *,
+    session_factory: Any,
+    user_id: int,
+    task_id: Optional[str] = None,
+    workspace_base_dir: Optional[str] = None,
+    excluded_agent_id: Optional[int] = None,
+    include_draft: bool = False,
+    draft_agent_ids_to_include: Optional[list[int]] = None,
+    allowed_agent_ids: Optional[list[int]] = None,
+    agent_tool_overrides: Optional[Mapping[Any, Any]] = None,
+    enable_global_agent_tools: bool = True,
+    allow_cross_user_agent_ids: bool = False,
+    parent_task_id: Optional[str] = None,
+    parent_tracer: Optional[Any] = None,
+    agent_call_stack: Optional[list[int]] = None,
+    execution_scope: Optional[Any] = None,
+) -> list[AbstractBaseTool]:
+    """Construct AgentTool instances from ORM-free worker results."""
+    if workspace_base_dir is None:
+        workspace_base_dir = str(get_uploads_dir())
+
+    policy, normalized_overrides = _resolve_published_agent_tool_policy(
+        excluded_agent_id=excluded_agent_id,
+        include_draft=include_draft,
+        draft_agent_ids_to_include=draft_agent_ids_to_include,
+        allowed_agent_ids=allowed_agent_ids,
+        agent_tool_overrides=agent_tool_overrides,
+        enable_global_agent_tools=enable_global_agent_tools,
+        allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+        agent_call_stack=agent_call_stack,
+    )
+    normalized_injected_agent_ids = (
+        list(policy.injected_agent_ids)
+        if policy.injected_agent_ids is not None
+        else None
+    )
+    normalized_call_stack = list(policy.call_stack)
+    tools: list[AbstractBaseTool] = []
+
+    for agent in records:
+        override = normalized_overrides.get(agent.id, {})
+        description = agent.description or f"Call {agent.name} agent"
+        if agent.instructions:
+            instructions_preview = agent.instructions[:200]
+            if len(agent.instructions) > 200:
+                instructions_preview += "..."
+            description += f". Instructions: {instructions_preview}"
+
+        if agent.status == "draft":
+            description = f"[DRAFT] {description}"
+
+        tool_name = _string_override(override, "tool_name")
+        tool_description = _string_override(override, "description", "tool_description")
+        extra_system_prompt = _string_override(override, "extra_system_prompt")
+        delegation_allowed_agent_ids = (
+            _normalize_agent_ids(override.get("allowed_agent_ids"))
+            if "allowed_agent_ids" in override
+            else None
+        )
+        delegation_agent_tool_overrides = _normalize_agent_tool_overrides(
+            override.get("agent_tool_overrides")
+        )
+        delegation_enable_global_agent_tools = _truthy_bool(
+            override.get("enable_global_agent_tools"), True
+        )
+        delegation_allow_cross_user_agent_ids = _truthy_bool(
+            override.get("allow_cross_user_agent_ids"), False
+        )
+        runtime_metadata = {
+            key: override[key]
+            for key in (
+                "workforce_run_id",
+                "workforce_id",
+                "workforce_name",
+                "worker_member_id",
+                "worker_alias",
+            )
+            if key in override
+        }
+
+        tool = AgentTool(
+            agent_id=agent.id,
+            agent_name=agent.name,
+            agent_description=tool_description or description,
+            session_factory=session_factory,
+            user_id=user_id,
+            task_id=task_id,
+            workspace_base_dir=workspace_base_dir,
+            tool_name=tool_name,
+            tool_description=tool_description,
+            extra_system_prompt=extra_system_prompt,
+            parent_task_id=parent_task_id,
+            parent_tracer=parent_tracer,
+            agent_call_stack=normalized_call_stack,
+            delegation_allowed_agent_ids=delegation_allowed_agent_ids,
+            agent_tool_overrides=delegation_agent_tool_overrides,
+            enable_global_agent_tools=delegation_enable_global_agent_tools,
+            delegation_allow_cross_user_agent_ids=delegation_allow_cross_user_agent_ids,
+            target_allowed_agent_ids=normalized_injected_agent_ids,
+            target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+            runtime_metadata=runtime_metadata,
+            execution_scope=execution_scope,
+        )
+        tools.append(tool)
+        logger.debug("Created agent tool: %s", tool.name)
+
+    return tools
+
+
 def get_published_agents_tools(
     session_factory: Any,
     user_id: int,
@@ -2036,194 +2353,48 @@ def get_published_agents_tools(
     Returns:
         List of AgentTool instances
     """
-    from .....config import get_uploads_dir
-    from .....web.models.agent import Agent, AgentStatus
     from .db_session import tool_session_scope
 
-    if workspace_base_dir is None:
-        workspace_base_dir = str(get_uploads_dir())
-
-    tools: list[AbstractBaseTool] = []
-    normalized_overrides = _normalize_agent_tool_overrides(agent_tool_overrides)
-    normalized_injected_agent_ids = _normalize_agent_ids(allowed_agent_ids)
-    normalized_call_stack = _normalize_agent_ids(agent_call_stack) or []
-    excluded_agent_ids = set(normalized_call_stack)
-
-    if excluded_agent_id is not None:
-        try:
-            excluded_agent_ids.add(int(excluded_agent_id))
-        except (TypeError, ValueError):
-            pass
-
-    if (
-        normalized_injected_agent_ids is None
-        and not enable_global_agent_tools
-        and normalized_overrides
-    ):
-        normalized_injected_agent_ids = list(normalized_overrides.keys())
-
-    if normalized_injected_agent_ids is not None:
-        normalized_injected_agent_ids = [
-            agent_id
-            for agent_id in normalized_injected_agent_ids
-            if agent_id not in excluded_agent_ids
-        ]
-
     try:
+        policy = build_published_agent_tool_query_policy(
+            excluded_agent_id=excluded_agent_id,
+            include_draft=include_draft,
+            draft_agent_ids_to_include=draft_agent_ids_to_include,
+            allowed_agent_ids=allowed_agent_ids,
+            agent_tool_overrides=agent_tool_overrides,
+            enable_global_agent_tools=enable_global_agent_tools,
+            allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+            agent_call_stack=agent_call_stack,
+        )
         with tool_session_scope(session_factory) as db:
-            if normalized_injected_agent_ids is not None:
-                if not normalized_injected_agent_ids:
-                    return []
-                query = db.query(Agent).filter(
-                    Agent.status.in_(["published"]),  # type: ignore[attr-defined]
-                )
-                query = _apply_agent_visibility_filters(
-                    query,
-                    Agent,
-                    user_id=user_id,
-                    allowed_agent_ids=normalized_injected_agent_ids,
-                    allow_cross_user_agent_ids=allow_cross_user_agent_ids,
-                    db=db,
-                )
-                if query is None:
-                    return []
-            elif not enable_global_agent_tools:
-                return []
-            elif include_draft:
-                # Include both PUBLISHED and DRAFT agents
-                query = db.query(Agent).filter(
-                    Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
-                )
-                query = _apply_owned_agent_tool_filters(
-                    query, Agent, user_id=user_id, db=db
-                )
-            else:
-                # Only PUBLISHED agents
-                query = db.query(Agent).filter(
-                    Agent.status == "published",
-                )
-                query = _apply_owned_agent_tool_filters(
-                    query, Agent, user_id=user_id, db=db
-                )
-
-            # Exclude the active delegation stack to prevent recursive self-calls.
-            if excluded_agent_ids:
-                query = query.filter(Agent.id.notin_(sorted(excluded_agent_ids)))
-
-            agents = query.all()
-
-            # If specific DRAFT agents should be included, add them
-            if draft_agent_ids_to_include:
-                normalized_draft_agent_ids = _normalize_agent_ids(
-                    draft_agent_ids_to_include
-                )
-                normalized_draft_agent_ids = [
-                    agent_id
-                    for agent_id in (normalized_draft_agent_ids or [])
-                    if agent_id not in excluded_agent_ids
-                ]
-                # Skip the query entirely when nothing survives the exclusion
-                # filter, so we never issue an empty ``IN ()`` predicate.
-                if normalized_draft_agent_ids:
-                    draft_agents = _apply_owned_agent_tool_filters(
-                        db.query(Agent).filter(
-                            Agent.id.in_(normalized_draft_agent_ids),
-                            Agent.status == "draft",
-                        ),
-                        Agent,
-                        user_id=user_id,
-                        db=db,
-                    ).all()
-                    # Merge without duplicates
-                    existing_ids = {agent.id for agent in agents}
-                    for draft_agent in draft_agents:
-                        if draft_agent.id not in existing_ids:
-                            agents.append(draft_agent)
-
-            if normalized_injected_agent_ids is not None:
-                agent_types = "selected PUBLISHED"
-            else:
-                agent_types = "PUBLISHED and DRAFT" if include_draft else "PUBLISHED"
-            logger.info(
-                f"Found {len(agents)} {agent_types} agents (excluded: {sorted(excluded_agent_ids)})"
+            records = load_published_agent_tool_records(
+                db,
+                user_id=user_id,
+                policy=policy,
             )
 
-            for agent in agents:
-                override = normalized_overrides.get(int(agent.id or 0), {})
-                # Build description
-                description = agent.description or f"Call {agent.name} agent"
-                if agent.instructions:
-                    # Add brief instructions to description
-                    instructions_preview = agent.instructions[:200]
-                    if len(agent.instructions) > 200:
-                        instructions_preview += "..."
-                    description += f". Instructions: {instructions_preview}"
-
-                # Add status indicator for draft agents
-                if agent.status == AgentStatus.DRAFT:
-                    description = f"[DRAFT] {description}"
-
-                tool_name = _string_override(override, "tool_name")
-                tool_description = _string_override(
-                    override, "description", "tool_description"
-                )
-                extra_system_prompt = _string_override(override, "extra_system_prompt")
-                delegation_allowed_agent_ids = (
-                    _normalize_agent_ids(override.get("allowed_agent_ids"))
-                    if "allowed_agent_ids" in override
-                    else None
-                )
-                delegation_agent_tool_overrides = _normalize_agent_tool_overrides(
-                    override.get("agent_tool_overrides")
-                )
-                delegation_enable_global_agent_tools = _truthy_bool(
-                    override.get("enable_global_agent_tools"), True
-                )
-                delegation_allow_cross_user_agent_ids = _truthy_bool(
-                    override.get("allow_cross_user_agent_ids"), False
-                )
-                runtime_metadata = {
-                    key: override[key]
-                    for key in (
-                        "workforce_run_id",
-                        "workforce_id",
-                        "workforce_name",
-                        "worker_member_id",
-                        "worker_alias",
-                    )
-                    if key in override
-                }
-
-                tool = AgentTool(
-                    agent_id=agent.id,
-                    agent_name=agent.name,
-                    agent_description=tool_description or description,
-                    session_factory=session_factory,
-                    user_id=user_id,
-                    task_id=task_id,
-                    workspace_base_dir=workspace_base_dir,
-                    tool_name=tool_name,
-                    tool_description=tool_description,
-                    extra_system_prompt=extra_system_prompt,
-                    parent_task_id=parent_task_id,
-                    parent_tracer=parent_tracer,
-                    agent_call_stack=normalized_call_stack,
-                    delegation_allowed_agent_ids=delegation_allowed_agent_ids,
-                    agent_tool_overrides=delegation_agent_tool_overrides,
-                    enable_global_agent_tools=delegation_enable_global_agent_tools,
-                    delegation_allow_cross_user_agent_ids=delegation_allow_cross_user_agent_ids,
-                    target_allowed_agent_ids=normalized_injected_agent_ids,
-                    target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
-                    runtime_metadata=runtime_metadata,
-                    execution_scope=execution_scope,
-                )
-                tools.append(tool)
-                logger.debug(f"Created agent tool: {tool.name}")
+        return build_published_agent_tools_from_records(
+            records,
+            session_factory=session_factory,
+            user_id=user_id,
+            task_id=task_id,
+            workspace_base_dir=workspace_base_dir,
+            excluded_agent_id=excluded_agent_id,
+            include_draft=include_draft,
+            draft_agent_ids_to_include=draft_agent_ids_to_include,
+            allowed_agent_ids=allowed_agent_ids,
+            agent_tool_overrides=agent_tool_overrides,
+            enable_global_agent_tools=enable_global_agent_tools,
+            allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+            parent_task_id=parent_task_id,
+            parent_tracer=parent_tracer,
+            agent_call_stack=agent_call_stack,
+            execution_scope=execution_scope,
+        )
 
     except Exception as e:
         logger.error(f"Failed to load agents as tools: {e}", exc_info=True)
-
-    return tools
+        return []
 
 
 # Register tool creator for auto-discovery
@@ -2263,8 +2434,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             return []
 
         excluded_agent_id = config.get_excluded_agent_id() if config else None
-
-        return get_published_agents_tools(
+        construction_kwargs: dict[str, Any] = dict(
             session_factory=session_factory,
             user_id=user_id,
             task_id=config.get_task_id(),
@@ -2282,6 +2452,15 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             if hasattr(config, "get_execution_scope")
             else None,
         )
+        records_getter = getattr(config, "get_published_agent_tool_records", None)
+        records = records_getter() if callable(records_getter) else None
+        if isinstance(records, (list, tuple)):
+            return build_published_agent_tools_from_records(
+                list(records),
+                **construction_kwargs,
+            )
+
+        return get_published_agents_tools(**construction_kwargs)
     except Exception as e:
         logger.warning(f"Failed to create agent tools: {e}")
         return []

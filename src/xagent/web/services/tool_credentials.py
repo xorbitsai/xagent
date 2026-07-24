@@ -58,6 +58,14 @@ def get_user_tool_allowlist(db: Session, user: Any) -> list[str] | None:
     return None
 
 
+def has_user_tool_policy_hooks() -> bool:
+    """Return whether an application registered either runtime policy hook."""
+    return (
+        _get_user_tool_overrides_hook is not None
+        or _get_user_tool_allowlist_hook is not None
+    )
+
+
 TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
     "exa_web_search": {
         "api_key": {

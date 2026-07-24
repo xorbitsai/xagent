@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -57,9 +58,25 @@ class TriggerAuditOutcome(str, enum.Enum):
 
 
 class AgentTrigger(Base):  # type: ignore
-    """Reusable automatic entry point for an agent."""
+    """Reusable automatic entry point for an agent or a workforce.
+
+    Exactly one of ``agent_id`` / ``workforce_id`` is set (enforced by the
+    service layer). Workforce triggers fire through ``create_workforce_run``
+    and are never bound to the workforce's generated manager agent: a plain
+    Task without a workforce run silently loses all delegation ability.
+    """
 
     __tablename__ = "agent_triggers"
+    __table_args__ = (
+        # Exactly one owner. Mirrors the CHECK the migration adds to upgraded
+        # databases so fresh installs (schema built from these models via
+        # Base.metadata.create_all) enforce the same invariant. Keep the name
+        # in sync with the migration so downgrade can drop it.
+        CheckConstraint(
+            "(agent_id IS NULL) <> (workforce_id IS NULL)",
+            name="ck_agent_triggers_single_owner",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(
@@ -68,7 +85,13 @@ class AgentTrigger(Base):  # type: ignore
     agent_id = Column(
         Integer,
         ForeignKey("agents.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+        index=True,
+    )
+    workforce_id = Column(
+        Integer,
+        ForeignKey("workforces.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
     type = Column(String(32), nullable=False, index=True)
@@ -98,6 +121,7 @@ class AgentTrigger(Base):  # type: ignore
 
     user = relationship("User", back_populates="agent_triggers")
     agent = relationship("Agent", back_populates="triggers")
+    workforce = relationship("Workforce", back_populates="triggers")
     runs = relationship(
         "TriggerRun",
         back_populates="trigger",
@@ -112,6 +136,7 @@ class AgentTrigger(Base):  # type: ignore
     def __repr__(self) -> str:
         return (
             f"<AgentTrigger(id={self.id}, agent_id={self.agent_id}, "
+            f"workforce_id={self.workforce_id}, "
             f"type='{self.type}', enabled={self.enabled})>"
         )
 

@@ -12,8 +12,10 @@ from xagent.web.models.user import User
 from xagent.web.services.model_service import (
     _is_model_visible_to_user,
     get_asr_models,
+    get_default_embedding_model,
     get_default_model,
     get_default_music_model,
+    get_default_rerank_model,
     get_default_sound_effect_model,
     get_image_models,
     get_music_models,
@@ -28,6 +30,18 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture
+def owned_model_session(monkeypatch):
+    """Expose one observable Session through the model-session owner."""
+    mock_db = MagicMock()
+    session_factory = MagicMock(return_value=mock_db)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        MagicMock(return_value=session_factory),
+    )
+    return mock_db, session_factory
 
 
 @pytest.fixture(scope="function")
@@ -661,19 +675,18 @@ class TestModelService:
         "get_default",
         [get_default_sound_effect_model, get_default_music_model],
     )
-    def test_audio_generation_default_closes_database_generator(self, get_default):
+    def test_audio_generation_default_closes_owned_session(self, get_default):
         mock_db = MagicMock()
         filter_query = (
             mock_db.query.return_value.join.return_value.join.return_value.filter
         )
         shared_query = filter_query.return_value
         shared_query.limit.return_value.all.return_value = []
-        db_gen = MagicMock()
-        db_gen.__next__.return_value = mock_db
+        session_factory = MagicMock(return_value=mock_db)
 
         with patch(
-            "xagent.web.models.database.get_db",
-            return_value=db_gen,
+            "xagent.web.models.database.get_session_local",
+            return_value=session_factory,
         ):
             result = get_default(user_id=None)
 
@@ -682,7 +695,142 @@ class TestModelService:
             getattr(getattr(condition, "right", None), "value", None) == '"generate"'
             for condition in filter_query.call_args.args
         )
-        db_gen.close.assert_called_once_with()
+        session_factory.assert_called_once_with()
+        mock_db.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "get_default",
+        [get_default_embedding_model, get_default_rerank_model],
+    )
+    def test_text_default_closes_owned_session_after_shared_fallback(
+        self, get_default, owned_model_session, monkeypatch
+    ):
+        mock_db, session_factory = owned_model_session
+        shared_default = MagicMock()
+        shared_default.model.model_id = "shared-text-model"
+        shared_query = mock_db.query.return_value.join.return_value.filter.return_value
+        shared_query.limit.return_value.all.return_value = [shared_default]
+        monkeypatch.setattr(
+            "xagent.web.services.model_service._get_visible_user_ids",
+            lambda db, user_id: [1],
+        )
+
+        result = get_default(user_id=None)
+
+        assert result == "shared-text-model"
+        session_factory.assert_called_once_with()
+        mock_db.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "get_default",
+        [get_default_embedding_model, get_default_rerank_model],
+    )
+    def test_text_default_closes_owned_session_after_user_early_return(
+        self, get_default, owned_model_session, monkeypatch
+    ):
+        mock_db, session_factory = owned_model_session
+        user_default = MagicMock()
+        user_default.model.id = 42
+        user_default.model.model_id = "user-text-model"
+        user_query = mock_db.query.return_value.join.return_value.filter.return_value
+        user_query.first.return_value = user_default
+        monkeypatch.setattr(
+            "xagent.web.services.model_service._is_model_visible_to_user",
+            lambda db, model_id, user_id: True,
+        )
+
+        result = get_default(user_id=7)
+
+        assert result == "user-text-model"
+        session_factory.assert_called_once_with()
+        mock_db.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        ("get_default", "propagates"),
+        [
+            (get_default_embedding_model, True),
+            (get_default_rerank_model, False),
+        ],
+    )
+    def test_text_default_closes_owned_session_after_query_error(
+        self, get_default, propagates, owned_model_session
+    ):
+        mock_db, session_factory = owned_model_session
+        mock_db.query.side_effect = RuntimeError("query failed")
+
+        if propagates:
+            with pytest.raises(RuntimeError, match="query failed"):
+                get_default(user_id=None)
+        else:
+            assert get_default(user_id=None) is None
+
+        session_factory.assert_called_once_with()
+        mock_db.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "get_default",
+        [get_default_embedding_model, get_default_rerank_model],
+    )
+    def test_text_default_does_not_close_caller_owned_session(
+        self, get_default, monkeypatch
+    ):
+        caller_db = MagicMock()
+        shared_query = (
+            caller_db.query.return_value.join.return_value.filter.return_value
+        )
+        shared_query.limit.return_value.all.return_value = []
+        monkeypatch.setattr(
+            "xagent.web.services.model_service._get_visible_user_ids",
+            lambda db, user_id: [1],
+        )
+
+        assert get_default(user_id=None, db=caller_db) is None
+
+        caller_db.close.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("get_default", "propagates"),
+        [
+            (get_default_embedding_model, True),
+            (get_default_rerank_model, False),
+        ],
+    )
+    def test_text_default_does_not_close_caller_owned_session_after_query_error(
+        self, get_default, propagates
+    ):
+        caller_db = MagicMock()
+        caller_db.query.side_effect = RuntimeError("query failed")
+
+        if propagates:
+            with pytest.raises(RuntimeError, match="query failed"):
+                get_default(user_id=None, db=caller_db)
+        else:
+            assert get_default(user_id=None, db=caller_db) is None
+
+        caller_db.close.assert_not_called()
+
+    def test_rerank_default_propagates_owned_session_factory_error(self, monkeypatch):
+        def fail_session_factory():
+            raise RuntimeError("session factory failed")
+
+        monkeypatch.setattr(
+            "xagent.web.models.database.get_session_local",
+            fail_session_factory,
+        )
+
+        with pytest.raises(RuntimeError, match="session factory failed"):
+            get_default_rerank_model(user_id=None)
+
+    def test_rerank_default_propagates_owned_session_close_error(
+        self, owned_model_session
+    ):
+        mock_db, _session_factory = owned_model_session
+        shared_query = mock_db.query.return_value.join.return_value.filter.return_value
+        shared_query.limit.return_value.all.return_value = []
+        mock_db.close.side_effect = RuntimeError("session close failed")
+
+        with pytest.raises(RuntimeError, match="session close failed"):
+            get_default_rerank_model(user_id=None)
 
     def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):
         """System fallback returns None when no visible embedding model exists."""

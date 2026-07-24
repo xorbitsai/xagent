@@ -22,6 +22,10 @@ from xagent.core.agent import (
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
+from xagent.core.model.chat.tool_protocol import (
+    ToolProtocolViolation,
+    tool_protocol_error_response,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
@@ -156,6 +160,18 @@ class FakeSkillManager:
             "description": "Auto skill",
             "content": "Use the Auto skill instructions.",
         }
+
+
+class FlakySkillManager(FakeSkillManager):
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.get_skill_calls = 0
+
+    async def get_skill(self, name: str) -> dict[str, Any] | None:
+        self.get_skill_calls += 1
+        if self.get_skill_calls <= self.failures:
+            raise RuntimeError("temporary skill store failure")
+        return await super().get_skill(name)
 
 
 class QueryMemoryNote:
@@ -340,6 +356,21 @@ def decision_tool_response(
     }
 
 
+def load_skill_tool_response(skill_name: str) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "call_load_skill",
+                "type": "function",
+                "function": {
+                    "name": "load_skill",
+                    "arguments": json.dumps({"skill_name": skill_name}),
+                },
+            }
+        ]
+    }
+
+
 def malformed_empty_missing_verification_decision_tool_response() -> dict[str, Any]:
     return {
         "tool_calls": [
@@ -435,6 +466,170 @@ async def test_auto_decision_sees_memory_context() -> None:
         if message["role"] == "system"
     )
     assert "Answer simple follow-ups using the project memory." in system_context
+    assert [tool["function"]["name"] for tool in llm.calls[0]["tools"]] == [
+        DECISION_TOOL_NAME,
+        "load_skill",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_loads_matching_skill_before_selecting_pattern() -> None:
+    llm = FakeLLM(
+        responses=[
+            load_skill_tool_response("auto-skill"),
+            decision_tool_response("react", "Skill guidance favors ReAct."),
+        ]
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-skill-routing")
+    context.add_user_message("Use the auto skill for this task")
+    manager = FakeSkillManager()
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+        skill_manager=manager,
+    )
+
+    assert result["success"] is True
+    assert pattern.selected_pattern == "react"
+    assert pattern.routing_skill_loads == 1
+    assert context.metadata["loaded_skills"] == ["auto-skill"]
+    assert context.metadata["selected_skill"]["name"] == "auto-skill"
+    assert (
+        "Use the Auto skill instructions." in context.metadata["selected_skill_context"]
+    )
+    assert child.kwargs is not None
+    assert child.kwargs["skill_manager"] is manager
+
+    first_tool_names = [tool["function"]["name"] for tool in llm.calls[0]["tools"]]
+    second_tool_names = [tool["function"]["name"] for tool in llm.calls[1]["tools"]]
+    assert first_tool_names == [DECISION_TOOL_NAME, "load_skill"]
+    assert second_tool_names == [DECISION_TOOL_NAME]
+    first_prompt = llm.calls[0]["messages"][-1]["content"]
+    assert "Before choosing an execution pattern" in first_prompt
+    assert "call load_skill as the only tool call" in first_prompt
+    second_system = next(
+        message["content"]
+        for message in llm.calls[1]["messages"]
+        if message["role"] == "system"
+    )
+    assert "Selected skill guidance" in second_system
+    assert "Use the Auto skill instructions." in second_system
+    assert pattern.get_state()["routing_skill_loads"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_retries_transient_routing_skill_load_failure() -> None:
+    llm = FakeLLM(
+        responses=[
+            load_skill_tool_response("auto-skill"),
+            load_skill_tool_response("auto-skill"),
+            decision_tool_response("react", "Skill guidance favors ReAct."),
+        ]
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-skill-load-retry")
+    context.add_user_message("Use the auto skill for this task")
+    manager = FlakySkillManager(failures=1)
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+        skill_manager=manager,
+    )
+
+    assert result["success"] is True
+    assert pattern.selected_pattern == "react"
+    assert manager.get_skill_calls == 2
+    assert pattern.routing_skill_loads == 1
+    assert pattern.routing_skill_load_failures == 1
+    assert [tool["function"]["name"] for tool in llm.calls[1]["tools"]] == [
+        DECISION_TOOL_NAME,
+        "load_skill",
+    ]
+    assert [checkpoint["label"] for checkpoint in runtime.checkpoints].count(
+        "auto_skill_load_failed"
+    ) == 1
+    assert [checkpoint["label"] for checkpoint in runtime.checkpoints].count(
+        "auto_skill_loaded"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_continues_after_routing_skill_load_retries_are_exhausted() -> None:
+    llm = FakeLLM(
+        responses=[
+            load_skill_tool_response("auto-skill"),
+            load_skill_tool_response("auto-skill"),
+            decision_tool_response("react", "Continue without skill guidance."),
+        ]
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-skill-load-exhausted")
+    context.add_user_message("Use the auto skill for this task")
+    manager = FlakySkillManager(failures=2)
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=RecordingRuntime(),
+        skill_manager=manager,
+    )
+
+    assert result["success"] is True
+    assert pattern.selected_pattern == "react"
+    assert manager.get_skill_calls == 2
+    assert pattern.routing_skill_loads == 0
+    assert pattern.routing_skill_load_failures == 2
+    assert [tool["function"]["name"] for tool in llm.calls[2]["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    assert "continue without it" in llm.calls[2]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_auto_loaded_skill_guidance_reaches_dag_before_planning() -> None:
+    llm = FakeLLM(
+        responses=[
+            load_skill_tool_response("auto-skill"),
+            decision_tool_response("plan_execute", "Skill requires a plan."),
+        ]
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(dag_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-skill-dag")
+    context.add_user_message("Plan this auto skill task")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=RecordingRuntime(),
+        skill_manager=FakeSkillManager(),
+    )
+
+    assert result["success"] is True
+    assert pattern.selected_pattern == "plan_execute"
+    assert child.kwargs is not None
+    child_context = child.kwargs["context"]
+    assert (
+        "Use the Auto skill instructions."
+        in child_context.metadata["selected_skill_context"]
+    )
+    child_system = child_context.get_messages_for_llm()[0]["content"]
+    assert "Selected skill guidance" in child_system
+    assert "Use the Auto skill instructions." in child_system
 
 
 def plan_tool_response(
@@ -1557,6 +1752,99 @@ async def test_auto_pattern_retries_missing_decision_tool_call() -> None:
     )
     retry_message = llm.calls[1]["messages"][-1]["content"]
     assert f"did not call the required {DECISION_TOOL_NAME} tool" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_retries_unavailable_tool_call_as_routing_decision() -> None:
+    llm = FakeLLM(
+        [
+            tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="unavailable_tool_call",
+                    message="DeepSeek returned unavailable tool call 'web_search'.",
+                )
+            ),
+            decision_tool_response(
+                "final_answer",
+                "No tool work is required.",
+                answer="Recovered routing answer.",
+            ),
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Answer from the current context")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Recovered routing answer."
+    assert len(llm.calls) == 2
+    retry_message = llm.calls[1]["messages"][-1]["content"]
+    assert f"did not call the required {DECISION_TOOL_NAME} tool" in retry_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "protocol_code",
+    ["malformed_tool_arguments", "unavailable_tool_call"],
+)
+async def test_auto_pattern_retries_provider_routing_protocol_errors_after_skill_load(
+    protocol_code: str,
+) -> None:
+    llm = RaisingFakeLLM(
+        [
+            load_skill_tool_response("auto-skill"),
+            {"tool_calls": []},
+            LLMToolProtocolError(
+                provider="deepseek",
+                code=protocol_code,
+                message="invalid routing tool call",
+            ),
+            decision_tool_response("react", "Recovered after protocol error."),
+        ]
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-protocol-retry")
+    context.add_user_message("Use the auto skill for this task")
+    runtime = RecordingRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+        skill_manager=FakeSkillManager(),
+    )
+
+    assert result["success"] is True
+    assert pattern.selected_pattern == "react"
+    assert pattern.routing_skill_loads == 1
+    assert len(llm.calls) == 4
+    assert [tool["function"]["name"] for tool in llm.calls[1]["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    assert [tool["function"]["name"] for tool in llm.calls[2]["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    assert [tool["function"]["name"] for tool in llm.calls[3]["tools"]] == [
+        DECISION_TOOL_NAME
+    ]
+    retry_message = llm.calls[3]["messages"][-1]["content"]
+    assert protocol_code.split("_", 1)[0] in retry_message
+    assert "one complete JSON object" in retry_message
+    assert DECISION_TOOL_NAME in retry_message
+    assert any(
+        checkpoint["label"] == "auto_decision_retry"
+        and checkpoint["metadata"].get("protocol_code") == protocol_code
+        for checkpoint in runtime.checkpoints
+    )
+    llm_error_hooks = [
+        payload for name, payload in runtime.hooks if name == "llm_error"
+    ]
+    assert llm_error_hooks[-1]["metadata"]["protocol_code"] == protocol_code
 
 
 @pytest.mark.asyncio

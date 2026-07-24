@@ -272,16 +272,31 @@ class AppendMessageRequest(BaseModel):
 
     Same shape as :class:`CreateTaskRequest` minus the lack of a
     ``metadata`` field by default -- callers append a new user
-    message to an existing task. ``agent_id`` is required again
-    (consistent with the SDK contract: every write carries the
-    agent_id explicitly for forward-compat with multi-agent keys).
+    message to an existing task.
+
+    Owner-scoping fields carry the presented key's owner for
+    forward-compat and Python/TS SDK symmetry: agent-bound keys pass
+    ``agent_id`` (required for that case; the endpoint returns 422 if
+    omitted with an agent key), workforce-bound keys optionally pass
+    ``workforce_id``. Both are optional at the schema level so one
+    request model serves both owner types; the endpoint enforces the
+    per-owner requirement.
     """
 
-    agent_id: int = Field(
-        ...,
+    agent_id: Optional[int] = Field(
+        None,
         description=(
-            "Target agent's primary key. Must match the agent the "
-            "presented API key is bound to and the task's agent_id."
+            "Target agent's primary key. Required for agent-bound keys; "
+            "must match the agent the key is bound to and the task's "
+            "agent_id. Omit for workforce-bound keys."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Target workforce's primary key. Optional for workforce-bound "
+            "keys; must match the workforce the key is bound to when "
+            "provided. Omit for agent-bound keys."
         ),
     )
     message: MessageBody = Field(..., description="Next user message in the task.")
@@ -306,7 +321,20 @@ class AppendMessageResponse(BaseModel):
     """
 
     task_id: int = Field(..., description="Existing task primary key.")
-    agent_id: int = Field(..., description="Agent the task is bound to.")
+    agent_id: int = Field(
+        ...,
+        description=(
+            "Agent the task is bound to. For workforce runs this is the "
+            "workforce's manager agent."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Workforce the task belongs to when the key is workforce-bound; "
+            "null for agent-bound keys."
+        ),
+    )
     status: str = Field(
         ...,
         description=(
@@ -330,6 +358,77 @@ class AppendMessageResponse(BaseModel):
     control_state: str = Field(..., description="Detailed task control state.")
 
 
+class CreateWorkforceRunRequest(BaseModel):
+    """Body for ``POST /v1/workforces/{workforce_id}/runs``.
+
+    Creates a workforce run (manager-agent task + WorkforceRun binding)
+    and kicks off its first turn. The subsequent multi-turn / polling /
+    steps flow reuses the ``/v1/chat/tasks/{task_id}`` family via the
+    run's 1:1 ``WorkforceRun.task_id`` binding.
+
+    ``idempotency_key`` is optional; when provided, a retry with the same
+    key returns the original run instead of creating a duplicate (the
+    server dedups on ``(workforce_id, idempotency_key)``).
+    """
+
+    message: MessageBody = Field(
+        ..., description="First user message driving the workforce run."
+    )
+    execution_mode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional manager execution mode override (flash / balanced / "
+            "think / auto). Defaults to the manager agent's configured mode."
+        ),
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Caller-supplied dedup token. A retry with the same key returns "
+            "the original run rather than creating a new one."
+        ),
+    )
+
+
+class CreateWorkforceRunResponse(BaseModel):
+    """``POST /v1/workforces/{workforce_id}/runs`` -> 202 Accepted response.
+
+    Carries both the workforce-run identity and the bound ``task_id`` so
+    SDK clients switch to the ``/v1/chat/tasks/{task_id}`` polling / append
+    / steps surface for the rest of the conversation.
+    """
+
+    workforce_run_id: int = Field(..., description="New workforce run primary key.")
+    workforce_id: int = Field(..., description="Workforce the run belongs to.")
+    task_id: int = Field(
+        ...,
+        description=(
+            "Manager-agent task bound 1:1 to this run. Use it with the "
+            "/v1/chat/tasks/{task_id} endpoints for polling / append / steps."
+        ),
+    )
+    agent_id: int = Field(
+        ..., description="Manager agent executing the run (the task's agent_id)."
+    )
+    status: str = Field(..., description="Run status, e.g. 'pending' / 'running'.")
+    created: bool = Field(
+        ...,
+        description=(
+            "True for a newly-created run; False when an idempotency_key "
+            "replay returned an existing run (the call was a safe no-op)."
+        ),
+    )
+    created_at: datetime = Field(..., description="UTC creation timestamp.")
+    run_id: Optional[str] = Field(
+        None, description="Identity of the accepted execution run, if started."
+    )
+    state_version: int = Field(
+        0, description="Monotonic version of the task control state."
+    )
+    control_state: str = Field("idle", description="Detailed task control state.")
+
+
 class TaskInfoResponse(BaseModel):
     """``GET /v1/chat/tasks/{task_id}`` response.
 
@@ -341,6 +440,13 @@ class TaskInfoResponse(BaseModel):
 
     task_id: int
     agent_id: int
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Workforce the task belongs to when read through a "
+            "workforce-bound key; null for agent-bound keys."
+        ),
+    )
     status: str = Field(
         ...,
         description="One of: pending / running / paused / completed / failed.",

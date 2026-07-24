@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -20,6 +19,11 @@ from .agent_team_scope import (
     validate_team_agent_connectors,
     validate_team_agent_knowledge_bases,
 )
+
+# Single source of truth for the widget embed credential; re-exported here so
+# existing ``from ..services.agent_store import new_widget_key`` callers keep
+# working (the agent and workforce channels mint the same kind of key).
+from .deployments import new_widget_key
 from .hot_path_cache import (
     agent_detail_key,
     agent_list_key,
@@ -131,11 +135,6 @@ def clean_tool_categories(categories: Any) -> list[str]:
     so ``None`` renders as ``[]`` here. Never use this on a write path.
     """
     return normalize_tool_categories(categories) or []
-
-
-def new_widget_key() -> str:
-    """Generate an unguessable widget embed credential for an agent."""
-    return secrets.token_urlsafe(32)
 
 
 class AgentStore:

@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
-import { ArrowLeft, History, LayoutDashboard, MessageSquare } from "lucide-react"
+import { ArrowLeft, History, LayoutDashboard, LayoutGrid, MessageSquare, Rocket, Share, Webhook } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
@@ -28,12 +28,16 @@ import type {
 } from "@/types/workforce"
 import {
     normalizeWorkerSortOrder,
+    DeployWorkforceDialog,
     WorkforceCanvas,
     WorkforceConfigPanel,
     WorkforceRunsList,
+    WorkforceShareDialog,
+    WorkforceWidgetDialog,
     WorkforceStatusBadge,
     type WorkerEditState,
 } from "@/components/workforce"
+import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { ResizableSplitLayout } from "@/components/layout/resizable-split-layout"
 import { Button } from "@/components/ui/button"
@@ -58,6 +62,10 @@ export default function WorkforceDetailPage() {
     const [saving, setSaving] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [activeView, setActiveView] = useState<ActiveView>("configure")
+    const [deployOpen, setDeployOpen] = useState(false)
+    const [triggersOpen, setTriggersOpen] = useState(false)
+    const [isShareDialogOpen, setIsShareDialogOpen] = useState(false)
+    const [isWidgetDialogOpen, setIsWidgetDialogOpen] = useState(false)
 
     const previewTaskIdRef = useRef<number | null>(null)
     const isArchived = workforce?.status === "archived"
@@ -356,8 +364,41 @@ export default function WorkforceDetailPage() {
                 <div className="flex items-center gap-2">
                     {error && <span className="text-xs text-red-500">{error}</span>}
                     {!isArchived && (
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setTriggersOpen(true)}
+                            disabled={saving}
+                        >
+                            <Webhook className="mr-1.5 h-3.5 w-3.5" />
+                            {t("workforces.actions.triggers")}
+                        </Button>
+                    )}
+                    {!isArchived && (
                         <Button variant="ghost" size="sm" onClick={archiveCurrentWorkforce} disabled={saving}>
                             {t("workforces.actions.archive")}
+                        </Button>
+                    )}
+                    {workforce.status === "active" && (
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setDeployOpen(true)}
+                        >
+                            <Rocket className="h-3.5 w-3.5 mr-1" />
+                            {t("workforces.actions.deploy") || "Deploy"}
+                        </Button>
+                    )}
+                    {!isArchived && (
+                        <Button variant="outline" size="sm" onClick={() => setIsShareDialogOpen(true)} disabled={saving}>
+                            <Share className="h-3.5 w-3.5 mr-1" />
+                            {t("workforces.actions.share")}
+                        </Button>
+                    )}
+                    {!isArchived && (
+                        <Button variant="outline" size="sm" onClick={() => setIsWidgetDialogOpen(true)} disabled={saving}>
+                            <LayoutGrid className="h-3.5 w-3.5 mr-1" />
+                            {t("workforces.actions.embed")}
                         </Button>
                     )}
                     {workforce.status === "active" ? (
@@ -371,6 +412,26 @@ export default function WorkforceDetailPage() {
                     )}
                 </div>
             </div>
+
+            {workforce && (
+                <DeployWorkforceDialog
+                    open={deployOpen}
+                    workforceId={workforce.id}
+                    workforceName={workforce.name}
+                    onClose={() => setDeployOpen(false)}
+                />
+            )}
+            <WorkforceShareDialog
+                workforce={workforce}
+                open={isShareDialogOpen}
+                onClose={() => setIsShareDialogOpen(false)}
+            />
+
+            <WorkforceWidgetDialog
+                workforce={workforce}
+                open={isWidgetDialogOpen}
+                onClose={() => setIsWidgetDialogOpen(false)}
+            />
 
             {/* Body: main view + test panel */}
             <div className="flex-1 min-h-0 overflow-hidden">
@@ -434,6 +495,14 @@ export default function WorkforceDetailPage() {
                     }
                 />
             </div>
+
+            <AgentTriggersDialog
+                agentId={null}
+                owner={{ kind: "workforce", id: id ?? workforce.id }}
+                agentName={workforce.name}
+                open={triggersOpen}
+                onOpenChange={setTriggersOpen}
+            />
         </div>
     )
 }

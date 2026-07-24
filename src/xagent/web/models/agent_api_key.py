@@ -1,4 +1,4 @@
-"""API key for SDK-side authentication, bound to a published agent."""
+"""API key for SDK-side authentication, bound to an agent or a workforce."""
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
@@ -8,7 +8,15 @@ from .database import Base
 
 
 class AgentApiKey(Base):  # type: ignore
-    """SDK API key. An agent may hold any number of simultaneously-active keys.
+    """SDK API key. An owner may hold any number of simultaneously-active keys.
+
+    A key is bound to exactly one owner: either an agent (``agent_id``) or
+    a workforce (``workforce_id``). Exactly one of the two FKs is set --
+    enforced at the service layer rather than by a CHECK constraint so
+    SQLite deployments don't need a table rebuild (same trade-off as
+    ``uq_workforce_run_idempotency``). The ``xag_*`` wire format is
+    identical for both owner types; resolution branches on which FK is
+    populated.
 
     Rotating (via the legacy single-key endpoints) revokes existing active
     rows and inserts a new one; the multi-key admin endpoints instead let
@@ -22,7 +30,13 @@ class AgentApiKey(Base):  # type: ignore
     agent_id = Column(
         Integer,
         ForeignKey("agents.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+        index=True,
+    )
+    workforce_id = Column(
+        Integer,
+        ForeignKey("workforces.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
     # Owner-facing display name for the key, e.g. "CI pipeline". Optional.
@@ -50,9 +64,11 @@ class AgentApiKey(Base):  # type: ignore
     )
 
     agent = relationship("Agent")
+    workforce = relationship("Workforce")
 
     def __repr__(self) -> str:
         return (
             f"<AgentApiKey(id={self.id}, agent_id={self.agent_id}, "
+            f"workforce_id={self.workforce_id}, "
             f"key_prefix='{self.key_prefix}', revoked={self.revoked_at is not None})>"
         )

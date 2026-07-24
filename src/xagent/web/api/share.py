@@ -17,8 +17,11 @@ from sqlalchemy.orm import Session
 
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import get_db
+from ..models.deployment import DeploymentOwnerType
 from ..models.user import User
+from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..services.deployments import find_enabled_share_deployment
 from .public_chat_access import (
     PublicChatAuthResponse,
     ShareChatAccessContext,
@@ -51,7 +54,10 @@ async def authenticate_share_link(
         .first()
     )
     if not agent or is_workforce_generated_manager_agent(agent):
-        raise HTTPException(status_code=404, detail="Share link not found")
+        # Not an agent share token: workforce share credentials live in the
+        # deployments table. Manager agents stay rejected above — external
+        # access enters only via workforce credentials.
+        return _authenticate_workforce_share_link(db, request.share_token)
     if agent.status != AgentStatus.PUBLISHED:
         raise HTTPException(status_code=403, detail="Share link is unavailable")
 
@@ -75,6 +81,45 @@ async def authenticate_share_link(
         agent_logo=agent.logo_url,
         agent_description=agent.description,
         suggested_prompts=agent.suggested_prompts or [],
+    )
+
+
+def _authenticate_workforce_share_link(
+    db: Session, share_token: str
+) -> PublicChatAuthResponse:
+    """Resolve a workforce share token and issue a guest chat token."""
+    deployment = find_enabled_share_deployment(
+        db, share_token, DeploymentOwnerType.WORKFORCE
+    )
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    workforce = (
+        db.query(Workforce).filter(Workforce.id == int(deployment.owner_id)).first()
+    )
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    if workforce.status != "active":
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+
+    user = db.query(User).filter(User.id == int(workforce.owner_user_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Workforce owner not found")
+
+    access_token = create_public_chat_access_token(
+        {
+            "sub": user.username,
+            "user_id": user.id,
+            "auth_mode": "share",
+            "share_workforce_id": int(workforce.id),
+            "share_token": deployment.share_token,
+        }
+    )
+    return PublicChatAuthResponse(
+        access_token=access_token,
+        workforce_id=int(workforce.id),
+        agent_name=workforce.name,
+        agent_description=workforce.description,
+        suggested_prompts=[],
     )
 
 

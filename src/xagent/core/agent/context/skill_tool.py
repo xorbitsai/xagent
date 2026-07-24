@@ -1,8 +1,8 @@
 """Model-invocable skill loading tool.
 
-ReAct runs with an active skill manager get a lightweight skill index in the
-system context plus this ``load_skill`` tool, so the model pulls in full skill
-guidance on demand instead of a framework-driven LLM selection call.
+Tool-capable agent routing and execution runs get a lightweight skill index in
+the system context plus this ``load_skill`` tool, so the model pulls in full
+skill guidance on demand instead of a framework-driven LLM selection call.
 """
 
 from __future__ import annotations

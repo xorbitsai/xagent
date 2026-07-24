@@ -6,13 +6,14 @@ import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
+import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
+import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
   getFilePublicDownloadUrl,
   getFilePublicPreviewUrl,
   setPublicAccessToken,
 } from "@/lib/utils"
-import { normalizeTaskStatus } from "@/lib/task-status"
 
 interface PublicAgentChatPageProps {
   authMode: "widget" | "share"
@@ -30,6 +31,8 @@ type PublicAuthResult = {
   agent_logo?: string | null
   agent_description?: string | null
   suggested_prompts?: string[] | null
+  // Set instead of agent_id when the share token exposes a workforce.
+  workforce_id?: number | null
 }
 
 interface PublicConversationContentProps {
@@ -38,11 +41,14 @@ interface PublicConversationContentProps {
   normalizedGuestId?: string | null
   accessToken: string
   agentId: number | null
+  workforceId: number | null
   agentName: string | null
   agentLogo: string | null
   agentDescription: string | null
   suggestedPrompts: string[]
 }
+
+type PublicMessageConfig = Record<string, unknown>
 
 function PublicConversationContent({
   authMode,
@@ -50,6 +56,7 @@ function PublicConversationContent({
   normalizedGuestId,
   accessToken,
   agentId,
+  workforceId,
   agentName,
   agentLogo,
   agentDescription,
@@ -64,7 +71,10 @@ function PublicConversationContent({
   const [hasResolvedStoredTask, setHasResolvedStoredTask] = useState(false)
   const storageKey = authMode === "share"
     ? `${authMode}_task_${routeToken}_${agentId ?? "anonymous"}`
-    : `${authMode}_task_${agentId ?? "anonymous"}_${normalizedGuestId ?? "anonymous"}`
+    // Include the owner id so two different widgets embedded on the same site
+    // (which share a guest id) don't collide on one stored task. A workforce
+    // widget has no agentId, so fall back to its workforceId.
+    : `${authMode}_task_${agentId ?? (workforceId ? `wf${workforceId}` : "anonymous")}_${normalizedGuestId ?? "anonymous"}`
   const publicApiPrefix = authMode === "share" ? "/api/share" : "/api/widget"
 
   useEffect(() => {
@@ -100,15 +110,27 @@ function PublicConversationContent({
     localStorage.removeItem(storageKey)
   }, [hasResolvedStoredTask, state.taskId, storageKey])
 
-  const handleSend = useCallback(async (message: string, config?: any, files?: File[]) => {
+  const handleSend = useCallback(async (
+    message: string,
+    config?: PublicMessageConfig,
+    files?: File[],
+  ) => {
     if (state.taskId) {
       await sendMessage(message, config, files)
       return
     }
 
+    // For a workforce share the first turn starts inside task creation, which
+    // rejects an empty message server-side (400) — AFTER any files uploaded
+    // above would already be orphaned. Guard the empty case here so files are
+    // never uploaded for a turn that cannot start.
+    if (workforceId && !message.trim()) {
+      return
+    }
+
     setIsBootstrappingTask(true)
     try {
-      const taskPayload: Record<string, string | number> = {
+      const taskPayload: Record<string, string | number | string[]> = {
         title: message,
         description: message,
       }
@@ -117,6 +139,21 @@ function PublicConversationContent({
       }
 
       setCreateTaskError(null)
+
+      // Workforce shares start their first turn inside task creation, so any
+      // opening-message attachments must be uploaded (task-lessly — no task
+      // exists yet) and threaded in as file ids BEFORE the run begins;
+      // otherwise the first turn never sees them.
+      if (workforceId && files?.length) {
+        const uploaded = await Promise.all(files.map((file) => uploadPublicChatFile({
+          url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
+          accessToken,
+          file,
+          taskType: "task",
+          fallbackError: t("files.uploadFailed"),
+        })))
+        taskPayload.files = uploaded.map((item) => item.file_id)
+      }
 
       const response = await fetch(`${getApiUrl()}${publicApiPrefix}/chat/task/create`, {
         method: "POST",
@@ -159,14 +196,20 @@ function PublicConversationContent({
         },
       })
 
-      await sendMessage(message, { ...config, targetTaskId: newTaskId }, files)
+      if (!workforceId) {
+        await sendMessage(message, { ...config, targetTaskId: newTaskId }, files)
+      }
+      // Workforce share sessions already started their first turn (with the
+      // files threaded in above) inside task creation — the connection
+      // replays it from history, so re-sending over the websocket would
+      // duplicate the turn.
       setDraftMessage("")
       setDraftFiles([])
     } catch (error) {
       setIsBootstrappingTask(false)
       throw error
     }
-  }, [accessToken, agentId, agentLogo, agentName, dispatch, publicApiPrefix, sendMessage, setTaskId, state.taskId, t])
+  }, [accessToken, agentId, agentLogo, agentName, dispatch, publicApiPrefix, sendMessage, setTaskId, state.taskId, t, workforceId])
 
   useEffect(() => {
     if (state.taskId || createTaskError) {
@@ -322,40 +365,17 @@ export function PublicAgentChatPage({
       getFilePublicPreviewUrl(fileId, baseUrl),
     buildFileDownloadUrl: ({ baseUrl, fileId }) =>
       getFilePublicDownloadUrl(fileId, baseUrl),
-    uploadFiles: async (files, params) => {
-      const uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
-
-      for (const file of files) {
-        const formData = new FormData()
-        formData.append("file", file)
-        formData.append("task_type", params.taskType)
-        if (params.taskId) {
-          formData.append("task_id", params.taskId.toString())
-        }
-
-        const response = await fetch(`${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${publicAccessToken}`,
-          },
-          body: formData,
-        })
-
-        const data = await response.json().catch(() => null)
-        if (!response.ok || !data?.success || typeof data.file_id !== "string") {
-          throw new Error(data?.detail || data?.message || t("files.uploadFailed"))
-        }
-
-        uploadedFiles.push({
-          file_id: data.file_id as string,
-          name: file.name,
-          size: file.size,
-          type: file.type,
-        })
-      }
-
-      return uploadedFiles
-    },
+    uploadFiles: (files, params) =>
+      Promise.all(files.map((file) =>
+        uploadPublicChatFile({
+          url: `${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`,
+          accessToken: publicAccessToken,
+          file,
+          taskType: params.taskType,
+          taskId: params.taskId,
+          fallbackError: t("files.uploadFailed"),
+        }),
+      )),
   }), [authMode, publicAccessToken, t])
 
   if (isInitializing) {
@@ -386,6 +406,7 @@ export function PublicAgentChatPage({
         normalizedGuestId={normalizedGuestId}
         accessToken={resolvedAuthResult.access_token}
         agentId={resolvedAuthResult.agent_id ?? searchAgentId ?? null}
+        workforceId={resolvedAuthResult.workforce_id ?? null}
         agentName={resolvedAuthResult.agent_name ?? null}
         agentLogo={resolvedAuthResult.agent_logo ?? null}
         agentDescription={resolvedAuthResult.agent_description ?? null}

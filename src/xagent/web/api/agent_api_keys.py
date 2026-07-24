@@ -33,16 +33,17 @@ router = APIRouter(prefix="/api/agent-api-keys", tags=["agent-api-keys"])
 @router.get("", response_model=List[AgentApiKeyListItem])
 async def list_agent_api_keys(
     agent_id: Optional[int] = Query(None),
+    workforce_id: Optional[int] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[AgentApiKeyListItem]:
-    """List API keys across every agent the caller owns.
+    """List API keys across every agent and workforce the caller owns.
 
-    Optionally filtered to a single ``agent_id`` (used by the "Manage API
-    Key" jump-link from an agent's card/deploy dialog).
+    Optionally filtered to a single ``agent_id`` or ``workforce_id`` (used
+    by the "Manage API Key" jump-link from a deploy dialog).
     """
     return AgentApiKeyService(db).list_keys_for_user(
-        int(current_user.id), agent_id=agent_id
+        int(current_user.id), agent_id=agent_id, workforce_id=workforce_id
     )
 
 
@@ -61,27 +62,39 @@ async def create_agent_api_key(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> APIKeyGenerateResponse:
-    """Add a new key for an agent without touching its other keys.
+    """Add a new key for an agent or workforce without touching other keys.
 
-    Raises 404 if ``agent_id`` doesn't exist or isn't owned by the caller
-    (same ownership-hiding rationale as ``_get_owned_agent_or_404``).
+    Raises 404 if the requested owner doesn't exist or isn't owned by the
+    caller (same ownership-hiding rationale as ``_get_owned_agent_or_404``).
     """
+    owner_kind = "agent" if request.agent_id is not None else "workforce"
+    owner_id = (
+        request.agent_id if request.agent_id is not None else (request.workforce_id)
+    )
     try:
         result = AgentApiKeyService(db).create_key(
-            int(current_user.id), request.agent_id, request.label
+            int(current_user.id),
+            request.agent_id,
+            request.label,
+            workforce_id=request.workforce_id,
         )
     except KeyRotationConflict as e:
         logger.warning(
-            f"Concurrent API key creation race for agent {request.agent_id}: {e}"
+            f"Concurrent API key creation race for {owner_kind} {owner_id}: {e}"
         )
         raise HTTPException(status_code=409, detail="rotation_conflict")
     except Exception as e:
-        logger.error(f"Failed to create API key for agent {request.agent_id}: {e}")
+        logger.error(f"Failed to create API key for {owner_kind} {owner_id}: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal server error")
 
     if result is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Agent not found"
+            if owner_kind == "agent"
+            else ("Workforce not found"),
+        )
 
     item, full_key = result
     return APIKeyGenerateResponse(

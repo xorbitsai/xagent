@@ -752,3 +752,188 @@ class TestLegacyMultiKeyInteraction:
         active = [k for k in listed if k["status"] == "active"]
         assert len(active) == 1
         assert active[0]["key_prefix"] == rotate_resp.json()["key_prefix"]
+
+
+# ===== Workforce-bound keys (issue #949) =====
+
+
+def _create_workforce(headers: dict[str, str], name: str = "Test Workforce") -> int:
+    """Create a minimal active workforce owned by the headers' user.
+
+    Built directly in the DB (manager agent + workforce rows) so these
+    tests don't depend on the full workforce-builder endpoint surface.
+    """
+    from xagent.web.models.user import User
+    from xagent.web.models.workforce import Workforce
+
+    me = client.get("/api/auth/me", headers=headers).json()["user"]
+    db = _direct_db_session()
+    try:
+        owner_id = db.query(User.id).filter(User.username == me["username"]).scalar()
+        manager = Agent(
+            user_id=owner_id,
+            name=f"{name} Manager",
+            description="manager",
+            instructions="manage",
+            execution_mode="balanced",
+            origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
+        db.add(manager)
+        db.flush()
+        workforce = Workforce(
+            owner_user_id=owner_id,
+            scope_type="user",
+            scope_id=str(owner_id),
+            name=name,
+            manager_agent_id=int(manager.id),
+            status="active",
+        )
+        db.add(workforce)
+        db.commit()
+        db.refresh(workforce)
+        return int(workforce.id)
+    finally:
+        db.close()
+
+
+class TestWorkforceKeys:
+    """Multi-key admin surface generalized to workforce-bound keys."""
+
+    def test_create_workforce_key_returns_same_wire_format(self):
+        headers = _headers()
+        workforce_id = _create_workforce(headers)
+
+        resp = client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"workforce_id": workforce_id, "label": "wf key"},
+        )
+        assert resp.status_code == 200, resp.text
+        full_key = resp.json()["full_key"]
+        parts = full_key.split("_")
+        # xag_* format is unchanged for workforce keys.
+        assert parts[0] == "xag"
+        assert len(parts) == 3
+        assert len(parts[1]) == 6
+        assert len(parts[2]) == 32
+
+        db = _direct_db_session()
+        try:
+            row = (
+                db.query(AgentApiKey)
+                .filter(AgentApiKey.workforce_id == workforce_id)
+                .one()
+            )
+            assert row.agent_id is None
+            assert row.revoked_at is None
+        finally:
+            db.close()
+
+    def test_create_requires_exactly_one_owner(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        workforce_id = _create_workforce(headers)
+
+        neither = client.post("/api/agent-api-keys", headers=headers, json={})
+        assert neither.status_code == 422
+
+        both = client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"agent_id": agent_id, "workforce_id": workforce_id},
+        )
+        assert both.status_code == 422
+
+    def test_create_for_unowned_workforce_returns_404(self):
+        headers = _headers()
+        workforce_id = _create_workforce(headers)
+        other_headers = _register_second_user()
+
+        resp = client.post(
+            "/api/agent-api-keys",
+            headers=other_headers,
+            json={"workforce_id": workforce_id},
+        )
+        assert resp.status_code == 404
+
+    def test_list_includes_owner_identity_and_workforce_filter(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        workforce_id = _create_workforce(headers, name="Filter Workforce")
+        client.post("/api/agent-api-keys", headers=headers, json={"agent_id": agent_id})
+        client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"workforce_id": workforce_id, "label": "wf"},
+        )
+
+        listed = client.get("/api/agent-api-keys", headers=headers).json()
+        assert len(listed) == 2
+        wf_items = [k for k in listed if k["owner_type"] == "workforce"]
+        agent_items = [k for k in listed if k["owner_type"] == "agent"]
+        assert len(wf_items) == 1 and len(agent_items) == 1
+        assert wf_items[0]["workforce_id"] == workforce_id
+        assert wf_items[0]["workforce_name"] == "Filter Workforce"
+        assert wf_items[0]["agent_id"] is None
+        assert agent_items[0]["agent_id"] == agent_id
+        assert agent_items[0]["workforce_id"] is None
+
+        filtered = client.get(
+            f"/api/agent-api-keys?workforce_id={workforce_id}", headers=headers
+        ).json()
+        assert len(filtered) == 1
+        assert filtered[0]["workforce_id"] == workforce_id
+
+    def test_stats_count_workforce_keys(self):
+        headers = _headers()
+        workforce_id = _create_workforce(headers)
+        client.post(
+            "/api/agent-api-keys", headers=headers, json={"workforce_id": workforce_id}
+        )
+
+        stats = client.get("/api/agent-api-keys/stats", headers=headers).json()
+        assert stats["total_keys"] == 1
+        assert stats["active_keys"] == 1
+
+    def test_pause_resume_regenerate_delete_round_trip(self):
+        headers = _headers()
+        workforce_id = _create_workforce(headers)
+        client.post(
+            "/api/agent-api-keys",
+            headers=headers,
+            json={"workforce_id": workforce_id, "label": "wf"},
+        )
+        key = client.get("/api/agent-api-keys", headers=headers).json()[0]
+        key_id = key["id"]
+
+        paused = client.post(f"/api/agent-api-keys/{key_id}/pause", headers=headers)
+        assert paused.status_code == 200, paused.text
+        assert paused.json()["status"] == "paused"
+        assert paused.json()["workforce_id"] == workforce_id
+
+        resumed = client.post(f"/api/agent-api-keys/{key_id}/resume", headers=headers)
+        assert resumed.json()["status"] == "active"
+
+        regen = client.post(f"/api/agent-api-keys/{key_id}/regenerate", headers=headers)
+        assert regen.status_code == 200, regen.text
+        assert regen.json()["key_prefix"] != key["key_prefix"]
+
+        deleted = client.delete(f"/api/agent-api-keys/{key_id}", headers=headers)
+        assert deleted.status_code == 200
+
+    def test_other_user_cannot_mutate_workforce_key(self):
+        headers = _headers()
+        workforce_id = _create_workforce(headers)
+        client.post(
+            "/api/agent-api-keys", headers=headers, json={"workforce_id": workforce_id}
+        )
+        key_id = client.get("/api/agent-api-keys", headers=headers).json()[0]["id"]
+
+        other_headers = _register_second_user()
+        for method, url in (
+            ("post", f"/api/agent-api-keys/{key_id}/pause"),
+            ("post", f"/api/agent-api-keys/{key_id}/regenerate"),
+            ("delete", f"/api/agent-api-keys/{key_id}"),
+        ):
+            resp = getattr(client, method)(url, headers=other_headers)
+            assert resp.status_code == 404

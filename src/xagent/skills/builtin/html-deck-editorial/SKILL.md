@@ -2,17 +2,20 @@
 name: html-deck-editorial
 description: |
   Generate a single-file HTML presentation deck with magazine-grade editorial
-  styling. Use whenever the user asks for an "html deck", "editorial slides",
-  "magazine style presentation", "beautiful slides", "美观 PPT", or "网页版幻灯片"
-  — i.e. a slide-style visual deliverable AND a beautiful, designer-looking
-  result is expected. Output is one self-contained .html file (inline CSS + JS,
-  no build, no npm), printable to PDF via the browser, with keyboard navigation.
-  Prefer this over native .pptx when the user wants visual quality over Office
-  compatibility.
+  styling. Use only when the user explicitly asks for an "html deck",
+  "editorial slides", "magazine style presentation", "beautiful slides", "美观
+  PPT", or "网页版幻灯片" — i.e. a slide-style visual deliverable AND a
+  beautiful, designer-looking result is expected. Do not use this for generic
+  visual design requests such as ad creatives, posters, banners, social media
+  graphics, or image generation; use `static-visual-design` for designed static
+  graphics and the image-generation tools for standalone image generation.
+  Output is one self-contained .html file (inline CSS + JS, no build, no npm),
+  printable to PDF via the browser, with keyboard navigation. Prefer this over
+  native .pptx when the user wants visual quality over Office compatibility.
 when_to_use: |
-  When the user wants a slide-style HTML deliverable with editorial polish —
-  pitch decks, talks, internal review decks — and visual quality matters more
-  than Office compatibility. Prefer over `pptx-editorial` for HTML output.
+  Use for the explicit slide-style HTML requests described above when editorial
+  polish matters more than Office compatibility. Prefer over `pptx-editorial`
+  only when HTML output is requested.
 tags:
   - presentation
   - html
@@ -26,6 +29,17 @@ You will generate **one self-contained .html file** that presents the user's
 content as a magazine-style slide deck. Write the file to the workspace using
 the available file-writing tool (e.g. `file_tool` write_file or
 `workspace_file_tool`), then return its path.
+
+## Scope gate
+
+Apply the rest of this skill only if the latest user request explicitly asks
+for slides, a deck, a presentation, or an HTML slide deliverable. Do not infer a
+deck merely because the user wants polished visual content.
+
+If this skill was loaded for an ad creative, poster, banner, social media image,
+or other designed static graphic, stop following this skill and use
+`static-visual-design` instead. For a standalone illustration or photo, use the
+available image-generation tool directly.
 
 ## ⚠️ Hard rules — NO exceptions
 
@@ -97,7 +111,8 @@ Each palette: `ink` (text + dark surfaces), `paper` (background), `paper-tint`
 
 ## 🖼️ Visual blocks (in place of images)
 
-Since you cannot fetch images, generate visual blocks using:
+To keep the deck self-contained without external image assets, generate visual
+blocks using:
 - CSS color blocks with `paper-tint` / `ink-tint` background
 - Inline SVG: geometric shapes (circles, lines, rectangles) using palette colors
 - For data: hand-drawn-feeling bar/line charts inline SVG with palette colors
@@ -133,17 +148,15 @@ writing the file, **read the tool's response** for the `markdown_link`
 field (or for `file_refs[].markdown_link` when there are multiple files)
 and use that string verbatim as the first line of your final answer.
 
-✅ **CORRECT** (chat renders the returned `markdown_link` as a clickable chip):
+✅ **CORRECT**: copy the exact `markdown_link` string from the successful
+file-writing tool result. The opaque file ID must originate in that result.
 
-    [deck.html](file:3a22d32b-36c8-4aa6-8ea4-57a5f6e87181)
-
-The exact UUID comes from the tool's response — do not fabricate one.
-
-❌ **WRONG**: guessing a UUID, calling `get_file_info` to "fetch" the file_id
-(its `FileInfo` return shape does not include a `file_id` — workspace
-helpers return file metadata, not the registered chip reference), or
-wrapping the chip in a code fence (renders as inert text — user cannot
-click).
+❌ **WRONG**: constructing a Markdown link yourself, guessing a UUID, reusing
+an illustrative/example UUID, calling `get_file_info` to invent or "fetch" a
+file ID, or wrapping the chip in a code fence. A syntactically valid `file:`
+link is not evidence that a file exists. If the current task has no successful
+file-writing result containing that link, the deck is not complete and you
+must not present one.
 
 After the chip line, report: number of slides, palette chosen, and a 1-line
 summary of layout choices (e.g. `L01 cover → L02 divider → 3× L03 stats → …`).

@@ -331,6 +331,10 @@ class BaseToolConfig(ABC):
         """Get per-agent tool metadata/runtime overrides for delegation."""
         return {}
 
+    def get_published_agent_tool_records(self) -> Optional[List[Any]]:
+        """Return detached published-agent construction rows when prefetched."""
+        return None
+
     def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
         """Get remote A2A agent tool configurations.
 

@@ -27,7 +27,7 @@ Design notes:
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ===== Multi-key admin schemas (``/api/agent-api-keys``) =====
 #
@@ -37,20 +37,41 @@ from pydantic import BaseModel, Field
 
 
 class AgentApiKeyCreateRequest(BaseModel):
-    """Request body for ``POST /api/agent-api-keys``."""
+    """Request body for ``POST /api/agent-api-keys``.
 
-    agent_id: int = Field(..., description="Agent to create a new key for.")
+    A key binds to exactly one owner: pass either ``agent_id`` or
+    ``workforce_id``, never both and never neither (422 otherwise).
+    """
+
+    agent_id: Optional[int] = Field(None, description="Agent to create a new key for.")
+    workforce_id: Optional[int] = Field(
+        None, description="Workforce to create a new key for."
+    )
     label: Optional[str] = Field(
         None, max_length=100, description="Owner-facing display name for the key."
     )
 
+    @model_validator(mode="after")
+    def _exactly_one_owner(self) -> "AgentApiKeyCreateRequest":
+        if (self.agent_id is None) == (self.workforce_id is None):
+            raise ValueError("Exactly one of agent_id or workforce_id must be provided")
+        return self
+
 
 class AgentApiKeyListItem(BaseModel):
-    """One row in the centralized API Keys table."""
+    """One row in the centralized API Keys table.
+
+    ``owner_type`` tells the UI which identity pair is populated:
+    ``agent`` -> ``agent_id``/``agent_name``, ``workforce`` ->
+    ``workforce_id``/``workforce_name``. The unset pair is ``None``.
+    """
 
     id: int
-    agent_id: int
-    agent_name: str
+    owner_type: str = Field(..., description="One of: agent, workforce.")
+    agent_id: Optional[int] = None
+    agent_name: Optional[str] = None
+    workforce_id: Optional[int] = None
+    workforce_name: Optional[str] = None
     label: Optional[str] = None
     key_prefix: str
     masked_key: str

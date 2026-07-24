@@ -1,5 +1,7 @@
 import logging
-from datetime import timezone
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -10,6 +12,7 @@ from sqlalchemy.orm import Session, selectinload
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
+from ..models.deployment import Deployment, DeploymentOwnerType
 from ..models.task import TaskStatus, TraceEvent
 from ..models.user import User
 from ..models.workforce import (
@@ -27,9 +30,16 @@ from ..services.agent_team_scope import (
     get_agent_team_scope,
     owns_agent,
 )
+from ..services.deployments import (
+    get_deployment,
+    get_or_create_deployment,
+    new_share_token,
+    new_widget_key,
+)
 from ..services.trace_message_storage import decode_trace_events_data
 from ..services.workforce_access import (
     can_create_workforce,
+    can_edit_workforce,
     ensure_agent_access,
     ensure_workforce_access,
     filter_visible_workforces,
@@ -850,6 +860,266 @@ async def unpublish_workforce(
     return _serialize_workforce_detail(
         _reload_workforce(db, workforce), user, get_agent_team_scope(db, int(user.id))
     )
+
+
+class WorkforceShareLinkResponse(BaseModel):
+    """Owner-only workforce share link state, including the raw token."""
+
+    workforce_id: int
+    share_enabled: bool
+    share_token: str | None
+    share_updated_at: str | None
+
+
+def _ensure_active_workforce(workforce: Workforce, detail: str) -> Workforce:
+    """Guard a deployment-channel mutation that must not run on a non-active
+    workforce (shared by the share-link and widget enable/rotate paths)."""
+    if workforce.status != "active":
+        raise HTTPException(status_code=400, detail=detail)
+    return workforce
+
+
+def _serialize_workforce_share_link(
+    workforce: Workforce, deployment: Deployment | None
+) -> WorkforceShareLinkResponse:
+    return WorkforceShareLinkResponse(
+        workforce_id=int(workforce.id),
+        share_enabled=bool(deployment.share_enabled) if deployment else False,
+        share_token=deployment.share_token if deployment else None,
+        share_updated_at=_serialize_datetime(deployment.share_updated_at)
+        if deployment
+        else None,
+    )
+
+
+@contextmanager
+def _commit_or_rollback(db: Session) -> Iterator[None]:
+    """Commit on clean exit, roll back and re-raise on any error."""
+    try:
+        yield
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+@router.get("/{workforce_id}/share-link", response_model=WorkforceShareLinkResponse)
+async def get_workforce_share_link(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> WorkforceShareLinkResponse:
+    """Return the current owner-only share link state for a workforce."""
+    workforce = _load_workforce(db, workforce_id)
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    # The raw token is a credential: gate reads on edit permission (owner /
+    # admin), not on the potentially broader view policy. Unlike mutations
+    # below, reading the state of an archived workforce is allowed.
+    if not can_edit_workforce(db, user, workforce):
+        raise HTTPException(status_code=403, detail="Access denied")
+    deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, int(workforce.id))
+    return _serialize_workforce_share_link(workforce, deployment)
+
+
+@router.post("/{workforce_id}/share-link", response_model=WorkforceShareLinkResponse)
+async def enable_workforce_share_link(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> WorkforceShareLinkResponse:
+    """Create or re-enable the public share link for an active workforce."""
+    workforce = ensure_workforce_access(
+        db, user, _load_workforce(db, workforce_id), action="edit"
+    )
+    _ensure_active_workforce(workforce, "Only active workforces can be shared")
+    with _commit_or_rollback(db):
+        deployment = get_or_create_deployment(
+            db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
+        )
+        cast(Any, deployment).share_enabled = True
+        cast(Any, deployment).share_updated_at = datetime.now(timezone.utc)
+        if not deployment.share_token:
+            cast(Any, deployment).share_token = new_share_token()
+    return _serialize_workforce_share_link(workforce, deployment)
+
+
+@router.post(
+    "/{workforce_id}/share-link/rotate", response_model=WorkforceShareLinkResponse
+)
+async def rotate_workforce_share_link(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> WorkforceShareLinkResponse:
+    """Rotate the public share link token for an active workforce.
+
+    Rotation only replaces the token; it preserves the current
+    ``share_enabled`` state rather than force-enabling, so resetting a
+    disabled link does not silently re-expose the workforce.
+    """
+    workforce = ensure_workforce_access(
+        db, user, _load_workforce(db, workforce_id), action="edit"
+    )
+    _ensure_active_workforce(workforce, "Only active workforces can be shared")
+    with _commit_or_rollback(db):
+        deployment = get_or_create_deployment(
+            db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
+        )
+        cast(Any, deployment).share_token = new_share_token()
+        cast(Any, deployment).share_updated_at = datetime.now(timezone.utc)
+    return _serialize_workforce_share_link(workforce, deployment)
+
+
+@router.delete("/{workforce_id}/share-link", response_model=WorkforceShareLinkResponse)
+async def disable_workforce_share_link(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> WorkforceShareLinkResponse:
+    """Disable and revoke the public share link for a workforce.
+
+    Revocation is idempotent and, unlike enable/rotate, is allowed on
+    archived workforces: it only ever *removes* access, so it mirrors the
+    read endpoint's permission check (``can_edit_workforce`` without the
+    archived-edit 409) for symmetry rather than routing through
+    ``ensure_workforce_access(action="edit")``.
+    """
+    workforce = _load_workforce(db, workforce_id)
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    if not can_edit_workforce(db, user, workforce):
+        raise HTTPException(status_code=403, detail="Access denied")
+    deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, int(workforce.id))
+    if deployment is not None:
+        with _commit_or_rollback(db):
+            cast(Any, deployment).share_enabled = False
+            cast(Any, deployment).share_token = None
+            cast(Any, deployment).share_updated_at = datetime.now(timezone.utc)
+    return _serialize_workforce_share_link(workforce, deployment)
+
+
+class WorkforceWidgetResponse(BaseModel):
+    """Owner-only workforce widget deployment state, including the raw key."""
+
+    workforce_id: int
+    widget_enabled: bool
+    widget_key: str | None
+    allowed_domains: list[str]
+
+
+class WorkforceWidgetUpdateRequest(BaseModel):
+    """Partial update of a workforce's widget configuration.
+
+    Both fields are optional so the owner UI can toggle ``widget_enabled`` and
+    edit ``allowed_domains`` independently, mirroring the agent widget config
+    endpoint.
+    """
+
+    widget_enabled: bool | None = None
+    allowed_domains: list[str] | None = None
+
+
+def _serialize_workforce_widget(
+    workforce: Workforce, deployment: Deployment | None
+) -> WorkforceWidgetResponse:
+    return WorkforceWidgetResponse(
+        workforce_id=int(workforce.id),
+        widget_enabled=bool(deployment.widget_enabled) if deployment else False,
+        widget_key=deployment.widget_key if deployment else None,
+        allowed_domains=list(deployment.allowed_domains or []) if deployment else [],
+    )
+
+
+@router.get("/{workforce_id}/widget-key", response_model=WorkforceWidgetResponse)
+async def get_workforce_widget_key(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> WorkforceWidgetResponse:
+    """Return the current owner-only widget deployment state for a workforce.
+
+    The raw widget key is a credential (domain-gated, but still), so reads gate
+    on edit permission (owner / admin) rather than the broader view policy;
+    reading an archived workforce's state stays allowed, matching the share
+    read endpoint.
+
+    Unlike the agent widget-key GET (which lazily mints a key on read), this
+    returns ``widget_key = None`` until the widget is enabled: the workforce
+    channel is opt-in and starts keyless, so the key is minted lazily on
+    enable (see ``update_workforce_widget``), never on read.
+    """
+    workforce = _load_workforce(db, workforce_id)
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    if not can_edit_workforce(db, user, workforce):
+        raise HTTPException(status_code=403, detail="Access denied")
+    deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, int(workforce.id))
+    return _serialize_workforce_widget(workforce, deployment)
+
+
+@router.put("/{workforce_id}/widget", response_model=WorkforceWidgetResponse)
+async def update_workforce_widget(
+    workforce_id: int,
+    request: WorkforceWidgetUpdateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> WorkforceWidgetResponse:
+    """Update a workforce's widget configuration (enable flag / allowed
+    domains). Enabling requires an active workforce and lazily mints a widget
+    key so the embed snippet is immediately usable.
+
+    Gated on ``can_edit_workforce`` (not ``ensure_workforce_access(edit)``) so
+    that, like ``DELETE /{id}/share-link``, an owner can still turn the widget
+    off on an archived workforce; re-enabling stays blocked by
+    ``_ensure_active_workforce`` below. Guest access is independently blocked
+    once ``status != "active"`` regardless of the stored flag."""
+    workforce = _load_workforce(db, workforce_id)
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    if not can_edit_workforce(db, user, workforce):
+        raise HTTPException(status_code=403, detail="Access denied")
+    with _commit_or_rollback(db):
+        deployment = get_or_create_deployment(
+            db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
+        )
+        if request.widget_enabled is not None:
+            if request.widget_enabled:
+                _ensure_active_workforce(
+                    workforce, "Only active workforces can enable the widget"
+                )
+                if not deployment.widget_key:
+                    cast(Any, deployment).widget_key = new_widget_key()
+            cast(Any, deployment).widget_enabled = request.widget_enabled
+        if request.allowed_domains is not None:
+            cast(Any, deployment).allowed_domains = list(request.allowed_domains)
+    return _serialize_workforce_widget(workforce, deployment)
+
+
+@router.post(
+    "/{workforce_id}/widget-key/rotate", response_model=WorkforceWidgetResponse
+)
+async def rotate_workforce_widget_key(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> WorkforceWidgetResponse:
+    """Rotate the widget key for an active workforce.
+
+    Like the share-link rotate, this only replaces the key and preserves the
+    current ``widget_enabled`` state, so resetting a disabled widget does not
+    silently re-expose the workforce.
+    """
+    workforce = ensure_workforce_access(
+        db, user, _load_workforce(db, workforce_id), action="edit"
+    )
+    _ensure_active_workforce(workforce, "Only active workforces can enable the widget")
+    with _commit_or_rollback(db):
+        deployment = get_or_create_deployment(
+            db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
+        )
+        cast(Any, deployment).widget_key = new_widget_key()
+    return _serialize_workforce_widget(workforce, deployment)
 
 
 @router.post("/{workforce_id}/agents")

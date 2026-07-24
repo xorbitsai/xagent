@@ -22,7 +22,7 @@ Why a separate error envelope from ``/api/*``:
 """
 
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -47,6 +47,34 @@ class V1ErrorCode(str, Enum):
     # bound to their key. Returned as 404 (not 403) so the existence
     # of other tenants' agents is not leaked.
     AGENT_NOT_FOUND = "agent_not_found"
+
+    # Caller is authenticated but the workforce_id they asked for is
+    # not bound to their key. Returned as 404 (not 403) for the same
+    # leak-prevention reason as AGENT_NOT_FOUND.
+    WORKFORCE_NOT_FOUND = "workforce_not_found"
+
+    # The key-bound workforce has been archived; run creation and new
+    # turns are permanently rejected (409 -- retrying cannot succeed).
+    WORKFORCE_ARCHIVED = "workforce_archived"
+
+    # The workforce exists but is not in the ``active`` status runs
+    # require (e.g. still a draft). 409.
+    WORKFORCE_NOT_ACTIVE = "workforce_not_active"
+
+    # The workforce configuration changed since this conversation
+    # started; the pinned run snapshot no longer matches, so appends
+    # are permanently rejected (409). Client should create a new run.
+    WORKFORCE_CONFIG_CHANGED = "workforce_config_changed"
+
+    # An idempotency key was already used by a run whose task no longer
+    # exists -- the original result can't be replayed and the key can't
+    # be reused. 409.
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+
+    # A file id passed in ``message.files`` on run creation isn't
+    # accessible to the caller. 404 -- distinct from workforce_not_found
+    # so SDK clients can tell "bad file" from "bad workforce".
+    FILE_NOT_FOUND = "file_not_found"
 
     # Caller is authenticated and agent_id is right, but the task_id
     # they asked for doesn't exist or doesn't belong to their agent.
@@ -101,6 +129,22 @@ class V1ErrorCode(str, Enum):
 _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INVALID_API_KEY: "Invalid or revoked API key.",
     V1ErrorCode.AGENT_NOT_FOUND: "Agent not found or not accessible with this key.",
+    V1ErrorCode.WORKFORCE_NOT_FOUND: (
+        "Workforce not found or not accessible with this key."
+    ),
+    V1ErrorCode.WORKFORCE_ARCHIVED: (
+        "This workforce has been archived; it can no longer accept new "
+        "runs or messages."
+    ),
+    V1ErrorCode.WORKFORCE_NOT_ACTIVE: "Workforce must be active to run.",
+    V1ErrorCode.WORKFORCE_CONFIG_CHANGED: (
+        "The workforce configuration has changed since this conversation "
+        "started; please create a new run."
+    ),
+    V1ErrorCode.IDEMPOTENCY_CONFLICT: (
+        "This idempotency key was already used by a run that can no longer be replayed."
+    ),
+    V1ErrorCode.FILE_NOT_FOUND: "One or more file ids are not accessible.",
     V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",
     V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
@@ -153,6 +197,34 @@ class V1ApiError(Exception):
         self.http_status = http_status
         self.message = message or _DEFAULT_MESSAGES[code]
         self.details = details
+
+
+# Turn-rejection reasons (``TaskTurnError.reason``) that are NOT the
+# transient "busy" case. The default TASK_BUSY message tells the client
+# to retry, which is actively misleading for workforce rejections where
+# retrying can never succeed -- mirror of the WebSocket layer's
+# ``_TURN_REJECTION_MESSAGES`` map, expressed as stable v1 error codes.
+_TURN_REJECTION_CODES: dict[str, tuple[V1ErrorCode, int]] = {
+    "workforce_archived": (V1ErrorCode.WORKFORCE_ARCHIVED, 409),
+    "workforce_config_changed": (V1ErrorCode.WORKFORCE_CONFIG_CHANGED, 409),
+    # The run row backing this conversation is gone; from the SDK's
+    # perspective the task is simply no longer available.
+    "workforce_run_not_found": (V1ErrorCode.TASK_NOT_FOUND, 404),
+}
+
+
+def raise_for_turn_rejection(reason: str) -> NoReturn:
+    """Translate a ``TaskTurnError.reason`` into the v1 error envelope.
+
+    Workforce-specific rejections get their own stable codes; anything
+    else (``busy``, ``bg_inflight``, future reasons) stays the generic
+    retryable ``task_busy`` 409.
+    """
+    code_status = _TURN_REJECTION_CODES.get(reason)
+    if code_status is not None:
+        code, http_status = code_status
+        raise V1ApiError(code, http_status)
+    raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
 
 
 async def v1_api_error_handler(_request: Request, exc: V1ApiError) -> JSONResponse:

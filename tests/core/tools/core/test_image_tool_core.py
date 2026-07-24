@@ -114,6 +114,16 @@ def _setup_edit_http_mock(mock_get):
 class TestImageGenerationToolCore:
     """Test cases for ImageGenerationToolCore class"""
 
+    def test_generate_description_enforces_single_canvas_and_copy_budget(self):
+        description = ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION
+
+        assert "one single final" in description
+        assert "one continuous canvas" in description
+        assert "contact sheet" in description
+        assert "one exact headline" in description
+        assert "one concise CTA" in description
+        assert "file_id through the images parameter" in description
+
     def test_init_with_models(self, mock_image_models, mock_workspace):
         """Test ImageGenerationToolCore initialization with models"""
         tool = ImageGenerationToolCore(mock_image_models, workspace=mock_workspace)

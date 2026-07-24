@@ -17,6 +17,7 @@ from xagent.web.models.user import User
 
 from ..models.workforce import Workforce, WorkforceAgent
 from .workforce_access import ensure_workforce_access, ensure_workforce_agent_run_access
+from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
 
 WORKFORCE_STATUSES = {"draft", "active", "archived"}
 RUN_STATUSES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
@@ -80,9 +81,17 @@ def validate_workforce_for_run(
 ) -> tuple[Agent, list[WorkforceAgent]]:
     workforce = ensure_workforce_access(db, user, workforce, action="run")
     if workforce.status == "archived":
-        raise HTTPException(status_code=400, detail="Archived workforce cannot run")
+        raise WorkforceRunError(
+            status_code=400,
+            detail="Archived workforce cannot run",
+            code=WorkforceRunErrorCode.ARCHIVED,
+        )
     if workforce.status != "active" and not is_preview:
-        raise HTTPException(status_code=400, detail="Workforce must be active to run")
+        raise WorkforceRunError(
+            status_code=400,
+            detail="Workforce must be active to run",
+            code=WorkforceRunErrorCode.NOT_ACTIVE,
+        )
 
     manager_agent = ensure_workforce_agent_run_access(
         workforce.manager_agent, user, db, workforce

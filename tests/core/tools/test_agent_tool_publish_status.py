@@ -1,8 +1,10 @@
+import asyncio
 import tempfile
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.core.tools.adapters.vibe.agent_tool import (
     AgentTool,
@@ -13,6 +15,8 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
 )
 from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
 from xagent.core.tools.adapters.vibe.config import ToolConfig
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
@@ -75,6 +79,77 @@ def test_web_delegation_config_defaults_are_noop() -> None:
             os.remove(db_path)
         except OSError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_published_agent_prefetch_waits_for_pool_off_event_loop(tmp_path) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'published-agents.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.5,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with SessionLocal() as db:
+        owner = User(username="prefetch-owner", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+        owner_id = int(owner.id)
+        published = Agent(
+            user_id=owner_id,
+            name="Prefetched Agent",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(published)
+        db.commit()
+        db.refresh(published)
+        published_id = int(published.id)
+        published_tool_name = gen_agent_tool_name(published_id, published.name)
+
+    held_connection = engine.connect()
+    config = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=SessionLocal,
+        user_id=owner_id,
+        task_id="_mock_",
+        workspace_config={"task_id": "_mock_"},
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=None),
+    )
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticker_task = asyncio.create_task(ticker())
+    build_task = asyncio.create_task(ToolFactory.create_all_tools(config))
+    try:
+        await asyncio.sleep(0.08)
+        assert ticks >= 4
+        assert not build_task.done()
+
+        held_connection.close()
+        tools = await build_task
+        assert published_tool_name in {tool.name for tool in tools}
+    finally:
+        if not held_connection.closed:
+            held_connection.close()
+        if not build_task.done():
+            build_task.cancel()
+            await asyncio.gather(build_task, return_exceptions=True)
+        stop.set()
+        await ticker_task
+        config.close()
+        engine.dispose()
 
 
 def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:

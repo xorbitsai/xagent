@@ -415,3 +415,45 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
     })
   })
 })
+
+describe("AgentTriggersDialog owner routing", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    apiRequestMock.mockImplementation(() => Promise.resolve(jsonResponse([])))
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("loads triggers from the workforce route when owner is a workforce", async () => {
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        owner={{ kind: "workforce", id: 5 }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    )
+
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/workforces/5/triggers",
+      ),
+    )
+    // The workforce owner must never fall through to the agent route.
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/api/agents/"),
+    )
+  })
+
+  it("loads triggers from the agent route when no explicit owner is given", async () => {
+    render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+
+    await waitFor(() =>
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/agents/42/triggers",
+      ),
+    )
+  })
+})

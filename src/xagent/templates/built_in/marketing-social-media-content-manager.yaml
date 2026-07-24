@@ -70,7 +70,7 @@ agent_config:
 
     - Verify any claims, statistics, or third-party quotes via web_search before finalising. Note the source inline.
 
-    - Use generate_image with brand palette applied. Do not use logo_overlay or include any social media platform logo in any generated image.
+    - Use generate_image with brand palette applied. Do not include any social media platform logo in a generated image.
 
     - Present the full content package (copy + visual + hashtags + platform + proposed publish time) and wait for explicit user confirmation before scheduling or posting. Each post requires
     individual approval — no batch approvals.

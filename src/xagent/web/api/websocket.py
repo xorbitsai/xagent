@@ -116,6 +116,7 @@ from ..services.task_lease_service import (
 )
 from ..services.uploaded_file_store import UploadedFileStore
 from ..services.workforce_runtime import (
+    is_workforce_task,
     mark_workforce_task_status,
     release_current_runner_task_lease_with_workforce_sync,
     release_task_lease_with_workforce_sync,
@@ -4198,6 +4199,30 @@ async def _handle_chat_message_unserialized(
                             context=context,
                         )
                         logger.info(f"Task {task_id} started in background")
+                        # ``begin_turn`` flips the Task to RUNNING but does
+                        # not project that onto the WorkforceRun; without an
+                        # explicit sync a multi-turn APPEND leaves the run
+                        # stuck on its previous terminal status in runs
+                        # history. This is a best-effort projection, not a
+                        # guaranteed-fresh read: begin_turn commits in its own
+                        # DB session, so this ``db.refresh`` may not observe
+                        # that commit yet and the sync can no-op on a stale
+                        # terminal status. That is acceptable — terminal
+                        # statuses re-sync on completion, so a stale/failed
+                        # projection here only delays the "running" flip and
+                        # is non-fatal.
+                        if is_workforce_task(task):
+                            try:
+                                db.refresh(task)
+                                if sync_workforce_run_status(db, task, task.status):
+                                    db.commit()
+                            except Exception:
+                                logger.warning(
+                                    "Failed to sync workforce run status after "
+                                    "WS turn for task %s",
+                                    task_id,
+                                    exc_info=True,
+                                )
                         await finish_delivery(True)
                     except TaskTurnNotFoundError:
                         # Task vanished or changed ownership between the

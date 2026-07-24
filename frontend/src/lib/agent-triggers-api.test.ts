@@ -13,10 +13,15 @@ vi.mock("@/lib/utils", () => ({
 import {
   StagedTrigger,
   createAgentTrigger,
+  createOwnerTrigger,
   createStagedTriggers,
+  deleteOwnerTrigger,
   listAgentTriggerRuns,
+  listOwnerTriggerRuns,
+  listOwnerTriggers,
   stagedToCreatePayload,
   stagedToPseudoTrigger,
+  testOwnerTrigger,
   updateAgentTrigger,
 } from "./agent-triggers-api"
 
@@ -122,6 +127,80 @@ describe("agent trigger API client", () => {
     )
     expect(runs).toHaveLength(1)
     expect(runs[0].task_id).toBe(99)
+  })
+})
+
+describe("workforce trigger API client (owner routing)", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+  })
+
+  it("routes list/create/delete/runs/test to the workforce path", async () => {
+    const owner = { kind: "workforce" as const, id: 5 }
+
+    apiRequestMock.mockResolvedValue(jsonResponse([]))
+    await listOwnerTriggers(owner)
+    expect(apiRequestMock).toHaveBeenLastCalledWith(
+      "http://api.local/api/workforces/5/triggers",
+    )
+
+    apiRequestMock.mockResolvedValue(
+      jsonResponse({
+        id: 9,
+        user_id: 1,
+        agent_id: null,
+        workforce_id: 5,
+        type: "webhook",
+        name: "WF hook",
+        enabled: true,
+        config: {},
+        prompt_template: null,
+        webhook_token: null,
+        next_run_at: null,
+        last_run_at: null,
+        last_error: null,
+        created_at: null,
+        updated_at: null,
+      }),
+    )
+    const created = await createOwnerTrigger(owner, { type: "webhook" })
+    expect(created.workforce_id).toBe(5)
+    expect(created.agent_id).toBeNull()
+    expect(apiRequestMock).toHaveBeenLastCalledWith(
+      "http://api.local/api/workforces/5/triggers",
+      expect.objectContaining({ method: "POST" }),
+    )
+
+    apiRequestMock.mockResolvedValue(jsonResponse([]))
+    await listOwnerTriggerRuns(owner, 9)
+    expect(apiRequestMock).toHaveBeenLastCalledWith(
+      "http://api.local/api/workforces/5/triggers/9/runs",
+    )
+
+    apiRequestMock.mockResolvedValue(
+      jsonResponse({ trigger_run: {}, duplicate: false }),
+    )
+    await testOwnerTrigger(owner, 9, { payload: {} })
+    expect(apiRequestMock).toHaveBeenLastCalledWith(
+      "http://api.local/api/workforces/5/triggers/9/test",
+      expect.objectContaining({ method: "POST" }),
+    )
+
+    apiRequestMock.mockResolvedValue(jsonResponse({ message: "Trigger deleted" }))
+    await deleteOwnerTrigger(owner, 9)
+    expect(apiRequestMock).toHaveBeenLastCalledWith(
+      "http://api.local/api/workforces/5/triggers/9",
+      expect.objectContaining({ method: "DELETE" }),
+    )
+  })
+
+  it("keeps the agent-scoped wrappers pointed at the agent path", async () => {
+    apiRequestMock.mockResolvedValue(jsonResponse([]))
+    await createAgentTrigger(42, { type: "webhook" })
+    expect(apiRequestMock).toHaveBeenLastCalledWith(
+      "http://api.local/api/agents/42/triggers",
+      expect.objectContaining({ method: "POST" }),
+    )
   })
 })
 

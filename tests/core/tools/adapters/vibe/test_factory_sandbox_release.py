@@ -1,7 +1,8 @@
-"""Regression test for issue #889: the config's DB connection is released
-again before sandbox workspace setup (which awaits external sandbox exec),
-because the override/allowlist loads after the MCP creator's release may
-have re-opened a read transaction."""
+"""Regression tests for ToolFactory release boundaries.
+
+Issue #889 requires the config's DB connection to be released again before
+sandbox workspace setup because override/allowlist reads may reopen it.
+"""
 
 import pytest
 
@@ -48,6 +49,70 @@ class _FakeConfig:
 
     def get_max_recursion_depth(self):
         return 5
+
+
+class _FailingPrepareConfig:
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    async def prepare_factory_runtime(self) -> None:
+        self._calls.append("prepare")
+        raise RuntimeError("prepare failed")
+
+    def release_prepared_factory_runtime(self) -> None:
+        self._calls.append("release")
+
+
+class _FailingPrepareAndReleaseConfig(_FailingPrepareConfig):
+    def release_prepared_factory_runtime(self) -> None:
+        super().release_prepared_factory_runtime()
+        raise ValueError("release failed")
+
+
+class _FailingReleaseConfig:
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    def release_prepared_factory_runtime(self) -> None:
+        self._calls.append("release")
+        raise ValueError("release failed")
+
+
+@pytest.mark.asyncio
+async def test_release_prepared_runtime_when_prepare_fails():
+    calls: list[str] = []
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        await ToolFactory.create_all_tools(_FailingPrepareConfig(calls))
+
+    assert calls == ["prepare", "release"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_error_wins_when_release_also_fails(caplog):
+    calls: list[str] = []
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        await ToolFactory.create_all_tools(_FailingPrepareAndReleaseConfig(calls))
+
+    assert calls == ["prepare", "release"]
+    assert "Failed to release prepared tool-factory runtime" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_release_error_propagates_without_primary_error(monkeypatch):
+    calls: list[str] = []
+
+    async def build_tools(config, apply_user_override_filter=True):
+        calls.append("build")
+        return []
+
+    monkeypatch.setattr(ToolFactory, "_create_all_tools_prepared", build_tools)
+
+    with pytest.raises(ValueError, match="release failed"):
+        await ToolFactory.create_all_tools(_FailingReleaseConfig(calls))
+
+    assert calls == ["build", "release"]
 
 
 @pytest.mark.asyncio

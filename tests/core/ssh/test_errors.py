@@ -10,6 +10,17 @@ def test_error_codes_have_stable_string_values() -> None:
     assert SshErrorCode.CONCURRENT_UPDATE.value == "ssh_concurrent_update"
 
 
+def test_cross_seam_consumer_raised_codes_are_stable() -> None:
+    # These four are raised by out-of-repo consumers across the provider /
+    # secret-store / audit seam and only *recorded* by core, so an in-repo grep
+    # sees no raise-site and can wrongly flag them as dead (this already happened
+    # once). Pinning their values here makes a delete/rename fail CI in-repo.
+    assert SshErrorCode.TARGET_IN_USE.value == "ssh_target_in_use"
+    assert SshErrorCode.CREDENTIAL_REVOKED.value == "ssh_credential_revoked"
+    assert SshErrorCode.CREDENTIAL_IN_USE.value == "ssh_credential_in_use"
+    assert SshErrorCode.HOST_KEY_UNVERIFIED.value == "ssh_host_key_unverified"
+
+
 def test_all_codes_are_lowercase_ssh_prefixed() -> None:
     for code in SshErrorCode:
         assert code.value.startswith("ssh_")

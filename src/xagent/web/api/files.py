@@ -181,9 +181,7 @@ async def _inline_preview_response(
             # it so one cache-miss preview cannot stall every other request
             # on this event loop (the public preview endpoint makes this
             # externally triggerable).
-            png_path = await asyncio.to_thread(
-                _rasterize_svg_preview, path, file_id
-            )
+            png_path = await asyncio.to_thread(_rasterize_svg_preview, path, file_id)
         except Exception as exc:
             raise HTTPException(
                 status_code=422, detail="SVG cannot be safely previewed"

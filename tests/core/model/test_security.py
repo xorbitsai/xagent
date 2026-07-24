@@ -131,7 +131,9 @@ async def test_fetch_public_http_bytes_via_proxy_still_rejects_private_dns_resul
     resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        raise AssertionError("private-network target must be rejected before connecting")
+        raise AssertionError(
+            "private-network target must be rejected before connecting"
+        )
 
     transport = httpx.MockTransport(handler)
 

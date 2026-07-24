@@ -500,6 +500,59 @@ describe("AgentTriggersDialog", () => {
     })
   })
 
+  it("keeps a fresh secret attached to its own trigger instead of letting Back navigate past it", async () => {
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers" && options?.method === "POST") {
+        return Promise.resolve(
+          jsonResponse(
+            makeTrigger({
+              id: 13,
+              name: "API / Webhook",
+              webhook_token: "tok",
+              webhook_secret: "wh_back_secret",
+            }),
+          ),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.secret")
+    const [detailSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(detailSwitch)
+
+    expect(await screen.findByText("wh_back_secret")).toBeInTheDocument()
+
+    // Back must not leave the just-created trigger's view while its one-time
+    // secret is still unacknowledged — otherwise the reveal alert would stay
+    // mounted and read as if it belonged to whatever the user navigates to.
+    fireEvent.click(screen.getByRole("button", { name: "common.back" }))
+    await waitFor(() => {
+      expect(screen.getByText("wh_back_secret")).toBeInTheDocument()
+    })
+    expect(screen.getByLabelText("triggers.form.name")).toBeInTheDocument()
+
+    // Once dismissed, Back proceeds normally.
+    fireEvent.click(screen.getByRole("button", { name: "triggers.secret.dismiss" }))
+    fireEvent.click(screen.getByRole("button", { name: "common.back" }))
+    await waitFor(() => {
+      expect(screen.queryByLabelText("triggers.form.name")).not.toBeInTheDocument()
+    })
+  })
+
   it("clears the dirty flag when the Gmail quick-toggle intent is reversed, so Done closes cleanly", async () => {
     const onOpenChange = vi.fn()
     // Zero connected accounts: the quick toggle must open the creation form
@@ -652,6 +705,54 @@ describe("AgentTriggersDialog", () => {
     })
     await waitFor(() => {
       expect(getCallsAfterFailure).toBeGreaterThan(0)
+    })
+  })
+
+  it("selects the newest remaining same-type trigger after deleting the selected one", async () => {
+    const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
+    let triggers = [
+      makeTrigger({ id: 50, name: "Older hook" }),
+      makeTrigger({ id: 51, name: "Newer hook" }),
+    ]
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse(triggers))
+      }
+      if (url === `${TRIGGERS_URL}/50/runs` || url === `${TRIGGERS_URL}/51/runs`) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === `${TRIGGERS_URL}/51` && init?.method === "DELETE") {
+        triggers = triggers.filter((item) => item.id !== 51)
+        return Promise.resolve(jsonResponse({}))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    // Newest enabled trigger (51) is auto-selected as primary.
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("Newer hook")
+
+    // Delete the currently-selected pill (pills list newest-first, so index 0
+    // is "Newer hook"), not another one — this is the pickNextAfterDelete
+    // branch that actually returns a next id (newest of what remains), as
+    // opposed to falling back to null/empty.
+    const [selectedHookDelete] = screen.getAllByRole("button", { name: "triggers.actions.delete" })
+    fireEvent.click(selectedHookDelete)
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.confirmDelete" }))
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("triggers.form.name")).toHaveValue("Older hook")
     })
   })
 
@@ -1257,6 +1358,50 @@ describe("AgentTriggersDialog owner routing", () => {
     await waitFor(() => {
       expect(apiRequestMock).toHaveBeenCalledWith(
         `${WORKFORCE_TRIGGERS_URL}/60`,
+        expect.objectContaining({ method: "PATCH" }),
+      )
+    })
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/api/agents/"),
+      expect.anything(),
+    )
+  })
+
+  it("toggles an existing workforce-owned trigger from the detail view via PATCH", async () => {
+    const WORKFORCE_TRIGGERS_URL = "http://api.local/api/workforces/5/triggers"
+    const trigger = makeTrigger({ id: 63, name: "Workforce hook", enabled: true })
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === WORKFORCE_TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([trigger]))
+      }
+      if (url === `${WORKFORCE_TRIGGERS_URL}/63/runs`) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === `${WORKFORCE_TRIGGERS_URL}/63` && init?.method === "PATCH") {
+        return Promise.resolve(jsonResponse({ ...trigger, enabled: false }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        owner={{ kind: "workforce", id: 5 }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("Workforce hook")
+    const [detailSwitch] = screen.getAllByRole("switch")
+    expect(detailSwitch).toHaveAttribute("aria-checked", "true")
+    fireEvent.click(detailSwitch)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        `${WORKFORCE_TRIGGERS_URL}/63`,
         expect.objectContaining({ method: "PATCH" }),
       )
     })

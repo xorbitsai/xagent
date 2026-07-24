@@ -507,7 +507,7 @@ export function AgentTriggersDialog({
     // Preset values carry real user intent (e.g. the Gmail quick toggle's
     // enabled=true); mark them dirty so Done/Back attempts the creation
     // instead of silently dropping them.
-    setFormDirty(Boolean(initial && Object.keys(initial).length > 0))
+    setFormDirty(Boolean(initial))
     setRuns([])
   }
 
@@ -741,7 +741,7 @@ export function AgentTriggersDialog({
         }
         return
       }
-      const result = await handleSubmit({ enabled: true })
+      const result = await handleSubmit(true)
       if (!result.ok && syncedFormKeyRef.current === formKeyAtStart) {
         setForm((current) => ({ ...current, enabled: false }))
       }
@@ -798,18 +798,16 @@ export function AgentTriggersDialog({
     secret: string | null
   }
 
-  // Persists the current form (update selected / create new). `overrides`
-  // lets callers force fields on top of the form state (the detail switch
+  // Persists the current form (update selected / create new). `enabled`
+  // lets callers force the field on top of the form state (the detail switch
   // passes enabled=true when creating). Returns success plus any freshly
   // generated webhook secret so commit-on-navigation callers can stay put on
   // failure or on a pending secret reveal.
-  const handleSubmit = async (
-    overrides?: Partial<Pick<TriggerFormState, "enabled">>,
-  ): Promise<SubmitResult> => {
+  const handleSubmit = async (enabled?: boolean): Promise<SubmitResult> => {
     if (!canOperate) return { ok: false, secret: null }
     let payload
     try {
-      payload = { ...buildPayload(), ...overrides }
+      payload = { ...buildPayload(), ...(enabled !== undefined && { enabled }) }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("triggers.messages.saveFailed"))
       return { ok: false, secret: null }
@@ -917,18 +915,21 @@ export function AgentTriggersDialog({
   }
 
   const handleBack = async () => {
-    if (!(await commitPendingEdits()).ok) return
+    const result = await commitPendingEdits()
+    if (!result.ok || secretPending(result)) return
     setActiveType(null)
   }
 
   const handleSelectTrigger = async (trigger: AgentTrigger) => {
     if (trigger.id === selectedTriggerId) return
-    if (!(await commitPendingEdits()).ok) return
+    const result = await commitPendingEdits()
+    if (!result.ok || secretPending(result)) return
     beginEdit(trigger)
   }
 
   const handleAddAnother = async (type: AgentTriggerType) => {
-    if (!(await commitPendingEdits()).ok) return
+    const result = await commitPendingEdits()
+    if (!result.ok || secretPending(result)) return
     beginCreateForType(type)
   }
 

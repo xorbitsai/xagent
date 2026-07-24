@@ -142,6 +142,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
                 max_content_bytes=self._max_content_bytes,
                 resource_name="remote asset",
                 require_non_empty=True,
+                via_proxy=bool(proxy_url),
             )
         return response.content, response.url, response.content_type
 

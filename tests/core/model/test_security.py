@@ -79,6 +79,75 @@ async def test_fetch_public_http_bytes_pins_validated_ip() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_public_http_bytes_via_proxy_does_not_rewrite_sni_to_ip() -> None:
+    """When routed through an HTTP CONNECT proxy, the request must keep the
+    original hostname as the connect target and TLS SNI. httpcore's CONNECT
+    tunnel path derives SNI from the request's remote origin and ignores the
+    ``sni_hostname`` extension entirely, so pinning the URL to a bare IP (as
+    the direct-connection path does) sends the IP as SNI and breaks
+    SNI-strict HTTPS servers behind the proxy."""
+
+    getaddrinfo_calls: list[tuple] = []
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        getaddrinfo_calls.append((host, port))
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["host"] = request.url.host
+        captured["host_header"] = request.headers.get("host")
+        captured["sni_hostname"] = request.extensions.get("sni_hostname")
+        return httpx.Response(200, content=b"ok")
+
+    transport = httpx.MockTransport(handler)
+
+    with patch("socket.getaddrinfo", side_effect=fake_getaddrinfo):
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await fetch_public_http_bytes(
+                client,
+                "https://rebind.example/x",
+                max_content_bytes=1024,
+                timeout=5,
+                via_proxy=True,
+            )
+
+    assert response.content == b"ok"
+    # The request must still target the original hostname (not the pinned
+    # IP) so a CONNECT proxy performs its own DNS resolution and TLS SNI
+    # matches the real origin.
+    assert captured["host"] == "rebind.example"
+    assert captured["sni_hostname"] is None
+    # DNS validation still runs up front to reject private-network targets
+    # before the request is ever dispatched to the proxy.
+    assert len(getaddrinfo_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_public_http_bytes_via_proxy_still_rejects_private_dns_result() -> (
+    None
+):
+    resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("private-network target must be rejected before connecting")
+
+    transport = httpx.MockTransport(handler)
+
+    with patch("socket.getaddrinfo", return_value=resolved):
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(PrivateNetworkHostError):
+                await fetch_public_http_bytes(
+                    client,
+                    "https://rebind.example/x",
+                    max_content_bytes=1024,
+                    timeout=5,
+                    via_proxy=True,
+                )
+
+
+@pytest.mark.asyncio
 async def test_fetch_public_http_bytes_revalidates_redirect_target() -> None:
     """Each redirect hop must be re-validated — a redirect to an internal
     host must be rejected even though the initial hop was public."""

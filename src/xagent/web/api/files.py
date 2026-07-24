@@ -50,7 +50,11 @@ from ..services.managed_file_ref import (
     ManagedFileRef,
     guess_media_type,
 )
-from ..services.uploaded_file_store import UploadedFileStore, delete_pptx_pdf_cache
+from ..services.uploaded_file_store import (
+    UploadedFileStore,
+    delete_pptx_pdf_cache,
+    delete_svg_png_cache,
+)
 from .legacy_file import (
     infer_user_id_from_legacy_path,
     is_valid_uuid,
@@ -124,15 +128,24 @@ def _svg_png_cache_path(svg_path: Path, file_id: Optional[str] = None) -> Path:
     """Return the on-disk cache path for a rasterized SVG preview.
 
     Mirrors ``_pptx_pdf_cache_path``'s cache-dir-outside-uploads pattern.
+
+    A single registered ``file_id`` can be asked to preview multiple
+    distinct SVGs (e.g. relative-path assets alongside a base upload), so
+    the cache key includes a hash of the resolved source path even when
+    ``file_id`` is given — otherwise two different SVGs registered under
+    the same ``file_id`` would collide on one cache entry and the second
+    preview request would read back the first asset's PNG. The ``file_id``
+    prefix is kept so ``delete_svg_png_cache`` can still glob-remove every
+    derived preview for a deleted upload.
     """
     import hashlib
 
     cache_dir = get_storage_root() / "svg_png_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    path_key = hashlib.sha256(str(svg_path.resolve()).encode()).hexdigest()[:24]
     if file_id:
-        return cache_dir / f"{file_id}.preview.png"
-    key = hashlib.sha256(str(svg_path.resolve()).encode()).hexdigest()[:24]
-    return cache_dir / f"{key}.preview.png"
+        return cache_dir / f"{file_id}.{path_key}.preview.png"
+    return cache_dir / f"{path_key}.preview.png"
 
 
 def _rasterize_svg_preview(svg_path: Path, file_id: Optional[str] = None) -> Path:
@@ -152,7 +165,7 @@ def _rasterize_svg_preview(svg_path: Path, file_id: Optional[str] = None) -> Pat
     return cache_path
 
 
-def _inline_preview_response(
+async def _inline_preview_response(
     path: Path, *, filename: str, media_type: str, file_id: Optional[str] = None
 ) -> FileResponse:
     """Build the final inline preview FileResponse, rasterizing SVG to PNG.
@@ -163,7 +176,14 @@ def _inline_preview_response(
     """
     if media_type == "image/svg+xml":
         try:
-            png_path = _rasterize_svg_preview(path, file_id=file_id)
+            # CairoSVG rasterization is CPU-bound and can run up to the
+            # 4096x4096 pixel budget even for a small (<=5MB) SVG; offload
+            # it so one cache-miss preview cannot stall every other request
+            # on this event loop (the public preview endpoint makes this
+            # externally triggerable).
+            png_path = await asyncio.to_thread(
+                _rasterize_svg_preview, path, file_id
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=422, detail="SVG cannot be safely previewed"
@@ -1321,7 +1341,7 @@ async def preview_file(
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
                 _ensure_under_uploads(materialized_path, owner_user_id)
-            return _inline_preview_response(
+            return await _inline_preview_response(
                 materialized_path,
                 filename=file_name,
                 media_type=media_type,
@@ -1350,7 +1370,7 @@ async def preview_file(
         if accel_response is not None:
             return accel_response
 
-    return _inline_preview_response(
+    return await _inline_preview_response(
         full_path,
         filename=file_name,
         media_type=media_type,
@@ -1563,7 +1583,7 @@ async def public_preview_file(
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
                 _ensure_under_uploads(target_path, owner_user_id)
-            return _inline_preview_response(
+            return await _inline_preview_response(
                 target_path,
                 filename=str(file_record.filename),
                 media_type=guess_media_type(str(file_record.filename)),
@@ -1610,7 +1630,7 @@ async def public_preview_file(
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
-    return _inline_preview_response(
+    return await _inline_preview_response(
         target_path,
         filename=target_path.name,
         media_type=guess_media_type(target_path.name),
@@ -1691,6 +1711,7 @@ async def delete_file(
     # so this HTTP route and every other deletion path (reconcile, orphan cleanup)
     # behave identically.  Non-UUID ids are silently ignored by the helper.
     delete_pptx_pdf_cache(file_id)
+    delete_svg_png_cache(file_id)
 
     return {
         "success": True,

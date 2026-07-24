@@ -31,6 +31,32 @@ def delete_pptx_pdf_cache(file_id: str) -> None:
         logger.warning("Failed to remove PDF preview cache for %s", file_id)
 
 
+def delete_svg_png_cache(file_id: str) -> None:
+    """Remove all rasterized SVG preview PNGs cached for an upload.
+
+    Unlike the PPTX preview cache (one fixed file per ``file_id``), an SVG
+    ``file_id`` can have multiple derived previews — one per relative-path
+    asset resolved under it (see ``_svg_png_cache_path`` in
+    ``web/api/files.py``), each keyed as ``<file_id>.<path-hash>.preview.png``.
+    Must be called from every path that deletes an ``UploadedFile`` row so
+    none of those derived previews outlive the source artifact. Silently
+    no-ops when there is nothing cached.
+    """
+    if not file_id:
+        return
+    cache_dir = get_storage_root() / "svg_png_cache"
+    try:
+        matches = list(cache_dir.glob(f"{file_id}.*.preview.png"))
+    except OSError:
+        logger.warning("Failed to list SVG preview cache for %s", file_id)
+        return
+    for cache_path in matches:
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove SVG preview cache %s", cache_path)
+
+
 def create_unbound_uploaded_file_from_local_path(
     *,
     local_path: Path,
@@ -226,6 +252,7 @@ class UploadedFileStore:
         # clean up the cache.
         file_id = str(getattr(file_record, "file_id", "") or "")
         delete_pptx_pdf_cache(file_id)
+        delete_svg_png_cache(file_id)
         self.db.delete(file_record)
         self.db.flush()
 

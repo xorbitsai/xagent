@@ -147,6 +147,7 @@ async def fetch_public_http_bytes(
     headers: Mapping[str, str] | None = None,
     resource_name: str = "response body",
     require_non_empty: bool = False,
+    via_proxy: bool = False,
 ) -> PublicHttpResponse:
     """Fetch a bounded HTTP body, validating and pinning every redirect hop.
 
@@ -155,6 +156,17 @@ async def fetch_public_http_bytes(
     header and TLS SNI override) — this closes the DNS-rebinding /
     TOCTOU window where a second, independent DNS lookup at connect
     time could return a different (private) address.
+
+    When ``via_proxy`` is set, the request goes through an HTTP CONNECT
+    proxy rather than connecting directly. httpcore's CONNECT tunnel path
+    ignores the ``sni_hostname`` extension and derives TLS SNI from the
+    request's remote origin, so rewriting the URL to the pinned IP would
+    send that IP as SNI and break SNI-strict servers. The proxy — not this
+    process — performs the actual outbound connection and its own DNS
+    resolution, so pinning to a client-resolved IP offers no real
+    protection there anyway. In this mode we keep the original hostname as
+    the connect target and rely on the upfront ``validate_public_http_url``
+    check alone to reject private-network targets before dispatch.
     """
 
     logical_url = url
@@ -162,16 +174,21 @@ async def fetch_public_http_bytes(
     for redirect_count in range(_MAX_REDIRECTS + 1):
         resolved_ips = await validate_public_http_url(logical_url)
         parsed = urlsplit(logical_url)
-        connect_url, host_header, sni = _pin_url_to_ip(parsed, resolved_ips[0])
         request_headers = dict(headers or {})
-        request_headers["Host"] = host_header
+        stream_extensions: dict[str, str] = {}
+        if via_proxy:
+            connect_url = logical_url
+        else:
+            connect_url, host_header, sni = _pin_url_to_ip(parsed, resolved_ips[0])
+            request_headers["Host"] = host_header
+            stream_extensions["sni_hostname"] = sni
         async with client.stream(
             "GET",
             connect_url,
             headers=request_headers,
             timeout=timeout,
             follow_redirects=False,
-            extensions={"sni_hostname": sni},
+            extensions=stream_extensions,
         ) as response:
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")

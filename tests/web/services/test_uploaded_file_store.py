@@ -7,7 +7,10 @@ from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.managed_file_ref import DurableStorageOperationError
-from xagent.web.services.uploaded_file_store import UploadedFileStore
+from xagent.web.services.uploaded_file_store import (
+    UploadedFileStore,
+    delete_svg_png_cache,
+)
 
 
 def _session():
@@ -103,6 +106,56 @@ def test_delete_removes_local_durable_and_db_record(monkeypatch, tmp_path):
     assert not source.exists()
     assert not get_unscoped_file_storage().exists(storage_key)
     assert db.query(UploadedFile).filter_by(file_id="file-delete").first() is None
+
+
+def test_delete_svg_png_cache_removes_all_previews_for_file_id(monkeypatch, tmp_path):
+    """A file_id can have multiple derived SVG previews cached (e.g. one per
+    relative-path asset registered under it). Deleting the source upload must
+    remove every one of them, not just a single fixed filename."""
+
+    storage_root = tmp_path / "storage"
+    cache_dir = storage_root / "svg_png_cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "file-svg.aaa111.preview.png").write_bytes(b"png-a")
+    (cache_dir / "file-svg.bbb222.preview.png").write_bytes(b"png-b")
+    other_file_cache = cache_dir / "other-file.ccc333.preview.png"
+    other_file_cache.write_bytes(b"png-other")
+
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(storage_root))
+
+    delete_svg_png_cache("file-svg")
+
+    assert not list(cache_dir.glob("file-svg.*.preview.png"))
+    assert other_file_cache.exists()
+
+
+def test_delete_removes_svg_png_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path / "storage"))
+    get_unscoped_file_storage.cache_clear()
+    db = _session()
+    user = _user(db)
+    source = tmp_path / "uploads" / "delete.svg"
+    source.parent.mkdir()
+    source.write_text("<svg></svg>", encoding="utf-8")
+    store = UploadedFileStore(db)
+    record = store.create_from_local_path(
+        local_path=source,
+        user_id=int(user.id),
+        file_id="file-svg-delete",
+        filename="delete.svg",
+        mime_type="image/svg+xml",
+    )
+
+    cache_dir = tmp_path / "storage" / "svg_png_cache"
+    cache_dir.mkdir(parents=True)
+    cache_path = cache_dir / "file-svg-delete.deadbeef.preview.png"
+    cache_path.write_bytes(b"cached preview")
+
+    store.delete(record, delete_local=True)
+    db.commit()
+
+    assert not cache_path.exists()
 
 
 def test_delete_preserves_db_row_when_durable_cleanup_fails(monkeypatch, tmp_path):

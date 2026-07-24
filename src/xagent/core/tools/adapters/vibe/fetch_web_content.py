@@ -22,8 +22,10 @@ class FetchWebContentArgs(BaseModel):
     asset_query: str | None = Field(
         default=None,
         description=(
-            "Optional substring such as 'logo' used to filter discovered assets. "
-            "For React SPAs this also searches the official asset manifest."
+            "Optional substring such as 'logo' used to filter assets discovered "
+            "in the fetched HTML, matched against each asset's URL, name, and "
+            "alt text. A <link rel=manifest> URL may be included among the "
+            "discovered assets, but its contents are not fetched or searched."
         ),
     )
 
@@ -51,8 +53,9 @@ class FetchWebContentResult(BaseModel):
     assets: list[WebAssetReferenceResult] = Field(
         default_factory=list,
         description=(
-            "Static asset URLs discovered from the page and, for supported SPAs, "
-            "the site's own asset manifest"
+            "Static asset URLs discovered by parsing the fetched HTML (images, "
+            "icons, stylesheets, scripts, and any linked manifest URL) — the "
+            "manifest itself, if present, is not fetched or searched"
         ),
     )
 

@@ -136,6 +136,7 @@ class WebContentFetcher:
                     headers=headers,
                     timeout=10,
                     max_content_bytes=self._max_content_bytes,
+                    via_proxy=bool(self._proxy_url),
                 )
                 content_type = response.content_type
                 final_url = response.url

@@ -582,13 +582,18 @@ class TestVisionToolUnderstandMedia:
         validate_url.assert_awaited_once_with(
             "https://cdn.example.com/official-logo.svg"
         )
+        # When routed through an HTTP CONNECT proxy, the request must keep the
+        # original hostname as the connect target: httpcore's CONNECT tunnel
+        # path derives TLS SNI from the remote origin and ignores the
+        # `sni_hostname` extension, so rewriting to the pinned IP here would
+        # send that IP as SNI and break SNI-strict servers (PR #977 review).
         client.stream.assert_called_once_with(
             "GET",
-            "https://93.184.216.34:443/official-logo.svg",
-            headers={"Host": "cdn.example.com"},
+            "https://cdn.example.com/official-logo.svg",
+            headers={},
             timeout=10,
             follow_redirects=False,
-            extensions={"sni_hostname": "cdn.example.com"},
+            extensions={},
         )
 
     @pytest.mark.asyncio

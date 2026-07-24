@@ -244,6 +244,7 @@ class VisionCore:
                 max_content_bytes=MAX_SVG_BYTES,
                 resource_name="remote SVG",
                 require_non_empty=True,
+                via_proxy=bool(proxy_url),
             )
         return self._decode_svg_bytes(response.content)
 

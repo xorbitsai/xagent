@@ -13,6 +13,7 @@ from xagent.core.computer.schema import (
     ComputerTarget,
     NormalizedPoint,
 )
+from xagent.core.computer.session import ComputerSessionBinding
 from xagent.core.context_ref import ContextReference, ContextReferencePurpose
 
 
@@ -75,6 +76,20 @@ class FakePage:
         self.keyboard = FakeKeyboard()
         self.goto_calls: list[tuple[str, str, int]] = []
         self.wait_calls: list[int] = []
+        self.interactive_elements: list[dict[str, Any]] = [
+            {
+                "bounds": {
+                    "x": 0.1,
+                    "y": 0.2,
+                    "width": 0.2,
+                    "height": 0.1,
+                },
+                "label": "Continue",
+                "role": "button",
+                "text": "Continue",
+                "metadata": {"tag": "button"},
+            }
+        ]
 
     async def set_viewport_size(self, viewport: dict[str, int]) -> None:
         self.viewport_size = viewport
@@ -90,20 +105,7 @@ class FakePage:
         if "devicePixelRatio" in script:
             return 2
         if "querySelectorAll" in script:
-            return [
-                {
-                    "bounds": {
-                        "x": 0.1,
-                        "y": 0.2,
-                        "width": 0.2,
-                        "height": 0.1,
-                    },
-                    "label": "Continue",
-                    "role": "button",
-                    "text": "Continue",
-                    "metadata": {"tag": "button"},
-                }
-            ]
+            return self.interactive_elements
         raise AssertionError(f"unexpected evaluate script: {script}")
 
     async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
@@ -125,11 +127,22 @@ class FakeSession:
 class FakeManager:
     def __init__(self, page: FakePage) -> None:
         self.page = page
-        self.calls: list[tuple[str, bool]] = []
+        self.calls: list[dict[str, Any]] = []
         self.closed: list[str] = []
 
-    async def get_or_create(self, session_id: str, headless: bool) -> FakeSession:
-        self.calls.append((session_id, headless))
+    async def get_or_create(
+        self,
+        session_id: str,
+        headless: bool,
+        **kwargs: Any,
+    ) -> FakeSession:
+        self.calls.append(
+            {
+                "session_id": session_id,
+                "headless": headless,
+                **kwargs,
+            }
+        )
         return FakeSession(self.page)
 
     async def close(self, session_id: str) -> None:
@@ -180,6 +193,39 @@ async def test_browser_observation_captures_screenshot_and_dom_elements(
     assert observation.elements[0].label == "Continue"
     assert store.calls[0]["image_bytes"] == b"browser-png"
     assert environment.current_observation == observation
+
+
+@pytest.mark.asyncio
+async def test_browser_observation_redacts_sensitive_input_values(
+    browser_environment,
+) -> None:
+    environment, page, _store = browser_environment
+    page.interactive_elements = [
+        {
+            "bounds": {
+                "x": 0.1,
+                "y": 0.2,
+                "width": 0.2,
+                "height": 0.1,
+            },
+            "label": "Password",
+            "role": "input",
+            "text": "plain-text-secret",
+            "metadata": {
+                "tag": "input",
+                "input_type": "password",
+                "autocomplete": "current-password",
+                "value": "metadata-secret",
+            },
+        }
+    ]
+
+    observation = await environment.observe()
+
+    assert observation.elements[0].text is None
+    assert observation.elements[0].metadata["sensitive"] is True
+    assert "plain-text-secret" not in observation.model_dump_json()
+    assert "metadata-secret" not in observation.model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -278,3 +324,32 @@ async def test_browser_environment_closes_its_session(browser_environment) -> No
     await environment.close()
 
     assert environment.manager.closed == ["browser-1"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_persistent_environment_uses_stable_profile_session(tmp_path) -> None:
+    page = FakePage()
+    manager = FakeManager(page)
+    binding = ComputerSessionBinding.from_values(
+        runtime_kind="persistent_playwright",
+        owner_task_id="task-9",
+        user_id=7,
+        profile_id="work",
+        profile_root=tmp_path,
+    )
+    environment = BrowserComputerEnvironment(
+        session_id="task-9:step-1",
+        workspace=FakeWorkspace(),
+        manager=manager,  # type: ignore[arg-type]
+        observation_store=FakeObservationStore(),  # type: ignore[arg-type]
+        session_binding=binding,
+    )
+
+    await environment.observe()
+
+    assert manager.calls[0] == {
+        "session_id": "computer-profile:user_7:work",
+        "headless": False,
+        "persistent_profile_dir": tmp_path / "user_7" / "work",
+        "owner_id": "task-9",
+    }

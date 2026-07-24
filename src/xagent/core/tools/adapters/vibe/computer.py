@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -19,6 +20,7 @@ from ....computer.schema import (
     ComputerActionType,
     ComputerObservation,
 )
+from ....computer.session import BrowserRuntimeKind, ComputerSessionBinding
 from ....context_ref import CONTEXT_REFS_KEY
 from ....workspace import TaskWorkspace
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
@@ -60,6 +62,7 @@ class ComputerToolArgs(BaseModel):
 class ComputerToolResult(BaseModel):
     success: bool
     session_id: str
+    browser_runtime_kind: BrowserRuntimeKind
     frame_id: str | None = None
     observation: ComputerObservation | None = None
     message: str = ""
@@ -79,12 +82,22 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         workspace: TaskWorkspace | None = None,
         environment_factory: ComputerEnvironmentFactory = BrowserComputerEnvironment,
         headless: bool = True,
+        browser_runtime_kind: BrowserRuntimeKind | str = (
+            BrowserRuntimeKind.EPHEMERAL_PLAYWRIGHT
+        ),
+        user_id: int | None = None,
+        browser_profile_id: str = "default",
+        browser_profile_root: Path | None = None,
     ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
         self._workspace = workspace
         self._environment_factory = environment_factory
         self._headless = headless
+        self._browser_runtime_kind = BrowserRuntimeKind(browser_runtime_kind)
+        self._user_id = user_id
+        self._browser_profile_id = browser_profile_id
+        self._browser_profile_root = browser_profile_root
         self._environments: dict[str, ComputerEnvironment] = {}
 
     @property
@@ -93,7 +106,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Inspect and control one browser through screenshots.
+        description = """Inspect and control one browser through screenshots.
 
         Workflow:
         1. First call: request only a screenshot and omit expected_frame_id.
@@ -108,6 +121,16 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         Do not request a separate screenshot after an action; the action result
         already contains the new observation.
         """
+        if self._browser_runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT:
+            description += """
+
+        This task uses a visible persistent browser profile. If login, CAPTCHA,
+        passkey, or two-factor authentication requires the user, do not ask for credentials.
+        Ask the user to take control of the visible browser and
+        complete the step, wait for their response, then request a fresh
+        screenshot before continuing.
+        """
+        return description
 
     @property
     def tags(self) -> list[str]:
@@ -123,7 +146,12 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         raise NotImplementedError("computer is async-only")
 
     async def run_json_async(self, args: Mapping[str, Any]) -> dict[str, Any]:
-        parsed = ComputerToolArgs.model_validate(self._with_default_session(args))
+        prepared_args = self._with_default_session(args)
+        if self._browser_runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT:
+            # Persistent profiles are an authenticated task resource, not a
+            # model-selected browser namespace.
+            prepared_args["session_id"] = self._default_session_id()
+        parsed = ComputerToolArgs.model_validate(prepared_args)
         session_id = str(parsed.session_id or "").strip()
         if not session_id:
             return self._error_result(
@@ -142,6 +170,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 session_id=session_id,
                 workspace=self._workspace,
                 headless=self._headless,
+                session_binding=self._session_binding(session_id),
             )
             self._environments[session_id] = environment
 
@@ -203,6 +232,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         result = ComputerToolResult(
             success=True,
             session_id=session_id,
+            browser_runtime_kind=self._browser_runtime_kind,
             frame_id=observation.frame_id,
             observation=observation,
             message=(
@@ -213,22 +243,44 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         result[CONTEXT_REFS_KEY] = [observation.screenshot.durable_dict()]
         return result
 
-    async def teardown(self, task_id: str | None = None) -> None:
+    async def teardown(
+        self,
+        task_id: str | None = None,
+        execution_status: str | None = None,
+    ) -> None:
+        preserve_for_user = (
+            self._browser_runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT
+            and execution_status in {"interrupted", "waiting_for_user"}
+        )
         environments = list(self._environments.values())
         self._environments.clear()
-        for environment in environments:
-            try:
-                await environment.close()
-            except Exception:  # noqa: BLE001 - teardown must continue.
-                logger.warning(
-                    "Failed to close computer environment %s",
-                    environment.session_id,
-                    exc_info=True,
-                )
+        if not preserve_for_user:
+            for environment in environments:
+                try:
+                    await environment.close()
+                except Exception:  # noqa: BLE001 - teardown must continue.
+                    logger.warning(
+                        "Failed to close computer environment %s",
+                        environment.session_id,
+                        exc_info=True,
+                    )
         await self._close_task_sessions(task_id)
 
-    @staticmethod
+    def _session_binding(self, logical_session_id: str) -> ComputerSessionBinding:
+        workspace_user_id = getattr(self._workspace, "owner_user_id", None)
+        user_id = self._user_id
+        if user_id is None and isinstance(workspace_user_id, int):
+            user_id = workspace_user_id
+        return ComputerSessionBinding.from_values(
+            runtime_kind=self._browser_runtime_kind,
+            owner_task_id=self._task_id or logical_session_id,
+            user_id=user_id,
+            profile_id=self._browser_profile_id,
+            profile_root=self._browser_profile_root,
+        )
+
     def _error_result(
+        self,
         *,
         session_id: str,
         error: str,
@@ -237,6 +289,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         return ComputerToolResult(
             success=False,
             session_id=session_id,
+            browser_runtime_kind=self._browser_runtime_kind,
             frame_id=frame_id,
             error=error,
         ).model_dump(mode="json", exclude_none=True)

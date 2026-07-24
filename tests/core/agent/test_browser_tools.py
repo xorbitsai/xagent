@@ -27,6 +27,23 @@ def test_browser_debug_tools_are_opt_in() -> None:
     assert "computer" in default_names
 
 
+def test_browser_factory_binds_persistent_profile_out_of_band(tmp_path) -> None:
+    tools = create_browser_tools(
+        task_id="task-1",
+        user_id=8,
+        computer_runtime_kind="persistent_playwright",
+        browser_profile_id="work",
+        browser_profile_root=tmp_path,
+    )
+    computer = next(tool for tool in tools if tool.name == "computer")
+
+    binding = computer._session_binding("task-1")
+
+    assert binding.user_id == 8
+    assert binding.profile_id == "work"
+    assert binding.persistent_profile_dir() == tmp_path / "user_8" / "work"
+
+
 @pytest.mark.asyncio
 async def test_browser_task_session_mixin_defaults_to_no_task() -> None:
     tool = BrowserTaskSessionMixin()

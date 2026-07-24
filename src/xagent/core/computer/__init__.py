@@ -25,9 +25,15 @@ from .schema import (
     NormalizedRect,
     Viewport,
 )
+from .session import (
+    BrowserRuntimeKind,
+    ComputerSessionBinding,
+    validate_browser_profile_id,
+)
 from .store import ObservationStore
 
 __all__ = [
+    "BrowserRuntimeKind",
     "ComputerAction",
     "ComputerActionBatch",
     "ComputerActionPolicy",
@@ -42,10 +48,12 @@ __all__ = [
     "ComputerPolicyOutcome",
     "ComputerRiskLevel",
     "ComputerSessionMismatchError",
+    "ComputerSessionBinding",
     "ComputerTarget",
     "ComputerTargetNotFoundError",
     "NormalizedPoint",
     "NormalizedRect",
     "ObservationStore",
     "Viewport",
+    "validate_browser_profile_id",
 ]

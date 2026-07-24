@@ -90,6 +90,7 @@ async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -
 
     assert initial["success"] is True
     assert initial["session_id"] == "task-1"
+    assert initial["browser_runtime_kind"] == "ephemeral_playwright"
     assert initial["frame_id"] == "frame-1"
     assert initial[CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == "image-1"
 
@@ -180,6 +181,44 @@ async def test_computer_tool_teardown_closes_created_environments() -> None:
 
     assert factory.environments[0].closed is True
     assert tool._environments == {}
+
+
+@pytest.mark.asyncio
+async def test_persistent_computer_tool_preserves_browser_while_waiting(
+    tmp_path,
+) -> None:
+    factory = EnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+        browser_runtime_kind="persistent_playwright",
+        user_id=9,
+        browser_profile_root=tmp_path,
+    )
+    result = await tool.run_json_async({"session_id": "model-selected-session"})
+
+    await tool.teardown(execution_status="waiting_for_user")
+
+    binding = factory.calls[0]["session_binding"]
+    assert result["session_id"] == "task-1"
+    assert factory.calls[0]["session_id"] == "task-1"
+    assert binding.manager_session_id("ignored") == ("computer-profile:user_9:default")
+    assert factory.environments[0].closed is False
+    assert "do not ask for credentials" in tool.description
+
+
+def test_persistent_computer_tool_requires_authenticated_user(tmp_path) -> None:
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=EnvironmentFactory(),
+        browser_runtime_kind="persistent_playwright",
+        browser_profile_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="authenticated user_id"):
+        tool._session_binding("task-1").persistent_profile_dir()
 
 
 class VisionToolCallingLLM:

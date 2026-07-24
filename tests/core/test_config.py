@@ -14,6 +14,9 @@ from xagent.config import (
     BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
     BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
     BOXLITE_HOME_DIR,
+    BROWSER_PROFILE_ID,
+    BROWSER_PROFILE_ROOT,
+    BROWSER_RUNTIME_KIND,
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
@@ -88,6 +91,9 @@ from xagent.config import (
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
     get_boxlite_home_dir,
+    get_browser_profile_id,
+    get_browser_profile_root,
+    get_browser_runtime_kind,
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
@@ -1019,6 +1025,47 @@ class TestGetStorageRoot:
         monkeypatch.setenv(STORAGE_ROOT, "~/custom-root")
         result = get_storage_root()
         assert result == tmp_path / "custom-root"
+
+
+class TestBrowserProfileConfig:
+    def test_runtime_defaults_to_ephemeral(self, monkeypatch):
+        monkeypatch.delenv(BROWSER_RUNTIME_KIND, raising=False)
+        assert get_browser_runtime_kind() == "ephemeral_playwright"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("persistent", "persistent_playwright"),
+            ("persistent_playwright", "persistent_playwright"),
+            ("managed", "ephemeral_playwright"),
+        ],
+    )
+    def test_runtime_aliases(self, monkeypatch, value, expected):
+        monkeypatch.setenv(BROWSER_RUNTIME_KIND, value)
+        assert get_browser_runtime_kind() == expected
+
+    def test_invalid_runtime_falls_back(self, monkeypatch):
+        monkeypatch.setenv(BROWSER_RUNTIME_KIND, "extension")
+        assert get_browser_runtime_kind() == "ephemeral_playwright"
+
+    def test_profile_root_defaults_under_storage(self, monkeypatch, tmp_path):
+        monkeypatch.delenv(BROWSER_PROFILE_ROOT, raising=False)
+        monkeypatch.setenv(STORAGE_ROOT, str(tmp_path))
+        assert get_browser_profile_root() == tmp_path / "browser_profiles"
+
+    def test_profile_root_override_expands_tilde(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv(BROWSER_PROFILE_ROOT, "~/browser-data")
+        assert get_browser_profile_root() == tmp_path / "browser-data"
+
+    @pytest.mark.parametrize("value", ["../escape", "", ".hidden", "bad/name"])
+    def test_invalid_profile_id_falls_back(self, monkeypatch, value):
+        monkeypatch.setenv(BROWSER_PROFILE_ID, value)
+        assert get_browser_profile_id() == "default"
+
+    def test_safe_profile_id_is_preserved(self, monkeypatch):
+        monkeypatch.setenv(BROWSER_PROFILE_ID, "work.account-1")
+        assert get_browser_profile_id() == "work.account-1"
 
 
 class TestGetSandboxImage:

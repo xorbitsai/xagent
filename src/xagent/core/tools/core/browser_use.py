@@ -8,6 +8,7 @@ automatically cleaned up after a timeout period.
 
 import asyncio
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
@@ -52,10 +53,25 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
         return f"Error: {str(error)}\n\nTraceback:\n{tb_str}"
 
 
+class BrowserProfileInUseError(RuntimeError):
+    """Raised when another task owns the requested persistent profile."""
+
+
+class BrowserSessionConfigurationError(RuntimeError):
+    """Raised when a session ID is reused with incompatible launch settings."""
+
+
 class BrowserSession:
     """Browser session with lazy initialization."""
 
-    def __init__(self, session_id: str, headless: bool = True):
+    def __init__(
+        self,
+        session_id: str,
+        headless: bool = True,
+        *,
+        persistent_profile_dir: Path | None = None,
+        owner_id: str | None = None,
+    ):
         """
         Initialize a browser session.
 
@@ -65,6 +81,12 @@ class BrowserSession:
         """
         self.session_id = session_id
         self.headless = headless
+        self.persistent_profile_dir = (
+            persistent_profile_dir.expanduser().resolve()
+            if persistent_profile_dir is not None
+            else None
+        )
+        self.owner_id = str(owner_id).strip() if owner_id is not None else None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
@@ -73,50 +95,102 @@ class BrowserSession:
         self._last_used = datetime.now()
         self._initialized = False
 
+    @property
+    def is_persistent(self) -> bool:
+        return self.persistent_profile_dir is not None
+
+    def matches_configuration(
+        self,
+        *,
+        headless: bool,
+        persistent_profile_dir: Path | None,
+        owner_id: str | None,
+    ) -> bool:
+        normalized_profile_dir = (
+            persistent_profile_dir.expanduser().resolve()
+            if persistent_profile_dir is not None
+            else None
+        )
+        normalized_owner = str(owner_id).strip() if owner_id is not None else None
+        if self.persistent_profile_dir is None and normalized_profile_dir is None:
+            # Preserve legacy behavior: existing ephemeral sessions keep their
+            # original headed/headless mode regardless of later tool defaults.
+            return True
+        return (
+            self.headless == headless
+            and self.persistent_profile_dir == normalized_profile_dir
+            and self.owner_id == normalized_owner
+        )
+
     async def _ensure_initialized(self) -> None:
         """Lazy initialization: create browser on first use."""
-        if not self._initialized:
-            if not PLAYWRIGHT_AVAILABLE:
-                raise RuntimeError(
-                    "Playwright is not installed or browsers not downloaded. "
-                    "Install with: pip install playwright. "
-                    "Then download browsers: playwright install chromium"
+        if self._initialized:
+            return
+        if not PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError(
+                "Playwright is not installed or browsers not downloaded. "
+                "Install with: pip install playwright. "
+                "Then download browsers: playwright install chromium"
+            )
+
+        self._playwright = await async_playwright().start()
+        try:
+            if self.persistent_profile_dir is not None:
+                user_profile_root = self.persistent_profile_dir.parent
+                user_profile_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                self.persistent_profile_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                    mode=0o700,
                 )
+                user_profile_root.chmod(0o700)
+                self.persistent_profile_dir.chmod(0o700)
+                self._context = (
+                    await self._playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(self.persistent_profile_dir),
+                        headless=self.headless,
+                        viewport={"width": 1920, "height": 1080},
+                        locale="zh-CN",
+                        timezone_id="Asia/Shanghai",
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--disable-infobars",
+                            "--restore-last-session",
+                            "--window-size=1920,1080",
+                            "--allow-file-access-from-files",
+                            "--allow-file-access",
+                        ],
+                    )
+                )
+                pages = list(self._context.pages)
+                self._page = pages[0] if pages else await self._context.new_page()
+            else:
+                # Preserve the legacy ephemeral launch behavior.
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self.headless,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-infobars",
+                        "--window-size=1920,1080",
+                        "--allow-file-access-from-files",
+                        "--allow-file-access",
+                        "--no-sandbox",
+                        "--disable-web-security",
+                    ],
+                )
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                )
+                self._page = await self._context.new_page()
 
-            self._playwright = await async_playwright().start()
-
-            # Launch browser with anti-detection settings
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless,
-                args=[
-                    # Disable WebDriver detection
-                    "--disable-blink-features=AutomationControlled",
-                    # Other anti-detection flags
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    # Allow local file access
-                    "--allow-file-access-from-files",
-                    "--allow-file-access",
-                    # No sandbox for local file access in some environments
-                    "--no-sandbox",
-                    # Disable web security for file:// URLs (required for local files)
-                    "--disable-web-security",
-                ],
-            )
-
-            # Create context with realistic settings
-            self._context = await self._browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                # Set locale and timezone
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
-            )
-
-            self._page = await self._context.new_page()
-
-            # Inject script to hide webdriver property
+            assert self._page is not None
             await self._page.add_init_script("""
                 // Override webdriver detection
                 Object.defineProperty(navigator, 'webdriver', {
@@ -146,8 +220,10 @@ class BrowserSession:
                     get: () => ['zh-CN', 'zh', 'en-US', 'en']
                 });
             """)
-
             self._initialized = True
+        except Exception:
+            await self.close()
+            raise
 
     async def get_page(self) -> Page:
         """
@@ -208,6 +284,7 @@ class BrowserSessionManager:
             timeout_minutes: Minutes of inactivity before auto-closing a session
         """
         self._sessions: Dict[str, BrowserSession] = {}
+        self._persistent_profiles: Dict[Path, str] = {}
         self._lock: asyncio.Lock = (
             asyncio.Lock()
         )  # Use asyncio.Lock instead of threading.Lock
@@ -215,7 +292,12 @@ class BrowserSessionManager:
         self._cleanup_task: Optional[asyncio.Task[None]] = None  # Track cleanup task
 
     async def get_or_create(
-        self, session_id: str, headless: bool = False
+        self,
+        session_id: str,
+        headless: bool = False,
+        *,
+        persistent_profile_dir: Path | None = None,
+        owner_id: str | None = None,
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -228,19 +310,58 @@ class BrowserSessionManager:
             BrowserSession instance
         """
         async with self._lock:
+            normalized_profile_dir = (
+                persistent_profile_dir.expanduser().resolve()
+                if persistent_profile_dir is not None
+                else None
+            )
             # Check if session already exists
             if session_id in self._sessions:
+                if not self._sessions[session_id].matches_configuration(
+                    headless=headless,
+                    persistent_profile_dir=persistent_profile_dir,
+                    owner_id=owner_id,
+                ):
+                    existing = self._sessions[session_id]
+                    if (
+                        existing.is_persistent
+                        and existing.owner_id
+                        and existing.owner_id != str(owner_id or "").strip()
+                    ):
+                        raise BrowserProfileInUseError(
+                            "Persistent browser profile is already in use by "
+                            "another task."
+                        )
+                    raise BrowserSessionConfigurationError(
+                        f"browser session {session_id!r} already exists with "
+                        "different launch settings"
+                    )
                 # Update last used time and return existing session
-                # Ignore headless parameter for existing sessions (can't change mode after creation)
                 self._sessions[session_id]._last_used = datetime.now()
                 return self._sessions[session_id]
+            if normalized_profile_dir is not None:
+                profile_session_id = self._persistent_profiles.get(
+                    normalized_profile_dir
+                )
+                if profile_session_id is not None:
+                    raise BrowserProfileInUseError(
+                        "Persistent browser profile is already in use by "
+                        "another browser session."
+                    )
 
             # Start cleanup task on first session creation
             if self._cleanup_task is None:
                 self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
             # Create new session with specified headless mode
-            self._sessions[session_id] = BrowserSession(session_id, headless)
+            self._sessions[session_id] = BrowserSession(
+                session_id,
+                headless,
+                persistent_profile_dir=normalized_profile_dir,
+                owner_id=owner_id,
+            )
+            if normalized_profile_dir is not None:
+                self._persistent_profiles[normalized_profile_dir] = session_id
             self._sessions[session_id]._last_used = datetime.now()
             return self._sessions[session_id]
 
@@ -253,8 +374,14 @@ class BrowserSessionManager:
         """
         async with self._lock:
             if session_id in self._sessions:
-                await self._sessions[session_id].close()
+                session = self._sessions[session_id]
+                await session.close()
                 del self._sessions[session_id]
+                if session.persistent_profile_dir is not None:
+                    self._persistent_profiles.pop(
+                        session.persistent_profile_dir,
+                        None,
+                    )
 
     async def cleanup_expired(self) -> int:
         """Clean up expired sessions based on timeout."""
@@ -266,8 +393,14 @@ class BrowserSessionManager:
                 if now - sess._last_used > self._timeout
             ]
             for sid in expired:
-                await self._sessions[sid].close()
+                session = self._sessions[sid]
+                await session.close()
                 del self._sessions[sid]
+                if session.persistent_profile_dir is not None:
+                    self._persistent_profiles.pop(
+                        session.persistent_profile_dir,
+                        None,
+                    )
             return len(expired)
 
     async def _cleanup_loop(self) -> None:
@@ -299,6 +432,7 @@ class BrowserSessionManager:
             for session in list(self._sessions.values()):
                 await session.close()
             self._sessions.clear()
+            self._persistent_profiles.clear()
 
 
 # Global singleton with async-safe initialization

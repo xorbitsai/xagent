@@ -5,7 +5,7 @@ These tests use mocking to avoid requiring actual browser installation.
 Run with: pytest tests/core/tools/test_browser_use.py
 """
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -272,6 +272,33 @@ class TestBrowserSessionManager:
 
             assert expired_count >= 0
 
+    async def test_persistent_profile_rejects_another_task(
+        self, reset_manager, tmp_path
+    ):
+        manager = browser_use.BrowserSessionManager()
+        profile_dir = tmp_path / "user_1" / "default"
+        try:
+            first = await manager.get_or_create(
+                "computer-profile:user_1:default",
+                headless=False,
+                persistent_profile_dir=profile_dir,
+                owner_id="task-1",
+            )
+
+            assert first.is_persistent is True
+            with pytest.raises(
+                browser_use.BrowserProfileInUseError,
+                match="another task",
+            ):
+                await manager.get_or_create(
+                    "computer-profile:user_1:default",
+                    headless=False,
+                    persistent_profile_dir=profile_dir,
+                    owner_id="task-2",
+                )
+        finally:
+            await manager.close_all()
+
 
 class TestBrowserSession:
     """Tests for BrowserSession class."""
@@ -284,3 +311,37 @@ class TestBrowserSession:
             assert session.session_id == "test-session"
             assert session.headless is True
             assert session._initialized is False
+
+    async def test_persistent_session_uses_persistent_context(
+        self, mock_playwright, tmp_path
+    ):
+        page = MagicMock()
+        page.add_init_script = AsyncMock()
+        page.close = AsyncMock()
+        context = MagicMock()
+        context.pages = []
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock()
+        playwright = MagicMock()
+        playwright.chromium.launch_persistent_context = AsyncMock(return_value=context)
+        playwright.stop = AsyncMock()
+        mock_playwright.return_value.start = AsyncMock(return_value=playwright)
+        profile_dir = tmp_path / "profiles" / "user_1" / "default"
+        session = browser_use.BrowserSession(
+            "persistent",
+            headless=False,
+            persistent_profile_dir=profile_dir,
+            owner_id="task-1",
+        )
+
+        try:
+            assert await session.get_page() is page
+            kwargs = playwright.chromium.launch_persistent_context.await_args.kwargs
+            assert kwargs["user_data_dir"] == str(profile_dir)
+            assert kwargs["headless"] is False
+            assert "--no-sandbox" not in kwargs["args"]
+            assert "--disable-web-security" not in kwargs["args"]
+            assert "--restore-last-session" in kwargs["args"]
+            assert profile_dir.stat().st_mode & 0o777 == 0o700
+        finally:
+            await session.close()

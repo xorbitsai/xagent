@@ -40,6 +40,9 @@ AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
+BROWSER_RUNTIME_KIND = "XAGENT_BROWSER_RUNTIME_KIND"
+BROWSER_PROFILE_ROOT = "XAGENT_BROWSER_PROFILE_ROOT"
+BROWSER_PROFILE_ID = "XAGENT_BROWSER_PROFILE_ID"
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
 FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
@@ -1214,6 +1217,70 @@ def get_storage_root() -> Path:
 
     # Default: ~/.xagent
     return Path.home() / ".xagent"
+
+
+def get_browser_runtime_kind() -> Literal[
+    "ephemeral_playwright", "persistent_playwright"
+]:
+    """Get the browser runtime used by the unified computer tool.
+
+    Priority:
+        1. XAGENT_BROWSER_RUNTIME_KIND environment variable
+        2. ``ephemeral_playwright`` for backward compatibility
+    """
+    value = os.getenv(BROWSER_RUNTIME_KIND, "ephemeral_playwright").strip().lower()
+    aliases = {
+        "ephemeral": "ephemeral_playwright",
+        "managed": "ephemeral_playwright",
+        "persistent": "persistent_playwright",
+    }
+    value = aliases.get(value, value)
+    if value == "persistent_playwright":
+        return "persistent_playwright"
+    if value == "ephemeral_playwright":
+        return "ephemeral_playwright"
+    logger.warning(
+        "Invalid %s=%r; falling back to ephemeral_playwright",
+        BROWSER_RUNTIME_KIND,
+        value,
+    )
+    return "ephemeral_playwright"
+
+
+def get_browser_profile_root() -> Path:
+    """Get the root for sensitive persistent browser profiles.
+
+    Priority:
+        1. XAGENT_BROWSER_PROFILE_ROOT environment variable
+        2. ``<storage_root>/browser_profiles``
+    """
+    env_dir = os.getenv(BROWSER_PROFILE_ROOT)
+    if env_dir:
+        return Path(env_dir).expanduser()
+    return get_storage_root() / "browser_profiles"
+
+
+def get_browser_profile_id() -> str:
+    """Get the persistent browser profile name.
+
+    Profile names are a single safe path component. Invalid values fall back
+    to ``default`` rather than being used in a filesystem path.
+    """
+    value = os.getenv(BROWSER_PROFILE_ID, "default").strip()
+    is_safe = (
+        1 <= len(value) <= 64
+        and value[0].isalnum()
+        and all(char.isalnum() or char in {"_", ".", "-"} for char in value)
+        and value not in {".", ".."}
+    )
+    if is_safe:
+        return value
+    logger.warning(
+        "Invalid %s=%r; falling back to default",
+        BROWSER_PROFILE_ID,
+        value,
+    )
+    return "default"
 
 
 def get_sandbox_image() -> str:

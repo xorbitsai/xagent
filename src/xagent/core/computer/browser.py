@@ -19,6 +19,7 @@ from .schema import (
     NormalizedPoint,
     Viewport,
 )
+from .session import ComputerSessionBinding
 from .store import ObservationStore
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,21 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
     const top = Math.max(0, rect.top);
     const right = Math.min(width, rect.right);
     const bottom = Math.min(height, rect.bottom);
-    const text = String(node.innerText || node.value || "").trim().slice(0, 240);
+    const inputType = String(node.getAttribute("type") || "").toLowerCase();
+    const autocomplete = String(
+      node.getAttribute("autocomplete") || ""
+    ).toLowerCase();
+    const sensitive = (
+      inputType === "password" ||
+      inputType === "hidden" ||
+      autocomplete === "current-password" ||
+      autocomplete === "new-password" ||
+      autocomplete === "one-time-code" ||
+      autocomplete === "webauthn" ||
+      autocomplete.startsWith("cc-")
+    );
+    const safeValue = sensitive ? "" : String(node.value || "");
+    const text = String(node.innerText || safeValue).trim().slice(0, 240);
     const label = String(
       node.getAttribute("aria-label") ||
       node.getAttribute("title") ||
@@ -71,7 +86,9 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
       text: text || null,
       metadata: {
         tag: node.tagName.toLowerCase(),
-        input_type: node.getAttribute("type"),
+        input_type: inputType || null,
+        autocomplete: autocomplete || null,
+        sensitive,
         disabled: Boolean(node.disabled)
       }
     });
@@ -95,6 +112,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         headless: bool = True,
         viewport_width: int = 1280,
         viewport_height: int = 720,
+        session_binding: ComputerSessionBinding | None = None,
     ) -> None:
         super().__init__(session_id)
         if viewport_width <= 0 or viewport_height <= 0:
@@ -102,14 +120,18 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         self.workspace = workspace
         self.manager = manager or get_browser_manager()
         self.observation_store = observation_store or ObservationStore(workspace)
-        self.headless = headless
+        self.session_binding = session_binding or ComputerSessionBinding()
+        self.headless = False if self.session_binding.is_persistent else headless
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
 
     async def _get_page(self) -> Any:
+        manager_session_id = self.session_binding.manager_session_id(self.session_id)
         session = await self.manager.get_or_create(
-            self.session_id,
+            manager_session_id,
             headless=self.headless,
+            persistent_profile_dir=self.session_binding.persistent_profile_dir(),
+            owner_id=self.session_binding.manager_owner_id(),
         )
         page = await session.get_page()
         requested = {
@@ -121,7 +143,9 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         return page
 
     async def close(self) -> None:
-        await self.manager.close(self.session_id)
+        await self.manager.close(
+            self.session_binding.manager_session_id(self.session_id)
+        )
 
     async def _observe(self) -> ComputerObservation:
         page = await self._get_page()
@@ -173,6 +197,10 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             elements=elements,
             active_url=active_url,
             title=str(title) if title else None,
+            metadata={
+                "browser_runtime_kind": self.session_binding.runtime_kind.value,
+                "user_takeover_available": self.session_binding.is_persistent,
+            },
         )
 
     async def _read_viewport(self, page: Any) -> Viewport:
@@ -202,6 +230,20 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             if not isinstance(payload, dict):
                 continue
             try:
+                metadata = payload.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                sensitive = self._is_sensitive_element_metadata(metadata)
+                safe_metadata = {
+                    key: metadata[key]
+                    for key in (
+                        "tag",
+                        "input_type",
+                        "autocomplete",
+                        "disabled",
+                    )
+                    if key in metadata
+                }
                 elements.append(
                     ComputerElement(
                         element_id=f"dom-{index}",
@@ -209,13 +251,34 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                         bounds=payload["bounds"],
                         label=payload.get("label"),
                         role=payload.get("role"),
-                        text=payload.get("text"),
-                        metadata=payload.get("metadata") or {},
+                        text=None if sensitive else payload.get("text"),
+                        metadata={
+                            **safe_metadata,
+                            "sensitive": sensitive,
+                        },
                     )
                 )
             except (KeyError, TypeError, ValueError):
                 logger.debug("Skipping invalid DOM element payload", exc_info=True)
         return elements
+
+    @staticmethod
+    def _is_sensitive_element_metadata(metadata: dict[str, Any]) -> bool:
+        if metadata.get("sensitive") is True:
+            return True
+        input_type = str(metadata.get("input_type") or "").strip().lower()
+        autocomplete = str(metadata.get("autocomplete") or "").strip().lower()
+        return (
+            input_type in {"password", "hidden"}
+            or autocomplete
+            in {
+                "current-password",
+                "new-password",
+                "one-time-code",
+                "webauthn",
+            }
+            or autocomplete.startswith("cc-")
+        )
 
     async def _execute_action(self, page: Any, action: ComputerAction) -> None:
         if action.type == ComputerActionType.SCREENSHOT:

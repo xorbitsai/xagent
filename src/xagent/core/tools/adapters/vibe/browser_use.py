@@ -7,6 +7,7 @@ Browser sessions are automatically cleaned up when tasks complete.
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
@@ -84,9 +85,8 @@ class BrowserTaskSessionMixin:
                     if session_id == target_task_id
                     or session_id.startswith(f"{target_task_id}:")
                 ]
-                for session_id in session_ids:
-                    await manager._sessions[session_id].close()
-                    del manager._sessions[session_id]
+            for session_id in session_ids:
+                await manager.close(session_id)
             logger.info(
                 "Cleaned up %d browser session(s) for task %s",
                 len(session_ids),
@@ -1122,6 +1122,10 @@ def create_browser_tools(
     workspace: Optional["TaskWorkspace"] = None,
     *,
     include_debug_tools: bool = False,
+    user_id: int | None = None,
+    computer_runtime_kind: str = "ephemeral_playwright",
+    browser_profile_id: str = "default",
+    browser_profile_root: Path | None = None,
 ) -> list:
     """
     Create all browser automation tools for a task.
@@ -1138,7 +1142,14 @@ def create_browser_tools(
     from .computer import ComputerTool
 
     tools = [
-        ComputerTool(task_id=task_id, workspace=workspace),
+        ComputerTool(
+            task_id=task_id,
+            workspace=workspace,
+            browser_runtime_kind=computer_runtime_kind,
+            user_id=user_id,
+            browser_profile_id=browser_profile_id,
+            browser_profile_root=browser_profile_root,
+        ),
         BrowserNavigateTool(task_id=task_id, workspace=workspace),
         BrowserClickTool(task_id=task_id),
         BrowserFillTool(task_id=task_id),

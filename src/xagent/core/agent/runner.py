@@ -173,6 +173,7 @@ class AgentRunner:
 
             tools = [*getattr(self.agent, "tools", []), *(extra_tools or [])]
             pattern_errors: list[dict[str, Any]] = []
+            teardown_status: str | None = None
 
             try:
                 await self._setup_tools(tools, task_id=execution_id)
@@ -190,6 +191,7 @@ class AgentRunner:
                             )
                         )
                     except ExecutionInterrupted as exc:
+                        teardown_status = "interrupted"
                         normalized = {
                             "success": False,
                             "status": "interrupted",
@@ -206,6 +208,7 @@ class AgentRunner:
                         )
                         return normalized
                     except Exception as exc:  # noqa: BLE001
+                        teardown_status = "failed"
                         logger.exception(
                             "Pattern %s failed", pattern.__class__.__name__
                         )
@@ -225,6 +228,7 @@ class AgentRunner:
                         execution_id=execution_id,
                     )
                     if normalized.get("success"):
+                        teardown_status = "completed"
                         await self._dispatch_callback(
                             "on_run_end",
                             runner=self,
@@ -232,7 +236,11 @@ class AgentRunner:
                             result=normalized,
                         )
                         return normalized
-                    if normalized.get("status") in {"interrupted", "waiting_for_user"}:
+                    normalized_status = str(
+                        normalized.get("status") or "failed"
+                    ).strip()
+                    teardown_status = normalized_status or "failed"
+                    if normalized_status in {"interrupted", "waiting_for_user"}:
                         await self._dispatch_callback(
                             "on_run_end",
                             runner=self,
@@ -251,7 +259,11 @@ class AgentRunner:
                         }
                     )
             finally:
-                await self._teardown_tools(tools, task_id=execution_id)
+                await self._teardown_tools(
+                    tools,
+                    task_id=execution_id,
+                    execution_status=teardown_status,
+                )
 
             if len(pattern_errors) == 1:
                 single_result = pattern_errors[0].get("result")
@@ -850,13 +862,23 @@ class AgentRunner:
             if inspect.isawaitable(result):
                 await result
 
-    async def _teardown_tools(self, tools: list[Any], *, task_id: str) -> None:
+    async def _teardown_tools(
+        self,
+        tools: list[Any],
+        *,
+        task_id: str,
+        execution_status: str | None = None,
+    ) -> None:
         for tool in reversed(tools):
             teardown = getattr(tool, "teardown", None)
             if not callable(teardown):
                 continue
             try:
-                result = teardown(task_id=task_id)
+                result = self._call_with_supported_kwargs(
+                    teardown,
+                    task_id=task_id,
+                    execution_status=execution_status,
+                )
                 if inspect.isawaitable(result):
                     await result
             except Exception:

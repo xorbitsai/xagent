@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..... import config as _root_config
@@ -254,6 +255,18 @@ class BaseToolConfig(ABC):
     def get_browser_tools_enabled(self) -> bool:
         """Whether to include browser automation tools."""
         pass
+
+    def get_browser_runtime_kind(self) -> str:
+        """Get the configured backend for the unified computer tool."""
+        return _root_config.get_browser_runtime_kind()
+
+    def get_browser_profile_id(self) -> str:
+        """Get the current user's persistent browser profile name."""
+        return _root_config.get_browser_profile_id()
+
+    def get_browser_profile_root(self) -> Path:
+        """Get the root directory for persistent browser profiles."""
+        return _root_config.get_browser_profile_root()
 
     @abstractmethod
     def get_task_id(self) -> Optional[str]:

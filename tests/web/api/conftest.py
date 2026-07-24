@@ -41,6 +41,7 @@ from xagent.web.api.conversation_logs import router as conversation_logs_router
 from xagent.web.api.files import file_router
 from xagent.web.api.mcp import mcp_router
 from xagent.web.api.me import router as me_router
+from xagent.web.api.personal_api_keys import router as personal_api_keys_router
 from xagent.web.api.share import share_router
 from xagent.web.api.triggers import router as triggers_router
 from xagent.web.api.v1 import v1_router
@@ -74,6 +75,7 @@ def _override_get_db() -> Iterator[Session]:
 app_for_tests = FastAPI()
 app_for_tests.include_router(auth_router)
 app_for_tests.include_router(me_router)
+app_for_tests.include_router(personal_api_keys_router)
 app_for_tests.include_router(conversation_logs_router)
 app_for_tests.include_router(agents_router)
 app_for_tests.include_router(agent_api_keys_router)

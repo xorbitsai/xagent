@@ -401,6 +401,9 @@ async def authenticate_widget(
             "guest_id": request.guest_id,
             "auth_mode": "widget",
             "widget_agent_id": int(agent.id),
+            # Carried so per-request revalidation can reject the token once the
+            # owner rotates the key (see ensure_widget_agent_available).
+            "widget_key": agent.widget_key,
         }
     )
 

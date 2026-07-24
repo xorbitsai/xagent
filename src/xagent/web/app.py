@@ -44,6 +44,7 @@ from .api.me import router as me_router
 from .api.memory import MemoryManagementRouter
 from .api.model import model_router
 from .api.monitor import monitor_router
+from .api.personal_api_keys import router as personal_api_keys_router
 from .api.progress_ws import progress_ws_router
 from .api.share import share_router
 from .api.skill_hub import router as skill_hub_router
@@ -626,6 +627,7 @@ app.include_router(file_router)
 app.include_router(jobs_router)
 app.include_router(kb_router)
 app.include_router(me_router)
+app.include_router(personal_api_keys_router)
 app.include_router(model_router)
 app.include_router(ws_router)
 app.include_router(monitor_router)

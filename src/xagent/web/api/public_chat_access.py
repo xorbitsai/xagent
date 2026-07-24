@@ -95,6 +95,40 @@ def create_public_chat_access_token(data: dict[str, Any]) -> str:
     return encoded_jwt
 
 
+def ensure_widget_agent_available(
+    db: Session,
+    widget_agent_id: int,
+    user_id: int,
+    *,
+    expected_widget_key: str | None = None,
+) -> Agent:
+    """Resolve a widget-guest agent id to a live, widget-enabled agent.
+
+    Mirrors :func:`ensure_share_agent_available` for the widget channel. The
+    guest JWT is long-lived (30-day TTL), so access is re-derived from the
+    agent's *current* widget state on every request rather than trusted from
+    the token alone: disabling the widget (``widget_enabled = False``) or
+    rotating ``widget_key`` cuts off outstanding guest tokens on their next
+    request.
+
+    ``expected_widget_key`` is the key carried by the guest JWT; when present
+    it must still match the agent's live key. Tokens minted before the key was
+    embedded carry no key and skip that comparison — they stay gated on
+    ``widget_enabled`` so the disable path still revokes them.
+    """
+    agent = db.query(Agent).filter(Agent.id == widget_agent_id).first()
+    if (
+        not agent
+        or is_workforce_generated_manager_agent(agent)
+        or agent.user_id != user_id
+        or not agent.widget_enabled
+        or not agent.widget_key
+        or (expected_widget_key is not None and agent.widget_key != expected_widget_key)
+    ):
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    return agent
+
+
 def ensure_share_agent_available(
     db: Session,
     share_agent_id: int,
@@ -137,7 +171,7 @@ def ensure_share_workforce_available(
     deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, share_workforce_id)
     if (
         not workforce
-        or int(workforce.owner_user_id) != user_id
+        or workforce.owner_user_id != user_id
         or workforce.status != "active"
         or deployment is None
         or not deployment.share_enabled
@@ -170,7 +204,7 @@ def ensure_widget_workforce_available(
     deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, widget_workforce_id)
     if (
         not workforce
-        or int(workforce.owner_user_id) != user_id
+        or workforce.owner_user_id != user_id
         or workforce.status != "active"
         or deployment is None
         or not deployment.widget_enabled
@@ -239,8 +273,21 @@ def get_public_chat_user(
                 widget_workforce_id=widget_workforce_id,
             )
 
+        # Agent widget: re-validate against the live agent every request so
+        # disabling the widget or rotating its key revokes outstanding guest
+        # tokens (mirrors the share path). The per-message WS revalidation
+        # calls back through here, so live sessions drop on the next inbound
+        # message too.
         if not isinstance(widget_agent_id, int):
             raise ValueError("Invalid widget token payload")
+        ensure_widget_agent_available(
+            db,
+            widget_agent_id,
+            user_id,
+            expected_widget_key=widget_key
+            if isinstance(widget_key, str) and widget_key
+            else None,
+        )
 
         return PublicChatAccessContext(
             user=user,

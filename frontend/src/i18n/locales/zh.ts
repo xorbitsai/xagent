@@ -3492,6 +3492,10 @@ const zh = {
     never: "从未使用",
     filteredByAgent: "已按 Agent 筛选",
     clearFilter: "清除筛选",
+    tabs: {
+      agent: "Agent 密钥",
+      personal: "个人密钥"
+    },
     stats: {
       totalKeys: "密钥总数",
       totalKeysHint: "覆盖所有 Agent",
@@ -3548,6 +3552,56 @@ const zh = {
       regenerated: "API Key 已重新生成",
       deleted: "API Key 已删除",
       actionFailed: "操作失败",
+      copied: "已复制到剪贴板",
+      copyFailed: "复制到剪贴板失败"
+    }
+  },
+  personalApiKeys: {
+    title: "个人密钥",
+    description: "管理您的个人 SDK 和 REST API 密钥。",
+    create: "创建个人密钥",
+    createForMe: "为我创建个人密钥",
+    noData: "暂无个人 API 密钥。",
+    noResults: "没有匹配的密钥。",
+    searchPlaceholder: "搜索密钥或所有者...",
+    stats: {
+      totalKeys: "密钥总数",
+      totalKeysHint: "个人密钥",
+      activeKeys: "有效密钥",
+      activeKeysHint: "可正常调用"
+    },
+    columns: {
+      key: "密钥",
+      owner: "所有者",
+      status: "状态",
+      expires: "过期时间",
+      created: "创建时间"
+    },
+    status: {
+      active: "有效",
+      expired: "已过期",
+      revoked: "已撤销"
+    },
+    neverExpires: "永不过期",
+    actions: {
+      copy: "复制个人 API 密钥",
+      revoke: "撤销"
+    },
+    reveal: {
+      title: "个人 API 密钥已创建",
+      warning: "请立即复制此密钥 —— 它只显示一次。"
+    },
+    confirm: {
+      revokeTitle: "撤销个人 API 密钥？",
+      revokeOwnDescription: "撤销会立即使此密钥失效。",
+      revokeOtherDescription: "要撤销 {owner} 的个人密钥吗？"
+    },
+    messages: {
+      loadFailed: "加载个人 API 密钥失败",
+      created: "个人 API 密钥已创建",
+      createFailed: "创建个人 API 密钥失败",
+      revoked: "个人 API 密钥已撤销",
+      revokeFailed: "撤销个人 API 密钥失败",
       copied: "已复制到剪贴板",
       copyFailed: "复制到剪贴板失败"
     }

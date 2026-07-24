@@ -7,11 +7,24 @@ from typing import Any
 
 
 class SshErrorCode(str, Enum):
-    """Stable, public error codes. Values are a contract; do not rename."""
+    """Stable, public error codes. Values are a contract; do not rename.
+
+    Several codes are part of the cross-seam contract: they are raised by
+    out-of-repo consumers on the other side of the provider / secret-store /
+    audit seam and only *recorded* by core's audit sink, never raised inside
+    this repo. A grep for raise-sites within this repo alone will find them
+    unused — do NOT remove them on that basis; that breaks the consumer
+    contract. TARGET_IN_USE / CREDENTIAL_REVOKED / CREDENTIAL_IN_USE /
+    HOST_KEY_UNVERIFIED are such consumer-raised codes.
+    """
 
     TARGET_NOT_FOUND = "ssh_target_not_found"
     TARGET_DISABLED = "ssh_target_disabled"
+    TARGET_IN_USE = "ssh_target_in_use"
     OPERATION_NOT_ALLOWED = "ssh_operation_not_allowed"
+    CREDENTIAL_REVOKED = "ssh_credential_revoked"
+    CREDENTIAL_IN_USE = "ssh_credential_in_use"
+    HOST_KEY_UNVERIFIED = "ssh_host_key_unverified"
     HOST_KEY_MISMATCH = "ssh_host_key_mismatch"
     EGRESS_DENIED = "ssh_egress_denied"
     APPROVAL_REQUIRED = "ssh_approval_required"

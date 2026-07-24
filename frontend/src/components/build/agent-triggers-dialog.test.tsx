@@ -44,7 +44,7 @@ vi.mock("@/lib/clipboard", () => ({
 }))
 
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
-import type { StagedTrigger } from "@/lib/agent-triggers-api"
+import type { AgentTrigger, StagedTrigger } from "@/lib/agent-triggers-api"
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {
@@ -54,25 +54,15 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
   })
 }
 
-const GMAIL_ACCOUNTS_URL = "http://api.local/api/cloud/accounts?provider=gmail"
-
-describe("AgentTriggersDialog", () => {
-  let gmailAccounts: Array<{ id: number; provider: string; email: string | null }>
-
-  const baseTrigger9 = {
-    id: 9,
+function makeTrigger(overrides: Partial<AgentTrigger> & { id: number }): AgentTrigger {
+  return {
     user_id: 1,
     agent_id: 42,
-    type: "gmail" as const,
-    name: "Support inbox",
+    type: "webhook",
+    name: "Trigger",
     enabled: true,
-    config: {
-      watch_label: "INBOX",
-      sender_filter: "boss@company.com",
-      subject_keyword: "urgent",
-      oauth_account_id: 7,
-    },
-    prompt_template: "Reply to {{payload}}",
+    config: {},
+    prompt_template: null,
     webhook_token: null,
     webhook_secret: null,
     next_run_at: null,
@@ -80,7 +70,27 @@ describe("AgentTriggersDialog", () => {
     last_error: null,
     created_at: null,
     updated_at: null,
+    ...overrides,
   }
+}
+
+const GMAIL_ACCOUNTS_URL = "http://api.local/api/cloud/accounts?provider=gmail"
+
+describe("AgentTriggersDialog", () => {
+  let gmailAccounts: Array<{ id: number; provider: string; email: string | null }>
+
+  const baseTrigger9 = makeTrigger({
+    id: 9,
+    type: "gmail",
+    name: "Support inbox",
+    config: {
+      watch_label: "INBOX",
+      sender_filter: "boss@company.com",
+      subject_keyword: "urgent",
+      oauth_account_id: 7,
+    },
+    prompt_template: "Reply to {{payload}}",
+  })
 
   beforeEach(() => {
     apiRequestMock.mockReset()
@@ -352,23 +362,14 @@ describe("AgentTriggersDialog", () => {
       }
       if (url === "http://api.local/api/agents/42/triggers" && options?.method === "POST") {
         return Promise.resolve(
-          jsonResponse({
-            id: 11,
-            user_id: 1,
-            agent_id: 42,
-            type: "webhook",
-            name: "API / Webhook",
-            enabled: true,
-            config: {},
-            prompt_template: null,
-            webhook_token: "tok",
-            webhook_secret: "wh_secret_once",
-            next_run_at: null,
-            last_run_at: null,
-            last_error: null,
-            created_at: null,
-            updated_at: null,
-          }),
+          jsonResponse(
+            makeTrigger({
+              id: 11,
+              name: "API / Webhook",
+              webhook_token: "tok",
+              webhook_secret: "wh_secret_once",
+            }),
+          ),
         )
       }
       return Promise.resolve(jsonResponse([]))
@@ -454,23 +455,14 @@ describe("AgentTriggersDialog", () => {
       }
       if (url === "http://api.local/api/agents/42/triggers" && options?.method === "POST") {
         return Promise.resolve(
-          jsonResponse({
-            id: 12,
-            user_id: 1,
-            agent_id: 42,
-            type: "webhook",
-            name: "API / Webhook",
-            enabled: true,
-            config: {},
-            prompt_template: null,
-            webhook_token: "tok",
-            webhook_secret: "wh_escape_secret",
-            next_run_at: null,
-            last_run_at: null,
-            last_error: null,
-            created_at: null,
-            updated_at: null,
-          }),
+          jsonResponse(
+            makeTrigger({
+              id: 12,
+              name: "API / Webhook",
+              webhook_token: "tok",
+              webhook_secret: "wh_escape_secret",
+            }),
+          ),
         )
       }
       return Promise.resolve(jsonResponse([]))
@@ -556,40 +548,8 @@ describe("AgentTriggersDialog", () => {
       if (url === TRIGGERS_URL) {
         return Promise.resolve(
           jsonResponse([
-            {
-              id: 20,
-              user_id: 1,
-              agent_id: 42,
-              type: "webhook",
-              name: "Backup hook",
-              enabled: true,
-              config: {},
-              prompt_template: null,
-              webhook_token: null,
-              webhook_secret: null,
-              next_run_at: null,
-              last_run_at: null,
-              last_error: null,
-              created_at: null,
-              updated_at: null,
-            },
-            {
-              id: 21,
-              user_id: 1,
-              agent_id: 42,
-              type: "webhook",
-              name: "Primary hook",
-              enabled: true,
-              config: {},
-              prompt_template: null,
-              webhook_token: null,
-              webhook_secret: null,
-              next_run_at: null,
-              last_run_at: null,
-              last_error: null,
-              created_at: null,
-              updated_at: null,
-            },
+            makeTrigger({ id: 20, name: "Backup hook" }),
+            makeTrigger({ id: 21, name: "Primary hook" }),
           ]),
         )
       }
@@ -647,40 +607,8 @@ describe("AgentTriggersDialog", () => {
   it("resyncs the trigger list when a batch disable partially fails", async () => {
     const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
     let triggers = [
-      {
-        id: 30,
-        user_id: 1,
-        agent_id: 42,
-        type: "webhook",
-        name: "Hook A",
-        enabled: true,
-        config: {},
-        prompt_template: null,
-        webhook_token: null,
-        webhook_secret: null,
-        next_run_at: null,
-        last_run_at: null,
-        last_error: null,
-        created_at: null,
-        updated_at: null,
-      },
-      {
-        id: 31,
-        user_id: 1,
-        agent_id: 42,
-        type: "webhook",
-        name: "Hook B",
-        enabled: true,
-        config: {},
-        prompt_template: null,
-        webhook_token: null,
-        webhook_secret: null,
-        next_run_at: null,
-        last_run_at: null,
-        last_error: null,
-        created_at: null,
-        updated_at: null,
-      },
+      makeTrigger({ id: 30, name: "Hook A" }),
+      makeTrigger({ id: 31, name: "Hook B" }),
     ]
     let getCallsAfterFailure = 0
     let patchAttempted = false
@@ -730,40 +658,8 @@ describe("AgentTriggersDialog", () => {
   it("keeps each overview switch's busy guard independent across two types toggled back-to-back", async () => {
     const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
     const triggers = [
-      {
-        id: 40,
-        user_id: 1,
-        agent_id: 42,
-        type: "webhook",
-        name: "Hook",
-        enabled: true,
-        config: {},
-        prompt_template: null,
-        webhook_token: null,
-        webhook_secret: null,
-        next_run_at: null,
-        last_run_at: null,
-        last_error: null,
-        created_at: null,
-        updated_at: null,
-      },
-      {
-        id: 41,
-        user_id: 1,
-        agent_id: 42,
-        type: "scheduled",
-        name: "Schedule",
-        enabled: true,
-        config: { interval_seconds: 3600 },
-        prompt_template: null,
-        webhook_token: null,
-        webhook_secret: null,
-        next_run_at: null,
-        last_run_at: null,
-        last_error: null,
-        created_at: null,
-        updated_at: null,
-      },
+      makeTrigger({ id: 40, name: "Hook" }),
+      makeTrigger({ id: 41, type: "scheduled", name: "Schedule", config: { interval_seconds: 3600 } }),
     ]
 
     let resolveWebhookPatch: ((value: Response) => void) | undefined

@@ -141,12 +141,33 @@ vi.mock("@/components/build/build-file-preview-sheet", () => ({
 }))
 
 import { AgentBuilder } from "./agent-builder"
+import type { AgentTrigger } from "@/lib/agent-triggers-api"
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   })
+}
+
+function makeTrigger(overrides: Partial<AgentTrigger> & { id: number }): AgentTrigger {
+  return {
+    user_id: 1,
+    agent_id: 42,
+    type: "webhook",
+    name: "Trigger",
+    enabled: true,
+    config: {},
+    prompt_template: null,
+    webhook_token: "tok",
+    webhook_secret: null,
+    next_run_at: null,
+    last_run_at: null,
+    last_error: null,
+    created_at: null,
+    updated_at: null,
+    ...overrides,
+  }
 }
 
 const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
@@ -159,25 +180,7 @@ describe("AgentBuilder trigger summary cards", () => {
     apiRequestMock.mockReset()
     globalThis.WebSocket = vi.fn() as unknown as typeof WebSocket
 
-    let triggers = [
-      {
-        id: 9,
-        user_id: 1,
-        agent_id: 42,
-        type: "webhook",
-        name: "API / Webhook",
-        enabled: true,
-        config: {},
-        prompt_template: null,
-        webhook_token: "tok",
-        webhook_secret: null,
-        next_run_at: null,
-        last_run_at: null,
-        last_error: null,
-        created_at: null,
-        updated_at: null,
-      },
-    ]
+    let triggers = [makeTrigger({ id: 9, name: "API / Webhook" })]
 
     apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
       if (url === "http://api.local/api/agents/42") {
@@ -258,40 +261,8 @@ describe("AgentBuilder trigger summary cards", () => {
 
   it("resyncs the summary via refreshTriggerSummary when a batch disable partially fails", async () => {
     let triggers = [
-      {
-        id: 9,
-        user_id: 1,
-        agent_id: 42,
-        type: "webhook",
-        name: "Hook A",
-        enabled: true,
-        config: {},
-        prompt_template: null,
-        webhook_token: "tok",
-        webhook_secret: null,
-        next_run_at: null,
-        last_run_at: null,
-        last_error: null,
-        created_at: null,
-        updated_at: null,
-      },
-      {
-        id: 10,
-        user_id: 1,
-        agent_id: 42,
-        type: "webhook",
-        name: "Hook B",
-        enabled: true,
-        config: {},
-        prompt_template: null,
-        webhook_token: "tok",
-        webhook_secret: null,
-        next_run_at: null,
-        last_run_at: null,
-        last_error: null,
-        created_at: null,
-        updated_at: null,
-      },
+      makeTrigger({ id: 9, name: "Hook A" }),
+      makeTrigger({ id: 10, name: "Hook B" }),
     ]
     let getCallsAfterFailure = 0
     let patchAttempted = false

@@ -1424,13 +1424,19 @@ def _logo_data_url(payload: bytes = b"fake-logo-bytes") -> str:
     return "data:image/png;base64," + base64.b64encode(payload).decode()
 
 
+@pytest.fixture
+def logo_uploads_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Isolate agent logo reads/writes to a temp dir instead of the real uploads root."""
+    monkeypatch.setattr(agents_api, "get_uploads_dir", lambda: tmp_path)
+    return tmp_path
+
+
 def test_logo_reupload_gets_a_fresh_url_and_removes_the_old_file(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    logo_uploads_dir: Path,
 ) -> None:
     """A re-uploaded logo must change logo_url (#975): the old fix saved every
     logo under the same deterministic filename, so browsers kept serving the
     stale cached image after an update even though the file on disk changed."""
-    monkeypatch.setattr(agents_api, "get_uploads_dir", lambda: tmp_path)
     headers = _admin_headers()
     agent_id = _create_agent(headers)
 
@@ -1442,7 +1448,7 @@ def test_logo_reupload_gets_a_fresh_url_and_removes_the_old_file(
     assert first.status_code == 200, first.text
     first_logo_url = first.json()["logo_url"]
     assert first_logo_url
-    first_path = tmp_path / first_logo_url.removeprefix("/uploads/")
+    first_path = logo_uploads_dir / first_logo_url.removeprefix("/uploads/")
     assert first_path.is_file()
 
     second = client.put(
@@ -1455,15 +1461,14 @@ def test_logo_reupload_gets_a_fresh_url_and_removes_the_old_file(
 
     assert second_logo_url and second_logo_url != first_logo_url
     assert not first_path.exists(), "old logo file should be cleaned up"
-    assert (tmp_path / second_logo_url.removeprefix("/uploads/")).is_file()
+    assert (logo_uploads_dir / second_logo_url.removeprefix("/uploads/")).is_file()
 
 
 def test_clearing_logo_with_empty_string_nulls_url_and_deletes_file(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    logo_uploads_dir: Path,
 ) -> None:
     """logo_base64="" (vs. omitted, meaning "no change") must clear an
     existing logo end-to-end (#976)."""
-    monkeypatch.setattr(agents_api, "get_uploads_dir", lambda: tmp_path)
     headers = _admin_headers()
     agent_id = _create_agent(headers)
 
@@ -1474,7 +1479,7 @@ def test_clearing_logo_with_empty_string_nulls_url_and_deletes_file(
     )
     assert uploaded.status_code == 200, uploaded.text
     logo_url = uploaded.json()["logo_url"]
-    logo_path = tmp_path / logo_url.removeprefix("/uploads/")
+    logo_path = logo_uploads_dir / logo_url.removeprefix("/uploads/")
     assert logo_path.is_file()
 
     cleared = client.put(
@@ -1488,10 +1493,9 @@ def test_clearing_logo_with_empty_string_nulls_url_and_deletes_file(
 
 
 def test_delete_logo_removes_a_file_inside_the_uploads_root(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    logo_uploads_dir: Path,
 ) -> None:
-    monkeypatch.setattr(agents_api, "get_uploads_dir", lambda: tmp_path)
-    logo_dir = tmp_path / "agent_logos"
+    logo_dir = logo_uploads_dir / "agent_logos"
     logo_dir.mkdir(parents=True)
     logo_file = logo_dir / "agent_1_abcd1234.png"
     logo_file.write_bytes(b"fake")
@@ -1502,12 +1506,11 @@ def test_delete_logo_removes_a_file_inside_the_uploads_root(
 
 
 def test_delete_logo_refuses_a_path_traversal_attempt(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    logo_uploads_dir: Path,
 ) -> None:
     """A logo_url escaping the uploads root (e.g. via "..") must be refused
     rather than deleting whatever it resolves to outside that root."""
-    monkeypatch.setattr(agents_api, "get_uploads_dir", lambda: tmp_path)
-    outside_file = tmp_path.parent / "outside-secret.txt"
+    outside_file = logo_uploads_dir.parent / "outside-secret.txt"
     outside_file.write_text("do not delete me")
 
     try:

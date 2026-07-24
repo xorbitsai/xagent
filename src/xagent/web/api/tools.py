@@ -400,7 +400,11 @@ async def get_available_tools(
     # Apply per-user tool overrides (e.g. per-user enable/disable).
     # Only affects policy-based states; resource-missing states cannot be
     # overridden to "available".
-    user_overrides = tool_config.get_user_tool_overrides()
+    # Refresh through the live request session and user: the factory's
+    # prefetch snapshot re-fetches the user by id in a worker session, which
+    # drops request-scoped policy attributes callers may have set on the
+    # user object (e.g. a route-selected team id).
+    user_overrides = tool_config.refresh_user_tool_overrides()
     for tool_item in tools:
         tool_name = str(tool_item.get("name") or "")
         override = user_overrides.get(tool_name)

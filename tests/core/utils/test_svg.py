@@ -99,3 +99,28 @@ def test_validate_svg_bytes_rejects_script() -> None:
 def test_validate_svg_bytes_accepts_clean_svg() -> None:
     svg = b'<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0" /></svg>'
     validate_svg_bytes(svg)  # no raise
+
+
+@pytest.mark.parametrize(
+    "svg",
+    [
+        b'<! DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg />',
+        b'<!\nENTITY xxe SYSTEM "file:///etc/passwd"><svg />',
+        b'<!  DoCtYpE svg [<!  EnTiTy xxe SYSTEM "file:///etc/passwd">]><svg />',
+        b"<!\tdoctype svg><svg />",
+    ],
+)
+def test_validate_svg_bytes_rejects_whitespace_obfuscated_declarations(
+    svg: bytes,
+) -> None:
+    with pytest.raises(ValueError, match="declarations and entities"):
+        validate_svg_bytes(svg)
+
+
+def test_validate_svg_bytes_rejects_exact_doctype_and_entity() -> None:
+    with pytest.raises(ValueError, match="declarations and entities"):
+        validate_svg_bytes(
+            b'<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg />'
+        )
+    with pytest.raises(ValueError, match="declarations and entities"):
+        validate_svg_bytes(b'<!ENTITY xxe SYSTEM "file:///etc/passwd"><svg />')

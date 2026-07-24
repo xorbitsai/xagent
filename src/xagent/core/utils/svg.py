@@ -27,7 +27,7 @@ def validate_svg_bytes(svg_bytes: bytes) -> None:
     lowered_all = svg_bytes.lower()
     if b"<svg" not in lowered_all[:4096]:
         raise ValueError("SVG content does not contain an <svg> root")
-    if b"<!doctype" in lowered_all or b"<!entity" in lowered_all:
+    if re.search(rb"<!\s*(?:doctype|entity)\b", lowered_all):
         raise ValueError("SVG declarations and entities are not supported")
     if b"<script" in lowered_all:
         raise ValueError("SVG must not contain <script> elements")

@@ -59,6 +59,7 @@ class SshRunner(Protocol):
         command: str,
         timeout_seconds: int,
         egress_config: EgressPolicyConfig,
+        max_output_bytes: int,
     ) -> SshRunResult: ...
 
     async def upload(
@@ -146,6 +147,17 @@ class AsyncsshRunner:
                 "host key verification failed",
                 cause=exc,
             ) from exc
+        except (asyncssh.Error, OSError) as exc:
+            # PermissionDenied, ConnectionLost, connection-refused (OSError),
+            # etc. are all DisconnectError/Error siblings that otherwise escape
+            # raw — skipping the executor's failure audit and the tool wrapper.
+            # Map them to one stable code so both runners fail identically.
+            # (SshError from _authorize_peer is neither, so it propagates.)
+            raise SshError(
+                SshErrorCode.CONNECTION_FAILED,
+                "ssh connection failed",
+                cause=exc,
+            ) from exc
 
     async def execute(
         self,
@@ -160,6 +172,7 @@ class AsyncsshRunner:
         command: str,
         timeout_seconds: int,
         egress_config: EgressPolicyConfig,
+        max_output_bytes: int,
     ) -> SshRunResult:
         async with self._connect(
             hostname=hostname,
@@ -170,8 +183,9 @@ class AsyncsshRunner:
             egress_config=egress_config,
         ) as conn:
             try:
-                result = await asyncio.wait_for(
-                    conn.run(command, check=False), timeout=timeout_seconds
+                out, err, truncated, exit_status = await asyncio.wait_for(
+                    _run_capped(conn, command, max_output_bytes),
+                    timeout=timeout_seconds,
                 )
             except TimeoutError as exc:
                 raise SshError(
@@ -181,10 +195,10 @@ class AsyncsshRunner:
                 ) from exc
 
         return SshRunResult(
-            exit_code=result.exit_status if result.exit_status is not None else -1,
-            stdout=_as_text(result.stdout),
-            stderr=_as_text(result.stderr),
-            truncated=False,
+            exit_code=exit_status if exit_status is not None else -1,
+            stdout=out.decode("utf-8", "replace"),
+            stderr=err.decode("utf-8", "replace"),
+            truncated=truncated,
         )
 
     async def upload(
@@ -253,6 +267,39 @@ class AsyncsshRunner:
             await sftp.get(remote_path, local_path)
 
 
+async def _run_capped(
+    conn: asyncssh.SSHClientConnection, command: str, cap: int
+) -> tuple[bytes, bytes, bool, int | None]:
+    """Run ``command`` and read stdout/stderr concurrently, stopping each at
+    ``cap`` bytes so a flood of remote output can't grow the host process
+    unbounded (#3). asyncssh has no native byte limit and ``conn.run`` buffers
+    the whole stream, so we drive a process and drain it ourselves. Returns
+    (stdout, stderr, truncated, exit_status)."""
+    async with conn.create_process(command, encoding=None) as proc:
+        (out, out_truncated), (err, err_truncated) = await asyncio.gather(
+            _drain(proc.stdout, cap), _drain(proc.stderr, cap)
+        )
+        truncated = out_truncated or err_truncated
+        # Only wait for the exit status when we read to EOF; if we stopped early
+        # the remote may keep writing forever, so don't block on it.
+        if not truncated:
+            await proc.wait()
+        return out, err, truncated, proc.exit_status
+
+
+async def _drain(reader: asyncssh.SSHReader[bytes], cap: int) -> tuple[bytes, bool]:
+    """Read up to ``cap`` bytes from ``reader``; report whether more remained."""
+    buf = bytearray()
+    while len(buf) < cap:
+        chunk = await reader.read(cap - len(buf))
+        if not chunk:
+            return bytes(buf), False
+        buf.extend(chunk)
+    # Cap hit: peek one more byte to flag truncation, then drop the rest.
+    extra = await reader.read(1)
+    return bytes(buf), bool(extra)
+
+
 def _authorize_peer(
     conn: asyncssh.SSHClientConnection, config: EgressPolicyConfig
 ) -> None:
@@ -265,11 +312,3 @@ def _authorize_peer(
         raise SshError(
             SshErrorCode.EGRESS_DENIED, "connection peer denied by egress policy"
         )
-
-
-def _as_text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)

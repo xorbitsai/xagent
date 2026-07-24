@@ -24,7 +24,9 @@ class _FakeSandbox:
         self.execs: list[tuple[str, ...]] = []
         self._results = results
 
-    async def exec(self, command: str, *args: str, env=None) -> ExecResult:
+    async def exec(
+        self, command: str, *args: str, env=None, max_output_bytes=None
+    ) -> ExecResult:
         self.execs.append((command, *args))
         return self._results.pop(0)
 
@@ -144,8 +146,19 @@ async def test_execute_generic_transport_error_no_leak() -> None:
     with pytest.raises(SshError) as exc:
         await SandboxSshRunner().execute(**_run_kwargs(sandbox=sandbox))
     # A stable, generic code — the raw stderr is not the user-facing message.
-    assert exc.value.code == SshErrorCode.CONNECTION_TIMEOUT
+    # Exit 255 that isn't a host-key failure means connection/auth failed, not a
+    # timeout (that's exit 124), so it maps to CONNECTION_FAILED.
+    assert exc.value.code == SshErrorCode.CONNECTION_FAILED
     assert "refused" not in str(exc.value)
+
+
+async def test_execute_propagates_truncated_from_sandbox() -> None:
+    # The sandbox exec caps output and flags it; the runner surfaces that (#3).
+    sandbox = _FakeSandbox(
+        [ExecResult(exit_code=0, stdout="x", stderr="", truncated=True)]
+    )
+    result = await SandboxSshRunner().execute(**_run_kwargs(sandbox=sandbox))
+    assert result.truncated is True
 
 
 async def test_execute_wraps_in_timeout_and_runs_ssh() -> None:
@@ -172,7 +185,9 @@ class _XferSandbox:
         self._remote_exists = remote_exists
         self._sftp_exit = sftp_exit
 
-    async def exec(self, command: str, *args: str, env=None) -> ExecResult:
+    async def exec(
+        self, command: str, *args: str, env=None, max_output_bytes=None
+    ) -> ExecResult:
         self.execs.append((command, *args))
         argv = (command, *args)
         if "ssh" in argv and any("test -e" in a for a in argv):

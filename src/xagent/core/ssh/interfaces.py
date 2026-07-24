@@ -23,7 +23,11 @@ class SandboxLike(Protocol):
     returns Any (its result exposes ``exit_code``/``stdout``/``stderr``)."""
 
     async def exec(
-        self, command: str, *args: str, env: dict[str, str] | None = None
+        self,
+        command: str,
+        *args: str,
+        env: dict[str, str] | None = None,
+        max_output_bytes: int | None = None,
     ) -> Any: ...
 
     async def write_file(

@@ -11,7 +11,7 @@ import os
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Any, cast
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -81,12 +81,13 @@ class SshOpResult(BaseModel):
 
 
 class _SshToolBase(AbstractBaseTool):
+    """Shared boilerplate for every SSH tool: the SSH category, async-only
+    execution, and the SshOpResult return type. Subclasses add their own
+    dependencies on top of the common ``context``."""
+
     category: ToolCategory = ToolCategory.SSH
 
-    def __init__(
-        self, *, provider: SshTargetProvider, context: SshExecutionContext
-    ) -> None:
-        self._provider = provider
+    def __init__(self, *, context: SshExecutionContext) -> None:
         self._context = context
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
@@ -97,6 +98,12 @@ class _SshToolBase(AbstractBaseTool):
 
 
 class SshListTargetsTool(_SshToolBase):
+    def __init__(
+        self, *, provider: SshTargetProvider, context: SshExecutionContext
+    ) -> None:
+        super().__init__(context=context)
+        self._provider = provider
+
     @property
     def name(self) -> str:
         return "ssh_list_targets"
@@ -125,50 +132,34 @@ class SshListTargetsTool(_SshToolBase):
         ).model_dump()
 
 
-class _SshTransferTool(AbstractBaseTool):
+class _SshTransferTool(_SshToolBase):
     """Base for the SFTP tools: executor-backed and workspace-aware. The
     workspace resolves and containment-checks the local path (no escaping the
     task workspace) before any transfer; the executor enforces capability,
     egress, and the remote_root constraint."""
 
-    category: ToolCategory = ToolCategory.SSH
-
     def __init__(
         self, *, executor: SshExecutor, workspace: Any, context: SshExecutionContext
     ) -> None:
+        super().__init__(context=context)
         self._executor = executor
         self._workspace = workspace
-        self._context = context
-
-    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
-        raise NotImplementedError("SSH tools are async-only.")
 
     def args_type(self) -> type[BaseModel]:
         return TransferArgs
-
-    def return_type(self) -> type[BaseModel]:
-        return SshOpResult
 
     @staticmethod
     def _fail(code: str | None, message: str) -> Any:
         return SshOpResult(ok=False, error_code=code, message=message).model_dump()
 
 
-class SshExecuteTool(AbstractBaseTool):
+class SshExecuteTool(_SshToolBase):
     """Runs a command on a bound target via the SshExecutor (resolve → egress →
     decrypt → materialize → run → cap → cleanup)."""
 
-    category: ToolCategory = ToolCategory.SSH
-
     def __init__(self, *, executor: SshExecutor, context: SshExecutionContext) -> None:
+        super().__init__(context=context)
         self._executor = executor
-        self._context = context
-
-    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
-        raise NotImplementedError("SSH tools are async-only.")
-
-    def return_type(self) -> type[BaseModel]:
-        return SshOpResult
 
     @property
     def name(self) -> str:
@@ -375,6 +366,13 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     if provider is None:
         logger.info("ssh tools: skip (no provider hook installed)")
         return []
+    # The provider adapter must also be the secret store (resolve + read_version
+    # on one object). Verify structurally instead of a bare cast so a mis-wired
+    # provider skips cleanly rather than failing mid-execute on a missing method.
+    secret_store = provider
+    if not isinstance(secret_store, SshSecretStore):
+        logger.error("ssh tools: provider does not implement SshSecretStore; skipping")
+        return []
     numeric_task_id = _numeric_task_id(task_id)
     agent_id = _agent_id_for_task(session_factory, numeric_task_id)
     if agent_id is None:
@@ -423,7 +421,7 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
         runner = AsyncsshRunner()
     executor = SshExecutor(
         provider=provider,
-        secret_store=cast(SshSecretStore, provider),
+        secret_store=secret_store,
         materializer=materializer,
         runner=runner,
         egress_config=_egress_from_env(),

@@ -21,6 +21,7 @@ class SshErrorCode(str, Enum):
     EGRESS_DENIED = "ssh_egress_denied"
     APPROVAL_REQUIRED = "ssh_approval_required"
     CONNECTION_TIMEOUT = "ssh_connection_timeout"
+    CONNECTION_FAILED = "ssh_connection_failed"
     COMMAND_TIMEOUT = "ssh_command_timeout"
     OUTPUT_LIMIT_EXCEEDED = "ssh_output_limit_exceeded"
     TRANSFER_LIMIT_EXCEEDED = "ssh_transfer_limit_exceeded"

@@ -43,8 +43,11 @@ class LocalTmpSecretMaterializer:
         finally:
             for path in (key_path, known_hosts_path):
                 _best_effort_shred(path)
+            # suppress: a cleanup failure here must not replace a real exception
+            # already propagating out of the yield with a confusing ENOTEMPTY.
             if os.path.isdir(directory):
-                os.rmdir(directory)
+                with suppress(OSError):
+                    os.rmdir(directory)
 
 
 def _write_private(path: str, data: bytes) -> None:

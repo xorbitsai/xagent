@@ -24,7 +24,9 @@ class _FakeSandbox:
         self.writes: list[tuple[str, str]] = []
         self._fail_mkdir = fail_mkdir
 
-    async def exec(self, command: str, *args: str, env=None) -> ExecResult:
+    async def exec(
+        self, command: str, *args: str, env=None, max_output_bytes=None
+    ) -> ExecResult:
         self.execs.append((command, *args))
         if self._fail_mkdir and command == "mkdir":
             return ExecResult(exit_code=1, stdout="", stderr="cannot create")

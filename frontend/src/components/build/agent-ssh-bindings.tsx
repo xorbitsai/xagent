@@ -74,15 +74,17 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
     if (!agentId) return
     try {
       const res = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/ssh-targets`)
-      if (res.ok) {
-        const data: SshBinding[] = await res.json()
-        setBindings(data)
-        onCount?.(data.length)
-      }
+      if (!res.ok) throw new Error(await res.text())
+      const data: SshBinding[] = await res.json()
+      setBindings(data)
+      onCount?.(data.length)
     } catch {
-      // Silent load failure; the section just shows empty.
+      // Surface the failure instead of silently treating it as "no bindings":
+      // saving in this state would drop the "ssh" tool category even though
+      // bindings exist server-side, since onCount never fires.
+      toast.error(t("ssh.bindings.loadFailed"))
     }
-  }, [agentId, onCount])
+  }, [agentId, onCount, t])
 
   useEffect(() => {
     load()

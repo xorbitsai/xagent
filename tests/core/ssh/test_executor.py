@@ -341,3 +341,58 @@ async def test_execute_timeout_clamped_to_max() -> None:
         assert runner.timeout_seconds == 5
     finally:
         await server.close()
+
+
+def test_constrain_remote_path_rejects_injection_chars() -> None:
+    # A quote or newline in remote_path could break out of the sandbox runner's
+    # sftp batch file and inject a second transfer command (#1). The shared
+    # transfer prologue must reject them for both runners.
+    from xagent.core.ssh.executor import _constrain_remote_path
+
+    for bad in (
+        '/root/x"',
+        "/root/a\nget /etc/shadow /tmp/exfil",
+        "/root/b\r",
+        "/root/\x00c",
+    ):
+        with pytest.raises(SshError) as exc:
+            _constrain_remote_path(bad, None)
+        assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
+
+
+class _BoomRunner:
+    """A runner whose execute raises a non-SshError, unexpected exception."""
+
+    async def execute(self, **kwargs) -> SshRunResult:
+        raise RuntimeError("unexpected runner failure")
+
+
+async def test_execute_audits_unexpected_non_ssh_error() -> None:
+    # A non-SshError (or a CancelledError) used to slip past `except SshError`
+    # and leave no audit trail; the failure audit must fire for any error (#6).
+    server = await start_test_ssh_server()
+    sink = _RecordingAuditSink()
+    try:
+        ex = SshExecutor(
+            provider=InMemorySshTargetProvider({(1, "prod"): _target(server)}),
+            secret_store=InMemorySshSecretStore(
+                {
+                    "v": SensitiveSshCredential(
+                        server.client_private_key.encode(), "", "ssh-ed25519"
+                    )
+                }
+            ),
+            materializer=LocalTmpSecretMaterializer(),
+            runner=_BoomRunner(),
+            egress_config=_ALLOW_LOOPBACK,
+            audit_sink=sink,
+        )
+        with pytest.raises(RuntimeError):
+            await ex.execute(
+                _ctx(), target_alias="prod", command="uptime", timeout_seconds=10
+            )
+        assert len(sink.events) == 1
+        assert sink.events[0]["status"] == "failure"
+        assert sink.events[0]["error_code"] is None
+    finally:
+        await server.close()

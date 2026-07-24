@@ -70,3 +70,26 @@ def test_ipv4_mapped_metadata_denied_even_with_private_and_link_local_off() -> N
 def test_ipv4_mapped_public_still_allowed() -> None:
     # A mapped public address should behave like the bare public IPv4.
     assert check_ip("::ffff:93.184.216.34", EgressPolicyConfig()).allowed is True
+
+
+def test_metadata_denied_even_when_broadly_allowlisted() -> None:
+    # A 0.0.0.0/0 allowlist opens private ranges, but the metadata deny sits
+    # ahead of the allowlist so instance credentials stay unreachable (#4).
+    config = EgressPolicyConfig(allow_cidrs=("0.0.0.0/0",))
+    assert check_ip("169.254.169.254", config).allowed is False
+    assert check_ip("10.0.0.1", config).allowed is True  # allowlist still works
+
+
+def test_nat64_embedded_private_denied() -> None:
+    # 64:ff9b::/96 wrapping 10.0.0.1 must be judged as the private IPv4 (#5).
+    assert check_ip("64:ff9b::0a00:0001", EgressPolicyConfig()).allowed is False
+
+
+def test_nat64_embedded_public_allowed() -> None:
+    # 64:ff9b:: wrapping a public IPv4 (93.184.216.34) stays allowed.
+    assert check_ip("64:ff9b::5db8:d822", EgressPolicyConfig()).allowed is True
+
+
+def test_6to4_embedded_metadata_denied() -> None:
+    # 2002:a9fe:a9fe::/48 embeds 169.254.169.254 — decode and deny it (#5).
+    assert check_ip("2002:a9fe:a9fe::1", EgressPolicyConfig()).allowed is False

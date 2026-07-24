@@ -58,7 +58,9 @@ class _LocalExecSandbox:
     def __init__(self) -> None:
         self.execs: list[tuple[str, ...]] = []
 
-    async def exec(self, command: str, *args: str, env=None) -> ExecResult:
+    async def exec(
+        self, command: str, *args: str, env=None, max_output_bytes=None
+    ) -> ExecResult:
         self.execs.append((command, *args))
         argv = [command, *args]
         if argv and argv[0] == "timeout":

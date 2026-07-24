@@ -128,12 +128,11 @@ class SshExecutor:
                     command=command,
                     timeout_seconds=timeout,
                     egress_config=self._egress_config,
+                    max_output_bytes=self._max_output_bytes,
                 )
             duration_ms = int((time.monotonic() - start) * 1000)
-        except SshError as exc:
-            await self._audit(
-                context, "ssh_execute", "failure", resolved, exc.code.value
-            )
+        except BaseException as exc:
+            await self._audit_failure(context, "ssh_execute", resolved, exc)
             raise
 
         await self._audit(context, "ssh_execute", "success", resolved, None)
@@ -182,10 +181,8 @@ class SshExecutor:
                     overwrite=overwrite,
                     egress_config=self._egress_config,
                 )
-        except SshError as exc:
-            await self._audit(
-                context, "ssh_upload", "failure", resolved, exc.code.value
-            )
+        except BaseException as exc:
+            await self._audit_failure(context, "ssh_upload", resolved, exc)
             raise
         await self._audit(context, "ssh_upload", "success", resolved, None)
 
@@ -223,12 +220,24 @@ class SshExecutor:
                     overwrite=overwrite,
                     egress_config=self._egress_config,
                 )
-        except SshError as exc:
-            await self._audit(
-                context, "ssh_download", "failure", resolved, exc.code.value
-            )
+        except BaseException as exc:
+            await self._audit_failure(context, "ssh_download", resolved, exc)
             raise
         await self._audit(context, "ssh_download", "success", resolved, None)
+
+    async def _audit_failure(
+        self,
+        context: SshExecutionContext,
+        operation: str,
+        target: ResolvedSshTarget | None,
+        exc: BaseException,
+    ) -> None:
+        """Guarantee a failure audit for every escaping error — not just
+        SshError. A non-SshError (unexpected bug) or a CancelledError would
+        otherwise slip past ``except SshError`` and leave no audit trail,
+        breaking the one-event-per-operation contract (#6)."""
+        code = exc.code.value if isinstance(exc, SshError) else None
+        await self._audit(context, operation, "failure", target, code)
 
     async def _audit(
         self,
@@ -309,6 +318,16 @@ def _constrain_remote_path(remote_path: str, remote_root: str | None) -> None:
     path (with ``..`` collapsed) must stay within it. Lexical only — the remote
     filesystem is not consulted — so a symlink on the remote could still escape;
     this is the conservative first guard, not a full remote realpath check."""
+    # The sandbox runner builds its SFTP batch file by wrapping each path in
+    # double quotes, one command per line. A quote or newline in the path would
+    # close the quoting / start a second, independent transfer command outside
+    # the intended root — a confinement bypass. Reject them here, on the shared
+    # transfer prologue, so both runners are covered at the root (#1).
+    if any(c in remote_path for c in ('"', "\n", "\r", "\x00")):
+        raise SshError(
+            SshErrorCode.OPERATION_NOT_ALLOWED,
+            "remote path contains forbidden characters",
+        )
     if not remote_path.startswith("/"):
         raise SshError(
             SshErrorCode.OPERATION_NOT_ALLOWED, "remote path must be absolute"

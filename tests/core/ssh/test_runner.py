@@ -69,6 +69,7 @@ async def test_execute_runs_command_over_ssh() -> None:
                 command="uptime",
                 timeout_seconds=10,
                 egress_config=_ALLOW_LOOPBACK,
+                max_output_bytes=1 << 20,
             )
         assert result.exit_code == 0
         assert result.stdout == "ran: uptime"
@@ -93,6 +94,7 @@ async def test_execute_denied_peer_ip_rejected() -> None:
                     command="uptime",
                     timeout_seconds=10,
                     egress_config=EgressPolicyConfig(),
+                    max_output_bytes=1 << 20,
                 )
         assert exc.value.code == SshErrorCode.EGRESS_DENIED
     finally:
@@ -113,6 +115,7 @@ async def test_execute_times_out() -> None:
                     command="sleep 10",
                     timeout_seconds=1,
                     egress_config=_ALLOW_LOOPBACK,
+                    max_output_bytes=1 << 20,
                 )
         assert exc.value.code == SshErrorCode.COMMAND_TIMEOUT
     finally:
@@ -212,7 +215,31 @@ async def test_execute_wrong_host_key_fails_before_auth() -> None:
                     command="uptime",
                     timeout_seconds=10,
                     egress_config=_ALLOW_LOOPBACK,
+                    max_output_bytes=1 << 20,
                 )
         assert exc.value.code == SshErrorCode.HOST_KEY_MISMATCH
+    finally:
+        await server.close()
+
+
+async def test_execute_caps_large_output() -> None:
+    # Output is capped as it is read, not buffered whole then trimmed (#3). The
+    # test server echoes "ran: uptime" (11 bytes); a 5-byte cap cuts it short.
+    server = await start_test_ssh_server()
+    try:
+        async with _materialized(server) as (key_path, known_hosts_path):
+            result = await AsyncsshRunner().execute(
+                hostname=server.host,
+                port=server.port,
+                username="deploy",
+                private_key_path=key_path,
+                known_hosts_path=known_hosts_path,
+                command="uptime",
+                timeout_seconds=10,
+                egress_config=_ALLOW_LOOPBACK,
+                max_output_bytes=5,
+            )
+        assert result.truncated is True
+        assert len(result.stdout.encode("utf-8")) == 5
     finally:
         await server.close()

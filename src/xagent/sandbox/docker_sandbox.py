@@ -287,6 +287,46 @@ def _write_tar_from_content(
     file_obj.seek(0)
 
 
+def _exec_capped(
+    container: Any, cmd: list[str], env: Optional[dict[str, str]], cap: int
+) -> ExecResult:
+    """Exec ``cmd`` streaming stdout/stderr and keeping at most ``cap`` bytes of
+    each, so the host docker client never buffers an unbounded remote flood
+    (#3). ``container.exec_run(demux=True)`` reads the whole stream into host
+    memory before returning; the low-level exec API streams instead, letting us
+    drop everything past the cap while still draining to EOF (the caller's
+    ``timeout`` bounds how long that can take). Blocking — run in a thread."""
+    api = container.client.api
+    exec_id = api.exec_create(
+        container.id, cmd, environment=env, stdout=True, stderr=True
+    )["Id"]
+    out = bytearray()
+    err = bytearray()
+    out_truncated = False
+    err_truncated = False
+    for stdout_chunk, stderr_chunk in api.exec_start(exec_id, stream=True, demux=True):
+        if stdout_chunk:
+            room = cap - len(out)
+            if room > 0:
+                out.extend(stdout_chunk[:room])
+            if len(stdout_chunk) > max(room, 0):
+                out_truncated = True
+        if stderr_chunk:
+            room = cap - len(err)
+            if room > 0:
+                err.extend(stderr_chunk[:room])
+            if len(stderr_chunk) > max(room, 0):
+                err_truncated = True
+    exit_code = api.exec_inspect(exec_id).get("ExitCode")
+    return ExecResult(
+        exit_code=exit_code if exit_code is not None else -1,
+        stdout=bytes(out).decode("utf-8", errors="replace"),
+        stderr=bytes(err).decode("utf-8", errors="replace"),
+        truncated=out_truncated or err_truncated,
+        error_message=None,
+    )
+
+
 def _write_stream_to_file(
     stream: Any, file_obj: io.BufferedRandom | io.BufferedWriter
 ) -> None:
@@ -422,11 +462,16 @@ class DockerSandbox(Sandbox):
         command: str,
         *args: str,
         env: Optional[dict[str, str]] = None,
+        max_output_bytes: Optional[int] = None,
     ) -> ExecResult:
         """Execute a command directly against the current container instance."""
         container = await self._require_container()
         cmd: list[str] = [command, *args]
         try:
+            if max_output_bytes is not None:
+                return await asyncio.to_thread(
+                    _exec_capped, container, cmd, env, max_output_bytes
+                )
             result = await asyncio.to_thread(
                 container.exec_run,
                 cmd,
@@ -473,6 +518,7 @@ class DockerSandbox(Sandbox):
         command: str,
         *args: str,
         env: Optional[dict[str, str]] = None,
+        max_output_bytes: Optional[int] = None,
     ) -> ExecResult:
         """Execute a shell command inside the sandbox.
 
@@ -481,7 +527,9 @@ class DockerSandbox(Sandbox):
         """
         async with self._control.operation():
             async with self._control.exec_lock:
-                return await self._exec_in_container(command, *args, env=env)
+                return await self._exec_in_container(
+                    command, *args, env=env, max_output_bytes=max_output_bytes
+                )
 
     async def run_code(
         self,

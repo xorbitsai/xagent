@@ -113,7 +113,8 @@ def _raise_for_transport(exit_code: int, stderr: str) -> None:
                 SshErrorCode.HOST_KEY_MISMATCH, "host key verification failed"
             )
         # Refused / unreachable / auth failure: one stable code, no raw detail.
-        raise SshError(SshErrorCode.CONNECTION_TIMEOUT, "ssh connection failed")
+        # NOT a timeout (exit 124 is handled above), so don't mislabel it as one.
+        raise SshError(SshErrorCode.CONNECTION_FAILED, "ssh connection failed")
 
 
 class SandboxSshRunner:
@@ -138,6 +139,7 @@ class SandboxSshRunner:
         command: str,
         timeout_seconds: int,
         egress_config: object = None,
+        max_output_bytes: int | None = None,
     ) -> SshRunResult:
         argv = _ssh_argv(
             hostname=hostname,
@@ -149,13 +151,17 @@ class SandboxSshRunner:
             command=command,
         )
         sb = cast(SandboxLike, sandbox)
-        result = await sb.exec("timeout", str(timeout_seconds), *argv)
+        # Cap in the sandbox exec so a flood of remote output is cut at the read,
+        # not buffered whole in the host docker client first (#3).
+        result = await sb.exec(
+            "timeout", str(timeout_seconds), *argv, max_output_bytes=max_output_bytes
+        )
         _raise_for_transport(result.exit_code, result.stderr or "")
         return SshRunResult(
             exit_code=result.exit_code,
             stdout=result.stdout or "",
             stderr=result.stderr or "",
-            truncated=False,
+            truncated=bool(getattr(result, "truncated", False)),
         )
 
     async def upload(

@@ -31,7 +31,17 @@ def get_ssh_target_provider(session_factory: Any) -> SshTargetProvider | None:
     """Build the provider for this call, or None if no hook is installed."""
     if _ssh_target_provider_factory is None:
         return None
-    return _ssh_target_provider_factory(session_factory)
+    provider = _ssh_target_provider_factory(session_factory)
+    # Structural guard at the injection seam: the factory is first-party but
+    # installed out-of-tree (xagent-cloud), so a mis-wired factory fails loudly
+    # here rather than as an AttributeError deep inside a tool call. The
+    # Protocol is @runtime_checkable, so this is a cheap method-presence check.
+    if not isinstance(provider, SshTargetProvider):
+        raise TypeError(
+            "SSH target provider factory returned an object that does not "
+            "implement SshTargetProvider"
+        )
+    return provider
 
 
 def set_ssh_audit_sink_hook(factory: SshAuditSinkFactory | None) -> None:
@@ -44,4 +54,11 @@ def get_ssh_audit_sink(session_factory: Any) -> SshAuditSink | None:
     """Build the audit sink for this call, or None if no hook is installed."""
     if _ssh_audit_sink_factory is None:
         return None
-    return _ssh_audit_sink_factory(session_factory)
+    sink = _ssh_audit_sink_factory(session_factory)
+    # Same structural guard as the provider seam (see above).
+    if not isinstance(sink, SshAuditSink):
+        raise TypeError(
+            "SSH audit sink factory returned an object that does not "
+            "implement SshAuditSink"
+        )
+    return sink

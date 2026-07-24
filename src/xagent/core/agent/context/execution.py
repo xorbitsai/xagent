@@ -7,6 +7,10 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from ...context_ref import (
+    normalize_context_references,
+    split_tool_result_context_references,
+)
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ...tools.artifacts import (
     format_tool_result_for_observation,
@@ -158,7 +162,19 @@ class ExecutionContext:
         *,
         context_refs: Any = (),
     ) -> Message:
-        context_result = self._sanitize_tool_result_for_context(tool_name, result)
+        public_result, embedded_refs = split_tool_result_context_references(result)
+        explicit_refs = normalize_context_references(context_refs)
+        all_context_refs = []
+        seen_context_refs: set[str] = set()
+        for reference in (*explicit_refs, *embedded_refs):
+            identity = reference.identity_key()
+            if identity in seen_context_refs:
+                continue
+            seen_context_refs.add(identity)
+            all_context_refs.append(reference)
+        context_result = self._sanitize_tool_result_for_context(
+            tool_name, public_result
+        )
         content = self._format_tool_result(tool_name, context_result)
         metadata = {
             "tool_name": tool_name,
@@ -173,7 +189,7 @@ class ExecutionContext:
             content,
             tool_call_id=tool_call_id,
             metadata=metadata,
-            context_refs=context_refs,
+            context_refs=tuple(all_context_refs),
         )
 
     def attach_workspace(

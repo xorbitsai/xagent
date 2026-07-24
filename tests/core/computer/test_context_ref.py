@@ -94,6 +94,39 @@ def test_tool_result_can_carry_durable_observation_reference() -> None:
     assert message.to_dict()[CONTEXT_REFS_KEY][0]["frame_id"] == "frame-1"
 
 
+def test_tool_result_reserved_envelope_moves_refs_onto_message() -> None:
+    context = ExecutionContext()
+
+    message = context.add_tool_result(
+        "computer",
+        {
+            "success": True,
+            "frame_id": "frame-1",
+            CONTEXT_REFS_KEY: [reference().durable_dict()],
+        },
+        tool_call_id="call-1",
+    )
+
+    assert message.context_refs == (reference(),)
+    assert CONTEXT_REFS_KEY not in message.metadata["raw_result"]
+    assert CONTEXT_REFS_KEY not in message.content
+
+
+def test_tool_result_deduplicates_explicit_and_embedded_refs() -> None:
+    context = ExecutionContext()
+
+    message = context.add_tool_result(
+        "computer",
+        {
+            "success": True,
+            CONTEXT_REFS_KEY: [reference().durable_dict()],
+        },
+        context_refs=[reference()],
+    )
+
+    assert message.context_refs == (reference(),)
+
+
 def test_compaction_transcript_preserves_file_id_without_binary_data() -> None:
     context = ExecutionContext()
     context.add_user_message("inspect", context_refs=[reference()])

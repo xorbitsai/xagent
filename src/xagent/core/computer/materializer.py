@@ -100,8 +100,15 @@ async def materialize_messages(
 
         content_parts: list[dict[str, Any]] = []
         text = str(copied.get("content") or "")
-        if text:
+        if copied.get("role") == "user" and text:
             content_parts.append({"type": "text", "text": text})
+        elif copied.get("role") != "user":
+            content_parts.append(
+                {
+                    "type": "text",
+                    "text": "Image context for the preceding message.",
+                }
+            )
         for ref in refs:
             detail = "high" if ref.detail.value == "original" else ref.detail.value
             content_parts.append(

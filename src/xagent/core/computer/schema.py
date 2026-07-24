@@ -16,6 +16,7 @@ class ComputerEnvironmentType(str, Enum):
 
 class ComputerActionType(str, Enum):
     SCREENSHOT = "screenshot"
+    NAVIGATE = "navigate"
     CLICK = "click"
     DOUBLE_CLICK = "double_click"
     MOVE = "move"
@@ -89,6 +90,7 @@ class ComputerTarget(_ComputerModel):
 class ComputerAction(_ComputerModel):
     type: ComputerActionType
     target: ComputerTarget | None = None
+    url: str | None = None
     text: str | None = None
     keys: list[str] = Field(default_factory=list, max_length=16)
     delta_x: float = Field(default=0, ge=-1, le=1)
@@ -107,10 +109,18 @@ class ComputerAction(_ComputerModel):
         }
         if self.type in target_actions and self.target is None:
             raise ValueError(f"{self.type.value} requires a target")
+        if self.type == ComputerActionType.NAVIGATE and not (
+            self.url and self.url.strip()
+        ):
+            raise ValueError("navigate requires a URL")
         if self.type == ComputerActionType.TYPE and self.text is None:
             raise ValueError("type requires text")
         if self.type == ComputerActionType.KEYPRESS and not self.keys:
             raise ValueError("keypress requires at least one key")
+        if self.type == ComputerActionType.KEYPRESS and any(
+            not key.strip() for key in self.keys
+        ):
+            raise ValueError("keypress keys must not be empty")
         if (
             self.type == ComputerActionType.SCROLL
             and self.delta_x == 0

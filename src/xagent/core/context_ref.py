@@ -157,3 +157,19 @@ def normalize_context_references(
         else ContextReference.model_validate(value)
         for value in values
     )
+
+
+def split_tool_result_context_references(
+    result: Any,
+) -> tuple[Any, tuple[ContextReference, ...]]:
+    """Detach durable context refs from a tool result before model formatting.
+
+    Tools can return ``_xagent_context_refs`` as a reserved internal envelope
+    field. ExecutionContext stores those refs on the tool Message while keeping
+    the public tool observation free of transport-only bookkeeping.
+    """
+    if not isinstance(result, dict) or CONTEXT_REFS_KEY not in result:
+        return result, ()
+    public_result = dict(result)
+    raw_refs = public_result.pop(CONTEXT_REFS_KEY)
+    return public_result, normalize_context_references(raw_refs)

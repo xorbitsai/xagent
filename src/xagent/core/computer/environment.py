@@ -77,6 +77,9 @@ class ComputerEnvironment(ABC):
         self.record_observation(observation)
         return observation
 
+    async def close(self) -> None:
+        """Release environment resources. Stateless adapters may keep the no-op."""
+
     @abstractmethod
     async def _observe(self) -> ComputerObservation:
         """Adapter hook that captures the current environment state."""

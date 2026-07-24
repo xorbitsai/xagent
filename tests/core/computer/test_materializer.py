@@ -122,6 +122,11 @@ async def test_tool_observation_image_follows_complete_tool_group() -> None:
         "user",
     ]
     assert isinstance(result[3]["content"], list)
+    assert result[3]["content"][0] == {
+        "type": "text",
+        "text": "Image context for the preceding message.",
+    }
+    assert "captured" not in str(result[3]["content"])
     assert result[4]["content"] == "continue"
 
 

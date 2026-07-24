@@ -42,6 +42,7 @@ def test_normalized_rect_must_fit_viewport() -> None:
         {"type": ComputerActionType.TYPE},
         {"type": ComputerActionType.KEYPRESS},
         {"type": ComputerActionType.SCROLL},
+        {"type": ComputerActionType.NAVIGATE},
         {
             "type": ComputerActionType.DRAG,
             "start": {"x": 0.1, "y": 0.1},

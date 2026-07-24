@@ -372,6 +372,28 @@ def test_constrain_remote_path_rejects_injection_chars() -> None:
         assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
 
 
+def test_constrain_remote_path_allows_leading_double_slash() -> None:
+    # normpath keeps a leading "//" (POSIX), which used to fail the root-prefix
+    # check and wrongly reject a valid in-root path (m4). It must be accepted.
+    from xagent.core.ssh.executor import _constrain_remote_path
+
+    _constrain_remote_path("//root/x", "/root")  # must not raise
+
+
+def test_transfer_timeout_clamped_to_max() -> None:
+    # SFTP transfers used a fixed 300s budget that ignored the deployment's
+    # max_timeout_seconds clamp (m3); a tighter max must also tighten transfers.
+    ex = SshExecutor(
+        provider=InMemorySshTargetProvider({}),
+        secret_store=InMemorySshSecretStore({}),
+        materializer=LocalTmpSecretMaterializer(),
+        runner=AsyncsshRunner(),
+        egress_config=_ALLOW_LOOPBACK,
+        max_timeout_seconds=10,
+    )
+    assert ex._transfer_timeout_seconds == 10
+
+
 class _BoomRunner:
     """A runner whose execute raises a non-SshError, unexpected exception."""
 

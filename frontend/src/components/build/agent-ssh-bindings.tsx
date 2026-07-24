@@ -95,12 +95,15 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
     ;(async () => {
       try {
         const res = await apiRequest(`${getApiUrl()}/api/ssh/targets?scope=user`)
-        if (res.ok) setTargets(await res.json())
+        if (!res.ok) throw new Error(await res.text())
+        setTargets(await res.json())
       } catch {
-        // Silent picker-load failure; the dropdown stays empty.
+        // Surface the failure instead of leaving a silently-empty dropdown,
+        // mirroring the bindings-load() toast in this same file (m5).
+        toast.error(t("ssh.bindings.targetsLoadFailed"))
       }
     })()
-  }, [dialogOpen])
+  }, [dialogOpen, t])
 
   function resetForm() {
     setTargetPublicId("")

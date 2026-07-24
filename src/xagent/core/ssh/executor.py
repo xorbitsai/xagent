@@ -10,6 +10,7 @@ timeout, and cancellation).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import posixpath
 import time
@@ -81,6 +82,12 @@ class SshExecutor:
         self._audit_sink = audit_sink
         self._max_output_bytes = max_output_bytes
         self._max_timeout_seconds = max_timeout_seconds
+        # SFTP transfers get their own default budget, but never more than the
+        # deployment's configured max (execute() clamps the same way) so a
+        # tighter max_timeout_seconds also tightens transfers (m3).
+        self._transfer_timeout_seconds = min(
+            DEFAULT_TRANSFER_TIMEOUT_SECONDS, max_timeout_seconds
+        )
 
     async def execute(
         self,
@@ -181,7 +188,7 @@ class SshExecutor:
                     remote_path=remote_path,
                     overwrite=overwrite,
                     egress_config=self._egress_config,
-                    timeout_seconds=DEFAULT_TRANSFER_TIMEOUT_SECONDS,
+                    timeout_seconds=self._transfer_timeout_seconds,
                 )
         except BaseException as exc:
             await self._audit_failure(context, "ssh_upload", resolved, exc)
@@ -221,7 +228,7 @@ class SshExecutor:
                     local_path=local_path,
                     overwrite=overwrite,
                     egress_config=self._egress_config,
-                    timeout_seconds=DEFAULT_TRANSFER_TIMEOUT_SECONDS,
+                    timeout_seconds=self._transfer_timeout_seconds,
                 )
         except BaseException as exc:
             await self._audit_failure(context, "ssh_download", resolved, exc)
@@ -240,7 +247,11 @@ class SshExecutor:
         otherwise slip past ``except SshError`` and leave no audit trail,
         breaking the one-event-per-operation contract (#6)."""
         code = exc.code.value if isinstance(exc, SshError) else None
-        await self._audit(context, operation, "failure", target, code)
+        # Shield the audit: this path runs while an exception (often a
+        # CancelledError) is propagating, and a second cancellation landing
+        # during the await would drop the failure audit — breaking the
+        # one-event-per-operation guarantee on the cancellation path (m1).
+        await asyncio.shield(self._audit(context, operation, "failure", target, code))
 
     async def _audit(
         self,
@@ -337,7 +348,12 @@ def _constrain_remote_path(remote_path: str, remote_root: str | None) -> None:
         )
     if remote_root is None:
         return
+    # normpath preserves a leading "//" (POSIX-defined), so "//root/x" would
+    # stay "//root/x" and wrongly fail the "/root/" prefix check below; collapse
+    # it to a single leading slash first (m4).
     normalized = posixpath.normpath(remote_path)
+    if normalized.startswith("//"):
+        normalized = "/" + normalized.lstrip("/")
     root = posixpath.normpath(remote_root)
     # normpath("/") == "/", so root + "/" would be "//"; guard that case.
     prefix = root if root.endswith("/") else root + "/"

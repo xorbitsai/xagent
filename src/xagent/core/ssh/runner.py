@@ -115,6 +115,7 @@ class AsyncsshRunner:
         private_key_path: str,
         known_hosts_path: str,
         egress_config: EgressPolicyConfig,
+        timeout_seconds: int,
     ) -> AsyncIterator[asyncssh.SSHClientConnection]:
         # Imported lazily so merely loading this module (and thus the SSH MCP
         # tools) never hard-requires asyncssh: agents that don't execute SSH,
@@ -137,6 +138,11 @@ class AsyncsshRunner:
                 x509_trusted_certs=None,
                 x509_trusted_cert_paths=None,
                 preferred_auth=["publickey"],
+                # Bound the TCP-connect and auth handshake; without these a slow
+                # or malicious target stalls the worker indefinitely, since the
+                # per-op wait_for below only wraps the post-connect work (M1).
+                connect_timeout=timeout_seconds,
+                login_timeout=timeout_seconds,
             ) as conn:
                 # DNS-rebinding defense: re-check the IP actually connected to,
                 # and refuse before doing anything if the policy denies it.
@@ -149,12 +155,13 @@ class AsyncsshRunner:
                 "host key verification failed",
                 cause=exc,
             ) from exc
-        except (asyncssh.Error, OSError) as exc:
+        except (asyncssh.Error, OSError, TimeoutError) as exc:
             # PermissionDenied, ConnectionLost, connection-refused (OSError),
-            # etc. are all DisconnectError/Error siblings that otherwise escape
-            # raw — skipping the executor's failure audit and the tool wrapper.
-            # Map them to one stable code so both runners fail identically.
-            # (SshError from _authorize_peer is neither, so it propagates.)
+            # connect/login-timeout (TimeoutError), etc. are all siblings that
+            # otherwise escape raw — skipping the executor's failure audit and
+            # the tool wrapper. Map them to one stable code so both runners fail
+            # identically. (SshError from _authorize_peer is none of these, so
+            # it propagates.)
             raise SshError(
                 SshErrorCode.CONNECTION_FAILED,
                 "ssh connection failed",
@@ -183,6 +190,7 @@ class AsyncsshRunner:
             private_key_path=private_key_path,
             known_hosts_path=known_hosts_path,
             egress_config=egress_config,
+            timeout_seconds=timeout_seconds,
         ) as conn:
             try:
                 out, err, truncated, exit_status = await asyncio.wait_for(
@@ -227,23 +235,24 @@ class AsyncsshRunner:
                 private_key_path=private_key_path,
                 known_hosts_path=known_hosts_path,
                 egress_config=egress_config,
+                timeout_seconds=timeout_seconds,
             ) as conn,
             conn.start_sftp_client() as sftp,
         ):
-            # Bound the transfer like execute() does — a stalled peer must not
-            # hang the worker indefinitely (the sandbox runner clamps with the
-            # `timeout` utility; the in-process path needs its own).
-            try:
-                if not overwrite and await asyncio.wait_for(
-                    sftp.exists(remote_path), timeout_seconds
-                ):
+            # Bound the whole transfer under one shared budget — a stalled peer
+            # must not hang the worker, and the exists-check + put must not each
+            # get a full timeout (m3). The connect handshake is separately
+            # bounded in _connect (M1).
+            async def _put() -> None:
+                if not overwrite and await sftp.exists(remote_path):
                     raise SshError(
                         SshErrorCode.OPERATION_NOT_ALLOWED,
                         "remote destination already exists",
                     )
-                await asyncio.wait_for(
-                    sftp.put(local_path, remote_path), timeout_seconds
-                )
+                await sftp.put(local_path, remote_path)
+
+            try:
+                await asyncio.wait_for(_put(), timeout_seconds)
             except TimeoutError as exc:
                 raise SshError(
                     SshErrorCode.COMMAND_TIMEOUT, "transfer timed out", cause=exc
@@ -277,6 +286,7 @@ class AsyncsshRunner:
                 private_key_path=private_key_path,
                 known_hosts_path=known_hosts_path,
                 egress_config=egress_config,
+                timeout_seconds=timeout_seconds,
             ) as conn,
             conn.start_sftp_client() as sftp,
         ):
@@ -304,7 +314,11 @@ async def _run_capped(
         )
         truncated = out_truncated or err_truncated
         # Only wait for the exit status when we read to EOF; if we stopped early
-        # the remote may keep writing forever, so don't block on it.
+        # the remote may keep writing forever, so don't block on it. This means
+        # exit_status is None (→ exit_code -1 in execute()) whenever truncated
+        # is True — the exit code is meaningless in that case, so callers must
+        # read it together with the truncated flag (m2). The process is killed
+        # by create_process's context exit either way.
         if not truncated:
             await proc.wait()
         return out, err, truncated, proc.exit_status

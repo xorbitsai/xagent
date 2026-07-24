@@ -16,6 +16,11 @@ def test_link_local_denied() -> None:
     assert check_ip("fe80::1", EgressPolicyConfig()).allowed is False
 
 
+def test_multicast_denied() -> None:
+    # Multicast used to fall through to default_allow_public (m6).
+    assert check_ip("224.0.0.1", EgressPolicyConfig()).allowed is False
+
+
 def test_cloud_metadata_denied_even_if_link_local_check_disabled() -> None:
     config = EgressPolicyConfig(deny_link_local=False)
     decision = check_ip("169.254.169.254", config)

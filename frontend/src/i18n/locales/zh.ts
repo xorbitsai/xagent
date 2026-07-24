@@ -4356,6 +4356,33 @@ const zh = {
       livePreviewHint: "实时预览将在此显示。",
     },
   },
+  ssh: {
+    bindings: {
+      label: "SSH 目标",
+      add: "绑定目标",
+      empty: "该智能体尚未绑定 SSH 目标。",
+      loadFailed: "无法加载 SSH 绑定,请重新加载后再保存,以免丢失 SSH 工具。",
+      targetsLoadFailed: "无法加载 SSH 目标。",
+      saveFirst: "请先保存智能体,再绑定 SSH 目标。",
+      created: "目标已绑定",
+      deleted: "绑定已移除",
+      confirmDelete: "确定要移除该 SSH 目标绑定吗？",
+      approval: {
+        always: "始终需要审批",
+        risk_based: "基于风险审批",
+        not_required: "无需审批",
+      },
+      dialog: {
+        title: "绑定 SSH 目标",
+        targetLabel: "目标",
+        targetPlaceholder: "选择目标",
+        capabilitiesLabel: "权限",
+        capabilitiesPlaceholder: "选择权限",
+        approvalLabel: "审批策略",
+        submit: "绑定",
+      },
+    },
+  },
 } as const
 
 export default zh

@@ -32,6 +32,7 @@ class ToolCategory(str, Enum):
     MCP = "mcp"
     DATABASE = "database"
     SKILL = "skill"
+    SSH = "ssh"
     OTHER = "other"
 
 

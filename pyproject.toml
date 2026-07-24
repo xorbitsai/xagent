@@ -40,6 +40,7 @@ dependencies = [
   "langfuse >= 4.0.6, < 5.0.0",    # Tracing implementation targets the v4 SDK API
   "python-dotenv >= 1.0.1",
   "mcp>=1.12.4",
+  "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
   "requests >= 2.32.0",
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",
@@ -203,6 +204,7 @@ test = [
   "copilotkit==0.1.69",
   "langgraph-prebuilt<1.0.9",
   "openpyxl>=3.1.5",
+  "asyncssh>=2.14.0",
 ]
 
 # Static type checking
@@ -268,6 +270,7 @@ namespace_packages = true
 explicit_package_bases = true
 [[tool.mypy.overrides]]
 module = [
+  "asyncssh",
   "docx",
   "pptx",
   "pptx.*",
@@ -324,6 +327,9 @@ module = [
   "xagent.core.model.tts.xinference",
   "xagent.web.channels.telegram.bot",
   "xagent.web.channels.telegram.handler",
+  # asyncssh ships no type stubs; the runner annotates connection types that
+  # would otherwise trip disallow_any_unimported.
+  "xagent.core.ssh.runner",
 ]
 disallow_any_unimported = false
 warn_unused_ignores = false

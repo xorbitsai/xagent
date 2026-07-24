@@ -8,16 +8,11 @@ and configuration management.
 # mypy: ignore-errors
 
 import logging
+from collections.abc import Callable, Iterable
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Dict,
-    FrozenSet,
-    Iterable,
-    List,
     Optional,
-    Tuple,
 )
 
 from sqlalchemy.orm import Session
@@ -66,16 +61,16 @@ class ToolRegistry:
 
     # (creator, declared_categories, selection_gate) — declared_categories is
     # None for dynamic creators that filter internally based on the spec.
-    _tool_creators: List[Tuple[Callable, Optional[FrozenSet[str]], Optional[str]]] = []
+    _tool_creators: list[tuple[Callable, frozenset[str] | None, str | None]] = []
     _modules_imported = False
 
     @classmethod
     def register(
         cls,
-        creator: Optional[Callable] = None,
+        creator: Callable | None = None,
         *,
-        categories: Optional[set] = None,
-        selection_gate: Optional[str] = None,
+        categories: set | None = None,
+        selection_gate: str | None = None,
     ) -> Callable:
         """
         Register a tool creator function.
@@ -120,7 +115,8 @@ class ToolRegistry:
             return
 
         try:
-            # Import tool modules in priority order - these imports trigger @register_tool decorators
+            # Import tool modules in priority order - these imports trigger
+            # @register_tool decorators
             from . import (  # noqa: F401 - imports trigger @register_tool decorators
                 a2a_agent_tool,
                 agent_tool,
@@ -138,6 +134,7 @@ class ToolRegistry:
                 skill_tools,
                 sound_effect_tool,
                 sql_tool,
+                ssh_tools,
                 translate_json,
                 video_tool,
                 vision_tool,
@@ -152,9 +149,9 @@ class ToolRegistry:
 
     @staticmethod
     def _should_run_creator(
-        declared_cats: Optional[FrozenSet[str]],
-        spec: Optional[ToolSelectionSpec],
-        selection_gate: Optional[str],
+        declared_cats: frozenset[str] | None,
+        spec: ToolSelectionSpec | None,
+        selection_gate: str | None,
     ) -> bool:
         if spec is None or declared_cats is None or spec.categories is None:
             return True
@@ -170,13 +167,10 @@ class ToolRegistry:
             # or a server-only spec would skip the MCP creator entirely.
             return spec.includes_mcp()
 
-        if declared_cats & spec.categories:
-            return True
-
-        return False
+        return bool(declared_cats & spec.categories)
 
     @classmethod
-    async def create_registered_tools(cls, config: BaseToolConfig) -> List[Tool]:
+    async def create_registered_tools(cls, config: BaseToolConfig) -> list[Tool]:
         """Create tools from all registered creators.
 
         When ``config.get_tool_selection_spec()`` returns a spec,
@@ -190,12 +184,12 @@ class ToolRegistry:
         # Import tool modules on first call to trigger decorator registration
         cls._import_tool_modules()
 
-        spec: Optional[ToolSelectionSpec] = (
+        spec: ToolSelectionSpec | None = (
             config.get_tool_selection_spec()
             if hasattr(config, "get_tool_selection_spec")
             else None
         )
-        tools: List[Tool] = []
+        tools: list[Tool] = []
         for creator, declared_cats, selection_gate in cls._tool_creators:
             # Registry-level skip: declared categories known and no
             # intersection with the spec's allowed categories. The helper
@@ -217,7 +211,7 @@ class ToolRegistry:
         return tools
 
     @classmethod
-    def _sort_tools_by_category(cls, tools: List[Tool]) -> List[Tool]:
+    def _sort_tools_by_category(cls, tools: list[Tool]) -> list[Tool]:
         """Sort tools by category priority.
 
         Priority order (most important first):
@@ -255,7 +249,8 @@ class ToolRegistry:
             ToolCategory.MCP: 11,
             ToolCategory.SKILL: 12,
             ToolCategory.AGENT: 13,
-            ToolCategory.OTHER: 14,
+            ToolCategory.SSH: 14,
+            ToolCategory.OTHER: 15,
         }
 
         def get_tool_priority(tool: Tool) -> int:
@@ -281,7 +276,7 @@ class ToolFactory:
     @staticmethod
     async def create_all_tools(
         config: BaseToolConfig, apply_user_override_filter: bool = True
-    ) -> List[Tool]:
+    ) -> list[Tool]:
         """Create tools within the config's optional prepared-runtime boundary.
 
         Release runs after partial preparation, while an active prepare/build
@@ -317,7 +312,7 @@ class ToolFactory:
     @staticmethod
     async def _create_all_tools_prepared(
         config: BaseToolConfig, apply_user_override_filter: bool = True
-    ) -> List[Tool]:
+    ) -> list[Tool]:
         """
         Create all tools based on configuration.
 
@@ -395,8 +390,7 @@ class ToolFactory:
             tools = [tool for tool in tools if tool.name in allowed_names]
             if allowed_names:
                 logger.info(
-                    f"Filtered tools to {len(tools)} allowed tools: "
-                    f"{[t.name for t in tools]}"
+                    f"Filtered tools to {len(tools)} allowed tools: {[t.name for t in tools]}"
                 )
 
         # Filter out tools disabled by per-user hook policy (execution layer)
@@ -454,7 +448,7 @@ class ToolFactory:
         return tools
 
     @staticmethod
-    def _apply_output_filters(tools: List[Tool], config: BaseToolConfig) -> List[Tool]:
+    def _apply_output_filters(tools: list[Tool], config: BaseToolConfig) -> list[Tool]:
         """Apply output filtering to all tools.
 
         Args:
@@ -468,7 +462,7 @@ class ToolFactory:
         max_fields = config.get_max_field_count()
         max_recursion = config.get_max_recursion_depth()
 
-        filtered_tools: List[Tool] = []
+        filtered_tools: list[Tool] = []
         for tool in tools:
             # Only wrap AbstractBaseTool instances
             if isinstance(tool, AbstractBaseTool):
@@ -492,7 +486,7 @@ class ToolFactory:
         return filtered_tools
 
     @staticmethod
-    async def _wrap_sandbox_tools(tools: List[Tool], sandbox: Any) -> List[Tool]:
+    async def _wrap_sandbox_tools(tools: list[Tool], sandbox: Any) -> list[Tool]:
         """Wrap sandbox-enabled tools with SandboxedToolWrapper.
 
         Args:
@@ -505,7 +499,7 @@ class ToolFactory:
         from .sandboxed_tool.sandbox_config import resolve_sandbox_config
         from .sandboxed_tool.sandboxed_tool_wrapper import create_sandboxed_tool
 
-        wrapped_tools: List[Tool] = []
+        wrapped_tools: list[Tool] = []
         for tool in tools:
             sb_config = resolve_sandbox_config(tool)
             if sb_config is not None and sb_config.enabled:
@@ -518,8 +512,7 @@ class ToolFactory:
                     logger.info(f"Wrapped tool '{tool.name}' with sandbox")
                 except Exception as e:
                     logger.warning(
-                        f"Failed to wrap tool '{tool.name}' with sandbox: {e}, "
-                        f"using original tool"
+                        f"Failed to wrap tool '{tool.name}' with sandbox: {e}, using original tool"
                     )
                     wrapped_tools.append(tool)
             else:
@@ -529,8 +522,8 @@ class ToolFactory:
     # New unified tool creation methods
     @staticmethod
     def _create_workspace(
-        workspace_config: Optional[Dict[str, Any]],
-    ) -> Optional[TaskWorkspace]:
+        workspace_config: dict[str, Any] | None,
+    ) -> TaskWorkspace | None:
         """Create workspace from configuration.
 
         Uses MockWorkspace for tool listing scenarios to avoid creating
@@ -590,7 +583,7 @@ class ToolFactory:
         from ....agent.result import normalize_tool_failure_code
         from .mcp_adapter import UnavailableMCPTool
 
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "server_name": server_name if isinstance(server_name, str) else "",
             "server_id": server_id,
             "allow_users": allow_users if isinstance(allow_users, list) else None,
@@ -605,13 +598,13 @@ class ToolFactory:
     @classmethod
     def _unavailable_mcp_tools_from_load_failures(
         cls,
-        failures: Tuple["MCPServerLoadFailure", ...],
-        configs_by_name: Dict[str, Dict[str, Any]],
-    ) -> List[Tool]:
+        failures: tuple["MCPServerLoadFailure", ...],
+        configs_by_name: dict[str, dict[str, Any]],
+    ) -> list[Tool]:
         """Convert structured load failures to one unavailable tool per server."""
         from .mcp_adapter import mcp_load_failure_message
 
-        tools: List[Tool] = []
+        tools: list[Tool] = []
         seen_servers: set[str] = set()
         for failure in failures:
             if failure.server_name in seen_servers:
@@ -651,15 +644,15 @@ class ToolFactory:
 
     @staticmethod
     async def _create_mcp_tools_from_configs(
-        mcp_configs: List[Dict[str, Any]],
+        mcp_configs: list[dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
-    ) -> List[Tool]:
+    ) -> list[Tool]:
         """Create MCP tools from configurations."""
         try:
             from .mcp_adapter import load_mcp_tools_as_agent_tools
 
-            unavailable_tools: List[Tool] = []
-            normal_configs: List[Dict[str, Any]] = []
+            unavailable_tools: list[Tool] = []
+            normal_configs: list[dict[str, Any]] = []
 
             for config in mcp_configs:
                 inner_config = config.get("config")
@@ -686,10 +679,10 @@ class ToolFactory:
                     continue
                 normal_configs.append(config)
 
-            normal_tools: List[Tool] = []
+            normal_tools: list[Tool] = []
             if normal_configs:
-                connections: Dict[str, Any] = {}
-                configs_by_name: Dict[str, Dict[str, Any]] = {}
+                connections: dict[str, Any] = {}
+                configs_by_name: dict[str, dict[str, Any]] = {}
                 try:
                     # Convert configs to connection format
                     for config in normal_configs:
@@ -845,9 +838,9 @@ class ToolFactory:
             shared_env_overrides = load_shared_env_overrides(db, user_id)
             env_source_overrides = load_user_env_sources(db, user_id)
 
-            connections: Dict[str, Any] = {}
-            configs_by_name: Dict[str, Dict[str, Any]] = {}
-            unavailable_tools: List[Tool] = []
+            connections: dict[str, Any] = {}
+            configs_by_name: dict[str, dict[str, Any]] = {}
+            unavailable_tools: list[Tool] = []
             for server in query.all():
                 if isinstance(server, tuple):
                     server = server[0]

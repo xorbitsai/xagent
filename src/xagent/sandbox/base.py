@@ -118,6 +118,11 @@ class ExecResult(BaseModel):
 
     stderr: str = Field(description="Standard error output")
 
+    truncated: bool = Field(
+        default=False,
+        description="True if output was capped at max_output_bytes and cut short",
+    )
+
     error_message: Optional[str] = Field(default=None, description="Error message")
 
     @property
@@ -178,6 +183,7 @@ class Sandbox(abc.ABC):
         command: str,
         *args: str,
         env: Optional[dict[str, str]] = None,
+        max_output_bytes: Optional[int] = None,
     ) -> ExecResult:
         """Execute a shell command in the sandbox.
 
@@ -185,6 +191,10 @@ class Sandbox(abc.ABC):
             command: Shell command to execute.
             args: Command arguments.
             env: Additional environment variables (merged with existing).
+            max_output_bytes: When set, cap each of stdout/stderr at this many
+                bytes, reading no more once the cap is hit (so a flood of output
+                can't grow the host client unbounded). Sets ``truncated`` on the
+                result. ``None`` (default) keeps the unbounded one-shot read.
 
         Returns:
             ExecResult: Execution result with exit code, stdout, and stderr.

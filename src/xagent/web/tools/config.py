@@ -357,6 +357,32 @@ def _oauth_launch_config_command(launch_config: Mapping[str, Any]) -> str:
     raise _OAuthLaunchConfigInvalid(field="command")
 
 
+def _oauth_launch_config_static_env(
+    launch_config: Mapping[str, Any],
+) -> Mapping[str, str]:
+    """Server-only static secrets forwarded verbatim from the host process env.
+
+    Unlike env_mapping (per-user OAuth token values), these are platform-wide
+    values read from this process's own environment at transport-config build
+    time — e.g. a shared API developer token that isn't tied to any one user's
+    OAuth grant.
+
+    A static_env entry can name *any* host env var to forward, so this is
+    only safe as long as launch_config is written exclusively by migrations,
+    the builtin registry, and admin-gated API routes — never by an
+    end-user-writable path.
+    """
+    static_env = launch_config.get("static_env")
+    if static_env is None:
+        return {}
+    if isinstance(static_env, Mapping):
+        return static_env
+    logger.warning(
+        "Ignoring OAuth MCP launch config static_env because static_env must be a mapping"
+    )
+    return {}
+
+
 def _oauth_launch_config_env_mapping(
     launch_config: Mapping[str, Any],
 ) -> Mapping[str, Any]:
@@ -2489,6 +2515,13 @@ class WebToolConfig(BaseToolConfig):
             ).items():
                 if token_type == "access_token":
                     env[env_key] = access_token
+
+            for env_key, host_env_var in _oauth_launch_config_static_env(
+                launch_config
+            ).items():
+                value = os.environ.get(str(host_env_var))
+                if value is not None:
+                    env[env_key] = str(value)
 
             env.update(
                 {

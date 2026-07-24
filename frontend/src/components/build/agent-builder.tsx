@@ -1196,9 +1196,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if (ownership !== originalOwnership) return true
     if (ownership === "team" && visibility !== (originalData.visibility === "admins" ? "admins" : "team")) return true
 
-    // Compare logo
+    // Compare logo. logoRemoved only counts as a change if the agent actually
+    // had a logo to remove - e.g. upload-then-remove on a logo-less agent is a net no-op.
     if (logoFile) return true
-    if (logoRemoved) return true
+    if (logoRemoved && originalData.logo_url) return true
 
     // Compare arrays
     if (normalizePrompts(suggestedPrompts) !== normalizePrompts(originalData.suggested_prompts)) return true

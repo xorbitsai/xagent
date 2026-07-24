@@ -242,6 +242,29 @@ def mock_workspace_db():
         yield
 
 
+@pytest.fixture(autouse=True, scope="function")
+def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient proxy env vars so tests are deterministic across hosts.
+
+    A developer machine or CI runner may have ``HTTP_PROXY``/``HTTPS_PROXY``
+    (either casing) set in its real environment for its own outbound traffic.
+    Since ``get_trusted_proxy_url()`` now raises unless
+    ``XAGENT_TRUSTED_EGRESS_PROXY`` is also set, an inherited proxy var would
+    make otherwise-unrelated tests (webpage fetch, SVG/image download, vision
+    tool) fail at that trust gate before ever reaching their mocked request.
+    Tests that specifically exercise proxy behavior should opt back in with
+    ``monkeypatch.setenv(...)`` for the exact vars they need.
+    """
+    for name in (
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "XAGENT_TRUSTED_EGRESS_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def temp_tool_dir():
     """Create a temporary directory with a single sample tool file.

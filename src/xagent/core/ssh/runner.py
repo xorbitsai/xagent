@@ -156,12 +156,13 @@ class AsyncsshRunner:
                 cause=exc,
             ) from exc
         except (asyncssh.Error, OSError, TimeoutError) as exc:
-            # PermissionDenied, ConnectionLost, connection-refused (OSError),
-            # connect/login-timeout (TimeoutError), etc. are all siblings that
-            # otherwise escape raw — skipping the executor's failure audit and
-            # the tool wrapper. Map them to one stable code so both runners fail
-            # identically. (SshError from _authorize_peer is none of these, so
-            # it propagates.)
+            # PermissionDenied, ConnectionLost (asyncssh raises this on
+            # connect_timeout/login_timeout expiry too), connection-refused
+            # (OSError), etc. all otherwise escape raw — skipping the executor's
+            # failure audit and the tool wrapper. Map them to one stable code so
+            # both runners fail identically. TimeoutError is kept only as a
+            # defensive backstop. (SshError from _authorize_peer is none of
+            # these, so it propagates.)
             raise SshError(
                 SshErrorCode.CONNECTION_FAILED,
                 "ssh connection failed",

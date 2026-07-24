@@ -131,10 +131,13 @@ def check_ip(ip: str, config: EgressPolicyConfig) -> EgressDecision:
         return EgressDecision(False, "loopback address denied")
     if config.deny_link_local and addr.is_link_local:
         return EgressDecision(False, "link-local address denied")
-    if config.deny_private and (addr.is_private or addr.is_multicast):
-        # Multicast (e.g. 224.0.0.0/4) is neither private nor a valid SSH peer,
-        # but without this it falls through to default_allow_public (m6).
-        return EgressDecision(False, "private or multicast address denied")
+    if config.deny_private and addr.is_private:
+        return EgressDecision(False, "private address denied")
+    # Multicast (e.g. 224.0.0.0/4) is never a valid unicast SSH peer, so deny it
+    # unconditionally — independent of deny_private, which is orthogonal: a
+    # deny_private=False deployment must still not connect to multicast (m6).
+    if addr.is_multicast:
+        return EgressDecision(False, "multicast address denied")
     if _in_any(addr, config._denied_networks):
         return EgressDecision(False, "denied by reserved cidr")
 

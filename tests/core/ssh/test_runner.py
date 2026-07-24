@@ -122,6 +122,68 @@ async def test_execute_times_out() -> None:
         await server.close()
 
 
+async def test_connect_passes_timeout_kwargs(monkeypatch) -> None:
+    # The connect/handshake phase must be time-bounded, not just the post-connect
+    # work, so connect_timeout/login_timeout must reach asyncssh.connect (M1).
+    import asyncssh
+
+    captured: dict[str, object] = {}
+    real_connect = asyncssh.connect
+
+    def spy_connect(*args, **kwargs):
+        captured.update(kwargs)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(asyncssh, "connect", spy_connect)
+    server = await start_test_ssh_server()
+    try:
+        async with _materialized(server) as (key_path, known_hosts_path):
+            await AsyncsshRunner().execute(
+                hostname=server.host,
+                port=server.port,
+                username="deploy",
+                private_key_path=key_path,
+                known_hosts_path=known_hosts_path,
+                command="uptime",
+                timeout_seconds=7,
+                egress_config=_ALLOW_LOOPBACK,
+                max_output_bytes=1 << 20,
+            )
+        assert captured.get("connect_timeout") == 7
+        assert captured.get("login_timeout") == 7
+    finally:
+        await server.close()
+
+
+async def test_connect_failure_maps_to_connection_failed(monkeypatch) -> None:
+    # A stalled/failed handshake (here a connect timeout) must map to the stable
+    # CONNECTION_FAILED code, not escape raw (M1).
+    import asyncssh
+
+    def boom(*args, **kwargs):
+        raise TimeoutError("connect timed out")
+
+    monkeypatch.setattr(asyncssh, "connect", boom)
+    server = await start_test_ssh_server()
+    try:
+        async with _materialized(server) as (key_path, known_hosts_path):
+            with pytest.raises(SshError) as exc:
+                await AsyncsshRunner().execute(
+                    hostname=server.host,
+                    port=server.port,
+                    username="deploy",
+                    private_key_path=key_path,
+                    known_hosts_path=known_hosts_path,
+                    command="uptime",
+                    timeout_seconds=1,
+                    egress_config=_ALLOW_LOOPBACK,
+                    max_output_bytes=1 << 20,
+                )
+        assert exc.value.code == SshErrorCode.CONNECTION_FAILED
+    finally:
+        await server.close()
+
+
 async def test_upload_transfers_local_file_to_remote(tmp_path) -> None:
     server = await start_test_ssh_server()
     local = tmp_path / "local.txt"

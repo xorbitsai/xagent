@@ -17,8 +17,13 @@ def test_link_local_denied() -> None:
 
 
 def test_multicast_denied() -> None:
-    # Multicast used to fall through to default_allow_public (m6).
+    # Multicast used to fall through to default_allow_public (m6); it's denied
+    # unconditionally — even when deny_private is off, since the two are
+    # orthogonal.
     assert check_ip("224.0.0.1", EgressPolicyConfig()).allowed is False
+    assert (
+        check_ip("224.0.0.1", EgressPolicyConfig(deny_private=False)).allowed is False
+    )
 
 
 def test_cloud_metadata_denied_even_if_link_local_check_disabled() -> None:

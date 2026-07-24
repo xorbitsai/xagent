@@ -4,6 +4,7 @@ from xagent.core.file_ref import (
     build_file_id_ref,
     build_file_ref,
     parse_file_id_ref,
+    sanitize_file_ref_for_context,
 )
 
 
@@ -46,6 +47,22 @@ def test_build_file_ref_uses_canonical_file_id_ref() -> None:
     result = build_file_ref(file_id="file-id", filename="report.txt")
 
     assert result["markdown_link"] == "[report.txt](file:file-id)"
+
+
+def test_context_file_ref_removes_host_paths() -> None:
+    result = sanitize_file_ref_for_context(
+        {
+            "file_id": "image-id",
+            "filename": "../frame.png",
+            "mime_type": "image/png",
+            "file_path": "/private/workspace/frame.png",
+            "relative_path": "/private/workspace/frame.png",
+        }
+    )
+
+    assert result["filename"] == "frame.png"
+    assert "file_path" not in result
+    assert "relative_path" not in result
 
 
 @pytest.mark.parametrize(

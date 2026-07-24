@@ -4,6 +4,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from ...context_ref import (
+    CONTEXT_REFS_KEY,
+    ContextReference,
+    normalize_context_references,
+)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -21,6 +27,14 @@ class Message:
     tool_call_id: str | None = None
     hidden: bool = False
     output_tokens: int | None = None
+    context_refs: tuple[ContextReference, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "context_refs",
+            normalize_context_references(self.context_refs),
+        )
 
     @classmethod
     def role_system(cls, content: str, **kwargs: Any) -> "Message":
@@ -46,6 +60,10 @@ class Message:
             result["tool_call_id"] = self.tool_call_id
         if self.hidden:
             result["hidden"] = True
+        if self.context_refs:
+            result[CONTEXT_REFS_KEY] = [
+                reference.durable_dict() for reference in self.context_refs
+            ]
         return result
 
     def __hash__(self) -> int:
@@ -62,7 +80,22 @@ class Message:
             for tool_call in self.tool_calls or []
             if isinstance(tool_call, dict)
         )
-        return (self.role, self.content, tool_call_ids, self.tool_call_id)
+        context_ref_keys = tuple(
+            reference.identity_key() for reference in self.context_refs
+        )
+        return (
+            self.role,
+            self.content,
+            tool_call_ids,
+            self.tool_call_id,
+            context_ref_keys,
+        )
+
+    def context_refs_text(self) -> str:
+        return "\n".join(reference.compact_text() for reference in self.context_refs)
+
+    def context_refs_token_estimate(self) -> int:
+        return sum(reference.estimated_tokens() for reference in self.context_refs)
 
 
 @dataclass

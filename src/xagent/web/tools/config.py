@@ -366,6 +366,11 @@ def _oauth_launch_config_static_env(
     values read from this process's own environment at transport-config build
     time — e.g. a shared API developer token that isn't tied to any one user's
     OAuth grant.
+
+    A static_env entry can name *any* host env var to forward, so this is
+    only safe as long as launch_config is written exclusively by migrations,
+    the builtin registry, and admin-gated API routes — never by an
+    end-user-writable path.
     """
     static_env = launch_config.get("static_env")
     if static_env is None:

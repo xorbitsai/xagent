@@ -20,7 +20,7 @@ mcp = FastMCP("google-ads-mcp")
 GOOGLE_ADS_BASE_URL = "https://googleads.googleapis.com/v23"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-_CUSTOMER_ID_PATTERN = re.compile(r"^[0-9-]+\Z")
+_CUSTOMER_ID_PATTERN = re.compile(r"^[0-9][0-9-]*\Z")
 
 
 def _success(**payload: Any) -> str:
@@ -32,12 +32,16 @@ def _error(message: str) -> str:
 
 
 def _normalize_customer_id(customer_id: str, *, field_name: str) -> str:
-    """Validate a customer id is digits/dashes only, then strip the dashes.
+    """Validate a customer id is digits/dashes (starting with a digit), then
+    strip the dashes.
 
     Rejects anything else (rather than silently sanitizing it) since this
     value is interpolated directly into an HTTP header and a URL path —
     a malformed value could otherwise inject headers or redirect the request
-    to an unintended API path.
+    to an unintended API path. Requiring a leading digit also rules out an
+    all-dash input (e.g. "---"), which would otherwise strip down to an
+    empty string and silently produce a malformed header/URL instead of
+    failing validation.
     """
     if not _CUSTOMER_ID_PATTERN.match(str(customer_id)):
         raise ValueError(f"{field_name} must contain only digits and dashes")

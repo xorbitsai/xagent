@@ -63,6 +63,12 @@ def test_headers_reject_login_customer_id_with_invalid_characters():
         google_ads._headers(login_customer_id="1234567890\n")
 
 
+def test_headers_reject_all_dash_login_customer_id():
+    """An all-dash value would otherwise strip to "" and send an empty header."""
+    with pytest.raises(ValueError, match="login_customer_id"):
+        google_ads._headers(login_customer_id="---")
+
+
 def test_request_wraps_http_error_with_response_body(monkeypatch):
     monkeypatch.setattr(
         google_ads.requests,
@@ -223,6 +229,18 @@ def test_google_ads_search_rejects_customer_id_with_invalid_characters(monkeypat
     result = json.loads(
         google_ads.google_ads_search("111/../other", "SELECT campaign.id")
     )
+
+    assert result["status"] == "error"
+    assert "customer_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_google_ads_search_rejects_all_dash_customer_id(monkeypatch):
+    """An all-dash value would otherwise strip to "" and hit /customers//... ."""
+    mock_request = Mock()
+    monkeypatch.setattr(google_ads.requests, "request", mock_request)
+
+    result = json.loads(google_ads.google_ads_search("---", "SELECT campaign.id"))
 
     assert result["status"] == "error"
     assert "customer_id" in result["message"]

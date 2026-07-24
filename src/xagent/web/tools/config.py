@@ -2514,9 +2514,9 @@ class WebToolConfig(BaseToolConfig):
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config
             ).items():
-                value = os.environ.get(str(host_env_var), "")
-                if value:
-                    env[env_key] = value
+                value = os.environ.get(str(host_env_var))
+                if value is not None:
+                    env[env_key] = str(value)
 
             env.update(
                 {

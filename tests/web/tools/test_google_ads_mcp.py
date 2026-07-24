@@ -59,6 +59,8 @@ def test_headers_include_normalized_login_customer_id():
 def test_headers_reject_login_customer_id_with_invalid_characters():
     with pytest.raises(ValueError, match="login_customer_id"):
         google_ads._headers(login_customer_id="1234567890\r\nX-Injected: 1")
+    with pytest.raises(ValueError, match="login_customer_id"):
+        google_ads._headers(login_customer_id="1234567890\n")
 
 
 def test_request_wraps_http_error_with_response_body(monkeypatch):

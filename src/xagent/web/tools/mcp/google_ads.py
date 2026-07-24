@@ -20,7 +20,7 @@ mcp = FastMCP("google-ads-mcp")
 GOOGLE_ADS_BASE_URL = "https://googleads.googleapis.com/v23"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-_CUSTOMER_ID_PATTERN = re.compile(r"^[0-9-]+$")
+_CUSTOMER_ID_PATTERN = re.compile(r"^[0-9-]+\Z")
 
 
 def _success(**payload: Any) -> str:

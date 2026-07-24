@@ -249,7 +249,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                         element_id=f"dom-{index}",
                         source=ComputerElementSource.DOM,
                         bounds=payload["bounds"],
-                        label=payload.get("label"),
+                        label="Sensitive input" if sensitive else payload.get("label"),
                         role=payload.get("role"),
                         text=None if sensitive else payload.get("text"),
                         metadata={

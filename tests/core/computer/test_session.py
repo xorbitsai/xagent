@@ -61,3 +61,18 @@ def test_persistent_binding_requires_task_owner(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="owning task"):
         binding.manager_owner_id()
+
+
+def test_extension_binding_requires_authenticated_user_and_owner() -> None:
+    binding = ComputerSessionBinding.from_values(
+        runtime_kind="extension_relay",
+        owner_task_id="task-1",
+        user_id=4,
+        profile_id="default",
+        profile_root=None,
+    )
+
+    assert binding.is_extension_relay is True
+    assert binding.is_user_controlled is True
+    assert binding.require_user_id() == 4
+    assert binding.require_owner_task_id() == "task-1"

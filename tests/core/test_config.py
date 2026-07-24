@@ -1038,6 +1038,8 @@ class TestBrowserProfileConfig:
             ("persistent", "persistent_playwright"),
             ("persistent_playwright", "persistent_playwright"),
             ("managed", "ephemeral_playwright"),
+            ("extension", "extension_relay"),
+            ("extension_relay", "extension_relay"),
         ],
     )
     def test_runtime_aliases(self, monkeypatch, value, expected):
@@ -1045,7 +1047,7 @@ class TestBrowserProfileConfig:
         assert get_browser_runtime_kind() == expected
 
     def test_invalid_runtime_falls_back(self, monkeypatch):
-        monkeypatch.setenv(BROWSER_RUNTIME_KIND, "extension")
+        monkeypatch.setenv(BROWSER_RUNTIME_KIND, "not-a-runtime")
         assert get_browser_runtime_kind() == "ephemeral_playwright"
 
     def test_profile_root_defaults_under_storage(self, monkeypatch, tmp_path):

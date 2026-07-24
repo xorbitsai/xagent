@@ -7,6 +7,7 @@ import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.computer.environment import ComputerEnvironment
+from xagent.core.computer.extension import ExtensionComputerEnvironment
 from xagent.core.computer.schema import (
     ComputerAction,
     ComputerActionBatch,
@@ -219,6 +220,34 @@ def test_persistent_computer_tool_requires_authenticated_user(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="authenticated user_id"):
         tool._session_binding("task-1").persistent_profile_dir()
+
+
+def test_extension_computer_tool_selects_relay_environment() -> None:
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        browser_runtime_kind="extension_relay",
+        user_id=9,
+    )
+
+    assert tool._environment_factory is ExtensionComputerEnvironment
+    assert "explicitly approved" in tool.description
+    assert tool._session_binding("ignored").require_user_id() == 9
+
+
+@pytest.mark.asyncio
+async def test_extension_computer_tool_reports_missing_authenticated_user() -> None:
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        browser_runtime_kind="extension_relay",
+    )
+
+    result = await tool.run_json_async({})
+
+    assert result["success"] is False
+    assert "authenticated user_id" in result["error"]
+    assert tool._environments == {}
 
 
 class VisionToolCallingLLM:

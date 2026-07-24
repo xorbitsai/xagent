@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Xagent Browser Relay</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Xagent Browser Relay</h1>
+          <p>Only the tab you approve can be controlled.</p>
+        </div>
+        <span id="status-badge" class="badge">Offline</span>
+      </header>
+
+      <section>
+        <label for="relay-url">Relay WebSocket URL</label>
+        <input
+          id="relay-url"
+          type="url"
+          spellcheck="false"
+          placeholder="ws://localhost:8000/ws/browser-relay"
+        />
+
+        <label for="pairing-token">One-time pairing token</label>
+        <input
+          id="pairing-token"
+          type="password"
+          autocomplete="off"
+          placeholder="Paste the token from Xagent Settings"
+        />
+
+        <button id="connect" class="primary">Connect relay</button>
+        <button id="disconnect" class="quiet">Forget relay session</button>
+      </section>
+
+      <section class="tab-section">
+        <div id="tab-status" class="tab-status">No tab approved</div>
+        <button id="attach" class="primary">Approve current tab</button>
+        <button id="detach" class="quiet">Stop controlling tab</button>
+      </section>
+
+      <p id="error" class="error" role="alert"></p>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

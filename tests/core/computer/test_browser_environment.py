@@ -208,7 +208,7 @@ async def test_browser_observation_redacts_sensitive_input_values(
                 "width": 0.2,
                 "height": 0.1,
             },
-            "label": "Password",
+            "label": "Password label secret",
             "role": "input",
             "text": "plain-text-secret",
             "metadata": {
@@ -223,9 +223,11 @@ async def test_browser_observation_redacts_sensitive_input_values(
     observation = await environment.observe()
 
     assert observation.elements[0].text is None
+    assert observation.elements[0].label == "Sensitive input"
     assert observation.elements[0].metadata["sensitive"] is True
     assert "plain-text-secret" not in observation.model_dump_json()
     assert "metadata-secret" not in observation.model_dump_json()
+    assert "Password label secret" not in observation.model_dump_json()
 
 
 @pytest.mark.asyncio

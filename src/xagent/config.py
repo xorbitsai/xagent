@@ -1220,7 +1220,7 @@ def get_storage_root() -> Path:
 
 
 def get_browser_runtime_kind() -> Literal[
-    "ephemeral_playwright", "persistent_playwright"
+    "ephemeral_playwright", "persistent_playwright", "extension_relay"
 ]:
     """Get the browser runtime used by the unified computer tool.
 
@@ -1233,8 +1233,12 @@ def get_browser_runtime_kind() -> Literal[
         "ephemeral": "ephemeral_playwright",
         "managed": "ephemeral_playwright",
         "persistent": "persistent_playwright",
+        "extension": "extension_relay",
+        "relay": "extension_relay",
     }
     value = aliases.get(value, value)
+    if value == "extension_relay":
+        return "extension_relay"
     if value == "persistent_playwright":
         return "persistent_playwright"
     if value == "ephemeral_playwright":

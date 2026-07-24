@@ -10,6 +10,7 @@ class BrowserRuntimeKind(str, Enum):
 
     EPHEMERAL_PLAYWRIGHT = "ephemeral_playwright"
     PERSISTENT_PLAYWRIGHT = "persistent_playwright"
+    EXTENSION_RELAY = "extension_relay"
 
 
 def validate_browser_profile_id(profile_id: str) -> str:
@@ -41,6 +42,14 @@ class ComputerSessionBinding:
     @property
     def is_persistent(self) -> bool:
         return self.runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT
+
+    @property
+    def is_extension_relay(self) -> bool:
+        return self.runtime_kind is BrowserRuntimeKind.EXTENSION_RELAY
+
+    @property
+    def is_user_controlled(self) -> bool:
+        return self.is_persistent or self.is_extension_relay
 
     @classmethod
     def from_values(
@@ -92,9 +101,19 @@ class ComputerSessionBinding:
     def manager_owner_id(self) -> str | None:
         if not self.is_persistent:
             return None
+        return self.require_owner_task_id()
+
+    def require_user_id(self) -> int:
+        if self.user_id is None or self.user_id <= 0:
+            raise ValueError(
+                f"{self.runtime_kind.value} requires an authenticated user_id"
+            )
+        return self.user_id
+
+    def require_owner_task_id(self) -> str:
         owner = str(self.owner_task_id or "").strip()
         if not owner:
             raise ValueError(
-                "persistent browser profiles require an owning task execution"
+                f"{self.runtime_kind.value} requires an owning task execution"
             )
         return owner

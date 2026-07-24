@@ -237,6 +237,7 @@ examples/*.html
 !AGENTS.md
 !CLAUDE.md
 !CHANGELOG.md
+!browser-extension/README.md
 # But keep skills markdown files and test markdown files
 !src/xagent/skills/**/*.md
 !tests/resources/test_files/*.md

@@ -14,6 +14,7 @@ from ....computer.environment import (
     ComputerSessionMismatchError,
     ComputerTargetNotFoundError,
 )
+from ....computer.extension import ExtensionComputerEnvironment
 from ....computer.schema import (
     ComputerAction,
     ComputerActionBatch,
@@ -80,7 +81,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         *,
         task_id: str | None = None,
         workspace: TaskWorkspace | None = None,
-        environment_factory: ComputerEnvironmentFactory = BrowserComputerEnvironment,
+        environment_factory: ComputerEnvironmentFactory | None = None,
         headless: bool = True,
         browser_runtime_kind: BrowserRuntimeKind | str = (
             BrowserRuntimeKind.EPHEMERAL_PLAYWRIGHT
@@ -92,9 +93,13 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
         self._workspace = workspace
-        self._environment_factory = environment_factory
         self._headless = headless
         self._browser_runtime_kind = BrowserRuntimeKind(browser_runtime_kind)
+        self._environment_factory = environment_factory or (
+            ExtensionComputerEnvironment
+            if self._browser_runtime_kind is BrowserRuntimeKind.EXTENSION_RELAY
+            else BrowserComputerEnvironment
+        )
         self._user_id = user_id
         self._browser_profile_id = browser_profile_id
         self._browser_profile_root = browser_profile_root
@@ -130,6 +135,16 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         complete the step, wait for their response, then request a fresh
         screenshot before continuing.
         """
+        elif self._browser_runtime_kind is BrowserRuntimeKind.EXTENSION_RELAY:
+            description += """
+
+        This task controls only the browser tab that the user explicitly approved
+        through the Xagent Chrome extension. If the extension is disconnected,
+        no tab is attached, or login/CAPTCHA/passkey/two-factor authentication
+        needs the user, do not ask for credentials. Ask the user to connect the
+        extension or take control of that tab, wait for their response, then
+        request a fresh screenshot before continuing.
+        """
         return description
 
     @property
@@ -147,9 +162,9 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> dict[str, Any]:
         prepared_args = self._with_default_session(args)
-        if self._browser_runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT:
-            # Persistent profiles are an authenticated task resource, not a
-            # model-selected browser namespace.
+        if self._browser_runtime_kind is not BrowserRuntimeKind.EPHEMERAL_PLAYWRIGHT:
+            # User-controlled browsers are authenticated task resources, not
+            # model-selected browser namespaces.
             prepared_args["session_id"] = self._default_session_id()
         parsed = ComputerToolArgs.model_validate(prepared_args)
         session_id = str(parsed.session_id or "").strip()
@@ -165,19 +180,20 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             )
 
         environment = self._environments.get(session_id)
-        if environment is None:
-            environment = self._environment_factory(
-                session_id=session_id,
-                workspace=self._workspace,
-                headless=self._headless,
-                session_binding=self._session_binding(session_id),
-            )
-            self._environments[session_id] = environment
-
-        screenshot_only = all(
-            action.type == ComputerActionType.SCREENSHOT for action in parsed.actions
-        )
         try:
+            if environment is None:
+                environment = self._environment_factory(
+                    session_id=session_id,
+                    workspace=self._workspace,
+                    headless=self._headless,
+                    session_binding=self._session_binding(session_id),
+                )
+                self._environments[session_id] = environment
+
+            screenshot_only = all(
+                action.type == ComputerActionType.SCREENSHOT
+                for action in parsed.actions
+            )
             if environment.current_observation is None:
                 if not screenshot_only:
                     return self._error_result(
@@ -215,14 +231,14 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             RuntimeError,
             ValueError,
         ) as exc:
-            current = environment.current_observation
+            current = environment.current_observation if environment else None
             return self._error_result(
                 session_id=session_id,
                 frame_id=current.frame_id if current else None,
                 error=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - provider errors become tool failures.
-            current = environment.current_observation
+            current = environment.current_observation if environment else None
             return self._error_result(
                 session_id=session_id,
                 frame_id=current.frame_id if current else None,
@@ -248,10 +264,10 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         task_id: str | None = None,
         execution_status: str | None = None,
     ) -> None:
-        preserve_for_user = (
-            self._browser_runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT
-            and execution_status in {"interrupted", "waiting_for_user"}
-        )
+        preserve_for_user = self._browser_runtime_kind in {
+            BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT,
+            BrowserRuntimeKind.EXTENSION_RELAY,
+        } and execution_status in {"interrupted", "waiting_for_user"}
         environments = list(self._environments.values())
         self._environments.clear()
         if not preserve_for_user:

@@ -31,6 +31,7 @@ from .api.admin_users import router as admin_users_router
 from .api.agent_api_keys import router as agent_api_keys_router
 from .api.agents import router as agents_router
 from .api.auth import auth_router
+from .api.browser_relay import browser_relay_router
 from .api.channel import router as channel_router
 from .api.chat import chat_router
 from .api.cloud_storage import cloud_router
@@ -620,6 +621,7 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 
 # API routers
 app.include_router(auth_router)
+app.include_router(browser_relay_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
 app.include_router(conversation_logs_router)

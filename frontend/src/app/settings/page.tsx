@@ -17,6 +17,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
 import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
+import { BrowserRelaySettings } from "@/components/settings/browser-relay"
 
 export default function SettingsPage() {
   const { user } = useAuth()
@@ -103,6 +104,8 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
+
+        <BrowserRelaySettings />
 
         {/* Password Change Section */}
         <Card>

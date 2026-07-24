@@ -6,11 +6,23 @@ from .environment import (
     ComputerSessionMismatchError,
     ComputerTargetNotFoundError,
 )
+from .extension import ExtensionComputerEnvironment
 from .policy import (
     ComputerActionPolicy,
     ComputerPolicyDecision,
     ComputerPolicyOutcome,
     ComputerRiskLevel,
+)
+from .relay import (
+    BROWSER_RELAY_PROTOCOL_VERSION,
+    BrowserRelayAuthenticationError,
+    BrowserRelayConnection,
+    BrowserRelayError,
+    BrowserRelayInUseError,
+    BrowserRelayProtocolError,
+    BrowserRelayRegistry,
+    BrowserRelayUnavailableError,
+    get_browser_relay_registry,
 )
 from .schema import (
     ComputerAction,
@@ -34,6 +46,14 @@ from .store import ObservationStore
 
 __all__ = [
     "BrowserRuntimeKind",
+    "BROWSER_RELAY_PROTOCOL_VERSION",
+    "BrowserRelayAuthenticationError",
+    "BrowserRelayConnection",
+    "BrowserRelayError",
+    "BrowserRelayInUseError",
+    "BrowserRelayProtocolError",
+    "BrowserRelayRegistry",
+    "BrowserRelayUnavailableError",
     "ComputerAction",
     "ComputerActionBatch",
     "ComputerActionPolicy",
@@ -51,9 +71,11 @@ __all__ = [
     "ComputerSessionBinding",
     "ComputerTarget",
     "ComputerTargetNotFoundError",
+    "ExtensionComputerEnvironment",
     "NormalizedPoint",
     "NormalizedRect",
     "ObservationStore",
     "Viewport",
+    "get_browser_relay_registry",
     "validate_browser_profile_id",
 ]

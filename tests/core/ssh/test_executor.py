@@ -343,6 +343,18 @@ async def test_execute_timeout_clamped_to_max() -> None:
         await server.close()
 
 
+def test_cap_outputs_reserves_stderr_slice() -> None:
+    # A large stdout must not zero out stderr entirely (N3) — diagnostics on a
+    # failing command matter more than the tail of stdout.
+    from xagent.core.ssh.executor import _cap_outputs
+
+    budget = 1 << 20
+    out, err, truncated = _cap_outputs("o" * (2 * budget), "e" * 1000, budget)
+    assert truncated is True
+    assert len(err.encode("utf-8")) == 1000  # stderr preserved, not dropped
+    assert len(out.encode("utf-8")) <= budget - 1000
+
+
 def test_constrain_remote_path_rejects_injection_chars() -> None:
     # A quote or newline in remote_path could break out of the sandbox runner's
     # sftp batch file and inject a second transfer command (#1). The shared

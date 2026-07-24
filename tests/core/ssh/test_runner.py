@@ -139,6 +139,7 @@ async def test_upload_transfers_local_file_to_remote(tmp_path) -> None:
                 remote_path=str(remote),
                 overwrite=False,
                 egress_config=_ALLOW_LOOPBACK,
+                timeout_seconds=30,
             )
         assert remote.read_text() == "payload-up"
     finally:
@@ -162,6 +163,7 @@ async def test_download_transfers_remote_file_to_local(tmp_path) -> None:
                 local_path=str(local),
                 overwrite=False,
                 egress_config=_ALLOW_LOOPBACK,
+                timeout_seconds=30,
             )
         assert local.read_text() == "payload-down"
     finally:
@@ -187,6 +189,7 @@ async def test_upload_refuses_existing_remote_without_overwrite(tmp_path) -> Non
                     remote_path=str(remote),
                     overwrite=False,
                     egress_config=_ALLOW_LOOPBACK,
+                    timeout_seconds=30,
                 )
         assert exc.value.code == SshErrorCode.OPERATION_NOT_ALLOWED
         assert remote.read_text() == "existing"  # unchanged
@@ -241,5 +244,32 @@ async def test_execute_caps_large_output() -> None:
             )
         assert result.truncated is True
         assert len(result.stdout.encode("utf-8")) == 5
+    finally:
+        await server.close()
+
+
+async def test_transfer_times_out(tmp_path) -> None:
+    # A stalled in-process transfer must be bounded like execute(), not hang the
+    # worker forever (N1). A zero timeout forces the wait_for to expire.
+    server = await start_test_ssh_server()
+    local = tmp_path / "local.txt"
+    local.write_text("x")
+    remote = tmp_path / "remote.txt"
+    try:
+        async with _materialized(server) as (key_path, known_hosts_path):
+            with pytest.raises(SshError) as exc:
+                await AsyncsshRunner().upload(
+                    hostname=server.host,
+                    port=server.port,
+                    username="deploy",
+                    private_key_path=key_path,
+                    known_hosts_path=known_hosts_path,
+                    local_path=str(local),
+                    remote_path=str(remote),
+                    overwrite=True,
+                    egress_config=_ALLOW_LOOPBACK,
+                    timeout_seconds=0,
+                )
+        assert exc.value.code == SshErrorCode.COMMAND_TIMEOUT
     finally:
         await server.close()

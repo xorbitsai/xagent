@@ -299,3 +299,17 @@ async def test_staging_removed_after_transfer() -> None:
         **_xfer_kwargs(sandbox=sandbox, local_path="/host/a", remote_path="/srv/a.txt")
     )
     assert any(c[0] == "rm" for c in sandbox.execs)
+
+
+async def test_transfer_threads_timeout_into_exec() -> None:
+    # The transfer's ssh/sftp invocations are clamped with `timeout <n>` (N1).
+    sandbox = _XferSandbox()
+    await SandboxSshRunner().upload(
+        **_xfer_kwargs(
+            sandbox=sandbox,
+            local_path="/host/a",
+            remote_path="/srv/a.txt",
+            timeout_seconds=99,
+        )
+    )
+    assert any(c[0] == "timeout" and c[1] == "99" for c in sandbox.execs)

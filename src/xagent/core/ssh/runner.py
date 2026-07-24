@@ -76,6 +76,7 @@ class SshRunner(Protocol):
         remote_path: str,
         overwrite: bool,
         egress_config: EgressPolicyConfig,
+        timeout_seconds: int,
     ) -> None: ...
 
     async def download(
@@ -92,6 +93,7 @@ class SshRunner(Protocol):
         local_path: str,
         overwrite: bool,
         egress_config: EgressPolicyConfig,
+        timeout_seconds: int,
     ) -> None: ...
 
 
@@ -215,6 +217,7 @@ class AsyncsshRunner:
         remote_path: str,
         overwrite: bool,
         egress_config: EgressPolicyConfig,
+        timeout_seconds: int,
     ) -> None:
         async with (
             self._connect(
@@ -227,12 +230,24 @@ class AsyncsshRunner:
             ) as conn,
             conn.start_sftp_client() as sftp,
         ):
-            if not overwrite and await sftp.exists(remote_path):
-                raise SshError(
-                    SshErrorCode.OPERATION_NOT_ALLOWED,
-                    "remote destination already exists",
+            # Bound the transfer like execute() does — a stalled peer must not
+            # hang the worker indefinitely (the sandbox runner clamps with the
+            # `timeout` utility; the in-process path needs its own).
+            try:
+                if not overwrite and await asyncio.wait_for(
+                    sftp.exists(remote_path), timeout_seconds
+                ):
+                    raise SshError(
+                        SshErrorCode.OPERATION_NOT_ALLOWED,
+                        "remote destination already exists",
+                    )
+                await asyncio.wait_for(
+                    sftp.put(local_path, remote_path), timeout_seconds
                 )
-            await sftp.put(local_path, remote_path)
+            except TimeoutError as exc:
+                raise SshError(
+                    SshErrorCode.COMMAND_TIMEOUT, "transfer timed out", cause=exc
+                ) from exc
 
     async def download(
         self,
@@ -248,6 +263,7 @@ class AsyncsshRunner:
         local_path: str,
         overwrite: bool,
         egress_config: EgressPolicyConfig,
+        timeout_seconds: int,
     ) -> None:
         if not overwrite and os.path.exists(local_path):
             raise SshError(
@@ -264,7 +280,14 @@ class AsyncsshRunner:
             ) as conn,
             conn.start_sftp_client() as sftp,
         ):
-            await sftp.get(remote_path, local_path)
+            try:
+                await asyncio.wait_for(
+                    sftp.get(remote_path, local_path), timeout_seconds
+                )
+            except TimeoutError as exc:
+                raise SshError(
+                    SshErrorCode.COMMAND_TIMEOUT, "transfer timed out", cause=exc
+                ) from exc
 
 
 async def _run_capped(

@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_OUTPUT_BYTES = 1 << 20  # 1 MiB, combined stdout + stderr
 DEFAULT_MAX_TIMEOUT_SECONDS = 600
+DEFAULT_TRANSFER_TIMEOUT_SECONDS = 300  # per-SFTP-transfer wall-clock bound
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ class SshExecutor:
                     remote_path=remote_path,
                     overwrite=overwrite,
                     egress_config=self._egress_config,
+                    timeout_seconds=DEFAULT_TRANSFER_TIMEOUT_SECONDS,
                 )
         except BaseException as exc:
             await self._audit_failure(context, "ssh_upload", resolved, exc)
@@ -219,6 +221,7 @@ class SshExecutor:
                     local_path=local_path,
                     overwrite=overwrite,
                     egress_config=self._egress_config,
+                    timeout_seconds=DEFAULT_TRANSFER_TIMEOUT_SECONDS,
                 )
         except BaseException as exc:
             await self._audit_failure(context, "ssh_download", resolved, exc)
@@ -347,17 +350,21 @@ def _constrain_remote_path(remote_path: str, remote_root: str | None) -> None:
 
 def _cap_outputs(stdout: str, stderr: str, budget: int) -> tuple[str, str, bool]:
     """Cap combined stdout+stderr to ``budget`` bytes; flag if anything was cut.
-    Decodes with errors='ignore' so a byte-boundary cut can't raise."""
+    Decodes with errors='ignore' so a byte-boundary cut can't raise.
+
+    stderr gets a reserved floor of the budget so a large stdout can't zero it
+    out entirely — on a failing command the diagnostics matter more than the
+    tail of stdout. stderr then also takes whatever stdout leaves unused."""
     out_b = stdout.encode("utf-8")
     err_b = stderr.encode("utf-8")
     truncated = False
-    if len(out_b) > budget:
-        out_b = out_b[:budget]
-        err_b = b""
+    err_floor = min(len(err_b), budget // 4)
+    out_budget = budget - err_floor
+    if len(out_b) > out_budget:
+        out_b = out_b[:out_budget]
         truncated = True
-    else:
-        remaining = budget - len(out_b)
-        if len(err_b) > remaining:
-            err_b = err_b[:remaining]
-            truncated = True
+    err_budget = budget - len(out_b)
+    if len(err_b) > err_budget:
+        err_b = err_b[:err_budget]
+        truncated = True
     return out_b.decode("utf-8", "ignore"), err_b.decode("utf-8", "ignore"), truncated

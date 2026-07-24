@@ -24,8 +24,6 @@ class SshErrorCode(str, Enum):
     CONNECTION_FAILED = "ssh_connection_failed"
     COMMAND_TIMEOUT = "ssh_command_timeout"
     OUTPUT_LIMIT_EXCEEDED = "ssh_output_limit_exceeded"
-    TRANSFER_LIMIT_EXCEEDED = "ssh_transfer_limit_exceeded"
-    QUOTA_EXCEEDED = "ssh_quota_exceeded"
     SECRET_UNAVAILABLE = "ssh_secret_unavailable"
     SANDBOX_UNAVAILABLE = "ssh_sandbox_unavailable"
     CONCURRENT_UPDATE = "ssh_concurrent_update"

@@ -178,6 +178,7 @@ class SandboxSshRunner:
         remote_path: str,
         overwrite: bool,
         egress_config: object = None,
+        timeout_seconds: int = _TRANSFER_TIMEOUT_SECONDS,
     ) -> None:
         sb = cast(SandboxLike, sandbox)
         async with self._staging(sb) as stage:
@@ -193,6 +194,7 @@ class SandboxSshRunner:
                 private_key_path=private_key_path,
                 known_hosts_path=known_hosts_path,
                 remote_path=remote_path,
+                timeout_seconds=timeout_seconds,
             ):
                 raise SshError(
                     SshErrorCode.OPERATION_NOT_ALLOWED,
@@ -212,6 +214,7 @@ class SandboxSshRunner:
                 username=username,
                 private_key_path=private_key_path,
                 known_hosts_path=known_hosts_path,
+                timeout_seconds=timeout_seconds,
             )
 
     async def download(
@@ -228,6 +231,7 @@ class SandboxSshRunner:
         local_path: str,
         overwrite: bool,
         egress_config: object = None,
+        timeout_seconds: int = _TRANSFER_TIMEOUT_SECONDS,
     ) -> None:
         if not overwrite and os.path.exists(local_path):
             raise SshError(
@@ -247,6 +251,7 @@ class SandboxSshRunner:
                 username=username,
                 private_key_path=private_key_path,
                 known_hosts_path=known_hosts_path,
+                timeout_seconds=timeout_seconds,
             )
             # Sandbox → host task workspace.
             await sb.download_file(staged, local_path, overwrite=overwrite)
@@ -279,6 +284,7 @@ class SandboxSshRunner:
         private_key_path: str,
         known_hosts_path: str,
         remote_path: str,
+        timeout_seconds: int,
     ) -> bool:
         argv = _ssh_argv(
             hostname=hostname,
@@ -289,7 +295,7 @@ class SandboxSshRunner:
             known_hosts_path=known_hosts_path,
             command=f"test -e {shlex.quote(remote_path)}",
         )
-        result = await sandbox.exec("timeout", str(_TRANSFER_TIMEOUT_SECONDS), *argv)
+        result = await sandbox.exec("timeout", str(timeout_seconds), *argv)
         _raise_for_transport(result.exit_code, result.stderr or "")
         return bool(result.exit_code == 0)
 
@@ -305,6 +311,7 @@ class SandboxSshRunner:
         username: str,
         private_key_path: str,
         known_hosts_path: str,
+        timeout_seconds: int,
     ) -> None:
         batch_path = f"{stage}/batch"
         await sandbox.write_file(content=batch, remote_path=batch_path, overwrite=True)
@@ -320,7 +327,7 @@ class SandboxSshRunner:
             ),
             f"{username}@{connect_ip}",
         ]
-        result = await sandbox.exec("timeout", str(_TRANSFER_TIMEOUT_SECONDS), *argv)
+        result = await sandbox.exec("timeout", str(timeout_seconds), *argv)
         _raise_for_transport(result.exit_code, result.stderr or "")
         if result.exit_code != 0:
             raise SshError(SshErrorCode.OPERATION_NOT_ALLOWED, "sftp transfer failed")

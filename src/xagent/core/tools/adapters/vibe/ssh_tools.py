@@ -283,6 +283,10 @@ def _numeric_task_id(task_id: Any) -> int | None:
     not the bare integer primary key."""
     if task_id is None:
         return None
+    # Assumption: the DB id is the trailing integer of the workspace-scoped id
+    # (``web_task_30`` → 30); ids with no trailing digits (``tools_list``) are
+    # intentionally treated as "no task". If the id format ever grows an
+    # internal number this trailing-match would need revisiting.
     match = re.search(r"(\d+)$", str(task_id))
     return int(match.group(1)) if match else None
 

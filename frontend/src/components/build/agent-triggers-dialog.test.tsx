@@ -1224,4 +1224,124 @@ describe("AgentTriggersDialog owner routing", () => {
       ),
     )
   })
+
+  it("toggles a workforce-owned trigger via PATCH on the workforce route", async () => {
+    const WORKFORCE_TRIGGERS_URL = "http://api.local/api/workforces/5/triggers"
+    const trigger = makeTrigger({ id: 60, name: "Workforce hook", enabled: true })
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === WORKFORCE_TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([trigger]))
+      }
+      if (url === `${WORKFORCE_TRIGGERS_URL}/60` && init?.method === "PATCH") {
+        return Promise.resolve(jsonResponse({ ...trigger, enabled: false }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        owner={{ kind: "workforce", id: 5 }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    )
+
+    const cardSwitch = (
+      await screen.findAllByRole("switch")
+    ).find((el) => el.getAttribute("aria-checked") === "true")
+    expect(cardSwitch).toBeDefined()
+    fireEvent.click(cardSwitch!)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        `${WORKFORCE_TRIGGERS_URL}/60`,
+        expect.objectContaining({ method: "PATCH" }),
+      )
+    })
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/api/agents/"),
+      expect.anything(),
+    )
+  })
+
+  it("creates a workforce-owned trigger via POST on the workforce route", async () => {
+    const WORKFORCE_TRIGGERS_URL = "http://api.local/api/workforces/5/triggers"
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === WORKFORCE_TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === WORKFORCE_TRIGGERS_URL && init?.method === "POST") {
+        return Promise.resolve(jsonResponse(makeTrigger({ id: 61, enabled: true })))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        owner={{ kind: "workforce", id: 5 }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.secret")
+    const [detailSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(detailSwitch)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        WORKFORCE_TRIGGERS_URL,
+        expect.objectContaining({ method: "POST" }),
+      )
+    })
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/api/agents/"),
+      expect.anything(),
+    )
+  })
+
+  it("deletes a workforce-owned trigger via DELETE on the workforce route", async () => {
+    const WORKFORCE_TRIGGERS_URL = "http://api.local/api/workforces/5/triggers"
+    const trigger = makeTrigger({ id: 62, name: "Workforce hook" })
+
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === WORKFORCE_TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([trigger]))
+      }
+      if (url === `${WORKFORCE_TRIGGERS_URL}/62` && init?.method === "DELETE") {
+        return Promise.resolve(jsonResponse({}))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        owner={{ kind: "workforce", id: 5 }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByLabelText("triggers.form.secret")
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.delete" }))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.confirmDelete" }))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        `${WORKFORCE_TRIGGERS_URL}/62`,
+        expect.objectContaining({ method: "DELETE" }),
+      )
+    })
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/api/agents/"),
+      expect.anything(),
+    )
+  })
 })

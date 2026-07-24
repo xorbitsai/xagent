@@ -65,6 +65,57 @@ def _headers(login_customer_id: str | None = None) -> dict[str, str]:
     return headers
 
 
+def _extract_error_detail(response: requests.Response) -> str | None:
+    """Pull the human-readable message(s) out of a Google Ads error body.
+
+    Google Ads error responses are a large structured JSON payload
+    (``{"error": {"message": ..., "details": [{"errors": [...]}]}}``);
+    returning that whole blob to the LLM wastes tokens and is harder for it
+    to act on than the plain message(s) it actually needs to fix a bad GAQL
+    query. Returns None if the body isn't in the expected shape, so the
+    caller can fall back to the raw response text.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+
+    messages: list[str] = []
+    top_message = error.get("message")
+    if isinstance(top_message, str) and top_message:
+        messages.append(top_message)
+
+    for detail in error.get("details") or []:
+        if not isinstance(detail, dict):
+            continue
+        for sub_error in detail.get("errors") or []:
+            if not isinstance(sub_error, dict):
+                continue
+            sub_message = sub_error.get("message")
+            if isinstance(sub_message, str) and sub_message:
+                messages.append(sub_message)
+
+    if not messages:
+        return None
+    return "; ".join(dict.fromkeys(messages))
+
+
+def _require_dict_result(result: Any) -> dict[str, Any]:
+    """Guard against a non-dict payload (e.g. a list or string) before
+    calling dict methods on it. A dict that's merely empty (zero
+    accessible customers, zero GAQL rows) is a normal, valid response and
+    must not be rejected here."""
+    if not isinstance(result, dict):
+        raise ValueError("Unexpected response format from Google Ads API")
+    return result
+
+
 def _request(
     method: str,
     path: str,
@@ -82,10 +133,12 @@ def _request(
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        response_text = response.text.strip()
         message = str(exc)
-        if response_text:
-            message = f"{message} - {response_text}"
+        detail = _extract_error_detail(response)
+        if detail is None:
+            detail = response.text.strip()
+        if detail:
+            message = f"{message} - {detail}"
         raise RuntimeError(message) from exc
 
     if response.status_code == 204 or not response.content:
@@ -100,9 +153,13 @@ def google_ads_list_accessible_customers() -> str:
     Use this first to discover which customer_id values are available for google_ads_search.
     """
     try:
-        result = _request("GET", "/customers:listAccessibleCustomers")
+        result = _require_dict_result(
+            _request("GET", "/customers:listAccessibleCustomers")
+        )
         resource_names = result.get("resourceNames", [])
-        customer_ids = [name.rsplit("/", 1)[-1] for name in resource_names]
+        customer_ids = [
+            name.rsplit("/", 1)[-1] for name in resource_names if isinstance(name, str)
+        ]
         return _success(customer_ids=customer_ids)
     except Exception as e:
         logger.error(f"Error listing accessible customers: {e}")
@@ -124,11 +181,13 @@ def google_ads_search(
         normalized_customer_id = _normalize_customer_id(
             customer_id, field_name="customer_id"
         )
-        result = _request(
-            "POST",
-            f"/customers/{normalized_customer_id}/googleAds:search",
-            login_customer_id=login_customer_id,
-            body={"query": query},
+        result = _require_dict_result(
+            _request(
+                "POST",
+                f"/customers/{normalized_customer_id}/googleAds:search",
+                login_customer_id=login_customer_id,
+                body={"query": query},
+            )
         )
         return _success(results=result.get("results", []))
     except Exception as e:

@@ -78,6 +78,44 @@ def test_request_wraps_http_error_with_response_body(monkeypatch):
         google_ads._request("GET", "/customers:listAccessibleCustomers")
 
 
+def test_request_extracts_structured_error_message(monkeypatch):
+    monkeypatch.setattr(
+        google_ads.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data={
+                    "error": {
+                        "message": "Request contains an invalid argument.",
+                        "details": [
+                            {
+                                "errors": [
+                                    {"message": "Unrecognized field in GAQL query."}
+                                ]
+                            }
+                        ],
+                    }
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Unrecognized field in GAQL query"):
+        google_ads._request("GET", "/customers:listAccessibleCustomers")
+
+
+def test_request_falls_back_to_raw_text_for_unstructured_error_body(monkeypatch):
+    monkeypatch.setattr(
+        google_ads.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="upstream 500")),
+    )
+
+    with pytest.raises(RuntimeError, match="upstream 500"):
+        google_ads._request("GET", "/customers:listAccessibleCustomers")
+
+
 def test_list_accessible_customers_strips_resource_prefix(monkeypatch):
     monkeypatch.setattr(
         google_ads.requests,
@@ -95,6 +133,36 @@ def test_list_accessible_customers_strips_resource_prefix(monkeypatch):
 
     assert result["status"] == "success"
     assert result["customer_ids"] == ["1112223333", "4445556666"]
+
+
+def test_list_accessible_customers_filters_non_string_resource_names(monkeypatch):
+    monkeypatch.setattr(
+        google_ads.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"resourceNames": ["customers/111", 42, None]}
+            )
+        ),
+    )
+
+    result = json.loads(google_ads.google_ads_list_accessible_customers())
+
+    assert result["status"] == "success"
+    assert result["customer_ids"] == ["111"]
+
+
+def test_list_accessible_customers_rejects_non_dict_response(monkeypatch):
+    monkeypatch.setattr(
+        google_ads.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected", "list"])),
+    )
+
+    result = json.loads(google_ads.google_ads_list_accessible_customers())
+
+    assert result["status"] == "error"
+    assert "Unexpected response format" in result["message"]
 
 
 def test_google_ads_search_sends_gaql_query_and_login_customer_id(monkeypatch):
@@ -131,6 +199,21 @@ def test_google_ads_search_returns_error_payload_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "bad request" in result["message"]
+
+
+def test_google_ads_search_handles_empty_dict_result(monkeypatch):
+    monkeypatch.setattr(
+        google_ads.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={})),
+    )
+
+    result = json.loads(
+        google_ads.google_ads_search("1112223333", "SELECT campaign.id")
+    )
+
+    assert result["status"] == "success"
+    assert result["results"] == []
 
 
 def test_google_ads_search_rejects_customer_id_with_invalid_characters(monkeypatch):

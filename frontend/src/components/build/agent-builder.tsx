@@ -812,6 +812,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const rawToolCategories = agent.tool_categories || []
           setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
           setSelectedMcpServers(rawToolCategories.filter((c: string) => c.startsWith('mcp:')).map((c: string) => c.replace('mcp:', '')))
+          // Seed the SSH auto-category from the saved config so a failed
+          // bindings-load (which never fires onCount) can't leave "ssh" unset
+          // at save time. A successful load overwrites this with the live count.
+          setHasSshBindings(rawToolCategories.includes("ssh"))
 
           // Admin inspecting someone else's agent: the mount-time /api/mcp/servers
           // fetch returned the admin's own servers, so the owner's mcp: entries have

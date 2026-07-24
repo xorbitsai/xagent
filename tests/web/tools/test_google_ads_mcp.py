@@ -56,6 +56,11 @@ def test_headers_include_normalized_login_customer_id():
     assert headers["login-customer-id"] == "1234567890"
 
 
+def test_headers_reject_login_customer_id_with_invalid_characters():
+    with pytest.raises(ValueError, match="login_customer_id"):
+        google_ads._headers(login_customer_id="1234567890\r\nX-Injected: 1")
+
+
 def test_request_wraps_http_error_with_response_body(monkeypatch):
     monkeypatch.setattr(
         google_ads.requests,
@@ -124,3 +129,16 @@ def test_google_ads_search_returns_error_payload_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "bad request" in result["message"]
+
+
+def test_google_ads_search_rejects_customer_id_with_invalid_characters(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_ads.requests, "request", mock_request)
+
+    result = json.loads(
+        google_ads.google_ads_search("111/../other", "SELECT campaign.id")
+    )
+
+    assert result["status"] == "error"
+    assert "customer_id" in result["message"]
+    mock_request.assert_not_called()

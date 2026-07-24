@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import requests
@@ -19,6 +20,8 @@ mcp = FastMCP("google-ads-mcp")
 GOOGLE_ADS_BASE_URL = "https://googleads.googleapis.com/v23"
 DEFAULT_TIMEOUT_SECONDS = 30
 
+_CUSTOMER_ID_PATTERN = re.compile(r"^[0-9-]+$")
+
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
@@ -26,6 +29,19 @@ def _success(**payload: Any) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _normalize_customer_id(customer_id: str, *, field_name: str) -> str:
+    """Validate a customer id is digits/dashes only, then strip the dashes.
+
+    Rejects anything else (rather than silently sanitizing it) since this
+    value is interpolated directly into an HTTP header and a URL path —
+    a malformed value could otherwise inject headers or redirect the request
+    to an unintended API path.
+    """
+    if not _CUSTOMER_ID_PATTERN.match(str(customer_id)):
+        raise ValueError(f"{field_name} must contain only digits and dashes")
+    return str(customer_id).replace("-", "")
 
 
 def _headers(login_customer_id: str | None = None) -> dict[str, str]:
@@ -43,7 +59,9 @@ def _headers(login_customer_id: str | None = None) -> dict[str, str]:
         "Content-Type": "application/json",
     }
     if login_customer_id:
-        headers["login-customer-id"] = login_customer_id.replace("-", "")
+        headers["login-customer-id"] = _normalize_customer_id(
+            login_customer_id, field_name="login_customer_id"
+        )
     return headers
 
 
@@ -103,9 +121,12 @@ def google_ads_search(
     under a manager (MCC) account, and should be the manager's customer id.
     """
     try:
+        normalized_customer_id = _normalize_customer_id(
+            customer_id, field_name="customer_id"
+        )
         result = _request(
             "POST",
-            f"/customers/{customer_id.replace('-', '')}/googleAds:search",
+            f"/customers/{normalized_customer_id}/googleAds:search",
             login_customer_id=login_customer_id,
             body={"query": query},
         )

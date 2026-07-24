@@ -1290,6 +1290,58 @@ class TestVisionToolHelperMethods:
         with pytest.raises(ValueError, match="script"):
             vision_tool_without_workspace.core._decode_svg_bytes(svg)
 
+    @pytest.mark.asyncio
+    async def test_svg_source_content_rejects_local_file_over_size_limit(
+        self, vision_tool_without_workspace, tmp_path
+    ):
+        from xagent.core.utils.svg import MAX_SVG_BYTES
+
+        svg_path = tmp_path / "huge.svg"
+        with open(svg_path, "w") as f:
+            f.write("<svg>")
+            f.write("a" * (MAX_SVG_BYTES + 1))
+            f.write("</svg>")
+
+        content, warning = await vision_tool_without_workspace.core._svg_source_content(
+            str(svg_path), 0
+        )
+
+        assert content is None
+        assert warning is not None
+        assert "exceeds maximum size" in warning
+
+    @pytest.mark.asyncio
+    async def test_svg_source_content_rejects_local_file_without_svg_root(
+        self, vision_tool_without_workspace, tmp_path
+    ):
+        svg_path = tmp_path / "not-really.svg"
+        svg_path.write_text("just some text pretending to be an svg file")
+
+        content, warning = await vision_tool_without_workspace.core._svg_source_content(
+            str(svg_path), 0
+        )
+
+        assert content is None
+        assert warning is not None
+        assert "does not contain" in warning
+
+    @pytest.mark.asyncio
+    async def test_svg_source_content_accepts_normal_local_svg(
+        self, vision_tool_without_workspace, tmp_path
+    ):
+        svg_path = tmp_path / "official-logo.svg"
+        svg_source = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>'
+        svg_path.write_text(svg_source)
+
+        content, warning = await vision_tool_without_workspace.core._svg_source_content(
+            str(svg_path), 0
+        )
+
+        assert warning is None
+        assert content is not None
+        assert content["type"] == "text"
+        assert svg_source in content["text"]
+
     def test_validate_images_string_input(self, vision_tool_without_workspace):
         """Test _validate_images method with string input"""
         result = vision_tool_without_workspace.core._validate_images("test_image.jpg")

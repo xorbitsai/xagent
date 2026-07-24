@@ -194,12 +194,22 @@ class VisionCore:
                     ".svg"
                 ):
                     return None, None
+                svg_path = Path(image_path)
+                if (
+                    await asyncio.to_thread(lambda: svg_path.stat().st_size)
+                    > MAX_SVG_BYTES
+                ):
+                    raise ValueError(
+                        f"SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
+                    )
                 source = await asyncio.to_thread(
-                    Path(image_path).read_text,
+                    svg_path.read_text,
                     encoding="utf-8-sig",
                     errors="replace",
                 )
-                label = Path(image_path).name
+                if "<svg" not in source[:4096].lower():
+                    raise ValueError("SVG source does not contain an <svg> root")
+                label = svg_path.name
         except (OSError, ValueError, httpx.HTTPError) as exc:
             return None, f"Failed to read SVG source {image_path}: {exc}"
 

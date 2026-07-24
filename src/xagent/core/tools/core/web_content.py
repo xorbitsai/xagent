@@ -235,10 +235,18 @@ class WebContentFetcher:
             )
 
         for image in soup.find_all("img"):
+            image_class = image.get("class")
             add(
                 image.get("src") or image.get("data-src"),
                 kind="image",
-                name=str(image.get("id") or image.get("class") or ""),
+                name=str(
+                    image.get("id")
+                    or (
+                        " ".join(image_class)
+                        if isinstance(image_class, list)
+                        else (image_class or "")
+                    )
+                ),
                 alt=str(image.get("alt") or ""),
             )
 

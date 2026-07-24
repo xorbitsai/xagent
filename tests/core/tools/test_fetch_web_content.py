@@ -169,6 +169,47 @@ class TestFetchWebContentTool:
         mock_get.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_fetch_discovers_asset_name_joins_multi_valued_class(
+        self, fetch_tool
+    ):
+        html = """
+        <html>
+          <body>
+            <img src="/assets/brand-logo.svg" class="logo primary" alt="Brand logo">
+          </body>
+        </html>
+        """
+        response = _MockStreamResponse(
+            body=html.encode("utf-8"),
+            headers={"content-type": "text/html"},
+            url="https://example.com/campaign",
+        )
+
+        with (
+            patch(
+                "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+            ),
+            patch("httpx.AsyncClient.get"),
+        ):
+            result = await fetch_tool.run_json_async(
+                {
+                    "url": "https://example.com/campaign",
+                    "include_assets": True,
+                }
+            )
+
+        assert result["success"] is True
+        assert result["assets"] == [
+            {
+                "url": "https://example.com/assets/brand-logo.svg",
+                "kind": "image",
+                "name": "logo primary",
+                "alt": "Brand logo",
+                "source": "html",
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_fetch_follows_redirects(
         self, fetch_tool, allow_public_test_hosts: AsyncMock
     ):

@@ -1,7 +1,6 @@
 """Agent Builder API endpoints for creating and managing custom AI agents."""
 
 import logging
-import os
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -358,8 +357,12 @@ def _save_logo(base64_data: Optional[str], agent_id: int) -> Optional[str]:
         upload_dir = get_uploads_dir() / "agent_logos"
         upload_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save file
-        filename = f"agent_{agent_id}.{ext}"
+        # Save file. The filename includes a unique suffix (rather than just
+        # the agent id) so replacing a logo yields a new URL - browsers cache
+        # images by URL, and a deterministic name kept serving the stale
+        # cached image after a re-upload even though the file on disk had
+        # changed.
+        filename = f"agent_{agent_id}_{uuid.uuid4().hex[:8]}.{ext}"
         filepath = upload_dir / filename
         with open(filepath, "wb") as f:
             f.write(image_data)
@@ -375,10 +378,22 @@ def _save_logo(base64_data: Optional[str], agent_id: int) -> Optional[str]:
 def _delete_logo(logo_url: str) -> None:
     """Delete logo file."""
     try:
-        if logo_url and logo_url.startswith("/"):
-            filepath = logo_url.lstrip("/")
-            if os.path.exists(filepath):
-                os.remove(filepath)
+        if not logo_url or not logo_url.startswith("/uploads/"):
+            return
+        # logo_url is a URL path (e.g. "/uploads/agent_logos/agent_1_ab12cd34.png"),
+        # not a filesystem path - resolve it against the configured uploads
+        # root rather than the process's CWD, which get_uploads_dir() may not match.
+        uploads_dir = get_uploads_dir().resolve()
+        try:
+            filepath = (uploads_dir / logo_url[len("/uploads/") :]).resolve()
+            filepath.relative_to(uploads_dir)
+        except ValueError:
+            # Path escapes the uploads directory (e.g. via "..") - refuse rather
+            # than delete an arbitrary file outside the intended root.
+            logger.warning(f"Refused to delete logo outside uploads dir: {logo_url}")
+            return
+        if filepath.is_file():
+            filepath.unlink()
     except Exception as e:
         logger.error(f"Failed to delete logo {logo_url}: {e}")
 

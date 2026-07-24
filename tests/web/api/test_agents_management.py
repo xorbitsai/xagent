@@ -1,9 +1,11 @@
 """Integration tests for agent management endpoints."""
 
 import asyncio
+import base64
 import io
 import secrets
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1573,6 +1575,106 @@ def test_share_public_file_download_requires_valid_share_token() -> None:
 
     download_without_token = client.get(f"/api/files/public/download/{file_id}")
     assert download_without_token.status_code == 403, download_without_token.text
+
+
+def _logo_data_url(payload: bytes = b"fake-logo-bytes") -> str:
+    return "data:image/png;base64," + base64.b64encode(payload).decode()
+
+
+@pytest.fixture
+def logo_uploads_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Isolate agent logo reads/writes to a temp dir instead of the real uploads root."""
+    monkeypatch.setattr(agents_api, "get_uploads_dir", lambda: tmp_path)
+    return tmp_path
+
+
+def test_logo_reupload_gets_a_fresh_url_and_removes_the_old_file(
+    logo_uploads_dir: Path,
+) -> None:
+    """A re-uploaded logo must change logo_url (#975): the old fix saved every
+    logo under the same deterministic filename, so browsers kept serving the
+    stale cached image after an update even though the file on disk changed."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    first = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": _logo_data_url(b"first")},
+    )
+    assert first.status_code == 200, first.text
+    first_logo_url = first.json()["logo_url"]
+    assert first_logo_url
+    first_path = logo_uploads_dir / first_logo_url.removeprefix("/uploads/")
+    assert first_path.is_file()
+
+    second = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": _logo_data_url(b"second")},
+    )
+    assert second.status_code == 200, second.text
+    second_logo_url = second.json()["logo_url"]
+
+    assert second_logo_url and second_logo_url != first_logo_url
+    assert not first_path.exists(), "old logo file should be cleaned up"
+    assert (logo_uploads_dir / second_logo_url.removeprefix("/uploads/")).is_file()
+
+
+def test_clearing_logo_with_empty_string_nulls_url_and_deletes_file(
+    logo_uploads_dir: Path,
+) -> None:
+    """logo_base64="" (vs. omitted, meaning "no change") must clear an
+    existing logo end-to-end (#976)."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    uploaded = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": _logo_data_url()},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    logo_url = uploaded.json()["logo_url"]
+    logo_path = logo_uploads_dir / logo_url.removeprefix("/uploads/")
+    assert logo_path.is_file()
+
+    cleared = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": ""},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["logo_url"] is None
+    assert not logo_path.exists()
+
+
+def test_delete_logo_removes_a_file_inside_the_uploads_root(
+    logo_uploads_dir: Path,
+) -> None:
+    logo_dir = logo_uploads_dir / "agent_logos"
+    logo_dir.mkdir(parents=True)
+    logo_file = logo_dir / "agent_1_abcd1234.png"
+    logo_file.write_bytes(b"fake")
+
+    agents_api._delete_logo("/uploads/agent_logos/agent_1_abcd1234.png")
+
+    assert not logo_file.exists()
+
+
+def test_delete_logo_refuses_a_path_traversal_attempt(
+    logo_uploads_dir: Path,
+) -> None:
+    """A logo_url escaping the uploads root (e.g. via "..") must be refused
+    rather than deleting whatever it resolves to outside that root."""
+    outside_file = logo_uploads_dir.parent / "outside-secret.txt"
+    outside_file.write_text("do not delete me")
+
+    try:
+        agents_api._delete_logo("/uploads/../" + outside_file.name)
+        assert outside_file.exists()
+    finally:
+        outside_file.unlink(missing_ok=True)
 
 
 class TestDeleteAgent:

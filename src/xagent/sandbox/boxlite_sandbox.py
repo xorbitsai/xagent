@@ -112,6 +112,14 @@ def _get_info_from_box_info(raw_info: boxlite.BoxInfo) -> SandboxInfo:  # type: 
     return info
 
 
+def _truncate_utf8(text: str, cap: int) -> tuple[str, bool]:
+    """Cut ``text`` to at most ``cap`` UTF-8 bytes; report if it was cut."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= cap:
+        return text, False
+    return encoded[:cap].decode("utf-8", errors="ignore"), True
+
+
 class BoxliteSandbox(Sandbox):
     """
     Boxlite implementation.
@@ -159,6 +167,7 @@ class BoxliteSandbox(Sandbox):
         command: str,
         *args: str,
         env: Optional[dict[str, str]] = None,
+        max_output_bytes: Optional[int] = None,
     ) -> ExecResult:
         res = await self._box.exec(command, *args, env=env)
 
@@ -170,10 +179,23 @@ class BoxliteSandbox(Sandbox):
                 # Remove first line, keep the rest
                 stderr = lines[1] if len(lines) > 1 else ""
 
+        stdout = res.stdout
+        truncated = False
+        if max_output_bytes is not None:
+            # ponytail: boxlite's runtime buffers the whole output before we get
+            # it, so this trims after the fact — host memory isn't actually
+            # bounded here the way the Docker stream path is. boxlite is the
+            # local, low-volume runner; add a stream-level cap only if it ever
+            # backs a high-volume path.
+            stdout, out_t = _truncate_utf8(stdout, max_output_bytes)
+            stderr, err_t = _truncate_utf8(stderr, max_output_bytes)
+            truncated = out_t or err_t
+
         return ExecResult(
             exit_code=res.exit_code,
-            stdout=res.stdout,
+            stdout=stdout,
             stderr=stderr,
+            truncated=truncated,
             error_message=res.error_message,
         )
 

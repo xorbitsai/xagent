@@ -3,7 +3,8 @@
 import { useRouter } from "next/navigation";
 import {
   ChevronRight, Layers, Bot, Database,
-  Sparkles, Play, Heart, Clock, Send, ListChecks, Loader2, Mic, Square
+  Sparkles, Play, Heart, Clock, Send, ListChecks, Loader2, Mic, Square,
+  File as FileIcon, X
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -18,7 +19,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import Link from "next/link";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type ChangeEvent } from "react";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import type { ConnectionInfo, Template } from "@/types/template";
@@ -28,9 +29,7 @@ import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
 import {
-  ComputerRuntimeControl,
-  DEFAULT_COMPUTER_RUNTIME_KIND,
-  getStoredComputerRuntimeKind,
+  ComposerAddMenu,
   type ComputerRuntimeKind,
 } from "@/components/computer-runtime-control";
 
@@ -64,15 +63,13 @@ export default function Home() {
   const [isCreating, setIsCreating] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
   const [computerRuntimeKind, setComputerRuntimeKind] =
-    useState<ComputerRuntimeKind>(DEFAULT_COMPUTER_RUNTIME_KIND);
+    useState<ComputerRuntimeKind | undefined>(undefined);
+  const [homeFiles, setHomeFiles] = useState<File[]>([]);
   const [visibleGetStartedVideos, setVisibleGetStartedVideos] = useState<Set<number>>(new Set());
   const getStartedSectionRef = useRef<HTMLDivElement | null>(null);
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const homeFileInputRef = useRef<HTMLInputElement | null>(null);
   const homeVoiceInput = useVoiceInputControls();
-
-  useEffect(() => {
-    setComputerRuntimeKind(getStoredComputerRuntimeKind());
-  }, []);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -198,12 +195,19 @@ export default function Home() {
         return;
       }
 
-      const requestBody = {
+      const requestBody: {
+        title: string;
+        description: string;
+        llm_ids: Array<string | null>;
+        computer_runtime_kind?: ComputerRuntimeKind;
+      } = {
         title: content,
         description: content,
         llm_ids: llmIds,
-        computer_runtime_kind: computerRuntimeKind,
       };
+      if (computerRuntimeKind) {
+        requestBody.computer_runtime_kind = computerRuntimeKind;
+      }
 
       const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
         method: "POST",
@@ -222,11 +226,12 @@ export default function Home() {
 
           setPendingMessage({
             message: content,
-            files: [],
+            files: homeFiles,
             targetTaskId: parsedTaskId
           });
 
           setTaskId(parsedTaskId);
+          setHomeFiles([]);
         }
       } else {
         console.error("Failed to create task");
@@ -243,6 +248,14 @@ export default function Home() {
     if (val && val.trim()) {
       handleCreateTask(val.trim());
     }
+  };
+
+  const handleHomeFileSelect = (event: ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(event.target.files || []);
+    if (selectedFiles.length > 0) {
+      setHomeFiles((current) => [...current, ...selectedFiles]);
+    }
+    event.target.value = "";
   };
 
   const homeVoiceInputLabel =
@@ -299,12 +312,37 @@ export default function Home() {
             </Link>
           </div>
 
-          <div className="w-full max-w-2xl bg-[hsl(234_30%_25%/0.4)] border border-[hsl(234_30%_35%)] rounded-[18px] p-3 flex items-end shadow-[0_12px_40px_rgba(0,0,0,0.25)] backdrop-blur-md focus-within:border-[hsl(234_50%_50%)] focus-within:shadow-[0_0_0_4px_hsl(234_50%_50%/0.2),0_12px_40px_rgba(0,0,0,0.25)] transition-all duration-200">
+          <div className="w-full max-w-2xl bg-[hsl(234_30%_25%/0.4)] border border-[hsl(234_30%_35%)] rounded-[18px] p-3 shadow-[0_12px_40px_rgba(0,0,0,0.25)] backdrop-blur-md focus-within:border-[hsl(234_50%_50%)] focus-within:shadow-[0_0_0_4px_hsl(234_50%_50%/0.2),0_12px_40px_rgba(0,0,0,0.25)] transition-all duration-200">
+            {homeFiles.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-2 px-2">
+                {homeFiles.map((file, index) => (
+                  <div
+                    key={`${file.name}-${file.lastModified}-${index}`}
+                    className="inline-flex h-8 min-w-0 items-center gap-2 rounded-lg border border-white/10 bg-white/10 px-2.5 text-xs text-white/85"
+                  >
+                    <FileIcon className="h-3.5 w-3.5 shrink-0" />
+                    <span className="max-w-[180px] truncate">{file.name}</span>
+                    <button
+                      type="button"
+                      aria-label={t("common.remove")}
+                      className="rounded-sm p-0.5 hover:bg-white/15"
+                      onClick={() =>
+                        setHomeFiles((current) =>
+                          current.filter((_, fileIndex) => fileIndex !== index)
+                        )
+                      }
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <textarea
               ref={homeChatInputRef}
               data-voice-input="false"
               placeholder={t("home.hero.searchPlaceholder")}
-              className="border-0 bg-transparent text-white text-[16px] leading-relaxed placeholder:text-[hsl(240_5%_60%)] focus-visible:ring-0 focus-visible:outline-none flex-1 resize-none overflow-hidden min-h-[28px] max-h-[120px] py-1 px-2"
+              className="w-full border-0 bg-transparent text-white text-[16px] leading-relaxed placeholder:text-[hsl(240_5%_60%)] focus-visible:ring-0 focus-visible:outline-none resize-none overflow-hidden min-h-[52px] max-h-[120px] py-1 px-2"
               rows={1}
               onInput={(e) => {
                 const target = e.target as HTMLTextAreaElement;
@@ -320,45 +358,59 @@ export default function Home() {
                 }
               }}
             />
-            {homeVoiceInput.hasAsrModel && (
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                aria-label={homeVoiceInputLabel}
-                title={homeVoiceInputLabel}
-                className={`shrink-0 w-9 h-9 ml-2 rounded-full transition-colors ${
-                  homeVoiceInput.status === "recording"
-                    ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
-                    : "text-white/70 hover:bg-[hsl(234_30%_35%)] hover:text-white"
-                } ${homeVoiceInput.status === "transcribing" ? "cursor-wait opacity-80" : ""}`}
-                disabled={homeVoiceInputDisabled}
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={handleHomeVoiceInputClick}
-              >
-                {homeVoiceInput.status === "recording" ? (
-                  <Square className="w-3.5 h-3.5 fill-current" />
-                ) : homeVoiceInput.status === "transcribing" ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Mic className="w-4 h-4" />
+            <div className="mt-1 flex items-center justify-between">
+              <input
+                ref={homeFileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                onChange={handleHomeFileSelect}
+              />
+              <ComposerAddMenu
+                value={computerRuntimeKind}
+                onValueChange={setComputerRuntimeKind}
+                onAddFiles={() => homeFileInputRef.current?.click()}
+                showFileUpload
+                disabled={isCreating}
+                dark
+              />
+              <div className="flex items-center gap-1">
+                {homeVoiceInput.hasAsrModel && (
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    aria-label={homeVoiceInputLabel}
+                    title={homeVoiceInputLabel}
+                    className={`shrink-0 w-9 h-9 rounded-full transition-colors ${
+                      homeVoiceInput.status === "recording"
+                        ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                        : "text-white/70 hover:bg-[hsl(234_30%_35%)] hover:text-white"
+                    } ${homeVoiceInput.status === "transcribing" ? "cursor-wait opacity-80" : ""}`}
+                    disabled={homeVoiceInputDisabled}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={handleHomeVoiceInputClick}
+                  >
+                    {homeVoiceInput.status === "recording" ? (
+                      <Square className="w-3.5 h-3.5 fill-current" />
+                    ) : homeVoiceInput.status === "transcribing" ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Mic className="w-4 h-4" />
+                    )}
+                  </Button>
                 )}
-              </Button>
-            )}
-            <ComputerRuntimeControl
-              value={computerRuntimeKind}
-              onValueChange={setComputerRuntimeKind}
-              dark
-              className="ml-1 shrink-0"
-            />
-            <Button
-              size="icon"
-              className="bg-[hsl(234_40%_40%)] hover:bg-[hsl(234_40%_45%)] text-white rounded-[12px] shrink-0 w-9 h-9 ml-3 transition-colors shadow-none disabled:opacity-50"
-              onClick={handleChatButtonClick}
-              disabled={isCreating}
-            >
-              {isCreating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-            </Button>
+                <Button
+                  size="icon"
+                  className="bg-[hsl(234_40%_40%)] hover:bg-[hsl(234_40%_45%)] text-white rounded-[12px] shrink-0 w-9 h-9 ml-2 transition-colors shadow-none disabled:opacity-50"
+                  onClick={handleChatButtonClick}
+                  disabled={isCreating}
+                >
+                  {isCreating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       </div>

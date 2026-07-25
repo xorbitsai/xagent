@@ -20,9 +20,9 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-import { ComputerRuntimeControl } from "./computer-runtime-control"
+import { ComposerAddMenu } from "./computer-runtime-control"
 
-describe("ComputerRuntimeControl", () => {
+describe("ComposerAddMenu", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     apiRequestMock.mockResolvedValue(
@@ -62,11 +62,10 @@ describe("ComputerRuntimeControl", () => {
     cleanup()
   })
 
-  it("shows live readiness without blocking target selection", async () => {
+  it("grants a ready local target from the optional add menu", async () => {
     const onValueChange = vi.fn()
     render(
-      <ComputerRuntimeControl
-        value="extension_relay"
+      <ComposerAddMenu
         onValueChange={onValueChange}
       />
     )
@@ -76,49 +75,74 @@ describe("ComputerRuntimeControl", () => {
         "http://api.local/api/computer/readiness"
       )
     })
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.title",
+      })
+    )
     expect(
-      await screen.findByLabelText("computerRuntime.status.ready")
+      await screen.findByText("computerRuntime.status.ready")
     ).toBeInTheDocument()
-
-    fireEvent.click(screen.getByTitle("computerRuntime.title"))
     expect(
       screen.getByText(
         "computerRuntime.issues.accessibility_permission_missing"
       )
     ).toBeInTheDocument()
 
-    fireEvent.click(screen.getByText("computerRuntime.desktop.label"))
-    expect(onValueChange).toHaveBeenCalledWith("desktop_relay")
+    fireEvent.click(screen.getByText("computerRuntime.browser.label"))
+    expect(onValueChange).toHaveBeenCalledWith("extension_relay")
   })
 
-  it("links setup guidance to the selected relay settings", async () => {
+  it("takes an unavailable target to its connection settings", async () => {
     render(
-      <ComputerRuntimeControl
-        value="desktop_relay"
+      <ComposerAddMenu
         onValueChange={vi.fn()}
       />
     )
 
-    fireEvent.click(screen.getByTitle("computerRuntime.title"))
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.title",
+      })
+    )
 
-    const link = screen.getByRole("link", {
-      name: "computerRuntime.manageConnections",
+    const link = await screen.findByRole("link", {
+      name: /computerRuntime\.desktop\.label/,
     })
     expect(link).toHaveAttribute("href", "/settings#desktop-relay")
   })
 
-  it("keeps a bound target inspectable but not changeable", () => {
+  it("shows a removable chip for an explicit task grant", async () => {
     const onValueChange = vi.fn()
     render(
-      <ComputerRuntimeControl
+      <ComposerAddMenu
         value="desktop_relay"
         onValueChange={onValueChange}
-        disabled
       />
     )
 
     fireEvent.click(
-      screen.getByTitle("computerRuntime.boundHint")
+      screen.getByRole("button", {
+        name: "computerRuntime.removeAccess",
+      })
+    )
+    expect(onValueChange).toHaveBeenCalledWith(undefined)
+  })
+
+  it("keeps an existing task grant inspectable but not changeable", () => {
+    const onValueChange = vi.fn()
+    render(
+      <ComposerAddMenu
+        value="desktop_relay"
+        onValueChange={onValueChange}
+        selectionLocked
+      />
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.title",
+      })
     )
     fireEvent.click(screen.getByText("computerRuntime.browser.label"))
 

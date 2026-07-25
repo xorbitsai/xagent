@@ -1,6 +1,14 @@
 "use client"
 
-import { Check, ChevronDown, ExternalLink, Globe2, Monitor } from "lucide-react"
+import {
+  Check,
+  ExternalLink,
+  FilePlus2,
+  Globe2,
+  Monitor,
+  Plus,
+  X,
+} from "lucide-react"
 import Link from "next/link"
 import React, { useEffect, useState } from "react"
 
@@ -15,10 +23,6 @@ import { cn, getApiUrl } from "@/lib/utils"
 
 export type ComputerRuntimeKind = "extension_relay" | "desktop_relay"
 
-export const DEFAULT_COMPUTER_RUNTIME_KIND: ComputerRuntimeKind =
-  "extension_relay"
-
-const STORAGE_KEY = "xagent.computerRuntimeKind"
 const READINESS_POLL_INTERVAL_MS = 3_000
 
 type ComputerReadinessIssueCode =
@@ -44,55 +48,36 @@ interface ComputerReadinessResponse {
   targets: Record<ComputerRuntimeKind, ComputerTargetReadiness>
 }
 
-export function getStoredComputerRuntimeKind(): ComputerRuntimeKind {
-  if (typeof window === "undefined") {
-    return DEFAULT_COMPUTER_RUNTIME_KIND
-  }
-  try {
-    return window.localStorage.getItem(STORAGE_KEY) === "desktop_relay"
-      ? "desktop_relay"
-      : DEFAULT_COMPUTER_RUNTIME_KIND
-  } catch {
-    return DEFAULT_COMPUTER_RUNTIME_KIND
-  }
-}
-
-export function storeComputerRuntimeKind(value: ComputerRuntimeKind): void {
-  if (typeof window !== "undefined") {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, value)
-    } catch {
-      // Storage can be unavailable in hardened/private browser contexts.
-    }
-  }
-}
-
-interface ComputerRuntimeControlProps {
-  value: ComputerRuntimeKind
-  onValueChange?: (value: ComputerRuntimeKind) => void
+interface ComposerAddMenuProps {
+  value?: ComputerRuntimeKind
+  onValueChange?: (value: ComputerRuntimeKind | undefined) => void
+  onAddFiles?: () => void
+  showFileUpload?: boolean
   disabled?: boolean
+  selectionLocked?: boolean
   dark?: boolean
   className?: string
 }
 
-export function ComputerRuntimeControl({
+/**
+ * Optional composer capabilities belong behind the add button. A local
+ * computer target is an explicit per-task grant; leaving it unset lets the
+ * deployment use its managed browser without adding a choice to every task.
+ */
+export function ComposerAddMenu({
   value,
   onValueChange,
+  onAddFiles,
+  showFileUpload = false,
   disabled = false,
+  selectionLocked = false,
   dark = false,
   className,
-}: ComputerRuntimeControlProps) {
+}: ComposerAddMenuProps) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const [readiness, setReadiness] =
     useState<ComputerReadinessResponse["targets"] | null>(null)
-  const selectionLocked = disabled || !onValueChange
-  const isDesktop = value === "desktop_relay"
-  const Icon = isDesktop ? Monitor : Globe2
-  const label = isDesktop
-    ? t("computerRuntime.desktop.label")
-    : t("computerRuntime.browser.label")
-  const selectedReadiness = readiness?.[value]
 
   useEffect(() => {
     let active = true
@@ -124,36 +109,6 @@ export function ComputerRuntimeControl({
     }
   }, [])
 
-  const trigger = (
-    <button
-      type="button"
-      aria-label={label}
-      className={cn(
-        "inline-flex h-9 items-center justify-center gap-2 whitespace-nowrap rounded-xl px-3 text-xs font-normal transition-colors",
-        dark
-          ? "text-white/75 hover:bg-[hsl(234_30%_35%)] hover:text-white"
-          : "text-muted-foreground hover:bg-secondary/80 hover:text-foreground",
-        selectionLocked && "opacity-80",
-        className
-      )}
-      title={
-        disabled
-          ? t("computerRuntime.boundHint", { target: label })
-          : t("computerRuntime.title")
-      }
-    >
-      <Icon className="h-4 w-4" />
-      <span className="hidden sm:inline-block">{label}</span>
-      <ReadinessDot
-        readiness={selectedReadiness}
-        readyLabel={t("computerRuntime.status.ready")}
-        attentionLabel={t("computerRuntime.status.needsAttention")}
-        checkingLabel={t("computerRuntime.status.checking")}
-      />
-      <ChevronDown className="h-3.5 w-3.5 opacity-60" />
-    </button>
-  )
-
   const options: Array<{
     value: ComputerRuntimeKind
     label: string
@@ -177,81 +132,192 @@ export function ComputerRuntimeControl({
     },
   ]
 
+  const selectedOption = options.find((option) => option.value === value)
+  const SelectedIcon = selectedOption?.icon
+  const selectedReadiness = value ? readiness?.[value] : undefined
+
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
-      <PopoverContent align="start" side="top" className="w-80 p-2">
-        <div className="px-2 pb-2 pt-1">
-          <div className="text-sm font-medium">{t("computerRuntime.title")}</div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t("computerRuntime.description")}
-          </p>
-        </div>
-        <div className="space-y-1">
-          {options.map((option) => {
-            const OptionIcon = option.icon
-            const selected = option.value === value
-            const optionReadiness = readiness?.[option.value]
-            const firstIssue = optionReadiness?.issues[0]
-            return (
+    <div className={cn("flex min-w-0 items-center gap-1.5", className)}>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            aria-label={t("computerRuntime.addMenu.title")}
+            title={t("computerRuntime.addMenu.title")}
+            disabled={disabled}
+            className={cn(
+              "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors",
+              dark
+                ? "text-white/75 hover:bg-[hsl(234_30%_35%)] hover:text-white"
+                : "text-muted-foreground hover:bg-secondary/80 hover:text-foreground",
+              disabled && "cursor-not-allowed opacity-50"
+            )}
+          >
+            <Plus className="h-4 w-4" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          side="top"
+          aria-label={t("computerRuntime.addMenu.title")}
+          className="w-80 p-2"
+        >
+          {showFileUpload && onAddFiles && (
+            <div className="pb-1">
               <button
-                key={option.value}
                 type="button"
-                disabled={selectionLocked}
-                className={cn(
-                  "flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent",
-                  selected && "bg-accent",
-                  selectionLocked && !selected && "opacity-45"
-                )}
+                className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent"
                 onClick={() => {
-                  if (!onValueChange || selectionLocked) return
-                  onValueChange(option.value)
-                  storeComputerRuntimeKind(option.value)
                   setOpen(false)
+                  onAddFiles()
                 }}
               >
-                <OptionIcon className="mt-0.5 h-4 w-4 shrink-0" />
-                <span className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium">{option.label}</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">
-                    {option.description}
-                  </span>
-                  <span
-                    className={cn(
-                      "mt-1.5 block text-xs",
-                      optionReadiness?.ready
-                        ? "text-emerald-600"
-                        : "text-amber-600"
-                    )}
-                  >
-                    {optionReadiness
-                      ? optionReadiness.ready
-                        ? t("computerRuntime.status.ready")
-                        : firstIssue
-                          ? t(`computerRuntime.issues.${firstIssue.code}`)
-                          : t("computerRuntime.status.needsAttention")
-                      : t("computerRuntime.status.checking")}
-                  </span>
+                <FilePlus2 className="h-4 w-4 shrink-0" />
+                <span className="text-sm font-medium">
+                  {t("computerRuntime.addMenu.files")}
                 </span>
-                {selected && <Check className="mt-0.5 h-4 w-4 text-primary" />}
               </button>
-            )
+            </div>
+          )}
+
+          <div className="border-t px-2 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            {t("computerRuntime.addMenu.computerAccess")}
+          </div>
+          <div className="space-y-1">
+            {options.map((option) => {
+              const OptionIcon = option.icon
+              const selected = option.value === value
+              const optionReadiness = readiness?.[option.value]
+              const firstIssue = optionReadiness?.issues[0]
+              const canGrant =
+                !selectionLocked && Boolean(onValueChange) && optionReadiness?.ready
+              const optionContent = (
+                <>
+                  <OptionIcon className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">
+                      {option.label}
+                    </span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      {option.description}
+                    </span>
+                    <span
+                      className={cn(
+                        "mt-1.5 block text-xs",
+                        optionReadiness?.ready
+                          ? "text-emerald-600"
+                          : "text-amber-600"
+                      )}
+                    >
+                      {selectionLocked && !selected
+                        ? t("computerRuntime.status.taskLocked")
+                        : optionReadiness
+                          ? optionReadiness.ready
+                            ? selected
+                              ? t("computerRuntime.status.added")
+                              : t("computerRuntime.status.ready")
+                            : firstIssue
+                              ? t(`computerRuntime.issues.${firstIssue.code}`)
+                              : t("computerRuntime.status.needsAttention")
+                          : t("computerRuntime.status.checking")}
+                    </span>
+                  </span>
+                  {selected && <Check className="mt-0.5 h-4 w-4 text-primary" />}
+                  {!selected && optionReadiness && !optionReadiness.ready && (
+                    <span className="mt-0.5 text-xs font-medium text-primary">
+                      {t("computerRuntime.status.connect")}
+                    </span>
+                  )}
+                </>
+              )
+
+              if (!selectionLocked && optionReadiness && !optionReadiness.ready) {
+                return (
+                  <Link
+                    key={option.value}
+                    href={`/settings#${option.settingsHash}`}
+                    className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent"
+                    onClick={() => setOpen(false)}
+                  >
+                    {optionContent}
+                  </Link>
+                )
+              }
+
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  disabled={!canGrant}
+                  className={cn(
+                    "flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left",
+                    canGrant && "hover:bg-accent",
+                    selected && "bg-accent",
+                    !canGrant && !selected && "opacity-60"
+                  )}
+                  onClick={() => {
+                    if (!canGrant || !onValueChange) return
+                    onValueChange(option.value)
+                    setOpen(false)
+                  }}
+                >
+                  {optionContent}
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="mt-2 border-t px-2 pt-2">
+            <Link
+              href={`/settings#${selectedOption?.settingsHash ?? "browser-relay"}`}
+              className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+              onClick={() => setOpen(false)}
+            >
+              {t("computerRuntime.manageConnections")}
+              <ExternalLink className="h-3 w-3" />
+            </Link>
+          </div>
+        </PopoverContent>
+      </Popover>
+
+      {selectedOption && SelectedIcon && (
+        <div
+          className={cn(
+            "inline-flex h-8 min-w-0 max-w-[180px] items-center gap-1.5 rounded-lg border px-2.5 text-xs",
+            dark
+              ? "border-white/15 bg-white/10 text-white/85"
+              : "border-border bg-secondary/70 text-foreground"
+          )}
+          title={t("computerRuntime.boundHint", {
+            target: selectedOption.label,
           })}
+        >
+          <SelectedIcon className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">{selectedOption.label}</span>
+          <ReadinessDot
+            readiness={selectedReadiness}
+            readyLabel={t("computerRuntime.status.ready")}
+            attentionLabel={t("computerRuntime.status.needsAttention")}
+            checkingLabel={t("computerRuntime.status.checking")}
+          />
+          {!selectionLocked && onValueChange && (
+            <button
+              type="button"
+              aria-label={t("computerRuntime.removeAccess", {
+                target: selectedOption.label,
+              })}
+              className={cn(
+                "ml-0.5 rounded-sm p-0.5",
+                dark ? "hover:bg-white/15" : "hover:bg-foreground/10"
+              )}
+              onClick={() => onValueChange(undefined)}
+            >
+              <X className="h-3 w-3" />
+            </button>
+          )}
         </div>
-        <div className="mt-2 border-t px-2 pt-2">
-          <Link
-            href={`/settings#${
-              options.find((option) => option.value === value)?.settingsHash
-            }`}
-            className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-            onClick={() => setOpen(false)}
-          >
-            {t("computerRuntime.manageConnections")}
-            <ExternalLink className="h-3 w-3" />
-          </Link>
-        </div>
-      </PopoverContent>
-    </Popover>
+      )}
+    </div>
   )
 }
 

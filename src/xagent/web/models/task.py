@@ -121,10 +121,11 @@ class Task(Base):  # type: ignore
     agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
     connector_runtime_selected_refs = Column(JSON, nullable=True, default=list)
 
-    # User-selected Computer target for this task. This is task-owned state,
+    # Explicit user grant for a local Computer target. This is task-owned state,
     # not a model/tool argument, so an agent cannot switch between the user's
-    # browser and desktop during execution. NULL preserves the deployment
-    # default for legacy and non-interactive task creation paths.
+    # browser and desktop during execution. NULL means no local-device grant
+    # and leaves the task on the deployment runtime (isolated Playwright by
+    # default).
     computer_runtime_kind = Column(String(32), nullable=True)
 
     # Execution mode configuration

@@ -14,9 +14,7 @@ import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "@/components/ui/sonner";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
 import {
-  ComputerRuntimeControl,
-  DEFAULT_COMPUTER_RUNTIME_KIND,
-  getStoredComputerRuntimeKind,
+  ComposerAddMenu,
   type ComputerRuntimeKind,
 } from "@/components/computer-runtime-control";
 import {
@@ -270,7 +268,6 @@ export function ChatInput({
   const [agentConfig, setAgentConfig] = useState<AgentConfig>({
     model: "",
     memorySimilarityThreshold: 1.5,
-    computerRuntimeKind: DEFAULT_COMPUTER_RUNTIME_KIND,
   });
   const [defaultAgentConfig, setDefaultAgentConfig] = useState<{
     model: string;
@@ -478,8 +475,7 @@ export function ChatInput({
         visualModel: taskConfig.visualModel || prev.visualModel,
         compactModel: taskConfig.compactModel || prev.compactModel,
         executionMode: taskConfig.executionMode,
-        computerRuntimeKind:
-          taskConfig.computerRuntimeKind || prev.computerRuntimeKind,
+        computerRuntimeKind: taskConfig.computerRuntimeKind,
       }));
     } else if (!readOnlyConfig) {
       setAgentConfig(prev => ({
@@ -489,7 +485,6 @@ export function ChatInput({
         visualModel: defaultAgentConfig.visualModel,
         compactModel: defaultAgentConfig.compactModel,
         executionMode: undefined,
-        computerRuntimeKind: getStoredComputerRuntimeKind(),
       }));
     }
   }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
@@ -891,28 +886,28 @@ export function ChatInput({
           {compact ? (
             <div className="absolute right-2 bottom-2 flex items-center gap-2">
               {!hideFileUpload && (
-                <>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    multiple
-                    onChange={handleFileSelect}
-                    className="hidden"
-                    accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={isInputBusy}
-                    title={t("chatPage.input.actions.upload")}
-                  >
-                    <Paperclip className="h-4 w-4" />
-                  </Button>
-                </>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  onChange={handleFileSelect}
+                  className="hidden"
+                  accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                />
               )}
+              <ComposerAddMenu
+                value={agentConfig.computerRuntimeKind}
+                onValueChange={(computerRuntimeKind) =>
+                  setAgentConfig(prev => ({
+                    ...prev,
+                    computerRuntimeKind,
+                  }))
+                }
+                onAddFiles={() => fileInputRef.current?.click()}
+                showFileUpload={!hideFileUpload}
+                disabled={isInputBusy}
+                selectionLocked={Boolean(taskStatus)}
+              />
               {voiceInput.hasAsrModel && (
                 <Button
                   type="button"
@@ -959,6 +954,29 @@ export function ChatInput({
           ) : (
             <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">
               <div className="flex items-center gap-2">
+                {!hideFileUpload && (
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                    accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                  />
+                )}
+                <ComposerAddMenu
+                  value={agentConfig.computerRuntimeKind}
+                  onValueChange={(computerRuntimeKind) =>
+                    setAgentConfig(prev => ({
+                      ...prev,
+                      computerRuntimeKind,
+                    }))
+                  }
+                  onAddFiles={() => fileInputRef.current?.click()}
+                  showFileUpload={!hideFileUpload}
+                  disabled={isInputBusy}
+                  selectionLocked={Boolean(taskStatus)}
+                />
                 {/* Settings button - left of upload */}
                 {!hideConfig && (
                   <>
@@ -997,45 +1015,6 @@ export function ChatInput({
                         }
                       />
                     )}
-                  </>
-                )}
-                {!hideConfig && (
-                  <ComputerRuntimeControl
-                    value={
-                      agentConfig.computerRuntimeKind ||
-                      DEFAULT_COMPUTER_RUNTIME_KIND
-                    }
-                    onValueChange={(computerRuntimeKind) =>
-                      setAgentConfig(prev => ({
-                        ...prev,
-                        computerRuntimeKind,
-                      }))
-                    }
-                    disabled={readOnlyConfig}
-                  />
-                )}
-                {/* Upload button - adjacent to bottom toolbar */}
-                {!hideFileUpload && (
-                  <>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      onChange={handleFileSelect}
-                      className="hidden"
-                      accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
-                      onClick={() => fileInputRef.current?.click()}
-                      disabled={isInputBusy}
-                      title={t("chatPage.input.actions.upload")}
-                    >
-                      <Paperclip className="h-4 w-4" />
-                    </Button>
                   </>
                 )}
               </div>

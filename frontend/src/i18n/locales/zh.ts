@@ -2688,14 +2688,24 @@ const zh = {
     loadAgentDetailsFailed: "无法加载 Agent 详情",
   },
   computerRuntime: {
-    title: "Computer 控制目标",
-    description: "选择本任务可以控制的目标。任务创建后将锁定，Agent 无法切换。",
-    boundHint: "本任务已绑定到{target}",
+    title: "Computer 访问权限",
+    description: "按需授权当前任务使用你的本地设备。",
+    boundHint: "本任务可以使用{target}",
+    removeAccess: "移除{target}访问权限",
     manageConnections: "管理 Computer 连接",
+    addMenu: {
+      title: "添加到当前任务",
+      description: "添加文件，或授权任务使用你的本地设备。",
+      files: "添加文件或照片",
+      computerAccess: "Computer 访问权限",
+    },
     status: {
-      ready: "已就绪",
+      ready: "已连接",
       needsAttention: "需要处理",
       checking: "正在检查连接…",
+      added: "已添加到当前任务",
+      connect: "连接",
+      taskLocked: "当前任务创建后不能更换",
     },
     issues: {
       disconnected: "尚未连接",
@@ -2706,12 +2716,12 @@ const zh = {
       emergency_stopped: "紧急停止已触发",
     },
     browser: {
-      label: "浏览器",
-      description: "通过 Xagent 扩展控制你已登录的浏览器。",
+      label: "我的浏览器",
+      description: "使用 Xagent 扩展访问你已登录的网站。",
     },
     desktop: {
-      label: "桌面",
-      description: "控制已连接的 macOS 桌面伴侣及其选定窗口。",
+      label: "我的电脑",
+      description: "操作桌面伴侣中已授权的窗口。",
     },
   },
   agent: {

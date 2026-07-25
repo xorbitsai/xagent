@@ -512,6 +512,7 @@ def test_standalone_task_create_defaults_to_auto(test_db, user1_headers):
     )
     assert resp.status_code == 200
     assert resp.json()["execution_mode"] == "auto"
+    assert resp.json()["computer_runtime_kind"] is None
 
 
 def test_task_create_persists_computer_runtime_binding(test_db, user1_headers):

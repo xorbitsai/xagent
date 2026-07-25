@@ -80,10 +80,42 @@ const emptyJsonResponse = () =>
     headers: { "Content-Type": "application/json" },
   })
 
+const computerReadinessResponse = () =>
+  new Response(
+    JSON.stringify({
+      targets: {
+        extension_relay: {
+          runtime_kind: "extension_relay",
+          ready: true,
+          connected: true,
+          attached: true,
+          issues: [],
+        },
+        desktop_relay: {
+          runtime_kind: "desktop_relay",
+          ready: true,
+          connected: true,
+          attached: true,
+          issues: [],
+        },
+      },
+    }),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }
+  )
+
 describe("ChatInput", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
-    apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
+    apiRequestMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url === "http://api.local/api/computer/readiness"
+          ? computerReadinessResponse()
+          : emptyJsonResponse()
+      )
+    )
     openFilePreviewMock.mockReset()
     routerPushMock.mockReset()
     resetMentionMock.mockReset()
@@ -150,8 +182,14 @@ describe("ChatInput", () => {
       />
     )
 
-    fireEvent.click(screen.getByTitle("computerRuntime.title"))
-    fireEvent.click(screen.getByText("computerRuntime.desktop.label"))
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.title",
+      })
+    )
+    fireEvent.click(
+      await screen.findByText("computerRuntime.desktop.label")
+    )
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 
     await waitFor(() => {
@@ -160,6 +198,26 @@ describe("ChatInput", () => {
         expect.objectContaining({ computerRuntimeKind: "desktop_relay" })
       )
     })
+  })
+
+  it("leaves computer access unbound unless the user adds a local device", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="research this topic"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        selectedAgents={[{ id: 42, name: "Shared Agent" }]}
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalled()
+    })
+    expect(onSend.mock.calls[0][1].computerRuntimeKind).toBeUndefined()
   })
 
   it("does not show pause for uppercase terminal task status", () => {

@@ -9,7 +9,7 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from redis.asyncio import Redis
@@ -29,6 +29,8 @@ from .relay import (
     BrowserRelayProtocolError,
     BrowserRelayStatusMessage,
     BrowserRelayUnavailableError,
+    DesktopRelayStatusMessage,
+    RelayStatusMessage,
 )
 
 logger = logging.getLogger(__name__)
@@ -249,6 +251,7 @@ class RedisBrowserRelayRegistry:
         redis_url: str,
         *,
         namespace: str = _DEFAULT_NAMESPACE,
+        target_kind: Literal["browser", "desktop"] = "browser",
         pairing_ttl: timedelta = timedelta(minutes=10),
         session_ttl: timedelta = timedelta(days=7),
         claim_ttl: timedelta = timedelta(minutes=30),
@@ -260,6 +263,7 @@ class RedisBrowserRelayRegistry:
         self._namespace = namespace.strip().rstrip(":")
         if not self._namespace:
             raise ValueError("Redis browser relay namespace must not be empty.")
+        self._target_kind = target_kind
         self._pairing_ttl_seconds = self._ttl_seconds(pairing_ttl)
         self._session_ttl_seconds = self._ttl_seconds(session_ttl)
         self._claim_ttl_seconds = self._ttl_seconds(claim_ttl)
@@ -367,6 +371,11 @@ class RedisBrowserRelayRegistry:
         )
 
     async def register(self, connection: BrowserRelayConnection) -> None:
+        if connection.target_kind != self._target_kind:
+            raise BrowserRelayProtocolError(
+                f"{connection.target_kind} connection cannot register with "
+                f"{self._target_kind} relay"
+            )
         connection_id = uuid4().hex
         command_channel = self._command_channel(connection_id)
         pubsub = self._redis.pubsub()
@@ -467,8 +476,18 @@ class RedisBrowserRelayRegistry:
     async def update_connection_status(
         self,
         connection: BrowserRelayConnection,
-        status: BrowserRelayStatusMessage,
+        status: RelayStatusMessage,
     ) -> None:
+        if (
+            self._target_kind == "browser"
+            and not isinstance(status, BrowserRelayStatusMessage)
+        ) or (
+            self._target_kind == "desktop"
+            and not isinstance(status, DesktopRelayStatusMessage)
+        ):
+            raise BrowserRelayProtocolError(
+                f"{self._target_kind} relay received the wrong status shape"
+            )
         state = await self._local_state(connection)
         if state is None:
             return
@@ -515,6 +534,10 @@ class RedisBrowserRelayRegistry:
             raise ValueError("browser relay requires authenticated user and task owner")
         status = await self._read_connection_status(user_id)
         if status is None:
+            if self._target_kind == "desktop":
+                raise BrowserRelayUnavailableError(
+                    "Desktop Relay is not connected for this user."
+                )
             raise BrowserRelayUnavailableError(
                 "Browser extension is not connected for this user."
             )
@@ -526,6 +549,10 @@ class RedisBrowserRelayRegistry:
             self._claim_ttl_seconds,
         )
         if current_owner != owner:
+            if self._target_kind == "desktop":
+                raise BrowserRelayInUseError(
+                    "The user desktop relay is already controlled by another task."
+                )
             raise BrowserRelayInUseError(
                 "The user browser is already controlled by another task."
             )
@@ -567,10 +594,17 @@ class RedisBrowserRelayRegistry:
                 "connected",
                 "client_id",
                 "client_name",
+                "target_kind",
                 "attached",
                 "tab_id",
                 "title",
                 "url",
+                "window_id",
+                "application",
+                "bounds",
+                "permissions",
+                "paused",
+                "emergency_stopped",
                 "connected_at",
             )
         }
@@ -634,17 +668,32 @@ class RedisBrowserRelayRegistry:
                 self._claim_ttl_seconds,
             )
             if publish_result == 2:
+                if self._target_kind == "desktop":
+                    raise BrowserRelayUnavailableError(
+                        "No desktop window is authorized. Ask the user to open "
+                        "Xagent Desktop Relay and choose one window."
+                    )
                 raise BrowserRelayUnavailableError(
                     "No browser tab is attached. Ask the user to open the Xagent "
                     "extension and approve the current tab."
                 )
             if publish_result != 1:
                 if publish_result == 3:
+                    if self._target_kind == "desktop":
+                        raise BrowserRelayInUseError(
+                            "The user desktop relay is no longer controlled by "
+                            "this task."
+                        )
                     raise BrowserRelayInUseError(
                         "The user browser is no longer controlled by this task."
                     )
+                peer = (
+                    "Desktop Relay"
+                    if self._target_kind == "desktop"
+                    else "Browser extension"
+                )
                 raise BrowserRelayUnavailableError(
-                    "Browser extension disconnected or reconnected. Request a fresh "
+                    f"{peer} disconnected or reconnected. Request a fresh "
                     "screenshot before continuing."
                 )
             deadline = asyncio.get_running_loop().time() + timeout
@@ -669,8 +718,13 @@ class RedisBrowserRelayRegistry:
             finally:
                 await response_pubsub.aclose()
         if raw_response is None:
+            peer = (
+                "Desktop Relay"
+                if self._target_kind == "desktop"
+                else "Browser extension"
+            )
             raise BrowserRelayUnavailableError(
-                f"Browser extension did not answer {command!r} in time."
+                f"{peer} did not answer {command!r} in time."
             )
         decoded = self._load_json(raw_response)
         if decoded.get("success") is True:
@@ -896,6 +950,7 @@ class RedisBrowserRelayRegistry:
         # content. Keep only routing/liveness metadata in durable Redis keys.
         public_status["title"] = None
         public_status["url"] = None
+        public_status["application"] = None
         return self._dump_json(
             {
                 **public_status,

@@ -11,9 +11,11 @@ from xagent.core.computer.relay import (
     BrowserRelayConnection,
     BrowserRelayHello,
     BrowserRelayInUseError,
+    BrowserRelayProtocolError,
     BrowserRelayRegistry,
     BrowserRelayResponse,
     BrowserRelayStatusMessage,
+    DesktopRelayStatusMessage,
     get_browser_relay_registry,
     reset_browser_relay_registry,
 )
@@ -163,6 +165,72 @@ async def test_registry_enforces_one_task_owner_per_user() -> None:
 
     await registry.release(user_id=4, owner_task_id="task-a")
     assert (await registry.acquire(user_id=4, owner_task_id="task-b")) is connection
+
+
+@pytest.mark.asyncio
+async def test_desktop_relay_has_separate_credentials_and_target_contract() -> None:
+    browser_registry = BrowserRelayRegistry()
+    desktop_registry = BrowserRelayRegistry(target_kind="desktop")
+    browser_pairing = await browser_registry.create_pairing(7)
+    desktop_pairing = await desktop_registry.create_pairing(7)
+
+    with pytest.raises(BrowserRelayAuthenticationError, match="invalid"):
+        await desktop_registry.authenticate(
+            BrowserRelayHello(
+                type="hello",
+                protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+                client_id="mac-1",
+                pairing_token=browser_pairing.pairing_token,
+            )
+        )
+
+    authentication = await desktop_registry.authenticate(
+        BrowserRelayHello(
+            type="hello",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            client_id="mac-1",
+            pairing_token=desktop_pairing.pairing_token,
+        )
+    )
+
+    async def send(_message: dict) -> None:
+        return None
+
+    browser_connection = BrowserRelayConnection(
+        user_id=7,
+        client_id="chrome",
+        client_name="Chrome",
+        send=send,
+    )
+    with pytest.raises(BrowserRelayProtocolError, match="cannot register"):
+        await desktop_registry.register(browser_connection)
+
+    desktop_connection = BrowserRelayConnection(
+        user_id=7,
+        client_id="mac-1",
+        client_name="Mac",
+        send=send,
+        authorization_id=authentication.session_id,
+        target_kind="desktop",
+    )
+    await desktop_registry.register(desktop_connection)
+    await desktop_registry.update_connection_status(
+        desktop_connection,
+        DesktopRelayStatusMessage(
+            type="status",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            attached=True,
+            window_id=9,
+            title="Document",
+            application="Editor",
+            permissions={"screen_recording": True, "accessibility": True},
+        ),
+    )
+
+    status = await desktop_registry.status(7)
+    assert status["target_kind"] == "desktop"
+    assert status["window_id"] == 9
+    assert status["permissions"]["accessibility"] is True
 
 
 def test_hello_requires_exactly_one_credential() -> None:

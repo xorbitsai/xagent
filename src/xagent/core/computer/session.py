@@ -11,6 +11,7 @@ class BrowserRuntimeKind(str, Enum):
     EPHEMERAL_PLAYWRIGHT = "ephemeral_playwright"
     PERSISTENT_PLAYWRIGHT = "persistent_playwright"
     EXTENSION_RELAY = "extension_relay"
+    DESKTOP_RELAY = "desktop_relay"
 
 
 def validate_browser_profile_id(profile_id: str) -> str:
@@ -48,8 +49,12 @@ class ComputerSessionBinding:
         return self.runtime_kind is BrowserRuntimeKind.EXTENSION_RELAY
 
     @property
+    def is_desktop_relay(self) -> bool:
+        return self.runtime_kind is BrowserRuntimeKind.DESKTOP_RELAY
+
+    @property
     def is_user_controlled(self) -> bool:
-        return self.is_persistent or self.is_extension_relay
+        return self.is_persistent or self.is_extension_relay or self.is_desktop_relay
 
     @classmethod
     def from_values(

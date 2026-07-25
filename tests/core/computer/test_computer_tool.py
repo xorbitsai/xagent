@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
+from xagent.core.computer.desktop import DesktopRelayEnvironment
 from xagent.core.computer.environment import ComputerEnvironment
 from xagent.core.computer.extension import ExtensionComputerEnvironment
 from xagent.core.computer.schema import (
@@ -245,6 +246,18 @@ async def test_persistent_computer_tool_preserves_browser_while_waiting(
     assert factory.environments[0].closed is False
     assert tool._environments["task-1"] is factory.environments[0]
     assert "do not ask for credentials" in tool.description
+
+
+def test_computer_tool_selects_desktop_relay_environment() -> None:
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        browser_runtime_kind="desktop_relay",
+        user_id=9,
+    )
+
+    assert tool._environment_factory is DesktopRelayEnvironment
+    assert "authorized in Xagent Desktop Relay" in tool.description
 
 
 def _button(

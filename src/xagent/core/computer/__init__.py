@@ -1,5 +1,10 @@
 """Provider-neutral Computer Use contracts and runtime helpers."""
 
+from .desktop import DesktopRelayEnvironment
+from .desktop_relay import (
+    DESKTOP_RELAY_PROTOCOL_VERSION,
+    get_desktop_relay_registry,
+)
 from .environment import (
     ComputerEnvironment,
     ComputerFrameMismatchError,
@@ -27,6 +32,7 @@ from .relay import (
     BrowserRelayRegistry,
     BrowserRelayRegistryProtocol,
     BrowserRelayUnavailableError,
+    DesktopRelayStatusMessage,
     get_browser_relay_registry,
 )
 from .schema import (
@@ -51,6 +57,7 @@ from .store import ObservationStore
 
 __all__ = [
     "BrowserRuntimeKind",
+    "DESKTOP_RELAY_PROTOCOL_VERSION",
     "BROWSER_RELAY_PROTOCOL_VERSION",
     "BrowserRelayAuthenticationError",
     "BrowserRelayCommandConnection",
@@ -78,6 +85,8 @@ __all__ = [
     "ComputerSessionBinding",
     "ComputerTarget",
     "ComputerTargetNotFoundError",
+    "DesktopRelayEnvironment",
+    "DesktopRelayStatusMessage",
     "DefaultComputerActionPolicy",
     "ExtensionComputerEnvironment",
     "NormalizedPoint",
@@ -86,6 +95,7 @@ __all__ = [
     "RedisBrowserRelayRegistry",
     "Viewport",
     "get_browser_relay_registry",
+    "get_desktop_relay_registry",
     "find_computer_target_element",
     "validate_browser_profile_id",
 ]

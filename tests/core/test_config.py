@@ -1070,6 +1070,9 @@ class TestBrowserProfileConfig:
             ("managed", "ephemeral_playwright"),
             ("extension", "extension_relay"),
             ("extension_relay", "extension_relay"),
+            ("desktop", "desktop_relay"),
+            ("computer", "desktop_relay"),
+            ("desktop_relay", "desktop_relay"),
         ],
     )
     def test_runtime_aliases(self, monkeypatch, value, expected):

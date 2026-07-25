@@ -85,6 +85,35 @@ class BrowserRelayStatusMessage(BaseModel):
     url: str | None = Field(default=None, max_length=4_096)
 
 
+class DesktopWindowBounds(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: float
+    y: float
+    width: float = Field(gt=0)
+    height: float = Field(gt=0)
+
+
+class DesktopRelayStatusMessage(BaseModel):
+    """Desktop companion permission, pause, and authorized-window state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["status"]
+    protocol_version: int
+    attached: bool
+    window_id: int | None = Field(default=None, ge=0)
+    title: str | None = Field(default=None, max_length=500)
+    application: str | None = Field(default=None, max_length=500)
+    bounds: DesktopWindowBounds | None = None
+    permissions: dict[str, bool] = Field(default_factory=dict)
+    paused: bool = False
+    emergency_stopped: bool = False
+
+
+RelayStatusMessage = BrowserRelayStatusMessage | DesktopRelayStatusMessage
+
+
 class BrowserRelayPing(BaseModel):
     """Keepalive message sent by the extension service worker."""
 
@@ -136,6 +165,7 @@ class BrowserRelayConnection:
         send: RelaySend,
         close_transport: RelayClose | None = None,
         authorization_id: str | None = None,
+        target_kind: Literal["browser", "desktop"] = "browser",
     ) -> None:
         self.user_id = user_id
         self.client_id = client_id
@@ -143,6 +173,7 @@ class BrowserRelayConnection:
         self._send = send
         self._close_transport = close_transport
         self.authorization_id = authorization_id
+        self.target_kind = target_kind
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending_lock = asyncio.Lock()
         self._closed = False
@@ -150,17 +181,35 @@ class BrowserRelayConnection:
         self.tab_id: int | None = None
         self.title: str | None = None
         self.url: str | None = None
+        self.window_id: int | None = None
+        self.application: str | None = None
+        self.bounds: dict[str, float] | None = None
+        self.permissions: dict[str, bool] = {}
+        self.paused = False
+        self.emergency_stopped = False
         self.connected_at = datetime.now(timezone.utc)
 
     @property
     def is_closed(self) -> bool:
         return self._closed
 
-    def update_status(self, status: BrowserRelayStatusMessage) -> None:
+    @property
+    def _peer_name(self) -> str:
+        return "Desktop Relay" if self.target_kind == "desktop" else "Browser extension"
+
+    def update_status(self, status: RelayStatusMessage) -> None:
         self.attached = status.attached
-        self.tab_id = status.tab_id if status.attached else None
         self.title = status.title if status.attached else None
-        self.url = status.url if status.attached else None
+        if isinstance(status, BrowserRelayStatusMessage):
+            self.tab_id = status.tab_id if status.attached else None
+            self.url = status.url if status.attached else None
+            return
+        self.window_id = status.window_id if status.attached else None
+        self.application = status.application if status.attached else None
+        self.bounds = status.bounds.model_dump(mode="json") if status.bounds else None
+        self.permissions = dict(status.permissions)
+        self.paused = status.paused
+        self.emergency_stopped = status.emergency_stopped
 
     async def request(
         self,
@@ -170,8 +219,13 @@ class BrowserRelayConnection:
         timeout: float = BROWSER_RELAY_DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         if self._closed:
-            raise BrowserRelayUnavailableError("Browser extension is disconnected.")
+            raise BrowserRelayUnavailableError(f"{self._peer_name} is disconnected.")
         if not self.attached:
+            if self.target_kind == "desktop":
+                raise BrowserRelayUnavailableError(
+                    "No desktop window is authorized. Ask the user to open the "
+                    "Xagent Desktop Relay and choose one window."
+                )
             raise BrowserRelayUnavailableError(
                 "No browser tab is attached. Ask the user to open the Xagent "
                 "extension and approve the current tab."
@@ -193,7 +247,7 @@ class BrowserRelayConnection:
             return await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError as exc:
             raise BrowserRelayUnavailableError(
-                f"Browser extension did not answer {command!r} in time."
+                f"{self._peer_name} did not answer {command!r} in time."
             ) from exc
         finally:
             async with self._pending_lock:
@@ -210,27 +264,30 @@ class BrowserRelayConnection:
             future.set_result(response.result or {})
         else:
             future.set_exception(
-                BrowserRelayError(response.error or "Browser extension command failed.")
+                BrowserRelayError(
+                    response.error or f"{self._peer_name} command failed."
+                )
             )
 
     async def close(
         self,
         *,
         code: int = 1000,
-        reason: str = "Browser relay disconnected.",
+        reason: str | None = None,
     ) -> None:
         if self._closed:
             return
+        resolved_reason = reason or f"{self._peer_name} disconnected."
         self._closed = True
         async with self._pending_lock:
             pending = list(self._pending.values())
             self._pending.clear()
         for future in pending:
             if not future.done():
-                future.set_exception(BrowserRelayUnavailableError(reason))
+                future.set_exception(BrowserRelayUnavailableError(resolved_reason))
         if self._close_transport is not None:
             try:
-                await self._close_transport(code, reason)
+                await self._close_transport(code, resolved_reason)
             except Exception:
                 pass
 
@@ -239,10 +296,17 @@ class BrowserRelayConnection:
             "connected": not self._closed,
             "client_id": self.client_id,
             "client_name": self.client_name,
+            "target_kind": self.target_kind,
             "attached": self.attached,
             "tab_id": self.tab_id,
             "title": self.title,
             "url": self.url,
+            "window_id": self.window_id,
+            "application": self.application,
+            "bounds": self.bounds,
+            "permissions": dict(self.permissions),
+            "paused": self.paused,
+            "emergency_stopped": self.emergency_stopped,
             "connected_at": self.connected_at.isoformat(),
         }
 
@@ -276,7 +340,7 @@ class BrowserRelayRegistryProtocol(Protocol):
     async def update_connection_status(
         self,
         connection: BrowserRelayConnection,
-        status: BrowserRelayStatusMessage,
+        status: RelayStatusMessage,
     ) -> None: ...
 
     async def touch_connection(self, connection: BrowserRelayConnection) -> None: ...
@@ -308,10 +372,12 @@ class BrowserRelayRegistry:
     def __init__(
         self,
         *,
+        target_kind: Literal["browser", "desktop"] = "browser",
         pairing_ttl: timedelta = timedelta(minutes=10),
         session_ttl: timedelta = timedelta(days=7),
         claim_ttl: timedelta = timedelta(minutes=30),
     ) -> None:
+        self._target_kind = target_kind
         self._pairing_ttl = pairing_ttl
         self._session_ttl = session_ttl
         self._claim_ttl = claim_ttl
@@ -397,6 +463,11 @@ class BrowserRelayRegistry:
             )
 
     async def register(self, connection: BrowserRelayConnection) -> None:
+        if connection.target_kind != self._target_kind:
+            raise BrowserRelayProtocolError(
+                f"{connection.target_kind} connection cannot register with "
+                f"{self._target_kind} relay"
+            )
         old_connection: BrowserRelayConnection | None
         async with self._lock:
             now = datetime.now(timezone.utc)
@@ -428,8 +499,18 @@ class BrowserRelayRegistry:
     async def update_connection_status(
         self,
         connection: BrowserRelayConnection,
-        status: BrowserRelayStatusMessage,
+        status: RelayStatusMessage,
     ) -> None:
+        if (
+            self._target_kind == "browser"
+            and not isinstance(status, BrowserRelayStatusMessage)
+        ) or (
+            self._target_kind == "desktop"
+            and not isinstance(status, DesktopRelayStatusMessage)
+        ):
+            raise BrowserRelayProtocolError(
+                f"{self._target_kind} relay received the wrong status shape"
+            )
         async with self._lock:
             if self._connections.get(connection.user_id) is connection:
                 connection.update_status(status)
@@ -451,6 +532,10 @@ class BrowserRelayRegistry:
             self._purge_expired(now)
             connection = self._connections.get(user_id)
             if connection is None or connection.is_closed:
+                if self._target_kind == "desktop":
+                    raise BrowserRelayUnavailableError(
+                        "Desktop Relay is not connected for this user."
+                    )
                 raise BrowserRelayUnavailableError(
                     "Browser extension is not connected for this user."
                 )
@@ -460,6 +545,10 @@ class BrowserRelayRegistry:
                 and claim.owner_task_id != owner
                 and now - claim.last_activity <= self._claim_ttl
             ):
+                if self._target_kind == "desktop":
+                    raise BrowserRelayInUseError(
+                        "The user desktop relay is already controlled by another task."
+                    )
                 raise BrowserRelayInUseError(
                     "The user browser is already controlled by another task."
                 )

@@ -76,3 +76,18 @@ def test_extension_binding_requires_authenticated_user_and_owner() -> None:
     assert binding.is_user_controlled is True
     assert binding.require_user_id() == 4
     assert binding.require_owner_task_id() == "task-1"
+
+
+def test_desktop_binding_is_user_controlled_and_task_scoped() -> None:
+    binding = ComputerSessionBinding.from_values(
+        runtime_kind="desktop_relay",
+        owner_task_id="task-2",
+        user_id=5,
+        profile_id="default",
+        profile_root=None,
+    )
+
+    assert binding.is_desktop_relay is True
+    assert binding.is_user_controlled is True
+    assert binding.require_user_id() == 5
+    assert binding.require_owner_task_id() == "task-2"

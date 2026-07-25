@@ -1247,9 +1247,12 @@ def get_storage_root() -> Path:
 
 
 def get_browser_runtime_kind() -> Literal[
-    "ephemeral_playwright", "persistent_playwright", "extension_relay"
+    "ephemeral_playwright",
+    "persistent_playwright",
+    "extension_relay",
+    "desktop_relay",
 ]:
-    """Get the browser runtime used by the unified computer tool.
+    """Get the environment runtime used by the unified computer tool.
 
     Priority:
         1. XAGENT_BROWSER_RUNTIME_KIND environment variable
@@ -1262,8 +1265,12 @@ def get_browser_runtime_kind() -> Literal[
         "persistent": "persistent_playwright",
         "extension": "extension_relay",
         "relay": "extension_relay",
+        "desktop": "desktop_relay",
+        "computer": "desktop_relay",
     }
     value = aliases.get(value, value)
+    if value == "desktop_relay":
+        return "desktop_relay"
     if value == "extension_relay":
         return "extension_relay"
     if value == "persistent_playwright":

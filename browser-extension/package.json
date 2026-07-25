@@ -1,11 +1,14 @@
 {
   "name": "xagent-browser-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
-    "type-check": "tsc -p tsconfig.json --noEmit"
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/test.mjs",
+    "package": "npm run build && node scripts/package.mjs",
+    "check": "npm run type-check && npm test && npm run package"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.4",

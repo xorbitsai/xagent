@@ -9,39 +9,89 @@
   <body>
     <main>
       <header>
-        <div>
-          <h1>Xagent Browser Relay</h1>
-          <p>Only the tab you approve can be controlled.</p>
+        <div class="brand">
+          <img src="xagent-logo.png" alt="" />
+          <div>
+            <h1>Xagent Browser Relay</h1>
+            <p>Control only the tab you explicitly approve.</p>
+          </div>
         </div>
-        <span id="status-badge" class="badge">Offline</span>
+        <span id="status-badge" class="badge">Not paired</span>
       </header>
 
-      <section>
-        <label for="relay-url">Relay WebSocket URL</label>
-        <input
-          id="relay-url"
-          type="url"
-          spellcheck="false"
-          placeholder="ws://localhost:8000/ws/browser-relay"
-        />
+      <ol class="steps" aria-label="Browser relay setup">
+        <li id="step-pair"><span>1</span><strong>Pair</strong></li>
+        <li id="step-connect"><span>2</span><strong>Connect</strong></li>
+        <li id="step-approve"><span>3</span><strong>Approve tab</strong></li>
+      </ol>
 
-        <label for="pairing-token">One-time pairing token</label>
-        <input
-          id="pairing-token"
-          type="password"
-          autocomplete="off"
-          placeholder="Paste the token from Xagent Settings"
-        />
-
-        <button id="connect" class="primary">Connect relay</button>
-        <button id="disconnect" class="quiet">Forget relay session</button>
+      <section class="status-panel" aria-live="polite">
+        <div>
+          <strong id="connection-title">Pairing required</strong>
+          <p id="connection-detail">Paste the setup copied from Xagent Settings.</p>
+        </div>
+        <p id="retry-detail" class="retry-detail" hidden></p>
       </section>
+
+      <section id="pairing-section">
+        <label for="setup-code">Pairing setup</label>
+        <textarea
+          id="setup-code"
+          rows="4"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder='Paste the JSON copied from Xagent Settings'
+        ></textarea>
+
+        <details>
+          <summary>Advanced manual pairing</summary>
+          <div class="advanced-fields">
+            <label for="relay-url">Relay WebSocket URL</label>
+            <input
+              id="relay-url"
+              type="url"
+              spellcheck="false"
+              placeholder="ws://localhost:8000/ws/browser-relay"
+            />
+
+            <label for="pairing-token">One-time pairing token</label>
+            <input
+              id="pairing-token"
+              type="password"
+              autocomplete="off"
+              placeholder="Paste a fresh token"
+            />
+          </div>
+        </details>
+      </section>
+
+      <div class="actions">
+        <button id="connect" class="primary">Pair and connect</button>
+        <button id="disconnect" class="quiet" hidden>
+          Disconnect and forget
+        </button>
+      </div>
 
       <section class="tab-section">
-        <div id="tab-status" class="tab-status">No tab approved</div>
-        <button id="attach" class="primary">Approve current tab</button>
-        <button id="detach" class="quiet">Stop controlling tab</button>
+        <div class="tab-header">
+          <div>
+            <strong>Approved browser tab</strong>
+            <div id="tab-status" class="tab-status">No tab approved</div>
+            <div id="tab-url" class="tab-url"></div>
+          </div>
+          <span id="tab-indicator" class="tab-indicator">OFF</span>
+        </div>
+        <div class="actions">
+          <button id="attach" class="primary">Approve current tab</button>
+          <button id="detach" class="quiet">Stop controlling tab</button>
+        </div>
       </section>
+
+      <aside>
+        Xagent pauses for passwords, one-time codes, payment fields, and other
+        sensitive steps. Enter them directly in the approved tab, then continue
+        the task in Xagent.
+      </aside>
 
       <p id="error" class="error" role="alert"></p>
     </main>

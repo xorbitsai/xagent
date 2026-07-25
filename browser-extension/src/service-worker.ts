@@ -1,7 +1,10 @@
 import {
   PROTOCOL_VERSION,
   isRecord,
+  normalizeRelayUrl,
+  parsePairingSetup,
   parseServerMessage,
+  reconnectDelayMs,
   type RelayCommand,
   type RelayPublicStatus,
 } from "./protocol.js"
@@ -15,6 +18,7 @@ const STORAGE = {
 const SESSION = {
   attachedTabId: "attachedTabId",
 } as const
+const RECONNECT_ALARM = "browser-relay-reconnect"
 
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -23,6 +27,8 @@ let attachedTabId: number | null = null
 let lastFrameId: string | null = null
 let lastError: string | null = null
 let connecting = false
+let reconnectAttempt = 0
+let nextRetryAt: number | null = null
 
 void restoreRuntimeState()
 
@@ -32,6 +38,12 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.runtime.onInstalled.addListener(() => {
   void ensureClientIdentity()
+})
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === RECONNECT_ALARM) {
+    void reconnectStoredSession()
+  }
 })
 
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
@@ -111,6 +123,7 @@ async function restoreRuntimeState(): Promise<void> {
     connectSocket({
       relayUrl,
       sessionToken,
+      reconnecting: true,
     })
   }
 }
@@ -139,8 +152,14 @@ async function ensureClientIdentity(): Promise<{
 async function connectFromUserInput(
   message: Record<string, unknown>,
 ): Promise<void> {
-  const relayUrl = normalizeRelayUrl(String(message.relayUrl ?? ""))
-  const pairingToken = String(message.pairingToken ?? "").trim()
+  const setupCode = String(message.setupCode ?? "").trim()
+  const setup = setupCode ? parsePairingSetup(setupCode) : null
+  const relayUrl = setup
+    ? setup.relayUrl
+    : normalizeRelayUrl(String(message.relayUrl ?? ""))
+  const pairingToken = setup
+    ? setup.pairingToken
+    : String(message.pairingToken ?? "").trim()
   const stored = await chrome.storage.local.get(STORAGE.sessionToken)
   const storedSessionToken = stored[STORAGE.sessionToken]
   const sessionToken =
@@ -149,10 +168,13 @@ async function connectFromUserInput(
     throw new Error("Enter a fresh pairing token.")
   }
   await chrome.storage.local.set({ [STORAGE.relayUrl]: relayUrl })
+  reconnectAttempt = 0
+  nextRetryAt = null
   connectSocket({
     relayUrl,
     pairingToken: pairingToken || undefined,
     sessionToken: pairingToken ? undefined : sessionToken,
+    reconnecting: false,
   })
 }
 
@@ -160,28 +182,38 @@ function connectSocket(options: {
   relayUrl: string
   pairingToken?: string
   sessionToken?: string
+  reconnecting: boolean
 }): void {
-  clearReconnectTimer()
+  clearReconnectSchedule()
   if (socket) {
     socket.onclose = null
     socket.close()
   }
   connecting = true
+  if (options.reconnecting) {
+    reconnectAttempt = Math.max(1, reconnectAttempt)
+  }
   lastError = null
   socket = new WebSocket(options.relayUrl)
+  void updateBadge()
   socket.onopen = () => {
     void (async () => {
-      const identity = await ensureClientIdentity()
-      send({
-        type: "hello",
-        protocol_version: PROTOCOL_VERSION,
-        client_id: identity.clientId,
-        client_name: identity.clientName,
-        ...(options.pairingToken
-          ? { pairing_token: options.pairingToken }
-          : { session_token: options.sessionToken }),
-      })
-      startKeepalive()
+      try {
+        const identity = await ensureClientIdentity()
+        send({
+          type: "hello",
+          protocol_version: PROTOCOL_VERSION,
+          client_id: identity.clientId,
+          client_name: identity.clientName,
+          ...(options.pairingToken
+            ? { pairing_token: options.pairingToken }
+            : { session_token: options.sessionToken }),
+        })
+        startKeepalive()
+      } catch (error) {
+        lastError = errorMessage(error)
+        socket?.close()
+      }
     })()
   }
   socket.onmessage = (event) => {
@@ -189,11 +221,14 @@ function connectSocket(options: {
   }
   socket.onerror = () => {
     lastError = "Could not connect to the Xagent relay."
+    void updateBadge()
   }
   socket.onclose = () => {
     socket = null
     connecting = false
+    lastFrameId = null
     stopKeepalive()
+    void updateBadge()
     void scheduleReconnect()
   }
 }
@@ -203,6 +238,8 @@ async function handleServerMessage(raw: string): Promise<void> {
     const message = parseServerMessage(raw)
     if (message.type === "ready") {
       connecting = false
+      reconnectAttempt = 0
+      nextRetryAt = null
       lastError = null
       if (message.session_token) {
         await chrome.storage.local.set({
@@ -210,6 +247,7 @@ async function handleServerMessage(raw: string): Promise<void> {
         })
       }
       await sendAttachedStatus()
+      await updateBadge()
       return
     }
     if (message.type === "command") {
@@ -218,8 +256,8 @@ async function handleServerMessage(raw: string): Promise<void> {
     }
     if (message.type === "error") {
       lastError = message.error
-      if (message.error.toLowerCase().includes("invalid")) {
-        await chrome.storage.local.remove(STORAGE.sessionToken)
+      if (isAuthenticationError(message.error)) {
+        await invalidateRelaySession(message.error)
       }
     }
   } catch (error) {
@@ -352,7 +390,7 @@ async function sendAttachedStatus(): Promise<void> {
 }
 
 async function forgetRelaySession(): Promise<void> {
-  clearReconnectTimer()
+  await clearReconnectSchedule()
   stopKeepalive()
   if (socket) {
     socket.onclose = null
@@ -360,11 +398,15 @@ async function forgetRelaySession(): Promise<void> {
     socket = null
   }
   connecting = false
+  reconnectAttempt = 0
+  nextRetryAt = null
   lastError = null
+  await detachApprovedTab()
   await chrome.storage.local.remove([
     STORAGE.relayUrl,
     STORAGE.sessionToken,
   ])
+  await updateBadge()
 }
 
 async function scheduleReconnect(): Promise<void> {
@@ -376,15 +418,37 @@ async function scheduleReconnect(): Promise<void> {
     typeof stored[STORAGE.relayUrl] !== "string" ||
     typeof stored[STORAGE.sessionToken] !== "string"
   ) {
+    reconnectAttempt = 0
+    nextRetryAt = null
     return
   }
-  clearReconnectTimer()
+  await clearReconnectSchedule()
+  reconnectAttempt += 1
+  const delayMs = reconnectDelayMs(reconnectAttempt)
+  nextRetryAt = Date.now() + delayMs
+  await chrome.alarms.create(RECONNECT_ALARM, { when: nextRetryAt })
   reconnectTimer = setTimeout(() => {
-    connectSocket({
-      relayUrl: stored[STORAGE.relayUrl] as string,
-      sessionToken: stored[STORAGE.sessionToken] as string,
-    })
-  }, 3_000)
+    void reconnectStoredSession()
+  }, delayMs)
+}
+
+async function reconnectStoredSession(): Promise<void> {
+  if (socket || connecting) return
+  const stored = await chrome.storage.local.get([
+    STORAGE.relayUrl,
+    STORAGE.sessionToken,
+  ])
+  const relayUrl = stored[STORAGE.relayUrl]
+  const sessionToken = stored[STORAGE.sessionToken]
+  if (typeof relayUrl !== "string" || typeof sessionToken !== "string") {
+    await clearReconnectSchedule()
+    return
+  }
+  connectSocket({
+    relayUrl,
+    sessionToken,
+    reconnecting: true,
+  })
 }
 
 function startKeepalive(): void {
@@ -401,11 +465,13 @@ function stopKeepalive(): void {
   }
 }
 
-function clearReconnectTimer(): void {
+async function clearReconnectSchedule(): Promise<void> {
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
   }
+  nextRetryAt = null
+  await chrome.alarms.clear(RECONNECT_ALARM)
 }
 
 function send(message: Record<string, unknown>): void {
@@ -415,6 +481,8 @@ function send(message: Record<string, unknown>): void {
 }
 
 async function publicStatus(): Promise<RelayPublicStatus> {
+  const stored = await chrome.storage.local.get(STORAGE.sessionToken)
+  const hasSession = typeof stored[STORAGE.sessionToken] === "string"
   let tab: chrome.tabs.Tab | null = null
   if (attachedTabId !== null) {
     try {
@@ -423,9 +491,22 @@ async function publicStatus(): Promise<RelayPublicStatus> {
       await clearAttachedTab()
     }
   }
+  const connected = socket?.readyState === WebSocket.OPEN && !connecting
   return {
-    connected: socket?.readyState === WebSocket.OPEN && !connecting,
+    connected,
     connecting,
+    connectionState: connected
+      ? "connected"
+      : connecting && reconnectAttempt > 0
+        ? "reconnecting"
+        : connecting
+          ? "connecting"
+          : hasSession
+            ? "offline"
+            : "unpaired",
+    hasSession,
+    reconnectAttempt,
+    nextRetryAt,
     attached: attachedTabId !== null,
     tabId: attachedTabId,
     title: tab?.title ?? null,
@@ -435,10 +516,18 @@ async function publicStatus(): Promise<RelayPublicStatus> {
 }
 
 async function updateBadge(): Promise<void> {
+  const connected = socket?.readyState === WebSocket.OPEN && !connecting
+  const text = connecting
+    ? "..."
+    : connected && attachedTabId !== null
+      ? "ON"
+      : !connected && attachedTabId !== null
+        ? "!"
+        : ""
   await chrome.action.setBadgeBackgroundColor({
-    color: attachedTabId === null ? "#64748b" : "#16a34a",
+    color: connecting ? "#d97706" : connected ? "#16a34a" : "#dc2626",
   })
-  await chrome.action.setBadgeText({ text: attachedTabId === null ? "" : "ON" })
+  await chrome.action.setBadgeText({ text })
 }
 
 interface BrowserObservation {
@@ -826,17 +915,6 @@ function readCommandValue(
   return isRecord(result) ? result[key] : undefined
 }
 
-function normalizeRelayUrl(raw: string): string {
-  const url = new URL(raw.trim())
-  if (url.protocol !== "ws:" && url.protocol !== "wss:") {
-    throw new Error("Relay URL must use ws:// or wss://.")
-  }
-  if (url.username || url.password || url.search || url.hash) {
-    throw new Error("Relay URL must not include credentials, query, or fragment.")
-  }
-  return url.toString()
-}
-
 function isSupportedUrl(raw: string): boolean {
   if (raw === "about:blank") return true
   try {
@@ -944,10 +1022,42 @@ function errorStatus(error: unknown): RelayPublicStatus {
   return {
     connected: false,
     connecting,
+    connectionState: "offline",
+    hasSession: false,
+    reconnectAttempt,
+    nextRetryAt,
     attached: attachedTabId !== null,
     tabId: attachedTabId,
     title: null,
     url: null,
     error: lastError,
   }
+}
+
+function isAuthenticationError(message: string): boolean {
+  const normalized = message.toLowerCase()
+  return (
+    normalized.includes("invalid") ||
+    normalized.includes("expired") ||
+    normalized.includes("revoked") ||
+    normalized.includes("authentication") ||
+    normalized.includes("no longer exists")
+  )
+}
+
+async function invalidateRelaySession(reason: string): Promise<void> {
+  await clearReconnectSchedule()
+  stopKeepalive()
+  if (socket) {
+    socket.onclose = null
+    socket.close()
+    socket = null
+  }
+  connecting = false
+  reconnectAttempt = 0
+  nextRetryAt = null
+  lastError = reason
+  await chrome.storage.local.remove(STORAGE.sessionToken)
+  await detachApprovedTab()
+  await updateBadge()
 }

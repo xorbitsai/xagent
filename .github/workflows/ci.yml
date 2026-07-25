@@ -683,6 +683,47 @@ jobs:
             || { echo "::error::wheel is missing the Python package (xagent/web/__main__.py)"; exit 1; }
           echo "Wheel bundles the frontend and the full Python package."
 
+  browser-extension-build:
+    name: Browser Extension
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: browser-extension/package-lock.json
+
+      - name: Install extension dependencies
+        working-directory: ./browser-extension
+        run: npm ci
+
+      - name: Test and package extension
+        working-directory: ./browser-extension
+        run: npm run check
+
+      - name: Verify extension package
+        working-directory: ./browser-extension
+        run: |
+          set -e
+          python -m zipfile -t artifacts/xagent-browser-relay-*.zip
+          (cd artifacts && sha256sum -c xagent-browser-relay-*.zip.sha256)
+
+      - name: Upload installable extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: xagent-browser-relay
+          path: |
+            browser-extension/artifacts/*.zip
+            browser-extension/artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
@@ -695,6 +736,7 @@ jobs:
       - pytest-slow
       - e2e
       - frontend-build
+      - browser-extension-build
 
     steps:
       - name: Check required jobs
@@ -719,5 +761,6 @@ jobs:
           check_job "pytest-slow" "${{ needs['pytest-slow'].result }}"
           check_job "e2e" "${{ needs.e2e.result }}"
           check_job "frontend-build" "${{ needs['frontend-build'].result }}"
+          check_job "browser-extension-build" "${{ needs['browser-extension-build'].result }}"
 
           exit "$failed"

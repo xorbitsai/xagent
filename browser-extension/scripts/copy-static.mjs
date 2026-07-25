@@ -11,6 +11,10 @@ await mkdir(dist, { recursive: true })
 await cp(resolve(root, "manifest.json"), resolve(dist, "manifest.json"))
 await cp(resolve(root, "src/popup.html"), resolve(dist, "popup.html"))
 await cp(resolve(root, "src/popup.css"), resolve(dist, "popup.css"))
+await cp(
+  resolve(root, "../frontend/public/xagent_logo.png"),
+  resolve(dist, "xagent-logo.png"),
+)
 
 for (const file of ["protocol.js", "popup.js", "service-worker.js"]) {
   const contents = await readFile(resolve(emittedRoot, file))

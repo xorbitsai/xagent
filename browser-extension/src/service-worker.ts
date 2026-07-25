@@ -275,7 +275,7 @@ async function handleCommand(message: RelayCommand): Promise<void> {
     let observation: BrowserObservation
     if (message.command === "observe") {
       const frameId = requiredString(message.payload.frame_id, "frame_id")
-      observation = await captureObservation(attachedTabId)
+      observation = await captureObservation(attachedTabId, frameId)
       lastFrameId = frameId
     } else if (message.command === "act") {
       const expectedFrameId = requiredString(
@@ -291,12 +291,16 @@ async function handleCommand(message: RelayCommand): Promise<void> {
       if (!isRecord(message.payload.action)) {
         throw new Error("Action payload is invalid.")
       }
-      await performAction(attachedTabId, message.payload.action)
+      await performAction(
+        attachedTabId,
+        message.payload.action,
+        expectedFrameId,
+      )
       const actionType = String(message.payload.action.type ?? "")
       if (actionType !== "navigate" && actionType !== "wait") {
         await delay(250)
       }
-      observation = await captureObservation(attachedTabId)
+      observation = await captureObservation(attachedTabId, frameId)
       lastFrameId = frameId
     } else {
       throw new Error(`Unsupported relay command: ${String(message.command)}`)
@@ -530,6 +534,9 @@ async function updateBadge(): Promise<void> {
   await chrome.action.setBadgeText({ text })
 }
 
+const MAX_OBSERVATION_ELEMENTS = 100
+const ELEMENT_MARKER_ATTRIBUTE = "data-xagent-eid"
+
 interface BrowserObservation {
   screenshot_base64: string
   viewport: {
@@ -538,12 +545,22 @@ interface BrowserObservation {
     device_pixel_ratio: number
   }
   elements: unknown[]
+  elements_truncated: boolean
+  element_extraction_failed: boolean
   active_url: string | null
   title: string | null
 }
 
-async function captureObservation(tabId: number): Promise<BrowserObservation> {
+async function captureObservation(
+  tabId: number,
+  frameToken: string,
+): Promise<BrowserObservation> {
   const target = { tabId }
+  const collectOptions = JSON.stringify({
+    frameToken,
+    limit: MAX_OBSERVATION_ELEMENTS,
+    markerAttribute: ELEMENT_MARKER_ATTRIBUTE,
+  })
   const [screenshot, viewportResult, elementsResult] = await Promise.all([
     chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
       format: "png",
@@ -556,17 +573,25 @@ async function captureObservation(tabId: number): Promise<BrowserObservation> {
         "active_url: location.href, title: document.title})",
       returnByValue: true,
     }),
-    chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(${collectInteractiveElements.toString()})()`,
-      returnByValue: true,
-    }),
+    chrome.debugger
+      .sendCommand(target, "Runtime.evaluate", {
+        expression: `(${collectInteractiveElements.toString()})(${collectOptions})`,
+        returnByValue: true,
+      })
+      .catch(() => null),
   ])
   const screenshotData = readCommandValue(screenshot, "data")
   const viewport = readRuntimeValue(viewportResult)
-  const elements = readRuntimeValue(elementsResult)
+  const extraction = readRuntimeValue(elementsResult)
   if (typeof screenshotData !== "string" || !isRecord(viewport)) {
     throw new Error("Chrome returned an invalid screenshot observation.")
   }
+  // A screenshot without element hints is still usable, but the backend must
+  // know the structure is unknown so its policy can fail closed.
+  const extracted = isRecord(extraction) ? extraction : null
+  const elements = extracted && Array.isArray(extracted.elements)
+    ? extracted.elements
+    : []
   return {
     screenshot_base64: screenshotData,
     viewport: {
@@ -577,16 +602,54 @@ async function captureObservation(tabId: number): Promise<BrowserObservation> {
         "device pixel ratio",
       ),
     },
-    elements: Array.isArray(elements) ? elements.slice(0, 100) : [],
+    elements: elements.slice(0, MAX_OBSERVATION_ELEMENTS),
+    elements_truncated: Boolean(extracted?.truncated),
+    element_extraction_failed: extracted === null,
     active_url:
       typeof viewport.active_url === "string" ? viewport.active_url : null,
     title: typeof viewport.title === "string" ? viewport.title : null,
   }
 }
 
+async function verifyHitTarget(
+  tabId: number,
+  action: Record<string, unknown>,
+  expectedFrameToken: string,
+  x: number,
+  y: number,
+): Promise<void> {
+  const elementId = action.target_element_id
+  if (typeof elementId !== "string" || !elementId) {
+    return
+  }
+  const options = JSON.stringify({
+    x,
+    y,
+    markerAttribute: ELEMENT_MARKER_ATTRIBUTE,
+  })
+  const result = await chrome.debugger
+    .sendCommand({ tabId }, "Runtime.evaluate", {
+      expression: `(${hitTestMarker.toString()})(${options})`,
+      returnByValue: true,
+    })
+    .catch(() => null)
+  const hit = readRuntimeValue(result)
+  if (!isRecord(hit) || hit.found !== true) return
+  const expected = `${expectedFrameToken}:${elementId}`
+  if (hit.marker === expected) return
+  const obstruction =
+    typeof hit.tag === "string" && hit.tag ? hit.tag : "another element"
+  throw new Error(
+    `${elementId} is covered by ${obstruction} at the clicked position. ` +
+      "Take a fresh screenshot, then dismiss the overlay, scroll the target " +
+      "into the clear, or choose a different element.",
+  )
+}
+
 async function performAction(
   tabId: number,
   action: Record<string, unknown>,
+  expectedFrameToken: string,
 ): Promise<void> {
   const type = requiredString(action.type, "action type")
   const target = { tabId }
@@ -613,6 +676,7 @@ async function performAction(
   if (type === "type") {
     if (isRecord(action.target)) {
       const point = await pointInPixels(tabId, action.target)
+      await verifyHitTarget(tabId, action, expectedFrameToken, point.x, point.y)
       await dispatchClick(tabId, point.x, point.y, 1)
     }
     await chrome.debugger.sendCommand(target, "Input.insertText", {
@@ -673,6 +737,7 @@ async function performAction(
   }
   const point = await pointInPixels(tabId, action.target)
   if (type === "click" || type === "double_click") {
+    await verifyHitTarget(tabId, action, expectedFrameToken, point.x, point.y)
     await dispatchClick(tabId, point.x, point.y, type === "double_click" ? 2 : 1)
   } else if (type === "move") {
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
@@ -757,7 +822,12 @@ async function dispatchKeypress(tabId: number, keys: string[]): Promise<void> {
   })
 }
 
-function collectInteractiveElements(): unknown[] {
+function collectInteractiveElements(options: {
+  frameToken: string
+  limit: number
+  markerAttribute: string
+}): { elements: unknown[]; truncated: boolean } {
+  const { frameToken, limit, markerAttribute } = options
   const selector = [
     "a[href]",
     "button",
@@ -773,18 +843,44 @@ function collectInteractiveElements(): unknown[] {
     "[role='menuitem']",
     "[onclick]",
     "[tabindex]",
+    "[contenteditable='true']",
   ].join(",")
   const width = Math.max(1, window.innerWidth)
   const height = Math.max(1, window.innerHeight)
   const elements: unknown[] = []
-  for (const [index, node] of Array.from(
-    document.querySelectorAll<HTMLElement>(selector),
-  ).entries()) {
+  let truncated = false
+
+  // Open shadow trees are invisible to a document-level querySelectorAll, so
+  // they are walked explicitly to keep controls inside web components usable.
+  const collect = (root: Document | ShadowRoot, out: HTMLElement[]): void => {
+    try {
+      for (const node of Array.from(
+        root.querySelectorAll<HTMLElement>(selector),
+      )) {
+        out.push(node)
+      }
+      for (const host of Array.from(root.querySelectorAll<HTMLElement>("*"))) {
+        if (host.shadowRoot) collect(host.shadowRoot, out)
+      }
+    } catch {
+      // A malformed selector context is skipped rather than failing the frame.
+    }
+  }
+  const candidates: HTMLElement[] = []
+  collect(document, candidates)
+
+  for (const node of candidates) {
+    if (elements.length >= limit) {
+      truncated = true
+      break
+    }
     const rect = node.getBoundingClientRect()
     const style = window.getComputedStyle(node)
     if (
       style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
       style.display === "none" ||
+      Number(style.opacity) === 0 ||
       rect.width < 2 ||
       rect.height < 2 ||
       rect.right <= 0 ||
@@ -821,8 +917,16 @@ function collectInteractiveElements(): unknown[] {
     const top = Math.max(0, rect.top)
     const right = Math.min(width, rect.right)
     const bottom = Math.min(height, rect.bottom)
+    const elementId = `dom-${elements.length + 1}`
+    try {
+      // Stamped so a later click can prove the coordinate still resolves to
+      // this element instead of an overlay that appeared in between.
+      node.setAttribute(markerAttribute, `${frameToken}:${elementId}`)
+    } catch {
+      // A read-only node is still reported; it just cannot be hit-tested.
+    }
     elements.push({
-      element_id: `dom-${index + 1}`,
+      element_id: elementId,
       bounds: {
         x: left / width,
         y: top / height,
@@ -841,9 +945,27 @@ function collectInteractiveElements(): unknown[] {
         focused: node === document.activeElement,
       },
     })
-    if (elements.length >= 100) break
   }
-  return elements
+  return { elements, truncated }
+}
+
+function hitTestMarker(options: {
+  x: number
+  y: number
+  markerAttribute: string
+}): { marker: string | null; tag: string | null; found: boolean } {
+  const { x, y, markerAttribute } = options
+  let node = document.elementFromPoint(x, y)
+  if (node === null) return { marker: null, tag: null, found: false }
+  const tag = node.tagName ? node.tagName.toLowerCase() : null
+  // A coordinate usually lands on a label or icon nested inside the control
+  // that was extracted, so walk outward before giving up.
+  while (node !== null) {
+    const marker = node.getAttribute ? node.getAttribute(markerAttribute) : null
+    if (marker) return { marker, tag, found: true }
+    node = node.parentElement
+  }
+  return { marker: null, tag, found: true }
 }
 
 async function readViewport(
@@ -903,7 +1025,7 @@ async function waitForTabReady(tabId: number, timeoutMs: number): Promise<void> 
   await delay(250)
 }
 
-function readRuntimeValue(result: object | undefined): unknown {
+function readRuntimeValue(result: object | null | undefined): unknown {
   if (!isRecord(result) || !isRecord(result.result)) return undefined
   return result.result.value
 }

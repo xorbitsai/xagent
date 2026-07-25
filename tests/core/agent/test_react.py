@@ -168,6 +168,10 @@ class FakeGroupedTool:
 
 
 class FakeBrowserNavigateTool:
+    # Mirrors BrowserTaskSessionMixin: the pattern injects the plan step only
+    # for tools that share the per-task browser session.
+    uses_browser_session = True
+
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
@@ -230,12 +234,14 @@ class ComputerConfirmationTool:
         confirmation_id: str,
         decision: str,
         session_id: str,
+        frame_signature: Any = None,
     ) -> None:
         self.approval = {
             "confirmation_id": confirmation_id,
             "decision": decision,
             "session_id": session_id,
         }
+        self.frame_signature = dict(frame_signature or {})
         self.authorizations.append(self.approval)
 
     async def run_json_async(self, args: dict[str, Any]) -> Any:

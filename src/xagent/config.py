@@ -44,6 +44,11 @@ BROWSER_RUNTIME_KIND = "XAGENT_BROWSER_RUNTIME_KIND"
 BROWSER_PROFILE_ROOT = "XAGENT_BROWSER_PROFILE_ROOT"
 BROWSER_PROFILE_ID = "XAGENT_BROWSER_PROFILE_ID"
 BROWSER_RELAY_BACKEND = "XAGENT_BROWSER_RELAY_BACKEND"
+BROWSER_NAVIGATION_ALLOWLIST = "XAGENT_BROWSER_NAVIGATION_ALLOWLIST"
+BROWSER_NAVIGATION_DENYLIST = "XAGENT_BROWSER_NAVIGATION_DENYLIST"
+BROWSER_LEGACY_DOM_TOOLS = "XAGENT_BROWSER_LEGACY_DOM_TOOLS"
+COMPUTER_MAX_LIVE_FRAMES = "XAGENT_COMPUTER_MAX_LIVE_FRAMES"
+COMPUTER_OBSERVATION_RETENTION = "XAGENT_COMPUTER_OBSERVATION_RETENTION"
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
 FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
@@ -1307,6 +1312,77 @@ def get_browser_profile_id() -> str:
         value,
     )
     return "default"
+
+
+def _get_host_list_env(env_var: str) -> tuple[str, ...]:
+    """Parse a comma-separated host pattern list from the environment."""
+    raw = os.getenv(env_var)
+    if not raw:
+        return ()
+    hosts = [item.strip().lower().lstrip(".") for item in raw.split(",")]
+    return tuple(dict.fromkeys(host for host in hosts if host))
+
+
+def get_browser_navigation_allowlist() -> tuple[str, ...]:
+    """Get the hosts the computer tool may navigate to.
+
+    An empty tuple means every host is permitted unless it is denied. Entries
+    match the host itself and its subdomains.
+
+    Priority:
+        1. XAGENT_BROWSER_NAVIGATION_ALLOWLIST environment variable
+        2. Empty (no allowlist restriction)
+    """
+    return _get_host_list_env(BROWSER_NAVIGATION_ALLOWLIST)
+
+
+def get_browser_navigation_denylist() -> tuple[str, ...]:
+    """Get the hosts the computer tool must never navigate to.
+
+    Priority:
+        1. XAGENT_BROWSER_NAVIGATION_DENYLIST environment variable
+        2. Empty (nothing explicitly denied)
+    """
+    return _get_host_list_env(BROWSER_NAVIGATION_DENYLIST)
+
+
+def get_browser_legacy_dom_tools_enabled() -> bool:
+    """Whether the low-level ``browser_*`` DOM tools are exposed to the model.
+
+    These tools drive the same browser session as ``computer`` but bypass its
+    action policy entirely: ``browser_fill`` can type into a password field and
+    ``browser_evaluate`` can run arbitrary JavaScript. They stay off unless a
+    deployment explicitly accepts that.
+
+    Priority:
+        1. XAGENT_BROWSER_LEGACY_DOM_TOOLS environment variable
+        2. ``False``
+    """
+    return _get_bool_env(BROWSER_LEGACY_DOM_TOOLS, False)
+
+
+def get_computer_max_live_frames() -> int:
+    """How many recent screenshots stay materialized as images for the model.
+
+    Older observations degrade to their text description. Every frame kept
+    alive is re-encoded and re-sent on every model call, so this bounds both
+    request size and image-token spend.
+
+    Priority:
+        1. XAGENT_COMPUTER_MAX_LIVE_FRAMES environment variable
+        2. ``2``
+    """
+    return _get_positive_int_env(COMPUTER_MAX_LIVE_FRAMES, 2)
+
+
+def get_computer_observation_retention() -> int:
+    """How many screenshots per session are retained on disk.
+
+    Priority:
+        1. XAGENT_COMPUTER_OBSERVATION_RETENTION environment variable
+        2. ``40``
+    """
+    return _get_positive_int_env(COMPUTER_OBSERVATION_RETENTION, 40)
 
 
 def get_sandbox_image() -> str:

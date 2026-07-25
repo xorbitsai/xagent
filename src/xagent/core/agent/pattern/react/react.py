@@ -43,6 +43,14 @@ from typing import Any, cast
 
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
+from ....tools.confirmation import (
+    STEP_SESSION_ARG,
+    TOOL_ACTION_CONFIRMATION_KIND,
+    confirmation_grant_callable,
+    strip_reserved_tool_args,
+    tool_result_waits_for_user,
+    user_approved_confirmation,
+)
 from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
@@ -76,7 +84,6 @@ DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
 REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 REACT_DECISION_TOOL_CALL = "tool_call"
-_COMPUTER_APPROVAL_ARG = "_xagent_computer_approval"
 UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
@@ -217,7 +224,7 @@ class ReActPattern(AgentPattern):
         self.force_final_answer_next = False
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
-        self.approved_tool_confirmation: dict[str, str] | None = None
+        self.approved_tool_confirmation: dict[str, Any] | None = None
         self.task_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
@@ -1090,15 +1097,8 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = (
             dict(waiting_request) if isinstance(waiting_request, dict) else None
         )
-        approved_confirmation = state.get("approved_tool_confirmation")
-        self.approved_tool_confirmation = (
-            {
-                str(key): str(value)
-                for key, value in approved_confirmation.items()
-                if isinstance(key, str) and isinstance(value, str)
-            }
-            if isinstance(approved_confirmation, dict)
-            else None
+        self.approved_tool_confirmation = self._restored_tool_confirmation(
+            state.get("approved_tool_confirmation")
         )
         stored_task_text = state.get("task_text")
         self.task_text = str(stored_task_text) if stored_task_text else None
@@ -1151,6 +1151,11 @@ class ReActPattern(AgentPattern):
             waiting_request=waiting_request,
             response=response or "",
         )
+        self._note_unclear_confirmation_response(
+            context=context,
+            waiting_request=waiting_request,
+            response=response or "",
+        )
         waiting_task = self.waiting_for_user_request.get("task_text")
         if waiting_task and self.task_text is None:
             self.task_text = str(waiting_task)
@@ -1193,6 +1198,63 @@ class ReActPattern(AgentPattern):
             return str(getattr(message, "content", "") or "")
         return None
 
+    @staticmethod
+    def _restored_tool_confirmation(stored: Any) -> dict[str, Any] | None:
+        """Rebuild a persisted approval grant after a checkpoint restore.
+
+        The grant is not flat: ``frame_signature`` carries the structure of the
+        frame the user approved, and it is exactly what makes the approval
+        verifiable after a resume, so it must survive restoration intact.
+        """
+        if not isinstance(stored, dict):
+            return None
+        confirmation_id = str(stored.get("confirmation_id") or "")
+        decision = str(stored.get("decision") or "")
+        if not confirmation_id or decision != "approve":
+            return None
+        frame_signature = stored.get("frame_signature")
+        return {
+            "tool_name": str(stored.get("tool_name") or ""),
+            "confirmation_id": confirmation_id,
+            "decision": decision,
+            "session_id": str(stored.get("session_id") or ""),
+            "frame_signature": (
+                dict(frame_signature) if isinstance(frame_signature, dict) else {}
+            ),
+        }
+
+    def _note_unclear_confirmation_response(
+        self,
+        *,
+        context: Any,
+        waiting_request: dict[str, Any],
+        response: str,
+    ) -> None:
+        """Tell the model when a confirmation reply carried no clear decision.
+
+        Silently treating an unreadable answer as refusal invites the model to
+        re-propose the same action, which would pause the run again. Stating it
+        plainly lets the model ask the user directly instead.
+        """
+        confirmation = waiting_request.get("confirmation")
+        if not isinstance(confirmation, dict):
+            return
+        if confirmation.get("kind") != TOOL_ACTION_CONFIRMATION_KIND:
+            return
+        if user_approved_confirmation(response) is not None:
+            return
+        summary = str(confirmation.get("action_summary") or "the proposed action")
+        add_message = getattr(context, "add_message", None)
+        if not callable(add_message):
+            return
+        add_message(
+            "system",
+            f"The user's reply did not clearly approve or decline “{summary}”. "
+            "It was not carried out. Ask the user plainly whether to proceed, or "
+            "continue without it.",
+            hidden=True,
+        )
+
     def _apply_tool_confirmation_response(
         self,
         *,
@@ -1202,49 +1264,28 @@ class ReActPattern(AgentPattern):
         confirmation = waiting_request.get("confirmation")
         if not isinstance(confirmation, dict):
             return
-        if confirmation.get("kind") != "computer_action_confirmation":
-            return
         confirmation_id = confirmation.get("confirmation_id")
         if not isinstance(confirmation_id, str) or not confirmation_id:
             return
-        if not self._computer_action_was_approved(response):
+        if confirmation.get("kind") != TOOL_ACTION_CONFIRMATION_KIND:
+            # A takeover asks the user to act in the browser themselves. There
+            # is nothing to authorize, and the tool has already refused to
+            # automate the step, so no grant is issued.
             self.approved_tool_confirmation = None
             return
+        if user_approved_confirmation(response) is not True:
+            self.approved_tool_confirmation = None
+            return
+        frame_signature = confirmation.get("frame_signature")
         self.approved_tool_confirmation = {
-            "tool_name": str(waiting_request.get("tool_name") or "computer"),
+            "tool_name": str(waiting_request.get("tool_name") or ""),
             "confirmation_id": confirmation_id,
             "decision": "approve",
             "session_id": str(waiting_request.get("session_id") or ""),
+            "frame_signature": (
+                dict(frame_signature) if isinstance(frame_signature, dict) else {}
+            ),
         }
-
-    @staticmethod
-    def _computer_action_was_approved(response: str) -> bool:
-        values = {
-            line.split(":", 1)[-1].strip().casefold()
-            for line in response.splitlines()
-            if line.strip()
-        }
-        denied = {
-            "deny",
-            "denied",
-            "deny this action",
-            "cancel",
-            "cancel this action",
-            "拒绝",
-            "取消",
-        }
-        if values & denied:
-            return False
-        approved = {
-            "approve",
-            "approved",
-            "approve this action",
-            "yes",
-            "批准",
-            "同意",
-            "是",
-        }
-        return bool(values & approved)
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
         if isinstance(response, str):
@@ -1846,12 +1887,7 @@ class ReActPattern(AgentPattern):
         )
         return waiting_result
 
-    @staticmethod
-    def _tool_result_waits_for_user(result: Any) -> bool:
-        return (
-            isinstance(result, dict)
-            and str(result.get("status") or "").strip().lower() == "waiting_for_user"
-        )
+    _tool_result_waits_for_user = staticmethod(tool_result_waits_for_user)
 
     async def _run_concurrent_batch(
         self,
@@ -2861,29 +2897,46 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         args = self._tool_call_args_dict(tool_call, require_mapping=True)
         tool_name = self._tool_name(tool)
-        if tool_name == "computer":
-            args.pop(_COMPUTER_APPROVAL_ARG, None)
-            approval = self.approved_tool_confirmation
-            if approval is not None and approval.get("tool_name") == tool_name:
-                authorize_confirmation = getattr(
-                    tool,
-                    "authorize_confirmation",
-                    None,
-                )
-                if callable(authorize_confirmation):
-                    authorize_confirmation(
-                        confirmation_id=approval.get("confirmation_id", ""),
-                        decision=approval.get("decision", ""),
-                        session_id=approval.get("session_id", ""),
-                    )
-                self.approved_tool_confirmation = None
-        if not (tool_name.startswith("browser_") or tool_name == "computer"):
+        # Runtime-reserved arguments are stripped before anything is injected,
+        # so a model cannot forge an approval by naming the internal field.
+        strip_reserved_tool_args(args)
+        self._grant_pending_confirmation(tool, tool_name)
+        if not self._tool_uses_browser_session(tool):
             return args
 
         step_id = tool_call.get("dag_step_id") or tool_call.get("step_id")
         if step_id and not args.get("session_id"):
-            args.setdefault("_xagent_step_id", str(step_id))
+            args.setdefault(STEP_SESSION_ARG, str(step_id))
         return args
+
+    def _grant_pending_confirmation(self, tool: Any, tool_name: str) -> None:
+        """Hand a tool the user's approval for exactly its next call.
+
+        The grant is matched by capability rather than by tool name: tools reach
+        the pattern wrapped (output filtering, sandboxing), so a name check
+        would silently drop the approval and re-ask the user forever.
+        """
+        approval = self.approved_tool_confirmation
+        if approval is None:
+            return
+        granted_to = str(approval.get("tool_name") or "")
+        if granted_to and granted_to != tool_name:
+            return
+        grant = confirmation_grant_callable(tool)
+        if grant is None:
+            return
+        grant(
+            confirmation_id=approval.get("confirmation_id", ""),
+            decision=approval.get("decision", ""),
+            session_id=approval.get("session_id", ""),
+            frame_signature=approval.get("frame_signature") or {},
+        )
+        self.approved_tool_confirmation = None
+
+    @staticmethod
+    def _tool_uses_browser_session(tool: Any) -> bool:
+        """Whether a tool participates in the shared per-task browser session."""
+        return getattr(tool, "uses_browser_session", False) is True
 
     def _find_tool(self, name: str, tools: list[Any]) -> Any:
         for tool in tools:

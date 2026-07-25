@@ -10,6 +10,7 @@ from uuid import uuid4
 from ...context_ref import (
     normalize_context_references,
     split_tool_result_context_references,
+    split_tool_result_supersedes_scope,
 )
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ...tools.artifacts import (
@@ -162,7 +163,10 @@ class ExecutionContext:
         *,
         context_refs: Any = (),
     ) -> Message:
-        public_result, embedded_refs = split_tool_result_context_references(result)
+        public_result, supersedes_scope = split_tool_result_supersedes_scope(result)
+        public_result, embedded_refs = split_tool_result_context_references(
+            public_result
+        )
         explicit_refs = normalize_context_references(context_refs)
         all_context_refs = []
         seen_context_refs: set[str] = set()
@@ -176,7 +180,7 @@ class ExecutionContext:
             tool_name, public_result
         )
         content = self._format_tool_result(tool_name, context_result)
-        metadata = {
+        metadata: dict[str, Any] = {
             "tool_name": tool_name,
             "raw_result": context_result,
             "workspace_id": self.workspace_id,
@@ -184,12 +188,59 @@ class ExecutionContext:
             "cwd": self.cwd,
             "memory_session_id": self.memory_session_id,
         }
+        if supersedes_scope:
+            metadata["supersedes_scope"] = supersedes_scope
+            self._compact_superseded_tool_messages(supersedes_scope)
         return self.add_message(
             "tool",
             content,
             tool_call_id=tool_call_id,
             metadata=metadata,
             context_refs=tuple(all_context_refs),
+        )
+
+    def _compact_superseded_tool_messages(self, scope: str) -> None:
+        """Shrink earlier tool results that this scope's new result replaces.
+
+        Only the bulky machine detail is dropped. The summary line keeps what a
+        reader needs to follow the transcript, and rewriting each message just
+        once keeps the prompt prefix stable for provider caching.
+        """
+        for index, message in enumerate(self.messages):
+            metadata = getattr(message, "metadata", None) or {}
+            if metadata.get("supersedes_scope") != scope:
+                continue
+            if metadata.get("superseded"):
+                continue
+            summary = self._superseded_tool_summary(metadata)
+            self.messages[index] = replace(
+                message,
+                content=summary,
+                metadata={
+                    **metadata,
+                    "superseded": True,
+                    "raw_result": None,
+                },
+            )
+
+    @staticmethod
+    def _superseded_tool_summary(metadata: dict[str, Any]) -> str:
+        tool_name = str(metadata.get("tool_name") or "tool")
+        raw_result = metadata.get("raw_result")
+        details: list[str] = []
+        if isinstance(raw_result, dict):
+            for key in ("frame_id", "active_url", "title"):
+                value = raw_result.get(key) or (
+                    (raw_result.get("observation") or {}).get(key)
+                    if isinstance(raw_result.get("observation"), dict)
+                    else None
+                )
+                if value:
+                    details.append(f"{key}={value}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        return (
+            f"[{tool_name} result superseded by a later observation{suffix}. "
+            "The page state it described no longer applies.]"
         )
 
     def attach_workspace(

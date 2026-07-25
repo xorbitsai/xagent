@@ -142,6 +142,24 @@ class TaskWorkspace:
         # Create directory structure
         self._ensure_directories()
 
+    def register_internal_file(
+        self, file_path: str, file_id: Optional[str] = None
+    ) -> str:
+        """Register a runtime-internal file without creating a user file record.
+
+        Files such as computer-use observation frames are execution scratch
+        data: they must be resolvable by file_id while the execution runs, but
+        they are not deliverables and must not appear in the user's file list.
+        Because no database row backs them, callers must tolerate a file_id
+        that no longer resolves (a later process, or after retention pruning).
+        """
+        resolved_path = Path(file_path).resolve()
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise FileNotFoundError(f"File not found for registration: {file_path}")
+        final_file_id = str(file_id).strip() if file_id else str(uuid4())
+        self._remember_file_registration(final_file_id, resolved_path)
+        return final_file_id
+
     def register_file(
         self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
     ) -> str:

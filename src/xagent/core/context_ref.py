@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from enum import Enum
 from typing import Any, Literal
 
@@ -9,6 +10,22 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .file_ref import sanitize_file_ref_for_context
 
 CONTEXT_REFS_KEY = "_xagent_context_refs"
+
+#: Reserved envelope field naming a scope whose earlier tool results this one
+#: replaces. A ``computer`` observation describes a page that no longer exists
+#: once the next action runs, so keeping every past element list in full would
+#: grow the context without adding usable information.
+SUPERSEDES_SCOPE_KEY = "_xagent_supersedes_scope"
+
+
+def split_tool_result_supersedes_scope(result: Any) -> tuple[Any, str | None]:
+    """Detach the supersede scope from a tool result before formatting."""
+    if not isinstance(result, dict) or SUPERSEDES_SCOPE_KEY not in result:
+        return result, None
+    public_result = dict(result)
+    scope = public_result.pop(SUPERSEDES_SCOPE_KEY)
+    normalized = str(scope).strip() if scope is not None else ""
+    return public_result, normalized or None
 
 
 def _validated_metadata(value: Any) -> dict[str, Any]:
@@ -133,13 +150,36 @@ class ContextReference(BaseModel):
         return f"[image: {filename}, file_id={self.file_id}{frame}]{fallback}"
 
     def estimated_tokens(self) -> int:
-        # Provider image-token accounting varies. This conservative fixed budget
-        # prevents compaction from treating references as free while ensuring no
-        # binary or base64 payload is ever inspected.
-        detail_tokens = (
-            765 if self.detail in {ImageDetail.HIGH, ImageDetail.ORIGINAL} else 255
-        )
-        return detail_tokens + max(1, len(self.compact_text()) // 4)
+        # Provider image-token accounting varies, but a flat constant makes
+        # compaction believe a full-viewport screenshot is as cheap as a
+        # thumbnail. When the reference records the viewport it was captured
+        # at, the tile-based estimate that mainstream providers use is applied
+        # instead. No binary or base64 payload is ever inspected.
+        return self._image_tokens() + max(1, len(self.compact_text()) // 4)
+
+    def _image_tokens(self) -> int:
+        if self.detail is ImageDetail.LOW:
+            return 85
+        viewport = self.metadata.get("viewport")
+        if not isinstance(viewport, dict):
+            return (
+                765 if self.detail in {ImageDetail.HIGH, ImageDetail.ORIGINAL} else 255
+            )
+        try:
+            width = int(viewport.get("width") or 0)
+            height = int(viewport.get("height") or 0)
+        except (TypeError, ValueError):
+            return 255
+        if width <= 0 or height <= 0:
+            return 255
+        # Long side capped at 2048, short side at 768, then billed per 512px
+        # tile plus a fixed base cost.
+        scale = min(1.0, 2048 / max(width, height))
+        width, height = int(width * scale), int(height * scale)
+        scale = min(1.0, 768 / max(1, min(width, height)))
+        width, height = int(width * scale), int(height * scale)
+        tiles = math.ceil(max(1, width) / 512) * math.ceil(max(1, height) / 512)
+        return 85 + 170 * tiles
 
 
 def normalize_context_references(

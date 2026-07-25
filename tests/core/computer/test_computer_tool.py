@@ -370,8 +370,9 @@ async def test_computer_tool_rejects_approval_after_target_changes() -> None:
     assert factory.environments[0].executed == []
 
 
-@pytest.mark.asyncio
-async def test_computer_tool_rejects_approval_after_environment_is_lost() -> None:
+def _lost_environment_tool() -> tuple[ComputerTool, EnvironmentFactory]:
+    """A tool whose in-memory environment was dropped, as after a resume."""
+
     def observations(session_id: str, index: int) -> ComputerObservation:
         return make_observation(
             session_id,
@@ -386,6 +387,12 @@ async def test_computer_tool_rejects_approval_after_environment_is_lost() -> Non
         workspace=object(),  # type: ignore[arg-type]
         environment_factory=factory,
     )
+    return tool, factory
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_rejects_approval_without_frame_signature() -> None:
+    tool, factory = _lost_environment_tool()
     await tool.run_json_async({})
     action_args = {
         "expected_frame_id": "frame-1",
@@ -403,10 +410,73 @@ async def test_computer_tool_rejects_approval_after_environment_is_lost() -> Non
 
     assert result["success"] is False
     assert result["status"] == "stale_approval"
-    assert "no longer available" in result["error"]
+    assert "action was not executed" in result["error"]
     assert result[CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == "image-1"
     assert len(factory.environments) == 2
     assert factory.environments[1].executed == []
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_executes_approval_after_environment_is_lost() -> None:
+    """A resume in a fresh process still honours the user's approval.
+
+    The grant carries the signature of the frame the user saw, so the action is
+    re-validated against a new observation instead of being discarded — without
+    this the model would have to ask for approval again on every resume.
+    """
+    tool, factory = _lost_environment_tool()
+    await tool.run_json_async({})
+    action_args = {
+        "expected_frame_id": "frame-1",
+        "actions": [{"type": "click", "target": {"element_id": "dom-1"}}],
+    }
+    waiting = await tool.run_json_async(action_args)
+    confirmation = waiting["confirmation"]
+    assert confirmation["frame_signature"]["active_url"] == (
+        "https://example.com/settings"
+    )
+
+    tool._environments.clear()
+    tool.authorize_confirmation(
+        confirmation_id=confirmation["confirmation_id"],
+        decision="approve",
+        session_id=waiting["session_id"],
+        frame_signature=confirmation["frame_signature"],
+    )
+    result = await tool.run_json_async(action_args)
+
+    assert result["success"] is True
+    assert len(factory.environments) == 2
+    executed = factory.environments[1].executed
+    assert len(executed) == 1
+    # Re-validated against the frame observed after the resume, not the stale one.
+    assert executed[0].expected_frame_id == "frame-1"
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_stops_asking_after_repeated_refusal() -> None:
+    """A re-proposed action that was never carried out becomes a plain failure.
+
+    Otherwise a model that keeps re-planning the same declined click would pause
+    the execution for the user again and again.
+    """
+    tool, factory = _lost_environment_tool()
+    await tool.run_json_async({})
+    action_args = {
+        "expected_frame_id": "frame-1",
+        "actions": [{"type": "click", "target": {"element_id": "dom-1"}}],
+    }
+
+    for _ in range(2):
+        waiting = await tool.run_json_async(action_args)
+        assert waiting["status"] == "waiting_for_user"
+
+    exhausted = await tool.run_json_async(action_args)
+
+    assert exhausted["success"] is False
+    assert exhausted.get("status") is None
+    assert "already asked the user" in exhausted["error"]
+    assert factory.environments[0].executed == []
 
 
 @pytest.mark.asyncio

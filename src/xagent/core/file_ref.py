@@ -129,8 +129,14 @@ def build_workspace_file_ref(
     file_path: str | Path,
     file_id: str | None = None,
     mime_type: str | None = None,
+    internal: bool = False,
 ) -> dict[str, Any]:
-    """Register a workspace file and build the model/API-facing FileRef."""
+    """Register a workspace file and build the model/API-facing FileRef.
+
+    ``internal`` marks execution scratch data (for example a computer-use
+    observation frame) that must be resolvable by file_id without becoming a
+    user-visible file record.
+    """
     resolved_path = Path(file_path).resolve()
     if not resolved_path.exists() or not resolved_path.is_file():
         raise FileNotFoundError(f"File not found for FileRef: {file_path}")
@@ -139,7 +145,11 @@ def build_workspace_file_ref(
 
     final_file_id = file_id or workspace.get_file_id_from_path(str(resolved_path))
     if not final_file_id:
-        final_file_id = workspace.register_file(str(resolved_path))
+        register_internal = getattr(workspace, "register_internal_file", None)
+        if internal and callable(register_internal):
+            final_file_id = register_internal(str(resolved_path))
+        else:
+            final_file_id = workspace.register_file(str(resolved_path))
 
     workspace_root = workspace.workspace_dir.resolve()
     file_ref = build_file_ref(

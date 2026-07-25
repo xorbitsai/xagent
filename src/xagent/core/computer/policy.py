@@ -1,17 +1,32 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from enum import Enum
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .schema import (
+    ELEMENT_EXTRACTION_FAILED_KEY,
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
     ComputerElement,
     ComputerObservation,
+)
+
+#: Actions that only read the environment and therefore need no risk gate.
+_READ_ONLY_ACTIONS = frozenset({ComputerActionType.SCREENSHOT, ComputerActionType.WAIT})
+
+#: Actions whose effect depends on hitting the intended element.
+_POINTED_ACTIONS = frozenset(
+    {
+        ComputerActionType.CLICK,
+        ComputerActionType.DOUBLE_CLICK,
+        ComputerActionType.TYPE,
+    }
 )
 
 
@@ -107,8 +122,45 @@ _HIGH_IMPACT_LABEL = re.compile(
 )
 
 
+def normalize_host_patterns(patterns: Sequence[str] | None) -> tuple[str, ...]:
+    """Normalize configured host patterns for navigation matching."""
+    if not patterns:
+        return ()
+    normalized = []
+    for pattern in patterns:
+        value = str(pattern).strip().lower().lstrip(".")
+        if value:
+            normalized.append(value)
+    return tuple(dict.fromkeys(normalized))
+
+
+def host_matches(host: str | None, patterns: Sequence[str]) -> bool:
+    """Whether ``host`` equals or is a subdomain of any configured pattern."""
+    if not host or not patterns:
+        return False
+    candidate = host.strip().lower().rstrip(".")
+    return any(
+        candidate == pattern or candidate.endswith(f".{pattern}")
+        for pattern in patterns
+    )
+
+
 class DefaultComputerActionPolicy:
-    """Conservative browser policy for actions with external side effects."""
+    """Conservative browser policy for actions with external side effects.
+
+    The policy deliberately fails closed: whenever the page structure is
+    unknown, or the action's target cannot be resolved in the current frame, it
+    asks the user instead of assuming the action is harmless.
+    """
+
+    def __init__(
+        self,
+        *,
+        navigation_allowlist: Sequence[str] | None = None,
+        navigation_denylist: Sequence[str] | None = None,
+    ) -> None:
+        self.navigation_allowlist = normalize_host_patterns(navigation_allowlist)
+        self.navigation_denylist = normalize_host_patterns(navigation_denylist)
 
     async def evaluate(
         self,
@@ -119,9 +171,28 @@ class DefaultComputerActionPolicy:
         blocked_indexes: list[int] = []
         confirmation_reasons: list[str] = []
         blocked_reasons: list[str] = []
+        structure_unknown = (
+            observation.metadata.get(ELEMENT_EXTRACTION_FAILED_KEY) is True
+        )
 
         for index, action in enumerate(batch.actions):
             element = find_computer_target_element(action, observation)
+
+            if action.type is ComputerActionType.NAVIGATE:
+                blocked_reason = self._blocked_navigation_reason(action.url or "")
+                if blocked_reason is not None:
+                    blocked_indexes.append(index)
+                    blocked_reasons.append(blocked_reason)
+                continue
+
+            if action.type not in _READ_ONLY_ACTIONS and structure_unknown:
+                confirmation_indexes.append(index)
+                confirmation_reasons.append(
+                    "The page structure could not be read, so the effect of "
+                    "this action cannot be checked in advance."
+                )
+                continue
+
             if (
                 action.type is ComputerActionType.TYPE
                 and element is not None
@@ -145,6 +216,22 @@ class DefaultComputerActionPolicy:
                 confirmation_indexes.append(index)
                 confirmation_reasons.append(
                     "Pressing Enter or Return can submit the current form."
+                )
+                continue
+
+            # A miss on a page whose controls are known means the coordinate is
+            # aimed at something the policy cannot reason about. An observation
+            # with no elements at all carries no such evidence either way, and
+            # is covered by the extraction-failure check above.
+            if (
+                action.type in _POINTED_ACTIONS
+                and element is None
+                and observation.elements
+            ):
+                confirmation_indexes.append(index)
+                confirmation_reasons.append(
+                    "The action targets a position that matches no known "
+                    "control, so what it activates cannot be verified."
                 )
                 continue
 
@@ -177,6 +264,27 @@ class DefaultComputerActionPolicy:
             risk=ComputerRiskLevel.LOW,
             reason="The requested computer action is low risk.",
         )
+
+    def _blocked_navigation_reason(self, raw_url: str) -> str | None:
+        """Return why navigation is refused, or None when it is permitted."""
+        url = raw_url.strip()
+        if url == "about:blank":
+            return None
+        host = urlsplit(url).hostname
+        if host is None:
+            # Workspace file navigation is already contained by the workspace;
+            # host policy only governs network destinations.
+            return None
+        if host_matches(host, self.navigation_denylist):
+            return f"Navigation to {host} is blocked by the configured policy."
+        if self.navigation_allowlist and not host_matches(
+            host, self.navigation_allowlist
+        ):
+            return (
+                f"Navigation to {host} is outside the configured allowlist. "
+                "Ask the user to open this site or extend the allowlist."
+            )
+        return None
 
     @staticmethod
     def _can_submit(action: ComputerAction) -> bool:

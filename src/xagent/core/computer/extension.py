@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .environment import ComputerEnvironment
+from .environment import ComputerEnvironment, ComputerTargetNotFoundError
 from .relay import (
     BROWSER_RELAY_MAX_MESSAGE_BYTES,
     BrowserRelayCommandConnection,
@@ -16,6 +16,9 @@ from .relay import (
     get_browser_relay_registry,
 )
 from .schema import (
+    ELEMENT_EXTRACTION_FAILED_KEY,
+    ELEMENTS_TRUNCATED_KEY,
+    MAX_OBSERVATION_ELEMENTS,
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
@@ -50,7 +53,12 @@ class _RelayObservation(BaseModel):
         max_length=BROWSER_RELAY_MAX_MESSAGE_BYTES,
     )
     viewport: Viewport
-    elements: list[_RelayElement] = Field(default_factory=list, max_length=100)
+    elements: list[_RelayElement] = Field(
+        default_factory=list,
+        max_length=MAX_OBSERVATION_ELEMENTS,
+    )
+    elements_truncated: bool = False
+    element_extraction_failed: bool = False
     active_url: str | None = Field(default=None, max_length=4_096)
     title: str | None = Field(default=None, max_length=500)
 
@@ -134,6 +142,10 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
                 else self._element_center(target.element_id or "")
             )
             payload["target"] = point.model_dump(mode="json")
+            if target.element_id:
+                # Lets the extension hit-test the coordinate against the very
+                # element the model chose before dispatching the click.
+                payload["target_element_id"] = target.element_id
         if action.type is ComputerActionType.NAVIGATE:
             payload["url"] = self._validate_navigation_url(action.url or "")
         return payload
@@ -143,8 +155,14 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         if observation is None:
             raise RuntimeError("element target requires a current observation")
         element = next(
-            item for item in observation.elements if item.element_id == element_id
+            (item for item in observation.elements if item.element_id == element_id),
+            None,
         )
+        if element is None:
+            raise ComputerTargetNotFoundError(
+                f"element {element_id!r} is not present in frame "
+                f"{observation.frame_id!r}"
+            )
         return NormalizedPoint(
             x=element.bounds.x + element.bounds.width / 2,
             y=element.bounds.y + element.bounds.height / 2,
@@ -176,6 +194,14 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
             text_fallback="Current user-approved browser tab screenshot.",
             metadata={"browser_runtime_kind": BrowserRuntimeKind.EXTENSION_RELAY.value},
         )
+        metadata: dict[str, Any] = {
+            "browser_runtime_kind": BrowserRuntimeKind.EXTENSION_RELAY.value,
+            "user_takeover_available": True,
+        }
+        if parsed.element_extraction_failed:
+            metadata[ELEMENT_EXTRACTION_FAILED_KEY] = True
+        if parsed.elements_truncated:
+            metadata[ELEMENTS_TRUNCATED_KEY] = True
         return ComputerObservation(
             session_id=self.session_id,
             frame_id=frame_id,
@@ -185,10 +211,7 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
             elements=[self._build_element(element) for element in parsed.elements],
             active_url=parsed.active_url,
             title=parsed.title,
-            metadata={
-                "browser_runtime_kind": BrowserRuntimeKind.EXTENSION_RELAY.value,
-                "user_takeover_available": True,
-            },
+            metadata=metadata,
         )
 
     @classmethod

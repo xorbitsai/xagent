@@ -24,6 +24,7 @@ from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
+from ..tools.confirmation import WAITING_FOR_USER_STATUS, tool_result_waits_for_user
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -780,10 +781,7 @@ class PatternRuntime:
             await self._maybe_await(start_span(**payload))
 
     async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
-        if (
-            isinstance(result, dict)
-            and str(result.get("status") or "").strip().lower() == "waiting_for_user"
-        ):
+        if tool_result_waits_for_user(result):
             await self._emit_trace_event(
                 TraceEventType(
                     TraceScope.ACTION,
@@ -798,13 +796,13 @@ class PatternRuntime:
                     "tool_call_id": tool_call.get("id"),
                     "result": result,
                     "success": False,
-                    "status": "waiting_for_user",
-                    "control_state": "waiting_for_user",
+                    "status": WAITING_FOR_USER_STATUS,
+                    "control_state": WAITING_FOR_USER_STATUS,
                 },
             )
             await self._finish_tool_span(
                 tool_call=tool_call,
-                status="waiting_for_user",
+                status=WAITING_FOR_USER_STATUS,
                 output=result,
             )
             return

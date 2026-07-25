@@ -5,7 +5,10 @@ from typing import Any
 
 import pytest
 
-from xagent.core.computer.browser import BrowserComputerEnvironment
+from xagent.core.computer.browser import (
+    BrowserComputerEnvironment,
+    ComputerTargetObstructedError,
+)
 from xagent.core.computer.schema import (
     ComputerAction,
     ComputerActionBatch,
@@ -68,14 +71,73 @@ class FakeKeyboard:
         self.calls.append(("insert_text", text))
 
 
+class FakeFrame:
+    """A nested frame reporting bounds in its own coordinate space."""
+
+    def __init__(
+        self,
+        *,
+        offset_x: float,
+        offset_y: float,
+        elements: list[dict[str, Any]],
+    ) -> None:
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.elements = elements
+        self.issued_markers: list[str] = []
+
+    async def frame_element(self) -> "FakeFrame":
+        return self
+
+    async def bounding_box(self) -> dict[str, float]:
+        return {"x": self.offset_x, "y": self.offset_y, "width": 640, "height": 360}
+
+    async def evaluate(self, script: str, arg: Any = None) -> Any:
+        if "querySelectorAll" not in script:
+            raise AssertionError(f"unexpected frame script: {script}")
+        options = arg or {}
+        offset_x = float(options.get("offsetX", 0))
+        offset_y = float(options.get("offsetY", 0))
+        width = float(options.get("rootWidth", 1))
+        height = float(options.get("rootHeight", 1))
+        token = str(options.get("frameToken") or "frame")
+        elements = []
+        for index, entry in enumerate(self.elements, start=1):
+            bounds = entry["bounds"]
+            # The real script reports local pixels shifted by the frame offset;
+            # 640x360 is this frame's own viewport.
+            elements.append(
+                {
+                    **entry,
+                    "marker": f"{token}:{index}",
+                    "bounds": {
+                        "x": (bounds["x"] * 640 + offset_x) / width,
+                        "y": (bounds["y"] * 360 + offset_y) / height,
+                        "width": max(1e-6, bounds["width"] * 640 / width),
+                        "height": max(1e-6, bounds["height"] * 360 / height),
+                    },
+                }
+            )
+            self.issued_markers.append(f"{token}:{index}")
+        return {"elements": elements, "truncated": False}
+
+
 class FakePage:
     def __init__(self) -> None:
         self.viewport_size = {"width": 1280, "height": 720}
         self.url = "about:blank"
+        self.child_frames: list[FakeFrame] = []
+        self.truncate_elements = False
+        self.fail_element_extraction = False
         self.mouse = FakeMouse()
         self.keyboard = FakeKeyboard()
         self.goto_calls: list[tuple[str, str, int]] = []
         self.wait_calls: list[int] = []
+        self.hit_test_calls: list[dict[str, Any]] = []
+        self.issued_markers: list[str] = []
+        #: Marker the hit test reports. ``None`` means the click lands on the
+        #: element that was extracted first, i.e. nothing is in the way.
+        self.hit_marker: str | None = None
         self.interactive_elements: list[dict[str, Any]] = [
             {
                 "bounds": {
@@ -91,6 +153,14 @@ class FakePage:
             }
         ]
 
+    @property
+    def main_frame(self) -> "FakePage":
+        return self
+
+    @property
+    def frames(self) -> list[Any]:
+        return [self, *self.child_frames]
+
     async def set_viewport_size(self, viewport: dict[str, int]) -> None:
         self.viewport_size = viewport
 
@@ -101,11 +171,34 @@ class FakePage:
     async def title(self) -> str:
         return "Browser page"
 
-    async def evaluate(self, script: str) -> Any:
+    async def evaluate(self, script: str, arg: Any = None) -> Any:
         if "devicePixelRatio" in script:
             return 2
+        if "innerWidth" in script and "innerHeight" in script and arg is None:
+            return {"width": 1280, "height": 720}
+        if "elementFromPoint" in script:
+            self.hit_test_calls.append(dict(arg or {}))
+            marker = self.hit_marker or (
+                self.issued_markers[0] if self.issued_markers else None
+            )
+            return {"marker": marker, "tag": "div", "found": True}
         if "querySelectorAll" in script:
-            return self.interactive_elements
+            if self.fail_element_extraction:
+                raise RuntimeError("element extraction failed")
+            token = str((arg or {}).get("frameToken") or "frame")
+            self.issued_markers = [
+                f"{token}:{index}"
+                for index in range(1, len(self.interactive_elements) + 1)
+            ]
+            return {
+                "elements": [
+                    {**entry, "marker": marker}
+                    for entry, marker in zip(
+                        self.interactive_elements, self.issued_markers
+                    )
+                ],
+                "truncated": self.truncate_elements,
+            }
         raise AssertionError(f"unexpected evaluate script: {script}")
 
     async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
@@ -319,6 +412,120 @@ async def test_browser_navigation_rejects_unapproved_scheme(
                 ],
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_click_is_refused_when_the_target_is_covered(
+    browser_environment,
+) -> None:
+    """The centre of an element's box is not always what a click would hit.
+
+    A consent overlay or sticky header on top of the target would otherwise turn
+    into a silent mis-click on whatever is actually there.
+    """
+    environment, page, _store = browser_environment
+    first = await environment.observe()
+    page.hit_marker = "some-other-element"
+
+    with pytest.raises(ComputerTargetObstructedError, match="covered by div"):
+        await environment.execute(
+            ComputerActionBatch(
+                session_id="browser-1",
+                expected_frame_id=first.frame_id,
+                actions=[
+                    ComputerAction(
+                        type=ComputerActionType.CLICK,
+                        target=ComputerTarget(element_id="dom-1"),
+                    )
+                ],
+            )
+        )
+
+    assert page.mouse.calls == []
+
+
+@pytest.mark.asyncio
+async def test_point_clicks_skip_hit_verification(browser_environment) -> None:
+    """Only element targets carry an identity that a hit test can check."""
+    environment, page, _store = browser_environment
+    first = await environment.observe()
+    page.hit_marker = "some-other-element"
+
+    await environment.execute(
+        ComputerActionBatch(
+            session_id="browser-1",
+            expected_frame_id=first.frame_id,
+            actions=[
+                ComputerAction(
+                    type=ComputerActionType.CLICK,
+                    target=ComputerTarget(point=NormalizedPoint(x=0.5, y=0.5)),
+                )
+            ],
+        )
+    )
+
+    assert page.mouse.calls == [("click", 640.0, 360.0)]
+    assert page.hit_test_calls == []
+
+
+@pytest.mark.asyncio
+async def test_iframe_elements_are_mapped_into_the_top_level_viewport() -> None:
+    """A screenshot spans nested frames, so one coordinate space must too."""
+    page = FakePage()
+    frame = FakeFrame(
+        offset_x=640.0,
+        offset_y=360.0,
+        elements=[
+            {
+                "bounds": {"x": 0.0, "y": 0.0, "width": 0.25, "height": 0.1},
+                "label": "Pay now",
+                "role": "button",
+                "text": "Pay now",
+                "metadata": {"tag": "button"},
+            }
+        ],
+    )
+    page.child_frames = [frame]
+    environment = BrowserComputerEnvironment(
+        session_id="browser-1",
+        workspace=FakeWorkspace(),
+        manager=FakeManager(page),  # type: ignore[arg-type]
+        observation_store=FakeObservationStore(),  # type: ignore[arg-type]
+    )
+
+    observation = await environment.observe()
+
+    assert [element.label for element in observation.elements] == [
+        "Continue",
+        "Pay now",
+    ]
+    nested = observation.elements[1]
+    # The frame sits at (640, 360) in a 1280x720 viewport, so its origin is the
+    # centre of the page.
+    assert nested.bounds.x == pytest.approx(0.5)
+    assert nested.bounds.y == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_truncated_element_lists_are_reported(browser_environment) -> None:
+    environment, page, _store = browser_environment
+    page.truncate_elements = True
+
+    observation = await environment.observe()
+
+    assert observation.metadata["elements_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_element_extraction_is_reported(browser_environment) -> None:
+    """The policy needs to know the page structure is unknown, not empty."""
+    environment, page, _store = browser_environment
+    page.fail_element_extraction = True
+
+    observation = await environment.observe()
+
+    assert observation.elements == []
+    assert observation.metadata["element_extraction_failed"] is True
 
 
 @pytest.mark.asyncio

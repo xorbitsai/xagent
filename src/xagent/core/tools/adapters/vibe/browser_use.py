@@ -12,6 +12,7 @@ from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
+from .....config import get_browser_legacy_dom_tools_enabled
 from ....file_ref import build_workspace_file_ref
 from ....tools.core.browser_use import (
     browser_click,
@@ -28,15 +29,19 @@ from ....tools.core.browser_use import (
     get_browser_manager,
 )
 from ....workspace import TaskWorkspace
+from ...confirmation import STEP_SESSION_ARG as _STEP_SESSION_ARG
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
 
-_STEP_SESSION_ARG = "_xagent_step_id"
-
 
 class BrowserTaskSessionMixin:
     """Keeps browser tool default sessions aligned during task setup."""
+
+    #: Public capability marker: patterns use it to decide whether to pass the
+    #: current plan step down, and it survives tool wrappers unlike a private
+    #: attribute would.
+    uses_browser_session = True
 
     _task_id: Optional[str] = None
 
@@ -1126,6 +1131,7 @@ def create_browser_tools(
     computer_runtime_kind: str = "ephemeral_playwright",
     browser_profile_id: str = "default",
     browser_profile_root: Path | None = None,
+    include_legacy_dom_tools: bool | None = None,
 ) -> list:
     """
     Create all browser automation tools for a task.
@@ -1135,11 +1141,18 @@ def create_browser_tools(
         workspace: Optional workspace for saving screenshots
         include_debug_tools: Include browser session diagnostics. Disabled for
             normal agent runs so debug schemas do not consume model context.
+        include_legacy_dom_tools: Expose the selector-driven tools that mutate
+            the page. They share the ``computer`` browser session but bypass its
+            action policy, so they default to off. ``None`` reads the
+            deployment setting.
 
     Returns:
         List of browser tool instances
     """
     from .computer import ComputerTool
+
+    if include_legacy_dom_tools is None:
+        include_legacy_dom_tools = get_browser_legacy_dom_tools_enabled()
 
     tools = [
         ComputerTool(
@@ -1150,17 +1163,33 @@ def create_browser_tools(
             browser_profile_id=browser_profile_id,
             browser_profile_root=browser_profile_root,
         ),
-        BrowserNavigateTool(task_id=task_id, workspace=workspace),
-        BrowserClickTool(task_id=task_id),
-        BrowserFillTool(task_id=task_id),
+        # Read-only companions to ``computer``: they observe the same page
+        # without being able to act on it, so no policy can be sidestepped.
         BrowserScreenshotTool(task_id=task_id, workspace=workspace),
         BrowserExtractTextTool(task_id=task_id),
         BrowserPdfTool(task_id=task_id, workspace=workspace),
-        BrowserEvaluateTool(task_id=task_id),
-        BrowserSelectOptionTool(task_id=task_id),
-        BrowserWaitForSelectorTool(task_id=task_id),
         BrowserCloseTool(task_id=task_id),
     ]
+    if include_legacy_dom_tools:
+        # Every tool below can change page state without passing through the
+        # computer action policy — ``browser_fill`` reaches password fields and
+        # ``browser_evaluate`` runs arbitrary JavaScript in the session.
+        logger.warning(
+            "Legacy browser DOM tools are enabled: browser_click, browser_fill, "
+            "browser_evaluate, browser_navigate and browser_select_option "
+            "bypass the computer action policy for task %s",
+            task_id,
+        )
+        tools.extend(
+            [
+                BrowserNavigateTool(task_id=task_id, workspace=workspace),
+                BrowserClickTool(task_id=task_id),
+                BrowserFillTool(task_id=task_id),
+                BrowserEvaluateTool(task_id=task_id),
+                BrowserSelectOptionTool(task_id=task_id),
+                BrowserWaitForSelectorTool(task_id=task_id),
+            ]
+        )
     if include_debug_tools:
         tools.append(BrowserListSessionsTool())
     return tools

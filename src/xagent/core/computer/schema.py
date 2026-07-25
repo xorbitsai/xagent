@@ -7,6 +7,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..context_ref import ContextReference, ContextReferencePurpose
 
+#: Observation metadata flag set when interactive elements could not be read.
+#: The policy treats an unknown page structure as elevated risk.
+ELEMENT_EXTRACTION_FAILED_KEY = "element_extraction_failed"
+
+#: Observation metadata flag set when the element list hit its cap, so the
+#: model knows the list is incomplete rather than exhaustive.
+ELEMENTS_TRUNCATED_KEY = "elements_truncated"
+
+#: Maximum interactive elements reported per observation.
+MAX_OBSERVATION_ELEMENTS = 100
+
 
 class ComputerEnvironmentType(str, Enum):
     BROWSER = "browser"

@@ -12,6 +12,8 @@ from .policy import (
     ComputerPolicyDecision,
     ComputerPolicyOutcome,
     ComputerRiskLevel,
+    DefaultComputerActionPolicy,
+    find_computer_target_element,
 )
 from .redis_relay import RedisBrowserRelayRegistry
 from .relay import (
@@ -76,6 +78,7 @@ __all__ = [
     "ComputerSessionBinding",
     "ComputerTarget",
     "ComputerTargetNotFoundError",
+    "DefaultComputerActionPolicy",
     "ExtensionComputerEnvironment",
     "NormalizedPoint",
     "NormalizedRect",
@@ -83,5 +86,6 @@ __all__ = [
     "RedisBrowserRelayRegistry",
     "Viewport",
     "get_browser_relay_registry",
+    "find_computer_target_element",
     "validate_browser_profile_id",
 ]

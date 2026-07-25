@@ -749,6 +749,7 @@ function collectInteractiveElements(): unknown[] {
         autocomplete: autocomplete || null,
         sensitive,
         disabled: Boolean(input.disabled),
+        focused: node === document.activeElement,
       },
     })
     if (elements.length >= 100) break

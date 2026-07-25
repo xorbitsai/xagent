@@ -780,6 +780,34 @@ class PatternRuntime:
             await self._maybe_await(start_span(**payload))
 
     async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
+        if (
+            isinstance(result, dict)
+            and str(result.get("status") or "").strip().lower() == "waiting_for_user"
+        ):
+            await self._emit_trace_event(
+                TraceEventType(
+                    TraceScope.ACTION,
+                    TraceAction.END,
+                    TraceCategory.TOOL,
+                ),
+                task_id=self._task_id_from_payload(tool_call),
+                step_id=self._step_id_from_payload(tool_call),
+                data={
+                    "tool_name": tool_call.get("name"),
+                    "tool_params": tool_call.get("args", {}),
+                    "tool_call_id": tool_call.get("id"),
+                    "result": result,
+                    "success": False,
+                    "status": "waiting_for_user",
+                    "control_state": "waiting_for_user",
+                },
+            )
+            await self._finish_tool_span(
+                tool_call=tool_call,
+                status="waiting_for_user",
+                output=result,
+            )
+            return
         success = self._tool_result_success(result)
         if not success:
             await self.on_tool_error(

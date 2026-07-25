@@ -89,7 +89,8 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
         input_type: inputType || null,
         autocomplete: autocomplete || null,
         sensitive,
-        disabled: Boolean(node.disabled)
+        disabled: Boolean(node.disabled),
+        focused: node === document.activeElement
       }
     });
     if (elements.length >= 100) break;
@@ -241,6 +242,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                         "input_type",
                         "autocomplete",
                         "disabled",
+                        "focused",
                     )
                     if key in metadata
                 }

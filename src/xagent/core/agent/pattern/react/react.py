@@ -76,6 +76,7 @@ DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
 REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 REACT_DECISION_TOOL_CALL = "tool_call"
+_COMPUTER_APPROVAL_ARG = "_xagent_computer_approval"
 UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
@@ -216,6 +217,7 @@ class ReActPattern(AgentPattern):
         self.force_final_answer_next = False
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
+        self.approved_tool_confirmation: dict[str, str] | None = None
         self.task_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
@@ -1034,6 +1036,7 @@ class ReActPattern(AgentPattern):
             "force_final_answer_next": self.force_final_answer_next,
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
+            "approved_tool_confirmation": self.approved_tool_confirmation,
             "task_text": self.task_text,
             "last_response": self.last_response,
             "pending_tool_calls": self.pending_tool_calls,
@@ -1087,6 +1090,16 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = (
             dict(waiting_request) if isinstance(waiting_request, dict) else None
         )
+        approved_confirmation = state.get("approved_tool_confirmation")
+        self.approved_tool_confirmation = (
+            {
+                str(key): str(value)
+                for key, value in approved_confirmation.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+            if isinstance(approved_confirmation, dict)
+            else None
+        )
         stored_task_text = state.get("task_text")
         self.task_text = str(stored_task_text) if stored_task_text else None
         self.last_response = state.get("last_response")
@@ -1129,9 +1142,14 @@ class ReActPattern(AgentPattern):
                 "context": context,
             }
 
-        self._mark_latest_user_message_as_waiting_response(
+        response = self._mark_latest_user_message_as_waiting_response(
             context=context,
             after_message_count=waiting_message_count,
+        )
+        waiting_request = dict(self.waiting_for_user_request)
+        self._apply_tool_confirmation_response(
+            waiting_request=waiting_request,
+            response=response or "",
         )
         waiting_task = self.waiting_for_user_request.get("task_text")
         if waiting_task and self.task_text is None:
@@ -1151,10 +1169,10 @@ class ReActPattern(AgentPattern):
         *,
         context: Any,
         after_message_count: int,
-    ) -> None:
+    ) -> str | None:
         messages = getattr(context, "messages", [])
         if not isinstance(messages, list):
-            return
+            return None
 
         for index in range(len(messages) - 1, after_message_count - 1, -1):
             message = messages[index]
@@ -1162,7 +1180,7 @@ class ReActPattern(AgentPattern):
                 continue
             metadata = dict(getattr(message, "metadata", {}) or {})
             if metadata.get("response_to_waiting_for_user"):
-                return
+                return str(getattr(message, "content", "") or "")
             waiting_request = self.waiting_for_user_request or {}
             metadata["response_to_waiting_for_user"] = {
                 "tool_name": waiting_request.get("tool_name"),
@@ -1172,7 +1190,61 @@ class ReActPattern(AgentPattern):
                 "interactions": waiting_request.get("interactions"),
             }
             messages[index] = replace(message, metadata=metadata)
+            return str(getattr(message, "content", "") or "")
+        return None
+
+    def _apply_tool_confirmation_response(
+        self,
+        *,
+        waiting_request: dict[str, Any],
+        response: str,
+    ) -> None:
+        confirmation = waiting_request.get("confirmation")
+        if not isinstance(confirmation, dict):
             return
+        if confirmation.get("kind") != "computer_action_confirmation":
+            return
+        confirmation_id = confirmation.get("confirmation_id")
+        if not isinstance(confirmation_id, str) or not confirmation_id:
+            return
+        if not self._computer_action_was_approved(response):
+            self.approved_tool_confirmation = None
+            return
+        self.approved_tool_confirmation = {
+            "tool_name": str(waiting_request.get("tool_name") or "computer"),
+            "confirmation_id": confirmation_id,
+            "decision": "approve",
+            "session_id": str(waiting_request.get("session_id") or ""),
+        }
+
+    @staticmethod
+    def _computer_action_was_approved(response: str) -> bool:
+        values = {
+            line.split(":", 1)[-1].strip().casefold()
+            for line in response.splitlines()
+            if line.strip()
+        }
+        denied = {
+            "deny",
+            "denied",
+            "deny this action",
+            "cancel",
+            "cancel this action",
+            "拒绝",
+            "取消",
+        }
+        if values & denied:
+            return False
+        approved = {
+            "approve",
+            "approved",
+            "approve this action",
+            "yes",
+            "批准",
+            "同意",
+            "是",
+        }
+        return bool(values & approved)
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
         if isinstance(response, str):
@@ -1716,6 +1788,71 @@ class ReActPattern(AgentPattern):
         )
         self._forget_tool_call_content(tool_call)
 
+    async def _pause_for_tool_result(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        result: dict[str, Any],
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any]:
+        message = str(
+            result.get("message")
+            or result.get("error")
+            or "This tool requires user input before it can continue."
+        )
+        message_type = str(result.get("message_type") or "confirmation")
+        interactions = _normalize_ask_user_interactions(result.get("interactions", []))
+        metadata: dict[str, Any] = {"interactions": interactions}
+        confirmation = result.get("confirmation")
+        if isinstance(confirmation, dict):
+            metadata["confirmation"] = confirmation
+        await runtime.send_message(
+            message=message,
+            message_type=message_type,
+            expect_response=True,
+            visible=True,
+            metadata=metadata,
+        )
+        self.status = "waiting_for_user"
+        self.waiting_for_user_request = {
+            "kind": "tool_waiting_for_user",
+            "tool_call_id": tool_call.get("id"),
+            "tool_name": tool_call.get("name"),
+            "session_id": result.get("session_id"),
+            "message": message,
+            "message_type": message_type,
+            "interactions": interactions,
+            "confirmation": confirmation if isinstance(confirmation, dict) else None,
+            "task_text": self.task_text,
+            "message_count": len(getattr(context, "messages", [])),
+        }
+        waiting_result = {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": message,
+            "message_type": message_type,
+            "interactions": interactions,
+            "context": context,
+        }
+        await runtime.checkpoint(
+            "waiting_for_user",
+            context=context,
+            pattern=self,
+            metadata={
+                "tool_call": tool_call,
+                "waiting_for_user_request": self.waiting_for_user_request,
+            },
+        )
+        return waiting_result
+
+    @staticmethod
+    def _tool_result_waits_for_user(result: Any) -> bool:
+        return (
+            isinstance(result, dict)
+            and str(result.get("status") or "").strip().lower() == "waiting_for_user"
+        )
+
     async def _run_concurrent_batch(
         self,
         batch: list[dict[str, Any]],
@@ -1873,6 +2010,14 @@ class ReActPattern(AgentPattern):
                 result = await self._execute_tool_safely(tool_call, tools, runtime)
                 self._backfill_result(tool_call, result, context)
                 self.pending_tool_calls = self.pending_tool_calls[1:]
+                if self._tool_result_waits_for_user(result):
+                    assert isinstance(result, dict)
+                    return await self._pause_for_tool_result(
+                        tool_call=tool_call,
+                        result=result,
+                        context=context,
+                        runtime=runtime,
+                    )
                 await runtime.checkpoint(
                     "after_tool",
                     context=context,
@@ -1891,6 +2036,23 @@ class ReActPattern(AgentPattern):
                     segment, tools, runtime, context
                 )
                 self.pending_tool_calls = self.pending_tool_calls[len(segment) :]
+                waiting_pair = next(
+                    (
+                        (waiting_call, waiting_result)
+                        for waiting_call, waiting_result in zip(segment, results)
+                        if self._tool_result_waits_for_user(waiting_result)
+                    ),
+                    None,
+                )
+                if waiting_pair is not None:
+                    waiting_call, waiting_result = waiting_pair
+                    assert isinstance(waiting_result, dict)
+                    return await self._pause_for_tool_result(
+                        tool_call=waiting_call,
+                        result=waiting_result,
+                        context=context,
+                        runtime=runtime,
+                    )
                 await runtime.checkpoint(
                     "after_tool_batch",
                     context=context,
@@ -2273,6 +2435,7 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         self.pending_tool_calls = []
         self.waiting_for_user_request = None
+        self.approved_tool_confirmation = None
         self.force_final_answer_next = False
         self.status = "completed"
         await runtime.checkpoint("final", context=context, pattern=self)
@@ -2443,6 +2606,16 @@ class ReActPattern(AgentPattern):
                 )
                 recorded_terminal = True
                 return error_result
+
+            if self._tool_result_waits_for_user(result):
+                self._record_tool_call(
+                    tool_call,
+                    status="waiting_for_user",
+                    result=result,
+                )
+                recorded_terminal = True
+                await runtime.on_tool_end(tool_call=tool_call, result=result)
+                return result
 
             if not self._tool_result_success(result):
                 error_message = str(
@@ -2688,6 +2861,22 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         args = self._tool_call_args_dict(tool_call, require_mapping=True)
         tool_name = self._tool_name(tool)
+        if tool_name == "computer":
+            args.pop(_COMPUTER_APPROVAL_ARG, None)
+            approval = self.approved_tool_confirmation
+            if approval is not None and approval.get("tool_name") == tool_name:
+                authorize_confirmation = getattr(
+                    tool,
+                    "authorize_confirmation",
+                    None,
+                )
+                if callable(authorize_confirmation):
+                    authorize_confirmation(
+                        confirmation_id=approval.get("confirmation_id", ""),
+                        decision=approval.get("decision", ""),
+                        session_id=approval.get("session_id", ""),
+                    )
+                self.approved_tool_confirmation = None
         if not (tool_name.startswith("browser_") or tool_name == "computer"):
             return args
 

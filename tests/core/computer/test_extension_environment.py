@@ -53,6 +53,7 @@ def relay_observation() -> dict[str, Any]:
                     "metadata": {
                         "tag": "input",
                         "input_type": "password",
+                        "focused": True,
                         "value": "metadata-secret",
                     },
                 }
@@ -124,6 +125,7 @@ async def test_extension_environment_captures_and_redacts_observation() -> None:
     assert observation.metadata["browser_runtime_kind"] == "extension_relay"
     assert observation.elements[0].text is None
     assert observation.elements[0].label == "Sensitive input"
+    assert observation.elements[0].metadata["focused"] is True
     assert "plaintext-secret" not in observation.model_dump_json()
     assert "metadata-secret" not in observation.model_dump_json()
     assert "Password label secret" not in observation.model_dump_json()

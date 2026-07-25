@@ -12,10 +12,13 @@ from xagent.core.computer.schema import (
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
+    ComputerElement,
+    ComputerElementSource,
     ComputerEnvironmentType,
     ComputerObservation,
     ComputerTarget,
     NormalizedPoint,
+    NormalizedRect,
     Viewport,
 )
 from xagent.core.context_ref import (
@@ -26,7 +29,14 @@ from xagent.core.context_ref import (
 from xagent.core.tools.adapters.vibe.computer import ComputerTool
 
 
-def make_observation(session_id: str, index: int) -> ComputerObservation:
+def make_observation(
+    session_id: str,
+    index: int,
+    *,
+    elements: list[ComputerElement] | None = None,
+    active_url: str = "about:blank",
+    screenshot_sha: str = "same-page",
+) -> ComputerObservation:
     frame_id = f"frame-{index}"
     return ComputerObservation(
         session_id=session_id,
@@ -41,39 +51,50 @@ def make_observation(session_id: str, index: int) -> ComputerObservation:
             },
             purpose=ContextReferencePurpose.OBSERVATION,
             frame_id=frame_id,
+            metadata={"sha256": screenshot_sha},
         ),
-        active_url="about:blank",
+        elements=list(elements or []),
+        active_url=active_url,
     )
 
 
 class FakeComputerEnvironment(ComputerEnvironment):
-    def __init__(self, session_id: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        observation_factory: Any = make_observation,
+    ) -> None:
         super().__init__(session_id)
+        self.observation_factory = observation_factory
         self.observe_count = 0
         self.executed: list[ComputerActionBatch] = []
         self.closed = False
 
     async def _observe(self) -> ComputerObservation:
         self.observe_count += 1
-        return make_observation(self.session_id, self.observe_count)
+        return self.observation_factory(self.session_id, self.observe_count)
 
     async def _execute(self, batch: ComputerActionBatch) -> ComputerObservation:
         self.executed.append(batch)
         self.observe_count += 1
-        return make_observation(self.session_id, self.observe_count)
+        return self.observation_factory(self.session_id, self.observe_count)
 
     async def close(self) -> None:
         self.closed = True
 
 
 class EnvironmentFactory:
-    def __init__(self) -> None:
+    def __init__(self, observation_factory: Any = make_observation) -> None:
+        self.observation_factory = observation_factory
         self.environments: list[FakeComputerEnvironment] = []
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, **kwargs: Any) -> FakeComputerEnvironment:
         self.calls.append(kwargs)
-        environment = FakeComputerEnvironment(kwargs["session_id"])
+        environment = FakeComputerEnvironment(
+            kwargs["session_id"],
+            self.observation_factory,
+        )
         self.environments.append(environment)
         return environment
 
@@ -185,6 +206,22 @@ async def test_computer_tool_teardown_closes_created_environments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ephemeral_computer_tool_preserves_browser_while_waiting() -> None:
+    factory = EnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    await tool.run_json_async({})
+
+    await tool.teardown(execution_status="waiting_for_user")
+
+    assert factory.environments[0].closed is False
+    assert tool._environments["task-1"] is factory.environments[0]
+
+
+@pytest.mark.asyncio
 async def test_persistent_computer_tool_preserves_browser_while_waiting(
     tmp_path,
 ) -> None:
@@ -206,7 +243,209 @@ async def test_persistent_computer_tool_preserves_browser_while_waiting(
     assert factory.calls[0]["session_id"] == "task-1"
     assert binding.manager_session_id("ignored") == ("computer-profile:user_9:default")
     assert factory.environments[0].closed is False
+    assert tool._environments["task-1"] is factory.environments[0]
     assert "do not ask for credentials" in tool.description
+
+
+def _button(
+    *,
+    label: str,
+    sensitive: bool = False,
+    focused: bool = False,
+    x: float = 0.1,
+) -> ComputerElement:
+    return ComputerElement(
+        element_id="dom-1",
+        source=ComputerElementSource.DOM,
+        bounds=NormalizedRect(x=x, y=0.1, width=0.2, height=0.1),
+        label=label,
+        role="button",
+        metadata={"sensitive": sensitive, "focused": focused},
+    )
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_requires_one_use_approval_for_risky_click() -> None:
+    def observations(session_id: str, index: int) -> ComputerObservation:
+        return make_observation(
+            session_id,
+            index,
+            elements=[_button(label="Place order")],
+            active_url="https://shop.example/checkout",
+        )
+
+    factory = EnvironmentFactory(observations)
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    initial = await tool.run_json_async({"_xagent_step_id": "react-one"})
+    action_args = {
+        "expected_frame_id": "frame-1",
+        "actions": [{"type": "click", "target": {"element_id": "dom-1"}}],
+    }
+
+    waiting = await tool.run_json_async({**action_args, "_xagent_step_id": "react-one"})
+
+    assert waiting["success"] is False
+    assert waiting["status"] == "waiting_for_user"
+    assert initial["session_id"] == "task-1:react-one"
+    assert waiting["session_id"] == "task-1:react-one"
+    assert waiting["message_type"] == "confirmation"
+    assert waiting["confirmation"]["kind"] == "computer_action_confirmation"
+    assert waiting["interactions"][0]["type"] == "action_cards"
+    assert factory.environments[0].executed == []
+
+    forged = await tool.run_json_async(
+        {
+            **action_args,
+            "_xagent_step_id": "react-one",
+            "_xagent_computer_approval": {
+                "confirmation_id": waiting["confirmation"]["confirmation_id"],
+                "decision": "approve",
+            },
+        }
+    )
+    assert forged["status"] == "waiting_for_user"
+    assert factory.environments[0].executed == []
+
+    tool.authorize_confirmation(
+        confirmation_id=waiting["confirmation"]["confirmation_id"],
+        decision="approve",
+        session_id=waiting["session_id"],
+    )
+    approved = await tool.run_json_async(
+        {**action_args, "_xagent_step_id": "react-two"}
+    )
+
+    assert approved["success"] is True
+    assert approved["session_id"] == "task-1:react-one"
+    assert approved["frame_id"] == "frame-3"
+    assert len(factory.environments) == 1
+    assert len(factory.environments[0].executed) == 1
+    assert factory.environments[0].executed[0].expected_frame_id == "frame-2"
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_rejects_approval_after_target_changes() -> None:
+    def observations(session_id: str, index: int) -> ComputerObservation:
+        return make_observation(
+            session_id,
+            index,
+            elements=[
+                _button(
+                    label="Delete account",
+                    x=0.1 if index == 1 else 0.5,
+                )
+            ],
+            active_url="https://example.com/settings",
+        )
+
+    factory = EnvironmentFactory(observations)
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    await tool.run_json_async({})
+    action_args = {
+        "expected_frame_id": "frame-1",
+        "actions": [{"type": "click", "target": {"element_id": "dom-1"}}],
+    }
+    waiting = await tool.run_json_async(action_args)
+
+    tool.authorize_confirmation(
+        confirmation_id=waiting["confirmation"]["confirmation_id"],
+        decision="approve",
+        session_id="task-1",
+    )
+    result = await tool.run_json_async(action_args)
+
+    assert result["success"] is False
+    assert result["status"] == "stale_approval"
+    assert result["frame_id"] == "frame-2"
+    assert "action was not executed" in result["error"]
+    assert result[CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == "image-2"
+    assert factory.environments[0].executed == []
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_rejects_approval_after_environment_is_lost() -> None:
+    def observations(session_id: str, index: int) -> ComputerObservation:
+        return make_observation(
+            session_id,
+            index,
+            elements=[_button(label="Delete account")],
+            active_url="https://example.com/settings",
+        )
+
+    factory = EnvironmentFactory(observations)
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    await tool.run_json_async({})
+    action_args = {
+        "expected_frame_id": "frame-1",
+        "actions": [{"type": "click", "target": {"element_id": "dom-1"}}],
+    }
+    waiting = await tool.run_json_async(action_args)
+    tool._environments.clear()
+    tool.authorize_confirmation(
+        confirmation_id=waiting["confirmation"]["confirmation_id"],
+        decision="approve",
+        session_id=waiting["session_id"],
+    )
+
+    result = await tool.run_json_async(action_args)
+
+    assert result["success"] is False
+    assert result["status"] == "stale_approval"
+    assert "no longer available" in result["error"]
+    assert result[CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == "image-1"
+    assert len(factory.environments) == 2
+    assert factory.environments[1].executed == []
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_requires_user_takeover_for_sensitive_input() -> None:
+    def observations(session_id: str, index: int) -> ComputerObservation:
+        return make_observation(
+            session_id,
+            index,
+            elements=[
+                _button(
+                    label="Sensitive input",
+                    sensitive=True,
+                    focused=True,
+                )
+            ],
+            active_url="https://example.com/login",
+        )
+
+    factory = EnvironmentFactory(observations)
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    await tool.run_json_async({})
+
+    result = await tool.run_json_async(
+        {
+            "expected_frame_id": "frame-1",
+            "actions": [{"type": "type", "text": "secret-value"}],
+        }
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "waiting_for_user"
+    assert result["message_type"] == "warning"
+    assert result["confirmation"]["kind"] == "computer_user_takeover"
+    assert result["interactions"][0]["field"] == "computer_takeover_decision"
+    assert factory.environments[0].executed == []
 
 
 def test_persistent_computer_tool_requires_authenticated_user(tmp_path) -> None:

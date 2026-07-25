@@ -197,7 +197,13 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         sensitive = cls._is_sensitive(metadata)
         safe_metadata = {
             key: metadata[key]
-            for key in ("tag", "input_type", "autocomplete", "disabled")
+            for key in (
+                "tag",
+                "input_type",
+                "autocomplete",
+                "disabled",
+                "focused",
+            )
             if key in metadata
         }
         return ComputerElement(

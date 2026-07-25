@@ -11,6 +11,11 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import {
+  getBackgroundJobFailureMessage,
+  isBackgroundJobResponse,
+  waitForBackgroundJob,
+} from "@/lib/background-jobs"
+import {
   Plus,
   FileText,
   FolderOpen,
@@ -183,6 +188,18 @@ export function KnowledgeBasePage() {
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
         throw new Error(typeof body.detail === "string" ? body.detail : t("kb.ownership.failed"))
+      }
+      // 202 means the transfer runs as a durable background job: the physical
+      // move can take minutes, so wait for it instead of reporting success on
+      // acceptance. Backends without a job queue still answer 204 synchronously.
+      if (response.status === 202) {
+        const job = await response.json().catch(() => null)
+        if (isBackgroundJobResponse(job)) {
+          const finished = await waitForBackgroundJob(getApiUrl(), job)
+          if (finished.status !== "succeeded") {
+            throw new Error(getBackgroundJobFailureMessage(finished, t("kb.ownership.failed")))
+          }
+        }
       }
       toast.success(
         collection.ownership === "team"

@@ -31,6 +31,7 @@ from ....computer.policy import (
     DefaultComputerActionPolicy,
     find_computer_target_element,
 )
+from ....computer.relay import BrowserRelayUnavailableError
 from ....computer.schema import (
     ELEMENTS_TRUNCATED_KEY,
     ComputerAction,
@@ -367,6 +368,18 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 if isinstance(policy_result, dict):
                     return policy_result
                 observation = policy_result
+        except BrowserRelayUnavailableError as exc:
+            current = environment.current_observation if environment else None
+            if environment is not None:
+                # A command may have reached the target before its response was
+                # lost. Never let a resumed run reuse that possibly stale frame
+                # or blindly repeat the state-changing action.
+                environment.invalidate_observation()
+            return self._relay_waiting_result(
+                session_id=session_id,
+                frame_id=current.frame_id if current else None,
+                message=str(exc),
+            )
         except (
             ComputerFrameMismatchError,
             ComputerSessionMismatchError,
@@ -781,4 +794,42 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             browser_runtime_kind=self._browser_runtime_kind,
             frame_id=frame_id,
             error=error,
+        ).model_dump(mode="json", exclude_none=True)
+
+    def _relay_waiting_result(
+        self,
+        *,
+        session_id: str,
+        message: str,
+        frame_id: str | None = None,
+    ) -> dict[str, Any]:
+        recovery_message = (
+            f"{message} Xagent paused before issuing another computer action. "
+            "After the target is ready, choose Continue; Xagent will capture a "
+            "fresh screenshot before acting again."
+        )
+        return ComputerToolResult(
+            success=False,
+            status="waiting_for_user",
+            message_type="warning",
+            session_id=session_id,
+            browser_runtime_kind=self._browser_runtime_kind,
+            frame_id=frame_id,
+            interactions=[
+                {
+                    "type": "action_cards",
+                    "field": "computer_relay_recovery",
+                    "label": "Computer connection",
+                    "options": [
+                        {
+                            "label": "Continue",
+                            "value": "continue",
+                            "description": (
+                                "I reconnected and authorized the selected target."
+                            ),
+                        }
+                    ],
+                }
+            ],
+            message=recovery_message,
         ).model_dump(mode="json", exclude_none=True)

@@ -38,6 +38,11 @@ class ComputerEnvironment(ABC):
             )
         self._current_observation = observation
 
+    def invalidate_observation(self) -> None:
+        """Forget a frame whose target may have changed while unavailable."""
+
+        self._current_observation = None
+
     def validate_action_batch(self, batch: ComputerActionBatch) -> None:
         if batch.session_id != self.session_id:
             raise ComputerSessionMismatchError(

@@ -31,6 +31,7 @@ from .relay import (
     BrowserRelayUnavailableError,
     DesktopRelayStatusMessage,
     RelayStatusMessage,
+    require_computer_target_ready,
 )
 
 logger = logging.getLogger(__name__)
@@ -541,6 +542,10 @@ class RedisBrowserRelayRegistry:
             raise BrowserRelayUnavailableError(
                 "Browser extension is not connected for this user."
             )
+        require_computer_target_ready(
+            status,
+            target_kind=self._target_kind,
+        )
         current_owner = await self._redis.eval(
             _ACQUIRE_CLAIM_SCRIPT,
             1,

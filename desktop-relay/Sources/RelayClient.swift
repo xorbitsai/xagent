@@ -257,6 +257,10 @@ actor RelayClient {
         )
       )
     } catch {
+      // Send current permissions, pause, emergency-stop, and window state
+      // before the failure response so the server can checkpoint a recoverable
+      // target interruption instead of treating it as an ordinary tool error.
+      try? await send(await statusProvider())
       await sendFailure(command, error.localizedDescription)
     }
   }

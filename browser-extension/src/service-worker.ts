@@ -343,6 +343,14 @@ async function handleCommand(message: RelayCommand): Promise<void> {
       result: { observation },
     })
   } catch (error) {
+    // Refresh authorization state before the failure response. The server can
+    // then distinguish a closed/detached tab (retriable user action) from an
+    // ordinary invalid or blocked command.
+    try {
+      await sendAttachedStatus()
+    } catch {
+      // Status refresh is best-effort; always return the command failure.
+    }
     send({
       type: "response",
       protocol_version: PROTOCOL_VERSION,

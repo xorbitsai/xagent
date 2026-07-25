@@ -112,6 +112,170 @@ class DesktopRelayStatusMessage(BaseModel):
 
 
 RelayStatusMessage = BrowserRelayStatusMessage | DesktopRelayStatusMessage
+RelayTargetKind = Literal["browser", "desktop"]
+
+
+class ComputerReadinessIssue(BaseModel):
+    """One user-actionable reason a relay target cannot currently be used."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal[
+        "disconnected",
+        "not_attached",
+        "screen_recording_permission_missing",
+        "accessibility_permission_missing",
+        "paused",
+        "emergency_stopped",
+    ]
+    message: str
+
+
+class ComputerTargetReadiness(BaseModel):
+    """Normalized readiness returned to both the UI and computer runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    runtime_kind: Literal["extension_relay", "desktop_relay"]
+    ready: bool
+    connected: bool
+    attached: bool
+    client_name: str | None = None
+    title: str | None = None
+    url: str | None = None
+    application: str | None = None
+    permissions: dict[str, bool] = Field(default_factory=dict)
+    paused: bool = False
+    emergency_stopped: bool = False
+    issues: list[ComputerReadinessIssue] = Field(default_factory=list)
+    message: str = ""
+
+
+def build_computer_target_readiness(
+    status: dict[str, Any],
+    *,
+    target_kind: RelayTargetKind,
+) -> ComputerTargetReadiness:
+    """Normalize browser and desktop relay state into one readiness contract."""
+
+    connected = status.get("connected") is True
+    attached = status.get("attached") is True
+    permissions = {
+        str(key): value
+        for key, value in dict(status.get("permissions") or {}).items()
+        if isinstance(value, bool)
+    }
+    paused = status.get("paused") is True
+    emergency_stopped = status.get("emergency_stopped") is True
+    issues: list[ComputerReadinessIssue] = []
+
+    if not connected:
+        peer = "Desktop Relay" if target_kind == "desktop" else "Browser extension"
+        issues.append(
+            ComputerReadinessIssue(
+                code="disconnected",
+                message=(
+                    f"{peer} is not connected. Open Settings, reconnect it, "
+                    "then continue this task."
+                ),
+            )
+        )
+    elif target_kind == "browser":
+        if not attached:
+            issues.append(
+                ComputerReadinessIssue(
+                    code="not_attached",
+                    message=(
+                        "No browser tab is approved. Open the Xagent extension, "
+                        "approve the tab to control, then continue this task."
+                    ),
+                )
+            )
+    else:
+        if emergency_stopped:
+            issues.append(
+                ComputerReadinessIssue(
+                    code="emergency_stopped",
+                    message=(
+                        "Desktop Relay emergency stop is active. Re-authorize a "
+                        "window in Desktop Relay, then continue this task."
+                    ),
+                )
+            )
+        elif paused:
+            issues.append(
+                ComputerReadinessIssue(
+                    code="paused",
+                    message=(
+                        "Desktop Relay is paused. Resume it from the companion, "
+                        "then continue this task."
+                    ),
+                )
+            )
+        if permissions.get("screen_recording") is not True:
+            issues.append(
+                ComputerReadinessIssue(
+                    code="screen_recording_permission_missing",
+                    message=(
+                        "Desktop Relay needs Screen Recording permission. Grant it "
+                        "in macOS Settings, restart the companion, then continue."
+                    ),
+                )
+            )
+        if permissions.get("accessibility") is not True:
+            issues.append(
+                ComputerReadinessIssue(
+                    code="accessibility_permission_missing",
+                    message=(
+                        "Desktop Relay needs Accessibility permission. Grant it "
+                        "in macOS Settings, restart the companion, then continue."
+                    ),
+                )
+            )
+        if not attached:
+            issues.append(
+                ComputerReadinessIssue(
+                    code="not_attached",
+                    message=(
+                        "No desktop window is authorized. Choose a window in "
+                        "Desktop Relay, then continue this task."
+                    ),
+                )
+            )
+
+    return ComputerTargetReadiness(
+        runtime_kind=(
+            "desktop_relay" if target_kind == "desktop" else "extension_relay"
+        ),
+        ready=not issues,
+        connected=connected,
+        attached=attached,
+        client_name=_optional_string(status.get("client_name")),
+        title=_optional_string(status.get("title")),
+        url=_optional_string(status.get("url")),
+        application=_optional_string(status.get("application")),
+        permissions=permissions,
+        paused=paused,
+        emergency_stopped=emergency_stopped,
+        issues=issues,
+        message=" ".join(issue.message for issue in issues),
+    )
+
+
+def require_computer_target_ready(
+    status: dict[str, Any],
+    *,
+    target_kind: RelayTargetKind,
+) -> None:
+    """Raise the retriable relay error used to checkpoint computer work."""
+
+    readiness = build_computer_target_readiness(status, target_kind=target_kind)
+    if not readiness.ready:
+        raise BrowserRelayUnavailableError(readiness.message)
+
+
+def _optional_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 class BrowserRelayPing(BaseModel):
@@ -218,32 +382,29 @@ class BrowserRelayConnection:
         *,
         timeout: float = BROWSER_RELAY_DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        if self._closed:
-            raise BrowserRelayUnavailableError(f"{self._peer_name} is disconnected.")
-        if not self.attached:
-            if self.target_kind == "desktop":
-                raise BrowserRelayUnavailableError(
-                    "No desktop window is authorized. Ask the user to open the "
-                    "Xagent Desktop Relay and choose one window."
-                )
-            raise BrowserRelayUnavailableError(
-                "No browser tab is attached. Ask the user to open the Xagent "
-                "extension and approve the current tab."
-            )
+        require_computer_target_ready(
+            self.public_status(),
+            target_kind=self.target_kind,
+        )
         request_id = secrets.token_urlsafe(18)
         future = asyncio.get_running_loop().create_future()
         async with self._pending_lock:
             self._pending[request_id] = future
         try:
-            await self._send(
-                {
-                    "type": "command",
-                    "protocol_version": BROWSER_RELAY_PROTOCOL_VERSION,
-                    "request_id": request_id,
-                    "command": command,
-                    "payload": payload,
-                }
-            )
+            try:
+                await self._send(
+                    {
+                        "type": "command",
+                        "protocol_version": BROWSER_RELAY_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "command": command,
+                        "payload": payload,
+                    }
+                )
+            except Exception as exc:
+                raise BrowserRelayUnavailableError(
+                    f"{self._peer_name} disconnected while sending {command!r}."
+                ) from exc
             return await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError as exc:
             raise BrowserRelayUnavailableError(
@@ -263,9 +424,18 @@ class BrowserRelayConnection:
         if response.success:
             future.set_result(response.result or {})
         else:
+            readiness = build_computer_target_readiness(
+                self.public_status(),
+                target_kind=self.target_kind,
+            )
+            error_type = (
+                BrowserRelayError if readiness.ready else BrowserRelayUnavailableError
+            )
             future.set_exception(
-                BrowserRelayError(
-                    response.error or f"{self._peer_name} command failed."
+                error_type(
+                    readiness.message
+                    or response.error
+                    or f"{self._peer_name} command failed."
                 )
             )
 
@@ -539,6 +709,10 @@ class BrowserRelayRegistry:
                 raise BrowserRelayUnavailableError(
                     "Browser extension is not connected for this user."
                 )
+            require_computer_target_ready(
+                connection.public_status(),
+                target_kind=self._target_kind,
+            )
             claim = self._claims.get(user_id)
             if (
                 claim is not None

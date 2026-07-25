@@ -35,6 +35,7 @@ from .api.browser_relay import browser_relay_router
 from .api.channel import router as channel_router
 from .api.chat import chat_router
 from .api.cloud_storage import cloud_router
+from .api.computer import computer_router
 from .api.conversation_logs import router as conversation_logs_router
 from .api.custom_api import custom_api_router
 from .api.desktop_relay import desktop_relay_router
@@ -624,6 +625,7 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 app.include_router(auth_router)
 app.include_router(browser_relay_router)
 app.include_router(desktop_relay_router)
+app.include_router(computer_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
 app.include_router(conversation_logs_router)

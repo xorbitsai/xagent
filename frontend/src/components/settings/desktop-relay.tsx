@@ -141,7 +141,7 @@ export function DesktopRelaySettings() {
   const accessibilityAllowed = status.permissions?.accessibility === true
 
   return (
-    <Card>
+    <Card id="desktop-relay" className="scroll-mt-6">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Monitor className="h-5 w-5" />

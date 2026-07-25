@@ -9,13 +9,16 @@ from xagent.core.computer.relay import (
     BROWSER_RELAY_PROTOCOL_VERSION,
     BrowserRelayAuthenticationError,
     BrowserRelayConnection,
+    BrowserRelayError,
     BrowserRelayHello,
     BrowserRelayInUseError,
     BrowserRelayProtocolError,
     BrowserRelayRegistry,
     BrowserRelayResponse,
     BrowserRelayStatusMessage,
+    BrowserRelayUnavailableError,
     DesktopRelayStatusMessage,
+    build_computer_target_readiness,
     get_browser_relay_registry,
     reset_browser_relay_registry,
 )
@@ -145,6 +148,113 @@ async def test_connection_routes_response_to_waiting_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connection_transport_failure_is_retriable_unavailability() -> None:
+    async def send(_message: dict) -> None:
+        raise ConnectionError("socket closed")
+
+    connection = BrowserRelayConnection(
+        user_id=2,
+        client_id="chrome",
+        client_name="Chrome",
+        send=send,
+    )
+    connection.update_status(
+        BrowserRelayStatusMessage(
+            type="status",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            attached=True,
+            tab_id=19,
+        )
+    )
+
+    with pytest.raises(BrowserRelayUnavailableError, match="disconnected"):
+        await connection.request("observe", {"frame_id": "f1"})
+
+
+@pytest.mark.asyncio
+async def test_failed_response_uses_latest_status_to_classify_unavailability() -> None:
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    connection = BrowserRelayConnection(
+        user_id=2,
+        client_id="chrome",
+        client_name="Chrome",
+        send=send,
+    )
+    connection.update_status(
+        BrowserRelayStatusMessage(
+            type="status",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            attached=True,
+            tab_id=19,
+        )
+    )
+    request = asyncio.create_task(connection.request("observe", {"frame_id": "f1"}))
+    await asyncio.sleep(0)
+
+    connection.update_status(
+        BrowserRelayStatusMessage(
+            type="status",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            attached=False,
+        )
+    )
+    await connection.resolve(
+        BrowserRelayResponse(
+            type="response",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            request_id=sent[0]["request_id"],
+            success=False,
+            error="No tab is attached.",
+        )
+    )
+
+    with pytest.raises(BrowserRelayUnavailableError, match="No browser tab"):
+        await request
+
+
+@pytest.mark.asyncio
+async def test_failed_response_stays_an_ordinary_error_when_target_is_ready() -> None:
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    connection = BrowserRelayConnection(
+        user_id=2,
+        client_id="chrome",
+        client_name="Chrome",
+        send=send,
+    )
+    connection.update_status(
+        BrowserRelayStatusMessage(
+            type="status",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            attached=True,
+            tab_id=19,
+        )
+    )
+    request = asyncio.create_task(connection.request("act", {}))
+    await asyncio.sleep(0)
+    await connection.resolve(
+        BrowserRelayResponse(
+            type="response",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            request_id=sent[0]["request_id"],
+            success=False,
+            error="The navigation policy blocked this command.",
+        )
+    )
+
+    with pytest.raises(BrowserRelayError, match="navigation policy") as exc_info:
+        await request
+    assert type(exc_info.value) is BrowserRelayError
+
+
+@pytest.mark.asyncio
 async def test_registry_enforces_one_task_owner_per_user() -> None:
     async def send(_message: dict) -> None:
         return None
@@ -231,6 +341,41 @@ async def test_desktop_relay_has_separate_credentials_and_target_contract() -> N
     assert status["target_kind"] == "desktop"
     assert status["window_id"] == 9
     assert status["permissions"]["accessibility"] is True
+
+
+def test_readiness_normalizes_browser_and_desktop_recovery_issues() -> None:
+    browser = build_computer_target_readiness(
+        {"connected": True, "attached": False},
+        target_kind="browser",
+    )
+    assert browser.runtime_kind == "extension_relay"
+    assert browser.ready is False
+    assert [issue.code for issue in browser.issues] == ["not_attached"]
+
+    desktop = build_computer_target_readiness(
+        {
+            "connected": True,
+            "attached": True,
+            "permissions": {
+                "screen_recording": False,
+                "accessibility": True,
+            },
+            "paused": True,
+        },
+        target_kind="desktop",
+    )
+    assert desktop.runtime_kind == "desktop_relay"
+    assert desktop.ready is False
+    assert [issue.code for issue in desktop.issues] == [
+        "paused",
+        "screen_recording_permission_missing",
+    ]
+
+    disconnected = build_computer_target_readiness(
+        {"connected": False, "attached": False},
+        target_kind="desktop",
+    )
+    assert [issue.code for issue in disconnected.issues] == ["disconnected"]
 
 
 def test_hello_requires_exactly_one_credential() -> None:

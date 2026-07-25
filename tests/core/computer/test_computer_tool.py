@@ -9,6 +9,7 @@ from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.computer.desktop import DesktopRelayEnvironment
 from xagent.core.computer.environment import ComputerEnvironment
 from xagent.core.computer.extension import ExtensionComputerEnvironment
+from xagent.core.computer.relay import BrowserRelayUnavailableError
 from xagent.core.computer.schema import (
     ComputerAction,
     ComputerActionBatch,
@@ -98,6 +99,22 @@ class EnvironmentFactory:
         )
         self.environments.append(environment)
         return environment
+
+
+class RecoverableRelayEnvironment(FakeComputerEnvironment):
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.unavailable = False
+
+    async def _observe(self) -> ComputerObservation:
+        if self.unavailable:
+            raise BrowserRelayUnavailableError("Browser extension disconnected.")
+        return await super()._observe()
+
+    async def _execute(self, batch: ComputerActionBatch) -> ComputerObservation:
+        if self.unavailable:
+            raise BrowserRelayUnavailableError("Browser extension disconnected.")
+        return await super()._execute(batch)
 
 
 @pytest.mark.asyncio
@@ -204,6 +221,48 @@ async def test_computer_tool_teardown_closes_created_environments() -> None:
 
     assert factory.environments[0].closed is True
     assert tool._environments == {}
+
+
+@pytest.mark.asyncio
+async def test_relay_disconnect_waits_and_requires_fresh_frame_after_resume() -> None:
+    environments: list[RecoverableRelayEnvironment] = []
+
+    def factory(**kwargs: Any) -> RecoverableRelayEnvironment:
+        environment = RecoverableRelayEnvironment(kwargs["session_id"])
+        environments.append(environment)
+        return environment
+
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+        browser_runtime_kind="extension_relay",
+        user_id=9,
+    )
+    initial = await tool.run_json_async({})
+    environments[0].unavailable = True
+
+    waiting = await tool.run_json_async(
+        {
+            "expected_frame_id": initial["frame_id"],
+            "actions": [{"type": "wait", "duration_ms": 100}],
+        }
+    )
+
+    assert waiting["status"] == "waiting_for_user"
+    assert waiting["message_type"] == "warning"
+    assert waiting["interactions"][0]["field"] == "computer_relay_recovery"
+    assert "fresh screenshot" in waiting["message"]
+    assert environments[0].current_observation is None
+
+    await tool.teardown(execution_status="waiting_for_user")
+    assert environments[0].closed is False
+
+    environments[0].unavailable = False
+    resumed = await tool.run_json_async({})
+    assert resumed["success"] is True
+    assert resumed["frame_id"] == "frame-2"
+    assert len(environments) == 1
 
 
 @pytest.mark.asyncio

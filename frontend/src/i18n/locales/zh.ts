@@ -2691,6 +2691,20 @@ const zh = {
     title: "Computer 控制目标",
     description: "选择本任务可以控制的目标。任务创建后将锁定，Agent 无法切换。",
     boundHint: "本任务已绑定到{target}",
+    manageConnections: "管理 Computer 连接",
+    status: {
+      ready: "已就绪",
+      needsAttention: "需要处理",
+      checking: "正在检查连接…",
+    },
+    issues: {
+      disconnected: "尚未连接",
+      not_attached: "请选择并授权控制目标",
+      screen_recording_permission_missing: "需要屏幕录制权限",
+      accessibility_permission_missing: "需要辅助功能权限",
+      paused: "桌面伴侣已暂停",
+      emergency_stopped: "紧急停止已触发",
+    },
     browser: {
       label: "浏览器",
       description: "通过 Xagent 扩展控制你已登录的浏览器。",

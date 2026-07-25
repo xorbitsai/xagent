@@ -15,6 +15,7 @@ from .environment import ComputerEnvironment, ComputerTargetNotFoundError
 from .relay import (
     BROWSER_RELAY_MAX_MESSAGE_BYTES,
     BrowserRelayCommandConnection,
+    BrowserRelayUnavailableError,
 )
 from .schema import (
     ELEMENT_EXTRACTION_FAILED_KEY,
@@ -120,9 +121,9 @@ class DesktopRelayEnvironment(ComputerEnvironment):
             self.current_observation is not None
             and self.current_observation.metadata.get("paused") is True
         ):
-            raise RuntimeError(
-                "Desktop relay is paused by the user. Ask the user to resume it, "
-                "then request a fresh screenshot."
+            raise BrowserRelayUnavailableError(
+                "Desktop Relay is paused by the user. Resume it from the "
+                "companion, then continue this task."
             )
 
         frame_id = self._new_frame_id()
@@ -189,9 +190,9 @@ class DesktopRelayEnvironment(ComputerEnvironment):
         raw_observation = raw_result.get("observation", raw_result)
         parsed = _DesktopRelayObservation.model_validate(raw_observation)
         if parsed.emergency_stopped:
-            raise RuntimeError(
-                "Desktop relay emergency stop is active. The user must explicitly "
-                "re-authorize a window before automation can continue."
+            raise BrowserRelayUnavailableError(
+                "Desktop Relay emergency stop is active. Re-authorize a window "
+                "in Desktop Relay, then continue this task."
             )
         try:
             image_bytes = base64.b64decode(

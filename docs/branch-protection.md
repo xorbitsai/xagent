@@ -10,13 +10,23 @@ blocks something urgent.
 > 1. `CI Summary` as a required status check -- independent of the queue.
 > 2. Exclude `refs/heads/gh-readonly-queue/**` from the branch-creation ruleset,
 >    or the queue cannot build anything.
-> 3. **Set `required_status_checks.strict` to `false`.** It is still `true` on
->    `main`. Leaving it on would defeat the entire change: a PR must satisfy its
->    branch-protection requirements before it is admitted to the queue, so with
->    strict on, every PR would still have to sync `main` and re-run its checks
->    first -- exactly the serialization the queue is meant to remove.
-> 4. Enable the merge queue.
-> 5. `enforce_admins` -- deliberately last, once the queue is proven.
+> 3. Enable the merge queue, **leaving `required_status_checks.strict` on**.
+> 4. Verify the queue end to end: a merge-group branch is created, and every
+>    required context reports on it. An already-up-to-date PR satisfies strict, so
+>    it can be enqueued for this without relaxing anything first.
+> 5. **Only now set `required_status_checks.strict` to `false`.** It is still
+>    `true` on `main`, and it has to go: a PR must satisfy its branch-protection
+>    requirements before it is admitted to the queue, so leaving strict on
+>    permanently would keep every PR syncing `main` and re-running checks first --
+>    exactly the serialization the queue exists to remove.
+> 6. `enforce_admins` -- deliberately last, once the queue is proven.
+>
+> **The order of 3 and 5 matters.** Turning strict off first would leave a window
+> where neither protection applies: `main` would accept an approved but stale PR
+> on the strength of green checks that never saw the combined tree, which is the
+> migration race this whole change exists to prevent. If queue activation then
+> failed, the repository would be stuck in that weaker state. Keeping strict on
+> until the queue is confirmed working means the worst case is the status quo.
 >
 > Sections below describe the mechanism; anything above that is still pending is
 > not in force yet. Update this block as each step lands.
@@ -99,10 +109,13 @@ The queue also needs to be able to create its branches: ruleset
 "Restrict new branches to main and rls" must exclude
 `refs/heads/gh-readonly-queue/**`.
 
-And `required_status_checks.strict` must be `false`. GitHub tracks the
+And `required_status_checks.strict` must end up `false`. GitHub tracks the
 up-to-date requirement separately from the queue, and a PR has to satisfy its
 branch-protection requirements before it is admitted -- so leaving strict on
 keeps every PR syncing `main` by hand before it can even enter the queue.
+
+Turn it off *after* the queue is confirmed working, not before; see the ordering
+note in the status block above.
 
 ## Break-glass (`enforce_admins` pending)
 

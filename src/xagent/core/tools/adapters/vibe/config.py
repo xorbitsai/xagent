@@ -445,6 +445,7 @@ class ToolConfig(BaseToolConfig):
         basic_tools_enabled = config_dict.get("basic_tools_enabled", True)
         embedding_model = config_dict.get("embedding_model")
         browser_tools_enabled = config_dict.get("browser_tools_enabled", True)
+        browser_runtime_kind = config_dict.get("computer_runtime_kind")
         task_id = config_dict.get("task_id")
         allowed_collections = config_dict.get("allowed_collections")
         allowed_skills = config_dict.get("allowed_skills")
@@ -516,6 +517,9 @@ class ToolConfig(BaseToolConfig):
         self.basic_tools_enabled: bool = bool(basic_tools_enabled)
         self.embedding_model: Optional[str] = embedding_model
         self.browser_tools_enabled: bool = bool(browser_tools_enabled)
+        self.browser_runtime_kind: Optional[str] = (
+            browser_runtime_kind if isinstance(browser_runtime_kind, str) else None
+        )
         self.task_id: Optional[str] = task_id
         self.allowed_collections: Optional[List[str]] = allowed_collections
         self.allowed_skills: Optional[List[str]] = allowed_skills
@@ -574,6 +578,11 @@ class ToolConfig(BaseToolConfig):
 
     def get_browser_tools_enabled(self) -> bool:
         return self.browser_tools_enabled
+
+    def get_browser_runtime_kind(self) -> str:
+        if self.browser_runtime_kind:
+            return self.browser_runtime_kind
+        return super().get_browser_runtime_kind()
 
     def get_task_id(self) -> Optional[str]:
         return self.task_id

@@ -590,7 +590,10 @@ describe("AppProvider websocket message routing", () => {
     function CreateTaskProbe() {
       const { sendMessage } = useApp()
       send = (message: string) =>
-        sendMessage(message, { clientMessageId: "turn-create" })
+        sendMessage(message, {
+          clientMessageId: "turn-create",
+          computerRuntimeKind: "desktop_relay",
+        })
       return null
     }
 
@@ -608,6 +611,13 @@ describe("AppProvider websocket message routing", () => {
       delivery = send?.("hello quota")
       await new Promise((resolve) => setTimeout(resolve, 0))
     })
+    expect(
+      JSON.parse(apiRequestMock.mock.calls[0][1].body as string)
+    ).toEqual(
+      expect.objectContaining({
+        computer_runtime_kind: "desktop_relay",
+      })
+    )
 
     // The socket for task 7 connects; the queued message is delivered and acked.
     await act(async () => {

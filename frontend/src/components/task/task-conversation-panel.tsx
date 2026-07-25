@@ -782,6 +782,7 @@ export function TaskConversationPanel({
                 visualModel: state.currentTask.visualModelId,
                 compactModel: state.currentTask.compactModelId,
                 executionMode: state.currentTask.executionMode,
+                computerRuntimeKind: state.currentTask.computerRuntimeKind,
               } : undefined}
               readOnlyConfig={true}
               hideFileUpload={hideFileUpload}

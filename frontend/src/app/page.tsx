@@ -27,6 +27,12 @@ import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
+import {
+  ComputerRuntimeControl,
+  DEFAULT_COMPUTER_RUNTIME_KIND,
+  getStoredComputerRuntimeKind,
+  type ComputerRuntimeKind,
+} from "@/components/computer-runtime-control";
 
 interface RecentTask {
   task_id: number | string;
@@ -57,10 +63,16 @@ export default function Home() {
   const [recentTasks, setRecentTasks] = useState<RecentTask[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
+  const [computerRuntimeKind, setComputerRuntimeKind] =
+    useState<ComputerRuntimeKind>(DEFAULT_COMPUTER_RUNTIME_KIND);
   const [visibleGetStartedVideos, setVisibleGetStartedVideos] = useState<Set<number>>(new Set());
   const getStartedSectionRef = useRef<HTMLDivElement | null>(null);
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const homeVoiceInput = useVoiceInputControls();
+
+  useEffect(() => {
+    setComputerRuntimeKind(getStoredComputerRuntimeKind());
+  }, []);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -190,6 +202,7 @@ export default function Home() {
         title: content,
         description: content,
         llm_ids: llmIds,
+        computer_runtime_kind: computerRuntimeKind,
       };
 
       const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
@@ -332,6 +345,12 @@ export default function Home() {
                 )}
               </Button>
             )}
+            <ComputerRuntimeControl
+              value={computerRuntimeKind}
+              onValueChange={setComputerRuntimeKind}
+              dark
+              className="ml-1 shrink-0"
+            />
             <Button
               size="icon"
               className="bg-[hsl(234_40%_40%)] hover:bg-[hsl(234_40%_45%)] text-white rounded-[12px] shrink-0 w-9 h-9 ml-3 transition-colors shadow-none disabled:opacity-50"

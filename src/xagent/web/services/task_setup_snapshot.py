@@ -63,6 +63,7 @@ class _TaskFields:
     execution_mode: Optional[str]
     agent_type: Optional[str]
     source: str | None = None
+    computer_runtime_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,11 @@ def load_task_setup_snapshot_sync(
             execution_mode=getattr(task_row, "execution_mode", None),
             agent_type=(
                 str(task_row.agent_type) if task_row.agent_type is not None else None
+            ),
+            computer_runtime_kind=(
+                str(task_row.computer_runtime_kind)
+                if task_row.computer_runtime_kind is not None
+                else None
             ),
         )
 

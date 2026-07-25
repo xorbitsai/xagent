@@ -1743,6 +1743,9 @@ async def execute_task_background(
                     "title": task_updated.title,
                     "description": task_updated.description,
                     "execution_mode": getattr(task_updated, "execution_mode", None),
+                    "computer_runtime_kind": getattr(
+                        task_updated, "computer_runtime_kind", None
+                    ),
                     "updated_at": task_updated.updated_at,
                 }
             else:
@@ -1761,6 +1764,7 @@ async def execute_task_background(
                     "title": None,
                     "description": None,
                     "execution_mode": None,
+                    "computer_runtime_kind": None,
                     "updated_at": None,
                 }
 
@@ -1814,6 +1818,9 @@ async def execute_task_background(
                         "description": broadcast_meta["description"],
                         "status": final_task_status,
                         "execution_mode": broadcast_meta["execution_mode"],
+                        "computer_runtime_kind": broadcast_meta[
+                            "computer_runtime_kind"
+                        ],
                         "agent_id": broadcast_agent_meta["agent_id"],
                         "agent_name": broadcast_agent_meta["agent_name"],
                         "agent_logo_url": broadcast_agent_meta["agent_logo_url"],
@@ -1992,6 +1999,7 @@ async def execute_resume_background(
     task_title: str | None = None
     task_description: str | None = None
     task_execution_mode: str | None = None
+    task_computer_runtime_kind: str | None = None
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
@@ -2229,6 +2237,9 @@ async def execute_resume_background(
                 task_title = cast(Any, task_updated.title)
                 task_description = cast(Any, task_updated.description)
                 task_execution_mode = cast(Any, task_updated.execution_mode)
+                task_computer_runtime_kind = cast(
+                    Any, task_updated.computer_runtime_kind
+                )
                 task_agent_id = cast(Any, task_updated.agent_id)
                 if task_updated.agent_id is not None:
                     agent = (
@@ -2317,6 +2328,7 @@ async def execute_resume_background(
                         "description": task_description,
                         "status": final_status,
                         "execution_mode": task_execution_mode,
+                        "computer_runtime_kind": task_computer_runtime_kind,
                         "agent_id": task_agent_id,
                         "agent_name": agent_name,
                         "agent_logo_url": agent_logo_url,
@@ -3503,6 +3515,7 @@ async def _handle_chat_message_unserialized(
                                 "visual_model_name": task.visual_model_name,
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
+                                "computer_runtime_kind": task.computer_runtime_kind,
                                 "agent_id": task.agent_id,
                                 "agent_name": task.agent.name if task.agent else None,
                                 "agent_logo_url": task.agent.logo_url
@@ -3839,6 +3852,7 @@ async def _handle_chat_message_unserialized(
                                 "visual_model_name": task.visual_model_name,
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
+                                "computer_runtime_kind": task.computer_runtime_kind,
                                 "created_at": safe_timestamp_to_unix(task.created_at)
                                 if task.created_at
                                 else None,
@@ -4083,6 +4097,7 @@ async def _handle_chat_message_unserialized(
                                 "visual_model_name": task.visual_model_name,
                                 "compact_model_name": task.compact_model_name,
                                 "execution_mode": task.execution_mode,
+                                "computer_runtime_kind": task.computer_runtime_kind,
                                 "agent_id": task.agent_id,
                                 "agent_name": task.agent.name if task.agent else None,
                                 "agent_logo_url": task.agent.logo_url
@@ -4418,6 +4433,7 @@ async def handle_execute_task(
                     "visual_model_name": task.visual_model_name,
                     "compact_model_name": task.compact_model_name,
                     "execution_mode": task.execution_mode,
+                    "computer_runtime_kind": task.computer_runtime_kind,
                     "agent_id": task.agent_id,
                     "agent_name": task.agent.name if task.agent else None,
                     "agent_logo_url": task.agent.logo_url if task.agent else None,
@@ -4717,6 +4733,7 @@ async def send_historical_data_as_stream(
                     "visual_model_name": task.visual_model_name,
                     "compact_model_name": task.compact_model_name,
                     "execution_mode": task.execution_mode,
+                    "computer_runtime_kind": task.computer_runtime_kind,
                     "agent_id": task.agent_id,
                     "agent_name": task.agent.name if task.agent else None,
                     "agent_logo_url": task.agent.logo_url if task.agent else None,

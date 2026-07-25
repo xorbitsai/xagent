@@ -1508,6 +1508,7 @@ class AgentTool(AbstractBaseTool):
         target_allow_cross_user_agent_ids: bool = False,
         runtime_metadata: Optional[dict[str, Any]] = None,
         execution_scope: Optional[Any] = None,
+        computer_runtime_kind: Optional[str] = None,
     ):
         """
         Initialize an agent tool.
@@ -1535,6 +1536,7 @@ class AgentTool(AbstractBaseTool):
             target_allowed_agent_ids: Agent IDs this tool may execute as its target
             target_allow_cross_user_agent_ids: Whether this tool may execute explicit cross-user target IDs
             runtime_metadata: Extra delegation metadata for tracing
+            computer_runtime_kind: Parent task's fixed Computer target
         """
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -1566,6 +1568,7 @@ class AgentTool(AbstractBaseTool):
             target_allow_cross_user_agent_ids
         )
         self._runtime_metadata = dict(runtime_metadata or {})
+        self._computer_runtime_kind = computer_runtime_kind
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2010,6 +2013,7 @@ class AgentTool(AbstractBaseTool):
                 parent_tracer=self._parent_tracer,
                 agent_call_stack=self._agent_call_stack,
                 task_id=execution_task_id,
+                computer_runtime_kind=self._computer_runtime_kind,
                 workspace_config={
                     "base_dir": self._workspace_base_dir,
                     "task_id": execution_task_id,
@@ -2221,6 +2225,7 @@ def build_published_agent_tools_from_records(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
+    computer_runtime_kind: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2307,6 +2312,7 @@ def build_published_agent_tools_from_records(
             target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
             runtime_metadata=runtime_metadata,
             execution_scope=execution_scope,
+            computer_runtime_kind=computer_runtime_kind,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -2330,6 +2336,7 @@ def get_published_agents_tools(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
+    computer_runtime_kind: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -2390,6 +2397,7 @@ def get_published_agents_tools(
             parent_tracer=parent_tracer,
             agent_call_stack=agent_call_stack,
             execution_scope=execution_scope,
+            computer_runtime_kind=computer_runtime_kind,
         )
 
     except Exception as e:
@@ -2451,6 +2459,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             execution_scope=config.get_execution_scope()
             if hasattr(config, "get_execution_scope")
             else None,
+            computer_runtime_kind=config.get_browser_runtime_kind(),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

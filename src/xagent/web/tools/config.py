@@ -995,6 +995,7 @@ class WebToolConfig(BaseToolConfig):
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
         browser_tools_enabled: bool = True,
+        computer_runtime_kind: Optional[str] = None,
         allowed_collections: Optional[List[str]] = None,
         allowed_skills: Optional[List[str]] = None,
         allowed_agent_ids: Optional[List[int]] = None,
@@ -1082,6 +1083,7 @@ class WebToolConfig(BaseToolConfig):
         self._include_mcp_tools = include_mcp_tools
         self._task_id = task_id
         self._browser_tools_enabled = browser_tools_enabled
+        self._computer_runtime_kind = computer_runtime_kind
         self._allowed_collections = allowed_collections
         self._allowed_skills = allowed_skills
         self._allowed_agent_ids = allowed_agent_ids
@@ -1524,6 +1526,12 @@ class WebToolConfig(BaseToolConfig):
     def get_browser_tools_enabled(self) -> bool:
         """Whether to include browser automation tools."""
         return self._browser_tools_enabled
+
+    def get_browser_runtime_kind(self) -> str:
+        """Return the task-bound Computer target, or the deployment default."""
+        if self._computer_runtime_kind:
+            return self._computer_runtime_kind
+        return super().get_browser_runtime_kind()
 
     def get_task_id(self) -> Optional[str]:
         """Get task ID for session tracking."""

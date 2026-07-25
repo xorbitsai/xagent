@@ -76,6 +76,7 @@ def test_agent_tool_does_not_share_a_live_session_with_child_config(monkeypatch)
         def spy(*args, **kwargs):
             captured["db"] = kwargs.get("db")
             captured["db_factory"] = kwargs.get("db_factory")
+            captured["computer_runtime_kind"] = kwargs.get("computer_runtime_kind")
             raise _Stop()
 
         monkeypatch.setattr(mod, "WebToolConfig", spy)
@@ -88,6 +89,7 @@ def test_agent_tool_does_not_share_a_live_session_with_child_config(monkeypatch)
             user_id=user_id,
             tool_name="t",
             tool_description="d",
+            computer_runtime_kind="desktop_relay",
         )
 
         try:
@@ -97,6 +99,7 @@ def test_agent_tool_does_not_share_a_live_session_with_child_config(monkeypatch)
 
         assert captured["db"] is None
         assert captured["db_factory"] is SessionLocal
+        assert captured["computer_runtime_kind"] == "desktop_relay"
     finally:
         try:
             os.remove(db_path)

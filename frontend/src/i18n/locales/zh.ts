@@ -2687,6 +2687,19 @@ const zh = {
   markdownRenderer: {
     loadAgentDetailsFailed: "无法加载 Agent 详情",
   },
+  computerRuntime: {
+    title: "Computer 控制目标",
+    description: "选择本任务可以控制的目标。任务创建后将锁定，Agent 无法切换。",
+    boundHint: "本任务已绑定到{target}",
+    browser: {
+      label: "浏览器",
+      description: "通过 Xagent 扩展控制你已登录的浏览器。",
+    },
+    desktop: {
+      label: "桌面",
+      description: "控制已连接的 macOS 桌面伴侣及其选定窗口。",
+    },
+  },
   agent: {
     logo: "Agent 标识",
     header: {

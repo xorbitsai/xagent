@@ -9,6 +9,7 @@ from xagent.core.tools.adapters.vibe.browser_use import (
     BrowserTaskSessionMixin,
     create_browser_tools,
 )
+from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.workspace import TaskWorkspace
 
 
@@ -42,6 +43,12 @@ def test_browser_factory_binds_persistent_profile_out_of_band(tmp_path) -> None:
     assert binding.user_id == 8
     assert binding.profile_id == "work"
     assert binding.persistent_profile_dir() == tmp_path / "user_8" / "work"
+
+
+def test_standalone_tool_config_accepts_out_of_band_computer_runtime() -> None:
+    config = ToolConfig({"computer_runtime_kind": "desktop_relay"})
+
+    assert config.get_browser_runtime_kind() == "desktop_relay"
 
 
 @pytest.mark.asyncio

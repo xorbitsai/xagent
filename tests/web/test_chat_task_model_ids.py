@@ -514,6 +514,59 @@ def test_standalone_task_create_defaults_to_auto(test_db, user1_headers):
     assert resp.json()["execution_mode"] == "auto"
 
 
+def test_task_create_persists_computer_runtime_binding(test_db, user1_headers):
+    from xagent.web.services.hot_path_cache import invalidate_task_cache
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "desktop-bound",
+            "description": "desc",
+            "computer_runtime_kind": "desktop_relay",
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_data = resp.json()
+    assert task_data["computer_runtime_kind"] == "desktop_relay"
+
+    detail = client.get(
+        f"/api/chat/task/{task_data['task_id']}",
+        headers=user1_headers,
+    )
+    assert detail.status_code == 200
+    assert detail.json()["computer_runtime_kind"] == "desktop_relay"
+
+    tasks = client.get("/api/chat/tasks", headers=user1_headers)
+    assert tasks.status_code == 200
+    persisted = next(
+        task
+        for task in tasks.json()["tasks"]
+        if task["task_id"] == task_data["task_id"]
+    )
+    assert persisted["computer_runtime_kind"] == "desktop_relay"
+    invalidate_task_cache(int(task_data["task_id"]))
+
+
+@pytest.mark.parametrize(
+    "runtime_kind",
+    ["ephemeral_playwright", "persistent_playwright", "other", ""],
+)
+def test_task_create_rejects_non_user_controlled_computer_runtime(
+    test_db, user1_headers, runtime_kind
+):
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "invalid-runtime",
+            "description": "desc",
+            "computer_runtime_kind": runtime_kind,
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 422
+
+
 def test_web_task_detail_cache_reuses_response_until_task_changes(
     test_db, user1_headers, monkeypatch
 ):

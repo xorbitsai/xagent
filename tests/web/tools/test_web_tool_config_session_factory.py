@@ -218,6 +218,17 @@ def test_live_db_path_unchanged():
     cfg.close()  # must not raise; caller owns the request session
 
 
+def test_web_tool_config_prefers_task_bound_computer_runtime(monkeypatch):
+    monkeypatch.setenv("XAGENT_BROWSER_RUNTIME_KIND", "ephemeral_playwright")
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        computer_runtime_kind="desktop_relay",
+    )
+
+    assert cfg.get_browser_runtime_kind() == "desktop_relay"
+
+
 @pytest.mark.asyncio
 async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     monkeypatch,
@@ -249,11 +260,13 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
         None,
         user=SimpleNamespace(id=7, is_admin=False),
         task_id="web_task_11",
+        computer_runtime_kind="extension_relay",
     )
 
     assert tools == ["prepared-tool"]
     assert captured["db"] is None
     assert captured["db_factory"] is session_factory
+    assert captured["computer_runtime_kind"] == "extension_relay"
 
 
 @pytest.mark.asyncio

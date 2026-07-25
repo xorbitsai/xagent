@@ -1,7 +1,7 @@
 """Chat API request and response models"""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, model_validator
 
@@ -62,6 +62,7 @@ class TaskCreateRequest(BaseModel):
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
     is_preview: bool = False  # Backward-compatible alias for is_visible=False.
     is_visible: bool = True
+    computer_runtime_kind: Optional[Literal["extension_relay", "desktop_relay"]] = None
 
     # Execution mode field
     execution_mode: Optional[str] = None  # "flash", "balanced", "think", or "auto"
@@ -100,6 +101,7 @@ class TaskCreateResponse(BaseModel):
     visual_model_name: Optional[str] = None
     compact_model_name: Optional[str] = None
     execution_mode: Optional[str] = None
+    computer_runtime_kind: Optional[str] = None
     channel_id: Optional[int] = None
     channel_name: Optional[str] = None
     agent_id: Optional[int] = None

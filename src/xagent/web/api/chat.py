@@ -516,6 +516,7 @@ async def create_default_tools(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[List[int]] = None,
     scope: Optional[ExecutionScope] = None,
+    computer_runtime_kind: Optional[str] = None,
     connector_runtime_turn_id: Optional[str] = None,
     mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
     mcp_load_summary_tracer: Optional[Any] = None,
@@ -579,6 +580,7 @@ async def create_default_tools(
         include_mcp_tools=_spec_wants_mcp(tool_selection_spec),
         task_id=task_id,  # Pass task_id for browser session tracking
         browser_tools_enabled=True,  # Enable browser automation tools
+        computer_runtime_kind=computer_runtime_kind,
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases
         allowed_skills=allowed_skills,  # Agent Builder skills
         vision_model=vision_model,  # Pass task-specific vision model
@@ -1360,6 +1362,7 @@ class AgentServiceManager:
             task_id=f"web_task_{task_id}",
             workspace_owner_id=int(task.user_id),
             scope=scope,
+            computer_runtime_kind=getattr(task, "computer_runtime_kind", None),
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
             else None,
@@ -1942,6 +1945,7 @@ class AgentServiceManager:
                     task_id=f"web_task_{task_id}",
                     workspace_owner_id=workspace_owner_id,
                     scope=scope,
+                    computer_runtime_kind=getattr(task, "computer_runtime_kind", None),
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
@@ -3074,6 +3078,7 @@ async def create_task(
             visual_model_name=visual_model_name,
             compact_model_name=compact_model_name,
             agent_config=task_agent_config,
+            computer_runtime_kind=request.computer_runtime_kind,
             execution_mode=task_execution_mode,
             process_description=request.process_description,
             examples=examples_data,
@@ -3141,6 +3146,7 @@ async def create_task(
             visual_model_name=task.visual_model_name,
             compact_model_name=task.compact_model_name,
             execution_mode=task.execution_mode,
+            computer_runtime_kind=task.computer_runtime_kind,
             channel_id=task.channel_id,
             channel_name=task.channel_name,
             agent_id=task.agent_id,
@@ -3299,6 +3305,7 @@ async def get_tasks(
                         "small_fast_model_name": task.small_fast_model_name,
                         "visual_model_name": task.visual_model_name,
                         "execution_mode": task.execution_mode,
+                        "computer_runtime_kind": task.computer_runtime_kind,
                         "input_tokens": task.input_tokens or 0,
                         "output_tokens": task.output_tokens or 0,
                         "total_tokens": task.total_tokens or 0,
@@ -3458,6 +3465,8 @@ async def get_task(
                 "small_fast_model_name": task.small_fast_model_name,
                 "visual_model_name": task.visual_model_name,
                 "compact_model_name": task.compact_model_name,
+                "execution_mode": task.execution_mode,
+                "computer_runtime_kind": task.computer_runtime_kind,
                 "dag_data": dag_data,
                 "input_tokens": task.input_tokens or 0,
                 "output_tokens": task.output_tokens or 0,
@@ -3580,6 +3589,8 @@ async def get_task_status(
                 "small_fast_model_name": task.small_fast_model_name,
                 "visual_model_name": task.visual_model_name,
                 "compact_model_name": task.compact_model_name,
+                "execution_mode": task.execution_mode,
+                "computer_runtime_kind": task.computer_runtime_kind,
                 "input_tokens": task.input_tokens or 0,
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,

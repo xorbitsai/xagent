@@ -467,6 +467,7 @@ export interface Task {
   visualModelName?: string
   compactModelName?: string
   executionMode?: "flash" | "balanced" | "think"
+  computerRuntimeKind?: "extension_relay" | "desktop_relay"
   isDag?: boolean
   agentId?: number
   agentName?: string
@@ -1623,6 +1624,7 @@ export function AppProvider({
                 visualModelName: taskData.visual_model_name,
                 compactModelName: taskData.compact_model_name,
                 executionMode: taskData.execution_mode,
+                computerRuntimeKind: taskData.computer_runtime_kind,
                 isDag: taskData.is_dag,
                 agentId: taskData.agent_id,
                 agentName: taskData.agent_name,
@@ -4510,6 +4512,12 @@ export function AppProvider({
         if (executionMode) {
           requestBody.execution_mode = executionMode
         }
+        if (
+          config?.computerRuntimeKind === "extension_relay" ||
+          config?.computerRuntimeKind === "desktop_relay"
+        ) {
+          requestBody.computer_runtime_kind = config.computerRuntimeKind
+        }
 
         // Upload files first if present
         if (files && files.length > 0) {
@@ -4612,6 +4620,7 @@ export function AppProvider({
             visualModelName: taskData.visual_model_name || taskData.visual_model_name,
             compactModelName: taskData.compact_model_name || taskData.compact_model_name,
             executionMode: taskData.execution_mode,
+            computerRuntimeKind: taskData.computer_runtime_kind,
             isDag: taskData.is_dag,
             agentId: taskData.agent_id,
             agentName: taskData.agent_name,

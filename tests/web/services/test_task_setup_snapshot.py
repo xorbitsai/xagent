@@ -159,6 +159,22 @@ def test_basic_task_no_agent_builder(db_session) -> None:
     assert snapshot.task_pattern == "single_call"  # "flash" -> single_call
 
 
+def test_task_computer_runtime_binding_is_preserved(db_session) -> None:
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        computer_runtime_kind="desktop_relay",
+    )
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.task.computer_runtime_kind == "desktop_relay"
+
+
 @pytest.mark.parametrize("source", ["sdk", "trigger", None])
 def test_task_source_is_preserved(db_session, source: str | None) -> None:
     """The setup policy owner receives the persisted task origin unchanged."""

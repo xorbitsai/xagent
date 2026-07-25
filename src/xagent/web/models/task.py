@@ -121,6 +121,12 @@ class Task(Base):  # type: ignore
     agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
     connector_runtime_selected_refs = Column(JSON, nullable=True, default=list)
 
+    # User-selected Computer target for this task. This is task-owned state,
+    # not a model/tool argument, so an agent cannot switch between the user's
+    # browser and desktop during execution. NULL preserves the deployment
+    # default for legacy and non-interactive task creation paths.
+    computer_runtime_kind = Column(String(32), nullable=True)
+
     # Execution mode configuration
     execution_mode = Column(
         String(20), default=ExecutionMode.AUTO.value, nullable=True

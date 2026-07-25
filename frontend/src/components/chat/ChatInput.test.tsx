@@ -138,6 +138,30 @@ describe("ChatInput", () => {
     expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
   })
 
+  it("sends the user-selected computer target with a new task", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="use my desktop"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        selectedAgents={[{ id: 42, name: "Shared Agent" }]}
+      />
+    )
+
+    fireEvent.click(screen.getByTitle("computerRuntime.title"))
+    fireEvent.click(screen.getByText("computerRuntime.desktop.label"))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "use my desktop",
+        expect.objectContaining({ computerRuntimeKind: "desktop_relay" })
+      )
+    })
+  })
+
   it("does not show pause for uppercase terminal task status", () => {
     const { container } = render(
       <ChatInput

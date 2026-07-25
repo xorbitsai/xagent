@@ -2687,6 +2687,19 @@ Build when you need.`,
   markdownRenderer: {
     loadAgentDetailsFailed: "Unable to load agent details",
   },
+  computerRuntime: {
+    title: "Computer target",
+    description: "Choose what this task may control. The target is locked when the task is created.",
+    boundHint: "This task is bound to {target}",
+    browser: {
+      label: "Browser",
+      description: "Control your signed-in browser through the Xagent extension.",
+    },
+    desktop: {
+      label: "Desktop",
+      description: "Control the connected macOS desktop companion and its selected window.",
+    },
+  },
   agent: {
     logo: "Agent Logo",
     header: {

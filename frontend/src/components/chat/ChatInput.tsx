@@ -14,6 +14,12 @@ import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "@/components/ui/sonner";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
 import {
+  ComputerRuntimeControl,
+  DEFAULT_COMPUTER_RUNTIME_KIND,
+  getStoredComputerRuntimeKind,
+  type ComputerRuntimeKind,
+} from "@/components/computer-runtime-control";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -64,6 +70,7 @@ interface AgentConfig {
   compactModel?: string;
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
+  computerRuntimeKind?: ComputerRuntimeKind;
   clientMessageId?: string;
 }
 
@@ -263,6 +270,7 @@ export function ChatInput({
   const [agentConfig, setAgentConfig] = useState<AgentConfig>({
     model: "",
     memorySimilarityThreshold: 1.5,
+    computerRuntimeKind: DEFAULT_COMPUTER_RUNTIME_KIND,
   });
   const [defaultAgentConfig, setDefaultAgentConfig] = useState<{
     model: string;
@@ -469,7 +477,9 @@ export function ChatInput({
         smallFastModel: taskConfig.smallFastModel || prev.smallFastModel,
         visualModel: taskConfig.visualModel || prev.visualModel,
         compactModel: taskConfig.compactModel || prev.compactModel,
-        executionMode: taskConfig.executionMode
+        executionMode: taskConfig.executionMode,
+        computerRuntimeKind:
+          taskConfig.computerRuntimeKind || prev.computerRuntimeKind,
       }));
     } else if (!readOnlyConfig) {
       setAgentConfig(prev => ({
@@ -478,13 +488,14 @@ export function ChatInput({
         smallFastModel: defaultAgentConfig.smallFastModel,
         visualModel: defaultAgentConfig.visualModel,
         compactModel: defaultAgentConfig.compactModel,
-        executionMode: undefined
+        executionMode: undefined,
+        computerRuntimeKind: getStoredComputerRuntimeKind(),
       }));
     }
   }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
 
   const handleConfigChange = (config: AgentConfig) => {
-    setAgentConfig(config);
+    setAgentConfig(prev => ({ ...prev, ...config }));
   };
 
   const normalizedTaskStatus = normalizeTaskStatus(taskStatus);
@@ -987,6 +998,21 @@ export function ChatInput({
                       />
                     )}
                   </>
+                )}
+                {!hideConfig && (
+                  <ComputerRuntimeControl
+                    value={
+                      agentConfig.computerRuntimeKind ||
+                      DEFAULT_COMPUTER_RUNTIME_KIND
+                    }
+                    onValueChange={(computerRuntimeKind) =>
+                      setAgentConfig(prev => ({
+                        ...prev,
+                        computerRuntimeKind,
+                      }))
+                    }
+                    disabled={readOnlyConfig}
+                  />
                 )}
                 {/* Upload button - adjacent to bottom toolbar */}
                 {!hideFileUpload && (

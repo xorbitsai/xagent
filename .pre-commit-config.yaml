@@ -56,6 +56,8 @@ repos:
           - cloudpickle
           - exa-py
           - limits
+          # Ships py.typed; the browser relay imports redis.asyncio directly.
+          - redis
           - google-genai==1.66.0
           - elevenlabs==2.56.0
           # Pin google-auth/google-api-core to versions that ship py.typed;

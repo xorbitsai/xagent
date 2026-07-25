@@ -44,7 +44,7 @@ TERMINAL_JOB_STATUSES = frozenset(
 
 def _is_redis_broker_reachable(broker_url: str) -> bool:
     try:
-        import redis  # type: ignore[import-not-found]
+        import redis
     except ImportError:
         logger.warning("Redis Celery broker configured but redis package is missing")
         return False

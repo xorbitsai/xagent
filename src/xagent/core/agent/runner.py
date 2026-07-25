@@ -179,6 +179,9 @@ class AgentRunner:
                 await self._setup_tools(tools, task_id=execution_id)
                 for pattern in patterns:
                     load_pattern_checkpoint(pattern, checkpoint)
+                    # Each attempt reports its own terminal status; without this
+                    # reset a later pattern would inherit the previous one's.
+                    teardown_status = None
                     try:
                         result = await pattern.run(
                             **self._build_pattern_kwargs(

@@ -19,6 +19,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    """Whether ``func`` accepts ``name`` as a keyword argument."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name and parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            return True
+    return False
+
+
 class OutputFilteredToolWrapper(AbstractBaseTool):
     """
     Wrapper that applies output filtering to any tool.
@@ -112,10 +129,42 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         if hasattr(self._target, "setup"):
             await self._target.setup(task_id)
 
-    async def teardown(self, task_id: Optional[str] = None) -> None:
-        """Teardown tool (delegates to target tool)."""
-        if hasattr(self._target, "teardown"):
-            await self._target.teardown(task_id)
+    async def teardown(
+        self,
+        task_id: Optional[str] = None,
+        execution_status: Optional[str] = None,
+    ) -> None:
+        """Teardown tool, forwarding only the kwargs the target accepts.
+
+        ``execution_status`` lets stateful tools keep resources alive across a
+        pause (for example a browser waiting on user approval), so it must not
+        be swallowed by this wrapper.
+        """
+        teardown = getattr(self._target, "teardown", None)
+        if teardown is None:
+            return
+        kwargs: dict[str, Any] = {"task_id": task_id}
+        if execution_status is not None and _accepts_kwarg(
+            teardown, "execution_status"
+        ):
+            kwargs["execution_status"] = execution_status
+        await teardown(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes to the wrapped tool.
+
+        Callers probe optional tool capabilities with ``getattr(tool, ...)``
+        (for example the trusted confirmation grant used by ``computer``, or
+        ``decision_group``). Without this fallback the wrapper silently hides
+        every capability it does not itself declare.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            target = object.__getattribute__(self, "_target")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(target, name)
 
     @property
     def func(self) -> Any:

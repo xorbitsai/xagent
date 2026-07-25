@@ -120,8 +120,8 @@ async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -
         {
             "actions": [
                 {
-                    "type": "click",
-                    "target": {"point": {"x": 0.5, "y": 0.5}},
+                    "type": "navigate",
+                    "url": "https://example.com",
                 }
             ]
         }
@@ -134,8 +134,8 @@ async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -
             "expected_frame_id": "frame-1",
             "actions": [
                 {
-                    "type": "click",
-                    "target": {"point": {"x": 0.5, "y": 0.5}},
+                    "type": "navigate",
+                    "url": "https://example.com",
                 }
             ],
         }

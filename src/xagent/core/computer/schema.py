@@ -11,6 +11,10 @@ from ..context_ref import ContextReference, ContextReferencePurpose
 #: The policy treats an unknown page structure as elevated risk.
 ELEMENT_EXTRACTION_FAILED_KEY = "element_extraction_failed"
 
+#: Observation metadata flag set when some page surfaces (for example an
+#: inaccessible frame or a closed shadow tree) could not be enumerated.
+ELEMENT_EXTRACTION_INCOMPLETE_KEY = "element_extraction_incomplete"
+
 #: Observation metadata flag set when the element list hit its cap, so the
 #: model knows the list is incomplete rather than exhaustive.
 ELEMENTS_TRUNCATED_KEY = "elements_truncated"

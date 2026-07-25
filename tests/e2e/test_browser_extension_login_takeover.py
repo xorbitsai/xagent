@@ -82,6 +82,16 @@ class RelayHarness:
                     return message
 
     async def observe(self, frame_id: str) -> dict[str, Any]:
+        return await self.command(
+            "observe",
+            {"frame_id": frame_id},
+        )
+
+    async def command(
+        self,
+        command: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         if self.connection is None:
             raise RuntimeError("Extension relay is not connected.")
         request_id = uuid4().hex
@@ -91,8 +101,8 @@ class RelayHarness:
                     "type": "command",
                     "protocol_version": 1,
                     "request_id": request_id,
-                    "command": "observe",
-                    "payload": {"frame_id": frame_id},
+                    "command": command,
+                    "payload": payload,
                 }
             )
         )
@@ -122,6 +132,7 @@ async def login_server() -> AsyncIterator[str]:
         <label>Password <input id="password" type="password"
           autocomplete="current-password"></label>
         <button id="sign-in" type="submit">Sign in</button>
+        <a id="outside" href="http://localhost:9/blocked">Outside host</a>
       </form>
     </main>
     <script>
@@ -263,6 +274,64 @@ async def _exercise_login_takeover(
         if element.get("metadata", {}).get("input_type") == "password"
     )
     assert password["metadata"]["sensitive"] is True
+    username = next(
+        element
+        for element in raw_observation["elements"]
+        if element.get("metadata", {}).get("autocomplete") == "username"
+    )
+
+    bounds = username["bounds"]
+    acted = await relay.command(
+        "act",
+        {
+            "expected_frame_id": "frame-before-takeover",
+            "frame_id": "frame-after-agent-type",
+            "action": {
+                "type": "type",
+                "target": {
+                    "x": bounds["x"] + bounds["width"] / 2,
+                    "y": bounds["y"] + bounds["height"] / 2,
+                },
+                "target_element_id": username["element_id"],
+                "text": "relay-user",
+            },
+            "navigation_policy": {
+                "allowlist": ["127.0.0.1"],
+                "denylist": [],
+            },
+        },
+    )
+    assert acted["success"] is True
+    assert await login_page.locator("#username").input_value() == "relay-user"
+    after_agent_type = acted["result"]["observation"]
+    outside = next(
+        element
+        for element in after_agent_type["elements"]
+        if element.get("label") == "Outside host"
+    )
+    outside_bounds = outside["bounds"]
+    blocked_navigation = await relay.command(
+        "act",
+        {
+            "expected_frame_id": "frame-after-agent-type",
+            "frame_id": "frame-after-blocked-navigation",
+            "action": {
+                "type": "click",
+                "target": {
+                    "x": outside_bounds["x"] + outside_bounds["width"] / 2,
+                    "y": outside_bounds["y"] + outside_bounds["height"] / 2,
+                },
+                "target_element_id": outside["element_id"],
+            },
+            "navigation_policy": {
+                "allowlist": ["127.0.0.1"],
+                "denylist": [],
+            },
+        },
+    )
+    assert blocked_navigation["success"] is False
+    assert "outside the configured allowlist" in blocked_navigation["error"]
+    assert login_page.url == login_url
 
     observation = _policy_observation(raw_observation, password)
     decision = await DefaultComputerActionPolicy().evaluate(

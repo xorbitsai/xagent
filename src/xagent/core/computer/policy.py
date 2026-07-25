@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .schema import (
     ELEMENT_EXTRACTION_FAILED_KEY,
+    ELEMENT_EXTRACTION_INCOMPLETE_KEY,
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
@@ -145,6 +146,33 @@ def host_matches(host: str | None, patterns: Sequence[str]) -> bool:
     )
 
 
+def navigation_block_reason(
+    raw_url: str,
+    *,
+    allowlist: Sequence[str] | None = None,
+    denylist: Sequence[str] | None = None,
+) -> str | None:
+    """Return why a browser URL is forbidden, or ``None`` when permitted."""
+    url = raw_url.strip()
+    if url == "about:blank":
+        return None
+    host = urlsplit(url).hostname
+    if host is None:
+        # Workspace file navigation is contained by the workspace. Host policy
+        # only governs network destinations.
+        return None
+    normalized_allowlist = normalize_host_patterns(allowlist)
+    normalized_denylist = normalize_host_patterns(denylist)
+    if host_matches(host, normalized_denylist):
+        return f"Navigation to {host} is blocked by the configured policy."
+    if normalized_allowlist and not host_matches(host, normalized_allowlist):
+        return (
+            f"Navigation to {host} is outside the configured allowlist. "
+            "Ask the user to open this site or extend the allowlist."
+        )
+    return None
+
+
 class DefaultComputerActionPolicy:
     """Conservative browser policy for actions with external side effects.
 
@@ -174,6 +202,9 @@ class DefaultComputerActionPolicy:
         structure_unknown = (
             observation.metadata.get(ELEMENT_EXTRACTION_FAILED_KEY) is True
         )
+        structure_incomplete = (
+            observation.metadata.get(ELEMENT_EXTRACTION_INCOMPLETE_KEY) is True
+        )
 
         for index, action in enumerate(batch.actions):
             element = find_computer_target_element(action, observation)
@@ -183,6 +214,34 @@ class DefaultComputerActionPolicy:
                 if blocked_reason is not None:
                     blocked_indexes.append(index)
                     blocked_reasons.append(blocked_reason)
+                continue
+
+            active_url_reason = self._blocked_navigation_reason(
+                observation.active_url or ""
+            )
+            if action.type not in _READ_ONLY_ACTIONS and active_url_reason is not None:
+                blocked_indexes.append(index)
+                blocked_reasons.append(
+                    f"The current page is outside the allowed browser boundary. "
+                    f"{active_url_reason}"
+                )
+                continue
+
+            if (
+                action.type is ComputerActionType.TYPE
+                and element is None
+                and (
+                    structure_unknown
+                    or structure_incomplete
+                    or not observation.elements
+                )
+            ):
+                blocked_indexes.append(index)
+                blocked_reasons.append(
+                    "The input target cannot be inspected, so Xagent cannot "
+                    "verify that it is not a password, payment, or one-time-code "
+                    "field. The user must enter the text."
+                )
                 continue
 
             if action.type not in _READ_ONLY_ACTIONS and structure_unknown:
@@ -219,20 +278,18 @@ class DefaultComputerActionPolicy:
                 )
                 continue
 
-            # A miss on a page whose controls are known means the coordinate is
-            # aimed at something the policy cannot reason about. An observation
-            # with no elements at all carries no such evidence either way, and
-            # is covered by the extraction-failure check above.
-            if (
-                action.type in _POINTED_ACTIONS
-                and element is None
-                and observation.elements
-            ):
+            if action.type in _POINTED_ACTIONS and element is None:
                 confirmation_indexes.append(index)
-                confirmation_reasons.append(
-                    "The action targets a position that matches no known "
-                    "control, so what it activates cannot be verified."
-                )
+                if structure_incomplete:
+                    confirmation_reasons.append(
+                        "Some page surfaces could not be inspected and the "
+                        "action matches no verified control."
+                    )
+                else:
+                    confirmation_reasons.append(
+                        "The action targets a position that matches no known "
+                        "control, so what it activates cannot be verified."
+                    )
                 continue
 
             if action.type in {
@@ -267,24 +324,11 @@ class DefaultComputerActionPolicy:
 
     def _blocked_navigation_reason(self, raw_url: str) -> str | None:
         """Return why navigation is refused, or None when it is permitted."""
-        url = raw_url.strip()
-        if url == "about:blank":
-            return None
-        host = urlsplit(url).hostname
-        if host is None:
-            # Workspace file navigation is already contained by the workspace;
-            # host policy only governs network destinations.
-            return None
-        if host_matches(host, self.navigation_denylist):
-            return f"Navigation to {host} is blocked by the configured policy."
-        if self.navigation_allowlist and not host_matches(
-            host, self.navigation_allowlist
-        ):
-            return (
-                f"Navigation to {host} is outside the configured allowlist. "
-                "Ask the user to open this site or extend the allowlist."
-            )
-        return None
+        return navigation_block_reason(
+            raw_url,
+            allowlist=self.navigation_allowlist,
+            denylist=self.navigation_denylist,
+        )
 
     @staticmethod
     def _can_submit(action: ComputerAction) -> bool:

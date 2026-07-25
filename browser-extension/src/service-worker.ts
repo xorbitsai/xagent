@@ -25,6 +25,7 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let keepaliveTimer: ReturnType<typeof setInterval> | null = null
 let attachedTabId: number | null = null
 let lastFrameId: string | null = null
+let lastObservationContextId: number | null = null
 let lastError: string | null = null
 let connecting = false
 let reconnectAttempt = 0
@@ -89,7 +90,24 @@ chrome.debugger.onDetach.addListener((source) => {
   }
 })
 
-chrome.debugger.onEvent.addListener((source, method) => {
+interface NavigationPolicy {
+  allowlist: string[]
+  denylist: string[]
+}
+
+interface ActiveNavigationGuard {
+  tabId: number
+  policy: NavigationPolicy
+  blockedReason: string | null
+}
+
+let activeNavigationGuard: ActiveNavigationGuard | null = null
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method === "Fetch.requestPaused") {
+    void handlePausedNavigation(source, params)
+    return
+  }
   if (
     source.tabId === attachedTabId &&
     (method === "Page.frameNavigated" ||
@@ -97,6 +115,7 @@ chrome.debugger.onEvent.addListener((source, method) => {
       method === "DOM.documentUpdated")
   ) {
     lastFrameId = null
+    lastObservationContextId = null
   }
 })
 
@@ -227,6 +246,7 @@ function connectSocket(options: {
     socket = null
     connecting = false
     lastFrameId = null
+    lastObservationContextId = null
     stopKeepalive()
     void updateBadge()
     void scheduleReconnect()
@@ -291,16 +311,26 @@ async function handleCommand(message: RelayCommand): Promise<void> {
       if (!isRecord(message.payload.action)) {
         throw new Error("Action payload is invalid.")
       }
-      await performAction(
-        attachedTabId,
-        message.payload.action,
-        expectedFrameId,
+      const action = message.payload.action
+      const navigationPolicy = parseNavigationPolicy(
+        message.payload.navigation_policy,
       )
-      const actionType = String(message.payload.action.type ?? "")
-      if (actionType !== "navigate" && actionType !== "wait") {
-        await delay(250)
-      }
-      observation = await captureObservation(attachedTabId, frameId)
+      observation = await withNavigationGuard(
+        attachedTabId,
+        navigationPolicy,
+        async () => {
+          await performAction(
+            attachedTabId as number,
+            action,
+            expectedFrameId,
+          )
+          const actionType = String(action.type ?? "")
+          if (actionType !== "navigate" && actionType !== "wait") {
+            await delay(250)
+          }
+          return captureObservation(attachedTabId as number, frameId)
+        },
+      )
       lastFrameId = frameId
     } else {
       throw new Error(`Unsupported relay command: ${String(message.command)}`)
@@ -346,6 +376,7 @@ async function attachActiveTab(): Promise<void> {
     await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.enable")
   }
   lastFrameId = null
+  lastObservationContextId = null
   lastError = null
   await updateBadge()
   await sendAttachedStatus()
@@ -366,6 +397,7 @@ async function detachApprovedTab(): Promise<void> {
 async function clearAttachedTab(): Promise<void> {
   attachedTabId = null
   lastFrameId = null
+  lastObservationContextId = null
   await chrome.storage.session.remove(SESSION.attachedTabId)
   await updateBadge()
   await sendAttachedStatus()
@@ -535,7 +567,7 @@ async function updateBadge(): Promise<void> {
 }
 
 const MAX_OBSERVATION_ELEMENTS = 100
-const ELEMENT_MARKER_ATTRIBUTE = "data-xagent-eid"
+const ISOLATED_WORLD_NAME = "xagent-computer"
 
 interface BrowserObservation {
   screenshot_base64: string
@@ -547,6 +579,7 @@ interface BrowserObservation {
   elements: unknown[]
   elements_truncated: boolean
   element_extraction_failed: boolean
+  element_extraction_incomplete: boolean
   active_url: string | null
   title: string | null
 }
@@ -556,10 +589,43 @@ async function captureObservation(
   frameToken: string,
 ): Promise<BrowserObservation> {
   const target = { tabId }
+  const frameTreeResult = await chrome.debugger.sendCommand(
+    target,
+    "Page.getFrameTree",
+  )
+  const rawFrameTree = readCommandValue(frameTreeResult, "frameTree")
+  const frameTree = isRecord(rawFrameTree)
+    ? rawFrameTree
+    : null
+  const mainFrame = frameTree && isRecord(frameTree.frame)
+    ? frameTree.frame
+    : null
+  const mainFrameId =
+    mainFrame && typeof mainFrame.id === "string" ? mainFrame.id : ""
+  if (!mainFrameId) {
+    throw new Error("Chrome returned no main frame for the approved tab.")
+  }
+  const isolatedWorld = await chrome.debugger.sendCommand(
+    target,
+    "Page.createIsolatedWorld",
+    {
+      frameId: mainFrameId,
+      worldName: ISOLATED_WORLD_NAME,
+      grantUniveralAccess: false,
+    },
+  )
+  const executionContextId = Math.round(
+    finiteNumber(
+      readCommandValue(isolatedWorld, "executionContextId"),
+      "isolated execution context",
+    ),
+  )
+  if (executionContextId <= 0) {
+    throw new Error("Chrome returned an invalid isolated execution context.")
+  }
   const collectOptions = JSON.stringify({
     frameToken,
     limit: MAX_OBSERVATION_ELEMENTS,
-    markerAttribute: ELEMENT_MARKER_ATTRIBUTE,
   })
   const [screenshot, viewportResult, elementsResult] = await Promise.all([
     chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
@@ -577,6 +643,7 @@ async function captureObservation(
       .sendCommand(target, "Runtime.evaluate", {
         expression: `(${collectInteractiveElements.toString()})(${collectOptions})`,
         returnByValue: true,
+        contextId: executionContextId,
       })
       .catch(() => null),
   ])
@@ -592,6 +659,7 @@ async function captureObservation(
   const elements = extracted && Array.isArray(extracted.elements)
     ? extracted.elements
     : []
+  lastObservationContextId = executionContextId
   return {
     screenshot_base64: screenshotData,
     viewport: {
@@ -605,6 +673,8 @@ async function captureObservation(
     elements: elements.slice(0, MAX_OBSERVATION_ELEMENTS),
     elements_truncated: Boolean(extracted?.truncated),
     element_extraction_failed: extracted === null,
+    element_extraction_incomplete:
+      Boolean(extracted?.incomplete) || frameTreeHasChildren(frameTree),
     active_url:
       typeof viewport.active_url === "string" ? viewport.active_url : null,
     title: typeof viewport.title === "string" ? viewport.title : null,
@@ -622,23 +692,40 @@ async function verifyHitTarget(
   if (typeof elementId !== "string" || !elementId) {
     return
   }
+  if (lastObservationContextId === null) {
+    throw new Error(
+      `Cannot verify ${elementId} because its browser frame is no longer current.`,
+    )
+  }
   const options = JSON.stringify({
     x,
     y,
-    markerAttribute: ELEMENT_MARKER_ATTRIBUTE,
+    frameToken: expectedFrameToken,
+    elementId,
   })
-  const result = await chrome.debugger
-    .sendCommand({ tabId }, "Runtime.evaluate", {
-      expression: `(${hitTestMarker.toString()})(${options})`,
-      returnByValue: true,
-    })
-    .catch(() => null)
+  let result: object | undefined
+  try {
+    result = await chrome.debugger.sendCommand(
+      { tabId },
+      "Runtime.evaluate",
+      {
+        expression: `(${hitTestTarget.toString()})(${options})`,
+        contextId: lastObservationContextId,
+        returnByValue: true,
+      },
+    )
+  } catch (error) {
+    throw new Error(
+      `Could not verify ${elementId} before clicking. Request a fresh screenshot.`,
+      { cause: error },
+    )
+  }
   const hit = readRuntimeValue(result)
-  if (!isRecord(hit) || hit.found !== true) return
-  const expected = `${expectedFrameToken}:${elementId}`
-  if (hit.marker === expected) return
+  if (isRecord(hit) && hit.found === true && hit.matches === true) return
   const obstruction =
-    typeof hit.tag === "string" && hit.tag ? hit.tag : "another element"
+    isRecord(hit) && typeof hit.tag === "string" && hit.tag
+      ? hit.tag
+      : "an unknown element"
   throw new Error(
     `${elementId} is covered by ${obstruction} at the clicked position. ` +
       "Take a fresh screenshot, then dismiss the overlay, scroll the target " +
@@ -825,9 +912,8 @@ async function dispatchKeypress(tabId: number, keys: string[]): Promise<void> {
 function collectInteractiveElements(options: {
   frameToken: string
   limit: number
-  markerAttribute: string
-}): { elements: unknown[]; truncated: boolean } {
-  const { frameToken, limit, markerAttribute } = options
+}): { elements: unknown[]; truncated: boolean; incomplete: boolean } {
+  const { frameToken, limit } = options
   const selector = [
     "a[href]",
     "button",
@@ -848,7 +934,9 @@ function collectInteractiveElements(options: {
   const width = Math.max(1, window.innerWidth)
   const height = Math.max(1, window.innerHeight)
   const elements: unknown[] = []
+  const targets = new Map<string, HTMLElement>()
   let truncated = false
+  let incomplete = false
 
   // Open shadow trees are invisible to a document-level querySelectorAll, so
   // they are walked explicitly to keep controls inside web components usable.
@@ -860,7 +948,13 @@ function collectInteractiveElements(options: {
         out.push(node)
       }
       for (const host of Array.from(root.querySelectorAll<HTMLElement>("*"))) {
-        if (host.shadowRoot) collect(host.shadowRoot, out)
+        if (host.shadowRoot) {
+          collect(host.shadowRoot, out)
+        } else if (host.tagName.includes("-")) {
+          // A custom element without an open shadow root may contain a closed
+          // tree, which cannot be inspected even from an isolated world.
+          incomplete = true
+        }
       }
     } catch {
       // A malformed selector context is skipped rather than failing the frame.
@@ -918,13 +1012,7 @@ function collectInteractiveElements(options: {
     const right = Math.min(width, rect.right)
     const bottom = Math.min(height, rect.bottom)
     const elementId = `dom-${elements.length + 1}`
-    try {
-      // Stamped so a later click can prove the coordinate still resolves to
-      // this element instead of an overlay that appeared in between.
-      node.setAttribute(markerAttribute, `${frameToken}:${elementId}`)
-    } catch {
-      // A read-only node is still reported; it just cannot be hit-tested.
-    }
+    targets.set(elementId, node)
     elements.push({
       element_id: elementId,
       bounds: {
@@ -946,26 +1034,184 @@ function collectInteractiveElements(options: {
       },
     })
   }
-  return { elements, truncated }
+  const state = globalThis as typeof globalThis & {
+    __xagentComputerTargets?: Map<string, Map<string, HTMLElement>>
+  }
+  // Keep only the newest frame. A stale frame cannot be acted on, and bounding
+  // this map also releases remote DOM nodes promptly.
+  state.__xagentComputerTargets = new Map([[frameToken, targets]])
+  return { elements, truncated, incomplete }
 }
 
-function hitTestMarker(options: {
+function hitTestTarget(options: {
   x: number
   y: number
-  markerAttribute: string
-}): { marker: string | null; tag: string | null; found: boolean } {
-  const { x, y, markerAttribute } = options
-  let node = document.elementFromPoint(x, y)
-  if (node === null) return { marker: null, tag: null, found: false }
-  const tag = node.tagName ? node.tagName.toLowerCase() : null
-  // A coordinate usually lands on a label or icon nested inside the control
-  // that was extracted, so walk outward before giving up.
-  while (node !== null) {
-    const marker = node.getAttribute ? node.getAttribute(markerAttribute) : null
-    if (marker) return { marker, tag, found: true }
-    node = node.parentElement
+  frameToken: string
+  elementId: string
+}): { matches: boolean; tag: string | null; found: boolean } {
+  const { x, y, frameToken, elementId } = options
+  const state = globalThis as typeof globalThis & {
+    __xagentComputerTargets?: Map<string, Map<string, HTMLElement>>
   }
-  return { marker: null, tag, found: true }
+  const target = state.__xagentComputerTargets
+    ?.get(frameToken)
+    ?.get(elementId)
+  if (!target) return { matches: false, tag: null, found: false }
+  const deepestElementFromPoint = (
+    root: Document | ShadowRoot,
+  ): Element | null => {
+    let hit = root.elementFromPoint(x, y)
+    while (hit?.shadowRoot) {
+      const nested = hit.shadowRoot.elementFromPoint(x, y)
+      if (!nested || nested === hit) break
+      hit = nested
+    }
+    return hit
+  }
+  const node = deepestElementFromPoint(document)
+  if (node === null) return { matches: false, tag: null, found: false }
+  const tag = node.tagName ? node.tagName.toLowerCase() : null
+  return {
+    matches: node === target || target.contains(node),
+    tag,
+    found: true,
+  }
+}
+
+function parseNavigationPolicy(value: unknown): NavigationPolicy {
+  const policy = isRecord(value) ? value : {}
+  return {
+    allowlist: normalizeHostPatterns(policy.allowlist),
+    denylist: normalizeHostPatterns(policy.denylist),
+  }
+}
+
+function normalizeHostPatterns(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(
+    new Set(
+      value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim().toLowerCase().replace(/^\.+/, ""))
+        .filter(Boolean),
+    ),
+  )
+}
+
+function hostMatches(host: string, patterns: string[]): boolean {
+  const candidate = host.trim().toLowerCase().replace(/\.+$/, "")
+  return patterns.some(
+    (pattern) =>
+      candidate === pattern || candidate.endsWith(`.${pattern}`),
+  )
+}
+
+function navigationBlockReason(
+  rawUrl: string,
+  policy: NavigationPolicy,
+): string | null {
+  if (rawUrl === "about:blank") return null
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    return null
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null
+  if (hostMatches(url.hostname, policy.denylist)) {
+    return `Navigation to ${url.hostname} is blocked by the configured policy.`
+  }
+  if (
+    policy.allowlist.length > 0 &&
+    !hostMatches(url.hostname, policy.allowlist)
+  ) {
+    return `Navigation to ${url.hostname} is outside the configured allowlist.`
+  }
+  return null
+}
+
+async function withNavigationGuard<T>(
+  tabId: number,
+  policy: NavigationPolicy,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (activeNavigationGuard !== null) {
+    throw new Error("Another guarded browser action is already running.")
+  }
+  const guard: ActiveNavigationGuard = {
+    tabId,
+    policy,
+    blockedReason: null,
+  }
+  activeNavigationGuard = guard
+  await chrome.debugger.sendCommand({ tabId }, "Fetch.enable", {
+    patterns: [
+      {
+        urlPattern: "*",
+        resourceType: "Document",
+        requestStage: "Request",
+      },
+    ],
+  })
+  try {
+    const result = await operation()
+    if (guard.blockedReason) {
+      throw new Error(guard.blockedReason)
+    }
+    return result
+  } finally {
+    activeNavigationGuard = null
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Fetch.disable")
+    } catch {
+      // Detaching or closing the approved tab also tears down interception.
+    }
+  }
+}
+
+async function handlePausedNavigation(
+  source: chrome.debugger.Debuggee,
+  rawParams: object | undefined,
+): Promise<void> {
+  if (typeof source.tabId !== "number" || !isRecord(rawParams)) return
+  const requestId = rawParams.requestId
+  const request = rawParams.request
+  if (typeof requestId !== "string" || !isRecord(request)) return
+  const guard = activeNavigationGuard
+  const reason =
+    guard && guard.tabId === source.tabId
+      ? navigationBlockReason(String(request.url ?? ""), guard.policy)
+      : null
+  if (reason !== null && guard !== null) {
+    guard.blockedReason = reason
+    // A failed top-level request commits Chrome's error page and destroys the
+    // user's current tab state. A synthetic 204 cancels the navigation while
+    // leaving the approved page in place; the command still returns the policy
+    // error to Xagent below.
+    await chrome.debugger.sendCommand(source, "Fetch.fulfillRequest", {
+      requestId,
+      responseCode: 204,
+      responsePhrase: "Blocked by Xagent policy",
+      responseHeaders: [
+        {
+          name: "X-Xagent-Blocked-Navigation",
+          value: "1",
+        },
+      ],
+    })
+    return
+  }
+  await chrome.debugger.sendCommand(source, "Fetch.continueRequest", {
+    requestId,
+  })
+}
+
+function frameTreeHasChildren(frameTree: Record<string, unknown> | null): boolean {
+  return Boolean(
+    frameTree &&
+      Array.isArray(frameTree.childFrames) &&
+      frameTree.childFrames.length > 0,
+  )
 }
 
 async function readViewport(

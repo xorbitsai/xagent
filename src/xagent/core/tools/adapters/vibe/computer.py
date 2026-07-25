@@ -143,9 +143,11 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         self._user_id = user_id
         self._browser_profile_id = browser_profile_id
         self._browser_profile_root = browser_profile_root
+        self._navigation_allowlist = get_browser_navigation_allowlist()
+        self._navigation_denylist = get_browser_navigation_denylist()
         self._action_policy = action_policy or DefaultComputerActionPolicy(
-            navigation_allowlist=get_browser_navigation_allowlist(),
-            navigation_denylist=get_browser_navigation_denylist(),
+            navigation_allowlist=self._navigation_allowlist,
+            navigation_denylist=self._navigation_denylist,
         )
         self._environments: dict[str, ComputerEnvironment] = {}
         self._approved_confirmation: dict[str, Any] | None = None
@@ -292,6 +294,8 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
                     workspace=self._workspace,
                     headless=self._headless,
                     session_binding=self._session_binding(session_id),
+                    navigation_allowlist=self._navigation_allowlist,
+                    navigation_denylist=self._navigation_denylist,
                 )
                 self._environments[session_id] = environment
 

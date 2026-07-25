@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -9,6 +10,11 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .policy import (
+    find_computer_target_element,
+    navigation_block_reason,
+    normalize_host_patterns,
+)
 from .relay import (
     BROWSER_RELAY_MAX_MESSAGE_BYTES,
     BrowserRelayCommandConnection,
@@ -17,6 +23,7 @@ from .relay import (
 )
 from .schema import (
     ELEMENT_EXTRACTION_FAILED_KEY,
+    ELEMENT_EXTRACTION_INCOMPLETE_KEY,
     ELEMENTS_TRUNCATED_KEY,
     MAX_OBSERVATION_ELEMENTS,
     ComputerAction,
@@ -59,6 +66,7 @@ class _RelayObservation(BaseModel):
     )
     elements_truncated: bool = False
     element_extraction_failed: bool = False
+    element_extraction_incomplete: bool = False
     active_url: str | None = Field(default=None, max_length=4_096)
     title: str | None = Field(default=None, max_length=500)
 
@@ -74,6 +82,8 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         session_binding: ComputerSessionBinding,
         registry: BrowserRelayRegistryProtocol | None = None,
         observation_store: ObservationStore | None = None,
+        navigation_allowlist: Sequence[str] | None = None,
+        navigation_denylist: Sequence[str] | None = None,
         **_kwargs: Any,
     ) -> None:
         super().__init__(session_id)
@@ -85,6 +95,8 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         self.owner_task_id = session_binding.require_owner_task_id()
         self.registry = registry or get_browser_relay_registry()
         self.observation_store = observation_store or ObservationStore(workspace)
+        self.navigation_allowlist = normalize_host_patterns(navigation_allowlist)
+        self.navigation_denylist = normalize_host_patterns(navigation_denylist)
 
     async def close(self) -> None:
         await self.registry.release(
@@ -107,6 +119,13 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         action = batch.actions[0]
         if action.type is ComputerActionType.SCREENSHOT:
             return await self._observe()
+        if action.type is not ComputerActionType.NAVIGATE:
+            current_url = (
+                self.current_observation.active_url
+                if self.current_observation is not None
+                else ""
+            )
+            self._assert_navigation_allowed(current_url or "")
 
         frame_id = self._new_frame_id()
         connection = await self._connection()
@@ -116,10 +135,16 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
                 "expected_frame_id": batch.expected_frame_id,
                 "frame_id": frame_id,
                 "action": self._serialize_action(action),
+                "navigation_policy": {
+                    "allowlist": list(self.navigation_allowlist),
+                    "denylist": list(self.navigation_denylist),
+                },
             },
             timeout=max(30.0, (action.duration_ms / 1_000) + 10.0),
         )
-        return self._build_observation(result, frame_id=frame_id)
+        observation = self._build_observation(result, frame_id=frame_id)
+        self._assert_navigation_allowed(observation.active_url or "")
+        return observation
 
     async def _connection(self) -> BrowserRelayCommandConnection:
         connection = await self.registry.acquire(
@@ -142,10 +167,17 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
                 else self._element_center(target.element_id or "")
             )
             payload["target"] = point.model_dump(mode="json")
-            if target.element_id:
+            target_element_id = target.element_id
+            if target_element_id is None and self.current_observation is not None:
+                element = find_computer_target_element(
+                    action,
+                    self.current_observation,
+                )
+                target_element_id = element.element_id if element is not None else None
+            if target_element_id:
                 # Lets the extension hit-test the coordinate against the very
                 # element the model chose before dispatching the click.
-                payload["target_element_id"] = target.element_id
+                payload["target_element_id"] = target_element_id
         if action.type is ComputerActionType.NAVIGATE:
             payload["url"] = self._validate_navigation_url(action.url or "")
         return payload
@@ -200,6 +232,8 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         }
         if parsed.element_extraction_failed:
             metadata[ELEMENT_EXTRACTION_FAILED_KEY] = True
+        if parsed.element_extraction_incomplete:
+            metadata[ELEMENT_EXTRACTION_INCOMPLETE_KEY] = True
         if parsed.elements_truncated:
             metadata[ELEMENTS_TRUNCATED_KEY] = True
         return ComputerObservation(
@@ -257,17 +291,26 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
             or autocomplete.startswith("cc-")
         )
 
-    @staticmethod
-    def _validate_navigation_url(raw_url: str) -> str:
+    def _validate_navigation_url(self, raw_url: str) -> str:
         url = raw_url.strip()
         parsed = urlsplit(url)
         if parsed.scheme in {"http", "https"}:
+            self._assert_navigation_allowed(url)
             return url
         if parsed.scheme == "about" and url == "about:blank":
             return url
         raise ValueError(
             "user-browser navigation requires http://, https://, or about:blank"
         )
+
+    def _assert_navigation_allowed(self, raw_url: str) -> None:
+        reason = navigation_block_reason(
+            raw_url,
+            allowlist=self.navigation_allowlist,
+            denylist=self.navigation_denylist,
+        )
+        if reason is not None:
+            raise ValueError(reason)
 
     @staticmethod
     def _new_frame_id() -> str:

@@ -65,6 +65,7 @@ class FakeEnvironment(ComputerEnvironment):
         super().__init__(session_id)
         self.observe_count = 0
         self.executed: list[ComputerActionBatch] = []
+        self.closed = False
 
     async def _observe(self) -> ComputerObservation:
         self.observe_count += 1
@@ -74,6 +75,9 @@ class FakeEnvironment(ComputerEnvironment):
         self.executed.append(batch)
         self.observe_count += 1
         return _button_observation(self.session_id, self.observe_count)
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class EnvironmentFactory:
@@ -170,3 +174,44 @@ def test_mutating_browser_tools_can_be_opted_into() -> None:
     }
 
     assert {"browser_click", "browser_fill", "browser_evaluate"} <= names
+
+
+@pytest.mark.asyncio
+async def test_full_wrapped_browser_bundle_preserves_pause_session() -> None:
+    """No sibling teardown may close the computer while approval is pending."""
+    factory = EnvironmentFactory()
+    tools = create_browser_tools(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        include_legacy_dom_tools=True,
+    )
+    computer = next(tool for tool in tools if tool.name == "computer")
+    computer._environment_factory = factory
+    wrappers = [
+        OutputFilteredToolWrapper(
+            target_tool=tool,
+            max_chars=50_000,
+            max_fields=1_000,
+            max_recursion=20,
+        )
+        for tool in tools
+    ]
+    wrapped_computer = next(tool for tool in wrappers if tool.name == "computer")
+
+    await wrapped_computer.run_json_async({})
+    waiting = await wrapped_computer.run_json_async(
+        {
+            "expected_frame_id": "frame-1",
+            "actions": [{"type": "click", "target": {"element_id": "dom-1"}}],
+        }
+    )
+    assert waiting["status"] == "waiting_for_user"
+
+    for tool in reversed(wrappers):
+        await tool.teardown(
+            task_id="task-1",
+            execution_status="waiting_for_user",
+        )
+
+    assert factory.environments[0].closed is False
+    assert computer._environments["task-1"] is factory.environments[0]

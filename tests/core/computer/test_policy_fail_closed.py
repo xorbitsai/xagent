@@ -11,6 +11,7 @@ from xagent.core.computer.policy import (
 )
 from xagent.core.computer.schema import (
     ELEMENT_EXTRACTION_FAILED_KEY,
+    ELEMENT_EXTRACTION_INCOMPLETE_KEY,
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
@@ -121,6 +122,51 @@ async def test_click_missing_every_known_control_requires_confirmation() -> None
 
 
 @pytest.mark.asyncio
+async def test_empty_element_list_does_not_make_point_actions_low_risk() -> None:
+    policy = DefaultComputerActionPolicy()
+
+    click = await policy.evaluate(
+        _batch(
+            ComputerAction(
+                type=ComputerActionType.CLICK,
+                target=ComputerTarget(point=NormalizedPoint(x=0.5, y=0.5)),
+            )
+        ),
+        _observation(),
+    )
+    typed = await policy.evaluate(
+        _batch(ComputerAction(type=ComputerActionType.TYPE, text="hello")),
+        _observation(),
+    )
+
+    assert click.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
+    assert typed.outcome is ComputerPolicyOutcome.BLOCK
+    assert "user must enter" in typed.reason
+
+
+@pytest.mark.asyncio
+async def test_incomplete_page_requires_confirmation_for_unresolved_target() -> None:
+    policy = DefaultComputerActionPolicy()
+    observation = _observation(
+        elements=[_plain_button()],
+        metadata={ELEMENT_EXTRACTION_INCOMPLETE_KEY: True},
+    )
+
+    decision = await policy.evaluate(
+        _batch(
+            ComputerAction(
+                type=ComputerActionType.CLICK,
+                target=ComputerTarget(point=NormalizedPoint(x=0.9, y=0.9)),
+            )
+        ),
+        observation,
+    )
+
+    assert decision.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
+    assert "could not be inspected" in decision.reason
+
+
+@pytest.mark.asyncio
 async def test_click_on_a_known_harmless_control_is_allowed() -> None:
     policy = DefaultComputerActionPolicy()
     observation = _observation(elements=[_plain_button()])
@@ -198,6 +244,28 @@ async def test_workspace_file_navigation_ignores_host_policy() -> None:
     )
 
     assert decision.outcome is ComputerPolicyOutcome.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_mutation_on_current_disallowed_host_is_blocked() -> None:
+    policy = DefaultComputerActionPolicy(navigation_allowlist=["example.com"])
+    observation = _observation(elements=[_plain_button()])
+    observation = observation.model_copy(
+        update={"active_url": "https://outside.test/account"}
+    )
+
+    decision = await policy.evaluate(
+        _batch(
+            ComputerAction(
+                type=ComputerActionType.CLICK,
+                target=ComputerTarget(element_id="dom-1"),
+            )
+        ),
+        observation,
+    )
+
+    assert decision.outcome is ComputerPolicyOutcome.BLOCK
+    assert "current page" in decision.reason
 
 
 def test_host_matching_covers_subdomains_only() -> None:

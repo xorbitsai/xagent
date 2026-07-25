@@ -36,7 +36,13 @@ logger = logging.getLogger(__name__)
 
 
 class BrowserTaskSessionMixin:
-    """Keeps browser tool default sessions aligned during task setup."""
+    """Keeps browser tool sessions aligned with the owning task.
+
+    Browser session identity is an execution capability, not model input.  The
+    mixin therefore always derives it from the task and optional DAG step.
+    Session cleanup belongs to ``ComputerTool`` so a sibling tool cannot close
+    the shared browser while the execution is paused for the user.
+    """
 
     #: Public capability marker: patterns use it to decide whether to pass the
     #: current plan step down, and it survives tool wrappers unlike a private
@@ -49,13 +55,19 @@ class BrowserTaskSessionMixin:
         if task_id:
             self._task_id = task_id
 
-    async def teardown(self, task_id: Optional[str] = None) -> None:
-        await self._close_task_sessions(task_id)
+    async def teardown(
+        self,
+        task_id: Optional[str] = None,
+        execution_status: Optional[str] = None,
+    ) -> None:
+        """Leave shared-session cleanup to the owning ``ComputerTool``."""
 
     def _with_default_session(self, args: Mapping[str, Any]) -> dict[str, Any]:
         updated = dict(args)
         step_id = updated.pop(_STEP_SESSION_ARG, None)
-        if not updated.get("session_id") and self._task_id:
+        # Never let model arguments select another task's live browser.
+        updated.pop("session_id", None)
+        if self._task_id:
             updated["session_id"] = self._default_session_id(step_id)
         return updated
 
@@ -488,10 +500,6 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         """Setup called when task starts - store task_id for session tracking."""
         if task_id:
             self._task_id = task_id
-
-    async def teardown(self, task_id: Optional[str] = None) -> None:
-        """Cleanup browser sessions when task completes."""
-        await self._close_task_sessions(task_id)
 
 
 class BrowserClickTool(BrowserTaskSessionMixin, AbstractBaseTool):
@@ -1154,7 +1162,7 @@ def create_browser_tools(
     if include_legacy_dom_tools is None:
         include_legacy_dom_tools = get_browser_legacy_dom_tools_enabled()
 
-    tools = [
+    tools: list[AbstractBaseTool] = [
         ComputerTool(
             task_id=task_id,
             workspace=workspace,
@@ -1162,15 +1170,14 @@ def create_browser_tools(
             user_id=user_id,
             browser_profile_id=browser_profile_id,
             browser_profile_root=browser_profile_root,
-        ),
-        # Read-only companions to ``computer``: they observe the same page
-        # without being able to act on it, so no policy can be sidestepped.
-        BrowserScreenshotTool(task_id=task_id, workspace=workspace),
-        BrowserExtractTextTool(task_id=task_id),
-        BrowserPdfTool(task_id=task_id, workspace=workspace),
-        BrowserCloseTool(task_id=task_id),
+        )
     ]
     if include_legacy_dom_tools:
+        if computer_runtime_kind != "ephemeral_playwright":
+            raise ValueError(
+                "legacy browser DOM tools are only compatible with the "
+                "ephemeral_playwright computer runtime"
+            )
         # Every tool below can change page state without passing through the
         # computer action policy — ``browser_fill`` reaches password fields and
         # ``browser_evaluate`` runs arbitrary JavaScript in the session.
@@ -1188,6 +1195,10 @@ def create_browser_tools(
                 BrowserEvaluateTool(task_id=task_id),
                 BrowserSelectOptionTool(task_id=task_id),
                 BrowserWaitForSelectorTool(task_id=task_id),
+                BrowserScreenshotTool(task_id=task_id, workspace=workspace),
+                BrowserExtractTextTool(task_id=task_id),
+                BrowserPdfTool(task_id=task_id, workspace=workspace),
+                BrowserCloseTool(task_id=task_id),
             ]
         )
     if include_debug_tools:

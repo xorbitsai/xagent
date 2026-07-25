@@ -168,10 +168,16 @@ class ContextReference(BaseModel):
         try:
             width = int(viewport.get("width") or 0)
             height = int(viewport.get("height") or 0)
+            device_pixel_ratio = float(viewport.get("device_pixel_ratio") or 1)
         except (TypeError, ValueError):
             return 255
-        if width <= 0 or height <= 0:
+        if width <= 0 or height <= 0 or device_pixel_ratio <= 0:
             return 255
+        # Viewport dimensions are CSS pixels while screenshots may be encoded
+        # in device pixels. Account for retina/high-DPI captures without ever
+        # reading or materializing the image payload.
+        width = max(1, int(width * device_pixel_ratio))
+        height = max(1, int(height * device_pixel_ratio))
         # Long side capped at 2048, short side at 768, then billed per 512px
         # tile plus a fixed base cost.
         scale = min(1.0, 2048 / max(width, height))

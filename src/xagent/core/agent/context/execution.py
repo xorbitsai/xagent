@@ -7,7 +7,9 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from ....config import get_computer_max_live_frames
 from ...context_ref import (
+    ContextReferencePurpose,
     normalize_context_references,
     split_tool_result_context_references,
     split_tool_result_supersedes_scope,
@@ -1180,16 +1182,47 @@ class ExecutionContext:
         return self._estimate_message_tokens(self.messages)
 
     def _estimate_message_tokens(self, messages: list[Message]) -> int:
+        reference_tokens = self._context_ref_token_estimates(messages)
         return sum(
-            max(1, len(message.content) // 4) + message.context_refs_token_estimate()
-            for message in messages
+            max(1, len(message.content) // 4) + ref_tokens
+            for message, ref_tokens in zip(messages, reference_tokens)
         )
 
     def _message_content_chars(self, messages: list[Message]) -> int:
+        reference_tokens = self._context_ref_token_estimates(messages)
         return sum(
-            len(message.content) + (4 * message.context_refs_token_estimate())
-            for message in messages
+            len(message.content) + (4 * ref_tokens)
+            for message, ref_tokens in zip(messages, reference_tokens)
         )
+
+    @staticmethod
+    def _context_ref_token_estimates(messages: list[Message]) -> list[int]:
+        """Estimate exactly the references the materializer keeps live.
+
+        Durable history retains every FileRef for audit and resume, but only the
+        newest observation frames are sent back to a vision model. Counting all
+        historical screenshots here would trigger compaction even though those
+        images no longer consume provider context.
+        """
+        observation_keys = [
+            reference.identity_key()
+            for message in messages
+            for reference in message.context_refs
+            if reference.purpose is ContextReferencePurpose.OBSERVATION
+        ]
+        max_live_frames = get_computer_max_live_frames()
+        live_observation_keys = (
+            set(observation_keys[-max_live_frames:]) if max_live_frames > 0 else set()
+        )
+        return [
+            sum(
+                reference.estimated_tokens()
+                for reference in message.context_refs
+                if reference.purpose is not ContextReferencePurpose.OBSERVATION
+                or reference.identity_key() in live_observation_keys
+            )
+            for message in messages
+        ]
 
     def _tail_window_preserving_tool_pairs(self, keep_count: int) -> list[Message]:
         """Keep recent messages without cutting a native tool-call exchange."""
@@ -1256,16 +1289,14 @@ class ExecutionContext:
     ) -> list[Message]:
         current_tokens = 0
         start = len(messages)
+        reference_tokens = self._context_ref_token_estimates(messages)
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
             if message.role == "assistant" and message.output_tokens is not None:
-                message_tokens = (
-                    message.output_tokens + message.context_refs_token_estimate()
-                )
+                message_tokens = message.output_tokens + reference_tokens[index]
             else:
                 message_tokens = (
-                    max(1, len(message.content) // 4)
-                    + message.context_refs_token_estimate()
+                    max(1, len(message.content) // 4) + reference_tokens[index]
                 )
 
             if current_tokens + message_tokens > max_tokens:

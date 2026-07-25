@@ -14,6 +14,9 @@ from xagent.config import (
     BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
     BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
     BOXLITE_HOME_DIR,
+    BROWSER_LEGACY_DOM_TOOLS,
+    BROWSER_NAVIGATION_ALLOWLIST,
+    BROWSER_NAVIGATION_DENYLIST,
     BROWSER_PROFILE_ID,
     BROWSER_PROFILE_ROOT,
     BROWSER_RELAY_BACKEND,
@@ -21,6 +24,8 @@ from xagent.config import (
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
+    COMPUTER_MAX_LIVE_FRAMES,
+    COMPUTER_OBSERVATION_RETENTION,
     DATABASE_URL,
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
@@ -92,6 +97,9 @@ from xagent.config import (
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
     get_boxlite_home_dir,
+    get_browser_legacy_dom_tools_enabled,
+    get_browser_navigation_allowlist,
+    get_browser_navigation_denylist,
     get_browser_profile_id,
     get_browser_profile_root,
     get_browser_relay_backend,
@@ -99,6 +107,8 @@ from xagent.config import (
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
+    get_computer_max_live_frames,
+    get_computer_observation_retention,
     get_database_url,
     get_db_max_overflow,
     get_db_pool_size,
@@ -219,6 +229,13 @@ class TestEnvironmentVariableConstants:
             OPENROUTER_OFFICIAL_PROVIDERS_ONLY
             == "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
         )
+
+    def test_computer_use_constants(self):
+        assert BROWSER_NAVIGATION_ALLOWLIST == "XAGENT_BROWSER_NAVIGATION_ALLOWLIST"
+        assert BROWSER_NAVIGATION_DENYLIST == "XAGENT_BROWSER_NAVIGATION_DENYLIST"
+        assert BROWSER_LEGACY_DOM_TOOLS == "XAGENT_BROWSER_LEGACY_DOM_TOOLS"
+        assert COMPUTER_MAX_LIVE_FRAMES == "XAGENT_COMPUTER_MAX_LIVE_FRAMES"
+        assert COMPUTER_OBSERVATION_RETENTION == "XAGENT_COMPUTER_OBSERVATION_RETENTION"
 
     def test_mcp_oauth_allow_private_hosts_constant(self):
         assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
@@ -1824,3 +1841,39 @@ class TestCompactThresholdConfig:
 
         monkeypatch.setenv(COMPACT_THRESHOLD_DEFAULT, value)
         assert get_compact_threshold_default() == 32000
+
+
+class TestComputerUseConfig:
+    def test_navigation_lists_are_normalized(self, monkeypatch):
+        monkeypatch.setenv(
+            BROWSER_NAVIGATION_ALLOWLIST,
+            " Example.COM, .docs.example.com,example.com ",
+        )
+        monkeypatch.setenv(
+            BROWSER_NAVIGATION_DENYLIST,
+            " Admin.Example.com ",
+        )
+
+        assert get_browser_navigation_allowlist() == (
+            "example.com",
+            "docs.example.com",
+        )
+        assert get_browser_navigation_denylist() == ("admin.example.com",)
+
+    def test_legacy_dom_tools_default_off_and_can_be_enabled(self, monkeypatch):
+        monkeypatch.delenv(BROWSER_LEGACY_DOM_TOOLS, raising=False)
+        assert get_browser_legacy_dom_tools_enabled() is False
+
+        monkeypatch.setenv(BROWSER_LEGACY_DOM_TOOLS, "true")
+        assert get_browser_legacy_dom_tools_enabled() is True
+
+    def test_computer_frame_limits_use_defaults_and_env(self, monkeypatch):
+        monkeypatch.delenv(COMPUTER_MAX_LIVE_FRAMES, raising=False)
+        monkeypatch.delenv(COMPUTER_OBSERVATION_RETENTION, raising=False)
+        assert get_computer_max_live_frames() == 2
+        assert get_computer_observation_retention() == 40
+
+        monkeypatch.setenv(COMPUTER_MAX_LIVE_FRAMES, "3")
+        monkeypatch.setenv(COMPUTER_OBSERVATION_RETENTION, "12")
+        assert get_computer_max_live_frames() == 3
+        assert get_computer_observation_retention() == 12

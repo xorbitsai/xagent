@@ -96,7 +96,10 @@ class FakeRegistry:
         self.releases.append((user_id, owner_task_id))
 
 
-def make_environment() -> tuple[ExtensionComputerEnvironment, FakeRegistry]:
+def make_environment(
+    *,
+    navigation_allowlist: list[str] | None = None,
+) -> tuple[ExtensionComputerEnvironment, FakeRegistry]:
     registry = FakeRegistry()
     binding = ComputerSessionBinding.from_values(
         runtime_kind="extension_relay",
@@ -111,6 +114,7 @@ def make_environment() -> tuple[ExtensionComputerEnvironment, FakeRegistry]:
         session_binding=binding,
         registry=registry,  # type: ignore[arg-type]
         observation_store=FakeObservationStore(),  # type: ignore[arg-type]
+        navigation_allowlist=navigation_allowlist,
     )
     return environment, registry
 
@@ -155,7 +159,32 @@ async def test_extension_environment_serializes_element_target_as_point() -> Non
     assert command == "act"
     assert payload["expected_frame_id"] == first.frame_id
     assert payload["action"]["target"] == pytest.approx({"x": 0.2, "y": 0.25})
+    assert payload["navigation_policy"] == {"allowlist": [], "denylist": []}
     assert second.frame_id == payload["frame_id"]
+
+
+@pytest.mark.asyncio
+async def test_extension_environment_blocks_action_on_disallowed_current_host() -> None:
+    environment, registry = make_environment(
+        navigation_allowlist=["allowed.example"],
+    )
+    first = await environment.observe()
+
+    with pytest.raises(ValueError, match="outside the configured allowlist"):
+        await environment.execute(
+            ComputerActionBatch(
+                session_id="task-1",
+                expected_frame_id=first.frame_id,
+                actions=[
+                    ComputerAction(
+                        type=ComputerActionType.CLICK,
+                        target=ComputerTarget(element_id="dom-1"),
+                    )
+                ],
+            )
+        )
+
+    assert len(registry.connection.calls) == 1
 
 
 @pytest.mark.asyncio

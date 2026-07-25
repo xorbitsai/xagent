@@ -71,6 +71,77 @@ class FakeKeyboard:
         self.calls.append(("insert_text", text))
 
 
+class FakeRequest:
+    def __init__(self, url: str, frame: Any) -> None:
+        self.url = url
+        self.frame = frame
+
+    def is_navigation_request(self) -> bool:
+        return True
+
+
+class FakeRoute:
+    def __init__(self) -> None:
+        self.aborted = False
+        self.continued = False
+
+    async def abort(self, _reason: str) -> None:
+        self.aborted = True
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+
+class FakeHandle:
+    def __init__(
+        self,
+        value: Any,
+        *,
+        page: "FakePage | None" = None,
+        is_element: bool = False,
+    ) -> None:
+        self.value = value
+        self.page = page
+        self.is_element = is_element
+        self.disposed = False
+
+    async def json_value(self) -> Any:
+        return self.value
+
+    async def get_properties(self) -> dict[str, "FakeHandle"]:
+        if isinstance(self.value, dict):
+            return {
+                key: FakeHandle(value, page=self.page)
+                for key, value in self.value.items()
+            }
+        if isinstance(self.value, list):
+            return {
+                str(index): (
+                    value
+                    if isinstance(value, FakeHandle)
+                    else FakeHandle(value, page=self.page)
+                )
+                for index, value in enumerate(self.value)
+            }
+        return {}
+
+    def as_element(self) -> "FakeHandle | None":
+        return self if self.is_element else None
+
+    async def evaluate(self, script: str, arg: Any = None) -> Any:
+        assert "elementFromPoint" in script
+        assert self.page is not None
+        self.page.hit_test_calls.append(dict(arg or {}))
+        return {
+            "matches": self.page.hit_marker is None,
+            "tag": "div",
+            "found": True,
+        }
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
 class FakeFrame:
     """A nested frame reporting bounds in its own coordinate space."""
 
@@ -100,16 +171,14 @@ class FakeFrame:
         offset_y = float(options.get("offsetY", 0))
         width = float(options.get("rootWidth", 1))
         height = float(options.get("rootHeight", 1))
-        token = str(options.get("frameToken") or "frame")
         elements = []
-        for index, entry in enumerate(self.elements, start=1):
+        for entry in self.elements:
             bounds = entry["bounds"]
             # The real script reports local pixels shifted by the frame offset;
             # 640x360 is this frame's own viewport.
             elements.append(
                 {
                     **entry,
-                    "marker": f"{token}:{index}",
                     "bounds": {
                         "x": (bounds["x"] * 640 + offset_x) / width,
                         "y": (bounds["y"] * 360 + offset_y) / height,
@@ -118,8 +187,20 @@ class FakeFrame:
                     },
                 }
             )
-            self.issued_markers.append(f"{token}:{index}")
-        return {"elements": elements, "truncated": False}
+        return {
+            "elements": elements,
+            "truncated": False,
+            "incomplete": False,
+        }
+
+    async def evaluate_handle(self, script: str, arg: Any = None) -> FakeHandle:
+        payload = await self.evaluate(script, arg)
+        # Nested-frame tests only inspect geometry, but production still
+        # requires an opaque provider handle for every reported element.
+        targets = [
+            FakeHandle({}, page=None, is_element=True) for _entry in payload["elements"]
+        ]
+        return FakeHandle({**payload, "targets": targets})
 
 
 class FakePage:
@@ -132,6 +213,8 @@ class FakePage:
         self.mouse = FakeMouse()
         self.keyboard = FakeKeyboard()
         self.goto_calls: list[tuple[str, str, int]] = []
+        self.goto_redirect_url: str | None = None
+        self.route_handler: Any = None
         self.wait_calls: list[int] = []
         self.hit_test_calls: list[dict[str, Any]] = []
         self.issued_markers: list[str] = []
@@ -164,6 +247,10 @@ class FakePage:
     async def set_viewport_size(self, viewport: dict[str, int]) -> None:
         self.viewport_size = viewport
 
+    async def route(self, pattern: str, handler: Any) -> None:
+        assert pattern == "**/*"
+        self.route_handler = handler
+
     async def screenshot(self, **kwargs: Any) -> bytes:
         assert kwargs == {"full_page": False, "type": "png"}
         return b"browser-png"
@@ -177,33 +264,35 @@ class FakePage:
         if "innerWidth" in script and "innerHeight" in script and arg is None:
             return {"width": 1280, "height": 720}
         if "elementFromPoint" in script:
-            self.hit_test_calls.append(dict(arg or {}))
-            marker = self.hit_marker or (
-                self.issued_markers[0] if self.issued_markers else None
-            )
-            return {"marker": marker, "tag": "div", "found": True}
+            raise AssertionError("hit testing must use an opaque element handle")
         if "querySelectorAll" in script:
             if self.fail_element_extraction:
                 raise RuntimeError("element extraction failed")
-            token = str((arg or {}).get("frameToken") or "frame")
-            self.issued_markers = [
-                f"{token}:{index}"
-                for index in range(1, len(self.interactive_elements) + 1)
-            ]
             return {
-                "elements": [
-                    {**entry, "marker": marker}
-                    for entry, marker in zip(
-                        self.interactive_elements, self.issued_markers
-                    )
-                ],
+                "elements": list(self.interactive_elements),
                 "truncated": self.truncate_elements,
+                "incomplete": False,
             }
         raise AssertionError(f"unexpected evaluate script: {script}")
 
+    async def evaluate_handle(self, script: str, arg: Any = None) -> FakeHandle:
+        payload = await self.evaluate(script, arg)
+        targets = [
+            FakeHandle({}, page=self, is_element=True) for _entry in payload["elements"]
+        ]
+        return FakeHandle({**payload, "targets": targets}, page=self)
+
     async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
         self.goto_calls.append((url, wait_until, timeout))
-        self.url = url
+        for candidate in [url, self.goto_redirect_url]:
+            if candidate is None:
+                continue
+            if self.route_handler is not None:
+                route = FakeRoute()
+                await self.route_handler(route, FakeRequest(candidate, self))
+                if route.aborted:
+                    raise RuntimeError("navigation was blocked")
+            self.url = candidate
 
     async def wait_for_timeout(self, duration_ms: int) -> None:
         self.wait_calls.append(duration_ms)
@@ -415,6 +504,36 @@ async def test_browser_navigation_rejects_unapproved_scheme(
 
 
 @pytest.mark.asyncio
+async def test_browser_navigation_guard_blocks_disallowed_redirect() -> None:
+    page = FakePage()
+    page.goto_redirect_url = "https://outside.test/landing"
+    environment = BrowserComputerEnvironment(
+        session_id="browser-1",
+        workspace=FakeWorkspace(),
+        manager=FakeManager(page),  # type: ignore[arg-type]
+        observation_store=FakeObservationStore(),  # type: ignore[arg-type]
+        navigation_allowlist=["example.com"],
+    )
+    first = await environment.observe()
+
+    with pytest.raises(RuntimeError, match="navigation was blocked"):
+        await environment.execute(
+            ComputerActionBatch(
+                session_id="browser-1",
+                expected_frame_id=first.frame_id,
+                actions=[
+                    ComputerAction(
+                        type=ComputerActionType.NAVIGATE,
+                        url="https://example.com/start",
+                    )
+                ],
+            )
+        )
+
+    assert page.url == "https://example.com/start"
+
+
+@pytest.mark.asyncio
 async def test_click_is_refused_when_the_target_is_covered(
     browser_environment,
 ) -> None:
@@ -466,6 +585,32 @@ async def test_point_clicks_skip_hit_verification(browser_environment) -> None:
 
     assert page.mouse.calls == [("click", 640.0, 360.0)]
     assert page.hit_test_calls == []
+
+
+@pytest.mark.asyncio
+async def test_element_click_fails_closed_without_provider_identity(
+    browser_environment,
+) -> None:
+    environment, page, _store = browser_environment
+    page.evaluate_handle = None  # type: ignore[method-assign]
+    first = await environment.observe()
+
+    with pytest.raises(RuntimeError, match="Cannot verify the identity"):
+        await environment.execute(
+            ComputerActionBatch(
+                session_id="browser-1",
+                expected_frame_id=first.frame_id,
+                actions=[
+                    ComputerAction(
+                        type=ComputerActionType.CLICK,
+                        target=ComputerTarget(element_id="dom-1"),
+                    )
+                ],
+            )
+        )
+
+    assert first.metadata["element_extraction_incomplete"] is True
+    assert page.mouse.calls == []
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from xagent.core.agent.context import ExecutionContext
+from xagent.core.agent.context.message import Message
 from xagent.core.computer.materializer import materialize_messages
 from xagent.core.context_ref import (
     CONTEXT_REFS_KEY,
@@ -139,6 +140,61 @@ def test_full_viewport_screenshots_are_not_costed_like_thumbnails() -> None:
     # 1280x720 scales to 1365x768 -> a 3x2 tile grid.
     assert reference.estimated_tokens() > 1_000
     assert low_detail.estimated_tokens() < 200
+
+
+def test_high_dpi_viewport_uses_device_pixel_dimensions() -> None:
+    regular = ContextReference(
+        file_ref={
+            "file_id": "regular",
+            "filename": "regular.png",
+            "mime_type": "image/png",
+        },
+        purpose=ContextReferencePurpose.OBSERVATION,
+        frame_id="frame-regular",
+        metadata={
+            "viewport": {
+                "width": 400,
+                "height": 300,
+                "device_pixel_ratio": 1,
+            }
+        },
+    )
+    retina = regular.model_copy(
+        update={
+            "file_ref": {
+                "file_id": "retina",
+                "filename": "retina.png",
+                "mime_type": "image/png",
+            },
+            "frame_id": "frame-retina",
+            "metadata": {
+                "viewport": {
+                    "width": 400,
+                    "height": 300,
+                    "device_pixel_ratio": 2,
+                }
+            },
+        }
+    )
+
+    assert retina.estimated_tokens() > regular.estimated_tokens()
+
+
+def test_context_estimate_counts_only_live_observation_frames(monkeypatch) -> None:
+    monkeypatch.setenv("XAGENT_COMPUTER_MAX_LIVE_FRAMES", "2")
+    context = ExecutionContext(execution_id="exec-1")
+    context.messages = [
+        Message.role_tool(
+            f"observation {index}",
+            context_refs=(ContextReference.model_validate(_observation_ref(index)),),
+        )
+        for index in range(1, 6)
+    ]
+
+    estimates = context._context_ref_token_estimates(context.messages)
+
+    assert estimates[:3] == [0, 0, 0]
+    assert all(value > 0 for value in estimates[3:])
 
 
 def test_a_new_observation_shrinks_the_previous_one() -> None:

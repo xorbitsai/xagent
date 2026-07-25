@@ -90,7 +90,7 @@ def test_browser_task_session_mixin_defaults_to_step_scoped_session() -> None:
     assert "_xagent_step_id" not in args
 
 
-def test_browser_task_session_mixin_keeps_explicit_session() -> None:
+def test_browser_task_session_mixin_rejects_model_selected_session() -> None:
     tool = BrowserTaskSessionMixin()
     tool._task_id = "task-412"
 
@@ -102,8 +102,24 @@ def test_browser_task_session_mixin_keeps_explicit_session() -> None:
         }
     )
 
-    assert args["session_id"] == "custom-session"
+    assert args["session_id"] == "task-412:render_english"
     assert "_xagent_step_id" not in args
+
+
+def test_default_browser_bundle_exposes_only_policy_controlled_computer() -> None:
+    names = {tool.name for tool in create_browser_tools(task_id="task", workspace=None)}
+
+    assert names == {"computer"}
+
+
+def test_legacy_dom_tools_reject_incompatible_browser_runtime() -> None:
+    with pytest.raises(ValueError, match="ephemeral_playwright"):
+        create_browser_tools(
+            task_id="task",
+            workspace=None,
+            computer_runtime_kind="extension_relay",
+            include_legacy_dom_tools=True,
+        )
 
 
 @pytest.mark.asyncio

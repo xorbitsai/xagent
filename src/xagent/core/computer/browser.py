@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -9,8 +10,14 @@ from uuid import uuid4
 
 from ..tools.core.browser_use import BrowserSessionManager, get_browser_manager
 from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .policy import (
+    find_computer_target_element,
+    navigation_block_reason,
+    normalize_host_patterns,
+)
 from .schema import (
     ELEMENT_EXTRACTION_FAILED_KEY,
+    ELEMENT_EXTRACTION_INCOMPLETE_KEY,
     ELEMENTS_TRUNCATED_KEY,
     MAX_OBSERVATION_ELEMENTS,
     ComputerAction,
@@ -37,20 +44,14 @@ class ComputerTargetObstructedError(RuntimeError):
 class _ElementHitTarget:
     """Where an extracted element lives, so a click can be hit-tested."""
 
-    frame: Any
-    marker: str
+    handle: Any
     offset_x: float
     offset_y: float
 
 
-#: Attribute stamped on extracted nodes so a later hit test can prove that a
-#: coordinate still resolves to the element the model asked for.
-_ELEMENT_MARKER_ATTRIBUTE = "data-xagent-eid"
-
 _INTERACTIVE_ELEMENTS_SCRIPT = """
 (options) => {
-  const {frameToken, limit, markerAttribute, offsetX, offsetY,
-         rootWidth, rootHeight} = options;
+  const {limit, offsetX, offsetY, rootWidth, rootHeight} = options;
   const selector = [
     "a[href]", "button", "input", "textarea", "select", "summary",
     "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
@@ -64,7 +65,9 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
   const localWidth = Math.max(1, window.innerWidth);
   const localHeight = Math.max(1, window.innerHeight);
   const elements = [];
+  const targets = [];
   let truncated = false;
+  let incomplete = false;
 
   const collect = (root, out) => {
     let nodes;
@@ -83,7 +86,14 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
       return;
     }
     for (const host of hosts) {
-      if (host.shadowRoot) collect(host.shadowRoot, out);
+      if (host.shadowRoot) {
+        collect(host.shadowRoot, out);
+      } else if (String(host.tagName || "").includes("-")) {
+        // A custom element without an open shadow root may own a closed tree.
+        // It cannot be enumerated, so unresolved coordinate actions must not
+        // be treated as verified.
+        incomplete = true;
+      }
     }
   };
 
@@ -147,14 +157,7 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
       node.getAttribute("placeholder") ||
       text
     ).trim().slice(0, 240);
-    const marker = frameToken + ":" + (elements.length + 1);
-    try {
-      node.setAttribute(markerAttribute, marker);
-    } catch (error) {
-      // A read-only node can still be reported; it just cannot be hit-tested.
-    }
     elements.push({
-      marker,
       bounds: {
         x: clippedLeft / width,
         y: clippedTop / height,
@@ -173,27 +176,32 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
         focused: node === document.activeElement
       }
     });
+    targets.push(node);
   }
-  return {elements, truncated};
+  return {elements, targets, truncated, incomplete};
 }
 """
 
 _HIT_TEST_SCRIPT = """
-(options) => {
-  const {x, y, markerAttribute} = options;
-  let node = document.elementFromPoint(x, y);
-  if (node === null) return {marker: null, tag: null, found: false};
+(target, options) => {
+  const {x, y} = options;
+  const deepestElementFromPoint = (root, pointX, pointY) => {
+    let hit = root.elementFromPoint(pointX, pointY);
+    while (hit && hit.shadowRoot) {
+      const nested = hit.shadowRoot.elementFromPoint(pointX, pointY);
+      if (!nested || nested === hit) break;
+      hit = nested;
+    }
+    return hit;
+  };
+  const node = deepestElementFromPoint(document, x, y);
+  if (node === null) return {matches: false, tag: null, found: false};
   const tag = node.tagName ? node.tagName.toLowerCase() : null;
-  // Walk outward: a coordinate usually lands on a label or icon inside the
-  // control that was actually extracted.
-  while (node !== null) {
-    const marker = node.getAttribute
-      ? node.getAttribute(markerAttribute)
-      : null;
-    if (marker) return {marker, tag, found: true};
-    node = node.parentElement;
-  }
-  return {marker: null, tag, found: true};
+  return {
+    matches: node === target || Boolean(target && target.contains(node)),
+    tag,
+    found: true
+  };
 }
 """
 
@@ -212,6 +220,8 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         viewport_width: int = 1280,
         viewport_height: int = 720,
         session_binding: ComputerSessionBinding | None = None,
+        navigation_allowlist: Sequence[str] | None = None,
+        navigation_denylist: Sequence[str] | None = None,
     ) -> None:
         super().__init__(session_id)
         if viewport_width <= 0 or viewport_height <= 0:
@@ -223,7 +233,10 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         self.headless = False if self.session_binding.is_persistent else headless
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
+        self.navigation_allowlist = normalize_host_patterns(navigation_allowlist)
+        self.navigation_denylist = normalize_host_patterns(navigation_denylist)
         self._hit_targets: dict[str, _ElementHitTarget] = {}
+        self._guarded_page_ids: set[int] = set()
 
     async def _get_page(self) -> Any:
         manager_session_id = self.session_binding.manager_session_id(self.session_id)
@@ -240,9 +253,11 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         }
         if page.viewport_size != requested:
             await page.set_viewport_size(cast(Any, requested))
+        await self._install_navigation_guard(page)
         return page
 
     async def close(self) -> None:
+        await self._clear_hit_targets()
         await self.manager.close(
             self.session_binding.manager_session_id(self.session_id)
         )
@@ -260,6 +275,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             for action in batch.actions
         ):
             await page.wait_for_timeout(250)
+            self._assert_navigation_allowed(str(getattr(page, "url", "") or ""))
         return await self._capture_observation(page)
 
     async def _capture_observation(self, page: Any) -> ComputerObservation:
@@ -280,13 +296,17 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             title = None
 
         extraction_failed = False
+        extraction_incomplete = False
         truncated = False
-        self._hit_targets = {}
+        await self._clear_hit_targets()
         try:
-            elements, truncated = await self._read_interactive_elements(
+            (
+                elements,
+                truncated,
+                extraction_incomplete,
+            ) = await self._read_interactive_elements(
                 page,
                 viewport=viewport,
-                frame_id=frame_id,
             )
         except Exception:  # noqa: BLE001 - screenshots remain usable without DOM hints.
             logger.warning(
@@ -304,6 +324,8 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         }
         if extraction_failed:
             metadata[ELEMENT_EXTRACTION_FAILED_KEY] = True
+        if extraction_incomplete:
+            metadata[ELEMENT_EXTRACTION_INCOMPLETE_KEY] = True
         if truncated:
             metadata[ELEMENTS_TRUNCATED_KEY] = True
         return ComputerObservation(
@@ -341,8 +363,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         page: Any,
         *,
         viewport: Viewport,
-        frame_id: str,
-    ) -> tuple[list[ComputerElement], bool]:
+    ) -> tuple[list[ComputerElement], bool, bool]:
         """Extract interactive elements from the page and its visible frames.
 
         Bounds from nested frames are translated into the top-level viewport so
@@ -350,6 +371,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         """
         elements: list[ComputerElement] = []
         truncated = False
+        incomplete = False
         for frame_index, frame in enumerate(self._iter_frames(page)):
             remaining = MAX_OBSERVATION_ELEMENTS - len(elements)
             if remaining <= 0:
@@ -357,59 +379,162 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                 break
             offset = await self._frame_offset(page, frame)
             if offset is None:
+                incomplete = True
                 continue
             offset_x, offset_y = offset
             try:
-                payload = await frame.evaluate(
-                    _INTERACTIVE_ELEMENTS_SCRIPT,
-                    {
-                        "frameToken": f"{frame_id}-f{frame_index}",
-                        "limit": remaining,
-                        "markerAttribute": _ELEMENT_MARKER_ATTRIBUTE,
-                        "offsetX": offset_x,
-                        "offsetY": offset_y,
-                        "rootWidth": viewport.width,
-                        "rootHeight": viewport.height,
-                    },
+                (
+                    payload,
+                    target_handles,
+                    identity_verified,
+                ) = await self._evaluate_interactive_elements(
+                    frame,
+                    limit=remaining,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                    viewport=viewport,
                 )
             except Exception:  # noqa: BLE001 - a detached frame is not fatal.
                 if frame is self._main_frame(page):
                     raise
+                incomplete = True
                 logger.debug(
                     "Skipping frame %s during element extraction",
                     frame_index,
                     exc_info=True,
                 )
                 continue
-            frame_elements, frame_truncated = self._parse_frame_elements(
-                payload,
-                frame=frame,
-                offset_x=offset_x,
-                offset_y=offset_y,
-                start_index=len(elements) + 1,
+            frame_elements, frame_truncated, frame_incomplete = (
+                self._parse_frame_elements(
+                    payload,
+                    target_handles=target_handles,
+                    identity_verified=identity_verified,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                    start_index=len(elements) + 1,
+                )
             )
             elements.extend(frame_elements)
             truncated = truncated or frame_truncated
-        return elements, truncated
+            incomplete = incomplete or frame_incomplete
+        return elements, truncated, incomplete
+
+    async def _evaluate_interactive_elements(
+        self,
+        frame: Any,
+        *,
+        limit: int,
+        offset_x: float,
+        offset_y: float,
+        viewport: Viewport,
+    ) -> tuple[Any, list[Any], bool]:
+        """Collect descriptors plus provider-owned handles to their DOM nodes.
+
+        Element handles are kept out of page-visible attributes.  A hostile
+        page therefore cannot copy or rewrite an Xagent marker to make a click
+        appear to target a different node.
+        """
+        options = {
+            "limit": limit,
+            "offsetX": offset_x,
+            "offsetY": offset_y,
+            "rootWidth": viewport.width,
+            "rootHeight": viewport.height,
+        }
+        evaluate_handle = getattr(frame, "evaluate_handle", None)
+        if not callable(evaluate_handle):
+            # Test doubles and unusual Playwright-compatible providers may only
+            # expose evaluate(). Descriptors remain useful, but element-target
+            # actions fail closed because no unforgeable identity was captured.
+            payload = await frame.evaluate(_INTERACTIVE_ELEMENTS_SCRIPT, options)
+            return payload, [], False
+
+        result_handle = await evaluate_handle(
+            _INTERACTIVE_ELEMENTS_SCRIPT,
+            options,
+        )
+        disposable_handles: list[Any] = [result_handle]
+        target_handles: list[Any] = []
+        try:
+            properties = await result_handle.get_properties()
+            elements_handle = properties.get("elements")
+            targets_handle = properties.get("targets")
+            truncated_handle = properties.get("truncated")
+            incomplete_handle = properties.get("incomplete")
+            if elements_handle is None or targets_handle is None:
+                raise RuntimeError(
+                    "interactive element extraction returned no target handles"
+                )
+            disposable_handles.extend(
+                handle
+                for handle in (
+                    elements_handle,
+                    targets_handle,
+                    truncated_handle,
+                    incomplete_handle,
+                )
+                if handle is not None
+            )
+            raw_elements = await elements_handle.json_value()
+            target_properties = await targets_handle.get_properties()
+            for index in range(
+                len(raw_elements) if isinstance(raw_elements, list) else 0
+            ):
+                item_handle = target_properties.get(str(index))
+                if item_handle is None:
+                    target_handles.append(None)
+                    continue
+                element_handle = item_handle.as_element()
+                if element_handle is None:
+                    await self._dispose_handle(item_handle)
+                    target_handles.append(None)
+                    continue
+                target_handles.append(element_handle)
+            payload = {
+                "elements": raw_elements,
+                "truncated": (
+                    bool(await truncated_handle.json_value())
+                    if truncated_handle is not None
+                    else False
+                ),
+                "incomplete": (
+                    bool(await incomplete_handle.json_value())
+                    if incomplete_handle is not None
+                    else False
+                ),
+            }
+            return payload, target_handles, True
+        except Exception:
+            for handle in target_handles:
+                await self._dispose_handle(handle)
+            raise
+        finally:
+            for handle in disposable_handles:
+                if handle not in target_handles:
+                    await self._dispose_handle(handle)
 
     def _parse_frame_elements(
         self,
         payload: Any,
         *,
-        frame: Any,
+        target_handles: list[Any],
+        identity_verified: bool,
         offset_x: float,
         offset_y: float,
         start_index: int,
-    ) -> tuple[list[ComputerElement], bool]:
+    ) -> tuple[list[ComputerElement], bool, bool]:
         raw_elements = payload.get("elements") if isinstance(payload, dict) else payload
         truncated = (
             bool(payload.get("truncated")) if isinstance(payload, dict) else False
         )
+        incomplete = (
+            bool(payload.get("incomplete")) if isinstance(payload, dict) else False
+        )
         if not isinstance(raw_elements, list):
-            return [], truncated
+            return [], truncated, True
         elements: list[ComputerElement] = []
         index = start_index
-        for entry in raw_elements:
+        for target_index, entry in enumerate(raw_elements):
             if not isinstance(entry, dict):
                 continue
             try:
@@ -445,17 +570,39 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                 )
             except (KeyError, TypeError, ValueError):
                 logger.debug("Skipping invalid DOM element payload", exc_info=True)
+                incomplete = True
                 continue
-            marker = entry.get("marker")
-            if isinstance(marker, str) and marker:
+            handle = (
+                target_handles[target_index]
+                if target_index < len(target_handles)
+                else None
+            )
+            if identity_verified and handle is not None:
                 self._hit_targets[element_id] = _ElementHitTarget(
-                    frame=frame,
-                    marker=marker,
+                    handle=handle,
                     offset_x=offset_x,
                     offset_y=offset_y,
                 )
+            else:
+                incomplete = True
             index += 1
-        return elements, truncated
+        return elements, truncated, incomplete
+
+    async def _clear_hit_targets(self) -> None:
+        targets = list(self._hit_targets.values())
+        self._hit_targets.clear()
+        for target in targets:
+            await self._dispose_handle(target.handle)
+
+    @staticmethod
+    async def _dispose_handle(handle: Any) -> None:
+        dispose = getattr(handle, "dispose", None)
+        if not callable(dispose):
+            return
+        try:
+            await dispose()
+        except Exception:  # noqa: BLE001 - stale remote handles are disposable.
+            logger.debug("Could not dispose browser element handle", exc_info=True)
 
     @staticmethod
     def _main_frame(page: Any) -> Any:
@@ -512,15 +659,19 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             return
         if action.type == ComputerActionType.NAVIGATE:
             assert action.url is not None
+            target_url = self._resolve_navigation_url(action.url)
+            self._assert_navigation_allowed(target_url)
             await page.goto(
-                self._resolve_navigation_url(action.url),
+                target_url,
                 wait_until="domcontentloaded",
                 timeout=30_000,
             )
+            self._assert_navigation_allowed(str(getattr(page, "url", "") or ""))
             return
         if action.type == ComputerActionType.WAIT:
             await page.wait_for_timeout(action.duration_ms or 1_000)
             return
+        self._assert_navigation_allowed(str(getattr(page, "url", "") or ""))
         if action.type == ComputerActionType.KEYPRESS:
             await page.keyboard.press(self._playwright_key_chord(action.keys))
             return
@@ -580,35 +731,49 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         model can react to.
         """
         target = action.target
-        if target is None or target.element_id is None:
+        if target is None:
             return
-        hit_target = self._hit_targets.get(target.element_id)
+        target_id = target.element_id
+        if target_id is None and self.current_observation is not None:
+            element = find_computer_target_element(action, self.current_observation)
+            target_id = element.element_id if element is not None else None
+        if target_id is None:
+            # An unresolved point is elevated by policy and bound to a fresh
+            # screenshot when the user approves it. There is no element
+            # identity to verify in addition to that grant.
+            return
+        hit_target = self._hit_targets.get(target_id)
         if hit_target is None:
-            return
+            raise ComputerTargetNotFoundError(
+                f"Cannot verify the identity of {target_id!r} in the "
+                "current frame. Take a fresh screenshot and try again."
+            )
         try:
-            result = await hit_target.frame.evaluate(
+            result = await hit_target.handle.evaluate(
                 _HIT_TEST_SCRIPT,
                 {
                     "x": x - hit_target.offset_x,
                     "y": y - hit_target.offset_y,
-                    "markerAttribute": _ELEMENT_MARKER_ATTRIBUTE,
                 },
             )
-        except Exception:  # noqa: BLE001 - verification is best effort.
-            logger.debug(
-                "Could not hit-test %s before clicking",
-                target.element_id,
-                exc_info=True,
-            )
+        except Exception as exc:  # noqa: BLE001 - provider errors fail closed.
+            raise ComputerTargetNotFoundError(
+                f"Could not verify {target_id!r} before clicking. "
+                "Take a fresh screenshot and try again."
+            ) from exc
+        if (
+            isinstance(result, dict)
+            and result.get("found") is True
+            and result.get("matches") is True
+        ):
             return
-        if not isinstance(result, dict) or not result.get("found"):
-            return
-        marker = result.get("marker")
-        if marker == hit_target.marker:
-            return
-        obstruction = str(result.get("tag") or "another element")
+        obstruction = (
+            str(result.get("tag") or "another element")
+            if isinstance(result, dict)
+            else "an unknown element"
+        )
         raise ComputerTargetObstructedError(
-            f"{target.element_id} is covered by {obstruction} at the clicked "
+            f"{target_id} is covered by {obstruction} at the clicked "
             "position. Take a fresh screenshot, then dismiss the overlay, "
             "scroll the target into the clear, or click a different element."
         )
@@ -680,6 +845,48 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             "navigate URL must use http://, https://, about:blank, or an allowed "
             "workspace file"
         )
+
+    def _assert_navigation_allowed(self, raw_url: str) -> None:
+        reason = navigation_block_reason(
+            raw_url,
+            allowlist=self.navigation_allowlist,
+            denylist=self.navigation_denylist,
+        )
+        if reason is not None:
+            raise ValueError(reason)
+
+    async def _install_navigation_guard(self, page: Any) -> None:
+        """Abort disallowed top-level document requests, including redirects."""
+        page_key = id(page)
+        if page_key in self._guarded_page_ids:
+            return
+        route_method = getattr(page, "route", None)
+        if not callable(route_method):
+            return
+
+        async def guard(route: Any, request: Any) -> None:
+            try:
+                is_navigation = request.is_navigation_request()
+            except (AttributeError, TypeError):
+                is_navigation = False
+            is_main_frame = getattr(request, "frame", None) is self._main_frame(page)
+            reason = (
+                navigation_block_reason(
+                    str(getattr(request, "url", "") or ""),
+                    allowlist=self.navigation_allowlist,
+                    denylist=self.navigation_denylist,
+                )
+                if is_navigation and is_main_frame
+                else None
+            )
+            if reason is not None:
+                logger.warning("Blocked browser navigation request: %s", reason)
+                await route.abort("blockedbyclient")
+                return
+            await route.continue_()
+
+        await route_method("**/*", guard)
+        self._guarded_page_ids.add(page_key)
 
     @staticmethod
     def _playwright_key_chord(keys: list[str]) -> str:

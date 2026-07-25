@@ -24,6 +24,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -77,24 +78,32 @@ def _alembic_env(tmp_path: Path, migrations: list[tuple[str, str, str | None]]) 
     return tmp_path
 
 
-def _run_check(env_root: Path) -> subprocess.CompletedProcess[str]:
-    """Run the script against env_root.
+def _run_script(cwd: Path, home: Path) -> subprocess.CompletedProcess[str]:
+    """Run the script with cwd as the Alembic root.
 
-    ALEMBIC_CHECK_CMD pins the invocation to this interpreter: the script's
-    default `uv run alembic` would try to resolve a uv project, and the fixture
-    directory deliberately is not one.
+    The parent environment is inherited so that bash and the coreutils the
+    script shells out to stay findable wherever they live -- a pinned PATH
+    breaks on any host that does not keep them under /usr/bin.
+
+    ALEMBIC_CHECK_CMD pins the invocation to this interpreter, which also makes
+    the inherited PATH harmless: the script's default `uv run alembic` would try
+    to resolve a uv project, and a fixture directory deliberately is not one.
+    HOME is redirected so no user-level config leaks into the run.
     """
+    env = os.environ.copy()
+    env["ALEMBIC_CHECK_CMD"] = f"{sys.executable} -m alembic"
+    env["HOME"] = str(home)
     return subprocess.run(
         ["bash", str(SCRIPT)],
-        cwd=env_root,
+        cwd=cwd,
         capture_output=True,
         text=True,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "ALEMBIC_CHECK_CMD": f"{sys.executable} -m alembic",
-            "HOME": str(env_root),
-        },
+        env=env,
     )
+
+
+def _run_check(env_root: Path) -> subprocess.CompletedProcess[str]:
+    return _run_script(cwd=env_root, home=env_root)
 
 
 def _report(result: subprocess.CompletedProcess[str]) -> str:
@@ -161,16 +170,6 @@ def test_accepts_this_repository(tmp_path: Path) -> None:
     Also a sanity check on the fixture-based tests above: if the script were
     broken outright, this would fail too.
     """
-    result = subprocess.run(
-        ["bash", str(SCRIPT)],
-        cwd=project_root,
-        capture_output=True,
-        text=True,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "ALEMBIC_CHECK_CMD": f"{sys.executable} -m alembic",
-            "HOME": str(tmp_path),
-        },
-    )
+    result = _run_script(cwd=project_root, home=tmp_path)
     assert result.returncode == 0, _report(result)
     assert "single head confirmed" in result.stdout, _report(result)

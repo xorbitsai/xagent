@@ -3,6 +3,13 @@
 How `main` is protected, why it is set up this way, and what to do when it
 blocks something urgent.
 
+> **Status.** Live today: the `alembic-check` hook, the required
+> `Test SQLite/PostgreSQL Migrations` checks, and the `merge_group:` triggers
+> (inert until a queue exists). Still pending: `CI Summary` as a required check,
+> the merge queue itself, and `enforce_admins`. Sections below describe the
+> mechanism; anything marked *pending* is not in force yet. Update this block as
+> each lands.
+
 ## What is being protected against
 
 Two migrations branched off the same Alembic revision will each declare the same
@@ -81,12 +88,15 @@ The queue also needs to be able to create its branches: ruleset
 "Restrict new branches to main and rls" must exclude
 `refs/heads/gh-readonly-queue/**`.
 
-## Break-glass
+## Break-glass (`enforce_admins` pending)
 
-`enforce_admins` is enabled, and pushes to `main` are restricted with an empty
-allowlist -- so nobody, including administrators, can push directly or merge
-around the required checks. The only override is to disable admin enforcement,
-merge, and immediately re-enable it.
+Pushes to `main` are restricted with an empty allowlist, so nobody can push
+directly. `enforce_admins` is **not yet enabled**: until it is, administrators
+can still merge around the required checks, and this procedure is not needed.
+
+Once it is enabled, nobody -- administrators included -- can bypass the required
+checks, and the only override is to disable admin enforcement, merge, and
+immediately re-enable it.
 
 **Authorized:** `qinxuye`, `rogercloud` (organization owners).
 

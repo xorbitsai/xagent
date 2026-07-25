@@ -7,12 +7,15 @@
 # ID only produces a warning. So each invariant is asserted explicitly here.
 #
 # Regression coverage: tests/migrations/test_check_alembic_heads.py
-# Set ALEMBIC_CHECK_CMD to override how alembic is invoked (used by the tests).
+# Set ALEMBIC_CHECK_PYTHON to run alembic under a specific interpreter (the tests
+# use it to pin their own). It names an interpreter rather than a whole command
+# line on purpose: the value goes straight into a quoted array element, so it
+# needs no word splitting and stays correct when the path contains spaces.
 
 set -uo pipefail
 
-if [ -n "${ALEMBIC_CHECK_CMD:-}" ]; then
-    read -r -a ALEMBIC_CMD <<<"$ALEMBIC_CHECK_CMD"
+if [ -n "${ALEMBIC_CHECK_PYTHON:-}" ]; then
+    ALEMBIC_CMD=("$ALEMBIC_CHECK_PYTHON" -m alembic)
 elif command -v uv >/dev/null 2>&1; then
     ALEMBIC_CMD=(uv run alembic)
 else

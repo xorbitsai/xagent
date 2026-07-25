@@ -85,13 +85,15 @@ def _run_script(cwd: Path, home: Path) -> subprocess.CompletedProcess[str]:
     script shells out to stay findable wherever they live -- a pinned PATH
     breaks on any host that does not keep them under /usr/bin.
 
-    ALEMBIC_CHECK_CMD pins the invocation to this interpreter, which also makes
-    the inherited PATH harmless: the script's default `uv run alembic` would try
-    to resolve a uv project, and a fixture directory deliberately is not one.
-    HOME is redirected so no user-level config leaks into the run.
+    ALEMBIC_CHECK_PYTHON pins the invocation to this interpreter, which also
+    makes the inherited PATH harmless: the script's default `uv run alembic`
+    would try to resolve a uv project, and a fixture directory deliberately is
+    not one. It carries a bare path, never a command line, so it needs no shell
+    quoting even when sys.executable contains spaces. HOME is redirected so no
+    user-level config leaks into the run.
     """
     env = os.environ.copy()
-    env["ALEMBIC_CHECK_CMD"] = f"{sys.executable} -m alembic"
+    env["ALEMBIC_CHECK_PYTHON"] = sys.executable
     env["HOME"] = str(home)
     return subprocess.run(
         ["bash", str(SCRIPT)],

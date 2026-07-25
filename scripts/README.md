@@ -31,9 +31,9 @@ Common usage:
 PYTHONPATH=src scripts/check_alembic_heads.sh
 ```
 
-Set `ALEMBIC_CHECK_CMD` to override how alembic is invoked (default: `uv run
-alembic`, falling back to `python -m alembic`). Its regression coverage is
-`tests/migrations/test_check_alembic_heads.py`.
+Set `ALEMBIC_CHECK_PYTHON` to a specific interpreter to run alembic under
+(default: `uv run alembic`, falling back to `python -m alembic`). Its regression
+coverage is `tests/migrations/test_check_alembic_heads.py`.
 
 ## `convert_trace_checkpoint_messages.py`
 

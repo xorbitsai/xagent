@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -20,6 +21,21 @@ from .celery_app import celery_app
 from .exceptions import BackgroundJobHandlerError
 
 logger = logging.getLogger(__name__)
+
+BackgroundJobHandler = Callable[[Session, BackgroundJob], dict[str, Any]]
+
+# Downstream distributions own job types this package must not import. They
+# register a handler when the worker imports their task module, so their work
+# still flows through execute_background_job and keeps the shared retry and
+# stale-requeue behaviour instead of needing a parallel Celery task.
+_EXTRA_HANDLERS: dict[str, BackgroundJobHandler] = {}
+
+
+def register_background_job_handler(
+    job_type: str, handler: BackgroundJobHandler
+) -> None:
+    """Register a handler for a job type defined outside this package."""
+    _EXTRA_HANDLERS[str(job_type)] = handler
 
 
 def _open_worker_session() -> Session:
@@ -48,6 +64,10 @@ def _execute_job_handler(db: Session, job: BackgroundJob) -> dict[str, Any]:
         from .trigger_tasks import handle_trigger_scan
 
         return handle_trigger_scan(db, job)
+
+    handler = _EXTRA_HANDLERS.get(str(job.job_type))
+    if handler is not None:
+        return handler(db, job)
 
     raise ValueError(f"Unsupported background job type: {job.job_type}")
 

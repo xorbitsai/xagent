@@ -1427,3 +1427,59 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         assert job.progress["message"] == "Requeued stale background job"
     finally:
         db.close()
+
+
+def test_registered_external_handler_receives_job(tmp_path):
+    """Downstream distributions register handlers for job types xagent cannot import."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-external-handler.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "external-handler")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type="kb.team.transfer",
+            payload={"collection": "kb1"},
+        )
+        # kb.* routes to the existing kb queue, so no Celery routing change is
+        # needed for a downstream job type.
+        assert job.queue == "kb"
+
+        calls: list[str] = []
+
+        def handler(session, received):
+            assert session is db
+            calls.append(str(received.id))
+            return {"status": "ok"}
+
+        tasks_module.register_background_job_handler("kb.team.transfer", handler)
+        try:
+            result = tasks_module._execute_job_handler(db, job)
+        finally:
+            tasks_module._EXTRA_HANDLERS.pop("kb.team.transfer", None)
+
+        assert result == {"status": "ok"}
+        assert calls == [str(job.id)]
+    finally:
+        db.close()
+
+
+def test_unregistered_job_type_still_raises(tmp_path):
+    from xagent.web.jobs import tasks as tasks_module
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-unknown-handler.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "unknown-handler")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type="nope.unsupported",
+            payload={},
+        )
+        with pytest.raises(ValueError, match="Unsupported background job type"):
+            tasks_module._execute_job_handler(db, job)
+    finally:
+        db.close()

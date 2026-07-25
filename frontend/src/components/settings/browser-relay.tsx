@@ -116,7 +116,7 @@ export function BrowserRelaySettings() {
           <div className="mt-1 text-muted-foreground">
             {status.attached
               ? t("settings.browserRelay.status.attached", {
-                  tab: status.title || status.url || "",
+                  tab: status.title || status.url || status.client_name || "Chrome",
                 })
               : t("settings.browserRelay.status.notAttached")}
           </div>

@@ -13,6 +13,7 @@ from xagent.web.auth_dependencies import get_current_user
 
 @pytest.fixture
 def relay_client(monkeypatch):
+    monkeypatch.setenv("XAGENT_BROWSER_RELAY_BACKEND", "memory")
     reset_browser_relay_registry()
     monkeypatch.setattr(browser_relay_api, "_user_exists", lambda _user_id: True)
     app = FastAPI()

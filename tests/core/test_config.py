@@ -16,6 +16,7 @@ from xagent.config import (
     BOXLITE_HOME_DIR,
     BROWSER_PROFILE_ID,
     BROWSER_PROFILE_ROOT,
+    BROWSER_RELAY_BACKEND,
     BROWSER_RUNTIME_KIND,
     CELERY_BROKER_URL,
     CELERY_ENABLED,
@@ -93,6 +94,7 @@ from xagent.config import (
     get_boxlite_home_dir,
     get_browser_profile_id,
     get_browser_profile_root,
+    get_browser_relay_backend,
     get_browser_runtime_kind,
     get_celery_broker_url,
     get_celery_enabled,
@@ -254,6 +256,9 @@ class TestEnvironmentVariableConstants:
 
     def test_redis_url_constant(self):
         assert REDIS_URL == "XAGENT_REDIS_URL"
+
+    def test_browser_relay_backend_constant(self):
+        assert BROWSER_RELAY_BACKEND == "XAGENT_BROWSER_RELAY_BACKEND"
 
     def test_hot_path_cache_constants(self):
         assert HOT_PATH_CACHE_ENABLED == "XAGENT_HOT_PATH_CACHE_ENABLED"
@@ -445,6 +450,14 @@ class TestHotPathCacheConfig:
     def test_redis_url_strips_value(self, monkeypatch):
         monkeypatch.setenv(REDIS_URL, " redis://localhost:6379/0 ")
         assert get_redis_url() == "redis://localhost:6379/0"
+
+    def test_browser_relay_backend(self, monkeypatch):
+        monkeypatch.delenv(BROWSER_RELAY_BACKEND, raising=False)
+        assert get_browser_relay_backend() == "auto"
+        monkeypatch.setenv(BROWSER_RELAY_BACKEND, " redis ")
+        assert get_browser_relay_backend() == "redis"
+        monkeypatch.setenv(BROWSER_RELAY_BACKEND, "invalid")
+        assert get_browser_relay_backend() == "auto"
 
     def test_hot_path_cache_enabled_defaults_true(self, monkeypatch):
         monkeypatch.delenv(HOT_PATH_CACHE_ENABLED, raising=False)

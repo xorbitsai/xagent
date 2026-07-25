@@ -22,9 +22,14 @@ same screenshot and input operations used by the provider-neutral Xagent
 `computer` tool. Chrome visibly indicates while a tab is being debugged.
 
 Pairing tokens are single-use and expire after ten minutes. The exchanged relay
-session stays in `chrome.storage.local` for reconnects, but it is invalidated by
-an Xagent server restart or by revoking the relay from Settings.
+session stays in `chrome.storage.local` for reconnects. It expires after seven
+days or immediately when the relay is revoked from Settings. Without Redis, an
+Xagent server restart also invalidates the process-local session. Successfully
+pairing a new extension rotates the previous relay session for that user.
 
-The current relay registry is process-local. The WebSocket endpoint and the
-agent execution must therefore run in the same Xagent process; distributed
-workers will require a shared relay backend in a later phase.
+Relay coordination uses Redis when `XAGENT_REDIS_URL` is configured, allowing
+the WebSocket endpoint and agent execution to run in different processes or
+replicas. Without Redis, coordination falls back to process-local memory for
+single-process development. Browser commands, screenshots, and DOM observations
+travel over ephemeral Redis Pub/Sub channels and are not stored as Redis keys or
+streams. Page URLs and titles are also excluded from Redis connection metadata.

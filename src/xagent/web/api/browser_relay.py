@@ -119,6 +119,7 @@ async def browser_relay_websocket(websocket: WebSocket) -> None:
             client_name=authentication.client_name,
             send=websocket.send_json,
             close_transport=close_transport,
+            authorization_id=authentication.session_id,
         )
         await registry.register(connection)
         ready: dict[str, Any] = {
@@ -139,10 +140,11 @@ async def browser_relay_websocket(websocket: WebSocket) -> None:
             elif message_type == "status":
                 status = BrowserRelayStatusMessage.model_validate(message)
                 _require_protocol_version(status.protocol_version)
-                connection.update_status(status)
+                await registry.update_connection_status(connection, status)
             elif message_type == "ping":
                 ping = BrowserRelayPing.model_validate(message)
                 _require_protocol_version(ping.protocol_version)
+                await registry.touch_connection(connection)
                 await websocket.send_json(
                     {
                         "type": "pong",

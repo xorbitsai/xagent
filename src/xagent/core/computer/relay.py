@@ -6,9 +6,11 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+
+from ...config import get_browser_relay_backend, get_redis_url
 
 BROWSER_RELAY_PROTOCOL_VERSION = 1
 BROWSER_RELAY_MAX_MESSAGE_BYTES = 12 * 1024 * 1024
@@ -104,6 +106,7 @@ class BrowserRelayAuthentication:
     client_id: str
     client_name: str
     session_token: str | None
+    session_id: str
     paired: bool
 
 
@@ -132,12 +135,14 @@ class BrowserRelayConnection:
         client_name: str,
         send: RelaySend,
         close_transport: RelayClose | None = None,
+        authorization_id: str | None = None,
     ) -> None:
         self.user_id = user_id
         self.client_id = client_id
         self.client_name = client_name
         self._send = send
         self._close_transport = close_transport
+        self.authorization_id = authorization_id
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending_lock = asyncio.Lock()
         self._closed = False
@@ -242,6 +247,56 @@ class BrowserRelayConnection:
         }
 
 
+class BrowserRelayCommandConnection(Protocol):
+    """Request interface shared by local and distributed relay connections."""
+
+    async def request(
+        self,
+        command: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float = BROWSER_RELAY_DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]: ...
+
+
+class BrowserRelayRegistryProtocol(Protocol):
+    """Coordination contract implemented by memory and Redis relay backends."""
+
+    async def create_pairing(self, user_id: int) -> BrowserRelayPairing: ...
+
+    async def authenticate(
+        self,
+        hello: BrowserRelayHello,
+    ) -> BrowserRelayAuthentication: ...
+
+    async def register(self, connection: BrowserRelayConnection) -> None: ...
+
+    async def unregister(self, connection: BrowserRelayConnection) -> None: ...
+
+    async def update_connection_status(
+        self,
+        connection: BrowserRelayConnection,
+        status: BrowserRelayStatusMessage,
+    ) -> None: ...
+
+    async def touch_connection(self, connection: BrowserRelayConnection) -> None: ...
+
+    async def acquire(
+        self,
+        *,
+        user_id: int,
+        owner_task_id: str,
+    ) -> BrowserRelayCommandConnection: ...
+
+    async def touch_claim(self, *, user_id: int, owner_task_id: str) -> None: ...
+
+    async def release(self, *, user_id: int, owner_task_id: str) -> None: ...
+
+    async def status(self, user_id: int) -> dict[str, Any]: ...
+
+    async def revoke_user(self, user_id: int) -> None: ...
+
+
 class BrowserRelayRegistry:
     """In-process pairing, connection, and task-ownership registry.
 
@@ -302,6 +357,9 @@ class BrowserRelayRegistry:
                     raise BrowserRelayAuthenticationError(
                         "Pairing token is invalid, expired, or already used."
                     )
+                for digest, existing_session in list(self._sessions.items()):
+                    if existing_session.user_id == pairing.user_id:
+                        self._sessions.pop(digest, None)
                 session_token = secrets.token_urlsafe(32)
                 self._sessions[self._digest(session_token)] = _StoredSecret(
                     user_id=pairing.user_id,
@@ -314,6 +372,7 @@ class BrowserRelayRegistry:
                     client_id=hello.client_id,
                     client_name=hello.client_name,
                     session_token=session_token,
+                    session_id=self._digest(session_token),
                     paired=True,
                 )
 
@@ -333,12 +392,25 @@ class BrowserRelayRegistry:
                 client_id=hello.client_id,
                 client_name=session.client_name or hello.client_name,
                 session_token=None,
+                session_id=self._digest(raw_token),
                 paired=False,
             )
 
     async def register(self, connection: BrowserRelayConnection) -> None:
         old_connection: BrowserRelayConnection | None
         async with self._lock:
+            now = datetime.now(timezone.utc)
+            self._purge_expired(now)
+            if connection.authorization_id is not None:
+                session = self._sessions.get(connection.authorization_id)
+                if (
+                    session is None
+                    or session.user_id != connection.user_id
+                    or session.expires_at <= now
+                ):
+                    raise BrowserRelayAuthenticationError(
+                        "Browser relay session was revoked before connection."
+                    )
             old_connection = self._connections.get(connection.user_id)
             self._connections[connection.user_id] = connection
         if old_connection is not None and old_connection is not connection:
@@ -352,6 +424,18 @@ class BrowserRelayRegistry:
             if self._connections.get(connection.user_id) is connection:
                 self._connections.pop(connection.user_id, None)
         await connection.close()
+
+    async def update_connection_status(
+        self,
+        connection: BrowserRelayConnection,
+        status: BrowserRelayStatusMessage,
+    ) -> None:
+        async with self._lock:
+            if self._connections.get(connection.user_id) is connection:
+                connection.update_status(status)
+
+    async def touch_connection(self, connection: BrowserRelayConnection) -> None:
+        return None
 
     async def acquire(
         self,
@@ -435,13 +519,22 @@ class BrowserRelayRegistry:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-_browser_relay_registry: BrowserRelayRegistry | None = None
+_browser_relay_registry: BrowserRelayRegistryProtocol | None = None
 
 
-def get_browser_relay_registry() -> BrowserRelayRegistry:
+def get_browser_relay_registry() -> BrowserRelayRegistryProtocol:
     global _browser_relay_registry
     if _browser_relay_registry is None:
-        _browser_relay_registry = BrowserRelayRegistry()
+        backend = get_browser_relay_backend()
+        redis_url = get_redis_url()
+        if backend == "redis" or (backend == "auto" and redis_url):
+            if not redis_url:
+                raise RuntimeError("Redis browser relay requires XAGENT_REDIS_URL.")
+            from .redis_relay import RedisBrowserRelayRegistry
+
+            _browser_relay_registry = RedisBrowserRelayRegistry(redis_url)
+        else:
+            _browser_relay_registry = BrowserRelayRegistry()
     return _browser_relay_registry
 
 

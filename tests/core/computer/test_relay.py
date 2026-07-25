@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from xagent.core.computer.redis_relay import RedisBrowserRelayRegistry
 from xagent.core.computer.relay import (
     BROWSER_RELAY_PROTOCOL_VERSION,
     BrowserRelayAuthenticationError,
@@ -13,6 +14,8 @@ from xagent.core.computer.relay import (
     BrowserRelayRegistry,
     BrowserRelayResponse,
     BrowserRelayStatusMessage,
+    get_browser_relay_registry,
+    reset_browser_relay_registry,
 )
 
 
@@ -49,6 +52,54 @@ async def test_pairing_is_single_use_and_issues_reconnect_token() -> None:
     assert reconnect.user_id == 7
     assert reconnect.client_name == "My Chrome"
     assert reconnect.session_token is None
+
+    replacement_pairing = await registry.create_pairing(7)
+    await registry.authenticate(
+        BrowserRelayHello(
+            type="hello",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            client_id="chrome-2",
+            pairing_token=replacement_pairing.pairing_token,
+        )
+    )
+    with pytest.raises(BrowserRelayAuthenticationError, match="expired"):
+        await registry.authenticate(
+            BrowserRelayHello(
+                type="hello",
+                protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+                client_id="chrome-1",
+                session_token=authentication.session_token,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_revoked_session_cannot_register_after_authentication() -> None:
+    registry = BrowserRelayRegistry()
+    pairing = await registry.create_pairing(7)
+    authentication = await registry.authenticate(
+        BrowserRelayHello(
+            type="hello",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            client_id="chrome-1",
+            pairing_token=pairing.pairing_token,
+        )
+    )
+
+    async def send(_message: dict) -> None:
+        return None
+
+    connection = BrowserRelayConnection(
+        user_id=7,
+        client_id="chrome-1",
+        client_name="Chrome",
+        send=send,
+        authorization_id=authentication.session_id,
+    )
+    await registry.revoke_user(7)
+
+    with pytest.raises(BrowserRelayAuthenticationError, match="revoked"):
+        await registry.register(connection)
 
 
 @pytest.mark.asyncio
@@ -121,3 +172,26 @@ def test_hello_requires_exactly_one_credential() -> None:
             protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
             client_id="chrome",
         )
+
+
+def test_registry_factory_selects_memory_or_redis(monkeypatch) -> None:
+    try:
+        monkeypatch.setenv("XAGENT_BROWSER_RELAY_BACKEND", "auto")
+        monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+        reset_browser_relay_registry()
+        assert isinstance(get_browser_relay_registry(), BrowserRelayRegistry)
+
+        monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+        reset_browser_relay_registry()
+        assert isinstance(
+            get_browser_relay_registry(),
+            RedisBrowserRelayRegistry,
+        )
+
+        monkeypatch.setenv("XAGENT_BROWSER_RELAY_BACKEND", "redis")
+        monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+        reset_browser_relay_registry()
+        with pytest.raises(RuntimeError, match="XAGENT_REDIS_URL"):
+            get_browser_relay_registry()
+    finally:
+        reset_browser_relay_registry()

@@ -11,8 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from .environment import ComputerEnvironment
 from .relay import (
     BROWSER_RELAY_MAX_MESSAGE_BYTES,
-    BrowserRelayConnection,
-    BrowserRelayRegistry,
+    BrowserRelayCommandConnection,
+    BrowserRelayRegistryProtocol,
     get_browser_relay_registry,
 )
 from .schema import (
@@ -64,7 +64,7 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         session_id: str,
         workspace: Any,
         session_binding: ComputerSessionBinding,
-        registry: BrowserRelayRegistry | None = None,
+        registry: BrowserRelayRegistryProtocol | None = None,
         observation_store: ObservationStore | None = None,
         **_kwargs: Any,
     ) -> None:
@@ -113,7 +113,7 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         )
         return self._build_observation(result, frame_id=frame_id)
 
-    async def _connection(self) -> BrowserRelayConnection:
+    async def _connection(self) -> BrowserRelayCommandConnection:
         connection = await self.registry.acquire(
             user_id=self.user_id,
             owner_task_id=self.owner_task_id,

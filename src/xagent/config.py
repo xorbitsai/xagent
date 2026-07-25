@@ -43,6 +43,7 @@ STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 BROWSER_RUNTIME_KIND = "XAGENT_BROWSER_RUNTIME_KIND"
 BROWSER_PROFILE_ROOT = "XAGENT_BROWSER_PROFILE_ROOT"
 BROWSER_PROFILE_ID = "XAGENT_BROWSER_PROFILE_ID"
+BROWSER_RELAY_BACKEND = "XAGENT_BROWSER_RELAY_BACKEND"
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
 FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
@@ -392,6 +393,27 @@ def get_redis_url() -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def get_browser_relay_backend() -> Literal["auto", "memory", "redis"]:
+    """Return the coordination backend for user-browser relay sessions.
+
+    ``auto`` uses Redis whenever ``XAGENT_REDIS_URL`` is configured and falls
+    back to process-local memory only for single-process local deployments.
+    """
+    value = os.getenv(BROWSER_RELAY_BACKEND, "auto").strip().lower()
+    if value == "memory":
+        return "memory"
+    if value == "redis":
+        return "redis"
+    if value == "auto":
+        return "auto"
+    logger.warning(
+        "Invalid %s=%r; falling back to auto",
+        BROWSER_RELAY_BACKEND,
+        value,
+    )
+    return "auto"
 
 
 def get_hot_path_cache_enabled() -> bool:

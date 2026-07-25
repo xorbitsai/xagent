@@ -81,6 +81,14 @@ describe("ComposerAddMenu", () => {
       })
     )
     expect(
+      screen.queryByText("computerRuntime.browser.label")
+    ).not.toBeInTheDocument()
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.computerAccess",
+      })
+    )
+    expect(
       await screen.findByText("computerRuntime.status.ready")
     ).toBeInTheDocument()
     expect(
@@ -103,6 +111,11 @@ describe("ComposerAddMenu", () => {
     fireEvent.click(
       screen.getByRole("button", {
         name: "computerRuntime.addMenu.title",
+      })
+    )
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.computerAccess",
       })
     )
 
@@ -142,6 +155,11 @@ describe("ComposerAddMenu", () => {
     fireEvent.click(
       screen.getByRole("button", {
         name: "computerRuntime.addMenu.title",
+      })
+    )
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.computerAccess",
       })
     )
     fireEvent.click(screen.getByText("computerRuntime.browser.label"))

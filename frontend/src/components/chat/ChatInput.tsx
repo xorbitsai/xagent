@@ -964,20 +964,6 @@ export function ChatInput({
                     accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
                   />
                 )}
-                <ComposerAddMenu
-                  value={agentConfig.computerRuntimeKind}
-                  onValueChange={(computerRuntimeKind) =>
-                    setAgentConfig(prev => ({
-                      ...prev,
-                      computerRuntimeKind,
-                    }))
-                  }
-                  onAddFiles={() => fileInputRef.current?.click()}
-                  showFileUpload={!hideFileUpload}
-                  disabled={isInputBusy}
-                  selectionLocked={Boolean(taskStatus)}
-                />
-                {/* Settings button - left of upload */}
                 {!hideConfig && (
                   <>
                     {readOnlyConfig ? (
@@ -1017,6 +1003,19 @@ export function ChatInput({
                     )}
                   </>
                 )}
+                <ComposerAddMenu
+                  value={agentConfig.computerRuntimeKind}
+                  onValueChange={(computerRuntimeKind) =>
+                    setAgentConfig(prev => ({
+                      ...prev,
+                      computerRuntimeKind,
+                    }))
+                  }
+                  onAddFiles={() => fileInputRef.current?.click()}
+                  showFileUpload={!hideFileUpload}
+                  disabled={isInputBusy}
+                  selectionLocked={Boolean(taskStatus)}
+                />
               </div>
 
               <div className="flex items-center gap-2">

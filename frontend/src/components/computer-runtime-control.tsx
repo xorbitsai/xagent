@@ -2,6 +2,8 @@
 
 import {
   Check,
+  ChevronLeft,
+  ChevronRight,
   ExternalLink,
   FilePlus2,
   Globe2,
@@ -76,6 +78,7 @@ export function ComposerAddMenu({
 }: ComposerAddMenuProps) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
+  const [view, setView] = useState<"root" | "computer">("root")
   const [readiness, setReadiness] =
     useState<ComputerReadinessResponse["targets"] | null>(null)
 
@@ -135,10 +138,20 @@ export function ComposerAddMenu({
   const selectedOption = options.find((option) => option.value === value)
   const SelectedIcon = selectedOption?.icon
   const selectedReadiness = value ? readiness?.[value] : undefined
+  const closeMenu = () => {
+    setOpen(false)
+    setView("root")
+  }
 
   return (
     <div className={cn("flex min-w-0 items-center gap-1.5", className)}>
-      <Popover open={open} onOpenChange={setOpen}>
+      <Popover
+        open={open}
+        onOpenChange={(nextOpen) => {
+          setOpen(nextOpen)
+          if (!nextOpen) setView("root")
+        }}
+      >
         <PopoverTrigger asChild>
           <button
             type="button"
@@ -162,121 +175,152 @@ export function ComposerAddMenu({
           aria-label={t("computerRuntime.addMenu.title")}
           className="w-80 p-2"
         >
-          {showFileUpload && onAddFiles && (
-            <div className="pb-1">
+          {view === "root" ? (
+            <div className="space-y-1">
+              {showFileUpload && onAddFiles && (
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent"
+                  onClick={() => {
+                    closeMenu()
+                    onAddFiles()
+                  }}
+                >
+                  <FilePlus2 className="h-4 w-4 shrink-0" />
+                  <span className="text-sm font-medium">
+                    {t("computerRuntime.addMenu.files")}
+                  </span>
+                </button>
+              )}
               <button
                 type="button"
                 className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent"
-                onClick={() => {
-                  setOpen(false)
-                  onAddFiles()
-                }}
+                onClick={() => setView("computer")}
               >
-                <FilePlus2 className="h-4 w-4 shrink-0" />
-                <span className="text-sm font-medium">
-                  {t("computerRuntime.addMenu.files")}
+                <Monitor className="h-4 w-4 shrink-0" />
+                <span className="min-w-0 flex-1 text-sm font-medium">
+                  {t("computerRuntime.addMenu.computerAccess")}
                 </span>
+                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
               </button>
             </div>
-          )}
-
-          <div className="border-t px-2 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            {t("computerRuntime.addMenu.computerAccess")}
-          </div>
-          <div className="space-y-1">
-            {options.map((option) => {
-              const OptionIcon = option.icon
-              const selected = option.value === value
-              const optionReadiness = readiness?.[option.value]
-              const firstIssue = optionReadiness?.issues[0]
-              const canGrant =
-                !selectionLocked && Boolean(onValueChange) && optionReadiness?.ready
-              const optionContent = (
-                <>
-                  <OptionIcon className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-medium">
-                      {option.label}
-                    </span>
-                    <span className="mt-0.5 block text-xs text-muted-foreground">
-                      {option.description}
-                    </span>
-                    <span
-                      className={cn(
-                        "mt-1.5 block text-xs",
-                        optionReadiness?.ready
-                          ? "text-emerald-600"
-                          : "text-amber-600"
+          ) : (
+            <>
+              <button
+                type="button"
+                aria-label={t("computerRuntime.addMenu.back")}
+                className="mb-1 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm font-medium hover:bg-accent"
+                onClick={() => setView("root")}
+              >
+                <ChevronLeft className="h-4 w-4 shrink-0" />
+                <span>{t("computerRuntime.addMenu.computerAccess")}</span>
+              </button>
+              <div className="space-y-1 border-t pt-1">
+                {options.map((option) => {
+                  const OptionIcon = option.icon
+                  const selected = option.value === value
+                  const optionReadiness = readiness?.[option.value]
+                  const firstIssue = optionReadiness?.issues[0]
+                  const canGrant =
+                    !selectionLocked &&
+                    Boolean(onValueChange) &&
+                    optionReadiness?.ready
+                  const optionContent = (
+                    <>
+                      <OptionIcon className="mt-0.5 h-4 w-4 shrink-0" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-medium">
+                          {option.label}
+                        </span>
+                        <span className="mt-0.5 block text-xs text-muted-foreground">
+                          {option.description}
+                        </span>
+                        <span
+                          className={cn(
+                            "mt-1.5 block text-xs",
+                            optionReadiness?.ready
+                              ? "text-emerald-600"
+                              : "text-amber-600"
+                          )}
+                        >
+                          {selectionLocked && !selected
+                            ? t("computerRuntime.status.taskLocked")
+                            : optionReadiness
+                              ? optionReadiness.ready
+                                ? selected
+                                  ? t("computerRuntime.status.added")
+                                  : t("computerRuntime.status.ready")
+                                : firstIssue
+                                  ? t(`computerRuntime.issues.${firstIssue.code}`)
+                                  : t("computerRuntime.status.needsAttention")
+                              : t("computerRuntime.status.checking")}
+                        </span>
+                      </span>
+                      {selected && (
+                        <Check className="mt-0.5 h-4 w-4 text-primary" />
                       )}
+                      {!selected &&
+                        optionReadiness &&
+                        !optionReadiness.ready && (
+                          <span className="mt-0.5 text-xs font-medium text-primary">
+                            {t("computerRuntime.status.connect")}
+                          </span>
+                        )}
+                    </>
+                  )
+
+                  if (
+                    !selectionLocked &&
+                    optionReadiness &&
+                    !optionReadiness.ready
+                  ) {
+                    return (
+                      <Link
+                        key={option.value}
+                        href={`/settings#${option.settingsHash}`}
+                        className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent"
+                        onClick={closeMenu}
+                      >
+                        {optionContent}
+                      </Link>
+                    )
+                  }
+
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      disabled={!canGrant}
+                      className={cn(
+                        "flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left",
+                        canGrant && "hover:bg-accent",
+                        selected && "bg-accent",
+                        !canGrant && !selected && "opacity-60"
+                      )}
+                      onClick={() => {
+                        if (!canGrant || !onValueChange) return
+                        onValueChange(option.value)
+                        closeMenu()
+                      }}
                     >
-                      {selectionLocked && !selected
-                        ? t("computerRuntime.status.taskLocked")
-                        : optionReadiness
-                          ? optionReadiness.ready
-                            ? selected
-                              ? t("computerRuntime.status.added")
-                              : t("computerRuntime.status.ready")
-                            : firstIssue
-                              ? t(`computerRuntime.issues.${firstIssue.code}`)
-                              : t("computerRuntime.status.needsAttention")
-                          : t("computerRuntime.status.checking")}
-                    </span>
-                  </span>
-                  {selected && <Check className="mt-0.5 h-4 w-4 text-primary" />}
-                  {!selected && optionReadiness && !optionReadiness.ready && (
-                    <span className="mt-0.5 text-xs font-medium text-primary">
-                      {t("computerRuntime.status.connect")}
-                    </span>
-                  )}
-                </>
-              )
+                      {optionContent}
+                    </button>
+                  )
+                })}
+              </div>
 
-              if (!selectionLocked && optionReadiness && !optionReadiness.ready) {
-                return (
-                  <Link
-                    key={option.value}
-                    href={`/settings#${option.settingsHash}`}
-                    className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent"
-                    onClick={() => setOpen(false)}
-                  >
-                    {optionContent}
-                  </Link>
-                )
-              }
-
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  disabled={!canGrant}
-                  className={cn(
-                    "flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left",
-                    canGrant && "hover:bg-accent",
-                    selected && "bg-accent",
-                    !canGrant && !selected && "opacity-60"
-                  )}
-                  onClick={() => {
-                    if (!canGrant || !onValueChange) return
-                    onValueChange(option.value)
-                    setOpen(false)
-                  }}
+              <div className="mt-2 border-t px-2 pt-2">
+                <Link
+                  href={`/settings#${selectedOption?.settingsHash ?? "browser-relay"}`}
+                  className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                  onClick={closeMenu}
                 >
-                  {optionContent}
-                </button>
-              )
-            })}
-          </div>
-
-          <div className="mt-2 border-t px-2 pt-2">
-            <Link
-              href={`/settings#${selectedOption?.settingsHash ?? "browser-relay"}`}
-              className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-              onClick={() => setOpen(false)}
-            >
-              {t("computerRuntime.manageConnections")}
-              <ExternalLink className="h-3 w-3" />
-            </Link>
-          </div>
+                  {t("computerRuntime.manageConnections")}
+                  <ExternalLink className="h-3 w-3" />
+                </Link>
+              </div>
+            </>
+          )}
         </PopoverContent>
       </Popover>
 

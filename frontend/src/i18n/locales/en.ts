@@ -2698,6 +2698,7 @@ Build when you need.`,
       description: "Add files or allow this task to use a local device.",
       files: "Add files or photos",
       computerAccess: "Computer access",
+      back: "Back to add menu",
     },
     status: {
       ready: "Connected",

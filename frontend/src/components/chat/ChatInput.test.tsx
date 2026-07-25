@@ -188,6 +188,11 @@ describe("ChatInput", () => {
       })
     )
     fireEvent.click(
+      screen.getByRole("button", {
+        name: "computerRuntime.addMenu.computerAccess",
+      })
+    )
+    fireEvent.click(
       await screen.findByText("computerRuntime.desktop.label")
     )
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
@@ -218,6 +223,27 @@ describe("ChatInput", () => {
       expect(onSend).toHaveBeenCalled()
     })
     expect(onSend.mock.calls[0][1].computerRuntimeKind).toBeUndefined()
+  })
+
+  it("places the model control before the add menu", () => {
+    render(
+      <ChatInput
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+      />
+    )
+
+    const modelControl = screen.getByTitle("agent.input.actions.config")
+    const addMenu = screen.getByRole("button", {
+      name: "computerRuntime.addMenu.title",
+    })
+
+    expect(
+      modelControl.compareDocumentPosition(addMenu) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
   })
 
   it("does not show pause for uppercase terminal task status", () => {

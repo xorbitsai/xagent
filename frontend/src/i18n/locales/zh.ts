@@ -2698,6 +2698,7 @@ const zh = {
       description: "添加文件，或授权任务使用你的本地设备。",
       files: "添加文件或照片",
       computerAccess: "Computer 访问权限",
+      back: "返回添加菜单",
     },
     status: {
       ready: "已连接",

@@ -368,6 +368,75 @@ describe("KnowledgeBasePage", () => {
     expect(toastSuccessMock).not.toHaveBeenCalled()
   })
 
+  it("surfaces an error when the 202 job body is malformed", async () => {
+    const seenUrls: string[] = []
+    let collectionFetchCount = 0
+
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      seenUrls.push(url)
+
+      if (url === "http://api.local/api/kb/collections" && !options) {
+        collectionFetchCount += 1
+        return Promise.resolve(createJsonResponse(ONE_COLLECTION))
+      }
+
+      if (url === "http://api.local/api/knowledge-bases/demo/promote-team" && options?.method === "POST") {
+        // Accepted, but the body is not a job descriptor: the transfer cannot be
+        // tracked, so its completion is unknown and must not read as success.
+        return Promise.resolve(createStatusResponse(202, { not_a_valid_job: true }))
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    await screen.findByText("demo")
+
+    fireEvent.click(screen.getByTitle("kb.ownership.makeTeam"))
+
+    await waitFor(() => {
+      expect(toastErrorMock.mock.calls.map((call) => call[0])).toContain("kb.ownership.failed")
+    })
+    expect(toastSuccessMock).not.toHaveBeenCalled()
+    expect(seenUrls.some((url) => url.includes("/api/jobs/"))).toBe(false)
+    // No success means no post-success refresh: only the initial mount fetch.
+    expect(collectionFetchCount).toBe(1)
+  })
+
+  it("surfaces an error when the 202 job body cannot be parsed", async () => {
+    let collectionFetchCount = 0
+
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      if (url === "http://api.local/api/kb/collections" && !options) {
+        collectionFetchCount += 1
+        return Promise.resolve(createJsonResponse(ONE_COLLECTION))
+      }
+
+      if (url === "http://api.local/api/knowledge-bases/demo/promote-team" && options?.method === "POST") {
+        return Promise.resolve({
+          ok: true,
+          status: 202,
+          json: vi.fn().mockRejectedValue(new SyntaxError("Unexpected end of JSON input")),
+        })
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    await screen.findByText("demo")
+
+    fireEvent.click(screen.getByTitle("kb.ownership.makeTeam"))
+
+    await waitFor(() => {
+      expect(toastErrorMock.mock.calls.map((call) => call[0])).toContain("kb.ownership.failed")
+    })
+    expect(toastSuccessMock).not.toHaveBeenCalled()
+    expect(collectionFetchCount).toBe(1)
+  })
+
   it("keeps the synchronous 204 contract when the backend has no job queue", async () => {
     const seenUrls: string[] = []
 

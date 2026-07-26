@@ -1364,13 +1364,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         // the job instead of racing it. Backends without a job queue send 204.
         if (res.status === 202) {
           const job = await res.json().catch(() => null)
-          if (isBackgroundJobResponse(job)) {
-            const finished = await waitForBackgroundJob(getApiUrl(), job)
-            if (finished.status !== "succeeded") {
-              throw new Error(
-                getBackgroundJobFailureMessage(finished, t("builds.editor.error.unknown")),
-              )
-            }
+          // An unreadable 202 body leaves the transfer untrackable, so the KB
+          // may still be personal. Continuing would race the agent promotion
+          // that this wait exists to order.
+          if (!isBackgroundJobResponse(job)) {
+            throw new Error(t("builds.editor.error.unknown"))
+          }
+          const finished = await waitForBackgroundJob(getApiUrl(), job)
+          if (finished.status !== "succeeded") {
+            throw new Error(
+              getBackgroundJobFailureMessage(finished, t("builds.editor.error.unknown")),
+            )
           }
         }
       }

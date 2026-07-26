@@ -194,11 +194,15 @@ export function KnowledgeBasePage() {
       // acceptance. Backends without a job queue still answer 204 synchronously.
       if (response.status === 202) {
         const job = await response.json().catch(() => null)
-        if (isBackgroundJobResponse(job)) {
-          const finished = await waitForBackgroundJob(getApiUrl(), job)
-          if (finished.status !== "succeeded") {
-            throw new Error(getBackgroundJobFailureMessage(finished, t("kb.ownership.failed")))
-          }
+        // An unreadable 202 body leaves the transfer untrackable. Falling
+        // through here would report success for work that may still be running,
+        // which is the very race this wait exists to close.
+        if (!isBackgroundJobResponse(job)) {
+          throw new Error(t("kb.ownership.failed"))
+        }
+        const finished = await waitForBackgroundJob(getApiUrl(), job)
+        if (finished.status !== "succeeded") {
+          throw new Error(getBackgroundJobFailureMessage(finished, t("kb.ownership.failed")))
         }
       }
       toast.success(

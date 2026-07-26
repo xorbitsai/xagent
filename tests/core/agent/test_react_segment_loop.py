@@ -76,6 +76,36 @@ async def test_concurrent_batch_then_final_answer_short_circuits() -> None:
     assert "after_tool_batch" in statuses
 
 
+async def test_partial_final_answer_is_structured_as_unsuccessful() -> None:
+    pattern = _make_pattern()
+    pattern.pending_tool_calls = [
+        make_tool_call(
+            "final_answer",
+            {
+                "answer": "The title changed, but the body was not written.",
+                "outcome": "partial",
+            },
+        ),
+    ]
+    context = RecordingContext()
+    runtime = FakeRuntime()
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context,
+        tools=[],
+        llm=None,
+        runtime=runtime,
+    )
+
+    assert result == {
+        "success": False,
+        "output": "The title changed, but the body was not written.",
+        "response": "The title changed, but the body was not written.",
+        "status": "partial",
+        "completion_outcome": "partial",
+    }
+
+
 async def test_serial_then_ask_user_waits() -> None:
     # A lone safe tool degrades to serial; ask_user_question then waits.
     tools = [FakeTool("s1", read_only=True)]

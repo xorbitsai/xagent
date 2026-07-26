@@ -64,6 +64,21 @@ def relay_observation() -> dict[str, Any]:
             ],
             "active_url": "https://example.com/login",
             "title": "Login",
+            "platform": "macos",
+            "supported_actions": [
+                "screenshot",
+                "capture_media",
+                "navigate",
+                "click",
+                "double_click",
+                "move",
+                "scroll",
+                "type",
+                "replace_text",
+                "keypress",
+                "drag",
+                "wait",
+            ],
         }
     }
 
@@ -71,6 +86,7 @@ def relay_observation() -> dict[str, Any]:
 class FakeConnection:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any], float]] = []
+        self.response = relay_observation()
 
     async def request(
         self,
@@ -104,7 +120,7 @@ class FakeConnection:
                     "sha256": hashlib.sha256(media).hexdigest(),
                 }
             }
-        return relay_observation()
+        return self.response
 
 
 class FakeRegistry:
@@ -168,6 +184,9 @@ async def test_extension_environment_captures_and_redacts_observation() -> None:
 
     assert observation.active_url == "https://example.com/login"
     assert observation.metadata["browser_runtime_kind"] == "extension_relay"
+    assert observation.metadata["platform"] == "macos"
+    assert observation.metadata["primary_modifier"] == "META"
+    assert "replace_text" in observation.metadata["supported_actions"]
     assert observation.elements[0].text is None
     assert observation.elements[0].label == "Sensitive input"
     assert observation.elements[0].metadata["focused"] is True
@@ -202,6 +221,55 @@ async def test_extension_environment_serializes_element_target_as_point() -> Non
     assert payload["action"]["target"] == pytest.approx({"x": 0.2, "y": 0.25})
     assert payload["navigation_policy"] == {"allowlist": [], "denylist": []}
     assert second.frame_id == payload["frame_id"]
+
+
+@pytest.mark.asyncio
+async def test_extension_environment_serializes_atomic_text_replacement() -> None:
+    environment, registry = make_environment()
+    first = await environment.observe()
+
+    await environment.execute(
+        ComputerActionBatch(
+            session_id="task-1",
+            expected_frame_id=first.frame_id,
+            actions=[
+                ComputerAction(
+                    type=ComputerActionType.REPLACE_TEXT,
+                    target=ComputerTarget(element_id="dom-1"),
+                    text="Xagent Introduction",
+                )
+            ],
+        )
+    )
+
+    action = registry.connection.calls[1][1]["action"]
+    assert action["type"] == "replace_text"
+    assert action["target_element_id"] == "dom-1"
+    assert action["text"] == "Xagent Introduction"
+
+
+@pytest.mark.asyncio
+async def test_extension_environment_does_not_send_new_action_to_legacy_client() -> (
+    None
+):
+    environment, registry = make_environment()
+    registry.connection.response["observation"].pop("supported_actions")
+    first = await environment.observe()
+
+    with pytest.raises(ValueError, match="not supported by the connected"):
+        await environment.execute(
+            ComputerActionBatch(
+                session_id="task-1",
+                expected_frame_id=first.frame_id,
+                actions=[
+                    ComputerAction(
+                        type=ComputerActionType.REPLACE_TEXT,
+                        target=ComputerTarget(element_id="dom-1"),
+                        text="Xagent Introduction",
+                    )
+                ],
+            )
+        )
 
 
 @pytest.mark.asyncio

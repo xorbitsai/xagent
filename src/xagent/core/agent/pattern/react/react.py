@@ -756,7 +756,9 @@ class ReActPattern(AgentPattern):
                 "Produce the final user-facing answer by calling the final_answer "
                 "control tool exactly once using the accumulated conversation and "
                 "tool results. Do not call any other tool and do not output "
-                "tool-call markup as plain text. "
+                "tool-call markup as plain text. Set outcome=completed only when "
+                "every requested action or verification succeeded; otherwise set "
+                "outcome=partial or outcome=blocked and say what remains. "
                 f"{final_answer_language_rule()}"
             )
         elif has_tools:
@@ -1472,10 +1474,15 @@ class ReActPattern(AgentPattern):
                     "name": "final_answer",
                     "description": (
                         "Finish the current ReAct step and send the final answer to "
-                        "the user. Use this once the latest tool results satisfy the "
-                        "current user request. Do not call additional tools after "
-                        "this. Set response_language to the target output language "
-                        "for this answer. "
+                        "the user. Set outcome=completed only when every requested "
+                        "action and verification succeeded. Use outcome=partial when "
+                        "some useful work succeeded but the request remains "
+                        "unfinished, or outcome=blocked when no further progress is "
+                        "possible without user input or an external state change. "
+                        "Never mark an answer completed when it admits work is "
+                        "unfinished. Do not call additional tools after this. Set "
+                        "response_language to the target output language for this "
+                        "answer. "
                         f"{final_answer_language_rule()}"
                     ),
                     "parameters": {
@@ -1494,8 +1501,18 @@ class ReActPattern(AgentPattern):
                                     f"{final_answer_language_rule()}"
                                 ),
                             },
+                            "outcome": {
+                                "type": "string",
+                                "enum": ["completed", "partial", "blocked"],
+                                "description": (
+                                    "Structured completion outcome. completed means "
+                                    "the whole request was carried out and verified; "
+                                    "partial means only part succeeded; blocked means "
+                                    "progress requires the user or an external change."
+                                ),
+                            },
                         },
-                        "required": ["response_language", "answer"],
+                        "required": ["response_language", "answer", "outcome"],
                     },
                 },
             },
@@ -1628,23 +1645,25 @@ class ReActPattern(AgentPattern):
 
         if name == "final_answer":
             answer = str(args.get("answer", ""))
+            outcome = self._final_answer_outcome(args.get("outcome"))
             self._record_tool_call(
                 tool_call,
                 status="completed",
-                result={"answer": answer},
+                result={"answer": answer, "outcome": outcome},
             )
-            self.status = "completed"
+            self.status = outcome
             context.add_tool_result(
                 tool_name=name,
-                result={"answer": answer},
+                result={"answer": answer, "outcome": outcome},
                 tool_call_id=tool_call.get("id"),
             )
             if answer:
                 context.add_assistant_message(answer)
-            return await self._finalize_success(
+            return await self._finalize_outcome(
                 context=context,
                 runtime=runtime,
                 response=answer,
+                outcome=outcome,
             )
 
         if name == "send_message":
@@ -2032,7 +2051,11 @@ class ReActPattern(AgentPattern):
                     metadata={"tool_call": tool_call},
                 )
                 if control_result is not None:
-                    if control_result.get("status") == "completed":
+                    if control_result.get("status") in {
+                        "completed",
+                        "partial",
+                        "blocked",
+                    }:
                         self.pending_tool_calls = []
                         return control_result
                     if control_result.get("status") == "waiting_for_user":
@@ -2488,6 +2511,43 @@ class ReActPattern(AgentPattern):
             metadata={"response": response, "status": self.status},
         ).to_dict()
         return result
+
+    @staticmethod
+    def _final_answer_outcome(value: Any) -> str:
+        outcome = str(value or "completed").strip().lower()
+        if outcome not in {"completed", "partial", "blocked"}:
+            return "blocked"
+        return outcome
+
+    async def _finalize_outcome(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        response: Any,
+        outcome: str,
+    ) -> dict[str, Any]:
+        if outcome == "completed":
+            return await self._finalize_success(
+                context=context,
+                runtime=runtime,
+                response=response,
+            )
+        self.pending_tool_calls = []
+        self.waiting_for_user_request = None
+        self.approved_tool_confirmation = None
+        self.force_final_answer_next = False
+        self.status = outcome
+        await runtime.checkpoint("final", context=context, pattern=self)
+        return PatternResult(
+            success=False,
+            output=response,
+            metadata={
+                "response": response,
+                "status": outcome,
+                "completion_outcome": outcome,
+            },
+        ).to_dict()
 
     def _ensure_pending_tool_call_envelope(self, context: Any) -> None:
         if not self.pending_tool_calls:

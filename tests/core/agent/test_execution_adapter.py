@@ -998,6 +998,32 @@ def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None
     assert result["error"] == "ReActPattern interrupted."
 
 
+def test_execution_adapter_preserves_structured_partial_outcome() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="partial",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = adapter._normalize_result(
+        result={
+            "status": "partial",
+            "success": False,
+            "output": "The title changed, but the body was not written.",
+        },
+        execution_type="agent_react",
+        execution_id="partial-exec",
+    )
+
+    assert result["status"] == "partial"
+    assert result["success"] is False
+    assert result["metadata"]["completion_outcome"] == "partial"
+    assert result["output"] == "The title changed, but the body was not written."
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> None:
     tracer = TracerCheckpointStore()

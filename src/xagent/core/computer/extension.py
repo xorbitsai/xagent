@@ -10,6 +10,10 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .input_platform import (
+    ComputerInputPlatform,
+    computer_input_metadata,
+)
 from .media_store import MediaArtifactStore, RelayMediaArtifact
 from .policy import (
     find_computer_target_element,
@@ -41,6 +45,12 @@ from .schema import (
 from .session import BrowserRuntimeKind, ComputerSessionBinding
 from .store import ObservationStore
 
+_LEGACY_EXTENSION_ACTIONS: tuple[ComputerActionType, ...] = tuple(
+    action
+    for action in ComputerActionType
+    if action is not ComputerActionType.REPLACE_TEXT
+)
+
 
 class _RelayElement(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -70,6 +80,10 @@ class _RelayObservation(BaseModel):
     element_extraction_incomplete: bool = False
     active_url: str | None = Field(default=None, max_length=4_096)
     title: str | None = Field(default=None, max_length=500)
+    platform: ComputerInputPlatform = ComputerInputPlatform.UNKNOWN
+    supported_actions: list[ComputerActionType] = Field(
+        default_factory=lambda: list(_LEGACY_EXTENSION_ACTIONS)
+    )
 
 
 class ExtensionComputerEnvironment(ComputerEnvironment):
@@ -120,6 +134,15 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         if len(batch.actions) != 1:
             raise ValueError("extension relay executes exactly one action per frame")
         action = batch.actions[0]
+        if (
+            self.current_observation is not None
+            and action.type.value
+            not in self.current_observation.metadata.get("supported_actions", [])
+        ):
+            raise ValueError(
+                f"{action.type.value} is not supported by the connected "
+                "browser extension"
+            )
         if action.type is ComputerActionType.SCREENSHOT:
             return await self._observe()
         if action.type is not ComputerActionType.NAVIGATE:
@@ -265,6 +288,8 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         metadata: dict[str, Any] = {
             "browser_runtime_kind": BrowserRuntimeKind.EXTENSION_RELAY.value,
             "user_takeover_available": True,
+            **computer_input_metadata(parsed.platform),
+            "supported_actions": [action.value for action in parsed.supported_actions],
         }
         if parsed.element_extraction_failed:
             metadata[ELEMENT_EXTRACTION_FAILED_KEY] = True

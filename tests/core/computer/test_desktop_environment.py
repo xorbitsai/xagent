@@ -73,6 +73,20 @@ def relay_observation(
             "window_id": 81,
             "title": "Sign in",
             "application": "Example App",
+            "platform": "macos",
+            "supported_actions": [
+                "screenshot",
+                "capture_media",
+                "click",
+                "double_click",
+                "move",
+                "scroll",
+                "type",
+                "replace_text",
+                "keypress",
+                "drag",
+                "wait",
+            ],
             "paused": paused,
             "emergency_stopped": emergency_stopped,
         }
@@ -177,6 +191,9 @@ async def test_desktop_environment_captures_window_and_redacts_secure_fields() -
 
     assert observation.environment is ComputerEnvironmentType.DESKTOP
     assert observation.metadata["computer_runtime_kind"] == "desktop_relay"
+    assert observation.metadata["platform"] == "macos"
+    assert observation.metadata["primary_modifier"] == "META"
+    assert "replace_text" in observation.metadata["supported_actions"]
     assert observation.metadata["window_id"] == 81
     assert observation.metadata[ELEMENT_EXTRACTION_INCOMPLETE_KEY] is True
     assert observation.elements[0].source is ComputerElementSource.UI_AUTOMATION

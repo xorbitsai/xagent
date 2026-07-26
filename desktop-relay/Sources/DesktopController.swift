@@ -412,6 +412,20 @@ actor DesktopController {
       targetScope: target.scope,
       title: target.title,
       application: target.application,
+      platform: "macos",
+      supportedActions: [
+        "screenshot",
+        "capture_media",
+        "click",
+        "double_click",
+        "move",
+        "scroll",
+        "type",
+        "replace_text",
+        "keypress",
+        "drag",
+        "wait",
+      ],
       paused: paused,
       emergencyStopped: emergencyStopped
     )
@@ -460,16 +474,22 @@ actor DesktopController {
       }
       Self.postMouse(type: .mouseMoved, at: point)
       return false
-    case "type":
+    case "type", "replace_text":
       if let targetID, sensitiveElementIDs.contains(targetID) {
         throw RelayFailure.invalidAction(
           "credentials and secure fields must be entered by the user"
         )
       }
+      if type == "replace_text", point == nil {
+        throw RelayFailure.invalidAction("replace_text requires a target")
+      }
       if let point {
         Self.click(at: point, count: 1)
       } else {
         try verifyAuthorizedTargetIsFocused(target: captureTarget)
+      }
+      if type == "replace_text" {
+        try Self.press(keys: ["META", "A"])
       }
       try Self.typeText(action["text"]?.stringValue ?? "")
       return true

@@ -752,6 +752,14 @@ async function updateBadge(): Promise<void> {
 const MAX_OBSERVATION_ELEMENTS = 100
 const ISOLATED_WORLD_NAME = "xagent-computer"
 
+type ComputerInputPlatform =
+  | "macos"
+  | "windows"
+  | "linux"
+  | "chromeos"
+  | "android"
+  | "unknown"
+
 interface BrowserObservation {
   screenshot_base64: string
   viewport: {
@@ -765,6 +773,40 @@ interface BrowserObservation {
   element_extraction_incomplete: boolean
   active_url: string | null
   title: string | null
+  platform: ComputerInputPlatform
+  supported_actions: string[]
+}
+
+let inputPlatformPromise: Promise<ComputerInputPlatform> | null = null
+
+function computerInputPlatform(): Promise<ComputerInputPlatform> {
+  if (!inputPlatformPromise) {
+    inputPlatformPromise = chrome.runtime
+      .getPlatformInfo()
+      .then((info): ComputerInputPlatform => {
+        switch (info.os) {
+          case "mac":
+            return "macos"
+          case "win":
+            return "windows"
+          case "linux":
+          case "openbsd":
+            return "linux"
+          case "cros":
+            return "chromeos"
+          case "android":
+            return "android"
+          default:
+            return "unknown"
+        }
+      })
+      .catch(() => "unknown")
+  }
+  return inputPlatformPromise
+}
+
+function primaryModifier(platform: ComputerInputPlatform): "META" | "CTRL" {
+  return platform === "macos" ? "META" : "CTRL"
 }
 
 async function captureObservation(
@@ -810,7 +852,7 @@ async function captureObservation(
     frameToken,
     limit: MAX_OBSERVATION_ELEMENTS,
   })
-  const [screenshot, viewportResult, elementsResult] = await Promise.all([
+  const [screenshot, viewportResult, elementsResult, platform] = await Promise.all([
     chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
       format: "png",
       fromSurface: true,
@@ -829,6 +871,7 @@ async function captureObservation(
         contextId: executionContextId,
       })
       .catch(() => null),
+    computerInputPlatform(),
   ])
   const screenshotData = readCommandValue(screenshot, "data")
   const viewport = readRuntimeValue(viewportResult)
@@ -861,6 +904,21 @@ async function captureObservation(
     active_url:
       typeof viewport.active_url === "string" ? viewport.active_url : null,
     title: typeof viewport.title === "string" ? viewport.title : null,
+    platform,
+    supported_actions: [
+      "screenshot",
+      "capture_media",
+      "navigate",
+      "click",
+      "double_click",
+      "move",
+      "scroll",
+      "type",
+      "replace_text",
+      "keypress",
+      "drag",
+      "wait",
+    ],
   }
 }
 
@@ -943,11 +1001,20 @@ async function performAction(
     await dispatchKeypress(tabId, keys)
     return
   }
-  if (type === "type") {
+  if (type === "type" || type === "replace_text") {
+    if (type === "replace_text" && !isRecord(action.target)) {
+      throw new Error("replace_text requires a target.")
+    }
     if (isRecord(action.target)) {
       const point = await pointInPixels(tabId, action.target)
       await verifyHitTarget(tabId, action, expectedFrameToken, point.x, point.y)
       await dispatchClick(tabId, point.x, point.y, 1)
+    }
+    if (type === "replace_text") {
+      await dispatchKeypress(
+        tabId,
+        [primaryModifier(await computerInputPlatform()), "A"],
+      )
     }
     await chrome.debugger.sendCommand(target, "Input.insertText", {
       text: String(action.text ?? ""),
@@ -1110,6 +1177,7 @@ function collectInteractiveElements(options: {
     "[role='radio']",
     "[role='tab']",
     "[role='menuitem']",
+    "[role='textbox']",
     "[onclick]",
     "[tabindex]",
     "[contenteditable='true']",

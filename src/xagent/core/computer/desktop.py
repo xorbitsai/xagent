@@ -12,6 +12,7 @@ from .desktop_relay import (
     get_desktop_relay_registry,
 )
 from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .input_platform import ComputerInputPlatform, computer_input_metadata
 from .media_store import MediaArtifactStore, RelayMediaArtifact
 from .relay import (
     BROWSER_RELAY_MAX_MESSAGE_BYTES,
@@ -36,6 +37,16 @@ from .schema import (
 )
 from .session import BrowserRuntimeKind, ComputerSessionBinding
 from .store import ObservationStore
+
+_LEGACY_DESKTOP_ACTIONS: tuple[ComputerActionType, ...] = tuple(
+    action
+    for action in ComputerActionType
+    if action
+    not in {
+        ComputerActionType.NAVIGATE,
+        ComputerActionType.REPLACE_TEXT,
+    }
+)
 
 
 class _DesktopRelayElement(BaseModel):
@@ -73,6 +84,10 @@ class _DesktopRelayObservation(BaseModel):
     application: str | None = Field(default=None, max_length=500)
     paused: bool = False
     emergency_stopped: bool = False
+    platform: ComputerInputPlatform = ComputerInputPlatform.MACOS
+    supported_actions: list[ComputerActionType] = Field(
+        default_factory=lambda: list(_LEGACY_DESKTOP_ACTIONS)
+    )
 
 
 class DesktopRelayEnvironment(ComputerEnvironment):
@@ -118,6 +133,15 @@ class DesktopRelayEnvironment(ComputerEnvironment):
         if len(batch.actions) != 1:
             raise ValueError("desktop relay executes exactly one action per frame")
         action = batch.actions[0]
+        if (
+            self.current_observation is not None
+            and action.type.value
+            not in self.current_observation.metadata.get("supported_actions", [])
+        ):
+            raise ValueError(
+                f"{action.type.value} is not supported by the connected "
+                "desktop companion"
+            )
         if action.type is ComputerActionType.SCREENSHOT:
             return await self._observe()
         if action.type is ComputerActionType.NAVIGATE:
@@ -257,6 +281,8 @@ class DesktopRelayEnvironment(ComputerEnvironment):
         metadata: dict[str, Any] = {
             "computer_runtime_kind": BrowserRuntimeKind.DESKTOP_RELAY.value,
             "user_takeover_available": True,
+            **computer_input_metadata(parsed.platform),
+            "supported_actions": [action.value for action in parsed.supported_actions],
             "window_id": parsed.window_id,
             "display_id": parsed.display_id,
             "target_scope": parsed.target_scope,

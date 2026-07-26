@@ -171,13 +171,22 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         Workflow:
         1. First call: request only a screenshot and omit expected_frame_id.
         2. Inspect the returned screenshot.
-        3. For click/type/scroll/keypress/drag/move/navigate/capture_media,
+        3. For click/type/replace_text/scroll/keypress/drag/move/navigate/capture_media,
            copy the returned frame_id into expected_frame_id.
         4. Every successful call automatically returns a fresh screenshot and frame_id.
 
         Coordinates are normalized: x=0/y=0 is the viewport top-left and
         x=1/y=1 is the bottom-right. Element IDs are valid only for the frame that
-        returned them. `keys` represents one keyboard chord, e.g. ["CTRL", "A"].
+        returned them. Each call accepts exactly one action. `type` inserts text
+        at the current caret; use `replace_text` with an explicit target to
+        atomically select and replace that field's current contents.
+
+        Keyboard keys are literal. Before using `keypress`, read
+        observation.metadata.platform and observation.metadata.primary_modifier.
+        For example, select-all is ["META", "A"] on macOS and ["CTRL", "A"] on
+        Windows/Linux. Never translate CTRL to META or guess the platform.
+        Only call actions listed in observation.metadata.supported_actions; relay
+        clients may expose fewer actions than the current server schema.
         Do not request a separate screenshot after an action; the action result
         already contains the new observation.
 
@@ -430,6 +439,12 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             f"{environment_label} observation captured for frame "
             f"{observation.frame_id}. "
             "Use this exact frame_id for the next state-changing action."
+        )
+        platform = str(observation.metadata.get("platform") or "unknown")
+        primary_modifier = str(observation.metadata.get("primary_modifier") or "CTRL")
+        message += (
+            f" Input platform: {platform}; primary shortcut modifier: "
+            f"{primary_modifier}."
         )
         if self._browser_runtime_kind is BrowserRuntimeKind.EPHEMERAL_PLAYWRIGHT:
             message += (
@@ -782,8 +797,16 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             return f"press {keys or 'a key'}"
         if action.type is ComputerActionType.DRAG:
             return "drag content"
-        if action.type is ComputerActionType.TYPE:
-            return f"type text into{target or ' the current field'}"
+        if action.type in {
+            ComputerActionType.TYPE,
+            ComputerActionType.REPLACE_TEXT,
+        }:
+            verb = (
+                "replace text in"
+                if action.type is ComputerActionType.REPLACE_TEXT
+                else "type text into"
+            )
+            return f"{verb}{target or ' the current field'}"
         return f"{action.type.value.replace('_', ' ')}{target}"
 
     @staticmethod

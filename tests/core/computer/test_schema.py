@@ -41,6 +41,11 @@ def test_normalized_rect_must_fit_viewport() -> None:
     [
         {"type": ComputerActionType.CLICK},
         {"type": ComputerActionType.TYPE},
+        {"type": ComputerActionType.REPLACE_TEXT, "text": "replacement"},
+        {
+            "type": ComputerActionType.REPLACE_TEXT,
+            "target": {"point": {"x": 0.5, "y": 0.5}},
+        },
         {"type": ComputerActionType.KEYPRESS},
         {"type": ComputerActionType.SCROLL},
         {"type": ComputerActionType.NAVIGATE},
@@ -69,6 +74,16 @@ def test_action_batch_uses_normalized_target_and_expected_frame() -> None:
 
     assert batch.actions[0].target is not None
     assert batch.actions[0].target.point == NormalizedPoint(x=0.25, y=0.75)
+
+
+def test_replace_text_requires_target_and_text() -> None:
+    action = ComputerAction(
+        type=ComputerActionType.REPLACE_TEXT,
+        target=ComputerTarget(point=NormalizedPoint(x=0.25, y=0.75)),
+        text="Xagent Introduction",
+    )
+
+    assert action.text == "Xagent Introduction"
 
 
 def test_capture_media_requires_kind_and_bounded_duration() -> None:

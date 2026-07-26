@@ -3117,6 +3117,12 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
         in final_answer_schema["description"]
     )
     assert "response_language" in final_answer_schema["parameters"]["required"]
+    assert "outcome" in final_answer_schema["parameters"]["required"]
+    assert final_answer_schema["parameters"]["properties"]["outcome"]["enum"] == [
+        "completed",
+        "partial",
+        "blocked",
+    ]
     response_language_schema = final_answer_schema["parameters"]["properties"][
         "response_language"
     ]

@@ -38,6 +38,7 @@ class ComputerActionType(str, Enum):
     MOVE = "move"
     SCROLL = "scroll"
     TYPE = "type"
+    REPLACE_TEXT = "replace_text"
     KEYPRESS = "keypress"
     DRAG = "drag"
     WAIT = "wait"
@@ -129,6 +130,7 @@ class ComputerAction(_ComputerModel):
             ComputerActionType.CLICK,
             ComputerActionType.DOUBLE_CLICK,
             ComputerActionType.MOVE,
+            ComputerActionType.REPLACE_TEXT,
         }
         if self.type in target_actions and self.target is None:
             raise ValueError(f"{self.type.value} requires a target")
@@ -138,6 +140,8 @@ class ComputerAction(_ComputerModel):
             raise ValueError("navigate requires a URL")
         if self.type == ComputerActionType.TYPE and self.text is None:
             raise ValueError("type requires text")
+        if self.type == ComputerActionType.REPLACE_TEXT and self.text is None:
+            raise ValueError("replace_text requires text")
         if self.type == ComputerActionType.KEYPRESS and not self.keys:
             raise ValueError("keypress requires at least one key")
         if self.type == ComputerActionType.KEYPRESS and any(

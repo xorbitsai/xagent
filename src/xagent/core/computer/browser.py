@@ -10,6 +10,11 @@ from uuid import uuid4
 
 from ..tools.core.browser_use import BrowserSessionManager, get_browser_manager
 from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .input_platform import (
+    computer_input_metadata,
+    host_computer_input_platform,
+    primary_modifier_for_platform,
+)
 from .policy import (
     find_computer_target_element,
     navigation_block_reason,
@@ -35,6 +40,12 @@ from .store import ObservationStore
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_ACTIONS = tuple(
+    action
+    for action in ComputerActionType
+    if action is not ComputerActionType.CAPTURE_MEDIA
+)
+
 
 class ComputerTargetObstructedError(RuntimeError):
     """Raised when the coordinate for a target resolves to another element."""
@@ -55,7 +66,7 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
   const selector = [
     "a[href]", "button", "input", "textarea", "select", "summary",
     "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
-    "[role='tab']", "[role='menuitem']", "[onclick]", "[tabindex]",
+    "[role='tab']", "[role='menuitem']", "[role='textbox']", "[onclick]", "[tabindex]",
     "[contenteditable='true']"
   ].join(",");
   // Bounds are reported in the top-level viewport's coordinate space so that
@@ -321,6 +332,8 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         metadata: dict[str, Any] = {
             "browser_runtime_kind": self.session_binding.runtime_kind.value,
             "user_takeover_available": self.session_binding.is_persistent,
+            **computer_input_metadata(host_computer_input_platform()),
+            "supported_actions": [action.value for action in _SUPPORTED_ACTIONS],
         }
         if extraction_failed:
             metadata[ELEMENT_EXTRACTION_FAILED_KEY] = True
@@ -655,6 +668,10 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         )
 
     async def _execute_action(self, page: Any, action: ComputerAction) -> None:
+        if action.type not in _SUPPORTED_ACTIONS:
+            raise ValueError(
+                f"{action.type.value} is not supported by this computer environment"
+            )
         if action.type == ComputerActionType.SCREENSHOT:
             return
         if action.type == ComputerActionType.NAVIGATE:
@@ -680,6 +697,18 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                 x, y = self._target_pixels(action)
                 await self._verify_hit_target(action, x, y)
                 await page.mouse.click(x, y)
+            await page.keyboard.insert_text(action.text or "")
+            return
+        if action.type == ComputerActionType.REPLACE_TEXT:
+            x, y = self._target_pixels(action)
+            await self._verify_hit_target(action, x, y)
+            await page.mouse.click(x, y)
+            primary_modifier = primary_modifier_for_platform(
+                host_computer_input_platform()
+            )
+            await page.keyboard.press(
+                self._playwright_key_chord([primary_modifier.value, "A"])
+            )
             await page.keyboard.insert_text(action.text or "")
             return
         if action.type == ComputerActionType.SCROLL:

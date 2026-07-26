@@ -27,6 +27,7 @@ _POINTED_ACTIONS = frozenset(
         ComputerActionType.CLICK,
         ComputerActionType.DOUBLE_CLICK,
         ComputerActionType.TYPE,
+        ComputerActionType.REPLACE_TEXT,
     }
 )
 
@@ -236,7 +237,11 @@ class DefaultComputerActionPolicy:
                 continue
 
             if (
-                action.type is ComputerActionType.TYPE
+                action.type
+                in {
+                    ComputerActionType.TYPE,
+                    ComputerActionType.REPLACE_TEXT,
+                }
                 and element is None
                 and (
                     structure_unknown
@@ -261,7 +266,11 @@ class DefaultComputerActionPolicy:
                 continue
 
             if (
-                action.type is ComputerActionType.TYPE
+                action.type
+                in {
+                    ComputerActionType.TYPE,
+                    ComputerActionType.REPLACE_TEXT,
+                }
                 and element is not None
                 and element.metadata.get("sensitive") is True
             ):

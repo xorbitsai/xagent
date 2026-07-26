@@ -364,6 +364,11 @@ class AgentExecutionAdapter:
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,
                 "task_id": execution_id,
+                **(
+                    {"completion_outcome": status}
+                    if status in {"partial", "blocked"}
+                    else {}
+                ),
             },
             "agent_result": result,
         }

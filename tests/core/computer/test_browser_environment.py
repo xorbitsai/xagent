@@ -9,6 +9,10 @@ from xagent.core.computer.browser import (
     BrowserComputerEnvironment,
     ComputerTargetObstructedError,
 )
+from xagent.core.computer.input_platform import (
+    host_computer_input_platform,
+    primary_modifier_for_platform,
+)
 from xagent.core.computer.schema import (
     ComputerAction,
     ComputerActionBatch,
@@ -373,6 +377,12 @@ async def test_browser_observation_captures_screenshot_and_dom_elements(
     }
     assert observation.elements[0].element_id == "dom-1"
     assert observation.elements[0].label == "Continue"
+    assert observation.metadata["platform"] == host_computer_input_platform().value
+    assert (
+        observation.metadata["primary_modifier"]
+        == primary_modifier_for_platform(host_computer_input_platform()).value
+    )
+    assert "replace_text" in observation.metadata["supported_actions"]
     assert store.calls[0]["image_bytes"] == b"browser-png"
     assert environment.current_observation == observation
 
@@ -436,6 +446,11 @@ async def test_browser_actions_use_normalized_and_element_coordinates(
                     text="hello",
                 ),
                 ComputerAction(
+                    type=ComputerActionType.REPLACE_TEXT,
+                    target=ComputerTarget(element_id="dom-1"),
+                    text="replacement",
+                ),
+                ComputerAction(
                     type=ComputerActionType.SCROLL,
                     delta_y=0.5,
                 ),
@@ -449,9 +464,17 @@ async def test_browser_actions_use_normalized_and_element_coordinates(
 
     assert page.mouse.calls[0] == ("click", 256.0, 180.0)
     assert page.mouse.calls[1] == ("click", 640.0, 360.0)
-    assert page.mouse.calls[2] == ("wheel", 0, 360.0)
+    assert page.mouse.calls[2] == ("click", 256.0, 180.0)
+    assert page.mouse.calls[3] == ("wheel", 0, 360.0)
+    replacement_modifier = (
+        "Meta"
+        if primary_modifier_for_platform(host_computer_input_platform()).value == "META"
+        else "Control"
+    )
     assert page.keyboard.calls == [
         ("insert_text", "hello"),
+        ("press", f"{replacement_modifier}+A"),
+        ("insert_text", "replacement"),
         ("press", "Control+A"),
     ]
     assert second.frame_id != first.frame_id

@@ -76,3 +76,16 @@ def test_project_execution_result_maps_interrupted_to_paused():
     assert projection.visible_text == INTERRUPTED_USER_MESSAGE
     assert projection.transcript_content == ""
     assert projection.interactions == []
+
+
+def test_project_execution_result_does_not_mark_partial_as_completed():
+    projection = project_execution_result_for_channel(
+        {
+            "status": "partial",
+            "success": False,
+            "output": "Only the title was changed.",
+        }
+    )
+
+    assert projection.task_status == TaskStatus.FAILED
+    assert projection.visible_text == "Only the title was changed."

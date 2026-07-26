@@ -212,6 +212,8 @@ struct ObservationPayload: Codable, Sendable {
   let targetScope: String
   let title: String?
   let application: String?
+  let platform: String
+  let supportedActions: [String]
   let paused: Bool
   let emergencyStopped: Bool
 
@@ -227,6 +229,8 @@ struct ObservationPayload: Codable, Sendable {
     case targetScope = "target_scope"
     case title
     case application
+    case platform
+    case supportedActions = "supported_actions"
     case paused
     case emergencyStopped = "emergency_stopped"
   }

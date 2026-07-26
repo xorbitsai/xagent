@@ -67,6 +67,7 @@ from ...runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
+from ...task_environment import task_environment_input_modalities
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import ReActFinalAnswerStreamer
 
@@ -436,6 +437,9 @@ class ReActPattern(AgentPattern):
                 llm=llm,
                 messages=route_messages,
                 context=context,
+                preferred_input_modalities=task_environment_input_modalities(
+                    context.metadata
+                ),
             )
             llm_metadata = {
                 "iteration": iteration,
@@ -2164,6 +2168,9 @@ class ReActPattern(AgentPattern):
             llm=llm,
             messages=messages,
             context=context,
+            preferred_input_modalities=task_environment_input_modalities(
+                context.metadata
+            ),
         )
         decision_tools = [self._react_decision_tool_schema()]
         llm_metadata = {

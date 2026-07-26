@@ -25,6 +25,7 @@ from ..language import (
     output_language_policy,
     response_language_rules,
 )
+from ..task_environment import task_environment_system_context
 from .components import (
     COMPONENT_LOADERS,
     ExecutionComponent,
@@ -462,6 +463,9 @@ class ExecutionContext:
                 f"{response_language_rules()}"
                 f"{language_policy}"
             )
+        task_environment_context = task_environment_system_context(self.metadata)
+        if task_environment_context:
+            parts.append(task_environment_context)
         process_description = str(
             self.metadata.get("process_description") or ""
         ).strip()

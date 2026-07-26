@@ -18,6 +18,7 @@ from ..tools.adapters.vibe.config import (
 )
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
+from .task_environment import normalize_task_environment
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 
@@ -54,6 +55,7 @@ class AgentService:
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
+        task_environment: dict[str, Any] | None = None,
         tools_initialized: bool | None = None,
         **agent_kwargs: Any,
     ) -> None:
@@ -68,6 +70,7 @@ class AgentService:
         self.vision_llm = vision_llm
         self.compact_llm = compact_llm
         self.system_prompt = system_prompt
+        self.task_environment = normalize_task_environment(task_environment)
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
         self.tool_config = tool_config
@@ -451,6 +454,7 @@ class AgentService:
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
             )
+            self._execution_adapter.config.task_environment = self.task_environment
 
         return cast(
             dict[str, Any],
@@ -500,6 +504,7 @@ class AgentService:
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,
+                task_environment=self.task_environment,
             )
         )
 

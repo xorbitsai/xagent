@@ -81,6 +81,35 @@ async def test_prepare_llm_for_context_preserves_plain_llm_threshold(
     assert context.compact_config.threshold == 12_345
 
 
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_passes_execution_modality_preferences() -> None:
+    prepare_calls: list[tuple[str, ...]] = []
+
+    class PreparedLLM:
+        context_window = 128_000
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert messages[-1]["content"] == "inspect the browser"
+            prepare_calls.append(preferred_input_modalities)
+            return PreparedLLM()
+
+    prepared = await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "inspect the browser"}],
+        context=ExecutionContext(),
+        preferred_input_modalities=("image",),
+    )
+
+    assert isinstance(prepared, PreparedLLM)
+    assert prepare_calls == [("image",)]
+
+
 class CancelledLLM:
     async def chat(self, **_: Any) -> str:
         raise asyncio.CancelledError

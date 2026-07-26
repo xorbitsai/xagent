@@ -194,10 +194,16 @@ async def materialize_messages(
                 )
                 unresolved.append(ref)
                 continue
+            image_url = {"url": url}
+            if detail != "auto":
+                # ``auto`` is the provider default. Omitting it preserves the
+                # same semantics while avoiding OpenAI-compatible endpoints
+                # that reject the explicitly supplied value.
+                image_url["detail"] = detail
             content_parts.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": url, "detail": detail},
+                    "image_url": image_url,
                 }
             )
         if unresolved:

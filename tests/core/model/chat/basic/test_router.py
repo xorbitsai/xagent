@@ -6,6 +6,13 @@ from typing import Any, AsyncIterator
 
 import pytest
 
+from xagent.core.computer.materializer import materialize_messages
+from xagent.core.context_ref import (
+    CONTEXT_REFS_KEY,
+    ContextReference,
+    ContextReferencePurpose,
+)
+from xagent.core.model.chat.basic import router as router_module
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.types import ChunkType, StreamChunk
@@ -16,6 +23,10 @@ _OPENROUTER_TOOL_CHOICE_ERROR = (
 )
 _THINKING_TOOL_CHOICE_ERROR = (
     "OpenAI bad request (400): Thinking mode does not support this tool_choice"
+)
+_MANDATORY_REASONING_ERROR = (
+    "OpenAI bad request (400): Reasoning is mandatory for this endpoint "
+    "and cannot be disabled."
 )
 
 
@@ -124,9 +135,41 @@ class _ScriptedChatLLM(BaseLLM):
             raise RuntimeError(self.errors.pop(0))
         return "ok"
 
+    async def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        del messages, temperature, max_tokens, tools, response_format
+        del output_config, kwargs
+        self.tool_choices.append(tool_choice)
+        self.thinking_values.append(thinking)
+        if self.errors:
+            raise RuntimeError(self.errors.pop(0))
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
+
 
 async def _select_glm(_prompt: str) -> str:
     return "z-ai/glm-5.2"
+
+
+def _image_context_ref() -> dict[str, Any]:
+    return ContextReference(
+        file_ref={
+            "file_id": "image-1",
+            "filename": "frame.png",
+            "mime_type": "image/png",
+        },
+        purpose=ContextReferencePurpose.OBSERVATION,
+        frame_id="frame-1",
+    ).durable_dict()
 
 
 @pytest.mark.asyncio
@@ -162,6 +205,137 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     assert prepared.context_window == 1_048_576
     assert await prepared.chat([{"role": "user", "content": "continue"}]) == "ok"
     assert selected == ["make a podcast"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_for_call_prefers_modalities_and_exposes_selected_capabilities(
+    monkeypatch,
+):
+    downstream = _ScriptedChatLLM([])
+    route_calls: list[dict[str, Any]] = []
+
+    class _Profile:
+        context_length = 128_000
+        input_modalities = ("text", "image")
+
+    class _Profiles:
+        @staticmethod
+        def get(_model_id: str) -> _Profile:
+            return _Profile()
+
+    class _Service:
+        profiles = _Profiles()
+
+        @staticmethod
+        def route(prompt: str, **kwargs: Any) -> dict[str, Any]:
+            route_calls.append({"prompt": prompt, **kwargs})
+            return {"selected": ["vision/model"]}
+
+    monkeypatch.setattr(router_module, "_get_service", lambda: _Service())
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    messages = [
+        {"role": "user", "content": "inspect the page"},
+        {
+            "role": "tool",
+            "content": "browser observation",
+            CONTEXT_REFS_KEY: [_image_context_ref()],
+        },
+    ]
+
+    prepared = await router.prepare_for_call(messages)
+
+    assert route_calls == [
+        {
+            "prompt": "inspect the page",
+            "config_name": "auto",
+            "preferred_input_modalities": ("image",),
+        }
+    ]
+    assert prepared.model_name == "vision/model"
+    assert prepared.has_ability("vision")
+
+    class _Resolver:
+        @staticmethod
+        async def resolve_image(_reference: ContextReference) -> str:
+            return "data:image/png;base64,c2NyZWVuc2hvdA=="
+
+    materialized = await materialize_messages(
+        llm=prepared,
+        messages=messages,
+        resolver=_Resolver(),
+    )
+    image_parts = [
+        part
+        for message in materialized
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if part.get("type") == "image_url"
+    ]
+    assert len(image_parts) == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_for_call_merges_execution_hint_before_first_image(monkeypatch):
+    downstream = _ScriptedChatLLM([])
+    route_calls: list[dict[str, Any]] = []
+
+    class _Profile:
+        context_length = 128_000
+        input_modalities = ("text", "image")
+
+    class _Profiles:
+        @staticmethod
+        def get(_model_id: str) -> _Profile:
+            return _Profile()
+
+    class _Service:
+        profiles = _Profiles()
+
+        @staticmethod
+        def route(prompt: str, **kwargs: Any) -> dict[str, Any]:
+            route_calls.append({"prompt": prompt, **kwargs})
+            return {"selected": ["vision/model"]}
+
+    monkeypatch.setattr(router_module, "_get_service", lambda: _Service())
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+
+    prepared = await router.prepare_for_call(
+        [{"role": "user", "content": "inspect the authorized page"}],
+        preferred_input_modalities=("image",),
+    )
+
+    assert route_calls == [
+        {
+            "prompt": "inspect the authorized page",
+            "config_name": "auto",
+            "preferred_input_modalities": ("image",),
+        }
+    ]
+    assert prepared.has_ability("vision")
+
+
+def test_router_detects_modalities_from_context_refs_and_content_parts() -> None:
+    messages = [
+        {
+            "role": "tool",
+            "content": "observation",
+            CONTEXT_REFS_KEY: [_image_context_ref()],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "review these inputs"},
+                {"type": "video_url", "video_url": {"url": "https://example.test/v"}},
+                {"type": "input_audio", "input_audio": {"data": "abc"}},
+            ],
+        },
+    ]
+
+    assert RouterLLM._preferred_input_modalities(messages) == (
+        "audio",
+        "image",
+        "video",
+    )
 
 
 @pytest.mark.asyncio
@@ -281,6 +455,73 @@ async def test_router_chat_propagates_non_matching_errors_without_retry(monkeypa
         )
 
     assert llm.tool_choices == ["required"]
+
+
+@pytest.mark.asyncio
+async def test_router_chat_enables_thinking_when_selected_model_requires_it(
+    monkeypatch,
+):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    result = await router.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=[_tool_schema()],
+        tool_choice="required",
+        thinking={"type": "disabled", "enable": False},
+    )
+
+    assert result == "ok"
+    assert llm.tool_choices == ["required", "required"]
+    assert llm.thinking_values == [
+        {"type": "disabled", "enable": False},
+        {"type": "enabled", "enable": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_router_stream_enables_thinking_before_first_chunk(monkeypatch):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    chunks = [
+        chunk
+        async for chunk in router.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tools=[_tool_schema()],
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert llm.tool_choices == ["required", "required"]
+    assert llm.thinking_values == [
+        {"type": "disabled", "enable": False},
+        {"type": "enabled", "enable": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_repeat_mandatory_reasoning_retry(monkeypatch):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR, _MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    with pytest.raises(RuntimeError, match="Reasoning is mandatory"):
+        await router.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=[_tool_schema()],
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        )
+
+    assert llm.thinking_values == [
+        {"type": "disabled", "enable": False},
+        {"type": "enabled", "enable": True},
+    ]
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,10 @@ import pytest
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.service import AgentService
+from xagent.core.agent.task_environment import (
+    TASK_ENVIRONMENT_METADATA_KEY,
+    build_task_environment,
+)
 
 
 class FakeLLM:
@@ -547,6 +551,37 @@ async def test_agent_service_passes_execution_context_to_execution_adapter() -> 
 
 
 @pytest.mark.asyncio
+async def test_agent_service_persists_selected_computer_target_in_context() -> None:
+    llm = FakeLLM(["The page is visible."])
+    environment = build_task_environment(computer_runtime_kind="extension_relay")
+    service = AgentService(
+        name="browser-target-service",
+        id="browser-target-service",
+        pattern="react",
+        llm=cast(Any, llm),
+        tools=cast(Any, []),
+        tool_config=None,
+        task_environment=environment,
+    )
+    service.allowed_skills = []
+
+    result = await service.execute_task(
+        "Inspect the authorized page",
+        task_id="browser-target-task",
+    )
+
+    assert result["success"] is True
+    context = result["agent_result"]["context"]
+    assert context.metadata[TASK_ENVIRONMENT_METADATA_KEY] == environment
+    system_message = next(
+        message["content"]
+        for message in llm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+    assert "Target: My browser (browser)." in system_message
+
+
+@pytest.mark.asyncio
 async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter() -> (
     None
 ):
@@ -1008,6 +1043,7 @@ async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> 
     )
 
     resumed_llm = FakeLLM(["resumed done"])
+    environment = build_task_environment(computer_runtime_kind="extension_relay")
     resumed_adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
             name="restart",
@@ -1017,6 +1053,7 @@ async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> 
             tracer=tracer,
             service_id="restart-service",
             skill_manager=NoSkillManager(),
+            task_environment=environment,
         )
     )
 
@@ -1028,7 +1065,9 @@ async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> 
     assert resumed["output"] == "resumed done"
     assert resumed["metadata"]["execution_type"] == "agent_react"
     assert resumed_adapter.get_status("restart-exec") is None
-    context_messages = resumed["agent_result"]["context"].messages
+    resumed_context = resumed["agent_result"]["context"]
+    assert resumed_context.metadata[TASK_ENVIRONMENT_METADATA_KEY] == environment
+    context_messages = resumed_context.messages
     assert any(
         message.role == "user" and message.content == "Resume with concise answer."
         for message in context_messages

@@ -25,6 +25,11 @@ from xagent.core.agent.language import (
     output_language_policy,
     response_language_rules,
 )
+from xagent.core.agent.task_environment import (
+    TASK_ENVIRONMENT_METADATA_KEY,
+    build_task_environment,
+    task_environment_input_modalities,
+)
 from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.web.user_isolated_memory import current_user_id
 
@@ -175,6 +180,31 @@ def test_system_context_includes_file_reference_output_spec() -> None:
     assert "File delivery integrity" in system_message
     assert "Never invent, guess, or construct a file_id" in system_message
     assert "it is not delivered until a successful tool result" in system_message
+
+
+def test_system_context_describes_selected_browser_target() -> None:
+    ctx = ExecutionContext(execution_id="exec-browser-target")
+    ctx.metadata[TASK_ENVIRONMENT_METADATA_KEY] = build_task_environment(
+        computer_runtime_kind="extension_relay"
+    )
+    ctx.add_user_message("What is on the authorized page?")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Selected computer target:" in system_message
+    assert "Target: My browser (browser)." in system_message
+    assert "single browser tab explicitly approved by the user" in system_message
+    assert "inspect this target with the computer tool" in system_message
+    assert "does not mean that a screenshot has already been captured" in system_message
+    assert task_environment_input_modalities(ctx.metadata) == ("image",)
+
+    restored = ExecutionContext.from_dict(ctx.to_dict())
+    assert task_environment_input_modalities(restored.metadata) == ("image",)
+
+
+def test_task_environment_ignores_unselected_or_unknown_computer_runtime() -> None:
+    assert build_task_environment(computer_runtime_kind=None) == {}
+    assert build_task_environment(computer_runtime_kind="ephemeral_playwright") == {}
 
 
 def test_response_language_rules_uses_custom_subject_throughout() -> None:

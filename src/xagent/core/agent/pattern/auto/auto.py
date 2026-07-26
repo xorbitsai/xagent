@@ -48,10 +48,7 @@ from ..base import (
     truncate_prompt_preview,
 )
 from ..dag import DAGPattern
-from ..final_answer_stream import (
-    FinalAnswerStreamSession,
-    ToolCallStringFieldStreamer,
-)
+from ..final_answer_stream import FinalAnswerStreamSession
 from ..react import ReActPattern
 
 logger = logging.getLogger(__name__)
@@ -853,25 +850,19 @@ class AutoPattern(AgentPattern):
                 runtime,
                 enabled=True,
             )
-            answer_streamer = ToolCallStringFieldStreamer(
-                runtime=runtime,
-                tool_name=DECISION_TOOL_NAME,
-                field_name="answer",
-                guard_field="action",
-                guard_value=AutoAction.FINAL_ANSWER.value,
-                emitter=answer_emitter,
-            )
             try:
+                # A routing ``answer`` is only a candidate until the complete
+                # decision passes normalization. Do not expose its argument
+                # chunks; accepted final answers are committed in _run().
                 response = await runtime.run_streaming_llm_call(
                     call_llm,
                     messages=messages,
                     tools=routing_tools,
                     tool_choice="required",
                     thinking={"type": "disabled", "enable": False},
-                    on_chunk=answer_streamer.handle_chunk,
                 )
             except LLMToolProtocolError as exc:
-                await answer_streamer.fail(
+                await answer_emitter.fail(
                     f"invalid {exc.code} routing tool protocol, retrying"
                 )
                 await runtime.on_llm_error(
@@ -908,7 +899,7 @@ class AutoPattern(AgentPattern):
                 )
                 continue
             except Exception as exc:
-                await answer_streamer.fail(str(exc))
+                await answer_emitter.fail(str(exc))
                 await runtime.on_llm_error(
                     context=context, error=exc, metadata=metadata
                 )

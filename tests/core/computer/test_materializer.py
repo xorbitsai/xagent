@@ -10,11 +10,12 @@ from xagent.core.context_ref import (
     CONTEXT_REFS_KEY,
     ContextReference,
     ContextReferencePurpose,
+    ImageDetail,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 
-def image_reference() -> ContextReference:
+def image_reference(*, detail: ImageDetail = ImageDetail.AUTO) -> ContextReference:
     return ContextReference(
         file_ref={
             "file_id": "image-1",
@@ -23,6 +24,7 @@ def image_reference() -> ContextReference:
         },
         purpose=ContextReferencePurpose.OBSERVATION,
         frame_id="frame-1",
+        detail=detail,
         text_fallback="Screen containing a settings dialog",
     )
 
@@ -83,8 +85,37 @@ async def test_vision_materializer_expands_user_image() -> None:
     assert result[0]["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
+    assert "detail" not in result[0]["content"][1]["image_url"]
     assert CONTEXT_REFS_KEY not in result[0]
     assert isinstance(messages[0]["content"], str)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        (ImageDetail.LOW, "low"),
+        (ImageDetail.HIGH, "high"),
+        (ImageDetail.ORIGINAL, "high"),
+    ],
+)
+async def test_vision_materializer_preserves_explicit_image_detail(
+    detail: ImageDetail,
+    expected: str,
+) -> None:
+    result = await materialize_messages(
+        llm=VisionLLM(),
+        messages=[
+            {
+                "role": "user",
+                "content": "What is visible?",
+                CONTEXT_REFS_KEY: [image_reference(detail=detail).durable_dict()],
+            }
+        ],
+        resolver=Resolver(),
+    )
+
+    assert result[0]["content"][1]["image_url"]["detail"] == expected
 
 
 @pytest.mark.asyncio

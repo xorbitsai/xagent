@@ -18,6 +18,10 @@ from xagent.core.agent import (
     ToolCallInterrupted,
     ToolCallRecord,
 )
+from xagent.core.agent.task_environment import (
+    TASK_ENVIRONMENT_METADATA_KEY,
+    build_task_environment,
+)
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -369,6 +373,22 @@ class FakeLLM:
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+class PreparingFakeLLM(FakeLLM):
+    def __init__(self, responses: list[Any]) -> None:
+        super().__init__(responses)
+        self.prepare_calls: list[tuple[str, ...]] = []
+
+    async def prepare_for_call(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> Any:
+        assert messages
+        self.prepare_calls.append(preferred_input_modalities)
+        return self
 
 
 class StreamingFinalAnswerLLM:
@@ -1021,6 +1041,25 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert "Do not write assistant text in the same response as a work tool call" in (
         system_prompt
     )
+
+
+@pytest.mark.asyncio
+async def test_react_prefers_vision_before_first_computer_observation() -> None:
+    llm = PreparingFakeLLM([{"content": "The page is ready."}])
+    context = ExecutionContext()
+    context.metadata[TASK_ENVIRONMENT_METADATA_KEY] = build_task_environment(
+        computer_runtime_kind="extension_relay"
+    )
+    context.add_user_message("Inspect the authorized page")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert llm.prepare_calls == [("image",)]
 
 
 @pytest.mark.asyncio

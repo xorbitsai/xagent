@@ -21,6 +21,10 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
+from xagent.core.agent.task_environment import (
+    TASK_ENVIRONMENT_METADATA_KEY,
+    build_task_environment,
+)
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
     ToolProtocolViolation,
@@ -81,6 +85,22 @@ class RaisingFakeLLM(FakeLLM):
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class PreparingFakeLLM(FakeLLM):
+    def __init__(self, responses: list[Any]) -> None:
+        super().__init__(responses)
+        self.prepare_calls: list[tuple[str, ...]] = []
+
+    async def prepare_for_call(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> Any:
+        assert messages
+        self.prepare_calls.append(preferred_input_modalities)
+        return self
 
 
 class StreamingDecisionLLM:
@@ -470,6 +490,40 @@ async def test_auto_decision_sees_memory_context() -> None:
         DECISION_TOOL_NAME,
         "load_skill",
     ]
+
+
+@pytest.mark.asyncio
+async def test_auto_sees_browser_target_without_forcing_vision_for_routing() -> None:
+    llm = PreparingFakeLLM(
+        [
+            decision_tool_response(
+                AutoAction.FINAL_ANSWER.value,
+                "The selected target is understood.",
+                "Ready.",
+            )
+        ]
+    )
+    context = ExecutionContext(execution_id="auto-browser-target")
+    context.metadata[TASK_ENVIRONMENT_METADATA_KEY] = build_task_environment(
+        computer_runtime_kind="extension_relay"
+    )
+    context.add_user_message("Inspect the authorized page")
+
+    result = await AutoPattern().run(
+        context=context,
+        tools=[],
+        llm=llm,
+        skill_manager=FakeSkillManager(),
+    )
+
+    assert result["success"] is True
+    assert llm.prepare_calls == [()]
+    system_context = next(
+        message["content"]
+        for message in llm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+    assert "Target: My browser (browser)." in system_context
 
 
 @pytest.mark.asyncio
@@ -952,7 +1006,7 @@ async def test_auto_pattern_rejects_unsafe_response_language_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() -> None:
+async def test_auto_pattern_commits_direct_final_answer_after_validation() -> None:
     prefix = (
         '{"action":"final_answer","reason":"simple",'
         '"response_language":"English",'
@@ -986,18 +1040,54 @@ async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() ->
     assert [event["type"] for event in collector.events] == [
         "final_answer_start",
         "final_answer_delta",
-        "final_answer_delta",
-        "final_answer_delta",
         "final_answer_end",
     ]
-    assert [event["delta"] for event in collector.events[1:-1]] == [
-        "Hi",
-        " there",
-        ".",
-    ]
+    assert collector.events[1]["delta"] == "Hi there."
     assert collector.events[-1]["content"] == "Hi there."
     assert len({event["message_id"] for event in collector.events}) == 1
     assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_discards_final_answer_candidate_falling_back_to_react() -> (
+    None
+):
+    prefix = (
+        '{"action":"final_answer","reason":"needs clarification",'
+        '"response_language":"Simplified Chinese",'
+        '"answer":"'
+    )
+    complete = (
+        prefix + '请说明是哪个授权页面",'
+        '"requires_current_or_external_facts":true,'
+        '"existing_context_sufficient":false,'
+        '"evidence_basis":"page content has not been inspected",'
+        '"missing_verification":"inspect the selected browser target"}'
+    )
+    llm = StreamingDecisionLLM(
+        [
+            prefix + "请说明",
+            prefix + "请说明是哪个授权页面",
+            complete,
+        ]
+    )
+    collector = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="auto-rejected-final-answer",
+        outbound_message_handler=collector,
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-rejected-final-answer")
+    context.add_user_message("查看授权页面")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "child done"
+    assert result["auto_decision"]["action"] == "react"
+    assert pattern.selected_pattern == "react"
+    assert collector.events == []
 
 
 @pytest.mark.asyncio

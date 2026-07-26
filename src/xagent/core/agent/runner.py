@@ -15,6 +15,10 @@ from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
+from .task_environment import (
+    TASK_ENVIRONMENT_METADATA_KEY,
+    normalize_task_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +89,7 @@ class AgentRunner:
             )
         if checkpoint and isinstance(checkpoint.get("context"), dict):
             context = ExecutionContext.from_dict(checkpoint["context"])
+            self._refresh_task_environment(context=context, metadata=metadata)
             self.context_manager.set_context(context)
             execution_id = context.execution_id
             workspace = None
@@ -638,6 +643,22 @@ class AgentRunner:
         if isinstance(context_window, int) and context_window > 0:
             return max(1, int(context_window * get_compact_threshold_ratio()))
         return get_compact_threshold_default()
+
+    @staticmethod
+    def _refresh_task_environment(
+        *,
+        context: ExecutionContext,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        """Overlay the locked task target onto legacy or resumed checkpoints."""
+
+        if not isinstance(metadata, dict):
+            return
+        environment = normalize_task_environment(
+            metadata.get(TASK_ENVIRONMENT_METADATA_KEY)
+        )
+        if environment:
+            context.metadata[TASK_ENVIRONMENT_METADATA_KEY] = environment
 
     def _initial_user_message_metadata(
         self, context: ExecutionContext

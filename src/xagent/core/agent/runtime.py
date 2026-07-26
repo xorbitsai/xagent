@@ -48,6 +48,7 @@ async def prepare_llm_for_context(
     llm: Any,
     messages: list[dict[str, Any]],
     context: Any,
+    preferred_input_modalities: tuple[str, ...] = (),
 ) -> Any:
     """Resolve virtual models before compaction and apply their context window.
 
@@ -58,7 +59,21 @@ async def prepare_llm_for_context(
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
     if callable(prepare):
-        prepared = prepare(messages)
+        prepare_kwargs: dict[str, Any] = {}
+        if preferred_input_modalities:
+            try:
+                parameters = list(inspect.signature(prepare).parameters.values())
+            except (TypeError, ValueError):
+                parameters = []
+            if any(
+                parameter.name == "preferred_input_modalities"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            ):
+                prepare_kwargs["preferred_input_modalities"] = (
+                    preferred_input_modalities
+                )
+        prepared = prepare(messages, **prepare_kwargs)
         if inspect.isawaitable(prepared):
             prepared = await prepared
 

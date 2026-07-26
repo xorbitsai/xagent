@@ -9,6 +9,10 @@ from .agent import Agent
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
 from .runner import AgentRunner
+from .task_environment import (
+    TASK_ENVIRONMENT_METADATA_KEY,
+    normalize_task_environment,
+)
 from .tracing import TraceEventCallback
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,7 @@ class AgentExecutionConfig:
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
     allowed_skills: list[str] | None = None
+    task_environment: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentExecutionAdapter:
@@ -88,12 +93,11 @@ class AgentExecutionAdapter:
             runner,
             execution_id=execution_id,
             task=task,
-            metadata={
-                "execution_type": execution_type,
-                "pattern": self.config.pattern,
-                "request_context": dict(context or {}),
-                "selected_skill_context": self.config.recovered_skill_context,
-            },
+            metadata=self._execution_metadata(
+                execution_type=execution_type,
+                request_context=context,
+                include_request_context=True,
+            ),
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
@@ -127,12 +131,11 @@ class AgentExecutionAdapter:
             runner,
             execution_id=execution_id,
             task=task,
-            metadata={
-                "execution_type": execution_type,
-                "pattern": self.config.pattern,
-                "request_context": dict(context or {}),
-                "selected_skill_context": self.config.recovered_skill_context,
-            },
+            metadata=self._execution_metadata(
+                execution_type=execution_type,
+                request_context=context,
+                include_request_context=True,
+            ),
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
@@ -148,16 +151,19 @@ class AgentExecutionAdapter:
         # Carry the mid-run quota checker into the resumed run too, so a
         # paused-and-resumed continuation is gated like a fresh run.
         kwargs.setdefault("interrupt_checker", self.config.interrupt_checker)
+        resume_metadata = dict(kwargs.get("metadata") or {})
+        environment = normalize_task_environment(self.config.task_environment)
+        if environment:
+            resume_metadata[TASK_ENVIRONMENT_METADATA_KEY] = environment
+        if resume_metadata:
+            kwargs["metadata"] = resume_metadata
         handle = self.registry.get(execution_id)
         if handle is None:
             runner, execution_type = self._build_runner()
             self.registry.register(
                 execution_id,
                 runner,
-                metadata={
-                    "execution_type": execution_type,
-                    "pattern": self.config.pattern,
-                },
+                metadata=self._execution_metadata(execution_type=execution_type),
             )
         else:
             execution_type = str(
@@ -190,10 +196,7 @@ class AgentExecutionAdapter:
             self.registry.register(
                 execution_id,
                 runner,
-                metadata={
-                    "execution_type": execution_type,
-                    "pattern": self.config.pattern,
-                },
+                metadata=self._execution_metadata(execution_type=execution_type),
             )
         context = await self.registry.post_user_message(
             execution_id,
@@ -220,6 +223,25 @@ class AgentExecutionAdapter:
         return str(
             self.config.service_id or self.config.current_task_id or execution_id
         )
+
+    def _execution_metadata(
+        self,
+        *,
+        execution_type: str,
+        request_context: dict[str, Any] | None = None,
+        include_request_context: bool = False,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "execution_type": execution_type,
+            "pattern": self.config.pattern,
+        }
+        if include_request_context:
+            metadata["request_context"] = dict(request_context or {})
+            metadata["selected_skill_context"] = self.config.recovered_skill_context
+        environment = normalize_task_environment(self.config.task_environment)
+        if environment:
+            metadata[TASK_ENVIRONMENT_METADATA_KEY] = environment
+        return metadata
 
     def _build_runner(self) -> tuple[AgentRunner, str]:
         pattern, execution_type = self._build_pattern()

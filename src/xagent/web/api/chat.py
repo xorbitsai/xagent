@@ -18,6 +18,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.task_environment import build_task_environment
 from ...core.execution_scope import (
     ExecutionScope,
     ScopeFingerprint,
@@ -2042,6 +2043,11 @@ class AgentServiceManager:
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=memory_policy.memory_enabled,
                         system_prompt=system_prompt,  # Pass agent builder instructions
+                        task_environment=build_task_environment(
+                            computer_runtime_kind=getattr(
+                                task, "computer_runtime_kind", None
+                            )
+                        ),
                     )
 
                     selected_file_ids: list[str] = []
@@ -2716,6 +2722,11 @@ class AgentServiceManager:
                             task_id=str(task_id),
                             memory_similarity_threshold=memory_similarity_threshold,
                             memory_enabled=memory_policy.memory_enabled,
+                            task_environment=build_task_environment(
+                                computer_runtime_kind=getattr(
+                                    task, "computer_runtime_kind", None
+                                )
+                            ),
                         )
                 else:
                     raise ValueError(

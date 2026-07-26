@@ -1641,3 +1641,77 @@ def test_unknown_job_type_fails_fast_without_retry(tmp_path, monkeypatch):
         assert "Unsupported background job type" in str(refreshed.error_message)
     finally:
         verify_db.close()
+
+
+def test_registered_handler_retryable_error_flows_through_execute_background_job(
+    tmp_path, monkeypatch
+):
+    """A registered downstream handler keeps the shared retry path, not just dispatch.
+
+    ``test_registered_external_handler_receives_job`` only drives the private
+    ``_execute_job_handler`` dispatch. Nothing verified that a registered
+    handler raising a retryable ``BackgroundJobHandlerError`` actually flows
+    through ``execute_background_job``'s retry machinery the same way the
+    built-in handlers do: job reset to ``ENQUEUED`` and ``self.retry`` invoked.
+    """
+    from xagent.web.jobs import tasks as tasks_module
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    job_type = "test.retryable_registered"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-registered-retryable.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "registered-retryable")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=job_type,
+            payload={},
+            max_attempts=3,
+        )
+        job_id = str(job.id)
+    finally:
+        db.close()
+
+    handler_calls: list[str] = []
+
+    def flaky_handler(session, received):
+        handler_calls.append(str(received.id))
+        raise BackgroundJobHandlerError("transient downstream failure", retryable=True)
+
+    tasks_module.register_background_job_handler(job_type, flaky_handler)
+
+    retry_calls: list[BaseException | None] = []
+
+    def fake_retry(*_args, **kwargs):
+        retry_calls.append(kwargs.get("exc"))
+        return RuntimeError("retry requested")
+
+    monkeypatch.setattr(tasks_module.execute_background_job, "retry", fake_retry)
+
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert handler_calls == [job_id]
+    assert len(retry_calls) == 1
+    assert isinstance(retry_calls[0], BackgroundJobHandlerError)
+    assert retry_calls[0].retryable is True
+    assert isinstance(outcome.result, RuntimeError)
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.ENQUEUED.value
+        assert refreshed.attempts == 1
+        assert "transient downstream failure" in str(refreshed.error_message)
+    finally:
+        verify_db.close()

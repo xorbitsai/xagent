@@ -21,6 +21,25 @@ CI publishes the same ZIP and checksum as the `xagent-browser-relay` artifact.
 
 For development, run `npm run build` and load `browser-extension/dist`.
 
+## Versioning
+
+Browser Relay uses the Xagent repository version instead of maintaining a
+separate extension version:
+
+- an Xagent release tag such as `v0.6.4` builds Browser Relay `0.6.4`;
+- a development checkout after `v0.6.3` builds a display version such as
+  `0.6.4.dev29+g675f9f21`;
+- Chrome's numeric update version for that development build is
+  `0.6.3.29`, which remains newer than `0.6.3` and older than `0.6.4`;
+- a dirty checkout adds `.dirty` to the display version.
+
+`manifest.template.json` intentionally has no independent version.
+`npm run build` derives the real `version` and `version_name` from the nearest
+Xagent tag while producing `dist/manifest.json`.
+`XAGENT_VERSION` may explicitly provide a release or PEP 440 development
+version. Publishing an Xagent GitHub release builds the matching Browser Relay
+ZIP and checksum and attaches both to that release.
+
 ## Connect Xagent
 
 1. Open **Settings → Computer Use → User Browser Relay** in Xagent.

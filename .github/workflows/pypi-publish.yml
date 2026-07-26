@@ -58,3 +58,39 @@ jobs:
 
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  browser-extension:
+    name: Attach Browser Relay to release
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: browser-extension/package-lock.json
+
+      - name: Build version-matched Browser Relay
+        working-directory: browser-extension
+        env:
+          XAGENT_VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          npm ci
+          npm run check
+
+      - name: Upload Browser Relay release assets
+        working-directory: browser-extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+          XAGENT_VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$XAGENT_VERSION" \
+            artifacts/xagent-browser-relay-* \
+            --clobber

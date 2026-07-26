@@ -11,13 +11,13 @@ import { fileURLToPath } from "node:url"
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const dist = resolve(root, "dist")
 const artifacts = resolve(root, "artifacts")
-const packageJson = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"))
 const manifest = JSON.parse(await readFile(resolve(dist, "manifest.json"), "utf8"))
 
-if (packageJson.version !== manifest.version) {
-  throw new Error(
-    `Version mismatch: package=${packageJson.version}, manifest=${manifest.version}`,
-  )
+if (
+  typeof manifest.version !== "string" ||
+  typeof manifest.version_name !== "string"
+) {
+  throw new Error("Extension manifest is missing generated Xagent version metadata")
 }
 
 const files = await collectFiles(dist)
@@ -26,7 +26,8 @@ if (!files.some((file) => file.name === "manifest.json")) {
 }
 
 const archive = createStoredZip(files)
-const baseName = `xagent-browser-relay-${packageJson.version}.zip`
+const artifactVersion = manifest.version_name.replaceAll("+", "-")
+const baseName = `xagent-browser-relay-${artifactVersion}.zip`
 const archivePath = resolve(artifacts, baseName)
 await mkdir(artifacts, { recursive: true })
 await writeFile(archivePath, archive)

@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ..context_ref import ContextReference, ContextReferencePurpose
 
 #: Observation metadata flag set when interactive elements could not be read.
-#: The policy treats an unknown page structure as elevated risk.
+#: Missing structure is diagnostic context, not evidence that an action is risky.
 ELEMENT_EXTRACTION_FAILED_KEY = "element_extraction_failed"
 
 #: Observation metadata flag set when some page surfaces (for example an

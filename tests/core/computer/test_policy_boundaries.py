@@ -1,4 +1,4 @@
-"""The action policy must fail closed when it cannot see what it is acting on."""
+"""Computer actions are bounded by authorization and positive risk evidence."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def _plain_button() -> ComputerElement:
 
 
 @pytest.mark.asyncio
-async def test_unknown_page_structure_requires_confirmation() -> None:
+async def test_unknown_page_structure_allows_ordinary_click() -> None:
     policy = DefaultComputerActionPolicy()
     observation = _observation(metadata={ELEMENT_EXTRACTION_FAILED_KEY: True})
 
@@ -85,8 +85,7 @@ async def test_unknown_page_structure_requires_confirmation() -> None:
         observation,
     )
 
-    assert decision.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
-    assert "page structure" in decision.reason
+    assert decision.outcome is ComputerPolicyOutcome.ALLOW
 
 
 @pytest.mark.asyncio
@@ -103,7 +102,7 @@ async def test_screenshot_is_allowed_even_without_page_structure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_click_missing_every_known_control_requires_confirmation() -> None:
+async def test_click_missing_every_known_control_is_allowed() -> None:
     policy = DefaultComputerActionPolicy()
     observation = _observation(elements=[_plain_button()])
 
@@ -117,12 +116,11 @@ async def test_click_missing_every_known_control_requires_confirmation() -> None
         observation,
     )
 
-    assert decision.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
-    assert "matches no known" in decision.reason
+    assert decision.outcome is ComputerPolicyOutcome.ALLOW
 
 
 @pytest.mark.asyncio
-async def test_empty_element_list_does_not_make_point_actions_low_risk() -> None:
+async def test_empty_element_list_allows_ordinary_click_and_type() -> None:
     policy = DefaultComputerActionPolicy()
 
     click = await policy.evaluate(
@@ -139,13 +137,12 @@ async def test_empty_element_list_does_not_make_point_actions_low_risk() -> None
         _observation(),
     )
 
-    assert click.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
-    assert typed.outcome is ComputerPolicyOutcome.BLOCK
-    assert "user must enter" in typed.reason
+    assert click.outcome is ComputerPolicyOutcome.ALLOW
+    assert typed.outcome is ComputerPolicyOutcome.ALLOW
 
 
 @pytest.mark.asyncio
-async def test_incomplete_page_requires_confirmation_for_unresolved_target() -> None:
+async def test_incomplete_page_allows_unresolved_ordinary_target() -> None:
     policy = DefaultComputerActionPolicy()
     observation = _observation(
         elements=[_plain_button()],
@@ -162,8 +159,60 @@ async def test_incomplete_page_requires_confirmation_for_unresolved_target() -> 
         observation,
     )
 
-    assert decision.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
-    assert "could not be inspected" in decision.reason
+    assert decision.outcome is ComputerPolicyOutcome.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_incomplete_page_allows_typing_at_unresolved_point() -> None:
+    policy = DefaultComputerActionPolicy()
+    observation = _observation(
+        elements=[_plain_button()],
+        metadata={ELEMENT_EXTRACTION_INCOMPLETE_KEY: True},
+    )
+
+    decision = await policy.evaluate(
+        _batch(
+            ComputerAction(
+                type=ComputerActionType.TYPE,
+                target=ComputerTarget(point=NormalizedPoint(x=0.9, y=0.9)),
+                text="Ordinary document content",
+            )
+        ),
+        observation,
+    )
+
+    assert decision.outcome is ComputerPolicyOutcome.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_incomplete_page_still_blocks_explicit_sensitive_target() -> None:
+    policy = DefaultComputerActionPolicy()
+    password = ComputerElement(
+        element_id="dom-password",
+        source=ComputerElementSource.DOM,
+        bounds=NormalizedRect(x=0.7, y=0.7, width=0.2, height=0.1),
+        label="Password",
+        role="input",
+        metadata={"sensitive": True},
+    )
+    observation = _observation(
+        elements=[password],
+        metadata={ELEMENT_EXTRACTION_INCOMPLETE_KEY: True},
+    )
+
+    decision = await policy.evaluate(
+        _batch(
+            ComputerAction(
+                type=ComputerActionType.TYPE,
+                target=ComputerTarget(point=NormalizedPoint(x=0.8, y=0.75)),
+                text="secret-value",
+            )
+        ),
+        observation,
+    )
+
+    assert decision.outcome is ComputerPolicyOutcome.BLOCK
+    assert "must be entered by the user" in decision.reason
 
 
 @pytest.mark.asyncio

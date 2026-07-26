@@ -9,8 +9,6 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field
 
 from .schema import (
-    ELEMENT_EXTRACTION_FAILED_KEY,
-    ELEMENT_EXTRACTION_INCOMPLETE_KEY,
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
@@ -20,16 +18,6 @@ from .schema import (
 
 #: Actions that only read the environment and therefore need no risk gate.
 _READ_ONLY_ACTIONS = frozenset({ComputerActionType.SCREENSHOT, ComputerActionType.WAIT})
-
-#: Actions whose effect depends on hitting the intended element.
-_POINTED_ACTIONS = frozenset(
-    {
-        ComputerActionType.CLICK,
-        ComputerActionType.DOUBLE_CLICK,
-        ComputerActionType.TYPE,
-        ComputerActionType.REPLACE_TEXT,
-    }
-)
 
 
 class ComputerRiskLevel(str, Enum):
@@ -175,11 +163,12 @@ def navigation_block_reason(
 
 
 class DefaultComputerActionPolicy:
-    """Conservative browser policy for actions with external side effects.
+    """Policy for actions inside an explicitly authorized computer target.
 
-    The policy deliberately fails closed: whenever the page structure is
-    unknown, or the action's target cannot be resolved in the current frame, it
-    asks the user instead of assuming the action is harmless.
+    Missing structural metadata is not itself evidence of risk. Ordinary
+    interactions remain allowed when a relay cannot inspect their target, while
+    positively identified sensitive, high-impact, submission, capture, and
+    navigation actions retain their dedicated safeguards.
     """
 
     def __init__(
@@ -200,12 +189,6 @@ class DefaultComputerActionPolicy:
         blocked_indexes: list[int] = []
         confirmation_reasons: list[str] = []
         blocked_reasons: list[str] = []
-        structure_unknown = (
-            observation.metadata.get(ELEMENT_EXTRACTION_FAILED_KEY) is True
-        )
-        structure_incomplete = (
-            observation.metadata.get(ELEMENT_EXTRACTION_INCOMPLETE_KEY) is True
-        )
 
         for index, action in enumerate(batch.actions):
             element = find_computer_target_element(action, observation)
@@ -242,35 +225,6 @@ class DefaultComputerActionPolicy:
                     ComputerActionType.TYPE,
                     ComputerActionType.REPLACE_TEXT,
                 }
-                and element is None
-                and (
-                    structure_unknown
-                    or structure_incomplete
-                    or not observation.elements
-                )
-            ):
-                blocked_indexes.append(index)
-                blocked_reasons.append(
-                    "The input target cannot be inspected, so Xagent cannot "
-                    "verify that it is not a password, payment, or one-time-code "
-                    "field. The user must enter the text."
-                )
-                continue
-
-            if action.type not in _READ_ONLY_ACTIONS and structure_unknown:
-                confirmation_indexes.append(index)
-                confirmation_reasons.append(
-                    "The page structure could not be read, so the effect of "
-                    "this action cannot be checked in advance."
-                )
-                continue
-
-            if (
-                action.type
-                in {
-                    ComputerActionType.TYPE,
-                    ComputerActionType.REPLACE_TEXT,
-                }
                 and element is not None
                 and element.metadata.get("sensitive") is True
             ):
@@ -293,20 +247,6 @@ class DefaultComputerActionPolicy:
                 confirmation_reasons.append(
                     "Pressing Enter or Return can submit the current form."
                 )
-                continue
-
-            if action.type in _POINTED_ACTIONS and element is None:
-                confirmation_indexes.append(index)
-                if structure_incomplete:
-                    confirmation_reasons.append(
-                        "Some page surfaces could not be inspected and the "
-                        "action matches no verified control."
-                    )
-                else:
-                    confirmation_reasons.append(
-                        "The action targets a position that matches no known "
-                        "control, so what it activates cannot be verified."
-                    )
                 continue
 
             if action.type in {

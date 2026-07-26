@@ -52,6 +52,7 @@ FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENAB
 FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
+KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
 DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
@@ -1354,6 +1355,27 @@ def get_lancedb_path() -> Path:
 
     # Default: storage_root/data/lancedb
     return get_storage_root() / "data" / "lancedb"
+
+
+def get_kb_collections_timeout_seconds() -> int:
+    """Get the deadline for a single knowledge base collection listing scan.
+
+    Bounds one ``list_collections`` scan so the /api/kb/collections endpoint
+    fails fast instead of hanging a request. The default is deliberately
+    generous: the scan runs off the event loop in a worker thread, so a slow
+    deployment now genuinely hits this deadline where previously the blocking
+    scan starved the timer and always eventually succeeded. Measured cost is
+    roughly 4s for a 400k-row table, so 30s keeps ~7x headroom while still
+    bounding the request.
+
+    Priority:
+        1. XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS environment variable
+        2. Default of 30 seconds
+
+    Returns:
+        Per-scan timeout in seconds
+    """
+    return _get_positive_int_env(KB_COLLECTIONS_TIMEOUT_SECONDS, 30)
 
 
 def get_default_sqlite_db_path() -> str:

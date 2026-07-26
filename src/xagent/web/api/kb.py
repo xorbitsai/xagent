@@ -45,6 +45,7 @@ from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
+from ...config import get_kb_collections_timeout_seconds
 from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from ...core.tools.core.RAG_tools.core.parser_registry import (
@@ -4736,7 +4737,14 @@ async def list_collections_api(
     db: Session = Depends(get_db),
 ) -> ListCollectionsResult:
     """List all collections with their statistics."""
-    kb_collections_timeout_seconds = 15
+    # Per-scan deadline, not a whole-request budget: the personal scan and each
+    # team-owner scan each get this much time. It is configurable because the
+    # scans now run off the event loop (asyncio.to_thread), which made this
+    # deadline reachable for the first time - a blocking scan used to starve the
+    # timer and always eventually succeed. Known limitation: cancelling the
+    # asyncio.wait_for coroutine does not stop the underlying to_thread worker,
+    # so a timed-out scan keeps running to completion in the default executor.
+    kb_collections_timeout_seconds = get_kb_collections_timeout_seconds()
 
     try:
         result = await asyncio.wait_for(
@@ -4767,15 +4775,26 @@ async def list_collections_api(
         refs_by_owner: dict[int, list[KnowledgeBaseAccess]] = {}
         for ref in team_refs:
             refs_by_owner.setdefault(ref.storage_user_id, []).append(ref)
-        for storage_user_id, refs in refs_by_owner.items():
-            owner_result = await asyncio.wait_for(
-                list_collections(user_id=storage_user_id, is_admin=False),
-                timeout=kb_collections_timeout_seconds,
+        # Scan every distinct team-KB owner concurrently: total latency is then
+        # bounded by the slowest owner scan instead of the sum of all of them,
+        # which also collapses N sequential chances to hit the per-scan timeout.
+        owner_ids = list(refs_by_owner)
+        owner_results = await asyncio.gather(
+            *(
+                asyncio.wait_for(
+                    list_collections(user_id=storage_user_id, is_admin=False),
+                    timeout=kb_collections_timeout_seconds,
+                )
+                for storage_user_id in owner_ids
             )
+        )
+        # zip is safe: dict iteration order matches the gather order, so merge
+        # precedence for duplicate collection names is unchanged.
+        for storage_user_id, owner_result in zip(owner_ids, owner_results):
             owner_collections = {
                 collection.name: collection for collection in owner_result.collections
             }
-            for ref in refs:
+            for ref in refs_by_owner[storage_user_id]:
                 collection = owner_collections.get(ref.name)
                 if collection is None:
                     continue

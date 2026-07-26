@@ -7,6 +7,7 @@ import {
 } from "node:fs/promises"
 import { dirname, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
+import { validateRelativeModuleImports } from "./validate-module-graph.mjs"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const dist = resolve(root, "dist")
@@ -24,6 +25,7 @@ const files = await collectFiles(dist)
 if (!files.some((file) => file.name === "manifest.json")) {
   throw new Error("Extension build is missing manifest.json")
 }
+validateRelativeModuleImports(files)
 
 const archive = createStoredZip(files)
 const artifactVersion = manifest.version_name.replaceAll("+", "-")

@@ -1,4 +1,11 @@
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import {
+  cp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { resolveExtensionVersion } from "./version.mjs"
@@ -27,14 +34,15 @@ await cp(
   resolve(dist, "xagent-logo.png"),
 )
 
-for (const file of [
-  "offscreen.js",
-  "protocol.js",
-  "popup.js",
-  "service-worker.js",
-]) {
-  const contents = await readFile(resolve(emittedRoot, file))
-  await writeFile(resolve(dist, file), contents)
+// Copy the complete emitted module graph. A fixed entrypoint list is unsafe:
+// TypeScript preserves ESM imports, so a newly extracted helper module must be
+// present beside the entrypoint that imports it.
+for (const entry of await readdir(emittedRoot, { withFileTypes: true })) {
+  await cp(
+    resolve(emittedRoot, entry.name),
+    resolve(dist, entry.name),
+    { recursive: entry.isDirectory() },
+  )
 }
 await rm(emittedRoot, { recursive: true, force: true })
 console.log(

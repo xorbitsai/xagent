@@ -2,9 +2,16 @@
   "manifest_version": 3,
   "name": "Xagent Browser Relay",
   "description": "Lets Xagent control only the Chrome tab you explicitly approve.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minimum_chrome_version": "116",
-  "permissions": ["activeTab", "alarms", "debugger", "storage"],
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "debugger",
+    "offscreen",
+    "storage",
+    "tabCapture"
+  ],
   "background": {
     "service_worker": "service-worker.js",
     "type": "module"

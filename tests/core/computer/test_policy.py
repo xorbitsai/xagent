@@ -14,6 +14,7 @@ from xagent.core.computer.schema import (
     ComputerElement,
     ComputerElementSource,
     ComputerEnvironmentType,
+    ComputerMediaKind,
     ComputerObservation,
     ComputerTarget,
     NormalizedPoint,
@@ -156,6 +157,24 @@ async def test_policy_requires_confirmation_for_submission_capable_actions(
 
     assert decision.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
     assert decision.risk is ComputerRiskLevel.ELEVATED
+
+
+@pytest.mark.asyncio
+async def test_policy_requires_confirmation_for_media_capture() -> None:
+    decision = await DefaultComputerActionPolicy().evaluate(
+        _batch(
+            ComputerAction(
+                type=ComputerActionType.CAPTURE_MEDIA,
+                media_kind=ComputerMediaKind.VIDEO,
+                duration_ms=5_000,
+            )
+        ),
+        _observation(),
+    )
+
+    assert decision.outcome is ComputerPolicyOutcome.REQUIRE_CONFIRMATION
+    assert decision.risk is ComputerRiskLevel.ELEVATED
+    assert "records" in decision.reason
 
 
 @pytest.mark.asyncio

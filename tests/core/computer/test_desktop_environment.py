@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from xagent.core.computer.desktop import DesktopRelayEnvironment
+from xagent.core.computer.relay import BrowserRelayMediaChunk
 from xagent.core.computer.schema import (
     ELEMENT_EXTRACTION_INCOMPLETE_KEY,
     ComputerAction,
@@ -13,6 +16,7 @@ from xagent.core.computer.schema import (
     ComputerActionType,
     ComputerElementSource,
     ComputerEnvironmentType,
+    ComputerMediaKind,
     ComputerTarget,
 )
 from xagent.core.computer.session import ComputerSessionBinding
@@ -86,8 +90,32 @@ class FakeConnection:
         payload: dict[str, Any],
         *,
         timeout: float = 30.0,
+        on_media_chunk: Any = None,
     ) -> dict[str, Any]:
         self.calls.append((command, payload, timeout))
+        if command == "capture_media":
+            media = b"desktop-media"
+            await on_media_chunk(
+                BrowserRelayMediaChunk(
+                    type="media_chunk",
+                    protocol_version=1,
+                    request_id="request-1",
+                    transfer_id=payload["transfer_id"],
+                    chunk_index=0,
+                    data_base64=base64.b64encode(media).decode(),
+                )
+            )
+            return {
+                "artifact": {
+                    "transfer_id": payload["transfer_id"],
+                    "mime_type": "audio/mp4",
+                    "media_kind": "audio",
+                    "duration_ms": 1_000,
+                    "chunk_count": 1,
+                    "size_bytes": len(media),
+                    "sha256": hashlib.sha256(media).hexdigest(),
+                }
+            }
         return self.response
 
 
@@ -108,7 +136,9 @@ class FakeRegistry:
         self.releases.append((user_id, owner_task_id))
 
 
-def make_environment() -> tuple[DesktopRelayEnvironment, FakeRegistry]:
+def make_environment(
+    *, workspace: Any = None
+) -> tuple[DesktopRelayEnvironment, FakeRegistry]:
     registry = FakeRegistry()
     binding = ComputerSessionBinding.from_values(
         runtime_kind="desktop_relay",
@@ -119,12 +149,24 @@ def make_environment() -> tuple[DesktopRelayEnvironment, FakeRegistry]:
     )
     environment = DesktopRelayEnvironment(
         session_id="task-1",
-        workspace=object(),
+        workspace=workspace or object(),
         session_binding=binding,
         registry=registry,  # type: ignore[arg-type]
         observation_store=FakeObservationStore(),  # type: ignore[arg-type]
     )
     return environment, registry
+
+
+class FakeWorkspace:
+    def __init__(self, root: Path) -> None:
+        self.workspace_dir = root
+        self.output_dir = root / "output"
+
+    def get_file_id_from_path(self, _path: str) -> None:
+        return None
+
+    def register_file(self, _path: str) -> str:
+        return "desktop-media-file"
 
 
 @pytest.mark.asyncio
@@ -219,3 +261,34 @@ async def test_desktop_environment_rejects_emergency_stop_and_releases_claim() -
 
     await environment.close()
     assert registry.releases == [(8, "task-1")]
+
+
+@pytest.mark.asyncio
+async def test_desktop_environment_streams_media_to_a_file_ref(
+    tmp_path: Path,
+) -> None:
+    environment, registry = make_environment(workspace=FakeWorkspace(tmp_path))
+    first = await environment.observe()
+
+    await environment.execute(
+        ComputerActionBatch(
+            session_id="task-1",
+            expected_frame_id=first.frame_id,
+            actions=[
+                ComputerAction(
+                    type=ComputerActionType.CAPTURE_MEDIA,
+                    media_kind=ComputerMediaKind.AUDIO,
+                    duration_ms=1_000,
+                    output_filename="capture.m4a",
+                )
+            ],
+        )
+    )
+
+    assert [call[0] for call in registry.connection.calls] == [
+        "observe",
+        "capture_media",
+        "observe",
+    ]
+    assert environment.action_artifacts[0]["file_id"] == "desktop-media-file"
+    assert (tmp_path / "output" / "capture.m4a").read_bytes() == b"desktop-media"

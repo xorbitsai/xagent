@@ -15,6 +15,7 @@ from xagent.core.computer.relay import (
     BrowserRelayConnection,
     BrowserRelayHello,
     BrowserRelayInUseError,
+    BrowserRelayMediaChunk,
     BrowserRelayResponse,
     BrowserRelayStatusMessage,
     BrowserRelayUnavailableError,
@@ -148,17 +149,32 @@ async def test_command_and_task_claim_route_across_registry_instances(
     async def send(message: dict) -> None:
         if message["command"] == "hang":
             return
+        if message["command"] == "capture_media":
+            await connection.resolve_media_chunk(
+                BrowserRelayMediaChunk(
+                    type="media_chunk",
+                    protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+                    request_id=message["request_id"],
+                    transfer_id="transfer-1",
+                    chunk_index=0,
+                    data_base64="bWVkaWE=",
+                )
+            )
         await connection.resolve(
             BrowserRelayResponse(
                 type="response",
                 protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
                 request_id=message["request_id"],
                 success=True,
-                result={
-                    "observation": {
-                        "transient_marker": "browser-content-must-not-persist"
+                result=(
+                    {"artifact": {"chunk_count": 1}}
+                    if message["command"] == "capture_media"
+                    else {
+                        "observation": {
+                            "transient_marker": "browser-content-must-not-persist"
+                        }
                     }
-                },
+                ),
             )
         )
 
@@ -192,6 +208,18 @@ async def test_command_and_task_claim_route_across_registry_instances(
         assert result == {
             "observation": {"transient_marker": "browser-content-must-not-persist"}
         }
+        chunks: list[BrowserRelayMediaChunk] = []
+
+        async def receive_chunk(chunk: BrowserRelayMediaChunk) -> None:
+            chunks.append(chunk)
+
+        media_result = await proxy.request(
+            "capture_media",
+            {},
+            on_media_chunk=receive_chunk,
+        )
+        assert media_result == {"artifact": {"chunk_count": 1}}
+        assert [chunk.data_base64 for chunk in chunks] == ["bWVkaWE="]
         state_client = redis.Redis.from_url(
             relay_redis_url,
             decode_responses=True,

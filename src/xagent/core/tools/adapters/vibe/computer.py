@@ -107,6 +107,7 @@ class ComputerToolResult(BaseModel):
     policy_decision: ComputerPolicyDecision | None = None
     confirmation: ComputerConfirmationRequest | None = None
     interactions: list[dict[str, Any]] | None = None
+    artifacts: list[dict[str, Any]] | None = None
     message: str = ""
     error: str = ""
 
@@ -170,8 +171,8 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         Workflow:
         1. First call: request only a screenshot and omit expected_frame_id.
         2. Inspect the returned screenshot.
-        3. For click/type/scroll/keypress/drag/move/navigate, copy the returned
-           frame_id into expected_frame_id.
+        3. For click/type/scroll/keypress/drag/move/navigate/capture_media,
+           copy the returned frame_id into expected_frame_id.
         4. Every successful call automatically returns a fresh screenshot and frame_id.
 
         Coordinates are normalized: x=0/y=0 is the viewport top-left and
@@ -179,6 +180,13 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         returned them. `keys` represents one keyboard chord, e.g. ["CTRL", "A"].
         Do not request a separate screenshot after an action; the action result
         already contains the new observation.
+
+        `capture_media` records a bounded segment from a relay target. Set
+        media_kind to `audio` or `video`, duration_ms from 1000 to 30000, and
+        optionally output_filename. Video includes available target audio. The
+        result returns a registered downloadable artifact and always requires
+        user confirmation. Media capture is supported by My browser and My
+        computer relay targets, not temporary Playwright browsers.
 
         Prefer element_id over point: a click by element_id is verified to
         actually land on that element. If a click is refused because the target
@@ -232,11 +240,13 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         elif self._browser_runtime_kind is BrowserRuntimeKind.DESKTOP_RELAY:
             description += """
 
-        This task controls only the macOS window that the user explicitly
-        authorized in Xagent Desktop Relay. It cannot see or act outside that
-        window. If the relay is paused, emergency-stopped, missing Screen
-        Recording or Accessibility permission, or needs credentials, ask the
-        user to take control. Never ask the user to reveal credentials.
+        This task controls the macOS target explicitly authorized in Xagent
+        Desktop Relay. The target may be one window or an entire display. An
+        entire-display grant permits switching between applications on that
+        display; a window grant remains confined to that window. If the relay is
+        paused, emergency-stopped, missing Screen Recording or Accessibility
+        permission, or needs credentials, ask the user to take control. Never
+        ask the user to reveal credentials.
         """
         return description
 
@@ -437,6 +447,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             browser_runtime_kind=self._browser_runtime_kind,
             frame_id=observation.frame_id,
             observation=observation,
+            artifacts=environment.action_artifacts or None,
             message=message,
         ).model_dump(mode="json", exclude_none=True)
         result[CONTEXT_REFS_KEY] = [observation.screenshot.durable_dict()]

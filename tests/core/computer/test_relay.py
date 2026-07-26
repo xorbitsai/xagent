@@ -12,6 +12,7 @@ from xagent.core.computer.relay import (
     BrowserRelayError,
     BrowserRelayHello,
     BrowserRelayInUseError,
+    BrowserRelayMediaChunk,
     BrowserRelayProtocolError,
     BrowserRelayRegistry,
     BrowserRelayResponse,
@@ -145,6 +146,53 @@ async def test_connection_routes_response_to_waiting_request() -> None:
 
     assert await request == {"observation": {"title": "Example"}}
     assert sent[0]["command"] == "observe"
+
+
+@pytest.mark.asyncio
+async def test_connection_routes_ordered_media_chunks_before_response() -> None:
+    sent: list[dict] = []
+    received: list[BrowserRelayMediaChunk] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    async def receive(chunk: BrowserRelayMediaChunk) -> None:
+        received.append(chunk)
+
+    connection = BrowserRelayConnection(
+        user_id=2,
+        client_id="chrome",
+        client_name="Chrome",
+        send=send,
+    )
+    connection.attached = True
+    request = asyncio.create_task(
+        connection.request("capture_media", {}, on_media_chunk=receive)
+    )
+    await asyncio.sleep(0)
+    request_id = sent[0]["request_id"]
+    await connection.resolve_media_chunk(
+        BrowserRelayMediaChunk(
+            type="media_chunk",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            request_id=request_id,
+            transfer_id="transfer-1",
+            chunk_index=0,
+            data_base64="bWVkaWE=",
+        )
+    )
+    await connection.resolve(
+        BrowserRelayResponse(
+            type="response",
+            protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
+            request_id=request_id,
+            success=True,
+            result={"artifact": {"chunk_count": 1}},
+        )
+    )
+
+    assert await request == {"artifact": {"chunk_count": 1}}
+    assert [chunk.chunk_index for chunk in received] == [0]
 
 
 @pytest.mark.asyncio
@@ -330,16 +378,18 @@ async def test_desktop_relay_has_separate_credentials_and_target_contract() -> N
             type="status",
             protocol_version=BROWSER_RELAY_PROTOCOL_VERSION,
             attached=True,
-            window_id=9,
-            title="Document",
-            application="Editor",
+            display_id=5,
+            target_scope="display",
+            title="LG HDR 4K",
             permissions={"screen_recording": True, "accessibility": True},
         ),
     )
 
     status = await desktop_registry.status(7)
     assert status["target_kind"] == "desktop"
-    assert status["window_id"] == 9
+    assert status["window_id"] is None
+    assert status["display_id"] == 5
+    assert status["target_scope"] == "display"
     assert status["permissions"]["accessibility"] is True
 
 

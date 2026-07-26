@@ -31,6 +31,7 @@ interface DesktopRelayStatus {
   client_name?: string | null
   title?: string | null
   application?: string | null
+  target_scope?: "window" | "display" | null
   permissions?: Record<string, boolean>
   paused?: boolean
   emergency_stopped?: boolean
@@ -164,7 +165,7 @@ export function DesktopRelaySettings() {
           <div className="text-muted-foreground">
             {status.attached
               ? t("settings.desktopRelay.status.attached", {
-                  window:
+                  target:
                     [status.application, status.title].filter(Boolean).join(" — ") ||
                     status.client_name ||
                     "macOS",

@@ -31,6 +31,7 @@ class ComputerEnvironmentType(str, Enum):
 
 class ComputerActionType(str, Enum):
     SCREENSHOT = "screenshot"
+    CAPTURE_MEDIA = "capture_media"
     NAVIGATE = "navigate"
     CLICK = "click"
     DOUBLE_CLICK = "double_click"
@@ -40,6 +41,11 @@ class ComputerActionType(str, Enum):
     KEYPRESS = "keypress"
     DRAG = "drag"
     WAIT = "wait"
+
+
+class ComputerMediaKind(str, Enum):
+    AUDIO = "audio"
+    VIDEO = "video"
 
 
 class ComputerElementSource(str, Enum):
@@ -107,6 +113,8 @@ class ComputerAction(_ComputerModel):
     target: ComputerTarget | None = None
     url: str | None = None
     text: str | None = None
+    media_kind: ComputerMediaKind | None = None
+    output_filename: str | None = Field(default=None, min_length=1, max_length=255)
     keys: list[str] = Field(default_factory=list, max_length=16)
     delta_x: float = Field(default=0, ge=-1, le=1)
     delta_y: float = Field(default=0, ge=-1, le=1)
@@ -146,6 +154,19 @@ class ComputerAction(_ComputerModel):
             self.start is None or self.end is None
         ):
             raise ValueError("drag requires start and end points")
+        if self.type == ComputerActionType.CAPTURE_MEDIA:
+            if self.media_kind is None:
+                raise ValueError("capture_media requires media_kind")
+            if not 1_000 <= self.duration_ms <= 30_000:
+                raise ValueError(
+                    "capture_media duration_ms must be between 1000 and 30000"
+                )
+            if self.target is not None:
+                raise ValueError("capture_media does not accept a target")
+        elif self.media_kind is not None or self.output_filename is not None:
+            raise ValueError(
+                "media_kind and output_filename are only valid for capture_media"
+            )
         return self
 
 

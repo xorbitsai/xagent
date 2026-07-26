@@ -19,6 +19,8 @@ const SESSION = {
   attachedTabId: "attachedTabId",
 } as const
 const RECONNECT_ALARM = "browser-relay-reconnect"
+const OFFSCREEN_DOCUMENT_PATH = "offscreen.html"
+const OFFSCREEN_MESSAGE_TARGET = "xagent-media-offscreen"
 
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -30,6 +32,7 @@ let lastError: string | null = null
 let connecting = false
 let reconnectAttempt = 0
 let nextRetryAt: number | null = null
+let creatingOffscreenDocument: Promise<void> | null = null
 
 void restoreRuntimeState()
 
@@ -297,6 +300,40 @@ async function handleCommand(message: RelayCommand): Promise<void> {
       const frameId = requiredString(message.payload.frame_id, "frame_id")
       observation = await captureObservation(attachedTabId, frameId)
       lastFrameId = frameId
+    } else if (message.command === "capture_media") {
+      const expectedFrameId = requiredString(
+        message.payload.expected_frame_id,
+        "expected_frame_id",
+      )
+      if (lastFrameId !== expectedFrameId) {
+        throw new Error(
+          "The approved tab changed after the last screenshot. Request a fresh screenshot.",
+        )
+      }
+      if (!isRecord(message.payload.action)) {
+        throw new Error("Action payload is invalid.")
+      }
+      const transferId = requiredString(
+        message.payload.transfer_id,
+        "transfer_id",
+      )
+      const artifact = await captureApprovedTabMedia(
+        attachedTabId,
+        message.payload.action,
+      )
+      const manifest = await sendMediaArtifactChunks(
+        message.request_id,
+        transferId,
+        artifact,
+      )
+      send({
+        type: "response",
+        protocol_version: PROTOCOL_VERSION,
+        request_id: message.request_id,
+        success: true,
+        result: { artifact: manifest },
+      })
+      return
     } else if (message.command === "act") {
       const expectedFrameId = requiredString(
         message.payload.expected_frame_id,
@@ -359,6 +396,144 @@ async function handleCommand(message: RelayCommand): Promise<void> {
       error: errorMessage(error),
     })
   }
+}
+
+const MEDIA_CHUNK_BYTES = 256 * 1024
+
+async function sendMediaArtifactChunks(
+  requestId: string,
+  transferId: string,
+  artifact: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const dataBase64 = requiredString(artifact.data_base64, "media data")
+  const bytes = base64ToBytes(dataBase64)
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes))
+  let chunkCount = 0
+  for (let offset = 0; offset < bytes.length; offset += MEDIA_CHUNK_BYTES) {
+    await waitForSocketCapacity()
+    sendRequired({
+      type: "media_chunk",
+      protocol_version: PROTOCOL_VERSION,
+      request_id: requestId,
+      transfer_id: transferId,
+      chunk_index: chunkCount,
+      data_base64: bytesToBase64(
+        bytes.subarray(offset, offset + MEDIA_CHUNK_BYTES),
+      ),
+    })
+    chunkCount += 1
+  }
+  return {
+    transfer_id: transferId,
+    mime_type: requiredString(artifact.mime_type, "mime_type"),
+    media_kind: requiredString(artifact.media_kind, "media_kind"),
+    duration_ms: artifact.duration_ms,
+    chunk_count: chunkCount,
+    size_bytes: bytes.length,
+    sha256: bytesToHex(new Uint8Array(digest)),
+  }
+}
+
+async function waitForSocketCapacity(): Promise<void> {
+  while (
+    socket?.readyState === WebSocket.OPEN &&
+    socket.bufferedAmount > 1024 * 1024
+  ) {
+    await delay(10)
+  }
+  if (socket?.readyState !== WebSocket.OPEN) {
+    throw new Error("The Xagent relay disconnected during media transfer.")
+  }
+}
+
+function sendRequired(message: Record<string, unknown>): void {
+  if (socket?.readyState !== WebSocket.OPEN) {
+    throw new Error("The Xagent relay is not connected.")
+  }
+  socket.send(JSON.stringify(message))
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return bytes
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const parts: string[] = []
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    parts.push(
+      String.fromCharCode(...bytes.subarray(offset, offset + 0x8000)),
+    )
+  }
+  return btoa(parts.join(""))
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join(
+    "",
+  )
+}
+
+async function captureApprovedTabMedia(
+  tabId: number,
+  action: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (requiredString(action.type, "action type") !== "capture_media") {
+    throw new Error("Media capture requires a capture_media action.")
+  }
+  const mediaKind = requiredString(action.media_kind, "media_kind")
+  if (mediaKind !== "audio" && mediaKind !== "video") {
+    throw new Error("media_kind must be audio or video.")
+  }
+  const durationMs = clampInteger(
+    action.duration_ms,
+    1_000,
+    30_000,
+    10_000,
+  )
+  await ensureOffscreenDocument()
+  const streamId = await chrome.tabCapture.getMediaStreamId({
+    targetTabId: tabId,
+  })
+  const response: unknown = await chrome.runtime.sendMessage({
+    target: OFFSCREEN_MESSAGE_TARGET,
+    type: "capture_media",
+    streamId,
+    mediaKind,
+    durationMs,
+  })
+  if (!isRecord(response) || response.success !== true) {
+    const error =
+      isRecord(response) && typeof response.error === "string"
+        ? response.error
+        : "The browser media recorder did not return a result."
+    throw new Error(error)
+  }
+  if (!isRecord(response.artifact)) {
+    throw new Error("The browser media recorder returned an invalid artifact.")
+  }
+  return response.artifact
+}
+
+async function ensureOffscreenDocument(): Promise<void> {
+  if (await chrome.offscreen.hasDocument()) return
+  if (creatingOffscreenDocument === null) {
+    creatingOffscreenDocument = chrome.offscreen
+      .createDocument({
+        url: OFFSCREEN_DOCUMENT_PATH,
+        reasons: [chrome.offscreen.Reason.USER_MEDIA],
+        justification:
+          "Record bounded audio or video from the user-approved browser tab.",
+      })
+      .finally(() => {
+        creatingOffscreenDocument = null
+      })
+  }
+  await creatingOffscreenDocument
 }
 
 async function attachActiveTab(): Promise<void> {

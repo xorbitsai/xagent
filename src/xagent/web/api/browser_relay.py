@@ -21,6 +21,7 @@ from ...core.computer.relay import (
     BrowserRelayAuthenticationError,
     BrowserRelayConnection,
     BrowserRelayHello,
+    BrowserRelayMediaChunk,
     BrowserRelayPing,
     BrowserRelayProtocolError,
     BrowserRelayResponse,
@@ -137,6 +138,10 @@ async def browser_relay_websocket(websocket: WebSocket) -> None:
             message_type = message.get("type")
             if message_type == "response":
                 await connection.resolve(BrowserRelayResponse.model_validate(message))
+            elif message_type == "media_chunk":
+                await connection.resolve_media_chunk(
+                    BrowserRelayMediaChunk.model_validate(message)
+                )
             elif message_type == "status":
                 status = BrowserRelayStatusMessage.model_validate(message)
                 _require_protocol_version(status.protocol_version)

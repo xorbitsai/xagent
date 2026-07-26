@@ -11,11 +11,33 @@ struct WindowChoice: Sendable {
   let frame: CGRect
 }
 
+struct DisplayChoice: Sendable {
+  let displayID: CGDirectDisplayID
+  let name: String
+  let frame: CGRect
+}
+
 private struct AuthorizedWindow {
   let windowID: CGWindowID
   let processID: pid_t
   let application: String
   let title: String
+}
+
+private struct AuthorizedDisplay {
+  let displayID: CGDirectDisplayID
+  let name: String
+}
+
+private struct ResolvedCaptureTarget {
+  let filter: SCContentFilter
+  let frame: CGRect
+  let window: SCWindow?
+  let display: SCDisplay?
+  let processID: pid_t?
+  let title: String?
+  let application: String?
+  let scope: String
 }
 
 struct VisualStabilityDetector {
@@ -64,11 +86,12 @@ actor DesktopController {
   private static let visualSettleInterval = Duration.milliseconds(200)
   private static let visualSettleMaximumSamples = 8
 
-  private var authorized: AuthorizedWindow?
+  private var authorizedWindow: AuthorizedWindow?
+  private var authorizedDisplay: AuthorizedDisplay?
   private var paused = false
   private var emergencyStopped = false
   private var lastFrameID: String?
-  private var lastWindowFrame: CGRect?
+  private var lastTargetFrame: CGRect?
   private var lastElements: [String: AXUIElement] = [:]
   private var sensitiveElementIDs: Set<String> = []
 
@@ -111,30 +134,60 @@ actor DesktopController {
     }
   }
 
+  static func availableDisplays() async throws -> [DisplayChoice] {
+    let content = try await SCShareableContent.excludingDesktopWindows(
+      false,
+      onScreenWindowsOnly: true
+    )
+    return content.displays.map { display in
+      DisplayChoice(
+        displayID: display.displayID,
+        name: displayName(display.displayID),
+        frame: display.frame
+      )
+    }.sorted { $0.displayID < $1.displayID }
+  }
+
   func authorize(windowID: CGWindowID) async throws {
     let window = try await currentShareableWindow(windowID: windowID)
     guard let application = window.owningApplication else {
       throw RelayFailure.windowUnavailable("selected window has no owning application")
     }
-    authorized = AuthorizedWindow(
+    authorizedWindow = AuthorizedWindow(
       windowID: window.windowID,
       processID: application.processID,
       application: application.applicationName,
       title: window.title ?? "Untitled"
     )
+    authorizedDisplay = nil
+    resetTargetState()
+  }
+
+  func authorize(displayID: CGDirectDisplayID) async throws {
+    let display = try await currentShareableDisplay(displayID: displayID)
+    authorizedDisplay = AuthorizedDisplay(
+      displayID: display.displayID,
+      name: Self.displayName(display.displayID)
+    )
+    authorizedWindow = nil
+    resetTargetState()
+  }
+
+  private func resetTargetState() {
     paused = false
     emergencyStopped = false
     lastFrameID = nil
-    lastWindowFrame = nil
+    lastTargetFrame = nil
     lastElements.removeAll()
     sensitiveElementIDs.removeAll()
   }
 
   func togglePause() {
-    guard authorized != nil, !emergencyStopped else { return }
+    guard authorizedWindow != nil || authorizedDisplay != nil, !emergencyStopped
+    else { return }
     paused.toggle()
     lastFrameID = nil
-    lastWindowFrame = nil
+    lastTargetFrame = nil
     lastElements.removeAll()
     sensitiveElementIDs.removeAll()
   }
@@ -142,19 +195,22 @@ actor DesktopController {
   func emergencyStop() {
     emergencyStopped = true
     paused = true
-    authorized = nil
+    authorizedWindow = nil
+    authorizedDisplay = nil
     lastFrameID = nil
-    lastWindowFrame = nil
+    lastTargetFrame = nil
     lastElements.removeAll()
     sensitiveElementIDs.removeAll()
   }
 
   func status() async -> DesktopWindowStatus {
     let permissions = Self.permissionStatus()
-    guard let authorized else {
+    guard authorizedWindow != nil || authorizedDisplay != nil else {
       return DesktopWindowStatus(
         attached: false,
         windowID: nil,
+        displayID: nil,
+        targetScope: nil,
         title: nil,
         application: nil,
         bounds: nil,
@@ -163,13 +219,15 @@ actor DesktopController {
         emergencyStopped: emergencyStopped
       )
     }
-    let window = try? await validateAuthorizedWindow()
+    let target = try? await resolveCaptureTarget()
     return DesktopWindowStatus(
-      attached: window != nil,
-      windowID: authorized.windowID,
-      title: authorized.title,
-      application: authorized.application,
-      bounds: window.map {
+      attached: target != nil,
+      windowID: target?.window?.windowID,
+      displayID: target?.display?.displayID,
+      targetScope: target?.scope,
+      title: target?.title,
+      application: target?.application,
+      bounds: target.map {
         WindowBounds(
           x: $0.frame.origin.x,
           y: $0.frame.origin.y,
@@ -183,7 +241,10 @@ actor DesktopController {
     )
   }
 
-  func handle(_ command: RelayCommand) async throws -> [String: JSONValue] {
+  func handle(
+    _ command: RelayCommand,
+    sendMediaChunk: @escaping RelayMediaChunkSender = { _, _, _ in }
+  ) async throws -> [String: JSONValue] {
     switch command.command {
     case "observe":
       let frameID = try requiredString(command.payload["frame_id"], "frame_id")
@@ -198,7 +259,7 @@ actor DesktopController {
       )
       guard expected == lastFrameID else {
         throw RelayFailure.invalidAction(
-          "the authorized window changed after the last screenshot; request a fresh screenshot"
+          "the authorized desktop target changed after the last screenshot; request a fresh screenshot"
         )
       }
       let frameID = try requiredString(command.payload["frame_id"], "frame_id")
@@ -211,11 +272,86 @@ actor DesktopController {
       }
       let observation = try await observe(frameID: frameID)
       return ["observation": try jsonValue(observation)]
+    case "capture_media":
+      guard !emergencyStopped else { throw RelayFailure.emergencyStopped }
+      guard !paused else { throw RelayFailure.paused }
+      let expected = try requiredString(
+        command.payload["expected_frame_id"],
+        "expected_frame_id"
+      )
+      guard expected == lastFrameID else {
+        throw RelayFailure.invalidAction(
+          "the authorized desktop target changed after the last screenshot; request a fresh screenshot"
+        )
+      }
+      guard let action = command.payload["action"]?.objectValue else {
+        throw RelayFailure.invalidAction("action must be an object")
+      }
+      let transferID = try requiredString(
+        command.payload["transfer_id"],
+        "transfer_id"
+      )
+      let artifact = try await captureMedia(
+        action,
+        transferID: transferID,
+        sendMediaChunk: sendMediaChunk
+      )
+      return ["artifact": try jsonValue(artifact)]
     default:
       throw RelayFailure.invalidMessage(
         "unsupported desktop relay command \(command.command)"
       )
     }
+  }
+
+  private func captureMedia(
+    _ action: [String: JSONValue],
+    transferID: String,
+    sendMediaChunk: @escaping RelayMediaChunkSender
+  ) async throws -> MediaArtifactPayload {
+    guard Self.permissionStatus()["screen_recording"] == true else {
+      throw RelayFailure.permission(
+        "Screen Recording permission is required in System Settings"
+      )
+    }
+    guard try requiredString(action["type"], "action type") == "capture_media"
+    else {
+      throw RelayFailure.invalidAction(
+        "media capture requires a capture_media action"
+      )
+    }
+    let rawKind = try requiredString(action["media_kind"], "media_kind")
+    guard let mediaKind = DesktopMediaKind(rawValue: rawKind) else {
+      throw RelayFailure.invalidAction("media_kind must be audio or video")
+    }
+    let duration = max(
+      1_000,
+      min(30_000, Int(action["duration_ms"]?.numberValue ?? 10_000))
+    )
+    let target = try await resolveCaptureTarget()
+    guard Self.sameFrame(target.frame, lastTargetFrame) else {
+      throw RelayFailure.invalidAction(
+        "the authorized desktop target changed after the last screenshot; request a fresh screenshot"
+      )
+    }
+    let source: DesktopCaptureSource
+    if let window = target.window {
+      source = .window(window.windowID)
+    } else if let display = target.display {
+      source = .display(display.displayID)
+    } else {
+      throw RelayFailure.windowUnavailable(
+        "the authorized desktop target is unavailable"
+      )
+    }
+    return try await DesktopMediaRecorder.capture(
+      source: source,
+      frame: target.frame,
+      mediaKind: mediaKind,
+      durationMilliseconds: duration,
+      transferID: transferID,
+      sendMediaChunk: sendMediaChunk
+    )
   }
 
   private func observe(frameID: String) async throws -> ObservationPayload {
@@ -226,16 +362,15 @@ actor DesktopController {
         "Screen Recording permission is required in System Settings"
       )
     }
-    let window = try await validateAuthorizedWindow()
-    let scale = Self.backingScale(for: window.frame)
+    let target = try await resolveCaptureTarget()
+    let scale = Self.backingScale(for: target.frame)
     let configuration = SCStreamConfiguration()
-    configuration.width = max(1, Int(window.frame.width * scale))
-    configuration.height = max(1, Int(window.frame.height * scale))
+    configuration.width = max(1, Int(target.frame.width * scale))
+    configuration.height = max(1, Int(target.frame.height * scale))
     configuration.showsCursor = true
-    configuration.ignoreShadowsSingleWindow = true
-    let filter = SCContentFilter(desktopIndependentWindow: window)
+    configuration.ignoreShadowsSingleWindow = target.scope == "window"
     let image = try await SCScreenshotManager.captureImage(
-      contentFilter: filter,
+      contentFilter: target.filter,
       configuration: configuration
     )
     let representation = NSBitmapImageRep(cgImage: image)
@@ -243,29 +378,40 @@ actor DesktopController {
       throw RelayFailure.invalidMessage("could not encode desktop screenshot")
     }
 
-    let extraction = Self.extractElements(
-      processID: authorized?.processID,
-      window: window,
-      accessibilityAllowed: permissions["accessibility"] == true
-    )
+    let extraction: AXExtraction
+    if target.scope == "window", let window = target.window {
+      extraction = Self.extractElements(
+        processID: target.processID,
+        rootWindowFrame: window.frame,
+        viewportFrame: target.frame,
+        accessibilityAllowed: permissions["accessibility"] == true
+      )
+    } else {
+      extraction = Self.extractFocusedElements(
+        within: target.frame,
+        accessibilityAllowed: permissions["accessibility"] == true
+      )
+    }
     lastElements = extraction.handles
     sensitiveElementIDs = extraction.sensitiveIDs
     lastFrameID = frameID
-    lastWindowFrame = window.frame
+    lastTargetFrame = target.frame
     return ObservationPayload(
       screenshotBase64: png.base64EncodedString(),
       viewport: ViewportPayload(
-        width: max(1, Int(window.frame.width)),
-        height: max(1, Int(window.frame.height)),
+        width: max(1, Int(target.frame.width)),
+        height: max(1, Int(target.frame.height)),
         devicePixelRatio: scale
       ),
       elements: extraction.elements,
       elementsTruncated: extraction.truncated,
       elementExtractionFailed: extraction.failed,
       elementExtractionIncomplete: extraction.incomplete,
-      windowID: window.windowID,
-      title: authorized?.title,
-      application: authorized?.application,
+      windowID: target.window?.windowID,
+      displayID: target.display?.displayID,
+      targetScope: target.scope,
+      title: target.title,
+      application: target.application,
       paused: paused,
       emergencyStopped: emergencyStopped
     )
@@ -288,18 +434,18 @@ actor DesktopController {
       return false
     }
 
-    let window = try await validateAuthorizedWindow()
-    guard Self.sameFrame(window.frame, lastWindowFrame) else {
+    let captureTarget = try await resolveCaptureTarget()
+    guard Self.sameFrame(captureTarget.frame, lastTargetFrame) else {
       throw RelayFailure.invalidAction(
-        "the authorized window moved or resized after the last screenshot; request a fresh screenshot"
+        "the authorized desktop target changed after the last screenshot; request a fresh screenshot"
       )
     }
     let target = try action["target"]?.objectValue.map(ComputerPoint.init(json:))
     let targetID = action["target_element_id"]?.stringValue
-    let point = target.map { Self.globalPoint($0, in: window.frame) }
+    let point = target.map { Self.globalPoint($0, in: captureTarget.frame) }
 
     if let point {
-      try verifyHit(targetID: targetID, at: point, window: window)
+      try verifyHit(targetID: targetID, at: point, target: captureTarget)
     }
     switch type {
     case "click", "double_click":
@@ -323,12 +469,12 @@ actor DesktopController {
       if let point {
         Self.click(at: point, count: 1)
       } else {
-        try verifyAuthorizedWindowIsFocused(window: window)
+        try verifyAuthorizedTargetIsFocused(target: captureTarget)
       }
       try Self.typeText(action["text"]?.stringValue ?? "")
       return true
     case "keypress":
-      try verifyAuthorizedWindowIsFocused(window: window)
+      try verifyAuthorizedTargetIsFocused(target: captureTarget)
       let keys =
         action["keys"].flatMap { value -> [String]? in
           guard case .array(let items) = value else { return nil }
@@ -342,15 +488,15 @@ actor DesktopController {
       let scrollPoint =
         point
         ?? CGPoint(
-          x: window.frame.midX,
-          y: window.frame.midY
+          x: captureTarget.frame.midX,
+          y: captureTarget.frame.midY
         )
       if point == nil {
-        try verifyHit(targetID: nil, at: scrollPoint, window: window)
+        try verifyHit(targetID: nil, at: scrollPoint, target: captureTarget)
       }
       Self.scroll(
-        x: deltaX * window.frame.width,
-        y: deltaY * window.frame.height,
+        x: deltaX * captureTarget.frame.width,
+        y: deltaY * captureTarget.frame.height,
         at: scrollPoint
       )
       return true
@@ -361,14 +507,20 @@ actor DesktopController {
       else {
         throw RelayFailure.invalidAction("drag requires start and end")
       }
-      let start = Self.globalPoint(try ComputerPoint(json: startJSON), in: window.frame)
-      let end = Self.globalPoint(try ComputerPoint(json: endJSON), in: window.frame)
-      try verifyHit(targetID: nil, at: start, window: window)
-      try verifyHit(targetID: nil, at: end, window: window)
+      let start = Self.globalPoint(
+        try ComputerPoint(json: startJSON),
+        in: captureTarget.frame
+      )
+      let end = Self.globalPoint(
+        try ComputerPoint(json: endJSON),
+        in: captureTarget.frame
+      )
+      try verifyHit(targetID: nil, at: start, target: captureTarget)
+      try verifyHit(targetID: nil, at: end, target: captureTarget)
       try verifyHit(
         targetID: nil,
         at: CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2),
-        window: window
+        target: captureTarget
       )
       let duration = max(0, min(30_000, Int(action["duration_ms"]?.numberValue ?? 250)))
       try await Self.drag(from: start, to: end, durationMilliseconds: duration)
@@ -384,8 +536,8 @@ actor DesktopController {
 
     for index in 0..<Self.visualSettleMaximumSamples {
       do {
-        let window = try await validateAuthorizedWindow()
-        let sample = try await captureVisualSample(window: window)
+        let target = try await resolveCaptureTarget()
+        let sample = try await captureVisualSample(target: target)
         if detector.observe(sample) {
           return
         }
@@ -403,15 +555,16 @@ actor DesktopController {
     }
   }
 
-  private func captureVisualSample(window: SCWindow) async throws -> [UInt8] {
+  private func captureVisualSample(
+    target: ResolvedCaptureTarget
+  ) async throws -> [UInt8] {
     let configuration = SCStreamConfiguration()
     configuration.width = Self.visualSampleSize
     configuration.height = Self.visualSampleSize
     configuration.showsCursor = false
-    configuration.ignoreShadowsSingleWindow = true
-    let filter = SCContentFilter(desktopIndependentWindow: window)
+    configuration.ignoreShadowsSingleWindow = target.scope == "window"
     let image = try await SCScreenshotManager.captureImage(
-      contentFilter: filter,
+      contentFilter: target.filter,
       configuration: configuration
     )
 
@@ -448,7 +601,7 @@ actor DesktopController {
     }
     guard rendered else {
       throw RelayFailure.invalidMessage(
-        "could not sample the authorized desktop window"
+        "could not sample the authorized desktop target"
       )
     }
     return pixels
@@ -457,28 +610,22 @@ actor DesktopController {
   private func verifyHit(
     targetID: String?,
     at point: CGPoint,
-    window: SCWindow
+    target: ResolvedCaptureTarget
   ) throws {
-    guard let authorized else {
+    guard authorizedWindow != nil || authorizedDisplay != nil else {
       throw RelayFailure.invalidAction(
-        "desktop window authorization is unavailable"
+        "desktop target authorization is unavailable"
+      )
+    }
+    guard target.frame.contains(point) else {
+      throw RelayFailure.invalidAction(
+        "the target point is outside the authorized desktop target"
       )
     }
     let expected = targetID.flatMap { lastElements[$0] }
     if targetID != nil, expected == nil {
       throw RelayFailure.invalidAction(
         "target identity is unavailable; request a fresh screenshot"
-      )
-    }
-    let application = AXUIElementCreateApplication(authorized.processID)
-    guard
-      let selectedWindow = Self.matchingAXWindow(
-        application: application,
-        frame: window.frame
-      )
-    else {
-      throw RelayFailure.invalidAction(
-        "could not verify the authorized desktop window"
       )
     }
     let system = AXUIElementCreateSystemWide()
@@ -495,70 +642,135 @@ actor DesktopController {
       throw RelayFailure.invalidAction("could not verify the desktop target")
     }
     var processID: pid_t = 0
-    guard
-      AXUIElementGetPid(candidate, &processID) == .success,
-      processID == authorized.processID
-    else {
-      throw RelayFailure.invalidAction(
-        "another application covers the authorized desktop window"
-      )
+    guard AXUIElementGetPid(candidate, &processID) == .success else {
+      throw RelayFailure.invalidAction("could not identify the desktop target")
     }
     var foundExpected = expected == nil
-    var foundWindow = false
+    var foundAuthorizedRoot = target.scope == "display"
+    let selectedWindow: AXUIElement?
+    if let authorizedWindow, let window = target.window {
+      guard processID == authorizedWindow.processID else {
+        throw RelayFailure.invalidAction(
+          "another application covers the authorized desktop window"
+        )
+      }
+      selectedWindow = Self.matchingAXWindow(
+        application: AXUIElementCreateApplication(authorizedWindow.processID),
+        frame: window.frame
+      )
+      guard selectedWindow != nil else {
+        throw RelayFailure.invalidAction(
+          "could not verify the authorized desktop window"
+        )
+      }
+    } else {
+      selectedWindow = nil
+    }
     for _ in 0..<32 {
       if let expected, CFEqual(candidate, expected) {
         foundExpected = true
       }
-      if CFEqual(candidate, selectedWindow) {
-        foundWindow = true
+      if let selectedWindow, CFEqual(candidate, selectedWindow) {
+        foundAuthorizedRoot = true
         break
       }
       guard let parent = Self.axElement(candidate, kAXParentAttribute) else { break }
       candidate = parent
     }
-    if foundExpected, foundWindow { return }
+    if foundExpected, foundAuthorizedRoot { return }
     throw RelayFailure.invalidAction(
       "the selected desktop control is covered or changed; request a fresh screenshot"
     )
   }
 
-  private func verifyAuthorizedWindowIsFocused(window: SCWindow) throws {
-    guard let authorized else {
+  private func verifyAuthorizedTargetIsFocused(
+    target: ResolvedCaptureTarget
+  ) throws {
+    guard authorizedWindow != nil || authorizedDisplay != nil else {
       throw RelayFailure.invalidAction(
-        "desktop window authorization is unavailable"
+        "desktop target authorization is unavailable"
       )
     }
-    let application = AXUIElementCreateApplication(authorized.processID)
+    if let authorizedWindow, let window = target.window {
+      let application = AXUIElementCreateApplication(authorizedWindow.processID)
+      guard
+        let selectedWindow = Self.matchingAXWindow(
+          application: application,
+          frame: window.frame
+        ),
+        let focusedWindow = Self.axElement(
+          application,
+          kAXFocusedWindowAttribute
+        ),
+        CFEqual(selectedWindow, focusedWindow)
+      else {
+        throw RelayFailure.invalidAction(
+          "the authorized desktop window is not focused; request a fresh screenshot and click it before sending keyboard input"
+        )
+      }
+      return
+    }
     guard
-      let selectedWindow = Self.matchingAXWindow(
-        application: application,
-        frame: window.frame
-      ),
-      let focusedWindow = Self.axElement(
-        application,
-        kAXFocusedWindowAttribute
-      ),
-      CFEqual(selectedWindow, focusedWindow)
+      let focused = Self.focusedApplicationWindow(),
+      focused.frame.intersects(target.frame)
     else {
       throw RelayFailure.invalidAction(
-        "the authorized desktop window is not focused; request a fresh screenshot and click it before sending keyboard input"
+        "no focused application window is visible in the authorized display"
       )
     }
   }
 
   private func validateAuthorizedWindow() async throws -> SCWindow {
-    guard let authorized else {
+    guard let authorizedWindow else {
       throw RelayFailure.windowUnavailable(
         "no desktop window is authorized; select one in Desktop Relay"
       )
     }
-    let window = try await currentShareableWindow(windowID: authorized.windowID)
-    guard window.owningApplication?.processID == authorized.processID else {
+    let window = try await currentShareableWindow(
+      windowID: authorizedWindow.windowID
+    )
+    guard
+      window.owningApplication?.processID == authorizedWindow.processID
+    else {
       throw RelayFailure.windowUnavailable(
         "the authorized window was closed or replaced"
       )
     }
     return window
+  }
+
+  private func resolveCaptureTarget() async throws -> ResolvedCaptureTarget {
+    if let authorizedWindow {
+      let window = try await validateAuthorizedWindow()
+      return ResolvedCaptureTarget(
+        filter: SCContentFilter(desktopIndependentWindow: window),
+        frame: window.frame,
+        window: window,
+        display: nil,
+        processID: authorizedWindow.processID,
+        title: authorizedWindow.title,
+        application: authorizedWindow.application,
+        scope: "window"
+      )
+    }
+    if let authorizedDisplay {
+      let display = try await currentShareableDisplay(
+        displayID: authorizedDisplay.displayID
+      )
+      return ResolvedCaptureTarget(
+        filter: SCContentFilter(display: display, excludingWindows: []),
+        frame: display.frame,
+        window: nil,
+        display: display,
+        processID: nil,
+        title: authorizedDisplay.name,
+        application: "Entire display",
+        scope: "display"
+      )
+    }
+    throw RelayFailure.windowUnavailable(
+      "no desktop target is authorized; select a display or window in Desktop Relay"
+    )
   }
 
   private func currentShareableWindow(windowID: CGWindowID) async throws -> SCWindow {
@@ -570,6 +782,25 @@ actor DesktopController {
       throw RelayFailure.windowUnavailable("the selected window is no longer available")
     }
     return window
+  }
+
+  private func currentShareableDisplay(
+    displayID: CGDirectDisplayID
+  ) async throws -> SCDisplay {
+    let content = try await SCShareableContent.excludingDesktopWindows(
+      false,
+      onScreenWindowsOnly: true
+    )
+    guard
+      let display = content.displays.first(where: {
+        $0.displayID == displayID
+      })
+    else {
+      throw RelayFailure.windowUnavailable(
+        "the selected display is no longer available"
+      )
+    }
+    return display
   }
 
   private static func permissionStatus() -> [String: Bool] {
@@ -596,6 +827,21 @@ actor DesktopController {
       }
     }
     return 1
+  }
+
+  private static func displayName(_ displayID: CGDirectDisplayID) -> String {
+    for screen in NSScreen.screens {
+      guard
+        let number = screen.deviceDescription[
+          NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber,
+        number.uint32Value == displayID
+      else {
+        continue
+      }
+      return screen.localizedName
+    }
+    return "Display \(displayID)"
   }
 
   private static func globalPoint(_ point: ComputerPoint, in frame: CGRect) -> CGPoint {
@@ -761,7 +1007,8 @@ extension DesktopController {
 
   fileprivate static func extractElements(
     processID: pid_t?,
-    window: SCWindow,
+    rootWindowFrame: CGRect,
+    viewportFrame: CGRect,
     accessibilityAllowed: Bool
   ) -> AXExtraction {
     guard accessibilityAllowed, let processID else {
@@ -775,7 +1022,12 @@ extension DesktopController {
       )
     }
     let application = AXUIElementCreateApplication(processID)
-    guard let root = matchingAXWindow(application: application, frame: window.frame) else {
+    guard
+      let root = matchingAXWindow(
+        application: application,
+        frame: rootWindowFrame
+      )
+    else {
       return AXExtraction(
         elements: [],
         handles: [:],
@@ -804,7 +1056,7 @@ extension DesktopController {
       let role = axString(element, kAXRoleAttribute)
       if let role, actionable.contains(role),
         let frame = axFrame(element),
-        let normalized = normalizedBounds(frame, within: window.frame)
+        let normalized = normalizedBounds(frame, within: viewportFrame)
       {
         let elementID = "ax-\(elements.count + 1)"
         let subrole = axString(element, kAXSubroleAttribute)
@@ -850,6 +1102,52 @@ extension DesktopController {
       failed: false,
       incomplete: truncated
     )
+  }
+
+  fileprivate static func extractFocusedElements(
+    within displayFrame: CGRect,
+    accessibilityAllowed: Bool
+  ) -> AXExtraction {
+    guard accessibilityAllowed, let focused = focusedApplicationWindow(),
+      focused.frame.intersects(displayFrame)
+    else {
+      return AXExtraction(
+        elements: [],
+        handles: [:],
+        sensitiveIDs: [],
+        truncated: false,
+        failed: !accessibilityAllowed,
+        incomplete: true
+      )
+    }
+    return extractElements(
+      processID: focused.processID,
+      rootWindowFrame: focused.frame,
+      viewportFrame: displayFrame,
+      accessibilityAllowed: true
+    )
+  }
+
+  fileprivate static func focusedApplicationWindow() -> (
+    processID: pid_t,
+    frame: CGRect
+  )? {
+    let system = AXUIElementCreateSystemWide()
+    guard
+      let application = axElement(
+        system,
+        kAXFocusedApplicationAttribute
+      ),
+      let window = axElement(application, kAXFocusedWindowAttribute),
+      let frame = axFrame(window)
+    else {
+      return nil
+    }
+    var processID: pid_t = 0
+    guard AXUIElementGetPid(application, &processID) == .success else {
+      return nil
+    }
+    return (processID, frame)
   }
 
   fileprivate static func matchingAXWindow(

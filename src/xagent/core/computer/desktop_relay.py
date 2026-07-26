@@ -1,4 +1,4 @@
-"""Dedicated relay registry for user-authorized desktop windows.
+"""Dedicated relay registry for user-authorized desktop targets.
 
 The transport primitives are shared with the browser relay, but credentials,
 connections, and task claims live in a separate namespace so a user may keep a

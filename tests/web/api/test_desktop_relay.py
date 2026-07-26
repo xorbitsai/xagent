@@ -54,6 +54,7 @@ def test_desktop_pairing_status_and_reconnect_flow(
                 "protocol_version": 1,
                 "attached": True,
                 "window_id": 7,
+                "target_scope": "window",
                 "title": "Signed in",
                 "application": "Example",
                 "bounds": {
@@ -77,6 +78,9 @@ def test_desktop_pairing_status_and_reconnect_flow(
         assert status["connected"] is True
         assert status["attached"] is True
         assert status["application"] == "Example"
+        assert status["window_id"] == 7
+        assert status["display_id"] is None
+        assert status["target_scope"] == "window"
         assert status["permissions"]["screen_recording"] is True
         assert status["paused"] is True
 

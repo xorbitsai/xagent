@@ -368,14 +368,14 @@ const zh = {
     },
     desktopRelay: {
       title: "桌面 Computer Relay",
-      description: "连接 macOS companion，并明确授权一个桌面窗口供 Agent 操作。",
+      description: "连接 macOS companion，并授权单个窗口或整个显示器供 Agent 操作。",
       status: {
         connected: "Desktop Relay 已连接",
         disconnected: "Desktop Relay 未连接",
-        attached: "已授权窗口：{window}",
-        notAttached: "当前没有已授权桌面窗口",
+        attached: "已授权目标：{target}",
+        notAttached: "当前没有已授权桌面目标",
         paused: "Desktop Relay 已暂停。在 Mac 上按 Command-Option-P 可继续。",
-        emergencyStopped: "紧急停止已清除窗口授权。请重启 Desktop Relay 并重新选择窗口。",
+        emergencyStopped: "紧急停止已清除桌面授权。请重启 Desktop Relay 并重新选择目标。",
       },
       permissions: {
         screen: "屏幕录制",
@@ -388,7 +388,7 @@ const zh = {
       steps: {
         build: "使用 Swift 从 desktop-relay 构建 macOS companion。",
         pair: "生成下方的一次性配置，首次使用 --setup-file 启动；后续启动不再需要配对文件。",
-        authorize: "授予 macOS 权限，并明确选择 Xagent 唯一可以操作的窗口。",
+        authorize: "授予 macOS 权限，然后选择单个窗口或整个显示器。",
       },
       expires: "有效期至 {time}",
       createPairing: "生成桌面配对",

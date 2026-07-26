@@ -12,7 +12,7 @@ export interface RelayCommand {
   type: "command"
   protocol_version: number
   request_id: string
-  command: "observe" | "act"
+  command: "observe" | "act" | "capture_media"
   payload: Record<string, unknown>
 }
 

@@ -8,6 +8,7 @@ from xagent.core.computer.schema import (
     ComputerActionBatch,
     ComputerActionType,
     ComputerEnvironmentType,
+    ComputerMediaKind,
     ComputerObservation,
     ComputerTarget,
     NormalizedPoint,
@@ -68,6 +69,25 @@ def test_action_batch_uses_normalized_target_and_expected_frame() -> None:
 
     assert batch.actions[0].target is not None
     assert batch.actions[0].target.point == NormalizedPoint(x=0.25, y=0.75)
+
+
+def test_capture_media_requires_kind_and_bounded_duration() -> None:
+    action = ComputerAction(
+        type=ComputerActionType.CAPTURE_MEDIA,
+        media_kind=ComputerMediaKind.VIDEO,
+        duration_ms=30_000,
+        output_filename="demo.mp4",
+    )
+
+    assert action.media_kind is ComputerMediaKind.VIDEO
+    with pytest.raises(ValidationError, match="media_kind"):
+        ComputerAction(type=ComputerActionType.CAPTURE_MEDIA, duration_ms=1_000)
+    with pytest.raises(ValidationError, match="less than or equal to 30000"):
+        ComputerAction(
+            type=ComputerActionType.CAPTURE_MEDIA,
+            media_kind=ComputerMediaKind.AUDIO,
+            duration_ms=30_001,
+        )
 
 
 def test_observation_requires_matching_screenshot_frame() -> None:

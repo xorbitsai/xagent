@@ -65,7 +65,8 @@ private final class RelaySessionDelegate: NSObject, URLSessionTaskDelegate,
 }
 
 actor RelayClient {
-  typealias CommandHandler = @Sendable (RelayCommand) async throws -> [String: JSONValue]
+  typealias CommandHandler =
+    @Sendable (RelayCommand, @escaping RelayMediaChunkSender) async throws -> [String: JSONValue]
   typealias StatusProvider = @Sendable () async -> DesktopWindowStatus
   typealias PairingCompleted = @Sendable () throws -> Void
 
@@ -288,7 +289,24 @@ actor RelayClient {
       return
     }
     do {
-      let result = try await commandHandler(command)
+      let result = try await commandHandler(
+        command,
+        { [self] transferID, chunkIndex, data in
+          guard !data.isEmpty, data.count <= 256 * 1024 else {
+            throw RelayFailure.invalidMessage(
+              "desktop relay produced an invalid media chunk size"
+            )
+          }
+          try await send(
+            RelayMediaChunk(
+              requestID: command.requestID,
+              transferID: transferID,
+              chunkIndex: chunkIndex,
+              dataBase64: data.base64EncodedString()
+            )
+          )
+        }
+      )
       try await send(
         RelayResponse(
           requestID: command.requestID,
@@ -298,7 +316,7 @@ actor RelayClient {
         )
       )
     } catch {
-      // Send current permissions, pause, emergency-stop, and window state
+      // Send current permissions, pause, emergency-stop, and target state
       // before the failure response so the server can checkpoint a recoverable
       // target interruption instead of treating it as an ordinary tool error.
       try? await send(await statusProvider())

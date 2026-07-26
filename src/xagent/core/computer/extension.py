@@ -10,6 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .media_store import MediaArtifactStore, RelayMediaArtifact
 from .policy import (
     find_computer_target_element,
     navigation_block_reason,
@@ -82,6 +83,7 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         session_binding: ComputerSessionBinding,
         registry: BrowserRelayRegistryProtocol | None = None,
         observation_store: ObservationStore | None = None,
+        media_store: MediaArtifactStore | None = None,
         navigation_allowlist: Sequence[str] | None = None,
         navigation_denylist: Sequence[str] | None = None,
         **_kwargs: Any,
@@ -95,6 +97,7 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
         self.owner_task_id = session_binding.require_owner_task_id()
         self.registry = registry or get_browser_relay_registry()
         self.observation_store = observation_store or ObservationStore(workspace)
+        self.media_store = media_store
         self.navigation_allowlist = normalize_host_patterns(navigation_allowlist)
         self.navigation_denylist = normalize_host_patterns(navigation_denylist)
 
@@ -129,6 +132,39 @@ class ExtensionComputerEnvironment(ComputerEnvironment):
 
         frame_id = self._new_frame_id()
         connection = await self._connection()
+        if action.type is ComputerActionType.CAPTURE_MEDIA:
+            media_store = self.media_store or MediaArtifactStore(self.workspace)
+            if action.media_kind is None:
+                raise ValueError("capture_media requires media_kind")
+            transfer = media_store.begin(
+                media_kind=action.media_kind,
+                output_filename=action.output_filename,
+            )
+            try:
+                media_result = await connection.request(
+                    "capture_media",
+                    {
+                        "expected_frame_id": batch.expected_frame_id,
+                        "transfer_id": transfer.transfer_id,
+                        "action": self._serialize_action(action),
+                    },
+                    timeout=max(30.0, (action.duration_ms / 1_000) + 10.0),
+                    on_media_chunk=transfer.accept,
+                )
+                artifact = RelayMediaArtifact.model_validate(
+                    media_result.get("artifact", media_result)
+                )
+                self.record_action_artifacts([transfer.finish(artifact)])
+            except Exception:
+                transfer.abort()
+                raise
+            result = await connection.request(
+                "observe",
+                {"frame_id": frame_id},
+            )
+            observation = self._build_observation(result, frame_id=frame_id)
+            self._assert_navigation_allowed(observation.active_url or "")
+            return observation
         result = await connection.request(
             "act",
             {

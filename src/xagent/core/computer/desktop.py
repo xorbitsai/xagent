@@ -12,6 +12,7 @@ from .desktop_relay import (
     get_desktop_relay_registry,
 )
 from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .media_store import MediaArtifactStore, RelayMediaArtifact
 from .relay import (
     BROWSER_RELAY_MAX_MESSAGE_BYTES,
     BrowserRelayCommandConnection,
@@ -65,7 +66,9 @@ class _DesktopRelayObservation(BaseModel):
     # Old or minimal companions cannot prove that every native control was
     # enumerated. Defaulting to incomplete keeps coordinate actions fail-closed.
     element_extraction_incomplete: bool = True
-    window_id: int = Field(ge=0)
+    window_id: int | None = Field(default=None, ge=0)
+    display_id: int | None = Field(default=None, ge=0)
+    target_scope: str = Field(default="window", pattern=r"^(window|display)$")
     title: str | None = Field(default=None, max_length=500)
     application: str | None = Field(default=None, max_length=500)
     paused: bool = False
@@ -73,7 +76,7 @@ class _DesktopRelayObservation(BaseModel):
 
 
 class DesktopRelayEnvironment(ComputerEnvironment):
-    """Computer environment backed by one user-authorized desktop window."""
+    """Computer environment backed by a user-authorized window or display."""
 
     def __init__(
         self,
@@ -83,6 +86,7 @@ class DesktopRelayEnvironment(ComputerEnvironment):
         session_binding: ComputerSessionBinding,
         registry: DesktopRelayRegistryProtocol | None = None,
         observation_store: ObservationStore | None = None,
+        media_store: MediaArtifactStore | None = None,
         **_kwargs: Any,
     ) -> None:
         super().__init__(session_id)
@@ -94,6 +98,7 @@ class DesktopRelayEnvironment(ComputerEnvironment):
         self.owner_task_id = session_binding.require_owner_task_id()
         self.registry = registry or get_desktop_relay_registry()
         self.observation_store = observation_store or ObservationStore(workspace)
+        self.media_store = media_store
 
     async def close(self) -> None:
         await self.registry.release(
@@ -127,7 +132,39 @@ class DesktopRelayEnvironment(ComputerEnvironment):
             )
 
         frame_id = self._new_frame_id()
-        result = await (await self._connection()).request(
+        connection = await self._connection()
+        if action.type is ComputerActionType.CAPTURE_MEDIA:
+            media_store = self.media_store or MediaArtifactStore(self.workspace)
+            if action.media_kind is None:
+                raise ValueError("capture_media requires media_kind")
+            transfer = media_store.begin(
+                media_kind=action.media_kind,
+                output_filename=action.output_filename,
+            )
+            try:
+                media_result = await connection.request(
+                    "capture_media",
+                    {
+                        "expected_frame_id": batch.expected_frame_id,
+                        "transfer_id": transfer.transfer_id,
+                        "action": self._serialize_action(action),
+                    },
+                    timeout=max(30.0, (action.duration_ms / 1_000) + 10.0),
+                    on_media_chunk=transfer.accept,
+                )
+                artifact = RelayMediaArtifact.model_validate(
+                    media_result.get("artifact", media_result)
+                )
+                self.record_action_artifacts([transfer.finish(artifact)])
+            except Exception:
+                transfer.abort()
+                raise
+            result = await connection.request(
+                "observe",
+                {"frame_id": frame_id},
+            )
+            return self._build_observation(result, frame_id=frame_id)
+        result = await connection.request(
             "act",
             {
                 "expected_frame_id": batch.expected_frame_id,
@@ -192,7 +229,7 @@ class DesktopRelayEnvironment(ComputerEnvironment):
         if parsed.emergency_stopped:
             raise BrowserRelayUnavailableError(
                 "Desktop Relay emergency stop is active. Re-authorize a window "
-                "in Desktop Relay, then continue this task."
+                "or display in Desktop Relay, then continue this task."
             )
         try:
             image_bytes = base64.b64decode(
@@ -209,16 +246,20 @@ class DesktopRelayEnvironment(ComputerEnvironment):
             image_bytes=image_bytes,
             mime_type="image/png",
             viewport=parsed.viewport,
-            text_fallback="Current user-authorized desktop window screenshot.",
+            text_fallback="Current user-authorized desktop target screenshot.",
             metadata={
                 "computer_runtime_kind": BrowserRuntimeKind.DESKTOP_RELAY.value,
                 "window_id": parsed.window_id,
+                "display_id": parsed.display_id,
+                "target_scope": parsed.target_scope,
             },
         )
         metadata: dict[str, Any] = {
             "computer_runtime_kind": BrowserRuntimeKind.DESKTOP_RELAY.value,
             "user_takeover_available": True,
             "window_id": parsed.window_id,
+            "display_id": parsed.display_id,
+            "target_scope": parsed.target_scope,
             "application": parsed.application,
             "paused": parsed.paused,
         }

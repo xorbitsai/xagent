@@ -18,6 +18,7 @@ BROWSER_RELAY_DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 
 RelaySend = Callable[[dict[str, Any]], Awaitable[None]]
 RelayClose = Callable[[int, str], Awaitable[None]]
+RelayMediaChunkHandler = Callable[["BrowserRelayMediaChunk"], Awaitable[None]]
 
 
 class BrowserRelayError(RuntimeError):
@@ -72,6 +73,23 @@ class BrowserRelayResponse(BaseModel):
     error: str = Field(default="", max_length=2_000)
 
 
+class BrowserRelayMediaChunk(BaseModel):
+    """One bounded, ordered chunk from a relay media transfer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["media_chunk"]
+    protocol_version: int
+    request_id: str = Field(min_length=1, max_length=128)
+    transfer_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    chunk_index: int = Field(ge=0, le=1_000)
+    data_base64: str = Field(min_length=1, max_length=400_000)
+
+
 class BrowserRelayStatusMessage(BaseModel):
     """Extension-reported user authorization and tab state."""
 
@@ -95,7 +113,7 @@ class DesktopWindowBounds(BaseModel):
 
 
 class DesktopRelayStatusMessage(BaseModel):
-    """Desktop companion permission, pause, and authorized-window state."""
+    """Desktop companion permission, pause, and authorized-target state."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -103,6 +121,8 @@ class DesktopRelayStatusMessage(BaseModel):
     protocol_version: int
     attached: bool
     window_id: int | None = Field(default=None, ge=0)
+    display_id: int | None = Field(default=None, ge=0)
+    target_scope: Literal["window", "display"] | None = None
     title: str | None = Field(default=None, max_length=500)
     application: str | None = Field(default=None, max_length=500)
     bounds: DesktopWindowBounds | None = None
@@ -198,7 +218,7 @@ def build_computer_target_readiness(
                     code="emergency_stopped",
                     message=(
                         "Desktop Relay emergency stop is active. Re-authorize a "
-                        "window in Desktop Relay, then continue this task."
+                        "window or display in Desktop Relay, then continue this task."
                     ),
                 )
             )
@@ -237,8 +257,8 @@ def build_computer_target_readiness(
                 ComputerReadinessIssue(
                     code="not_attached",
                     message=(
-                        "No desktop window is authorized. Choose a window in "
-                        "Desktop Relay, then continue this task."
+                        "No desktop target is authorized. Choose a window or display "
+                        "in Desktop Relay, then continue this task."
                     ),
                 )
             )
@@ -338,7 +358,13 @@ class BrowserRelayConnection:
         self._close_transport = close_transport
         self.authorization_id = authorization_id
         self.target_kind = target_kind
-        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._pending: dict[
+            str,
+            tuple[
+                asyncio.Future[dict[str, Any]],
+                RelayMediaChunkHandler | None,
+            ],
+        ] = {}
         self._pending_lock = asyncio.Lock()
         self._closed = False
         self.attached = False
@@ -346,6 +372,8 @@ class BrowserRelayConnection:
         self.title: str | None = None
         self.url: str | None = None
         self.window_id: int | None = None
+        self.display_id: int | None = None
+        self.target_scope: str | None = None
         self.application: str | None = None
         self.bounds: dict[str, float] | None = None
         self.permissions: dict[str, bool] = {}
@@ -369,6 +397,8 @@ class BrowserRelayConnection:
             self.url = status.url if status.attached else None
             return
         self.window_id = status.window_id if status.attached else None
+        self.display_id = status.display_id if status.attached else None
+        self.target_scope = status.target_scope if status.attached else None
         self.application = status.application if status.attached else None
         self.bounds = status.bounds.model_dump(mode="json") if status.bounds else None
         self.permissions = dict(status.permissions)
@@ -381,6 +411,7 @@ class BrowserRelayConnection:
         payload: dict[str, Any],
         *,
         timeout: float = BROWSER_RELAY_DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        on_media_chunk: RelayMediaChunkHandler | None = None,
     ) -> dict[str, Any]:
         require_computer_target_ready(
             self.public_status(),
@@ -389,7 +420,7 @@ class BrowserRelayConnection:
         request_id = secrets.token_urlsafe(18)
         future = asyncio.get_running_loop().create_future()
         async with self._pending_lock:
-            self._pending[request_id] = future
+            self._pending[request_id] = (future, on_media_chunk)
         try:
             try:
                 await self._send(
@@ -418,8 +449,11 @@ class BrowserRelayConnection:
         if response.protocol_version != BROWSER_RELAY_PROTOCOL_VERSION:
             raise BrowserRelayProtocolError("Browser relay protocol version mismatch.")
         async with self._pending_lock:
-            future = self._pending.get(response.request_id)
-        if future is None or future.done():
+            pending = self._pending.get(response.request_id)
+        if pending is None:
+            return
+        future, _ = pending
+        if future.done():
             return
         if response.success:
             future.set_result(response.result or {})
@@ -439,6 +473,28 @@ class BrowserRelayConnection:
                 )
             )
 
+    async def resolve_media_chunk(self, chunk: BrowserRelayMediaChunk) -> None:
+        if chunk.protocol_version != BROWSER_RELAY_PROTOCOL_VERSION:
+            raise BrowserRelayProtocolError("Browser relay protocol version mismatch.")
+        async with self._pending_lock:
+            pending = self._pending.get(chunk.request_id)
+        if pending is None:
+            return
+        future, handler = pending
+        if future.done():
+            return
+        if handler is None:
+            future.set_exception(
+                BrowserRelayProtocolError(
+                    f"{self._peer_name} sent media for a non-media request."
+                )
+            )
+            return
+        try:
+            await handler(chunk)
+        except Exception as exc:
+            future.set_exception(exc)
+
     async def close(
         self,
         *,
@@ -450,7 +506,7 @@ class BrowserRelayConnection:
         resolved_reason = reason or f"{self._peer_name} disconnected."
         self._closed = True
         async with self._pending_lock:
-            pending = list(self._pending.values())
+            pending = [future for future, _ in self._pending.values()]
             self._pending.clear()
         for future in pending:
             if not future.done():
@@ -472,6 +528,8 @@ class BrowserRelayConnection:
             "title": self.title,
             "url": self.url,
             "window_id": self.window_id,
+            "display_id": self.display_id,
+            "target_scope": self.target_scope,
             "application": self.application,
             "bounds": self.bounds,
             "permissions": dict(self.permissions),
@@ -490,6 +548,7 @@ class BrowserRelayCommandConnection(Protocol):
         payload: dict[str, Any],
         *,
         timeout: float = BROWSER_RELAY_DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        on_media_chunk: RelayMediaChunkHandler | None = None,
     ) -> dict[str, Any]: ...
 
 

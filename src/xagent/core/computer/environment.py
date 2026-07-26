@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from .schema import ComputerActionBatch, ComputerObservation
 
@@ -25,10 +26,18 @@ class ComputerEnvironment(ABC):
             raise ValueError("session_id must not be empty")
         self.session_id = session_id
         self._current_observation: ComputerObservation | None = None
+        self._action_artifacts: list[dict[str, Any]] = []
 
     @property
     def current_observation(self) -> ComputerObservation | None:
         return self._current_observation
+
+    @property
+    def action_artifacts(self) -> list[dict[str, Any]]:
+        return list(self._action_artifacts)
+
+    def record_action_artifacts(self, artifacts: list[dict[str, Any]]) -> None:
+        self._action_artifacts = list(artifacts)
 
     def record_observation(self, observation: ComputerObservation) -> None:
         if observation.session_id != self.session_id:
@@ -71,6 +80,7 @@ class ComputerEnvironment(ABC):
 
     async def observe(self) -> ComputerObservation:
         """Capture and record the current environment state."""
+        self._action_artifacts = []
         observation = await self._observe()
         self.record_observation(observation)
         return observation
@@ -78,6 +88,7 @@ class ComputerEnvironment(ABC):
     async def execute(self, batch: ComputerActionBatch) -> ComputerObservation:
         """Validate and execute actions, then return a new observation."""
         self.validate_action_batch(batch)
+        self._action_artifacts = []
         observation = await self._execute(batch)
         self.record_observation(observation)
         return observation

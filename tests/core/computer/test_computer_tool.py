@@ -317,7 +317,8 @@ def test_computer_tool_selects_desktop_relay_environment() -> None:
     )
 
     assert tool._environment_factory is DesktopRelayEnvironment
-    assert "authorized in Xagent Desktop Relay" in tool.description
+    assert "target explicitly authorized in Xagent" in tool.description
+    assert "one window or an entire display" in tool.description
 
 
 def _button(

@@ -25,11 +25,13 @@ from .relay import (
     BrowserRelayError,
     BrowserRelayHello,
     BrowserRelayInUseError,
+    BrowserRelayMediaChunk,
     BrowserRelayPairing,
     BrowserRelayProtocolError,
     BrowserRelayStatusMessage,
     BrowserRelayUnavailableError,
     DesktopRelayStatusMessage,
+    RelayMediaChunkHandler,
     RelayStatusMessage,
     require_computer_target_ready,
 )
@@ -233,6 +235,7 @@ class _RedisRelayCommandConnection(BrowserRelayCommandConnection):
         payload: dict[str, Any],
         *,
         timeout: float = BROWSER_RELAY_DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        on_media_chunk: RelayMediaChunkHandler | None = None,
     ) -> dict[str, Any]:
         return await self._registry.request(
             user_id=self._user_id,
@@ -241,6 +244,7 @@ class _RedisRelayCommandConnection(BrowserRelayCommandConnection):
             command=command,
             payload=payload,
             timeout=timeout,
+            on_media_chunk=on_media_chunk,
         )
 
 
@@ -605,6 +609,8 @@ class RedisBrowserRelayRegistry:
                 "title",
                 "url",
                 "window_id",
+                "display_id",
+                "target_scope",
                 "application",
                 "bounds",
                 "permissions",
@@ -641,12 +647,13 @@ class RedisBrowserRelayRegistry:
         command: str,
         payload: dict[str, Any],
         timeout: float,
+        on_media_chunk: RelayMediaChunkHandler | None = None,
     ) -> dict[str, Any]:
         request_id = secrets.token_urlsafe(18)
         response_channel = self._response_channel(request_id)
         command_channel = self._command_channel(connection_id)
         response_pubsub = self._redis.pubsub()
-        raw_response: str | None = None
+        decoded_response: dict[str, Any] | None = None
         command_data = self._dump_json(
             {
                 "kind": "command",
@@ -675,8 +682,8 @@ class RedisBrowserRelayRegistry:
             if publish_result == 2:
                 if self._target_kind == "desktop":
                     raise BrowserRelayUnavailableError(
-                        "No desktop window is authorized. Ask the user to open "
-                        "Xagent Desktop Relay and choose one window."
+                        "No desktop target is authorized. Ask the user to open "
+                        "Xagent Desktop Relay and choose a window or display."
                     )
                 raise BrowserRelayUnavailableError(
                     "No browser tab is attached. Ask the user to open the Xagent "
@@ -702,7 +709,7 @@ class RedisBrowserRelayRegistry:
                     "screenshot before continuing."
                 )
             deadline = asyncio.get_running_loop().time() + timeout
-            while raw_response is None:
+            while decoded_response is None:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     break
@@ -711,7 +718,17 @@ class RedisBrowserRelayRegistry:
                     timeout=min(1.0, remaining),
                 )
                 if message is not None and isinstance(message.get("data"), str):
-                    raw_response = message["data"]
+                    decoded = self._load_json(message["data"])
+                    if decoded.get("kind") == "media_chunk":
+                        if on_media_chunk is None:
+                            raise BrowserRelayProtocolError(
+                                "Browser relay sent media for a non-media request."
+                            )
+                        await on_media_chunk(
+                            BrowserRelayMediaChunk.model_validate(decoded.get("chunk"))
+                        )
+                        continue
+                    decoded_response = decoded
         finally:
             try:
                 await response_pubsub.unsubscribe(response_channel)
@@ -722,7 +739,7 @@ class RedisBrowserRelayRegistry:
                 )
             finally:
                 await response_pubsub.aclose()
-        if raw_response is None:
+        if decoded_response is None:
             peer = (
                 "Desktop Relay"
                 if self._target_kind == "desktop"
@@ -731,16 +748,17 @@ class RedisBrowserRelayRegistry:
             raise BrowserRelayUnavailableError(
                 f"{peer} did not answer {command!r} in time."
             )
-        decoded = self._load_json(raw_response)
-        if decoded.get("success") is True:
-            result = decoded.get("result")
+        if decoded_response.get("success") is True:
+            result = decoded_response.get("result")
             if not isinstance(result, dict):
                 raise BrowserRelayProtocolError(
                     "Browser relay response result must be an object."
                 )
             return result
-        error = str(decoded.get("error") or "Browser extension command failed.")
-        if decoded.get("error_type") == "unavailable":
+        error = str(
+            decoded_response.get("error") or "Browser extension command failed."
+        )
+        if decoded_response.get("error_type") == "unavailable":
             raise BrowserRelayUnavailableError(error)
         raise BrowserRelayError(error)
 
@@ -803,10 +821,24 @@ class RedisBrowserRelayRegistry:
                     "Distributed browser command payload must be an object."
                 )
             timeout = float(message.get("timeout") or 30.0)
+
+            async def forward_media_chunk(chunk: BrowserRelayMediaChunk) -> None:
+                await self._redis.publish(
+                    response_channel,
+                    self._dump_json(
+                        {
+                            "kind": "media_chunk",
+                            "request_id": request_id,
+                            "chunk": chunk.model_dump(mode="json"),
+                        }
+                    ),
+                )
+
             result = await state.connection.request(
                 command,
                 payload,
                 timeout=max(0.1, min(timeout, 120.0)),
+                on_media_chunk=forward_media_chunk,
             )
             response = {
                 "request_id": request_id,

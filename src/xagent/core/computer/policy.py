@@ -209,6 +209,14 @@ class DefaultComputerActionPolicy:
         for index, action in enumerate(batch.actions):
             element = find_computer_target_element(action, observation)
 
+            if action.type is ComputerActionType.CAPTURE_MEDIA:
+                confirmation_indexes.append(index)
+                confirmation_reasons.append(
+                    "Capturing audio or video records content from the authorized "
+                    "computer target and creates a downloadable file."
+                )
+                continue
+
             if action.type is ComputerActionType.NAVIGATE:
                 blocked_reason = self._blocked_navigation_reason(action.url or "")
                 if blocked_reason is not None:

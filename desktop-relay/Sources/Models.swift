@@ -86,6 +86,27 @@ struct RelayCommand: Codable, Sendable {
   }
 }
 
+typealias RelayMediaChunkSender =
+  @Sendable (_ transferID: String, _ chunkIndex: Int, _ data: Data) async throws -> Void
+
+struct RelayMediaChunk: Codable, Sendable {
+  let type = "media_chunk"
+  let protocolVersion = relayProtocolVersion
+  let requestID: String
+  let transferID: String
+  let chunkIndex: Int
+  let dataBase64: String
+
+  enum CodingKeys: String, CodingKey {
+    case type
+    case protocolVersion = "protocol_version"
+    case requestID = "request_id"
+    case transferID = "transfer_id"
+    case chunkIndex = "chunk_index"
+    case dataBase64 = "data_base64"
+  }
+}
+
 struct RelayReady: Codable, Sendable {
   let type: String
   let protocolVersion: Int
@@ -110,6 +131,8 @@ struct DesktopWindowStatus: Codable, Sendable {
   let protocolVersion = relayProtocolVersion
   let attached: Bool
   let windowID: UInt32?
+  let displayID: UInt32?
+  let targetScope: String?
   let title: String?
   let application: String?
   let bounds: WindowBounds?
@@ -122,6 +145,8 @@ struct DesktopWindowStatus: Codable, Sendable {
     case protocolVersion = "protocol_version"
     case attached
     case windowID = "window_id"
+    case displayID = "display_id"
+    case targetScope = "target_scope"
     case title
     case application
     case bounds
@@ -182,7 +207,9 @@ struct ObservationPayload: Codable, Sendable {
   let elementsTruncated: Bool
   let elementExtractionFailed: Bool
   let elementExtractionIncomplete: Bool
-  let windowID: UInt32
+  let windowID: UInt32?
+  let displayID: UInt32?
+  let targetScope: String
   let title: String?
   let application: String?
   let paused: Bool
@@ -196,6 +223,8 @@ struct ObservationPayload: Codable, Sendable {
     case elementExtractionFailed = "element_extraction_failed"
     case elementExtractionIncomplete = "element_extraction_incomplete"
     case windowID = "window_id"
+    case displayID = "display_id"
+    case targetScope = "target_scope"
     case title
     case application
     case paused
@@ -241,7 +270,7 @@ enum RelayFailure: LocalizedError, Sendable {
     case .paused:
       "Desktop Relay is paused by the user."
     case .emergencyStopped:
-      "Desktop Relay emergency stop is active. Re-authorize a window to continue."
+      "Desktop Relay emergency stop is active. Re-authorize a window or display to continue."
     }
   }
 }

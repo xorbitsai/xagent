@@ -5,6 +5,7 @@ import Foundation
 struct CommandLineOptions {
   let setup: PairingSetup
   let windowID: CGWindowID?
+  let displayID: CGDirectDisplayID?
   let configurationStore: DesktopRelayConfigurationStore
   let setupFileURL: URL?
   let shouldPersistConfiguration: Bool
@@ -16,6 +17,7 @@ struct CommandLineOptions {
     var setupJSON: String?
     var setupFile: String?
     var windowID: CGWindowID?
+    var displayID: CGDirectDisplayID?
     var index = 1
     while index < arguments.count {
       switch arguments[index] {
@@ -42,6 +44,17 @@ struct CommandLineOptions {
           )
         }
         windowID = parsed
+      case "--display-id":
+        index += 1
+        guard
+          index < arguments.count,
+          let parsed = CGDirectDisplayID(arguments[index])
+        else {
+          throw RelayFailure.invalidSetup(
+            "--display-id requires an unsigned integer"
+          )
+        }
+        displayID = parsed
       case "--help", "-h":
         printUsage()
         Foundation.exit(EXIT_SUCCESS)
@@ -55,6 +68,11 @@ struct CommandLineOptions {
     guard setupJSON == nil || setupFile == nil else {
       throw RelayFailure.invalidSetup(
         "provide at most one of --setup or --setup-file"
+      )
+    }
+    guard windowID == nil || displayID == nil else {
+      throw RelayFailure.invalidSetup(
+        "provide at most one of --window-id or --display-id"
       )
     }
     let setup: PairingSetup
@@ -81,6 +99,7 @@ struct CommandLineOptions {
     return Self(
       setup: setup,
       windowID: windowID,
+      displayID: displayID,
       configurationStore: configurationStore,
       setupFileURL: setupFileURL,
       shouldPersistConfiguration: shouldPersistConfiguration
@@ -122,7 +141,7 @@ private final class RelayApplication {
       Desktop Relay is running.
         Pause/resume: Command-Option-P
         Emergency stop: Command-Option-Escape
-      Leave this process running while Xagent uses the authorized window.
+      Leave this process running while Xagent uses the authorized desktop target.
       """
     )
     Task.detached(priority: .userInitiated) { [client] in
@@ -167,7 +186,7 @@ private final class RelayApplication {
   private func stopImmediately() async {
     await controller.emergencyStop()
     print(
-      "Desktop Relay emergency stop activated; the window authorization was cleared."
+      "Desktop Relay emergency stop activated; the desktop target authorization was cleared."
     )
     await client.sendCurrentStatus()
     await client.stop()
@@ -204,17 +223,25 @@ private enum DesktopRelayMain {
       }
 
       let windows = try await DesktopController.availableWindows()
-      guard !windows.isEmpty else {
+      let displays = try await DesktopController.availableDisplays()
+      guard !windows.isEmpty || !displays.isEmpty else {
         throw RelayFailure.windowUnavailable(
-          "no shareable windows are available"
+          "no shareable displays or windows are available"
         )
       }
-      let selectedID = try selectWindow(
-        windows,
-        requestedWindowID: options.windowID
+      let selectedTarget = try selectTarget(
+        windows: windows,
+        displays: displays,
+        requestedWindowID: options.windowID,
+        requestedDisplayID: options.displayID
       )
       let controller = DesktopController()
-      try await controller.authorize(windowID: selectedID)
+      switch selectedTarget {
+      case .window(let windowID):
+        try await controller.authorize(windowID: windowID)
+      case .display(let displayID):
+        try await controller.authorize(displayID: displayID)
+      }
       let pairingCompleted: RelayClient.PairingCompleted?
       if options.shouldPersistConfiguration {
         let configurationStore = options.configurationStore
@@ -234,8 +261,11 @@ private enum DesktopRelayMain {
       let client = try RelayClient(
         setup: options.setup,
         pairingCompleted: pairingCompleted,
-        commandHandler: { command in
-          try await controller.handle(command)
+        commandHandler: { command, sendMediaChunk in
+          try await controller.handle(
+            command,
+            sendMediaChunk: sendMediaChunk
+          )
         },
         statusProvider: {
           await controller.status()
@@ -248,6 +278,54 @@ private enum DesktopRelayMain {
       )
       printUsage()
       Foundation.exit(EXIT_FAILURE)
+    }
+  }
+
+  private enum SelectedDesktopTarget {
+    case window(CGWindowID)
+    case display(CGDirectDisplayID)
+  }
+
+  private static func selectTarget(
+    windows: [WindowChoice],
+    displays: [DisplayChoice],
+    requestedWindowID: CGWindowID?,
+    requestedDisplayID: CGDirectDisplayID?
+  ) throws -> SelectedDesktopTarget {
+    if let requestedWindowID {
+      return .window(
+        try selectWindow(
+          windows,
+          requestedWindowID: requestedWindowID
+        )
+      )
+    }
+    if let requestedDisplayID {
+      return .display(
+        try selectDisplay(
+          displays,
+          requestedDisplayID: requestedDisplayID
+        )
+      )
+    }
+    print("Choose what Xagent may observe and control:")
+    print("  1. Entire display (switch between apps and windows)")
+    print("  2. One window only")
+    print("Authorization scope: ", terminator: "")
+    guard let input = readLine(), let selection = Int(input) else {
+      throw RelayFailure.invalidSetup("invalid authorization scope")
+    }
+    switch selection {
+    case 1:
+      return .display(
+        try selectDisplay(displays, requestedDisplayID: nil)
+      )
+    case 2:
+      return .window(
+        try selectWindow(windows, requestedWindowID: nil)
+      )
+    default:
+      throw RelayFailure.invalidSetup("invalid authorization scope")
     }
   }
 
@@ -344,6 +422,15 @@ private enum DesktopRelayMain {
         "no-argument launch did not use stored relay configuration"
       )
     }
+    let displayOptions = try CommandLineOptions.parse(
+      ["xagent-desktop-relay", "--display-id", "5"],
+      configurationStore: configurationStore
+    )
+    guard displayOptions.displayID == 5, displayOptions.windowID == nil else {
+      throw RelayFailure.invalidSetup(
+        "display authorization argument did not parse"
+      )
+    }
     let managedPairingURL = configurationStore.directoryURL
       .appendingPathComponent("pairing.json", isDirectory: false)
     try Data("one-time".utf8).write(to: managedPairingURL)
@@ -383,15 +470,52 @@ private enum DesktopRelayMain {
     }
     return windows[selection - 1].windowID
   }
+
+  private static func selectDisplay(
+    _ displays: [DisplayChoice],
+    requestedDisplayID: CGDirectDisplayID?
+  ) throws -> CGDirectDisplayID {
+    if let requestedDisplayID {
+      guard displays.contains(where: { $0.displayID == requestedDisplayID })
+      else {
+        throw RelayFailure.windowUnavailable(
+          "display \(requestedDisplayID) is not currently shareable"
+        )
+      }
+      return requestedDisplayID
+    }
+    guard !displays.isEmpty else {
+      throw RelayFailure.windowUnavailable(
+        "no shareable displays are available"
+      )
+    }
+    print("Select the display Xagent may observe and control:")
+    for (index, display) in displays.enumerated() {
+      print(
+        "  \(index + 1). \(display.name) — "
+          + "\(Int(display.frame.width))×\(Int(display.frame.height)) "
+          + "[\(display.displayID)]"
+      )
+    }
+    print("Display number: ", terminator: "")
+    guard
+      let input = readLine(),
+      let selection = Int(input),
+      displays.indices.contains(selection - 1)
+    else {
+      throw RelayFailure.invalidSetup("invalid display selection")
+    }
+    return displays[selection - 1].displayID
+  }
 }
 
 private func printUsage() {
   print(
     """
     Usage:
-      xagent-desktop-relay [--window-id ID]
-      xagent-desktop-relay --setup '<pairing-json>' [--window-id ID]
-      xagent-desktop-relay --setup-file PATH [--window-id ID]
+      xagent-desktop-relay [--window-id ID | --display-id ID]
+      xagent-desktop-relay --setup '<pairing-json>' [--window-id ID | --display-id ID]
+      xagent-desktop-relay --setup-file PATH [--window-id ID | --display-id ID]
       xagent-desktop-relay --self-test
 
     Create the one-time pairing JSON in Xagent Settings > Computer Use.
@@ -399,7 +523,8 @@ private func printUsage() {
     $XAGENT_STORAGE_ROOT/desktop-relay (default: ~/.xagent/desktop-relay)
     and later launches need no setup argument. Session credentials stay in
     macOS Keychain.
-    Without --window-id, the relay asks you to explicitly select one window.
+    Without a target ID, the relay asks whether to authorize one entire display
+    or one specific window.
     """
   )
 }

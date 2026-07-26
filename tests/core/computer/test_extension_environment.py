@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from xagent.core.computer.extension import ExtensionComputerEnvironment
+from xagent.core.computer.relay import BrowserRelayMediaChunk
 from xagent.core.computer.schema import (
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
+    ComputerMediaKind,
     ComputerTarget,
 )
 from xagent.core.computer.session import ComputerSessionBinding
@@ -74,8 +78,32 @@ class FakeConnection:
         payload: dict[str, Any],
         *,
         timeout: float = 30.0,
+        on_media_chunk: Any = None,
     ) -> dict[str, Any]:
         self.calls.append((command, payload, timeout))
+        if command == "capture_media":
+            media = b"browser-media"
+            await on_media_chunk(
+                BrowserRelayMediaChunk(
+                    type="media_chunk",
+                    protocol_version=1,
+                    request_id="request-1",
+                    transfer_id=payload["transfer_id"],
+                    chunk_index=0,
+                    data_base64=base64.b64encode(media).decode(),
+                )
+            )
+            return {
+                "artifact": {
+                    "transfer_id": payload["transfer_id"],
+                    "mime_type": "video/webm",
+                    "media_kind": "video",
+                    "duration_ms": 1_000,
+                    "chunk_count": 1,
+                    "size_bytes": len(media),
+                    "sha256": hashlib.sha256(media).hexdigest(),
+                }
+            }
         return relay_observation()
 
 
@@ -99,6 +127,7 @@ class FakeRegistry:
 def make_environment(
     *,
     navigation_allowlist: list[str] | None = None,
+    workspace: Any = None,
 ) -> tuple[ExtensionComputerEnvironment, FakeRegistry]:
     registry = FakeRegistry()
     binding = ComputerSessionBinding.from_values(
@@ -110,13 +139,25 @@ def make_environment(
     )
     environment = ExtensionComputerEnvironment(
         session_id="task-1",
-        workspace=object(),
+        workspace=workspace or object(),
         session_binding=binding,
         registry=registry,  # type: ignore[arg-type]
         observation_store=FakeObservationStore(),  # type: ignore[arg-type]
         navigation_allowlist=navigation_allowlist,
     )
     return environment, registry
+
+
+class FakeWorkspace:
+    def __init__(self, root: Path) -> None:
+        self.workspace_dir = root
+        self.output_dir = root / "output"
+
+    def get_file_id_from_path(self, _path: str) -> None:
+        return None
+
+    def register_file(self, _path: str) -> str:
+        return "browser-media-file"
 
 
 @pytest.mark.asyncio
@@ -194,3 +235,37 @@ async def test_extension_environment_releases_task_claim() -> None:
     await environment.close()
 
     assert registry.releases == [(8, "task-1")]
+
+
+@pytest.mark.asyncio
+async def test_extension_environment_streams_media_to_a_file_ref(
+    tmp_path: Path,
+) -> None:
+    environment, registry = make_environment(workspace=FakeWorkspace(tmp_path))
+    first = await environment.observe()
+
+    await environment.execute(
+        ComputerActionBatch(
+            session_id="task-1",
+            expected_frame_id=first.frame_id,
+            actions=[
+                ComputerAction(
+                    type=ComputerActionType.CAPTURE_MEDIA,
+                    media_kind=ComputerMediaKind.VIDEO,
+                    duration_ms=1_000,
+                    output_filename="capture.webm",
+                )
+            ],
+        )
+    )
+
+    assert [call[0] for call in registry.connection.calls] == [
+        "observe",
+        "capture_media",
+        "observe",
+    ]
+    assert environment.action_artifacts[0]["file_id"] == "browser-media-file"
+    assert (tmp_path / "output" / "capture.webm").read_bytes() == b"browser-media"
+
+    await environment.observe()
+    assert environment.action_artifacts == []

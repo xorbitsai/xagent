@@ -24,6 +24,7 @@ from ...core.computer.relay import (
     BrowserRelayAuthenticationError,
     BrowserRelayConnection,
     BrowserRelayHello,
+    BrowserRelayMediaChunk,
     BrowserRelayPing,
     BrowserRelayProtocolError,
     BrowserRelayResponse,
@@ -51,6 +52,8 @@ class DesktopRelayStatusResponse(BaseModel):
     client_id: str | None = None
     client_name: str | None = None
     window_id: int | None = None
+    display_id: int | None = None
+    target_scope: str | None = None
     title: str | None = None
     application: str | None = None
     bounds: dict[str, float] | None = None
@@ -143,6 +146,10 @@ async def desktop_relay_websocket(websocket: WebSocket) -> None:
             message_type = message.get("type")
             if message_type == "response":
                 await connection.resolve(BrowserRelayResponse.model_validate(message))
+            elif message_type == "media_chunk":
+                await connection.resolve_media_chunk(
+                    BrowserRelayMediaChunk.model_validate(message)
+                )
             elif message_type == "status":
                 status = DesktopRelayStatusMessage.model_validate(message)
                 _require_protocol_version(status.protocol_version)

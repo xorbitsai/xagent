@@ -62,7 +62,7 @@ enum JSONValue: Codable, Sendable, Equatable {
 
 struct PairingSetup: Codable, Sendable {
   let websocketURL: String
-  let pairingToken: String
+  let pairingToken: String?
 
   enum CodingKeys: String, CodingKey {
     case websocketURL = "websocket_url"

@@ -2,11 +2,17 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-private struct CommandLineOptions {
+struct CommandLineOptions {
   let setup: PairingSetup
   let windowID: CGWindowID?
+  let configurationStore: DesktopRelayConfigurationStore
+  let setupFileURL: URL?
+  let shouldPersistConfiguration: Bool
 
-  static func parse(_ arguments: [String]) throws -> Self {
+  static func parse(
+    _ arguments: [String],
+    configurationStore: DesktopRelayConfigurationStore = .defaultStore()
+  ) throws -> Self {
     var setupJSON: String?
     var setupFile: String?
     var windowID: CGWindowID?
@@ -46,23 +52,53 @@ private struct CommandLineOptions {
       }
       index += 1
     }
-    guard (setupJSON == nil) != (setupFile == nil) else {
+    guard setupJSON == nil || setupFile == nil else {
       throw RelayFailure.invalidSetup(
-        "provide exactly one of --setup or --setup-file"
+        "provide at most one of --setup or --setup-file"
       )
     }
-    let data: Data
+    let setup: PairingSetup
+    let setupFileURL: URL?
+    let shouldPersistConfiguration: Bool
     if let setupJSON {
-      data = Data(setupJSON.utf8)
+      setup = try decodePairingSetup(Data(setupJSON.utf8))
+      setupFileURL = nil
+      shouldPersistConfiguration = true
     } else if let setupFile {
-      data = try Data(contentsOf: URL(fileURLWithPath: setupFile))
+      let fileURL = URL(fileURLWithPath: setupFile)
+      setup = try decodePairingSetup(Data(contentsOf: fileURL))
+      setupFileURL = fileURL
+      shouldPersistConfiguration = true
     } else {
-      throw RelayFailure.invalidSetup("pairing setup is required")
+      let stored = try configurationStore.load()
+      setup = PairingSetup(
+        websocketURL: stored.websocketURL,
+        pairingToken: nil
+      )
+      setupFileURL = nil
+      shouldPersistConfiguration = false
     }
     return Self(
-      setup: try JSONDecoder().decode(PairingSetup.self, from: data),
-      windowID: windowID
+      setup: setup,
+      windowID: windowID,
+      configurationStore: configurationStore,
+      setupFileURL: setupFileURL,
+      shouldPersistConfiguration: shouldPersistConfiguration
     )
+  }
+
+  private static func decodePairingSetup(_ data: Data) throws -> PairingSetup {
+    let setup = try JSONDecoder().decode(PairingSetup.self, from: data)
+    guard
+      let token = setup.pairingToken?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+      !token.isEmpty
+    else {
+      throw RelayFailure.invalidSetup(
+        "one-time pairing setup must include pairing_token"
+      )
+    }
+    return setup
   }
 }
 
@@ -89,7 +125,9 @@ private final class RelayApplication {
       Leave this process running while Xagent uses the authorized window.
       """
     )
-    Task { await client.runForever() }
+    Task.detached(priority: .userInitiated) { [client] in
+      await client.runForever()
+    }
     app.run()
   }
 
@@ -177,8 +215,25 @@ private enum DesktopRelayMain {
       )
       let controller = DesktopController()
       try await controller.authorize(windowID: selectedID)
+      let pairingCompleted: RelayClient.PairingCompleted?
+      if options.shouldPersistConfiguration {
+        let configurationStore = options.configurationStore
+        let websocketURL = options.setup.websocketURL
+        let setupFileURL = options.setupFileURL
+        pairingCompleted = {
+          try configurationStore.save(websocketURL: websocketURL)
+          configurationStore.removeManagedPairingFileIfNeeded(setupFileURL)
+          print(
+            "Desktop Relay configuration saved to "
+              + configurationStore.configurationURL.path
+          )
+        }
+      } else {
+        pairingCompleted = nil
+      }
       let client = try RelayClient(
         setup: options.setup,
+        pairingCompleted: pairingCompleted,
         commandHandler: { command in
           try await controller.handle(command)
         },
@@ -220,6 +275,65 @@ private enum DesktopRelayMain {
         "out-of-window coordinates were accepted"
       )
     }
+
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+    let configurationStore = DesktopRelayConfigurationStore(
+      directoryURL: temporaryDirectory.appendingPathComponent(
+        "desktop-relay",
+        isDirectory: true
+      )
+    )
+    try configurationStore.save(
+      websocketURL: "wss://example.test/ws/desktop-relay"
+    )
+    let stored = try configurationStore.load()
+    guard stored.websocketURL == "wss://example.test/ws/desktop-relay" else {
+      throw RelayFailure.invalidSetup("stored relay endpoint did not round-trip")
+    }
+    let persistedJSON = try String(
+      contentsOf: configurationStore.configurationURL,
+      encoding: .utf8
+    )
+    guard !persistedJSON.contains("pairing_token") else {
+      throw RelayFailure.invalidSetup(
+        "one-time pairing token leaked into persistent configuration"
+      )
+    }
+    let attributes = try FileManager.default.attributesOfItem(
+      atPath: configurationStore.configurationURL.path
+    )
+    guard
+      (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600
+    else {
+      throw RelayFailure.invalidSetup(
+        "persistent relay configuration permissions are not 0600"
+      )
+    }
+    let storedOptions = try CommandLineOptions.parse(
+      ["xagent-desktop-relay"],
+      configurationStore: configurationStore
+    )
+    guard
+      storedOptions.setup.websocketURL
+        == "wss://example.test/ws/desktop-relay",
+      storedOptions.setup.pairingToken == nil,
+      !storedOptions.shouldPersistConfiguration
+    else {
+      throw RelayFailure.invalidSetup(
+        "no-argument launch did not use stored relay configuration"
+      )
+    }
+    let managedPairingURL = configurationStore.directoryURL
+      .appendingPathComponent("pairing.json", isDirectory: false)
+    try Data("one-time".utf8).write(to: managedPairingURL)
+    configurationStore.removeManagedPairingFileIfNeeded(managedPairingURL)
+    guard !FileManager.default.fileExists(atPath: managedPairingURL.path) else {
+      throw RelayFailure.invalidSetup(
+        "managed one-time pairing file was not removed"
+      )
+    }
   }
 
   private static func selectWindow(
@@ -256,11 +370,16 @@ private func printUsage() {
   print(
     """
     Usage:
+      xagent-desktop-relay [--window-id ID]
       xagent-desktop-relay --setup '<pairing-json>' [--window-id ID]
       xagent-desktop-relay --setup-file PATH [--window-id ID]
       xagent-desktop-relay --self-test
 
-    Create pairing JSON in Xagent Settings > Desktop Computer Relay.
+    Create the one-time pairing JSON in Xagent Settings > Computer Use.
+    After the first successful pairing, the server address is stored under
+    $XAGENT_STORAGE_ROOT/desktop-relay (default: ~/.xagent/desktop-relay)
+    and later launches need no setup argument. Session credentials stay in
+    macOS Keychain.
     Without --window-id, the relay asks you to explicitly select one window.
     """
   )

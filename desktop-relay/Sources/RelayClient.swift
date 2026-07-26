@@ -67,8 +67,10 @@ private final class RelaySessionDelegate: NSObject, URLSessionTaskDelegate,
 actor RelayClient {
   typealias CommandHandler = @Sendable (RelayCommand) async throws -> [String: JSONValue]
   typealias StatusProvider = @Sendable () async -> DesktopWindowStatus
+  typealias PairingCompleted = @Sendable () throws -> Void
 
   private let setup: PairingSetup
+  private let pairingCompleted: PairingCompleted?
   private let commandHandler: CommandHandler
   private let statusProvider: StatusProvider
   private let clientID: String
@@ -78,9 +80,12 @@ actor RelayClient {
   private var socket: URLSessionWebSocketTask?
   private var shouldRun = true
   private var paired = false
+  private var pendingPairingToken: String?
+  private var pairingConfigurationCompleted = false
 
   init(
     setup: PairingSetup,
+    pairingCompleted: PairingCompleted? = nil,
     commandHandler: @escaping CommandHandler,
     statusProvider: @escaping StatusProvider
   ) throws {
@@ -97,12 +102,16 @@ actor RelayClient {
         "websocket_url must be an absolute ws:// or wss:// URL without credentials or query parameters"
       )
     }
-    guard !setup.pairingToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    if let pairingToken = setup.pairingToken,
+      pairingToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
       throw RelayFailure.invalidSetup("pairing_token must not be empty")
     }
     self.setup = setup
+    self.pairingCompleted = pairingCompleted
     self.commandHandler = commandHandler
     self.statusProvider = statusProvider
+    pendingPairingToken = setup.pairingToken
     let port = components.port.map(String.init) ?? ""
     credentialAccount = [
       components.scheme ?? "",
@@ -176,11 +185,21 @@ actor RelayClient {
       if socket === task { socket = nil }
     }
 
-    let savedSession = KeychainStore.loadSessionToken(account: credentialAccount)
+    let pairingToken = pendingPairingToken
+    let savedSession =
+      pairingToken == nil
+      ? KeychainStore.loadSessionToken(account: credentialAccount)
+      : nil
+    guard pairingToken != nil || savedSession != nil else {
+      throw RelayFailure.invalidSetup(
+        "Desktop Relay session is missing or expired. Create a new desktop "
+          + "pairing in Xagent Settings and launch once with --setup-file."
+      )
+    }
     let hello = RelayHello(
       clientID: clientID,
       clientName: clientName,
-      pairingToken: savedSession == nil ? setup.pairingToken : nil,
+      pairingToken: pairingToken,
       sessionToken: savedSession
     )
     try await send(hello)
@@ -219,6 +238,14 @@ actor RelayClient {
           token,
           account: credentialAccount
         )
+        pendingPairingToken = nil
+      }
+      if pendingPairingToken == nil,
+        !pairingConfigurationCompleted,
+        let pairingCompleted
+      {
+        try pairingCompleted()
+        pairingConfigurationCompleted = true
       }
       paired = true
       try await send(await statusProvider())
@@ -232,7 +259,9 @@ actor RelayClient {
       return
     case "error":
       let message = try JSONDecoder().decode(RelayErrorMessage.self, from: data)
-      if message.error.localizedCaseInsensitiveContains("invalid or expired") {
+      if pendingPairingToken == nil,
+        message.error.localizedCaseInsensitiveContains("invalid or expired")
+      {
         KeychainStore.deleteSessionToken(account: credentialAccount)
       }
       throw RelayFailure.invalidMessage(message.error)

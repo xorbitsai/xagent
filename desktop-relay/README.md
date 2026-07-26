@@ -13,12 +13,24 @@ macOS 14 or later and Swift 6 are required.
 cd desktop-relay
 swift build -c release
 .build/release/xagent-desktop-relay --self-test
-.build/release/xagent-desktop-relay --setup-file pairing.json
+.build/release/xagent-desktop-relay --setup-file /path/to/pairing.json
 ```
 
-Create `pairing.json` from **Settings > Desktop Computer Relay** in Xagent. The
-one-time token is exchanged for a session credential stored in macOS Keychain.
-The desktop and browser relays use separate credentials and can run together.
+Create the one-time pairing JSON from **Settings > Computer Use** in Xagent.
+Keep it outside the source tree and pass it to the first launch with
+`--setup-file`. After pairing succeeds, Desktop Relay stores only the server
+WebSocket address in
+`$XAGENT_STORAGE_ROOT/desktop-relay/config.json` (default:
+`~/.xagent/desktop-relay/config.json`) and stores the session credential in
+macOS Keychain. Later launches need no setup argument:
+
+```bash
+.build/release/xagent-desktop-relay
+```
+
+A pairing file placed in the managed desktop-relay configuration directory is
+removed after successful pairing. The desktop and browser relays use separate
+credentials and can run together.
 
 On first launch, macOS prompts for:
 
@@ -40,12 +52,8 @@ fields are never exposed to the agent and must be completed by the user.
 
 ## Xagent configuration
 
-Set the runtime before starting the Xagent backend:
-
-```bash
-XAGENT_BROWSER_RUNTIME_KIND=desktop_relay
-```
-
-The runtime keeps the existing `computer` tool schema and ReAct execution
-pipeline. Desktop navigation is intentionally unavailable; applications own
-their own navigation.
+Choose **My computer** when creating the task. That task-bound target takes
+precedence over the deployment default, so ordinary UI use does not require
+`XAGENT_BROWSER_RUNTIME_KIND`. The runtime keeps the existing `computer` tool
+schema and ReAct execution pipeline. Desktop navigation is intentionally
+unavailable; applications own their own navigation.

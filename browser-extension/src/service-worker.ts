@@ -805,10 +805,6 @@ function computerInputPlatform(): Promise<ComputerInputPlatform> {
   return inputPlatformPromise
 }
 
-function primaryModifier(platform: ComputerInputPlatform): "META" | "CTRL" {
-  return platform === "macos" ? "META" : "CTRL"
-}
-
 async function captureObservation(
   tabId: number,
   frameToken: string,
@@ -1011,14 +1007,24 @@ async function performAction(
       await dispatchClick(tabId, point.x, point.y, 1)
     }
     if (type === "replace_text") {
-      await dispatchKeypress(
+      await selectEditableTargetText(
         tabId,
-        [primaryModifier(await computerInputPlatform()), "A"],
+        action,
+        expectedFrameToken,
       )
     }
+    const text = String(action.text ?? "")
     await chrome.debugger.sendCommand(target, "Input.insertText", {
-      text: String(action.text ?? ""),
+      text,
     })
+    if (type === "replace_text") {
+      await assertEditableTargetText(
+        tabId,
+        action,
+        expectedFrameToken,
+        text,
+      )
+    }
     return
   }
   if (type === "scroll") {
@@ -1159,6 +1165,85 @@ async function dispatchKeypress(tabId: number, keys: string[]): Promise<void> {
   })
 }
 
+async function selectEditableTargetText(
+  tabId: number,
+  action: Record<string, unknown>,
+  expectedFrameToken: string,
+): Promise<void> {
+  const elementId = requiredString(
+    action.target_element_id,
+    "replace_text target element ID",
+  )
+  if (lastObservationContextId === null) {
+    throw new Error(
+      `Cannot select ${elementId} because its browser frame is no longer current.`,
+    )
+  }
+  const options = JSON.stringify({
+    frameToken: expectedFrameToken,
+    elementId,
+  })
+  const result = await chrome.debugger.sendCommand(
+    { tabId },
+    "Runtime.evaluate",
+    {
+      expression: `(${selectEditableTarget.toString()})(${options})`,
+      contextId: lastObservationContextId,
+      returnByValue: true,
+    },
+  )
+  const selection = readRuntimeValue(result)
+  if (!isRecord(selection) || selection.selected !== true) {
+    throw new Error(
+      `replace_text target ${elementId} is not a selectable text field. ` +
+        "Request a fresh screenshot and choose a verified editable element.",
+    )
+  }
+}
+
+async function assertEditableTargetText(
+  tabId: number,
+  action: Record<string, unknown>,
+  expectedFrameToken: string,
+  expectedText: string,
+): Promise<void> {
+  const elementId = requiredString(
+    action.target_element_id,
+    "replace_text target element ID",
+  )
+  if (lastObservationContextId === null) {
+    throw new Error(
+      `Cannot verify ${elementId} because its browser frame is no longer current.`,
+    )
+  }
+  await delay(50)
+  const options = JSON.stringify({
+    frameToken: expectedFrameToken,
+    elementId,
+  })
+  const result = await chrome.debugger.sendCommand(
+    { tabId },
+    "Runtime.evaluate",
+    {
+      expression: `(${readEditableTarget.toString()})(${options})`,
+      contextId: lastObservationContextId,
+      returnByValue: true,
+    },
+  )
+  const current = readRuntimeValue(result)
+  if (
+    !isRecord(current) ||
+    current.readable !== true ||
+    current.text !== expectedText
+  ) {
+    throw new Error(
+      `replace_text did not produce the requested value in ${elementId}. ` +
+        "The field may use a custom editor; request a fresh screenshot before " +
+        "choosing another action.",
+    )
+  }
+}
+
 function collectInteractiveElements(options: {
   frameToken: string
   limit: number
@@ -1292,6 +1377,64 @@ function collectInteractiveElements(options: {
   // this map also releases remote DOM nodes promptly.
   state.__xagentComputerTargets = new Map([[frameToken, targets]])
   return { elements, truncated, incomplete }
+}
+
+function selectEditableTarget(options: {
+  frameToken: string
+  elementId: string
+}): { selected: boolean } {
+  const state = globalThis as typeof globalThis & {
+    __xagentComputerTargets?: Map<string, Map<string, HTMLElement>>
+  }
+  const target = state.__xagentComputerTargets
+    ?.get(options.frameToken)
+    ?.get(options.elementId)
+  if (!target) return { selected: false }
+  target.focus()
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement
+  ) {
+    target.select()
+    return {
+      selected:
+        target.selectionStart === 0 &&
+        target.selectionEnd === target.value.length,
+    }
+  }
+  if (target.isContentEditable) {
+    const selection = window.getSelection()
+    if (!selection) return { selected: false }
+    const range = document.createRange()
+    range.selectNodeContents(target)
+    selection.removeAllRanges()
+    selection.addRange(range)
+    return { selected: selection.rangeCount === 1 }
+  }
+  return { selected: false }
+}
+
+function readEditableTarget(options: {
+  frameToken: string
+  elementId: string
+}): { readable: boolean; text?: string } {
+  const state = globalThis as typeof globalThis & {
+    __xagentComputerTargets?: Map<string, Map<string, HTMLElement>>
+  }
+  const target = state.__xagentComputerTargets
+    ?.get(options.frameToken)
+    ?.get(options.elementId)
+  if (!target) return { readable: false }
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement
+  ) {
+    return { readable: true, text: target.value }
+  }
+  if (target.isContentEditable) {
+    return { readable: true, text: target.textContent ?? "" }
+  }
+  return { readable: false }
 }
 
 function hitTestTarget(options: {

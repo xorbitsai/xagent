@@ -276,6 +276,25 @@ private enum DesktopRelayMain {
       )
     }
 
+    let stableSample: [UInt8] = [0, 64, 128, 255]
+    let changedSample: [UInt8] = [255, 128, 64, 0]
+    var detector = VisualStabilityDetector(
+      maximumNormalizedDifference: 0.003,
+      requiredStableComparisons: 2
+    )
+    guard
+      !detector.observe(stableSample),
+      !detector.observe(stableSample),
+      detector.observe(stableSample),
+      !detector.observe(changedSample),
+      !detector.observe(changedSample),
+      detector.observe(changedSample)
+    else {
+      throw RelayFailure.invalidAction(
+        "visual stability detector did not settle or reset as expected"
+      )
+    }
+
     let temporaryDirectory = FileManager.default.temporaryDirectory
       .appendingPathComponent(UUID().uuidString, isDirectory: true)
     defer { try? FileManager.default.removeItem(at: temporaryDirectory) }

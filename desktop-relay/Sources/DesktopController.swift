@@ -18,7 +18,52 @@ private struct AuthorizedWindow {
   let title: String
 }
 
+struct VisualStabilityDetector {
+  private let maximumNormalizedDifference: Double
+  private let requiredStableComparisons: Int
+  private var previousSample: [UInt8]?
+  private var stableComparisons = 0
+
+  init(
+    maximumNormalizedDifference: Double = 0.003,
+    requiredStableComparisons: Int = 2
+  ) {
+    self.maximumNormalizedDifference = maximumNormalizedDifference
+    self.requiredStableComparisons = max(1, requiredStableComparisons)
+  }
+
+  mutating func observe(_ sample: [UInt8]) -> Bool {
+    guard !sample.isEmpty else {
+      previousSample = nil
+      stableComparisons = 0
+      return false
+    }
+    guard let previousSample, previousSample.count == sample.count else {
+      self.previousSample = sample
+      stableComparisons = 0
+      return false
+    }
+
+    let totalDifference = zip(previousSample, sample).reduce(0.0) { partial, pair in
+      partial + abs(Double(pair.0) - Double(pair.1))
+    }
+    let normalizedDifference =
+      totalDifference / (Double(sample.count) * Double(UInt8.max))
+    stableComparisons =
+      normalizedDifference <= maximumNormalizedDifference
+      ? stableComparisons + 1
+      : 0
+    self.previousSample = sample
+    return stableComparisons >= requiredStableComparisons
+  }
+}
+
 actor DesktopController {
+  private static let visualSampleSize = 64
+  private static let visualSettleInitialDelay = Duration.milliseconds(300)
+  private static let visualSettleInterval = Duration.milliseconds(200)
+  private static let visualSettleMaximumSamples = 8
+
   private var authorized: AuthorizedWindow?
   private var paused = false
   private var emergencyStopped = false
@@ -160,7 +205,10 @@ actor DesktopController {
       guard let action = command.payload["action"]?.objectValue else {
         throw RelayFailure.invalidAction("action must be an object")
       }
-      try await perform(action)
+      let shouldSettle = try await perform(action)
+      if shouldSettle {
+        try await waitForVisualStability()
+      }
       let observation = try await observe(frameID: frameID)
       return ["observation": try jsonValue(observation)]
     default:
@@ -223,21 +271,21 @@ actor DesktopController {
     )
   }
 
-  private func perform(_ action: [String: JSONValue]) async throws {
+  private func perform(_ action: [String: JSONValue]) async throws -> Bool {
     guard Self.permissionStatus()["accessibility"] == true else {
       throw RelayFailure.permission(
         "Accessibility permission is required in System Settings"
       )
     }
     let type = try requiredString(action["type"], "action type")
-    if type == "screenshot" { return }
+    if type == "screenshot" { return false }
     if type == "navigate" {
       throw RelayFailure.invalidAction("navigate is not supported on desktop")
     }
     if type == "wait" {
       let duration = max(0, min(30_000, Int(action["duration_ms"]?.numberValue ?? 1_000)))
       try await Task.sleep(for: .milliseconds(duration))
-      return
+      return false
     }
 
     let window = try await validateAuthorizedWindow()
@@ -259,11 +307,13 @@ actor DesktopController {
         throw RelayFailure.invalidAction("\(type) requires a target")
       }
       Self.click(at: point, count: type == "double_click" ? 2 : 1)
+      return true
     case "move":
       guard let point else {
         throw RelayFailure.invalidAction("move requires a target")
       }
       Self.postMouse(type: .mouseMoved, at: point)
+      return false
     case "type":
       if let targetID, sensitiveElementIDs.contains(targetID) {
         throw RelayFailure.invalidAction(
@@ -276,6 +326,7 @@ actor DesktopController {
         try verifyAuthorizedWindowIsFocused(window: window)
       }
       try Self.typeText(action["text"]?.stringValue ?? "")
+      return true
     case "keypress":
       try verifyAuthorizedWindowIsFocused(window: window)
       let keys =
@@ -284,6 +335,7 @@ actor DesktopController {
           return items.compactMap(\.stringValue)
         } ?? []
       try Self.press(keys: keys)
+      return true
     case "scroll":
       let deltaX = action["delta_x"]?.numberValue ?? 0
       let deltaY = action["delta_y"]?.numberValue ?? 0
@@ -301,6 +353,7 @@ actor DesktopController {
         y: deltaY * window.frame.height,
         at: scrollPoint
       )
+      return true
     case "drag":
       guard
         let startJSON = action["start"]?.objectValue,
@@ -319,9 +372,86 @@ actor DesktopController {
       )
       let duration = max(0, min(30_000, Int(action["duration_ms"]?.numberValue ?? 250)))
       try await Self.drag(from: start, to: end, durationMilliseconds: duration)
+      return true
     default:
       throw RelayFailure.invalidAction("unsupported desktop action \(type)")
     }
+  }
+
+  private func waitForVisualStability() async throws {
+    try await Task.sleep(for: Self.visualSettleInitialDelay)
+    var detector = VisualStabilityDetector()
+
+    for index in 0..<Self.visualSettleMaximumSamples {
+      do {
+        let window = try await validateAuthorizedWindow()
+        let sample = try await captureVisualSample(window: window)
+        if detector.observe(sample) {
+          return
+        }
+      } catch {
+        if Task.isCancelled {
+          throw error
+        }
+        // Stabilization is best-effort. The full observation below remains the
+        // source of truth and will surface any persistent capture failure.
+        return
+      }
+      if index + 1 < Self.visualSettleMaximumSamples {
+        try await Task.sleep(for: Self.visualSettleInterval)
+      }
+    }
+  }
+
+  private func captureVisualSample(window: SCWindow) async throws -> [UInt8] {
+    let configuration = SCStreamConfiguration()
+    configuration.width = Self.visualSampleSize
+    configuration.height = Self.visualSampleSize
+    configuration.showsCursor = false
+    configuration.ignoreShadowsSingleWindow = true
+    let filter = SCContentFilter(desktopIndependentWindow: window)
+    let image = try await SCScreenshotManager.captureImage(
+      contentFilter: filter,
+      configuration: configuration
+    )
+
+    var pixels = [UInt8](
+      repeating: 0,
+      count: Self.visualSampleSize * Self.visualSampleSize
+    )
+    let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+      guard
+        let baseAddress = bytes.baseAddress,
+        let context = CGContext(
+          data: baseAddress,
+          width: Self.visualSampleSize,
+          height: Self.visualSampleSize,
+          bitsPerComponent: 8,
+          bytesPerRow: Self.visualSampleSize,
+          space: CGColorSpaceCreateDeviceGray(),
+          bitmapInfo: CGImageAlphaInfo.none.rawValue
+        )
+      else {
+        return false
+      }
+      context.interpolationQuality = .low
+      context.draw(
+        image,
+        in: CGRect(
+          x: 0,
+          y: 0,
+          width: Self.visualSampleSize,
+          height: Self.visualSampleSize
+        )
+      )
+      return true
+    }
+    guard rendered else {
+      throw RelayFailure.invalidMessage(
+        "could not sample the authorized desktop window"
+      )
+    }
+    return pixels
   }
 
   private func verifyHit(

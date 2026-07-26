@@ -142,6 +142,7 @@ actor RelayClient {
       } catch is CancellationError {
         return
       } catch {
+        guard shouldRun else { return }
         attempt += 1
         let seconds = min(30, max(1, 1 << min(attempt - 1, 5)))
         FileHandle.standardError.write(
@@ -204,25 +205,36 @@ actor RelayClient {
     )
     try await send(hello)
 
-    async let keepalive: Void = pingLoop(task)
-    do {
-      while shouldRun {
-        let message = try await task.receive()
-        let data: Data
-        switch message {
-        case .string(let text): data = Data(text.utf8)
-        case .data(let bytes): data = bytes
-        @unknown default:
-          throw RelayFailure.invalidMessage("unsupported WebSocket message")
-        }
-        try await handleMessage(data)
+    // Race reads against keepalive writes so either transport failure tears
+    // down the whole connection and returns control to runForever for retry.
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask { [self] in
+        try await receiveLoop(task)
       }
-    } catch {
-      task.cancel(with: .goingAway, reason: nil)
-      _ = await keepalive
-      throw error
+      group.addTask { [self] in
+        try await pingLoop(task)
+      }
+      defer {
+        group.cancelAll()
+        task.cancel(with: .goingAway, reason: nil)
+      }
+      _ = try await group.next()
     }
-    _ = await keepalive
+  }
+
+  private func receiveLoop(_ task: URLSessionWebSocketTask) async throws {
+    while shouldRun, socket === task {
+      try Task.checkCancellation()
+      let message = try await task.receive()
+      let data: Data
+      switch message {
+      case .string(let text): data = Data(text.utf8)
+      case .data(let bytes): data = bytes
+      @unknown default:
+        throw RelayFailure.invalidMessage("unsupported WebSocket message")
+      }
+      try await handleMessage(data)
+    }
   }
 
   private func handleMessage(_ data: Data) async throws {
@@ -305,11 +317,12 @@ actor RelayClient {
     )
   }
 
-  private func pingLoop(_ task: URLSessionWebSocketTask) async {
+  private func pingLoop(_ task: URLSessionWebSocketTask) async throws {
     while shouldRun, socket === task {
-      try? await Task.sleep(for: .seconds(20))
+      try await Task.sleep(for: .seconds(20))
+      try Task.checkCancellation()
       guard shouldRun, socket === task else { return }
-      try? await send(RelayPing())
+      try await send(RelayPing())
     }
   }
 

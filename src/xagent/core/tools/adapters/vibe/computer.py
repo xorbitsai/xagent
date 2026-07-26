@@ -385,42 +385,43 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 action.type == ComputerActionType.SCREENSHOT
                 for action in parsed.actions
             )
-            if environment.current_observation is None:
-                if not screenshot_only:
-                    if approval is not None and parsed.expected_frame_id is not None:
-                        policy_result = await self._execute_with_policy(
-                            environment=environment,
-                            batch=ComputerActionBatch(
-                                session_id=session_id,
-                                expected_frame_id=parsed.expected_frame_id,
-                                actions=parsed.actions,
-                            ),
-                            approval=approval,
-                        )
-                        if isinstance(policy_result, dict):
-                            return policy_result
-                        observation = policy_result
-                    else:
-                        return self._error_result(
+            if screenshot_only:
+                # A screenshot is an observation request, not an action planned
+                # against an earlier frame. Always read the live target even if
+                # a model unnecessarily supplies a stale or malformed-looking
+                # frame token such as the literal string "None".
+                observation = await environment.observe()
+            elif environment.current_observation is None:
+                if approval is not None and parsed.expected_frame_id is not None:
+                    policy_result = await self._execute_with_policy(
+                        environment=environment,
+                        batch=ComputerActionBatch(
                             session_id=session_id,
-                            error=(
-                                "No computer frame exists yet. Call computer with only "
-                                "a screenshot action before planning other actions."
-                            ),
-                        )
+                            expected_frame_id=parsed.expected_frame_id,
+                            actions=parsed.actions,
+                        ),
+                        approval=approval,
+                    )
+                    if isinstance(policy_result, dict):
+                        return policy_result
+                    observation = policy_result
                 else:
-                    observation = await environment.observe()
-            elif parsed.expected_frame_id is None:
-                if not screenshot_only:
                     return self._error_result(
                         session_id=session_id,
-                        frame_id=environment.current_observation.frame_id,
                         error=(
-                            "expected_frame_id is required for state-changing "
-                            "computer actions."
+                            "No computer frame exists yet. Call computer with only "
+                            "a screenshot action before planning other actions."
                         ),
                     )
-                observation = await environment.observe()
+            elif parsed.expected_frame_id is None:
+                return self._error_result(
+                    session_id=session_id,
+                    frame_id=environment.current_observation.frame_id,
+                    error=(
+                        "expected_frame_id is required for state-changing "
+                        "computer actions."
+                    ),
+                )
             else:
                 batch = ComputerActionBatch(
                     session_id=session_id,

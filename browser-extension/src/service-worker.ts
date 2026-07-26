@@ -8,6 +8,10 @@ import {
   type RelayCommand,
   type RelayPublicStatus,
 } from "./protocol.js"
+import {
+  waitForPageStable,
+  type PageStabilityState,
+} from "./page-stability.js"
 
 const STORAGE = {
   relayUrl: "relayUrl",
@@ -349,6 +353,7 @@ async function handleCommand(message: RelayCommand): Promise<void> {
         throw new Error("Action payload is invalid.")
       }
       const action = message.payload.action
+      const actionType = String(action.type ?? "")
       const navigationPolicy = parseNavigationPolicy(
         message.payload.navigation_policy,
       )
@@ -356,14 +361,22 @@ async function handleCommand(message: RelayCommand): Promise<void> {
         attachedTabId,
         navigationPolicy,
         async () => {
+          const baseline =
+            actionType === "wait" || actionType === "move"
+              ? null
+              : await readPageStabilityState(attachedTabId as number).catch(
+                  () => null,
+                )
           await performAction(
             attachedTabId as number,
             action,
             expectedFrameId,
           )
-          const actionType = String(action.type ?? "")
-          if (actionType !== "navigate" && actionType !== "wait") {
-            await delay(250)
+          if (actionType !== "wait" && actionType !== "move") {
+            await waitForPageStable(
+              () => readPageStabilityState(attachedTabId as number),
+              { baseline },
+            )
           }
           return captureObservation(attachedTabId as number, frameId)
         },
@@ -875,8 +888,9 @@ async function captureObservation(
   if (typeof screenshotData !== "string" || !isRecord(viewport)) {
     throw new Error("Chrome returned an invalid screenshot observation.")
   }
-  // A screenshot without element hints is still usable, but the backend must
-  // know the structure is unknown so its policy can fail closed.
+  // A screenshot without element hints is still usable. Preserve the
+  // extraction status so the backend can avoid pretending the list is
+  // exhaustive while treating coordinate-only targets as ordinary content.
   const extracted = isRecord(extraction) ? extraction : null
   const elements = extracted && Array.isArray(extracted.elements)
     ? extracted.elements
@@ -1665,6 +1679,47 @@ async function waitForTabReady(tabId: number, timeoutMs: number): Promise<void> 
   await delay(250)
 }
 
+async function readPageStabilityState(
+  tabId: number,
+): Promise<PageStabilityState> {
+  const result = await chrome.debugger.sendCommand(
+    { tabId },
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
+        const body = document.body;
+        return {
+          url: location.href,
+          title: document.title,
+          readyState: document.readyState,
+          domSize: Math.max(0, body?.getElementsByTagName("*").length ?? 0),
+          interactiveSize: Math.max(
+            0,
+            document.querySelectorAll(
+              'a[href],button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"]'
+            ).length
+          ),
+          textSize: Math.max(0, body?.textContent?.length ?? 0),
+        };
+      })()`,
+      returnByValue: true,
+    },
+  )
+  const value = readRuntimeValue(result)
+  if (!isRecord(value)) {
+    throw new Error("Could not read browser page stability.")
+  }
+  return {
+    url: typeof value.url === "string" ? value.url : "",
+    title: typeof value.title === "string" ? value.title : "",
+    readyState:
+      typeof value.readyState === "string" ? value.readyState : "loading",
+    domSize: nonNegativeInteger(value.domSize),
+    interactiveSize: nonNegativeInteger(value.interactiveSize),
+    textSize: nonNegativeInteger(value.textSize),
+  }
+}
+
 function readRuntimeValue(result: object | null | undefined): unknown {
   if (!isRecord(result) || !isRecord(result.result)) return undefined
   return result.result.value
@@ -1706,6 +1761,11 @@ function finiteInteger(value: unknown, field: string): number {
     throw new Error(`${field} is outside the supported range.`)
   }
   return number
+}
+
+function nonNegativeInteger(value: unknown): number {
+  const number = Number(value)
+  return Number.isFinite(number) && number >= 0 ? Math.round(number) : 0
 }
 
 function clampNumber(value: unknown, min: number, max: number): number {

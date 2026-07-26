@@ -192,6 +192,30 @@ async def test_computer_tool_lifts_action_scoped_expected_frame_id() -> None:
     assert factory.environments[0].executed[0].expected_frame_id == "frame-1"
 
 
+@pytest.mark.asyncio
+async def test_computer_tool_ignores_frame_id_for_fresh_screenshot() -> None:
+    factory = EnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+
+    initial = await tool.run_json_async({})
+    refreshed = await tool.run_json_async(
+        {
+            "expected_frame_id": "None",
+            "actions": [{"type": "screenshot"}],
+        }
+    )
+
+    assert initial["frame_id"] == "frame-1"
+    assert refreshed["success"] is True
+    assert refreshed["frame_id"] == "frame-2"
+    assert factory.environments[0].observe_count == 2
+    assert factory.environments[0].executed == []
+
+
 def test_computer_tool_rejects_conflicting_frame_id_locations() -> None:
     tool = ComputerTool(
         task_id="task-1",

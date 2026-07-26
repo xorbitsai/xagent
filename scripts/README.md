@@ -19,14 +19,21 @@ PYTHONPATH=src python scripts/backfill_uploaded_files.py --user-id 1
 
 ## `check_alembic_heads.sh`
 
-Verifies that Alembic currently has exactly one migration head. This is a quick
-CI/local guard for accidental migration branching.
+Checks the Alembic revision graph and reports which invariant broke: more than
+one head, a duplicate revision ID, or a `down_revision` that is not on disk.
+Alembic enforces none of these itself -- a branched graph is legal to it, and a
+duplicate ID only produces a warning -- so this is the guard against accidental
+migration branching, run both locally via pre-commit and on every PR.
 
 Common usage:
 
 ```bash
 PYTHONPATH=src scripts/check_alembic_heads.sh
 ```
+
+Set `ALEMBIC_CHECK_PYTHON` to a specific interpreter to run alembic under
+(default: `uv run alembic`, falling back to `python -m alembic`). Its regression
+coverage is `tests/migrations/test_check_alembic_heads.py`.
 
 ## `convert_trace_checkpoint_messages.py`
 

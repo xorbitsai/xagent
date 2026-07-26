@@ -166,6 +166,55 @@ async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -
 
 
 @pytest.mark.asyncio
+async def test_computer_tool_lifts_action_scoped_expected_frame_id() -> None:
+    factory = EnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    initial = await tool.run_json_async({})
+
+    acted = await tool.run_json_async(
+        {
+            "actions": [
+                {
+                    "type": "navigate",
+                    "url": "https://example.com",
+                    "expected_frame_id": initial["frame_id"],
+                }
+            ]
+        }
+    )
+
+    assert acted["success"] is True
+    assert acted["frame_id"] == "frame-2"
+    assert factory.environments[0].executed[0].expected_frame_id == "frame-1"
+
+
+def test_computer_tool_rejects_conflicting_frame_id_locations() -> None:
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=EnvironmentFactory(),
+    )
+
+    with pytest.raises(ValueError, match="conflicts with the top-level"):
+        tool.args_type().model_validate(
+            {
+                "expected_frame_id": "frame-1",
+                "actions": [
+                    {
+                        "type": "navigate",
+                        "url": "https://example.com",
+                        "expected_frame_id": "frame-2",
+                    }
+                ],
+            }
+        )
+
+
+@pytest.mark.asyncio
 async def test_computer_tool_rejects_action_before_first_observation() -> None:
     factory = EnvironmentFactory()
     tool = ComputerTool(

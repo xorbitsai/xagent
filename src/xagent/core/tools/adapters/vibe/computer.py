@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .....config import (
     get_browser_navigation_allowlist,
@@ -81,6 +81,43 @@ class ComputerToolArgs(BaseModel):
             "state-changing action may be planned."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_action_scoped_frame_id(cls, value: Any) -> Any:
+        """Accept the common model mistake of nesting the batch frame ID.
+
+        ``expected_frame_id`` belongs to the call because every action is
+        planned against the same observation. Some models nevertheless place it
+        beside ``type`` inside the sole action. Normalize only that one field,
+        and reject conflicting values instead of guessing which frame to use.
+        """
+        if not isinstance(value, Mapping):
+            return value
+        raw_actions = value.get("actions")
+        if (
+            not isinstance(raw_actions, list)
+            or len(raw_actions) != 1
+            or not isinstance(raw_actions[0], Mapping)
+            or "expected_frame_id" not in raw_actions[0]
+        ):
+            return value
+
+        action = dict(raw_actions[0])
+        nested_frame_id = action.pop("expected_frame_id")
+        normalized = dict(value)
+        normalized["actions"] = [action]
+        if nested_frame_id is None:
+            return normalized
+
+        top_level_frame_id = normalized.get("expected_frame_id")
+        if top_level_frame_id is None:
+            normalized["expected_frame_id"] = nested_frame_id
+        elif top_level_frame_id != nested_frame_id:
+            raise ValueError(
+                "action expected_frame_id conflicts with the top-level value"
+            )
+        return normalized
 
 
 class ComputerConfirmationRequest(BaseModel):

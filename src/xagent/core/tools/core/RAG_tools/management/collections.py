@@ -549,24 +549,34 @@ async def _load_collection_ingestion_configs(
         uid = None
     else:
         uid = 0 if user_id is None else user_id
-    for collection in collection_keys:
-        try:
-            config_json = await metadata_store.get_collection_config(
-                collection, uid, is_admin=is_admin
+    # Fetch every collection's config concurrently: each lookup is a separate
+    # LanceDB round trip, so awaiting them in sequence made the total cost scale
+    # linearly with the number of collections.
+    config_results = await asyncio.gather(
+        *(
+            metadata_store.get_collection_config(collection, uid, is_admin=is_admin)
+            for collection in collection_keys
+        ),
+        return_exceptions=True,
+    )
+
+    for collection, config_json in zip(collection_keys, config_results):
+        if isinstance(config_json, BaseException):
+            logger.debug(
+                "Could not load config for collection %s: %s", collection, config_json
             )
-            if not config_json:
-                continue
-            try:
-                config_dict = json.loads(config_json)
-                collection_configs[collection] = IngestionConfig(**config_dict)
-            except Exception as e:
-                logger.warning(
-                    "Failed to parse config for collection %s: %s",
-                    collection,
-                    e,
-                )
+            continue
+        if not config_json:
+            continue
+        try:
+            config_dict = json.loads(config_json)
+            collection_configs[collection] = IngestionConfig(**config_dict)
         except Exception as e:
-            logger.debug("Could not load config for collection %s: %s", collection, e)
+            logger.warning(
+                "Failed to parse config for collection %s: %s",
+                collection,
+                e,
+            )
     return collection_configs
 
 

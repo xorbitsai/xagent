@@ -10,6 +10,7 @@
     "type-check": "tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:pages": "vitest run --config vitest.config.ts src/components/pages",
     "test:widget": "vitest run src/components/widget/widget-bootstrap.test.ts src/components/widget/public-agent-chat-page.test.tsx",
     "test:widget:coverage": "vitest run --config vitest.widget.config.ts --coverage"
   },

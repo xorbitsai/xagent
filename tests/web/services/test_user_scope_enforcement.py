@@ -224,6 +224,18 @@ def test_explicit_scope_overrides_ambient(storage_env, tmp_path):
         reset_execution_scope(token)
 
 
+def test_explicit_unscoped_overrides_ambient(storage_env, tmp_path):
+    """Explicit None is an owner-root decision, not an omitted argument."""
+
+    record = _record(tmp_path / "uploads" / "missing.txt")
+    token = set_execution_scope(_ISOLATED_SCOPE)
+    try:
+        ref = ManagedFileRef(record, execution_scope=None)
+        assert ref.storage.prefix == "users/7"
+    finally:
+        reset_execution_scope(token)
+
+
 def test_sync_to_durable_writes_into_scoped_subtree(storage_env, tmp_path):
     source = tmp_path / "uploads" / "source.txt"
     source.parent.mkdir()

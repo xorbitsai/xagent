@@ -7,7 +7,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, TypeVar
 
 from fastapi import Depends, HTTPException, Query, UploadFile, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.deployment import DeploymentOwnerType
 from ..models.task import Task, TaskStatus
 from ..models.user import User
@@ -28,11 +28,13 @@ from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
 from .websocket import (
+    WebSocketPrincipal,
     handle_chat_message,
     handle_execute_task,
     handle_intervention,
@@ -84,6 +86,14 @@ class ShareChatAccessContext:
     share_token: str
     agent: Agent | None = None
     workforce: Workforce | None = None
+
+
+class _ChatAccessContext(Protocol):
+    @property
+    def user(self) -> User: ...
+
+
+_ChatAccessContextT = TypeVar("_ChatAccessContextT", bound=_ChatAccessContext)
 
 
 def create_public_chat_access_token(data: dict[str, Any]) -> str:
@@ -567,6 +577,7 @@ async def upload_public_chat_files(
     if not upload_items:
         raise HTTPException(status_code=422, detail="No files provided")
 
+    user_id = int(access_context.user.id)
     if not task_id:
         # A workforce widget session starts its first turn inside task
         # creation, so its opening-message attachments must be uploaded BEFORE
@@ -590,13 +601,17 @@ async def upload_public_chat_files(
                     f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
                 ),
             )
+        if not release_db_connection_if_clean(db):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload authorization could not be finalized",
+            )
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
             task_id=None,
             folder=folder,
-            user=access_context.user,
-            db=db,
+            user_id=user_id,
             single_file_mode=file is not None and (not files),
         )
 
@@ -605,14 +620,18 @@ async def upload_public_chat_files(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid task_id") from exc
     get_task_for_public_context(db, parsed_task_id, access_context)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail="Upload authorization could not be finalized",
+        )
 
     return await store_uploaded_files(
         upload_items=upload_items,
         task_type=task_type,
         task_id=task_id,
         folder=folder,
-        user=access_context.user,
-        db=db,
+        user_id=user_id,
         single_file_mode=file is not None and (not files),
     )
 
@@ -638,6 +657,7 @@ async def upload_share_chat_files(
     if not upload_items:
         raise HTTPException(status_code=422, detail="No files provided")
 
+    user_id = int(access_context.user.id)
     if not task_id:
         # A workforce share session starts its first turn inside task
         # creation, so its opening-message attachments must be uploaded
@@ -660,13 +680,17 @@ async def upload_share_chat_files(
                     f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
                 ),
             )
+        if not release_db_connection_if_clean(db):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload authorization could not be finalized",
+            )
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
             task_id=None,
             folder=folder,
-            user=access_context.user,
-            db=db,
+            user_id=user_id,
             single_file_mode=file is not None and (not files),
         )
 
@@ -675,14 +699,18 @@ async def upload_share_chat_files(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid task_id") from exc
     get_task_for_share_context(db, parsed_task_id, access_context)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail="Upload authorization could not be finalized",
+        )
 
     return await store_uploaded_files(
         upload_items=upload_items,
         task_type=task_type,
         task_id=task_id,
         folder=folder,
-        user=access_context.user,
-        db=db,
+        user_id=user_id,
         single_file_mode=file is not None and (not files),
     )
 
@@ -939,6 +967,73 @@ async def create_share_chat_task(
     )
 
 
+def _authorize_chat_websocket_sync(
+    *,
+    load_access_context: Callable[[Session], _ChatAccessContextT],
+    authorize_task: Callable[[Session, _ChatAccessContextT], object],
+) -> WebSocketPrincipal:
+    """Authorize one public WebSocket operation in a worker-owned Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        access_context = load_access_context(db)
+        authorize_task(db, access_context)
+        user_id = access_context.user.id
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user")
+        return WebSocketPrincipal(
+            id=int(user_id),
+            is_admin=bool(access_context.user.is_admin),
+        )
+
+
+async def _authorize_public_chat_websocket(
+    *,
+    token: str,
+    task_id: int,
+    expected_auth_mode: str,
+) -> WebSocketPrincipal:
+    """Validate widget access without blocking the asyncio event loop."""
+
+    def load_access_context(db: Session) -> PublicChatAccessContext:
+        return get_public_chat_user(
+            token,
+            db,
+            expected_auth_mode=expected_auth_mode,
+        )
+
+    def authorize_task(db: Session, context: PublicChatAccessContext) -> object:
+        return get_task_for_public_context(db, task_id, context)
+
+    return await run_db_io_cancellation_safe(
+        lambda: _authorize_chat_websocket_sync(
+            load_access_context=load_access_context,
+            authorize_task=authorize_task,
+        )
+    )
+
+
+async def _authorize_share_chat_websocket(
+    *,
+    token: str,
+    task_id: int,
+) -> WebSocketPrincipal:
+    """Validate share-link access without blocking the asyncio event loop."""
+
+    def load_access_context(db: Session) -> ShareChatAccessContext:
+        return get_share_chat_user(token, db)
+
+    def authorize_task(db: Session, context: ShareChatAccessContext) -> object:
+        return get_task_for_share_context(db, task_id, context)
+
+    return await run_db_io_cancellation_safe(
+        lambda: _authorize_chat_websocket_sync(
+            load_access_context=load_access_context,
+            authorize_task=authorize_task,
+        )
+    )
+
+
 async def public_chat_websocket_endpoint(
     *,
     websocket: WebSocket,
@@ -948,11 +1043,11 @@ async def public_chat_websocket_endpoint(
 ) -> None:
     """Serve widget/share websocket chat with per-message revalidation."""
     try:
-        with db_session_context() as db:
-            access_context = get_public_chat_user(
-                token, db, expected_auth_mode=expected_auth_mode
-            )
-            get_task_for_public_context(db, task_id, access_context)
+        principal = await _authorize_public_chat_websocket(
+            token=token,
+            task_id=task_id,
+            expected_auth_mode=expected_auth_mode,
+        )
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -960,26 +1055,24 @@ async def public_chat_websocket_endpoint(
     await manager.connect(websocket, task_id)
 
     try:
-        await handle_status_request(websocket, task_id, access_context.user)
+        await handle_status_request(websocket, task_id, principal)
 
         while True:
             data = await websocket.receive_text()
             message_data = json.loads(data)
 
             try:
-                with db_session_context() as validation_db:
-                    current_access_context = get_public_chat_user(
-                        token, validation_db, expected_auth_mode=expected_auth_mode
-                    )
-                    get_task_for_public_context(
-                        validation_db, task_id, current_access_context
-                    )
+                current_principal = await _authorize_public_chat_websocket(
+                    token=token,
+                    task_id=task_id,
+                    expected_auth_mode=expected_auth_mode,
+                )
             except HTTPException as exc:
                 await websocket.close(code=4003, reason=exc.detail)
                 return
 
-            message_data["user_id"] = access_context.user.id
-            message_data["user"] = access_context.user
+            message_data["user_id"] = current_principal.id
+            message_data["user"] = current_principal
 
             if message_data.get("type") == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
@@ -1006,9 +1099,10 @@ async def share_chat_websocket_endpoint(
 ) -> None:
     """Serve share websocket chat with per-message revalidation."""
     try:
-        with db_session_context() as db:
-            access_context = get_share_chat_user(token, db)
-            get_task_for_share_context(db, task_id, access_context)
+        principal = await _authorize_share_chat_websocket(
+            token=token,
+            task_id=task_id,
+        )
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -1016,24 +1110,23 @@ async def share_chat_websocket_endpoint(
     await manager.connect(websocket, task_id)
 
     try:
-        await handle_status_request(websocket, task_id, access_context.user)
+        await handle_status_request(websocket, task_id, principal)
 
         while True:
             data = await websocket.receive_text()
             message_data = json.loads(data)
 
             try:
-                with db_session_context() as validation_db:
-                    current_access_context = get_share_chat_user(token, validation_db)
-                    get_task_for_share_context(
-                        validation_db, task_id, current_access_context
-                    )
+                current_principal = await _authorize_share_chat_websocket(
+                    token=token,
+                    task_id=task_id,
+                )
             except HTTPException as exc:
                 await websocket.close(code=4003, reason=exc.detail)
                 return
 
-            message_data["user_id"] = access_context.user.id
-            message_data["user"] = access_context.user
+            message_data["user_id"] = current_principal.id
+            message_data["user"] = current_principal
 
             if message_data.get("type") == "chat":
                 await handle_chat_message(websocket, task_id, message_data)

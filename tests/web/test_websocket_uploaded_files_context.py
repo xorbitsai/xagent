@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +24,15 @@ from xagent.web.api.websocket import (
     handle_file_upload_for_task,
 )
 from xagent.web.models import Base
-from xagent.web.models import database as database_models
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services.task_lease_service import TaskLease
+from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
+    TaskSetupSnapshot,
+    _TaskFields,
+)
 
 
 @pytest.fixture()
@@ -60,6 +66,8 @@ def _create_task(
     user_id: int,
     selected_file_ids: list[str] | None = None,
     status: TaskStatus = TaskStatus.PENDING,
+    runner_id: str | None = None,
+    run_id: str | None = None,
 ) -> Task:
     task = Task(
         id=task_id,
@@ -67,6 +75,8 @@ def _create_task(
         title=f"task-{task_id}",
         description="task",
         status=status,
+        runner_id=runner_id,
+        run_id=run_id,
         agent_config=(
             {"selected_file_ids": selected_file_ids}
             if selected_file_ids is not None
@@ -76,6 +86,49 @@ def _create_task(
     db.add(task)
     db.flush()
     return task
+
+
+def _task_setup_snapshot(
+    *,
+    task_id: int,
+    user_id: int,
+    status: TaskStatus,
+    run_id: str | None = None,
+) -> TaskSetupSnapshot:
+    """Build the detached runtime input consumed by the background runner."""
+    return TaskSetupSnapshot(
+        task=_TaskFields(
+            id=task_id,
+            user_id=user_id,
+            status=status,
+            source=None,
+            agent_id=None,
+            agent_config=None,
+            model_name=None,
+            compact_model_name=None,
+            execution_mode=None,
+            agent_type="standard",
+            run_id=run_id,
+        ),
+        runtime_user=RuntimeUserFields(id=user_id, is_admin=False),
+        has_reconstructable_history=False,
+        task_pattern="single_call",
+        task_llm=None,
+        task_fast_llm=None,
+        task_vision_llm=None,
+        task_compact_llm=None,
+        agent=None,
+        agent_config=None,
+        excluded_agent_id=None,
+    )
+
+
+def _task_lease(task_id: int) -> TaskLease:
+    return TaskLease(
+        task_id=task_id,
+        runner_id="test-runner",
+        run_id=f"run-{task_id}",
+    )
 
 
 def _create_uploaded_file(
@@ -114,12 +167,16 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
     terminal_status,
 ):
     user = _create_user(db_session, 1, "owner")
+    lease = _task_lease(10)
     _create_task(
         db_session,
         task_id=10,
         user_id=1,
         status=terminal_status,
+        runner_id=lease.runner_id,
+        run_id=lease.run_id,
     )
+    db_session.commit()
     captured: dict[str, object] = {}
 
     class BackgroundTaskManager:
@@ -156,30 +213,14 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             captured["tracking_task_id"] = kwargs.get("tracking_task_id")
             return {"success": True, "output": "ok", "file_outputs": []}
 
-    def fake_get_db():
-        yield db_session
-
-    def fake_release_current_runner_task_lease_with_workforce_sync(
-        db, task_id, *, status
-    ):
-        return True
-
     monkeypatch.setattr(
         websocket_api,
         "background_task_manager",
         BackgroundTaskManager(),
     )
     monkeypatch.setattr(websocket_api, "manager", BroadcastManager())
-    monkeypatch.setattr(
-        websocket_api,
-        "release_current_runner_task_lease_with_workforce_sync",
-        fake_release_current_runner_task_lease_with_workforce_sync,
-    )
-    monkeypatch.setattr(database_models, "get_db", fake_get_db)
-    monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message",
-        lambda *args, **kwargs: None,
-    )
+    test_sessionmaker = sessionmaker(bind=db_session.get_bind())
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
 
     await execute_task_background(
         task_id=10,
@@ -188,6 +229,15 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
         agent_manager=AgentManager(),
         task_owner_user_id=int(user.id),
         llm_user_message="重试",
+        task_setup_snapshot=_task_setup_snapshot(
+            task_id=10,
+            user_id=int(user.id),
+            status=terminal_status,
+            run_id=lease.run_id,
+        ),
+        expected_run_id=lease.run_id,
+        task_lease=lease,
+        resolved_execution_scope=None,
     )
 
     assert captured["agent_task_id"] == "10"
@@ -218,15 +268,10 @@ def _wire_execute_task_background(monkeypatch, db_session, manager):
     """Wire execute_task_background's collaborators to the test session.
 
     ``get_session_local`` is pointed at the same engine as ``db_session``
-    so the failure handler's status probe (and the terminal payload
-    writer, when not stubbed) read the row the test committed.
+    so the worker-owned upload registration and isolated result finalizer read
+    the row the test committed. The concrete lease remains owned by the
+    orchestrator; these executor tests therefore never stub lease settlement.
     """
-
-    def fake_get_db():
-        yield db_session
-
-    def fake_release(db, task_id, *, status):
-        return True
 
     test_sessionmaker = sessionmaker(bind=db_session.get_bind())
 
@@ -234,24 +279,7 @@ def _wire_execute_task_background(monkeypatch, db_session, manager):
         websocket_api, "background_task_manager", _NoopBackgroundTaskManager()
     )
     monkeypatch.setattr(websocket_api, "manager", manager)
-    monkeypatch.setattr(
-        websocket_api,
-        "release_current_runner_task_lease_with_workforce_sync",
-        fake_release,
-    )
     monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
-    monkeypatch.setattr(database_models, "get_db", fake_get_db)
-
-    def fake_persist_assistant_message(db, *args, **kwargs):
-        # The real helper commits the session; mirror that so the pending
-        # terminal status set by execute_task_background is durably landed
-        # (the status commit now rides on the assistant-message write).
-        db.commit()
-
-    monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message",
-        fake_persist_assistant_message,
-    )
 
 
 @pytest.mark.asyncio
@@ -262,7 +290,15 @@ async def test_completion_broadcast_failure_keeps_task_completed(
     execution failure: the already-COMPLETED row is left untouched, no
     task_error is emitted, and the terminal failure writer is not invoked."""
     user = _create_user(db_session, 1, "owner")
-    _create_task(db_session, task_id=10, user_id=1, status=TaskStatus.RUNNING)
+    lease = _task_lease(10)
+    _create_task(
+        db_session,
+        task_id=10,
+        user_id=1,
+        status=TaskStatus.RUNNING,
+        runner_id=lease.runner_id,
+        run_id=lease.run_id,
+    )
     db_session.commit()
 
     sent_events: list[object] = []
@@ -283,7 +319,12 @@ async def test_completion_broadcast_failure_keeps_task_completed(
             return {"success": True, "output": "ok", "file_outputs": []}
 
     def fake_payload(
-        task_id, message, *, event_type="agent_error", expected_run_id=None
+        task_id,
+        message,
+        *,
+        event_type="agent_error",
+        expected_run_id=None,
+        only_if_running=False,
     ):
         payload_calls.append((task_id, message, event_type))
         return {"type": event_type, "task_id": task_id}
@@ -298,11 +339,22 @@ async def test_completion_broadcast_failure_keeps_task_completed(
         agent_manager=AgentManager(),
         task_owner_user_id=int(user.id),
         llm_user_message="hi",
+        task_setup_snapshot=_task_setup_snapshot(
+            task_id=10,
+            user_id=int(user.id),
+            status=TaskStatus.RUNNING,
+            run_id=lease.run_id,
+        ),
+        expected_run_id=lease.run_id,
+        task_lease=lease,
+        resolved_execution_scope=None,
     )
 
     db_session.expire_all()
     task = db_session.query(Task).filter(Task.id == 10).first()
     assert task.status == TaskStatus.COMPLETED
+    assert task.runner_id == lease.runner_id
+    assert task.run_id == lease.run_id
     assert task.error_message is None
     assert "task_completed" in sent_events
     assert "task_error" not in sent_events
@@ -314,7 +366,15 @@ async def test_late_execution_result_does_not_resurrect_canceled_a2a_task(
     db_session, monkeypatch
 ):
     user = _create_user(db_session, 1, "owner")
-    _create_task(db_session, task_id=14, user_id=1, status=TaskStatus.RUNNING)
+    lease = _task_lease(14)
+    _create_task(
+        db_session,
+        task_id=14,
+        user_id=1,
+        status=TaskStatus.RUNNING,
+        runner_id=lease.runner_id,
+        run_id=lease.run_id,
+    )
     db_session.commit()
 
     class BroadcastManager:
@@ -346,6 +406,15 @@ async def test_late_execution_result_does_not_resurrect_canceled_a2a_task(
         agent_manager=AgentManager(),
         task_owner_user_id=int(user.id),
         llm_user_message="hi",
+        task_setup_snapshot=_task_setup_snapshot(
+            task_id=14,
+            user_id=int(user.id),
+            status=TaskStatus.RUNNING,
+            run_id=lease.run_id,
+        ),
+        expected_run_id=lease.run_id,
+        task_lease=lease,
+        resolved_execution_scope=None,
     )
 
     db_session.expire_all()
@@ -354,17 +423,25 @@ async def test_late_execution_result_does_not_resurrect_canceled_a2a_task(
     assert task.agent_config == {"a2a_state": "TASK_STATE_CANCELED"}
     assert task.output is None
     assert task.error_message == "Task canceled by A2A client."
+    assert task.runner_id == lease.runner_id
+    assert task.run_id == lease.run_id
 
 
 @pytest.mark.asyncio
-async def test_execution_failure_routes_real_error_to_terminal_payload(
+async def test_execution_failure_is_deferred_to_concrete_lease_owner(
     db_session, monkeypatch
 ):
-    """A genuine execution failure (task still RUNNING) routes the real
-    exception text through _terminal_task_error_payload (which persists
-    FAILED + error_message) and emits task_error."""
+    """Only the concrete lease owner may settle and emit terminal failure."""
     user = _create_user(db_session, 1, "owner")
-    _create_task(db_session, task_id=11, user_id=1, status=TaskStatus.RUNNING)
+    lease = _task_lease(11)
+    _create_task(
+        db_session,
+        task_id=11,
+        user_id=1,
+        status=TaskStatus.RUNNING,
+        runner_id=lease.runner_id,
+        run_id=lease.run_id,
+    )
     db_session.commit()
 
     sent_events: list[object] = []
@@ -382,7 +459,12 @@ async def test_execution_failure_routes_real_error_to_terminal_payload(
             raise RuntimeError("agent boom xyz")
 
     def fake_payload(
-        task_id, message, *, event_type="agent_error", expected_run_id=None
+        task_id,
+        message,
+        *,
+        event_type="agent_error",
+        expected_run_id=None,
+        only_if_running=False,
     ):
         payload_calls.append((task_id, message, event_type))
         return {"type": event_type, "task_id": task_id}
@@ -390,30 +472,54 @@ async def test_execution_failure_routes_real_error_to_terminal_payload(
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
     monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
 
-    await execute_task_background(
-        task_id=11,
-        user_message="hi",
-        context={},
-        agent_manager=AgentManager(),
-        task_owner_user_id=int(user.id),
-        llm_user_message="hi",
-    )
+    with pytest.raises(RuntimeError, match="agent boom xyz"):
+        await execute_task_background(
+            task_id=11,
+            user_message="hi",
+            context={},
+            agent_manager=AgentManager(),
+            task_owner_user_id=int(user.id),
+            llm_user_message="hi",
+            task_setup_snapshot=_task_setup_snapshot(
+                task_id=11,
+                user_id=int(user.id),
+                status=TaskStatus.RUNNING,
+                run_id=lease.run_id,
+            ),
+            expected_run_id=lease.run_id,
+            task_lease=lease,
+            resolved_execution_scope=None,
+        )
 
-    assert payload_calls == [(11, "agent boom xyz", "task_error")]
-    assert "task_error" in sent_events
+    assert payload_calls == []
+    assert sent_events == []
+    db_session.expire_all()
+    task = db_session.query(Task).filter(Task.id == 11).one()
+    assert task.status == TaskStatus.RUNNING
+    assert task.runner_id == lease.runner_id
+    assert task.run_id == lease.run_id
 
 
 @pytest.mark.asyncio
 async def test_assistant_persist_failure_surfaces_as_task_failure(
     db_session, monkeypatch
 ):
-    """Assistant-message persistence is a durable write, not best-effort.
-    If it fails after a successful agent result, the terminal status must
-    not have been committed (it is pending until the message lands), so
-    the failure is surfaced through _terminal_task_error_payload rather
-    than leaving a COMPLETED row with no message."""
+    """Assistant-message persistence is a durable part of finalization.
+
+    If it fails after a successful agent result, the isolated transaction
+    rolls back, the exact lease stays RUNNING, and the exception returns to
+    the orchestrator that owns settlement.
+    """
     user = _create_user(db_session, 1, "owner")
-    _create_task(db_session, task_id=12, user_id=1, status=TaskStatus.RUNNING)
+    lease = _task_lease(12)
+    _create_task(
+        db_session,
+        task_id=12,
+        user_id=1,
+        status=TaskStatus.RUNNING,
+        runner_id=lease.runner_id,
+        run_id=lease.run_id,
+    )
     db_session.commit()
 
     payload_calls: list[tuple] = []
@@ -433,41 +539,65 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
         raise RuntimeError("durable persist failed")
 
     def fake_payload(
-        task_id, message, *, event_type="agent_error", expected_run_id=None
+        task_id,
+        message,
+        *,
+        event_type="agent_error",
+        expected_run_id=None,
+        only_if_running=False,
     ):
         payload_calls.append((task_id, event_type))
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
-    # Override the no-op persist with one that fails (durable write error).
+    # The isolated finalizer owns the no-commit message write and the terminal
+    # task transition in one transaction.
     monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message", boom
+        "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
+        boom,
     )
     monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
 
-    await execute_task_background(
-        task_id=12,
-        user_message="hi",
-        context={},
-        agent_manager=AgentManager(),
-        task_owner_user_id=int(user.id),
-        llm_user_message="hi",
-    )
+    with pytest.raises(RuntimeError, match="durable persist failed"):
+        await execute_task_background(
+            task_id=12,
+            user_message="hi",
+            context={},
+            agent_manager=AgentManager(),
+            task_owner_user_id=int(user.id),
+            llm_user_message="hi",
+            task_setup_snapshot=_task_setup_snapshot(
+                task_id=12,
+                user_id=int(user.id),
+                status=TaskStatus.RUNNING,
+                run_id=lease.run_id,
+            ),
+            expected_run_id=lease.run_id,
+            task_lease=lease,
+            resolved_execution_scope=None,
+        )
 
-    # The COMPLETED status was never committed (pending until the message
-    # write that failed), so the status probe still sees RUNNING and the
-    # failure is routed to the terminal payload writer.
-    assert payload_calls == [(12, "task_error")]
+    assert payload_calls == []
+    db_session.expire_all()
+    task = db_session.query(Task).filter(Task.id == 12).one()
+    assert task.status == TaskStatus.RUNNING
+    assert task.runner_id == lease.runner_id
+    assert task.run_id == lease.run_id
 
 
 @pytest.mark.asyncio
 async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
-    """An empty assistant reply makes persist_assistant_message
-    early-return WITHOUT committing. The explicit terminal commit must
-    still land COMPLETED, so a successful empty turn is not left RUNNING
-    (and later flipped to FAILED by finish_turn)."""
+    """An empty assistant write still commits the terminal task transition."""
     user = _create_user(db_session, 1, "owner")
-    _create_task(db_session, task_id=13, user_id=1, status=TaskStatus.RUNNING)
+    lease = _task_lease(13)
+    _create_task(
+        db_session,
+        task_id=13,
+        user_id=1,
+        status=TaskStatus.RUNNING,
+        runner_id=lease.runner_id,
+        run_id=lease.run_id,
+    )
     db_session.commit()
 
     payload_calls: list[tuple] = []
@@ -484,15 +614,20 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
             return {"success": True, "output": "ok", "file_outputs": []}
 
     def fake_payload(
-        task_id, message, *, event_type="agent_error", expected_run_id=None
+        task_id,
+        message,
+        *,
+        event_type="agent_error",
+        expected_run_id=None,
+        only_if_running=False,
     ):
         payload_calls.append((task_id, event_type))
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
-    # Empty-content path: persist early-returns None without committing.
+    # Empty-content path: the no-commit helper returns without adding a row.
     monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message",
+        "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
@@ -504,11 +639,22 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
         agent_manager=AgentManager(),
         task_owner_user_id=int(user.id),
         llm_user_message="hi",
+        task_setup_snapshot=_task_setup_snapshot(
+            task_id=13,
+            user_id=int(user.id),
+            status=TaskStatus.RUNNING,
+            run_id=lease.run_id,
+        ),
+        expected_run_id=lease.run_id,
+        task_lease=lease,
+        resolved_execution_scope=None,
     )
 
     db_session.expire_all()
     task = db_session.query(Task).filter(Task.id == 13).first()
     assert task.status == TaskStatus.COMPLETED
+    assert task.runner_id == lease.runner_id
+    assert task.run_id == lease.run_id
     assert payload_calls == []
 
 
@@ -640,7 +786,6 @@ def test_selected_file_refs_from_task_revalidates_owner_and_task_binding(
         task_id=11,
         filename="other-task.txt",
     )
-
     assert _selected_file_refs_from_task(task, db_session) == [
         {
             "file_id": "task-file",
@@ -702,7 +847,7 @@ def test_normalize_file_outputs_rejects_foreign_storage_path_record(
     assert path_to_file_id == {}
 
 
-def test_normalize_file_outputs_rejects_foreign_untracked_storage_path(
+def test_normalize_file_outputs_preserves_unregistered_legacy_path(
     db_session,
     tmp_path,
     monkeypatch,
@@ -711,18 +856,19 @@ def test_normalize_file_outputs_rejects_foreign_untracked_storage_path(
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
     _create_user(db_session, 1, "owner")
     _create_task(db_session, task_id=20, user_id=1)
-    foreign_path = uploads_dir / "user_2" / "web_task_10" / "output" / "secret.txt"
-    foreign_path.parent.mkdir(parents=True)
-    foreign_path.write_text("secret")
+    legacy_path = uploads_dir / "user_1" / "web_task_20" / "output" / "legacy.txt"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text("legacy")
+    legacy_output = {"path": str(legacy_path), "filename": "legacy.txt"}
 
     normalized_outputs, path_to_file_id = _normalize_file_outputs(
         db_session,
         task_id=20,
         task_user_id=1,
-        file_outputs=[{"path": str(foreign_path)}],
+        file_outputs=[legacy_output],
     )
 
-    assert normalized_outputs == []
+    assert normalized_outputs == [legacy_output]
     assert path_to_file_id == {}
     assert db_session.query(UploadedFile).count() == 0
 
@@ -905,7 +1051,7 @@ def test_normalize_file_outputs_rejects_registered_non_output_agent_file(
     assert path_to_file_id == {}
 
 
-def test_normalize_file_outputs_registers_current_task_output_path(
+def test_normalize_file_outputs_preserves_mixed_registered_and_legacy_order(
     db_session,
     tmp_path,
     monkeypatch,
@@ -916,30 +1062,53 @@ def test_normalize_file_outputs_registers_current_task_output_path(
     get_unscoped_file_storage.cache_clear()
     _create_user(db_session, 1, "owner")
     _create_task(db_session, task_id=20, user_id=1)
-    output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
-    output_path.parent.mkdir(parents=True)
-    output_path.write_text("report")
+    registered_path = (
+        uploads_dir / "user_1" / "web_task_20" / "output" / "registered.txt"
+    )
+    legacy_path = uploads_dir / "user_1" / "web_task_20" / "output" / "legacy.txt"
+    registered_path.parent.mkdir(parents=True)
+    registered_path.write_text("registered")
+    legacy_path.write_text("legacy")
+    db_session.add(
+        UploadedFile(
+            file_id="registered-output",
+            user_id=1,
+            task_id=20,
+            filename="registered.txt",
+            storage_path=str(registered_path),
+            storage_status="legacy",
+            mime_type="text/plain",
+            file_size=len("registered"),
+            workspace_relative_path="output/registered.txt",
+            workspace_category="output",
+        )
+    )
+    db_session.flush()
+    legacy_output = {"path": str(legacy_path), "filename": "legacy.txt"}
 
     try:
         normalized_outputs, path_to_file_id = _normalize_file_outputs(
             db_session,
             task_id=20,
             task_user_id=1,
-            file_outputs=[{"path": str(output_path), "filename": "report.txt"}],
+            file_outputs=[
+                {
+                    "path": str(registered_path),
+                    "filename": "registered.txt",
+                },
+                legacy_output,
+            ],
         )
     finally:
         get_unscoped_file_storage.cache_clear()
 
-    assert len(normalized_outputs) == 1
-    assert normalized_outputs[0]["filename"] == "report.txt"
-    assert path_to_file_id[str(output_path)] == normalized_outputs[0]["file_id"]
-    file_record = db_session.query(UploadedFile).one()
-    assert file_record.user_id == 1
-    assert file_record.task_id == 20
-    assert file_record.storage_path == str(output_path)
+    assert normalized_outputs[0]["file_id"] == "registered-output"
+    assert normalized_outputs[1] == legacy_output
+    assert path_to_file_id[str(registered_path)] == "registered-output"
+    assert db_session.query(UploadedFile).count() == 1
 
 
-def test_normalize_task_file_outputs_registers_preview_output_normally(
+def test_normalize_task_file_outputs_projects_registered_preview_output(
     db_session,
     tmp_path,
     monkeypatch,
@@ -952,6 +1121,21 @@ def test_normalize_task_file_outputs_registers_preview_output_normally(
     output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
     output_path.parent.mkdir(parents=True)
     output_path.write_text("preview report")
+    db_session.add(
+        UploadedFile(
+            file_id="preview-output",
+            user_id=1,
+            task_id=20,
+            filename="report.txt",
+            storage_path=str(output_path),
+            storage_status="legacy",
+            mime_type="text/plain",
+            file_size=len("preview report"),
+            workspace_relative_path="output/report.txt",
+            workspace_category="output",
+        )
+    )
+    db_session.flush()
 
     normalized_outputs, path_to_file_id = _normalize_task_file_outputs(
         db_session,
@@ -960,12 +1144,14 @@ def test_normalize_task_file_outputs_registers_preview_output_normally(
     )
 
     assert len(normalized_outputs) == 1
+    assert normalized_outputs[0]["file_id"] == "preview-output"
     assert normalized_outputs[0]["filename"] == "report.txt"
-    assert path_to_file_id[str(output_path)] == normalized_outputs[0]["file_id"]
+    assert path_to_file_id[str(output_path)] == "preview-output"
     file_record = db_session.query(UploadedFile).one()
     assert file_record.user_id == 1
     assert file_record.task_id == 20
     assert file_record.storage_path == str(output_path)
+    assert file_record.storage_status == "legacy"
 
 
 @pytest.mark.asyncio
@@ -1002,6 +1188,10 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
         task_id=11,
         filename="other-task.txt",
     )
+    # Turn-file resolution may release its read-only connection before local
+    # restore/checksum work. Persist setup first so the test exercises that
+    # production boundary instead of carrying fixture writes into storage I/O.
+    db_session.commit()
 
     import xagent.web.api.chat as chat_api
 
@@ -1028,7 +1218,7 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
     assert valid_file.task_id == 10
 
 
-def test_register_uploaded_files_for_agent_uses_execution_db_session(
+def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     db_session,
     tmp_path,
 ):
@@ -1046,8 +1236,11 @@ def test_register_uploaded_files_for_agent_uses_execution_db_session(
             self.input_dir = str(tmp_path / "workspace" / "input")
             self.registered_files = []
 
-        def register_file(self, path, file_id, db_session=None):
-            self.registered_files.append((path, file_id, db_session))
+        def describe_file_registration(self, path):
+            return SimpleNamespace(path=Path(path))
+
+        def bind_already_durable_file(self, registration, *, file_id):
+            self.registered_files.append((registration.path, file_id))
 
     workspace = Workspace()
     file_info = {
@@ -1060,11 +1253,9 @@ def test_register_uploaded_files_for_agent_uses_execution_db_session(
     _register_uploaded_files_for_agent(
         SimpleNamespace(workspace=workspace),
         [file_info],
-        db_session,
     )
 
     assert [item[1] for item in workspace.registered_files] == ["valid-file"]
-    assert workspace.registered_files[0][2] is db_session
     assert file_info["workspace_path"]
 
 

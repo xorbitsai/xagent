@@ -24,20 +24,30 @@ existing ``test_task_orchestrator`` fixture style.
 from __future__ import annotations
 
 from dataclasses import is_dataclass
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
 
+from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
     load_task_setup_snapshot_sync,
 )
+from xagent.web.services.trace_message_storage import (
+    MESSAGE_REFS_ENCODING,
+    encode_checkpoint_data_for_storage,
+)
+from xagent.web.services.workforce_runtime import WorkforceTaskRuntime
 
 
 @pytest.fixture()
@@ -126,6 +136,33 @@ def test_owner_mismatch_raises_distinct_from_missing(db_session) -> None:
     )
 
 
+def test_actor_authorization_is_applied_inside_snapshot_session(db_session) -> None:
+    owner = _create_user(db_session)
+    stranger = User(username="stranger", password_hash="hash", is_admin=False)
+    admin = User(username="admin", password_hash="hash", is_admin=True)
+    db_session.add_all([stranger, admin])
+    db_session.commit()
+    task = _create_task(db_session, user_id=int(owner.id))
+
+    assert (
+        load_task_setup_snapshot_sync(
+            task_id=int(task.id),
+            task_owner_user_id=None,
+            actor_user_id=int(stranger.id),
+            actor_is_admin=False,
+        )
+        is None
+    )
+    admin_snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id),
+        task_owner_user_id=None,
+        actor_user_id=int(admin.id),
+        actor_is_admin=True,
+    )
+    assert admin_snapshot is not None
+    assert admin_snapshot.task.user_id == int(owner.id)
+
+
 def test_basic_task_no_agent_builder(db_session) -> None:
     """Happy path: standalone task with no ``agent_id``. Snapshot
     populates ``task`` and resolves LLMs from task fields only;
@@ -147,8 +184,13 @@ def test_basic_task_no_agent_builder(db_session) -> None:
     assert snapshot.task.user_id == int(user.id)
     assert snapshot.task.status == TaskStatus.PENDING
     assert snapshot.task.source == "sdk"
+    assert snapshot.task.run_id == task.run_id
+    assert snapshot.task.state_version == int(task.state_version or 0)
+    assert snapshot.task.control_state == task.control_state
     assert snapshot.task.agent_id is None
     assert snapshot.task.execution_mode == "flash"
+    assert snapshot.runtime_user == RuntimeUserFields(id=int(user.id), is_admin=False)
+    assert snapshot.has_reconstructable_history is False
 
     # No agent-builder branch fired
     assert snapshot.agent is None
@@ -194,6 +236,258 @@ def test_task_source_is_preserved(db_session, source: str | None) -> None:
 
     assert snapshot is not None
     assert snapshot.task.source == source
+
+
+def test_reconstructable_history_is_captured_in_snapshot(db_session) -> None:
+    """The retry pre-check is read in the worker-owned snapshot session."""
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        status=TaskStatus.RUNNING,
+    )
+
+    build_event = TraceEvent(
+        task_id=int(task.id),
+        build_id="builder-session",
+        event_id="build-only",
+        event_type="build_step",
+        timestamp=datetime.now(timezone.utc),
+        data={},
+    )
+    db_session.add(build_event)
+    db_session.commit()
+
+    without_runtime_history = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+    assert without_runtime_history is not None
+    assert without_runtime_history.has_reconstructable_history is False
+
+    runtime_event = TraceEvent(
+        task_id=int(task.id),
+        build_id=None,
+        event_id="runtime-event",
+        event_type="agent_step",
+        timestamp=datetime.now(timezone.utc),
+        data={},
+    )
+    db_session.add(runtime_event)
+    db_session.commit()
+
+    with_trace_history = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+    assert with_trace_history is not None
+    assert with_trace_history.has_reconstructable_history is True
+
+    db_session.delete(runtime_event)
+    db_session.add(DAGExecution(task_id=int(task.id), current_plan={"steps": []}))
+    db_session.commit()
+
+    with_dag_history = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+    assert with_dag_history is not None
+    assert with_dag_history.has_reconstructable_history is True
+
+
+def test_snapshot_captures_turn_transcript_recovery_and_decoded_reconstruction(
+    db_session,
+) -> None:
+    """Every retry read is completed inside the snapshot's worker session."""
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        status=TaskStatus.RUNNING,
+    )
+    prior_message = TaskChatMessage(
+        task_id=int(task.id),
+        user_id=int(user.id),
+        role="user",
+        content="prior turn",
+        message_type="user_message",
+    )
+    current_message = TaskChatMessage(
+        task_id=int(task.id),
+        user_id=int(user.id),
+        role="user",
+        content="current turn",
+        message_type="user_message",
+    )
+    db_session.add_all([prior_message, current_message])
+    db_session.flush()
+
+    checkpoint_messages = [{"role": "user", "content": "checkpoint input"}]
+    checkpoint_data = {
+        "checkpoint_type": CHECKPOINT_TYPE,
+        "root_execution_id": "execution-1",
+        "execution_id": "execution-1",
+        "label": "after_llm",
+        "snapshot": {
+            "type": "checkpoint",
+            "label": "after_llm",
+            "execution_id": "execution-1",
+            "context": {"messages": checkpoint_messages},
+            "pattern": "ReActPattern",
+            "pattern_state": {"current_iteration": 1},
+        },
+    }
+    encoded_checkpoint = encode_checkpoint_data_for_storage(
+        db_session,
+        task_id=int(task.id),
+        data=checkpoint_data,
+        use_v2=False,
+    )
+    assert (
+        encoded_checkpoint["snapshot"]["context"]["messages"]["__encoding"]
+        == MESSAGE_REFS_ENCODING
+    )
+    now = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            TraceEvent(
+                task_id=int(task.id),
+                build_id=None,
+                event_id="checkpoint-event",
+                event_type="pattern_checkpoint",
+                timestamp=now,
+                data=encoded_checkpoint,
+            ),
+            TraceEvent(
+                task_id=int(task.id),
+                build_id=None,
+                event_id="tool-event",
+                event_type="tool_execution_end",
+                timestamp=now,
+                data={
+                    "tool_name": "web_search",
+                    "success": True,
+                    "result": {"title": "prior evidence"},
+                },
+            ),
+            TraceEvent(
+                task_id=int(task.id),
+                build_id=None,
+                event_id="skill-event",
+                event_type="skill_select_end",
+                timestamp=now,
+                data={"selected": True, "skill_name": "translator"},
+            ),
+            DAGExecution(
+                task_id=int(task.id),
+                current_plan={"steps": [{"id": "step-1"}]},
+            ),
+        ]
+    )
+    db_session.commit()
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id),
+        task_owner_user_id=int(user.id),
+        before_message_id=int(current_message.id),
+    )
+
+    assert snapshot is not None
+    assert snapshot.conversation_history == ({"role": "user", "content": "prior turn"},)
+    assert snapshot.execution_recovery.selected_skill_name == "translator"
+    assert len(snapshot.execution_recovery.messages) == 1
+    assert "prior evidence" in snapshot.execution_recovery.messages[0]["content"]
+    assert snapshot.reconstruction.plan_state == {"steps": [{"id": "step-1"}]}
+    checkpoint_event = next(
+        event
+        for event in snapshot.reconstruction.tracer_events
+        if event["id"] == "checkpoint-event"
+    )
+    assert checkpoint_event["data"]["snapshot"]["context"]["messages"] == (
+        checkpoint_messages
+    )
+
+
+def test_snapshot_carries_verified_workforce_runtime(db_session) -> None:
+    """The runtime resolved by llm_utils is not discarded and re-queried later."""
+    user = _create_user(db_session)
+    task = _create_task(db_session, user_id=int(user.id), agent_config={})
+    manager = _create_agent(
+        db_session,
+        user_id=int(user.id),
+        id=51,
+        name="Research manager",
+    )
+    workforce = Workforce(
+        id=41,
+        owner_user_id=int(user.id),
+        scope_type="user",
+        scope_id=str(user.id),
+        name="Research team",
+        description="Coordinates research tasks",
+        manager_agent_id=int(manager.id),
+        status="active",
+    )
+    db_session.add(workforce)
+    db_session.flush()
+    workforce_snapshot = {
+        "version": 1,
+        "workforce": {"id": 41, "name": "Research team"},
+        "manager": {"agent_id": 51, "runtime_prompt": "Coordinate workers"},
+        "workers": [
+            {
+                "agent_id": 61,
+                "name": "Researcher",
+                "alias": "Researcher",
+                "description": "Find evidence",
+                "assignment_instructions": "Find evidence",
+                "enabled": True,
+            }
+        ],
+    }
+    run = WorkforceRun(
+        workforce_id=int(workforce.id),
+        task_id=int(task.id),
+        user_id=int(user.id),
+        status="pending",
+        snapshot=workforce_snapshot,
+    )
+    db_session.add(run)
+    db_session.flush()
+    task.agent_config = {"workforce_run_id": int(run.id)}
+    db_session.commit()
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert isinstance(snapshot.workforce_runtime, WorkforceTaskRuntime)
+    assert snapshot.workforce_runtime.workforce_run_id == int(run.id)
+    assert snapshot.workforce_runtime.allowed_agent_ids == [61]
+
+
+def test_inline_published_preview_agent_is_excluded_in_snapshot(db_session) -> None:
+    """Preview exclusion uses the same owner/team visibility rule off-loop."""
+    user = _create_user(db_session)
+    preview_agent = _create_agent(db_session, user_id=int(user.id))
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        agent_id=None,
+        agent_config={
+            "instructions": "preview instructions",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": [],
+            "preview_agent_id": int(preview_agent.id),
+        },
+    )
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.agent is None
+    assert snapshot.excluded_agent_id == int(preview_agent.id)
 
 
 def test_agent_builder_published_sets_excluded_agent_id(db_session) -> None:
@@ -315,6 +609,10 @@ def test_no_orm_leak_in_returned_fields(db_session) -> None:
         snapshot.task.execution_mode, str
     )
     assert snapshot.task.agent_type is None or isinstance(snapshot.task.agent_type, str)
+    assert isinstance(snapshot.runtime_user, RuntimeUserFields)
+    assert isinstance(snapshot.runtime_user.id, int)
+    assert isinstance(snapshot.runtime_user.is_admin, bool)
+    assert isinstance(snapshot.has_reconstructable_history, bool)
     # agent_config is JSON column -- dict or None, never an ORM proxy.
     assert snapshot.task.agent_config is None or isinstance(
         snapshot.task.agent_config, dict

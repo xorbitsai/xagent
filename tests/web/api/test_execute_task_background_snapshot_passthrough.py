@@ -1,5 +1,4 @@
-"""Test that ``execute_task_background`` consumes the snapshot when
-provided and falls back to its legacy Task SELECT when it isn't.
+"""Test that ``execute_task_background`` consumes an off-loop snapshot.
 
 Background:
     Profiling measured the inline ``db.query(Task)`` at the top of
@@ -13,33 +12,35 @@ Background:
 
 What this test pins:
 
-    * Snapshot path: ``db.query(Task)`` is **not** called on the
-      request session. ``db.query(User)`` still fires once because
-      ``get_user_tool_overrides`` is a hook (``Callable[[Session,
-      Any], dict]``) that may read arbitrary ORM fields off the user
-      object -- swapping in a primitive shim would be a quiet BC
-      break.
-    * Legacy / WS path (``task_setup_snapshot=None``):
-      ``db.query(Task)`` fires once (the existence check) and
-      ``db.query(User)`` fires once. This pins the WS-fallback
-      behaviour so a future refactor that drops the fallback branch
-      gets caught here, not in production logs.
+    * Snapshot path performs no event-loop Task/User query.
+    * A caller that omits the snapshot loads the same primitive snapshot in a
+      worker thread instead of reintroducing an event-loop Session.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import threading
 from collections import Counter
+from time import monotonic
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.web.api.websocket import execute_task_background
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import AgentRuntimeFields
+from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
 )
@@ -77,6 +78,8 @@ def _make_snapshot(*, source: str | None = "trigger") -> TaskSetupSnapshot:
             execution_mode="flash",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="single_call",
         task_llm=None,
         task_fast_llm=None,
@@ -136,24 +139,12 @@ def _build_db_mock(*, task_row: Any, user_row: Any) -> tuple[MagicMock, _QueryCo
 
 
 def _common_patches(db: Any, agent_service: Any) -> list[Any]:
-    """Patch the rest of ``execute_task_background``'s body so the
-    test focuses on the Task / User query counters at the top.
-    Downstream layers (transcript load, agent run, status update,
-    persist) are stubbed -- a failure there would mask the counter
-    assertions which run before the call returns / raises.
-    """
+    """Stub persistence so this test observes only snapshot handoff."""
 
-    def _fake_get_db():
-        yield db
-
-    # ``execute_task_background`` re-imports these names inside the
-    # function body, so patches must target the source modules (the
-    # local rebind inside the function picks up whatever the source
-    # module's attribute resolves to at lookup time).
     return [
         patch(
-            "xagent.web.models.database.get_db",
-            return_value=_fake_get_db(),
+            "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
+            return_value=_make_snapshot(),
         ),
         patch(
             "xagent.web.api.websocket.background_task_manager.wait_for_previous",
@@ -163,23 +154,28 @@ def _common_patches(db: Any, agent_service: Any) -> list[Any]:
             "xagent.web.api.websocket._register_uploaded_files_for_agent",
         ),
         patch(
-            "xagent.web.api.websocket._normalize_file_outputs",
-            return_value=([], {}),
+            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            return_value=SimpleNamespace(
+                normalized_outputs=[],
+                ai_response="ok",
+                chat_response=None,
+                waiting_for_control=False,
+                terminal_state_committed=True,
+                final_control_snapshot=None,
+                final_task_status=TaskStatus.COMPLETED.value,
+                broadcast_meta={
+                    "id": 42,
+                    "title": "exec-bg test",
+                    "description": "x",
+                    "execution_mode": "flash",
+                    "updated_at": None,
+                },
+                late_result=False,
+            ),
         ),
         patch(
-            "xagent.web.api.websocket._rewrite_file_links_to_file_id",
-            side_effect=lambda s, _m: s,
-        ),
-        patch(
-            "xagent.web.services.task_execution_context_service.load_task_execution_recovery_state",
-            new=AsyncMock(return_value={"messages": [], "skill_context": None}),
-        ),
-        patch(
-            "xagent.web.services.chat_history_service.persist_assistant_message",
-        ),
-        patch(
-            "xagent.web.services.chat_history_service.load_task_transcript",
-            return_value=[],
+            "xagent.web.api.websocket.manager.broadcast_to_task",
+            new=AsyncMock(),
         ),
     ]
 
@@ -203,14 +199,17 @@ def _build_fake_agent_service() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_path_skips_task_query_keeps_user_query() -> None:
-    """Snapshot provided → Task SELECT must not fire on the request
-    session; User SELECT must still fire once (kept for hook compat).
-    """
+async def test_snapshot_path_skips_task_and_user_queries() -> None:
+    """A supplied snapshot must require no task/user checkout on the loop."""
     db, counter = _build_db_mock(task_row=_make_task_orm(), user_row=_make_user_orm())
     snapshot = _make_snapshot()
     agent_service = _build_fake_agent_service()
-    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent_service))
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
+    )
 
     with _Patches(_common_patches(db, agent_service)):
         try:
@@ -232,15 +231,273 @@ async def test_snapshot_path_skips_task_query_keeps_user_query() -> None:
         "session with snapshot provided -- expected 0. The snapshot "
         "passthrough exists to skip this re-read."
     )
-    assert counter.calls_by_model[User] == 1, (
-        f"User queried {counter.calls_by_model[User]} time(s) -- expected 1 "
-        "(kept for get_user_tool_overrides hook compat)."
+    assert counter.calls_by_model[User] == 0, (
+        f"User queried {counter.calls_by_model[User]} time(s) on the event-loop "
+        "session with snapshot provided -- expected 0."
     )
     forwarded_snapshot = agent_manager.get_agent_for_task.await_args.kwargs[
         "task_setup_snapshot"
     ]
     assert forwarded_snapshot is snapshot
     assert forwarded_snapshot.task.source == "trigger"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broadcast_fails", [False, True])
+async def test_cancellation_during_finalization_broadcasts_committed_result(
+    broadcast_fails: bool,
+) -> None:
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
+    )
+    finalization_started = threading.Event()
+    allow_finalization = threading.Event()
+    broadcast = AsyncMock(
+        side_effect=RuntimeError("client disconnected") if broadcast_fails else None
+    )
+
+    def blocking_finalize(**_kwargs: Any) -> Any:
+        finalization_started.set()
+        assert allow_finalization.wait(timeout=2)
+        return SimpleNamespace(
+            normalized_outputs=[],
+            ai_response="ok",
+            chat_response=None,
+            waiting_for_control=False,
+            terminal_state_committed=True,
+            final_control_snapshot=None,
+            final_task_status=TaskStatus.COMPLETED.value,
+            broadcast_meta={
+                "id": 42,
+                "title": "exec-bg test",
+                "description": "x",
+                "execution_mode": "flash",
+                "updated_at": None,
+            },
+            late_result=False,
+        )
+
+    patches = [
+        patch(
+            "xagent.web.api.websocket.background_task_manager.wait_for_previous",
+            new=AsyncMock(),
+        ),
+        patch("xagent.web.api.websocket._register_uploaded_files_for_agent"),
+        patch(
+            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            side_effect=blocking_finalize,
+        ),
+        patch(
+            "xagent.web.api.websocket.manager.broadcast_to_task",
+            new=broadcast,
+        ),
+    ]
+    with _Patches(patches):
+        execution = asyncio.create_task(
+            execute_task_background(
+                task_id=42,
+                user_message="hi",
+                context={},
+                agent_manager=agent_manager,
+                task_owner_user_id=1,
+                task_setup_snapshot=snapshot,
+                resolved_execution_scope=None,
+            )
+        )
+        await asyncio.wait_for(
+            asyncio.to_thread(finalization_started.wait, 1),
+            timeout=1,
+        )
+        execution.cancel()
+        await asyncio.sleep(0)
+        assert not execution.done()
+
+        allow_finalization.set()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+
+    broadcast.assert_awaited_once()
+    assert broadcast.await_args.args[0]["type"] == "task_completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_task_lease", [False, True])
+async def test_cancellation_after_uncommitted_finalization_always_propagates(
+    with_task_lease: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xagent.web.api.websocket")
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
+    )
+    finalization_started = threading.Event()
+    allow_finalization = threading.Event()
+    broadcast_error = RuntimeError("client disconnected")
+    broadcast = AsyncMock(side_effect=broadcast_error)
+
+    def blocking_finalize(**_kwargs: Any) -> Any:
+        finalization_started.set()
+        assert allow_finalization.wait(timeout=2)
+        return SimpleNamespace(
+            normalized_outputs=[],
+            ai_response="ok",
+            chat_response=None,
+            waiting_for_control=False,
+            terminal_state_committed=False,
+            final_control_snapshot=None,
+            final_task_status=TaskStatus.RUNNING.value,
+            broadcast_meta={
+                "id": 42,
+                "title": "exec-bg test",
+                "description": "x",
+                "execution_mode": "flash",
+                "updated_at": None,
+            },
+            late_result=False,
+        )
+
+    patches = [
+        patch("xagent.web.api.websocket._register_uploaded_files_for_agent"),
+        patch(
+            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            side_effect=blocking_finalize,
+        ),
+        patch(
+            "xagent.web.api.websocket._terminal_task_error_payload",
+            return_value=None,
+        ),
+        patch(
+            "xagent.web.api.websocket.manager.broadcast_to_task",
+            new=broadcast,
+        ),
+    ]
+    with _Patches(patches):
+        execution = asyncio.create_task(
+            execute_task_background(
+                task_id=42,
+                user_message="hi",
+                context={},
+                agent_manager=agent_manager,
+                task_owner_user_id=1,
+                task_setup_snapshot=snapshot,
+                expected_run_id="run-a",
+                task_lease=(
+                    TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+                    if with_task_lease
+                    else None
+                ),
+                resolved_execution_scope=None,
+            )
+        )
+        await asyncio.wait_for(
+            asyncio.to_thread(finalization_started.wait, 1),
+            timeout=1,
+        )
+        execution.cancel()
+        await asyncio.sleep(0)
+        assert not execution.done()
+
+        allow_finalization.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await execution
+
+    assert exc_info.value.__cause__ is broadcast_error
+    broadcast.assert_awaited_once()
+    assert (
+        "Background task 42 cancelled after deferred work failed: client disconnected"
+    ) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_snapshot_execution_start_stays_responsive_with_exhausted_pool(
+    tmp_path,
+) -> None:
+    """The snapshot-to-manager handoff must not checkout on the event loop."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'execute-startup-pool.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    SessionLocal = sessionmaker(bind=engine)
+    held_connection = engine.connect()
+    db = SessionLocal()
+    snapshot = _make_snapshot()
+    manager_entered = asyncio.Event()
+    release_manager = asyncio.Event()
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def blocked_get_agent(*_args: Any, **_kwargs: Any) -> None:
+        manager_entered.set()
+        await release_manager.wait()
+        raise RuntimeError("stop after the manager boundary")
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(side_effect=blocked_get_agent)
+    )
+
+    with _Patches(
+        [
+            *_common_patches(db, MagicMock()),
+            patch(
+                "xagent.web.api.websocket._terminal_task_error_payload",
+                return_value=None,
+            ),
+        ]
+    ):
+        started = monotonic()
+        execution_task = asyncio.create_task(
+            execute_task_background(
+                task_id=42,
+                user_message="hi",
+                context={},
+                agent_manager=agent_manager,
+                task_owner_user_id=1,
+                task_setup_snapshot=snapshot,
+                resolved_execution_scope=None,
+            )
+        )
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await asyncio.wait_for(manager_entered.wait(), timeout=0.4)
+            elapsed = monotonic() - started
+            await asyncio.sleep(0.04)
+            assert elapsed < 0.15, (
+                "Snapshot handoff waited for the exhausted request pool; "
+                f"manager reached after {elapsed:.3f}s."
+            )
+            assert ticks >= 3, f"Event-loop ticker advanced only {ticks} time(s)."
+        finally:
+            release_manager.set()
+            ticker_stop.set()
+            await asyncio.gather(
+                execution_task,
+                ticker_task,
+                return_exceptions=True,
+            )
+            db.close()
+            held_connection.close()
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -275,30 +532,41 @@ async def test_execute_task_background_accepts_missing_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_path_runs_task_and_user_queries() -> None:
-    """No snapshot (WS path) → both legacy queries fire exactly once."""
+async def test_missing_snapshot_is_loaded_off_loop_without_event_loop_queries() -> None:
+    """A legacy caller is upgraded to the worker-owned snapshot boundary."""
     db, counter = _build_db_mock(task_row=_make_task_orm(), user_row=_make_user_orm())
     agent_service = _build_fake_agent_service()
-    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent_service))
-
-    with _Patches(_common_patches(db, agent_service)):
-        try:
-            await execute_task_background(
-                task_id=42,
-                user_message="hi",
-                context={},
-                agent_manager=agent_manager,
-                task_owner_user_id=1,
-                task_setup_snapshot=None,
-            )
-        except Exception:
-            pass
-
-    assert counter.calls_by_model[Task] == 1, (
-        f"Task queried {counter.calls_by_model[Task]} time(s) on legacy path "
-        "-- expected 1 (the existence check). WS fallback must not regress."
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
     )
-    assert counter.calls_by_model[User] == 1
+    loader_threads: list[int] = []
+
+    def load_snapshot(*_args: Any, **_kwargs: Any) -> TaskSetupSnapshot:
+        loader_threads.append(threading.get_ident())
+        return _make_snapshot()
+
+    patches = _common_patches(db, agent_service)
+    patches[0] = patch(
+        "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
+        side_effect=load_snapshot,
+    )
+    with _Patches(patches):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_setup_snapshot=None,
+        )
+
+    assert counter.calls_by_model[Task] == 0
+    assert counter.calls_by_model[User] == 0
+    assert loader_threads and loader_threads[0] != threading.get_ident()
+    assert agent_manager.get_agent_for_task.await_args.args[1] is None
 
 
 class _Patches:

@@ -25,18 +25,25 @@ What this test pins:
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack
+from time import monotonic
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
+from xagent.core.execution_scope import scope_fingerprint
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
     _TaskFields,
@@ -60,6 +67,8 @@ def _build_snapshot() -> TaskSetupSnapshot:
             execution_mode="flash",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="single_call",
         task_llm=None,
         task_fast_llm=None,
@@ -84,11 +93,7 @@ def _build_snapshot() -> TaskSetupSnapshot:
 
 
 def _build_db_mock(task_row: Task) -> MagicMock:
-    """Mock ``db`` whose ``query(Task)...first()`` returns the row.
-    The existence check at the top of ``get_agent_for_task`` still
-    runs against this; the snapshot path only skips the LLM-config
-    re-read further down.
-    """
+    """Mock request session used by legacy-path tests."""
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = task_row
     return db
@@ -154,6 +159,83 @@ async def test_caller_supplied_snapshot_skips_internal_to_thread() -> None:
             pass
 
     loader_mock.assert_not_called()
+    db.query.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_startup_stays_responsive_with_exhausted_pool(tmp_path) -> None:
+    """A ready snapshot must reach non-DB setup without waiting on QueuePool."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'startup-pool.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    SessionLocal = sessionmaker(bind=engine)
+    held_connection = engine.connect()
+    db = SessionLocal()
+    manager = AgentServiceManager()
+    manager._default_llm = MagicMock()
+    snapshot = _build_snapshot()
+    sandbox_entered = asyncio.Event()
+    release_sandbox = asyncio.Event()
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def blocked_sandbox(**_kwargs: Any) -> None:
+        sandbox_entered.set()
+        await release_sandbox.wait()
+        raise RuntimeError("stop after the startup boundary")
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    with ExitStack() as stack:
+        for p in _common_patches(manager):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch.object(manager, "_get_or_create_task_sandbox", blocked_sandbox)
+        )
+        started = monotonic()
+        build_task = asyncio.create_task(
+            manager.get_agent_for_task(
+                task_id=42,
+                db=db,
+                user=None,
+                task_setup_snapshot=snapshot,
+                task_owner_user_id=1,
+                resolved_execution_scope=None,
+            )
+        )
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            await asyncio.wait_for(sandbox_entered.wait(), timeout=0.4)
+            elapsed = monotonic() - started
+            await asyncio.sleep(0.04)
+            assert elapsed < 0.15, (
+                "Snapshot startup waited for the exhausted request pool; "
+                f"sandbox boundary reached after {elapsed:.3f}s."
+            )
+            assert ticks >= 3, f"Event-loop ticker advanced only {ticks} time(s)."
+        finally:
+            release_sandbox.set()
+            ticker_stop.set()
+            results = await asyncio.gather(
+                build_task,
+                ticker_task,
+                return_exceptions=True,
+            )
+            db.close()
+            held_connection.close()
+            engine.dispose()
+
+    assert isinstance(results[0], RuntimeError)
 
 
 @pytest.mark.asyncio
@@ -197,6 +279,29 @@ async def test_no_snapshot_falls_back_to_internal_to_thread() -> None:
         "means either the in-method fallback was removed (breaking WS / "
         "non-passthrough callers) or the snapshot is being loaded twice."
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_unscoped_result_skips_internal_scope_resolver() -> None:
+    """Explicit ``None`` is a resolved unscoped turn, not an instruction to
+    resolve again inside the cache owner.
+    """
+    manager = AgentServiceManager()
+    cached_agent = MagicMock()
+    manager._agents[42] = cached_agent
+    manager._agent_owner_ids[42] = 1
+    manager._agent_scope_fingerprints[42] = scope_fingerprint(None)
+
+    with patch("xagent.web.api.chat.resolve_execution_scope") as resolver_mock:
+        resolved = await manager.get_agent_for_task(
+            task_id=42,
+            user=_make_user(),
+            task_owner_user_id=1,
+            resolved_execution_scope=None,
+        )
+
+    assert resolved is cached_agent
+    resolver_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

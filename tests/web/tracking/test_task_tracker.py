@@ -1,20 +1,164 @@
 """Test cases for TaskTracker and TaskTrackerManager."""
 
+import asyncio
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
-from xagent.core.model.chat.token_context import add_token_usage, get_token_usage
+from xagent.core.model.chat.token_context import (
+    TokenUsage,
+    add_token_usage,
+    get_token_usage,
+)
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.tracking import TaskTracker, TaskTrackerManager
+
+
+def _create_tracker_concurrency_db(tmp_path, filename):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / filename}",
+        connect_args={"check_same_thread": False},
+        isolation_level="AUTOCOMMIT",
+    )
+    Task.__table__.create(engine)
+    session_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+        bind=engine,
+    )
+    with session_factory() as db:
+        db.add(
+            Task(
+                id=123,
+                user_id=1,
+                title="tracker ownership race",
+                status=TaskStatus.RUNNING,
+                run_id="run-a",
+                runner_id="runner-a",
+                input_tokens=4,
+                output_tokens=2,
+                total_tokens=6,
+                llm_calls=1,
+            )
+        )
+        db.commit()
+    return engine, session_factory
+
+
+def _run_tracker_ownership_race(
+    monkeypatch,
+    tmp_path,
+    filename,
+    operation,
+    *,
+    pause_after_ownership_read=False,
+):
+    from xagent.web.models import database
+    from xagent.web.tracking import task_tracker as tracker_module
+
+    engine, session_factory = _create_tracker_concurrency_db(tmp_path, filename)
+    monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+    fence_ready = threading.Event()
+    takeover_done = threading.Event()
+    pause_lock = threading.Lock()
+    worker_thread_id: int | None = None
+    paused = False
+    result: dict[str, bool] = {}
+    errors: list[BaseException] = []
+    original_task_for_run = tracker_module._task_for_run
+
+    def pause_for_takeover() -> None:
+        nonlocal paused
+        with pause_lock:
+            if paused:
+                return
+            paused = True
+        fence_ready.set()
+        assert takeover_done.wait(timeout=5)
+
+    def pause_before_usage_update(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        if (
+            threading.get_ident() == worker_thread_id
+            and statement.lstrip().upper().startswith("UPDATE TASKS SET")
+            and "input_tokens" in statement.lower()
+        ):
+            pause_for_takeover()
+
+    def pause_after_legacy_ownership_read(*args, **kwargs):
+        task = original_task_for_run(*args, **kwargs)
+        if threading.get_ident() == worker_thread_id:
+            pause_for_takeover()
+        return task
+
+    event.listen(engine, "before_cursor_execute", pause_before_usage_update)
+    if pause_after_ownership_read:
+        monkeypatch.setattr(
+            tracker_module,
+            "_task_for_run",
+            pause_after_legacy_ownership_read,
+        )
+
+    def run_as_old_runner():
+        nonlocal worker_thread_id
+        worker_thread_id = threading.get_ident()
+        try:
+            result["owned"] = operation(tracker_module)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run_as_old_runner)
+    worker.start()
+    try:
+        assert fence_ready.wait(timeout=5)
+        with session_factory() as takeover_db:
+            replacement = takeover_db.get(Task, 123)
+            assert replacement is not None
+            replacement.runner_id = "runner-b"
+            replacement.input_tokens = 100
+            replacement.output_tokens = 50
+            replacement.total_tokens = 150
+            takeover_db.commit()
+    finally:
+        takeover_done.set()
+        worker.join(timeout=5)
+        event.remove(engine, "before_cursor_execute", pause_before_usage_update)
+
+    assert not worker.is_alive()
+    assert errors == []
+    with session_factory() as verify_db:
+        replacement = verify_db.get(Task, 123)
+        assert replacement is not None
+        persisted = (
+            replacement.runner_id,
+            replacement.input_tokens,
+            replacement.output_tokens,
+            replacement.total_tokens,
+        )
+    engine.dispose()
+    return result["owned"], persisted
 
 
 class TestTaskTracker:
     """Test cases for TaskTracker."""
 
     @pytest.fixture
-    def db_session(self):
+    def db_session(self, monkeypatch):
         """Fixture providing a mock database session."""
+        from xagent.web.models import database
+
         session = MagicMock()
 
         # Mock Task object
@@ -30,6 +174,17 @@ class TestTaskTracker:
         # Mock query to return the task
         session.query.return_value.filter.return_value.first.return_value = mock_task
 
+        def apply_atomic_update(values, *, synchronize_session):
+            assert synchronize_session is False
+            for column, value in values.items():
+                setattr(mock_task, column.key, value)
+            return 1
+
+        session.query.return_value.filter.return_value.update.side_effect = (
+            apply_atomic_update
+        )
+        monkeypatch.setattr(database, "get_session_local", lambda: lambda: session)
+
         return session
 
     @pytest.fixture
@@ -43,9 +198,625 @@ class TestTaskTracker:
         tracker = TaskTracker(task_id=123, db_session=db_session)
 
         assert tracker.task_id == 123
-        assert tracker.db_session == db_session
+        assert not hasattr(tracker, "db_session")
+        assert not hasattr(tracker, "task")
         assert tracker.update_interval_seconds == 15  # default
         assert not tracker.is_tracking
+
+    @pytest.mark.asyncio
+    async def test_start_tracking_does_not_block_event_loop_when_pool_is_full(
+        self, monkeypatch, tmp_path
+    ):
+        """A pool wait belongs in a worker thread, never on the event loop."""
+        from xagent.web.models import database
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'tracker.db'}",
+            connect_args={"check_same_thread": False},
+            poolclass=QueuePool,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=1,
+        )
+        Task.__table__.create(engine)
+        session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=engine,
+        )
+        with session_factory() as db:
+            db.add(
+                Task(
+                    id=123,
+                    user_id=1,
+                    title="pool isolation",
+                    status=TaskStatus.RUNNING,
+                )
+            )
+            db.commit()
+
+        monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+        held_connection = engine.connect()
+        tracker = None
+        try:
+            tracker = TaskTracker(task_id=123)
+            start_task = asyncio.create_task(tracker.start_tracking())
+
+            # The worker is waiting for the only pool slot, but the event loop
+            # must remain responsive enough to run this ticker.
+            await asyncio.sleep(0.05)
+            assert not start_task.done()
+
+            held_connection.close()
+            await asyncio.wait_for(start_task, timeout=1)
+            assert tracker.is_tracking
+        finally:
+            held_connection.close()
+            if tracker is not None and tracker.is_tracking:
+                await tracker.stop_periodic_updates()
+            engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_final_usage_does_not_overwrite_a_replacement_run(
+        self, monkeypatch, tmp_path
+    ):
+        from xagent.web.models import database
+        from xagent.web.services import quota_hooks
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'tracker-run-fence.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Task.__table__.create(engine)
+        session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=engine,
+        )
+        with session_factory() as db:
+            db.add(
+                Task(
+                    id=123,
+                    user_id=1,
+                    title="run fence",
+                    status=TaskStatus.RUNNING,
+                    run_id="run-a",
+                    input_tokens=4,
+                    output_tokens=2,
+                    total_tokens=6,
+                    llm_calls=1,
+                )
+            )
+            db.commit()
+
+        monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+        usage_hook_calls: list[int] = []
+        quota_hooks.set_usage_record_hook(
+            lambda _db, _user_id, _details, _actions: usage_hook_calls.append(1)
+        )
+        try:
+            tracker = TaskTracker(task_id=123, expected_run_id="run-a")
+            await tracker.start_tracking()
+            add_token_usage(input_tokens=10, output_tokens=5)
+
+            with session_factory() as replacement_db:
+                replacement = replacement_db.get(Task, 123)
+                assert replacement is not None
+                replacement.run_id = "run-b"
+                replacement.input_tokens = 100
+                replacement.output_tokens = 50
+                replacement.total_tokens = 150
+                replacement_db.commit()
+
+            await tracker.complete_tracking()
+        finally:
+            quota_hooks.set_usage_record_hook(None)
+
+        with session_factory() as verify_db:
+            replacement = verify_db.get(Task, 123)
+            assert replacement is not None
+            assert replacement.run_id == "run-b"
+            assert replacement.input_tokens == 100
+            assert replacement.output_tokens == 50
+            assert replacement.total_tokens == 150
+        assert usage_hook_calls == []
+        engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_runner_fence_rejects_same_run_takeover_at_every_db_boundary(
+        self, monkeypatch, tmp_path
+    ):
+        """A stale tracker must not seed or write after runner ownership changes."""
+        from xagent.web.models import database
+        from xagent.web.services import quota_hooks
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'tracker-runner-fence.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Task.__table__.create(engine)
+        session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=engine,
+        )
+        with session_factory() as db:
+            for task_id in (123, 124, 125):
+                db.add(
+                    Task(
+                        id=task_id,
+                        user_id=1,
+                        title=f"runner fence {task_id}",
+                        status=TaskStatus.RUNNING,
+                        run_id="run-a",
+                        runner_id="runner-a",
+                        input_tokens=4,
+                        output_tokens=2,
+                        total_tokens=6,
+                        llm_calls=1,
+                    )
+                )
+            db.commit()
+
+        monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+        usage_hook_calls: list[int] = []
+        quota_hooks.set_usage_record_hook(
+            lambda _db, _user_id, _details, _actions: usage_hook_calls.append(1)
+        )
+        periodic_tracker = None
+        try:
+            periodic_tracker = TaskTracker(
+                task_id=123,
+                update_interval_seconds=60,
+                expected_run_id="run-a",
+                expected_runner_id="runner-a",
+            )
+            final_tracker = TaskTracker(
+                task_id=124,
+                update_interval_seconds=60,
+                expected_run_id="run-a",
+                expected_runner_id="runner-a",
+            )
+            await periodic_tracker.start_tracking()
+            await final_tracker.start_tracking()
+
+            with session_factory() as takeover_db:
+                for task_id in (123, 124, 125):
+                    replacement = takeover_db.get(Task, task_id)
+                    assert replacement is not None
+                    replacement.runner_id = "runner-b"
+                    replacement.input_tokens = 100
+                    replacement.output_tokens = 50
+                    replacement.total_tokens = 150
+                takeover_db.commit()
+
+            add_token_usage(input_tokens=10, output_tokens=5)
+            await periodic_tracker.periodic_update()
+            await final_tracker.complete_tracking()
+
+            seed_tracker = TaskTracker(
+                task_id=125,
+                expected_run_id="run-a",
+                expected_runner_id="runner-a",
+            )
+            with pytest.raises(ValueError, match="Task 125.*not found"):
+                await seed_tracker.start_tracking()
+        finally:
+            quota_hooks.set_usage_record_hook(None)
+            if periodic_tracker is not None and periodic_tracker.is_tracking:
+                await periodic_tracker.stop_periodic_updates()
+
+        with session_factory() as verify_db:
+            for task_id in (123, 124, 125):
+                replacement = verify_db.get(Task, task_id)
+                assert replacement is not None
+                assert replacement.run_id == "run-a"
+                assert replacement.runner_id == "runner-b"
+                assert replacement.input_tokens == 100
+                assert replacement.output_tokens == 50
+                assert replacement.total_tokens == 150
+        assert not periodic_tracker.is_tracking
+        assert usage_hook_calls == []
+        engine.dispose()
+
+    def test_periodic_write_cannot_overwrite_runner_takeover_after_ownership_read(
+        self, monkeypatch, tmp_path
+    ):
+        """The ownership predicate and counter write must be one SQL statement."""
+        owned, persisted = _run_tracker_ownership_race(
+            monkeypatch,
+            tmp_path,
+            "tracker-periodic-cas.db",
+            lambda tracker_module: tracker_module._write_task_usage_sync(
+                123,
+                TokenUsage(input_tokens=20, output_tokens=10, llm_calls=2),
+                "run-a",
+                "runner-a",
+            ),
+        )
+
+        assert owned is False
+        assert persisted == ("runner-b", 100, 50, 150)
+
+    def test_final_usage_write_loses_takeover_ownership_race(
+        self, monkeypatch, tmp_path
+    ):
+        """A stale runner must lose the durable fence before final persistence."""
+        owned, persisted = _run_tracker_ownership_race(
+            monkeypatch,
+            tmp_path,
+            "tracker-final-cas.db",
+            lambda tracker_module: tracker_module._complete_task_usage_sync(
+                123,
+                TokenUsage(input_tokens=20, output_tokens=10, llm_calls=2),
+                "run-a",
+                "runner-a",
+            ),
+            pause_after_ownership_read=True,
+        )
+
+        assert owned is False
+        assert persisted == ("runner-b", 100, 50, 150)
+
+    @pytest.mark.asyncio
+    async def test_usage_hook_pool_timeout_is_best_effort_after_counter_commit(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A metering checkout timeout must not reclassify a committed write."""
+        import logging
+
+        from xagent.web.models import database
+        from xagent.web.services import quota_hooks
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'tracker-hook-pool-timeout.db'}",
+            connect_args={"check_same_thread": False},
+            poolclass=QueuePool,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=0.05,
+        )
+        Task.__table__.create(engine)
+        session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=engine,
+        )
+        with session_factory() as db:
+            db.add(
+                Task(
+                    id=123,
+                    user_id=1,
+                    title="best-effort usage hook",
+                    status=TaskStatus.RUNNING,
+                    run_id="run-a",
+                    runner_id="runner-a",
+                    input_tokens=4,
+                    output_tokens=2,
+                    total_tokens=6,
+                    llm_calls=1,
+                )
+            )
+            db.commit()
+
+        monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+
+        def pool_pressured_usage_hook(db, *_args):
+            # The fenced counter commit has returned its connection. Occupy that
+            # only slot before the hook's compatibility-session read, reproducing
+            # a real QueuePool checkout timeout inside best-effort metering.
+            held_connection = engine.connect()
+            try:
+                db.query(Task.id).first()
+            finally:
+                held_connection.close()
+
+        quota_hooks.set_usage_record_hook(pool_pressured_usage_hook)
+        try:
+            tracker = TaskTracker(
+                task_id=123,
+                update_interval_seconds=60,
+                expected_run_id="run-a",
+                expected_runner_id="runner-a",
+            )
+            await tracker.start_tracking()
+            add_token_usage(input_tokens=16, output_tokens=8)
+
+            with caplog.at_level(
+                logging.WARNING,
+                logger="xagent.web.tracking.task_tracker",
+            ):
+                await tracker.complete_tracking()
+
+            assert "Quota usage recording failed for task 123" in caplog.text
+            assert "QueuePool limit of size 1 overflow 0 reached" in caplog.text
+
+            with session_factory() as verify_db:
+                task = verify_db.get(Task, 123)
+                assert task is not None
+                assert task.input_tokens == 20
+                assert task.output_tokens == 10
+                assert task.total_tokens == 30
+                assert task.llm_calls == 2
+        finally:
+            quota_hooks.set_usage_record_hook(None)
+            engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_db_writes_run_off_loop_without_moving_quota_hooks(self, monkeypatch):
+        """Database writes use workers without changing quota hook affinity."""
+        from xagent.web.models import database
+        from xagent.web.services import quota_hooks
+
+        event_loop_thread = threading.get_ident()
+        session_threads = []
+        sessions = []
+        hook_threads = []
+        hook_sessions = []
+
+        def create_session():
+            session_threads.append(threading.get_ident())
+            session = MagicMock()
+            task = MagicMock(spec=Task)
+            task.id = 123
+            task.user_id = 7
+            task.input_tokens = 0
+            task.output_tokens = 0
+            task.total_tokens = 0
+            task.llm_calls = 0
+            task.token_usage_details = None
+            session.query.return_value.filter.return_value.first.return_value = task
+            sessions.append(session)
+            return session
+
+        monkeypatch.setattr(database, "get_session_local", lambda: create_session)
+
+        def progress_hook(db, user_id, delta_details, delta_actions):
+            hook_threads.append(threading.get_ident())
+            hook_sessions.append(db)
+            return None
+
+        def usage_hook(db, user_id, delta_details, delta_actions):
+            hook_threads.append(threading.get_ident())
+            hook_sessions.append(db)
+
+        quota_hooks.set_run_progress_gate_hook(progress_hook)
+        quota_hooks.set_usage_record_hook(usage_hook)
+        try:
+            tracker = TaskTracker(task_id=123, update_interval_seconds=60)
+            await tracker.start_tracking()
+            await tracker.periodic_update()
+            assert await tracker.interrupt_reason_for_quota() is None
+            await tracker.complete_tracking()
+        finally:
+            quota_hooks.set_run_progress_gate_hook(None)
+            quota_hooks.set_usage_record_hook(None)
+
+        assert len(hook_threads) == 2
+        assert hook_threads == [event_loop_thread, event_loop_thread]
+        assert len(hook_sessions) == 2
+        assert len(sessions) == 5
+        assert session_threads.count(event_loop_thread) == 2
+        hook_session_ids = {id(session) for session in hook_sessions}
+        for hook_session in hook_sessions:
+            session_index = sessions.index(hook_session)
+            assert session_threads[session_index] == event_loop_thread
+        for session_index, session in enumerate(sessions):
+            if id(session) not in hook_session_ids:
+                assert session_threads[session_index] != event_loop_thread
+        for session in sessions:
+            session.close.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_completion_waits_for_inflight_periodic_worker(
+        self, db_session, monkeypatch
+    ):
+        """An uncancellable thread write must finish before the final write."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        periodic_started = threading.Event()
+        release_periodic = threading.Event()
+        writes = []
+
+        def blocking_periodic_write(*_args):
+            periodic_started.set()
+            assert release_periodic.wait(timeout=1)
+            writes.append("periodic")
+            return True
+
+        def final_write(*_args):
+            writes.append("complete")
+            return True
+
+        monkeypatch.setattr(
+            tracker_module, "_write_task_usage_sync", blocking_periodic_write
+        )
+        monkeypatch.setattr(tracker_module, "_complete_task_usage_sync", final_write)
+
+        tracker = TaskTracker(
+            task_id=123,
+            db_session=db_session,
+            update_interval_seconds=0.01,
+        )
+        await tracker.start_tracking()
+        assert await asyncio.to_thread(periodic_started.wait, 1)
+
+        completion = asyncio.create_task(tracker.complete_tracking())
+        try:
+            await asyncio.sleep(0.02)
+            assert not completion.done()
+            release_periodic.set()
+            await asyncio.wait_for(completion, timeout=1)
+        finally:
+            release_periodic.set()
+            if not completion.done():
+                await asyncio.wait_for(completion, timeout=1)
+
+        assert writes == ["periodic", "complete"]
+
+    @pytest.mark.asyncio
+    async def test_periodic_pool_timeout_does_not_checkout_again_or_stop_tracking(
+        self, db_session, monkeypatch
+    ):
+        """A transient pool timeout is one failed write, not a second probe."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        attempts = 0
+
+        def write_with_one_timeout(*_args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise SQLAlchemyTimeoutError("pool exhausted")
+            return True
+
+        tracker = TaskTracker(
+            task_id=123,
+            db_session=db_session,
+            update_interval_seconds=60,
+        )
+        await tracker.start_tracking()
+        monkeypatch.setattr(
+            tracker_module,
+            "_write_task_usage_sync",
+            write_with_one_timeout,
+        )
+        monkeypatch.setattr(
+            tracker_module,
+            "_new_short_session",
+            lambda: pytest.fail("periodic failure performed a second checkout"),
+        )
+
+        try:
+            await tracker.periodic_update()
+            assert tracker.is_tracking
+
+            await tracker.periodic_update()
+            assert tracker.is_tracking
+            assert attempts == 2
+        finally:
+            await tracker.stop_periodic_updates()
+
+    @pytest.mark.asyncio
+    async def test_final_pool_timeout_is_reported_to_the_lease_owner(
+        self, db_session, monkeypatch
+    ):
+        """The lease owner must be able to avoid a second checkout after timeout."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        attempts = 0
+
+        def final_write(*_args):
+            nonlocal attempts
+            attempts += 1
+            raise SQLAlchemyTimeoutError("pool exhausted")
+
+        tracker = TaskTracker(
+            task_id=123,
+            db_session=db_session,
+            update_interval_seconds=60,
+        )
+        await tracker.start_tracking()
+        monkeypatch.setattr(
+            tracker_module,
+            "_complete_task_usage_sync",
+            final_write,
+        )
+
+        with pytest.raises(SQLAlchemyTimeoutError, match="pool exhausted"):
+            await tracker.complete_tracking()
+
+        assert attempts == 1
+        assert not tracker.is_tracking
+
+    @pytest.mark.asyncio
+    async def test_periodic_missing_row_stops_tracking_without_a_followup_checkout(
+        self, db_session, monkeypatch
+    ):
+        """The write helper's False result is the only missing-row signal."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        tracker = TaskTracker(
+            task_id=123,
+            db_session=db_session,
+            update_interval_seconds=60,
+        )
+        await tracker.start_tracking()
+        monkeypatch.setattr(
+            tracker_module,
+            "_write_task_usage_sync",
+            lambda *_args: False,
+        )
+        monkeypatch.setattr(
+            tracker_module,
+            "_new_short_session",
+            lambda: pytest.fail("missing-row result performed a second checkout"),
+        )
+
+        try:
+            await tracker.periodic_update()
+            assert not tracker.is_tracking
+        finally:
+            await tracker.stop_periodic_updates()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_completion_drains_periodic_then_persists_final_usage(
+        self, db_session, monkeypatch
+    ):
+        """Cancellation is propagated only after stale writes can no longer win."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        periodic_started = threading.Event()
+        release_periodic = threading.Event()
+        writes = []
+
+        def blocking_periodic_write(*_args):
+            periodic_started.set()
+            assert release_periodic.wait(timeout=1)
+            writes.append("periodic")
+            return True
+
+        def final_write(*_args):
+            writes.append("complete")
+            return True
+
+        monkeypatch.setattr(
+            tracker_module,
+            "_write_task_usage_sync",
+            blocking_periodic_write,
+        )
+        monkeypatch.setattr(tracker_module, "_complete_task_usage_sync", final_write)
+
+        tracker = TaskTracker(
+            task_id=123,
+            db_session=db_session,
+            update_interval_seconds=0.01,
+        )
+        await tracker.start_tracking()
+        assert await asyncio.to_thread(periodic_started.wait, 1)
+
+        completion = asyncio.create_task(tracker.complete_tracking())
+        try:
+            await asyncio.sleep(0.02)
+            completion.cancel()
+            await asyncio.sleep(0.02)
+
+            assert not completion.done()
+            assert writes == []
+
+            release_periodic.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(completion, timeout=1)
+        finally:
+            release_periodic.set()
+            if not completion.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(completion), timeout=1)
+                except BaseException:
+                    pass
+
+        assert completion.cancelled()
+        assert writes == ["periodic", "complete"]
 
     @pytest.mark.asyncio
     async def test_complete_tracking_reports_only_current_turn_delta(self, db_session):
@@ -119,13 +890,13 @@ class TestTaskTracker:
         try:
             tracker = TaskTracker(task_id=123, db_session=db_session)
             # Before tracking starts, the checker is a no-op (fails open).
-            assert tracker.interrupt_reason_for_quota() is None
+            assert await tracker.interrupt_reason_for_quota() is None
             await tracker.start_tracking()
             add_token_usage(
                 input_tokens=10, output_tokens=5, model="m", call_type="chat"
             )
             add_tool_call_usage(2)
-            reason = tracker.interrupt_reason_for_quota()
+            reason = await tracker.interrupt_reason_for_quota()
         finally:
             quota_hooks.set_run_progress_gate_hook(None)
 
@@ -140,8 +911,7 @@ class TestTaskTracker:
 
     @pytest.mark.asyncio
     async def test_quota_gate_caches_user_id_and_logs_once(self, db_session, caplog):
-        """F1: user_id is cached at construction (not re-read per step). F3: the
-        fail-open warning is logged once per run, not once per step."""
+        """The tracker caches user_id and logs gate failures once per run."""
         import logging
 
         from xagent.web.services import quota_hooks
@@ -155,17 +925,17 @@ class TestTaskTracker:
         quota_hooks.set_run_progress_gate_hook(_boom)
         try:
             tracker = TaskTracker(task_id=123, db_session=db_session)
-            assert tracker._user_id == 7  # F1: cached at construction
+            assert tracker._user_id == 7
             await tracker.start_tracking()
             with caplog.at_level(logging.WARNING):
-                assert tracker.interrupt_reason_for_quota() is None
-                assert tracker.interrupt_reason_for_quota() is None
-                assert tracker.interrupt_reason_for_quota() is None
+                assert await tracker.interrupt_reason_for_quota() is None
+                assert await tracker.interrupt_reason_for_quota() is None
+                assert await tracker.interrupt_reason_for_quota() is None
         finally:
             quota_hooks.set_run_progress_gate_hook(None)
 
         warnings = [r for r in caplog.records if "failed open" in r.getMessage()]
-        assert len(warnings) == 1  # F3: one log despite three failing calls
+        assert len(warnings) == 1
         assert tracker.quota_interrupt_reason is None  # never tripped → no reason
 
     @pytest.mark.asyncio
@@ -255,7 +1025,7 @@ class TestTaskTracker:
         assert "already being tracked" in mock_warning.call_args.args[0]
 
     @pytest.mark.asyncio
-    async def test_periodic_update(self, task_tracker):
+    async def test_periodic_update(self, task_tracker, db_session):
         """Test periodic database update."""
         await task_tracker.start_tracking()
 
@@ -266,12 +1036,13 @@ class TestTaskTracker:
         await task_tracker.periodic_update()
 
         # Verify database was updated
-        task_tracker.task.input_tokens = 100
-        task_tracker.task.output_tokens = 50
-        task_tracker.task.total_tokens = 150
-        task_tracker.task.llm_calls = 1
-
-        task_tracker.db_session.commit.assert_called_once()
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        assert task.input_tokens == 100
+        assert task.output_tokens == 50
+        assert task.total_tokens == 150
+        assert task.llm_calls == 1
+        db_session.commit.assert_called_once()
+        db_session.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_periodic_update_not_tracking(self, task_tracker, caplog):
@@ -286,7 +1057,7 @@ class TestTaskTracker:
         assert "not being tracked" in mock_warning.call_args.args[0]
 
     @pytest.mark.asyncio
-    async def test_complete_tracking(self, task_tracker):
+    async def test_complete_tracking(self, task_tracker, db_session):
         """Test completing tracking."""
         await task_tracker.start_tracking()
 
@@ -304,10 +1075,15 @@ class TestTaskTracker:
         assert usage.llm_calls == 2
 
         # Verify database was updated
-        task_tracker.task.input_tokens = 250
-        task_tracker.task.output_tokens = 125
-        task_tracker.task.total_tokens = 375
-        task_tracker.task.llm_calls = 2
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        assert task.input_tokens == 250
+        assert task.output_tokens == 125
+        assert task.total_tokens == 375
+        assert task.llm_calls == 2
+        db_session.commit.assert_called_once()
+        # The fenced task write and compatibility quota callback each own one
+        # short-lived Session.
+        assert db_session.close.call_count == 2
 
         assert not task_tracker.is_tracking
 
@@ -371,8 +1147,10 @@ class TestTaskTrackerManager:
         return TaskTrackerManager()
 
     @pytest.fixture
-    def mock_session(self):
+    def mock_session(self, monkeypatch):
         """Fixture providing a mock database session."""
+        from xagent.web.models import database
+
         session = MagicMock()
 
         # Mock Task object
@@ -381,6 +1159,7 @@ class TestTaskTrackerManager:
         mock_task.status = TaskStatus.RUNNING
 
         session.query.return_value.filter.return_value.first.return_value = mock_task
+        monkeypatch.setattr(database, "get_session_local", lambda: lambda: session)
 
         return session
 
@@ -448,7 +1227,7 @@ class TestTaskTrackerManager:
         assert usage is None
 
     @pytest.mark.asyncio
-    async def test_complete_all(self, manager):
+    async def test_complete_all(self, manager, mock_session):
         """Test completing all trackers."""
         # Create multiple trackers with independent token tracking
         # Note: In real usage, each task would have its own execution context
@@ -499,8 +1278,10 @@ class TestTaskTrackerIntegration:
     """Integration tests for TaskTracker with real token tracking."""
 
     @pytest.fixture
-    def db_session(self):
+    def db_session(self, monkeypatch):
         """Fixture providing a mock database session."""
+        from xagent.web.models import database
+
         session = MagicMock()
 
         mock_task = MagicMock(spec=Task)
@@ -513,6 +1294,7 @@ class TestTaskTrackerIntegration:
         mock_task.token_usage_details = None
 
         session.query.return_value.filter.return_value.first.return_value = mock_task
+        monkeypatch.setattr(database, "get_session_local", lambda: lambda: session)
 
         return session
 

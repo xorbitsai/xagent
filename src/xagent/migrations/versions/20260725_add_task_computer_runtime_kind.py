@@ -1,7 +1,7 @@
 """add task computer runtime kind
 
 Revision ID: 20260725_add_task_computer_runtime_kind
-Revises: 20260724_seed_google_ads_mcp_app
+Revises: 20260725_add_uploaded_file_recovery_index
 Create Date: 2026-07-25 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260725_add_task_computer_runtime_kind"
-down_revision: Union[str, None] = "20260724_seed_google_ads_mcp_app"
+down_revision: Union[str, None] = "20260725_add_uploaded_file_recovery_index"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

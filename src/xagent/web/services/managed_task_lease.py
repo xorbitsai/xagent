@@ -5,19 +5,117 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ..models.database import release_db_connection_if_clean
 from ..models.task import Task, TaskStatus
+from .db_runtime import (
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
 from .task_lease_service import (
     TaskLease,
-    acquire_task_lease,
+    TaskLeaseHeartbeatOutcome,
+    acquire_task_lease_cancellation_safe,
+    acquire_task_lease_no_commit,
+    release_task_lease_no_commit,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
-from .workforce_runtime import release_task_lease_with_workforce_sync
+from .workforce_runtime import sync_workforce_run_status
 
 logger = logging.getLogger(__name__)
+
+
+def finalize_managed_task_lease_result(
+    db: Session,
+    lease: TaskLease,
+    *,
+    status: TaskStatus,
+    assistant_content: str | None = None,
+    interactions: list[dict[str, Any]] | None = None,
+    message_type: str = "assistant_message",
+) -> bool:
+    """Atomically persist one inline transport result under its exact lease."""
+
+    if status == TaskStatus.RUNNING:
+        raise ValueError("Cannot finalize a managed lease with RUNNING status")
+
+    from .chat_history_service import persist_assistant_message_no_commit
+    from .task_orchestrator import invalidate_task_cache_best_effort
+
+    try:
+        if not release_task_lease_no_commit(db, lease, status=status):
+            db.rollback()
+            return False
+
+        db.expire_all()
+        task = db.query(Task).filter(Task.id == lease.task_id).one()
+        sync_workforce_run_status(db, task, status)
+        if task.user_id is not None and (
+            (assistant_content is not None and assistant_content.strip())
+            or interactions
+        ):
+            persist_assistant_message_no_commit(
+                db,
+                task_id=lease.task_id,
+                user_id=int(task.user_id),
+                content=assistant_content or "",
+                interactions=interactions,
+                message_type=message_type,
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    invalidate_task_cache_best_effort(lease.task_id)
+    return True
+
+
+def _finalize_managed_task_lease_result_sync(
+    lease: TaskLease,
+    *,
+    status: TaskStatus,
+    assistant_content: str | None = None,
+    interactions: list[dict[str, Any]] | None = None,
+    message_type: str = "assistant_message",
+) -> bool:
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return finalize_managed_task_lease_result(
+            db,
+            lease,
+            status=status,
+            assistant_content=assistant_content,
+            interactions=interactions,
+            message_type=message_type,
+        )
+
+
+async def finalize_managed_task_lease_result_isolated(
+    lease: TaskLease,
+    *,
+    status: TaskStatus,
+    assistant_content: str | None = None,
+    interactions: list[dict[str, Any]] | None = None,
+    message_type: str = "assistant_message",
+) -> bool:
+    """Settle one exact managed lease using a worker-owned short Session."""
+
+    return await run_db_io_cancellation_safe(
+        lambda: _finalize_managed_task_lease_result_sync(
+            lease,
+            status=status,
+            assistant_content=assistant_content,
+            interactions=interactions,
+            message_type=message_type,
+        )
+    )
 
 
 def _release_managed_task_lease_sync(lease: TaskLease) -> bool:
@@ -31,7 +129,7 @@ def _release_managed_task_lease_sync(lease: TaskLease) -> bool:
         final_status = (
             TaskStatus.FAILED if task.status == TaskStatus.RUNNING else task.status
         )
-        return release_task_lease_with_workforce_sync(
+        return finalize_managed_task_lease_result(
             db,
             lease,
             status=final_status,
@@ -44,16 +142,80 @@ class ManagedTaskLease:
 
     lease: TaskLease
     stop_event: asyncio.Event
-    heartbeat_task: asyncio.Task[None]
+    heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome]
     _closed: bool = field(default=False, init=False)
 
     async def close(self) -> bool:
         if self._closed:
             return False
         self._closed = True
-        await stop_task_lease_heartbeat(self.heartbeat_task, self.stop_event)
+        cleanup_task = asyncio.create_task(self._close_resources())
+        return await drain_async_task_cancellation_safe(cleanup_task)
+
+    async def finalize_result(
+        self,
+        *,
+        status: TaskStatus,
+        assistant_content: str | None = None,
+        interactions: list[dict[str, Any]] | None = None,
+        message_type: str = "assistant_message",
+    ) -> bool:
+        """Stop heartbeating, then atomically persist this owner's result."""
+
+        if self._closed:
+            return False
+        self._closed = True
+        cleanup_task = asyncio.create_task(
+            self._finalize_resources(
+                status=status,
+                assistant_content=assistant_content,
+                interactions=interactions,
+                message_type=message_type,
+            )
+        )
+        return await drain_async_task_cancellation_safe(cleanup_task)
+
+    async def _stop_heartbeat_for_settlement(self) -> bool:
+        heartbeat_outcome = await stop_task_lease_heartbeat(
+            self.heartbeat_task, self.stop_event
+        )
+        if not heartbeat_outcome.requires_ttl_recovery:
+            return True
+        logger.error(
+            "Task %s managed lease heartbeat unhealthy at shutdown; "
+            "retaining run %s for TTL recovery (lost=%s, pool_timeout=%s)",
+            self.lease.task_id,
+            self.lease.run_id,
+            heartbeat_outcome.lease_lost,
+            heartbeat_outcome.pool_timeout is not None,
+        )
+        return False
+
+    async def _finalize_resources(
+        self,
+        *,
+        status: TaskStatus,
+        assistant_content: str | None,
+        interactions: list[dict[str, Any]] | None,
+        message_type: str,
+    ) -> bool:
+        if not await self._stop_heartbeat_for_settlement():
+            return False
+        return await finalize_managed_task_lease_result_isolated(
+            self.lease,
+            status=status,
+            assistant_content=assistant_content,
+            interactions=interactions,
+            message_type=message_type,
+        )
+
+    async def _close_resources(self) -> bool:
+        if not await self._stop_heartbeat_for_settlement():
+            return False
         try:
-            return await asyncio.to_thread(_release_managed_task_lease_sync, self.lease)
+            return await run_db_io_cancellation_safe(
+                lambda: _release_managed_task_lease_sync(self.lease)
+            )
         except Exception:
             logger.error(
                 "Failed to release managed task lease for task %s run %s",
@@ -80,7 +242,58 @@ def claim_managed_task_lease(
     db: Session,
     task_id: int,
 ) -> ManagedTaskLease | None:
-    """Atomically claim a new run and start its lease heartbeat."""
+    """Atomically claim a new run, project RUNNING, and start its heartbeat."""
 
-    lease = acquire_task_lease(db, task_id, new_run=True)
+    lease = _claim_managed_task_lease_in_session(db, task_id)
+    return start_managed_task_lease(lease) if lease is not None else None
+
+
+def _claim_managed_task_lease_in_session(
+    db: Session,
+    task_id: int,
+) -> TaskLease | None:
+    """Commit one managed claim in the Session owned by the current caller."""
+
+    lease = acquire_task_lease_no_commit(db, task_id, new_run=True)
+    if lease is None:
+        db.rollback()
+        return None
+    try:
+        db.expire_all()
+        task = db.query(Task).filter(Task.id == task_id).one()
+        sync_workforce_run_status(db, task, TaskStatus.RUNNING)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return lease
+
+
+def _claim_managed_task_lease_sync(task_id: int) -> TaskLease | None:
+    """Claim using a short Session owned entirely by one database worker."""
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return _claim_managed_task_lease_in_session(db, task_id)
+
+
+async def claim_managed_task_lease_isolated(
+    task_id: int,
+    *,
+    caller_db: Session | None = None,
+) -> ManagedTaskLease | None:
+    """Claim off-loop and compensate a commit that wins caller cancellation."""
+
+    if caller_db is not None and not release_db_connection_if_clean(caller_db):
+        raise RuntimeError(
+            "Cannot claim a managed task lease while the caller database "
+            "session has pending writes"
+        )
+
+    lease = await acquire_task_lease_cancellation_safe(
+        lambda: _claim_managed_task_lease_sync(task_id),
+        _release_managed_task_lease_sync,
+    )
     return start_managed_task_lease(lease) if lease is not None else None

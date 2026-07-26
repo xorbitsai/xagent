@@ -1199,7 +1199,10 @@ async def _rebuild_collection_stats_impl(
         existing_info = None
 
     # collection_metadata is a global cache; never persist user-scoped counts here.
-    stats_by_collection = get_vector_index_store().aggregate_collection_stats(
+    # aggregate_collection_stats is a synchronous LanceDB scan: keep it off the
+    # event loop so it cannot stall every other coroutine in the process.
+    stats_by_collection = await asyncio.to_thread(
+        get_vector_index_store().aggregate_collection_stats,
         user_id=None,
         is_admin=True,
     )

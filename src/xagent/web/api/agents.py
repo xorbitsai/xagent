@@ -17,7 +17,7 @@ from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.agent import Agent, AgentOrigin
-from ..models.database import get_db
+from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.user import User
 from ..schemas.agent_api_key import (
@@ -25,12 +25,14 @@ from ..schemas.agent_api_key import (
     APIKeyMetadataResponse,
     APIKeyRevokeResponse,
 )
+from ..schemas.widget import WidgetAllowedDomain
 from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
     list_accessible_agents,
 )
 from ..services.agent_management import (
+    AgentManagementRuntime,
     AgentManagementService,
     AgentWorkforceConflictError,
     DuplicateAgentNameError,
@@ -106,7 +108,7 @@ class AgentUpdateRequest(BaseModel):
     )
     logo_base64: Optional[str] = None
     widget_enabled: Optional[bool] = None
-    allowed_domains: Optional[List[str]] = None
+    allowed_domains: Optional[List[WidgetAllowedDomain]] = None
     visibility: Optional[Literal["team", "admins"]] = Field(
         None, description="Team visibility: 'team' or 'admins' (team admins only)"
     )
@@ -514,18 +516,34 @@ async def create_agent_from_template(
     db: Session = Depends(get_db),
 ) -> AgentResponse:
     """Create an agent from a template (session-auth wrapper for /v1/agents/from-template)."""
+    user_id = int(current_user.id)
+    is_admin = bool(current_user.is_admin)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creation requires a clean request database transaction",
+        )
+
     template_manager = getattr(fastapi_request.app.state, "template_manager", None)
-    service = AgentManagementService(db, template_manager=template_manager)
     try:
-        agent, _api_key = await service.create_agent_from_template(
-            user_id=int(current_user.id),
-            is_admin=bool(current_user.is_admin),
+        result = await AgentManagementRuntime(
+            template_manager=template_manager
+        ).create_agent_from_template(
+            user_id=user_id,
+            is_admin=is_admin,
             template_id=data.template_id,
             name=data.name,
+            description=None,
+            instructions=None,
+            execution_mode=None,
+            models=None,
+            knowledge_bases=None,
+            skills=None,
+            tool_categories=None,
+            suggested_prompts=None,
             generate_runtime_key=False,
         )
-        store = AgentStore(db)
-        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
+        return AgentResponse.model_validate(result.agent.to_response_dict())
     except TemplateNotFoundError:
         raise HTTPException(status_code=404, detail="Template not found")
     except DuplicateAgentNameError:
@@ -534,7 +552,6 @@ async def create_agent_from_template(
         )
     except Exception as e:
         logger.error(f"Failed to create agent from template: {e}")
-        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 

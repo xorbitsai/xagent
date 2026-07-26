@@ -7,18 +7,29 @@ Test plumbing (client, _test_db fixture, auth helpers) is shared via
 ``tests/web/api/conftest.py``.
 """
 
+import asyncio
+import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import bcrypt
 import pytest
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
 
 from xagent.core.utils.api_key import BCRYPT_COST
 from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.user_api_key import UserApiKey
 
-from ..conftest import _admin_headers, _direct_db_session, client
+from ..conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _install_one_slot_queue_pool,
+    client,
+)
 
 # Opt this file into the shared conftest ``_test_db`` fixture. See the
 # note in test_agent_api_keys.py for why we use ``usefixtures`` with a
@@ -221,6 +232,179 @@ def test_generated_manager_key_returns_401():
     _assert_invalid_api_key(resp)
 
 
+@pytest.mark.asyncio
+async def test_runtime_key_auth_runs_sql_and_bcrypt_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime-key auth owns its Session and bcrypt work in one DB worker."""
+
+    from xagent.web.api.v1 import deps
+
+    agent_id, full_key, prefix = _create_agent_and_key()
+    event_loop_thread = threading.get_ident()
+    query_threads: list[int] = []
+    bcrypt_threads: list[int] = []
+    original_load = deps._load_runtime_key_record
+    original_verify = deps.verify_api_key
+
+    def recording_load(key_prefix: str):  # type: ignore[no-untyped-def]
+        query_threads.append(threading.get_ident())
+        return original_load(key_prefix)
+
+    def recording_verify(raw: str, key_hash: str) -> bool:
+        bcrypt_threads.append(threading.get_ident())
+        return original_verify(raw, key_hash)
+
+    monkeypatch.setattr(deps, "_load_runtime_key_record", recording_load)
+    monkeypatch.setattr(deps, "verify_api_key", recording_verify)
+
+    principal = await deps.get_principal_from_api_key(
+        HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+    )
+
+    assert principal.agent is not None
+    assert principal.agent.id == agent_id
+    assert principal.key.key_prefix == prefix
+    assert query_threads and query_threads[0] != event_loop_thread
+    assert bcrypt_threads == query_threads
+
+
+@pytest.mark.asyncio
+async def test_runtime_key_auth_pool_wait_keeps_event_loop_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A saturated auth pool cannot stop unrelated asyncio work."""
+
+    from xagent.web.api.v1 import deps
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'auth-pool.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=1,
+    )
+    worker_started = threading.Event()
+    held_connection = engine.connect()
+
+    def waiting_resolve(_credentials):  # type: ignore[no-untyped-def]
+        worker_started.set()
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1")).scalar_one()
+        return deps.ApiKeyPrincipal(
+            key=deps.RuntimeApiKeySnapshot(key_prefix="ABC123"),
+            agent=deps.AgentPrincipalSnapshot(
+                id=1,
+                user_id=2,
+                execution_mode="balanced",
+                status="published",
+                origin="user",
+            ),
+        )
+
+    monkeypatch.setattr(
+        deps,
+        "_resolve_principal_from_credentials",
+        waiting_resolve,
+    )
+    auth = asyncio.create_task(deps.get_principal_from_api_key(None))
+    await asyncio.to_thread(worker_started.wait, 2)
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    try:
+        await ticker()
+        assert ticks == 5
+        assert auth.done() is False
+    finally:
+        held_connection.close()
+
+    principal = await auth
+    assert principal.agent is not None
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_key_auth_cancellation_drains_worker_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot abandon auth work with a live worker Session."""
+
+    from xagent.web.api.v1 import deps
+
+    _agent_id, full_key, _prefix = _create_agent_and_key()
+    worker_started = threading.Event()
+    allow_worker = threading.Event()
+    worker_finished = threading.Event()
+    original_load = deps._load_runtime_key_record
+
+    def blocking_load(key_prefix: str):  # type: ignore[no-untyped-def]
+        worker_started.set()
+        assert allow_worker.wait(timeout=2)
+        try:
+            return original_load(key_prefix)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(deps, "_load_runtime_key_record", blocking_load)
+    auth = asyncio.create_task(
+        deps.get_principal_from_api_key(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+        )
+    )
+    await asyncio.to_thread(worker_started.wait, 2)
+    auth.cancel()
+    allow_worker.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await auth
+    assert worker_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_personal_key_auth_runs_sql_and_bcrypt_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Personal-key auth follows the same worker-owned snapshot boundary."""
+
+    from xagent.web.api.v1 import deps
+
+    full_key, prefix = _create_personal_key()
+    event_loop_thread = threading.get_ident()
+    query_threads: list[int] = []
+    bcrypt_threads: list[int] = []
+    original_load = deps._load_personal_key_record
+    original_verify = deps.verify_api_key
+
+    def recording_load(key_prefix: str):  # type: ignore[no-untyped-def]
+        query_threads.append(threading.get_ident())
+        return original_load(key_prefix)
+
+    def recording_verify(raw: str, key_hash: str) -> bool:
+        bcrypt_threads.append(threading.get_ident())
+        return original_verify(raw, key_hash)
+
+    monkeypatch.setattr(deps, "_load_personal_key_record", recording_load)
+    monkeypatch.setattr(deps, "verify_api_key", recording_verify)
+
+    user, key = await deps.get_user_from_personal_key(
+        HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+    )
+
+    assert user.username == "admin"
+    assert key.key_prefix == prefix
+    assert query_threads and query_threads[0] != event_loop_thread
+    assert bcrypt_threads == query_threads
+
+
 def test_paused_key_returns_401():
     """A paused (not revoked) key is rejected identically to a revoked one.
 
@@ -264,7 +448,8 @@ def _usage_snapshot(prefix: str):
         db.close()
 
 
-def test_record_key_usage_skips_revoked_key():
+@pytest.mark.asyncio
+async def test_record_key_usage_skips_revoked_key():
     """Direct-call test for the defense-in-depth guard in ``record_key_usage``.
 
     Both real call sites (create task / append message) are gated by
@@ -287,11 +472,12 @@ def test_record_key_usage_skips_revoked_key():
         db.close()
 
     before = _usage_snapshot(prefix)
-    record_key_usage(prefix)
+    await record_key_usage(prefix)
     assert _usage_snapshot(prefix) == before
 
 
-def test_record_key_usage_skips_paused_key():
+@pytest.mark.asyncio
+async def test_record_key_usage_skips_paused_key():
     from xagent.web.api.v1.deps import record_key_usage
     from xagent.web.models.agent_api_key import AgentApiKey
 
@@ -306,22 +492,50 @@ def test_record_key_usage_skips_paused_key():
         db.close()
 
     before = _usage_snapshot(prefix)
-    record_key_usage(prefix)
+    await record_key_usage(prefix)
     assert _usage_snapshot(prefix) == before
 
 
-def test_record_key_usage_updates_active_key():
+@pytest.mark.asyncio
+async def test_record_key_usage_updates_active_key():
     """Sanity counterpart: the guard doesn't block a legitimately active key."""
     from xagent.web.api.v1.deps import record_key_usage
 
     _agent_id, _full_key, prefix = _create_agent_and_key()
 
-    record_key_usage(prefix)
+    await record_key_usage(prefix)
 
     last_used_at, usage_month, usage_month_calls = _usage_snapshot(prefix)
     assert last_used_at is not None
     assert usage_month == datetime.now(timezone.utc).strftime("%Y-%m")
     assert usage_month_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_record_key_usage_pool_wait_keeps_event_loop_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort metering may wait for a slot, but never on the event loop."""
+
+    from xagent.web.api.v1.deps import record_key_usage
+
+    _agent_id, _full_key, prefix = _create_agent_and_key()
+    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=0.15)
+    held_connection = engine.connect()
+
+    async def invoke_usage() -> None:
+        await record_key_usage(prefix)
+
+    usage_task = asyncio.create_task(invoke_usage())
+    started_at = asyncio.get_running_loop().time()
+    ticker_task = asyncio.create_task(asyncio.sleep(0.02))
+    try:
+        await ticker_task
+        assert asyncio.get_running_loop().time() - started_at < 0.08
+    finally:
+        held_connection.close()
+        await usage_task
+        engine.dispose()
 
 
 # ===== timing oracle defense =====

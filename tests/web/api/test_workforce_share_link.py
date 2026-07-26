@@ -9,6 +9,7 @@ and the WS APPEND path flipping the run back to ``running``.
 
 from __future__ import annotations
 
+import asyncio
 import io
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,7 @@ import pytest
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
@@ -736,6 +738,7 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
 
     from xagent.web.api.websocket import handle_chat_message
     from xagent.web.models.workforce import WorkforceAgent
+    from xagent.web.services import task_orchestrator as task_orchestrator_service
     from xagent.web.services.workforce_snapshot import build_workforce_snapshot
 
     workforce_id = _create_workforce("Append Sync Workforce")
@@ -778,25 +781,17 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
     finally:
         db.close()
 
-    from xagent.web.services import task_orchestrator as task_orchestrator_service
+    turn_started = asyncio.Event()
 
-    async def _claiming_begin_turn(**kwargs: Any) -> SimpleNamespace:
-        # Simulate the orchestrator's atomic claim flipping the task RUNNING.
-        claim_db = _direct_db_session()
-        try:
-            claim_db.query(Task).filter(Task.id == int(kwargs["task_id"])).update(
-                {"status": TaskStatus.RUNNING}
-            )
-            claim_db.commit()
-        finally:
-            claim_db.close()
-        return SimpleNamespace(background_task=None)
+    def _observe_schedule(**_kwargs: Any) -> asyncio.Task[None]:
+        turn_started.set()
 
-    monkeypatch.setattr(
-        task_orchestrator_service.TaskTurnOrchestrator,
-        "begin_turn",
-        _claiming_begin_turn,
-    )
+        async def _noop() -> None:
+            return None
+
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", _observe_schedule)
 
     db = _direct_db_session()
     try:
@@ -805,17 +800,42 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
             broadcast_to_task=AsyncMock(), send_personal_message=AsyncMock()
         )
         with patch("xagent.web.api.websocket.manager", ws_manager):
-            await handle_chat_message(
-                MagicMock(),
-                task_id,
-                {"message": "follow-up", "user": user, "files": []},
+            handler_task = asyncio.create_task(
+                handle_chat_message(
+                    MagicMock(),
+                    task_id,
+                    {"message": "follow-up", "user": user, "files": []},
+                )
             )
-    finally:
-        db.close()
+            try:
+                await asyncio.wait_for(turn_started.wait(), timeout=1.0)
+                await asyncio.wait_for(asyncio.shield(handler_task), timeout=1.0)
 
-    db = _direct_db_session()
-    try:
-        run = db.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
-        assert run.status == "running"
+                for _ in range(100):
+                    command_db = _direct_db_session()
+                    try:
+                        run_status = (
+                            command_db.query(WorkforceRun.status)
+                            .filter(WorkforceRun.id == run_id)
+                            .scalar()
+                        )
+                        command_status = (
+                            command_db.query(TaskExecutionCommand.status)
+                            .filter(TaskExecutionCommand.task_id == task_id)
+                            .scalar()
+                        )
+                    finally:
+                        command_db.close()
+                    if run_status == "running" and command_status == "completed":
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError(
+                        "detached APPEND command did not project the WorkforceRun "
+                        "to running"
+                    )
+            finally:
+                if not handler_task.done():
+                    await asyncio.wait_for(handler_task, timeout=1.0)
     finally:
         db.close()

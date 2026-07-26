@@ -1,14 +1,113 @@
 """Test builder chat WebSocket endpoint with agent-based implementation."""
 
+import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy.orm import Session
+from fastapi import WebSocketDisconnect
 
-from xagent.web.api.websocket import handle_builder_chat
-from xagent.web.models.model import Model as DBModel
+from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import (
+    handle_builder_chat,
+    websocket_builder_chat_endpoint,
+)
 from xagent.web.models.user import User
+from xagent.web.services.builder_chat_runtime import BuilderChatRuntimeInputs
+
+
+@pytest.mark.asyncio
+async def test_builder_endpoint_drains_replaced_and_disconnected_chat_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement never overlaps cleanup owned by the previous handler."""
+
+    first_started = asyncio.Event()
+    first_cleanup_started = asyncio.Event()
+    release_first_cleanup = asyncio.Event()
+    second_started = asyncio.Event()
+    second_cleanup_started = asyncio.Event()
+    release_second_cleanup = asyncio.Event()
+    allow_disconnect = asyncio.Event()
+    handler_calls = 0
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace()
+            self.receive_count = 0
+
+        async def accept(self) -> None:
+            return None
+
+        async def close(self, **_kwargs: object) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            self.receive_count += 1
+            if self.receive_count == 1:
+                return '{"messages":[{"role":"user","content":"first"}]}'
+            if self.receive_count == 2:
+                await first_started.wait()
+                return '{"messages":[{"role":"user","content":"second"}]}'
+            await allow_disconnect.wait()
+            raise WebSocketDisconnect()
+
+    async def controlled_handler(
+        _websocket: object,
+        _message_data: dict,
+        _user: object,
+    ) -> None:
+        nonlocal handler_calls
+        handler_calls += 1
+        if handler_calls == 1:
+            first_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                first_cleanup_started.set()
+                await release_first_cleanup.wait()
+        else:
+            second_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                second_cleanup_started.set()
+                await release_second_cleanup.wait()
+
+    principal = SimpleNamespace(id=1, is_admin=False)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(return_value=principal),
+    )
+    monkeypatch.setattr(websocket_api, "handle_builder_chat", controlled_handler)
+
+    endpoint_task = asyncio.create_task(
+        websocket_builder_chat_endpoint(FakeWebSocket(), token="token")  # type: ignore[arg-type]
+    )
+    try:
+        await first_cleanup_started.wait()
+        await asyncio.sleep(0)
+        assert not second_started.is_set()
+
+        release_first_cleanup.set()
+        await second_started.wait()
+        allow_disconnect.set()
+        await second_cleanup_started.wait()
+        await asyncio.sleep(0)
+        assert not endpoint_task.done()
+
+        release_second_cleanup.set()
+        await endpoint_task
+    finally:
+        release_first_cleanup.set()
+        release_second_cleanup.set()
+        allow_disconnect.set()
+        if not endpoint_task.done():
+            endpoint_task.cancel()
+        await asyncio.gather(endpoint_task, return_exceptions=True)
+    assert handler_calls == 2
 
 
 @pytest.mark.asyncio
@@ -37,26 +136,29 @@ async def test_handle_builder_chat_basic() -> None:
             "skills": [],
             "toolCategories": [],
         },
+        "files": [
+            {"file_id": "owned-file"},
+            {"file_id": "another-user-file"},
+        ],
     }
 
-    # Mock DB Session
-    mock_db = MagicMock(spec=Session)
-
-    # Mock DB query results for models
-    mock_model = MagicMock(spec=DBModel)
-    mock_model.model_id = "gpt-4"
-
-    # Mock query().filter().first() chain
-    mock_query = MagicMock()
-    mock_filter = MagicMock()
-    mock_db.query.return_value = mock_query
-    mock_query.filter.return_value = mock_filter
-    mock_filter.first.return_value = mock_model
+    mock_llm = AsyncMock()
+    mock_compact_llm = AsyncMock()
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=("owned-file",),
+            llm=mock_llm,
+            compact_llm=mock_compact_llm,
+        )
+    )
 
     # Mock dependencies
     with (
-        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
-        patch("xagent.web.services.llm_utils.UserAwareModelStorage") as MockStorage,
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
+        patch("xagent.web.api.websocket.get_session_local", return_value=MagicMock()),
         patch("xagent.core.agent.service.AgentService") as MockAgentService,
         patch("xagent.core.agent.trace.Tracer"),
         patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
@@ -68,18 +170,7 @@ async def test_handle_builder_chat_basic() -> None:
             "xagent.core.tools.adapters.vibe.agent_tool.UpdateAgentTool"
         ) as MockUpdateAgentTool,
     ):
-        # Setup mocks
-        mock_storage_instance = MockStorage.return_value
-        mock_llm = AsyncMock()
-        mock_compact_llm = AsyncMock()
         mock_llm.stream_chat = AsyncMock()
-        mock_storage_instance.get_llm_by_name_with_access.return_value = mock_llm
-        mock_storage_instance.get_configured_defaults.return_value = (
-            mock_llm,
-            None,
-            None,
-            mock_compact_llm,
-        )
 
         # Mock agent service
         mock_agent_service = MockAgentService.return_value
@@ -97,12 +188,7 @@ async def test_handle_builder_chat_basic() -> None:
         del mock_websocket.state.builder_agent_service
 
         # Act
-        try:
-            await handle_builder_chat(mock_websocket, message_data, mock_user)
-        except Exception:
-            # If there's an error, check if it's related to our test setup
-            # The actual implementation should work
-            pass
+        await handle_builder_chat(mock_websocket, message_data, mock_user)
 
         # Assert
         # Verify AgentService was created with v2 ReAct so builder chat can use
@@ -122,9 +208,18 @@ async def test_handle_builder_chat_basic() -> None:
         # Verify CreateAgentTool was created (direct tool creation, not via WebToolConfig)
         assert MockCreateAgentTool.called
         assert MockUpdateAgentTool.called
+        runtime_loader.assert_awaited_once_with(
+            user_id=1,
+            requested_file_ids=["owned-file", "another-user-file"],
+            model_name=None,
+            compact_model_name=None,
+        )
 
         # Verify agent service execute_task was called
         mock_agent_service.execute_task.assert_awaited_once()
+        executed_message = mock_agent_service.execute_task.await_args.kwargs["task"]
+        assert "owned-file" in executed_message
+        assert "another-user-file" not in executed_message
 
 
 @pytest.mark.asyncio
@@ -147,42 +242,28 @@ async def test_handle_builder_chat_uses_payload_compact_model() -> None:
         "tool_categories": [],
         "executionMode": "balanced",
     }
-    mock_db = MagicMock(spec=Session)
+    mock_llm = AsyncMock()
+    mock_compact_llm = AsyncMock()
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=(),
+            llm=mock_llm,
+            compact_llm=mock_compact_llm,
+        )
+    )
 
     with (
-        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
-        patch("xagent.web.services.llm_utils.UserAwareModelStorage") as MockStorage,
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
+        patch("xagent.web.api.websocket.get_session_local", return_value=MagicMock()),
         patch("xagent.core.agent.service.AgentService") as MockAgentService,
         patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
         patch("xagent.web.user_isolated_memory.UserContext"),
         patch("xagent.core.tools.adapters.vibe.agent_tool.CreateAgentTool"),
         patch("xagent.core.tools.adapters.vibe.agent_tool.UpdateAgentTool"),
     ):
-        mock_storage_instance = MockStorage.return_value
-        mock_llm = AsyncMock()
-        mock_compact_llm = AsyncMock()
-        mock_default_llm = AsyncMock()
-        mock_default_compact_llm = AsyncMock()
-
-        def get_llm_by_name_with_access(
-            model_name: object, *, user_id: int | None = None
-        ) -> object | None:
-            assert user_id == 1
-            return {
-                10: mock_llm,
-                20: mock_compact_llm,
-            }.get(model_name)
-
-        mock_storage_instance.get_llm_by_name_with_access.side_effect = (
-            get_llm_by_name_with_access
-        )
-        mock_storage_instance.get_configured_defaults.return_value = (
-            mock_default_llm,
-            None,
-            None,
-            mock_default_compact_llm,
-        )
-
         mock_agent_service = MockAgentService.return_value
         mock_agent_service.execute_task = AsyncMock(
             return_value={"output": "Agent created successfully", "status": "completed"}
@@ -198,8 +279,12 @@ async def test_handle_builder_chat_uses_payload_compact_model() -> None:
     call_kwargs = MockAgentService.call_args[1]
     assert call_kwargs["llm"] is mock_llm
     assert call_kwargs["compact_llm"] is mock_compact_llm
-    mock_storage_instance.get_configured_defaults.assert_not_called()
-    assert mock_storage_instance.get_llm_by_name_with_access.call_count == 2
+    runtime_loader.assert_awaited_once_with(
+        user_id=1,
+        requested_file_ids=[],
+        model_name=10,
+        compact_model_name=20,
+    )
 
 
 @pytest.mark.asyncio
@@ -226,30 +311,25 @@ async def test_handle_builder_chat_waiting_for_user_sends_chat_response() -> Non
         "executionMode": "balanced",
     }
 
-    mock_db = MagicMock(spec=Session)
-    mock_query = MagicMock()
-    mock_filter = MagicMock()
-    mock_db.query.return_value = mock_query
-    mock_query.filter.return_value = mock_filter
-    mock_filter.first.return_value = MagicMock(spec=DBModel, model_id="gpt-4")
+    mock_llm = AsyncMock()
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=(),
+            llm=mock_llm,
+            compact_llm=None,
+        )
+    )
 
     with (
-        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
-        patch("xagent.web.services.llm_utils.UserAwareModelStorage") as MockStorage,
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
+        patch("xagent.web.api.websocket.get_session_local", return_value=MagicMock()),
         patch("xagent.core.agent.service.AgentService") as MockAgentService,
         patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
         patch("xagent.web.user_isolated_memory.UserContext"),
     ):
-        mock_storage_instance = MockStorage.return_value
-        mock_llm = AsyncMock()
-        mock_storage_instance.get_llm_by_name_with_access.return_value = mock_llm
-        mock_storage_instance.get_configured_defaults.return_value = (
-            mock_llm,
-            None,
-            None,
-            None,
-        )
-
         mock_agent_service = MockAgentService.return_value
         mock_agent_service.execute_task = AsyncMock(
             return_value={
@@ -303,6 +383,7 @@ async def test_handle_builder_chat_no_llm() -> None:
     mock_websocket = AsyncMock()
     mock_user = MagicMock(spec=User)
     mock_user.id = 1
+    mock_user.is_admin = False
 
     message_data = {
         "messages": [{"role": "user", "content": "Create an agent"}],
@@ -310,24 +391,21 @@ async def test_handle_builder_chat_no_llm() -> None:
         "available_options": {},
     }
 
-    # Mock DB Session
-    mock_db = MagicMock(spec=Session)
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=(),
+            llm=None,
+            compact_llm=None,
+        )
+    )
 
     # Mock dependencies
     with (
-        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
-        patch("xagent.web.services.llm_utils.UserAwareModelStorage") as MockStorage,
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
     ):
-        # Setup mocks to return None for LLM
-        mock_storage_instance = MockStorage.return_value
-        mock_storage_instance.get_llm_by_name_with_access.return_value = None
-        mock_storage_instance.get_configured_defaults.return_value = (
-            None,
-            None,
-            None,
-            None,
-        )
-
         # Act
         await handle_builder_chat(mock_websocket, message_data, mock_user)
 

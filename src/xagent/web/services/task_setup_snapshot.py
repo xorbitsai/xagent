@@ -20,31 +20,34 @@ Background:
     reference past the close would hit ``DetachedInstanceError`` on
     its next attribute access.
 
-Out of scope (first cut, by design):
-    * ``UploadedFile`` selected-files loop -- contains writes
-      (``UploadedFile.task_id`` assignment + ``db.flush()``), so it
-      stays on the main loop with the request session.
-    * ``_load_persisted_conversation_history`` /
-      ``_load_persisted_execution_context`` -- already separate async
-      helpers; can be migrated in a follow-up.
-    * ToolFactory inner DB I/O -- tool subclasses hold ``self._db``;
-      threading the factory requires a session-factory refactor of
-      every tool subclass first.
+Out of scope:
+    * ``UploadedFile`` selected-files binding -- contains writes and is
+      therefore handled by its own worker-owned Session during agent
+      bootstrap instead of being folded into this read-only snapshot.
     * MCP server configs -- async + OAuth refresh path.
 """
 
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from sqlalchemy.orm import Session
 
 from ...core.model.chat.basic.base import BaseLLM
 from ..models.database import get_session_local
-from ..models.task import Task
+from ..models.task import DAGExecution, Task, TraceEvent
+from ..models.user import User
 from .llm_utils import AgentRuntimeFields
+from .task_execution_context_service import (
+    TaskExecutionRecoverySnapshot,
+    load_task_execution_recovery_snapshot_sync,
+)
+
+if TYPE_CHECKING:
+    from .workforce_runtime import WorkforceTaskRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,28 @@ class _TaskFields:
     agent_type: Optional[str]
     source: str | None = None
     computer_runtime_kind: str | None = None
+    run_id: str | None = None
+    state_version: int = 0
+    control_state: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeUserFields:
+    """Primitive runtime identity required while an agent is constructed."""
+
+    id: int
+    is_admin: bool
+
+
+@dataclass(frozen=True)
+class TaskReconstructionSnapshot:
+    """Detached historical state consumed by agent reconstruction."""
+
+    tracer_events: tuple[dict[str, Any], ...] = ()
+    plan_state: Optional[dict[str, Any]] = None
+    # Preserve the legacy retry pre-check: any runtime TraceEvent or
+    # DAGExecution row attempts reconstruction, even when current_plan is empty.
+    has_history: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +103,8 @@ class TaskSetupSnapshot:
     """
 
     task: _TaskFields
+    runtime_user: Optional[RuntimeUserFields]
+    has_reconstructable_history: bool
     task_pattern: str
     # Final resolved LLMs after the agent-builder override (if any).
     task_llm: Optional[BaseLLM]
@@ -92,6 +119,12 @@ class TaskSetupSnapshot:
     agent: Optional[AgentRuntimeFields]
     agent_config: Optional[dict]
     excluded_agent_id: Optional[int]
+    conversation_history: tuple[dict[str, str], ...] = ()
+    execution_recovery: TaskExecutionRecoverySnapshot = TaskExecutionRecoverySnapshot()
+    reconstruction: TaskReconstructionSnapshot = TaskReconstructionSnapshot()
+    # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
+    # Kept as the service-layer frozen dataclass; no ORM row is retained.
+    workforce_runtime: WorkforceTaskRuntime | None = None
 
 
 # NOTE: All LLM resolution + agent-builder merge + execution-mode →
@@ -103,9 +136,8 @@ class TaskSetupSnapshot:
 #      ``_TaskFields`` so nothing escapes the loader's session
 #      (``Agent`` primitives are already provided by the core as an
 #      ``AgentRuntimeFields`` instance).
-# The main-loop reconstruct path (``_resolve_task_runtime_config`` in
-# chat.py) calls the same core directly, since it doesn't need the
-# primitive wrapping and runs inside the request session's lifetime.
+# Reconstruction and normal creation both consume this detached snapshot;
+# neither path re-resolves runtime configuration from a request Session.
 
 
 class TaskOwnerMismatchError(Exception):
@@ -124,9 +156,93 @@ class TaskOwnerMismatchError(Exception):
         self.actual = actual
 
 
+def load_task_reconstruction_snapshot_sync(
+    session: Session,
+    task_id: int,
+) -> TaskReconstructionSnapshot:
+    """Load and decode reconstruction rows before the worker Session closes."""
+    from .trace_message_storage import decode_trace_events_data
+
+    trace_rows = (
+        session.query(TraceEvent)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+        )
+        .all()
+    )
+    decoded_data = decode_trace_events_data(
+        session,
+        task_id=task_id,
+        data_items=[row.data for row in trace_rows],
+        strict=False,
+    )
+    tracer_events = tuple(
+        {
+            "id": str(row.event_id),
+            "event_type": str(row.event_type),
+            "task_id": str(row.task_id),
+            "step_id": str(row.step_id) if row.step_id is not None else None,
+            "timestamp": row.timestamp.timestamp() if row.timestamp else None,
+            "data": deepcopy(data),
+            "parent_id": (
+                str(row.parent_event_id) if row.parent_event_id is not None else None
+            ),
+        }
+        for row, data in zip(trace_rows, decoded_data)
+    )
+
+    dag_row = (
+        session.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
+    )
+    plan_state = (
+        deepcopy(cast(dict[str, Any], dag_row.current_plan))
+        if dag_row is not None and dag_row.current_plan
+        else None
+    )
+    return TaskReconstructionSnapshot(
+        tracer_events=tracer_events,
+        plan_state=plan_state,
+        has_history=bool(trace_rows) or dag_row is not None,
+    )
+
+
+def _resolve_inline_preview_excluded_agent_id(
+    session: Session,
+    task_row: Task,
+    agent_config: Optional[dict],
+) -> Optional[int]:
+    """Resolve the published preview agent with the legacy owner/team rule."""
+    if not agent_config or not agent_config.get("preview_agent_id"):
+        return None
+
+    from ..models.agent import Agent, AgentStatus
+    from .agent_team_scope import get_agent_team_scope, owned_agent_clause
+
+    owner_user_id = int(task_row.user_id)
+    preview_agent = (
+        session.query(Agent)
+        .filter(
+            Agent.id == agent_config["preview_agent_id"],
+            owned_agent_clause(
+                owner_user_id,
+                get_agent_team_scope(session, owner_user_id),
+            ),
+        )
+        .first()
+    )
+    if preview_agent is None or preview_agent.status != AgentStatus.PUBLISHED:
+        return None
+    return int(preview_agent.id)
+
+
 def load_task_setup_snapshot_sync(
     task_id: int,
     task_owner_user_id: Optional[int],
+    *,
+    before_message_id: Optional[int] = None,
+    actor_user_id: Optional[int] = None,
+    actor_is_admin: bool = False,
 ) -> Optional[TaskSetupSnapshot]:
     """Open a dedicated ``SessionLocal``, read every synchronous field
     ``get_agent_for_task`` needs for normal (non-reconstruct) creation,
@@ -151,13 +267,30 @@ def load_task_setup_snapshot_sync(
     session_factory = get_session_local()
     session: Session = session_factory()
     try:
-        task_row = session.query(Task).filter(Task.id == task_id).first()
+        task_query = session.query(Task).filter(Task.id == task_id)
+        if actor_user_id is not None and not actor_is_admin:
+            task_query = task_query.filter(Task.user_id == actor_user_id)
+        task_row = task_query.first()
         if task_row is None:
             return None
 
         owner_user_id = int(task_row.user_id)
         if task_owner_user_id is not None and owner_user_id != task_owner_user_id:
             raise TaskOwnerMismatchError(task_id, task_owner_user_id, owner_user_id)
+
+        runtime_user_row = (
+            session.query(User.id, User.is_admin)
+            .filter(User.id == owner_user_id)
+            .first()
+        )
+        runtime_user = (
+            RuntimeUserFields(
+                id=int(runtime_user_row[0]),
+                is_admin=bool(runtime_user_row[1]),
+            )
+            if runtime_user_row is not None
+            else None
+        )
 
         task_fields = _TaskFields(
             id=int(task_row.id),
@@ -187,6 +320,13 @@ def load_task_setup_snapshot_sync(
                 if task_row.computer_runtime_kind is not None
                 else None
             ),
+            run_id=str(task_row.run_id) if task_row.run_id is not None else None,
+            state_version=int(task_row.state_version or 0),
+            control_state=(
+                str(task_row.control_state)
+                if task_row.control_state is not None
+                else None
+            ),
         )
 
         # Runtime resolution always uses the row's OWNER, never the passed
@@ -195,11 +335,35 @@ def load_task_setup_snapshot_sync(
             task_row, session, user_id=owner_user_id
         )
         task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
+        excluded_agent_id = core.excluded_agent_id
+        if excluded_agent_id is None:
+            excluded_agent_id = _resolve_inline_preview_excluded_agent_id(
+                session,
+                task_row,
+                core.agent_config,
+            )
+
+        from .chat_history_service import load_task_transcript
+
+        conversation_history = tuple(
+            load_task_transcript(
+                session,
+                task_id,
+                before_message_id=before_message_id,
+            )
+        )
+        execution_recovery = load_task_execution_recovery_snapshot_sync(
+            session,
+            task_id,
+        )
+        reconstruction = load_task_reconstruction_snapshot_sync(session, task_id)
 
         # ``core.agent_fields`` is already an ``AgentRuntimeFields``
         # frozen dataclass; pass it through directly.
         return TaskSetupSnapshot(
             task=task_fields,
+            runtime_user=runtime_user,
+            has_reconstructable_history=reconstruction.has_history,
             task_pattern=core.task_pattern,
             task_llm=task_llm,
             task_fast_llm=task_fast_llm,
@@ -207,7 +371,11 @@ def load_task_setup_snapshot_sync(
             task_compact_llm=task_compact_llm,
             agent=core.agent_fields,
             agent_config=core.agent_config,
-            excluded_agent_id=core.excluded_agent_id,
+            excluded_agent_id=excluded_agent_id,
+            conversation_history=conversation_history,
+            execution_recovery=execution_recovery,
+            reconstruction=reconstruction,
+            workforce_runtime=deepcopy(core.workforce),
         )
     finally:
         session.close()

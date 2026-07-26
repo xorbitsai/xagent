@@ -8,7 +8,7 @@ from alembic import command
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from alembic.util.exc import CommandError
-from sqlalchemy import Engine, inspect
+from sqlalchemy import Engine, inspect, text
 from sqlalchemy.engine import Connection
 
 from .config import create_alembic_config
@@ -23,6 +23,10 @@ SQLiteForeignKeyViolation = tuple[
     SQLiteRowIdentity,
     SQLiteForeignKeyDescriptor,
 ]
+
+# Session-level PostgreSQL advisory lock shared by every xagent startup
+# migrator.  The ASCII bytes spell ``XAGENTDB`` and fit in a signed bigint.
+POSTGRES_MIGRATION_ADVISORY_LOCK_ID = 0x584147454E544442
 
 
 def _set_sqlite_foreign_keys(connection: Connection, *, enabled: bool) -> None:
@@ -203,8 +207,58 @@ def _sqlite_foreign_key_violations(
 
 
 @contextmanager
-def _migration_connection(engine: Engine) -> Iterator[Connection]:
+def database_startup_lock(
+    engine: Engine,
+) -> Iterator[Connection | None]:
+    """Serialize the complete PostgreSQL database-startup critical section.
+
+    The caller owns schema detection, migration, metadata creation, and
+    first-start seeding while this session-level lock is held.  Keeping the
+    lock owner outside Alembic prevents a second backend worker from observing
+    a half-initialized fresh database after the revision stamp commits.
+    """
+
+    if engine.dialect.name != "postgresql":
+        yield None
+        return
+
+    with engine.connect() as connection:
+        connection.execute(
+            text("SELECT pg_advisory_lock(:lock_id)"),
+            {"lock_id": POSTGRES_MIGRATION_ADVISORY_LOCK_ID},
+        )
+        # Session-level advisory locks survive transaction boundaries.  Close
+        # the implicit transaction so Alembic can enter an autocommit block for
+        # online index DDL while this connection continues to own the lock.
+        connection.commit()
+        try:
+            yield connection
+        except BaseException:
+            if connection.in_transaction():
+                connection.rollback()
+            raise
+        else:
+            if connection.in_transaction():
+                connection.commit()
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_id)"),
+                {"lock_id": POSTGRES_MIGRATION_ADVISORY_LOCK_ID},
+            )
+            connection.commit()
+
+
+@contextmanager
+def _migration_connection(
+    engine: Engine,
+    *,
+    locked_connection: Connection | None = None,
+) -> Iterator[Connection]:
     """Own one migration transaction without SQLite FK cascade side effects."""
+    if locked_connection is not None:
+        yield locked_connection
+        return
+
     if engine.dialect.name != "sqlite":
         with engine.begin() as connection:
             yield connection
@@ -243,16 +297,20 @@ def _migration_connection(engine: Engine) -> Iterator[Connection]:
             )
 
 
-def is_database_empty(engine: Engine) -> bool:
-    inspector = inspect(engine)
+def is_database_empty(connectable: Engine | Connection) -> bool:
+    inspector = inspect(connectable)
     tables = inspector.get_table_names()
     return len(tables) == 0
 
 
-def get_alembic_revision(engine: Engine) -> str | None:
+def get_alembic_revision(connectable: Engine | Connection) -> str | None:
     """Get the current Alembic revision from the database."""
-    with engine.connect() as conn:
-        context: Any = MigrationContext.configure(conn)
+    if isinstance(connectable, Connection):
+        context: Any = MigrationContext.configure(connectable)
+        return cast(str | None, context.get_current_revision())
+
+    with connectable.connect() as connection:
+        context = MigrationContext.configure(connection)
         return cast(str | None, context.get_current_revision())
 
 
@@ -282,32 +340,70 @@ def _check_revision_is_known(alembic_cfg: Any, engine: Engine, version: str) -> 
         ) from None
 
 
-def try_upgrade_db(engine: Engine) -> None:
+def _upgrade_db_locked(
+    engine: Engine,
+    *,
+    locked_connection: Connection | None,
+) -> None:
+    """Run revision detection and Alembic work under the caller's lock."""
+
+    alembic_cfg = create_alembic_config(engine)
+    metadata_connection: Engine | Connection = (
+        locked_connection if locked_connection is not None else engine
+    )
+    # Read the revision only after taking the PostgreSQL lock.  A worker that
+    # waited for another initializer must observe its committed revision, not
+    # a pre-lock snapshot.
+    version = get_alembic_revision(metadata_connection)
+
+    # An empty-string version_num (tampered/corrupted alembic_version) is
+    # treated like a missing revision: get_revisions("") dies with a bare
+    # AssertionError instead of a catchable error.
+    if not version:
+        if is_database_empty(metadata_connection):
+            logger.info("Creating new database, stamping to latest revision.")
+            with _migration_connection(
+                engine,
+                locked_connection=locked_connection,
+            ) as conn:
+                alembic_cfg.attributes["connection"] = conn
+                command.stamp(alembic_cfg, "head")
+            return
+        raise RuntimeError(
+            "Database exists without alembic revision information. Please "
+            "initialize the database schema version manually by running: "
+            "alembic stamp <revision>"
+        )
+
+    _check_revision_is_known(alembic_cfg, engine, version)
+    logger.info("Current version: %s, upgrading to head", version)
+    with _migration_connection(
+        engine,
+        locked_connection=locked_connection,
+    ) as conn:
+        alembic_cfg.attributes["connection"] = conn
+        command.upgrade(alembic_cfg, "head")
+
+
+def try_upgrade_db(
+    engine: Engine,
+    *,
+    locked_connection: Connection | None = None,
+) -> None:
     """Upgrade database to latest migration (or stamp head for brand-new databases)."""
     try:
         logger.info("Starting database upgrade process")
-        alembic_cfg = create_alembic_config(engine)
-        version = get_alembic_revision(engine)
-
-        # An empty-string version_num (tampered/corrupted alembic_version)
-        # is treated like a missing revision: get_revisions("") dies with a
-        # bare AssertionError instead of a catchable error.
-        if not version:
-            if is_database_empty(engine):
-                logger.info("Creating new database, stamping to latest revision.")
-                with _migration_connection(engine) as conn:
-                    alembic_cfg.attributes["connection"] = conn
-                    command.stamp(alembic_cfg, "head")
-            else:
-                raise RuntimeError(
-                    "Database exists without alembic revision information. Please initialize the database schema version manually by running: alembic stamp <revision>"
-                )
+        if locked_connection is not None:
+            _upgrade_db_locked(
+                engine,
+                locked_connection=locked_connection,
+            )
         else:
-            _check_revision_is_known(alembic_cfg, engine, version)
-            logger.info(f"Current version: {version}, upgrading to head")
-            with _migration_connection(engine) as conn:
-                alembic_cfg.attributes["connection"] = conn
-                command.upgrade(alembic_cfg, "head")
+            with database_startup_lock(engine) as acquired_connection:
+                _upgrade_db_locked(
+                    engine,
+                    locked_connection=acquired_connection,
+                )
     except Exception as e:
         logger.error(f"Automatic database upgrade failed: {e}")
         raise

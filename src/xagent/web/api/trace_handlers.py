@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,13 +21,17 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
 from ...web.models.database import get_db
-from ...web.models.task import Task
+from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
 from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
     clear_degradation,
     register_degradation,
+)
+from ...web.services.task_lease_service import (
+    TASK_RUN_ID_TRACE_FIELD,
+    current_task_lease,
 )
 from ...web.services.trace_message_storage import (
     SQL_IN_CLAUSE_CHUNK_SIZE,
@@ -127,7 +131,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 DatabaseTraceEvent.event_type == "system_update_general",
             )
             if self.build_id is None:
-                query = query.filter(DatabaseTraceEvent.build_id.is_(None))
+                allowed, run_id = self._root_checkpoint_read_partition(db)
+                if not allowed:
+                    return None
+                query = query.filter(
+                    DatabaseTraceEvent.build_id.is_(None),
+                    self._checkpoint_run_partition_filter(run_id),
+                )
             else:
                 query = query.filter(DatabaseTraceEvent.build_id == self.build_id)
 
@@ -187,6 +197,52 @@ class DatabaseTraceHandler(BaseTraceHandler):
         finally:
             db.close()
 
+    def _root_checkpoint_read_partition(
+        self,
+        db: Session,
+    ) -> tuple[bool, str | None]:
+        """Resolve the only root-task run partition safe for this reader.
+
+        Exact executions read only checkpoints tagged with their bound run.
+        Legacy callers can read only untagged rows, and only while the task has
+        no active run. Build-scoped checkpoints retain their historical
+        build-only partitioning and do not call this helper.
+        """
+
+        lease = current_task_lease()
+        if lease is not None:
+            if lease.task_id != self.task_id or lease.run_id is None:
+                return False, None
+            return True, lease.run_id
+
+        task_run = db.query(Task.run_id).filter(Task.id == self.task_id).one_or_none()
+        if task_run is None or task_run[0] is not None:
+            return False, None
+        tagged_checkpoint_exists = (
+            db.query(DatabaseTraceEvent.id)
+            .filter(
+                DatabaseTraceEvent.task_id == self.task_id,
+                DatabaseTraceEvent.build_id.is_(None),
+                DatabaseTraceEvent.event_type == "system_update_general",
+                DatabaseTraceEvent.data["checkpoint_type"]
+                .as_string()
+                .in_(sorted(READABLE_CHECKPOINT_TYPES)),
+                DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD]
+                .as_string()
+                .is_not(None),
+            )
+            .first()
+            is not None
+        )
+        if tagged_checkpoint_exists:
+            return False, None
+        return True, None
+
+    @staticmethod
+    def _checkpoint_run_partition_filter(run_id: str | None) -> Any:
+        run_field = DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD].as_string()
+        return run_field == run_id if run_id is not None else run_field.is_(None)
+
     def _sync_save_to_database(self, event: CoreTraceEvent) -> None:
         """Synchronous database save operation (runs in thread pool)."""
         # Create database session
@@ -228,11 +284,21 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 and isinstance(data, dict)
                 and data.get("checkpoint_type") == CHECKPOINT_TYPE
             ):
+                checkpoint_lease = (
+                    current_task_lease() if self.build_id is None else None
+                )
+                if checkpoint_lease is not None:
+                    data = {
+                        **data,
+                        TASK_RUN_ID_TRACE_FIELD: checkpoint_lease.run_id,
+                    }
                 data = encode_checkpoint_data_for_storage(
                     db,
                     task_id=self.task_id,
                     data=data,
                 )
+            else:
+                checkpoint_lease = None
 
             # Create trace event record
             trace_event = DatabaseTraceEvent(
@@ -253,10 +319,24 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 and isinstance(data, dict)
                 and data.get("checkpoint_type") == CHECKPOINT_TYPE
                 and self.build_id is None
+                and checkpoint_lease is not None
             ):
-                task = db.query(Task).filter(Task.id == self.task_id).first()
-                if task:
-                    setattr(task, "last_checkpoint_event_id", str(event.id))
+                pointer_update = db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == self.task_id,
+                        Task.status == TaskStatus.RUNNING,
+                        Task.runner_id == checkpoint_lease.runner_id,
+                        Task.run_id == checkpoint_lease.run_id,
+                    )
+                    .values(last_checkpoint_event_id=str(event.id))
+                    .execution_options(synchronize_session=False)
+                )
+                if int(getattr(pointer_update, "rowcount", 0) or 0) != 1:
+                    raise RuntimeError(
+                        f"Task {self.task_id} lease changed before checkpoint "
+                        f"{event.id} could be persisted"
+                    )
 
             # Update tool usage statistics if this is a tool execution event
             if event_type_str == "tool_execution_end":
@@ -352,11 +432,19 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 if self.build_id is not None
                 else DatabaseTraceEvent.build_id.is_(None)
             )
+            partition_filters = [build_filter]
+            if self.build_id is None:
+                run_id = data.get(TASK_RUN_ID_TRACE_FIELD)
+                partition_filters.append(
+                    self._checkpoint_run_partition_filter(
+                        run_id if isinstance(run_id, str) and run_id else None
+                    )
+                )
             stale_rows = (
                 db.query(DatabaseTraceEvent.id)
                 .filter(
                     DatabaseTraceEvent.task_id == self.task_id,
-                    build_filter,
+                    *partition_filters,
                     DatabaseTraceEvent.event_type == "system_update_general",
                     DatabaseTraceEvent.data["checkpoint_type"]
                     .as_string()

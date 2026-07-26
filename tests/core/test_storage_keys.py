@@ -10,6 +10,7 @@ documented behavior.
 
 import pytest
 
+from xagent.core.file_storage import keys as storage_keys
 from xagent.core.file_storage import normalize_storage_key
 from xagent.core.file_storage.keys import (
     build_task_output_storage_key,
@@ -85,6 +86,23 @@ def test_upload_key_uses_safe_filename(filename, expected_name):
         build_upload_storage_key(7, "file-id", filename)
         == f"users/7/uploads/file-id/{expected_name}"
     )
+
+
+def test_upload_generation_key_preserves_scope_and_sanitizes_filename():
+    assert hasattr(storage_keys, "build_upload_generation_storage_key")
+    key = storage_keys.build_upload_generation_storage_key(
+        7,
+        "legacy-file-id",
+        "dir/report.txt",
+        generation="12345678123456781234567812345678",
+        scope_segments=("workforces", "9"),
+    )
+
+    assert key == (
+        "users/7/workforces/9/uploads/legacy-file-id/_versions/"
+        "12345678123456781234567812345678/report.txt"
+    )
+    assert normalize_storage_key(key) == key
 
 
 @pytest.mark.parametrize(

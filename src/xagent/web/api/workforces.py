@@ -20,6 +20,7 @@ from ..models.workforce import (
     WorkforceAgent,
     WorkforceRun,
 )
+from ..schemas.widget import WidgetAllowedDomain
 from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
@@ -1017,7 +1018,7 @@ class WorkforceWidgetUpdateRequest(BaseModel):
     """
 
     widget_enabled: bool | None = None
-    allowed_domains: list[str] | None = None
+    allowed_domains: list[WidgetAllowedDomain] | None = None
 
 
 def _serialize_workforce_widget(

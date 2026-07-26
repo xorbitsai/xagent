@@ -3,6 +3,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
+from uuid import uuid4
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -12,26 +13,33 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequestBody,
 )
 
-from ....config import get_default_task_execution_mode
 from ....core.file_ref import build_file_id_ref
 from ...api.chat import get_agent_manager
-from ...models.database import get_db
-from ...models.task import Task, TaskStatus
-from ...models.user import User
-from ...models.user_channel import UserChannel
+from ...models.task import TaskStatus
+from ...services.channel_runtime import (
+    ChannelAuthorizationError,
+    ChannelConfigurationError,
+    DownloadedChannelFile,
+    authorize_channel_sender,
+    load_active_channel_configs,
+    persist_channel_user_message,
+    prepare_channel_task,
+    register_channel_uploaded_files,
+    update_channel_task_fields,
+)
+from ...services.db_runtime import (
+    cancel_and_drain_async_task,
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
 from ...services.execution_result_projection import project_execution_result_for_channel
-from ...services.managed_task_lease import (
-    ManagedTaskLease,
-    claim_managed_task_lease,
+from ...services.file_turn import normalize_attachments_for_persistence
+from ...services.managed_task_lease import ManagedTaskLease
+from ...services.task_execution_context_service import (
+    materialize_task_execution_recovery_state,
 )
-from ...services.task_execution_controller import (
-    StaleTaskRunError,
-    TaskControlState,
-    apply_task_control_transition,
-    control_state_for_status,
-    task_control_snapshot,
-    task_execution_controller,
-)
+from ...services.task_lease_service import TaskLeaseLostError
+from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
 from .trace_handler import FeishuTraceHandler
 
 logger = logging.getLogger(__name__)
@@ -62,6 +70,11 @@ class FeishuBotInstance:
         self.polling_task: Optional[asyncio.Task] = None
         self.user_message_queues: Dict[str, list] = {}
         self.user_message_tasks: Dict[str, asyncio.Task] = {}
+        self._ping_task: asyncio.Task | None = None
+        self._accepting = True
+        self._ingress_stopped = False
+        self._stop_lock: asyncio.Lock | None = None
+        self._stop_loop: asyncio.AbstractEventLoop | None = None
 
         import time
 
@@ -86,6 +99,9 @@ class FeishuBotInstance:
             logger.error(f"Error saving feishu active tasks: {e}")
 
     def _handle_message_sync(self, data: Any) -> None:
+        if not self._accepting:
+            return
+
         loop = asyncio.get_event_loop()
         if loop.is_running():
             event = data.event
@@ -129,41 +145,10 @@ class FeishuBotInstance:
     async def _process_messages_batch(
         self, open_id: str, messages_data: list[Any]
     ) -> None:
-        # Get chat_id from the first message
         chat_id = messages_data[0].event.message.chat_id
-
-        db_gen = get_db()
-        db = next(db_gen)
         claimed_task_id: int | None = None
-        claimed_run_id: str | None = None
         managed_lease: ManagedTaskLease | None = None
         try:
-            user = None
-            if self.channel_id:
-                channel = (
-                    db.query(UserChannel)
-                    .filter(UserChannel.id == self.channel_id)
-                    .first()
-                )
-                if channel:
-                    user = db.query(User).filter(User.id == channel.user_id).first()
-                    if channel.config:
-                        allowed_users = channel.config.get("allowed_users")
-                        if allowed_users is not None:
-                            if str(open_id) not in allowed_users:
-                                await self._send_text(
-                                    chat_id,
-                                    "\ud83d\udeab You are not authorized to use this bot.",
-                                )
-                                return
-
-            if not user:
-                await self._send_text(
-                    chat_id,
-                    "Configuration error: Cannot find the owner of this bot.",
-                )
-                return
-
             combined_text = ""
             files_info = []
             message_types = []
@@ -213,81 +198,100 @@ class FeishuBotInstance:
                 else:
                     return
 
-            if text == "/start":
-                await self._send_text(
-                    chat_id, "Welcome to Xagent! You can send /new to start a new task."
-                )
-                return
-            elif text == "/new":
-                self.active_tasks[open_id] = "-1"
-                self._save_active_tasks()
-                await self._send_text(
-                    chat_id, "Started a new task. Please describe your request."
-                )
+            if text in {"/start", "/new"}:
+                try:
+                    await authorize_channel_sender(
+                        channel_id=self.channel_id,
+                        external_user_id=str(open_id),
+                    )
+                except ChannelAuthorizationError:
+                    await self._send_text(
+                        chat_id,
+                        "\ud83d\udeab You are not authorized to use this bot.",
+                    )
+                    return
+                except ChannelConfigurationError:
+                    await self._send_text(
+                        chat_id,
+                        "Configuration error: Cannot find the owner of this bot.",
+                    )
+                    return
+
+                if text == "/start":
+                    await self._send_text(
+                        chat_id,
+                        "Welcome to Xagent! You can send /new to start a new task.",
+                    )
+                else:
+                    self.active_tasks[open_id] = "-1"
+                    self._save_active_tasks()
+                    await self._send_text(
+                        chat_id,
+                        "Started a new task. Please describe your request.",
+                    )
                 return
 
             active_task_id = self.active_tasks.get(open_id)
-            task = None
-
-            if active_task_id == "-1":
-                pass
-            elif active_task_id:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == int(active_task_id), Task.user_id == user.id)
-                    .first()
-                )
-
-            if not task:
-                is_new_task = True
-
-                task_title = text if text else "Untitled Task"
-                if len(task_title) > 50:
-                    task_title = task_title[:50] + "..."
-
-                task = Task(
-                    user_id=user.id,
-                    title=task_title,
-                    description=text,
-                    status=TaskStatus.PENDING,
-                    execution_mode=get_default_task_execution_mode(),
+            try:
+                prepared_task = await prepare_channel_task(
                     channel_id=self.channel_id,
+                    external_user_id=str(open_id),
+                    active_task_id=(
+                        int(active_task_id) if active_task_id is not None else None
+                    ),
+                    text=text,
                     channel_name=self.channel_name,
-                    connector_runtime_selected_refs=[],
                 )
-                db.add(task)
-                db.commit()
-                db.refresh(task)
-                self.active_tasks[open_id] = str(task.id)
+            except ChannelAuthorizationError:
+                await self._send_text(
+                    chat_id,
+                    "\ud83d\udeab You are not authorized to use this bot.",
+                )
+                return
+            except ChannelConfigurationError:
+                await self._send_text(
+                    chat_id,
+                    "Configuration error: Cannot find the owner of this bot.",
+                )
+                return
+
+            if prepared_task is None:
+                await self._send_text(
+                    chat_id,
+                    "I'm still working on the previous message. "
+                    "Please wait for it to finish.",
+                )
+                return
+
+            # Take ownership synchronously after the atomic DB claim so any
+            # later transport failure settles or TTL-recovers this exact run.
+            managed_lease = prepared_task.managed_lease
+            task_id = prepared_task.task_id
+            claimed_task_id = task_id
+            owner_user_id = prepared_task.user_id
+            is_new_task = prepared_task.is_new_task
+            if is_new_task:
+                self.active_tasks[open_id] = str(task_id)
                 self._save_active_tasks()
-            else:
-                is_new_task = False
 
-            async with task_execution_controller.command(int(task.id)):
-                db.refresh(task)
-                managed_lease = claim_managed_task_lease(db, int(task.id))
-                if managed_lease is None:
-                    await self._send_text(
-                        chat_id,
-                        "I'm still working on the previous message. "
-                        "Please wait for it to finish.",
-                    )
-                    return
-                db.refresh(task)
-                run_snapshot = task_control_snapshot(task)
-                claimed_task_id = int(task.id)
-                claimed_run_id = run_snapshot.run_id
-
+            setup_snapshot = await run_db_io_cancellation_safe(
+                lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
+            )
+            if setup_snapshot is None:
+                raise RuntimeError(f"Task {task_id} disappeared before execution")
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
-                int(task.id), db, user=user
+                task_id,
+                user=setup_snapshot.runtime_user,
+                task_setup_snapshot=setup_snapshot,
+                task_owner_user_id=owner_user_id,
             )
-
-            from ...services.task_execution_context_service import (
-                load_task_execution_recovery_state,
+            agent_service.set_conversation_history(
+                [dict(message) for message in setup_snapshot.conversation_history]
             )
-
-            recovery_state = await load_task_execution_recovery_state(db, int(task.id))
+            recovery_state = await materialize_task_execution_recovery_state(
+                setup_snapshot.execution_recovery
+            )
             agent_service.set_execution_context_messages(
                 recovery_state.get("messages", [])
             )
@@ -295,17 +299,21 @@ class FeishuBotInstance:
                 recovery_state.get("skill_context")
             )
 
-            context: dict = {}
+            message_turn_id = str(uuid4())
+            context: dict = {"turn_id": message_turn_id}
+            persisted_attachments: list[dict[str, Any]] = []
 
             if files_info:
                 uploaded_info = await self._download_and_register_files(
                     files_info=files_info,
                     agent_service=agent_service,
-                    task_id=int(task.id),
-                    user_id=int(user.id),
-                    db=db,
+                    task_id=task_id,
+                    user_id=owner_user_id,
                 )
                 if uploaded_info:
+                    persisted_attachments = normalize_attachments_for_persistence(
+                        uploaded_info
+                    )
                     file_info_list = [
                         f"[{info['name']}]({build_file_id_ref(info['file_id'])})"
                         for info in uploaded_info
@@ -315,62 +323,68 @@ class FeishuBotInstance:
                     else:
                         text = " ".join(file_info_list)
                     if is_new_task:
-                        task.description = text  # type: ignore
-                        if not task.title:
-                            task.title = text if len(text) <= 50 else f"{text[:50]}..."  # type: ignore
-                        db.commit()
+                        await update_channel_task_fields(
+                            task_id=task_id,
+                            user_id=owner_user_id,
+                            description=text,
+                        )
 
                     context["state"] = context.get("state", {})
                     context["state"]["file_info"] = uploaded_info
 
-            loading_msg_id = await self._send_text(
-                chat_id,
-                f"⏳ **Task #{task.id} is processing...**\n_Please wait for the result._",
+            await persist_channel_user_message(
+                task_id=task_id,
+                user_id=owner_user_id,
+                content=text,
+                attachments=persisted_attachments or None,
+                turn_id=message_turn_id,
             )
 
+            loading_msg_id = await self._send_text(
+                chat_id,
+                f"⏳ **Task #{task_id} is processing...**\n_Please wait for the result._",
+            )
+
+            fs_handler = None
             if loading_msg_id:
                 fs_handler = FeishuTraceHandler(
-                    int(task.id), self.api_client, chat_id, loading_msg_id
+                    task_id, self.api_client, chat_id, loading_msg_id
                 )
                 agent_service.tracer.add_handler(fs_handler)
 
             from ...user_isolated_memory import UserContext
 
-            actual_task_id = str(task.id)
-
-            with UserContext(int(user.id)):
-                result = await agent_manager.execute_task(
-                    agent_service=agent_service,
-                    task=text,
-                    context=context,
-                    task_id=actual_task_id,
-                    tracking_task_id=str(task.id),
-                    db_session=db,
-                    manage_task_lease=False,
-                )
+            actual_task_id = str(task_id)
+            try:
+                with UserContext(owner_user_id):
+                    result = await agent_manager.execute_task(
+                        agent_service=agent_service,
+                        task=text,
+                        context=context,
+                        task_id=actual_task_id,
+                        tracking_task_id=actual_task_id,
+                        db_session=None,
+                        manage_task_lease=False,
+                        task_lease=managed_lease.lease,
+                        task_lease_heartbeat_task=managed_lease.heartbeat_task,
+                    )
+            finally:
+                if (
+                    fs_handler is not None
+                    and fs_handler in agent_service.tracer.handlers
+                ):
+                    agent_service.tracer.handlers.remove(fs_handler)
 
             projection = project_execution_result_for_channel(result)
-            db.refresh(task)
-            projected_control_state = control_state_for_status(projection.task_status)
-            if (
-                task.status != projection.task_status
-                or task.control_state != projected_control_state.value
+            if not await managed_lease.finalize_result(
+                status=projection.task_status,
+                assistant_content=projection.transcript_content,
+                interactions=projection.interactions,
+                message_type=projection.message_type,
             ):
-                try:
-                    apply_task_control_transition(
-                        task,
-                        projected_control_state,
-                        status=projection.task_status,
-                        expected_run_id=run_snapshot.run_id,
-                    )
-                    db.commit()
-                except StaleTaskRunError:
-                    db.rollback()
-                    logger.info(
-                        "Skipping stale Feishu completion for task %s run %s",
-                        task.id,
-                        run_snapshot.run_id,
-                    )
+                raise TaskLeaseLostError(
+                    f"task {task_id} ownership changed before Feishu result"
+                )
 
             output = projection.visible_text
 
@@ -387,40 +401,38 @@ class FeishuBotInstance:
             for chunk in text_chunks[1:]:
                 await self._send_text(chat_id, chunk)
 
+        except TaskLeaseLostError:
+            logger.warning(
+                "Feishu execution lost task %s lease; skipping stale result",
+                claimed_task_id,
+            )
         except Exception as e:
             logger.error(f"Error processing Feishu message: {e}", exc_info=True)
-            if claimed_task_id is not None and claimed_run_id is not None:
+            if managed_lease is not None:
                 try:
-                    snapshot = await task_execution_controller.snapshot(claimed_task_id)
-                    if (
-                        snapshot is not None
-                        and snapshot.run_id == claimed_run_id
-                        and snapshot.status == TaskStatus.RUNNING
-                    ):
-                        await task_execution_controller.transition(
-                            claimed_task_id,
-                            TaskControlState.FAILED,
-                            status=TaskStatus.FAILED,
-                            expected_run_id=claimed_run_id,
-                        )
+                    finalized = await managed_lease.finalize_result(
+                        status=TaskStatus.FAILED,
+                    )
                 except Exception:
                     logger.warning(
                         "Failed to finalize Feishu task %s after channel error",
                         claimed_task_id,
                         exc_info=True,
                     )
+                    return
+                if not finalized:
+                    logger.warning(
+                        "Feishu task %s ownership changed after channel error; "
+                        "skipping stale error response",
+                        claimed_task_id,
+                    )
+                    return
             await self._send_text(
                 chat_id, "Sorry, an error occurred while processing your request."
             )
         finally:
-            try:
-                try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
-            finally:
-                if managed_lease is not None:
-                    await managed_lease.close()
+            if managed_lease is not None:
+                await managed_lease.close()
 
     async def _download_and_register_files(
         self,
@@ -428,124 +440,106 @@ class FeishuBotInstance:
         agent_service: "Any",
         task_id: int,
         user_id: int,
-        db: Any,
     ) -> list:
-        import mimetypes
-        from pathlib import Path
-
-        from lark_oapi.api.im.v1 import GetMessageResourceRequest
-
-        from ...services.uploaded_file_store import UploadedFileStore
-
-        uploaded_files_info: list[dict] = []
-
         if not agent_service.workspace:
             logger.warning("Agent service workspace is not available for file upload")
-            return uploaded_files_info
+            return []
 
         target_dir = getattr(
             agent_service.workspace,
             "input_dir",
             agent_service.workspace.workspace_dir / "input",
         )
-
-        for f_info in files_info:
+        downloaded_files: list[DownloadedChannelFile] = []
+        for file_info in files_info:
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    self._download_feishu_file_sync,
+                    file_info,
+                    target_dir,
+                )
+            )
             try:
-                message_id = f_info["message_id"]
-                file_key = f_info["file_key"]
-                msg_type = f_info["type"]
-
-                # Call Lark API to get file resource
-                req = (
-                    GetMessageResourceRequest.builder()
-                    .message_id(message_id)
-                    .file_key(file_key)
-                    .type(msg_type)
-                    .build()
+                downloaded = await drain_async_task_cancellation_safe(worker)
+            except Exception:
+                logger.exception(
+                    "Failed to download Feishu file %s",
+                    file_info.get("file_key", "unknown"),
                 )
+                continue
+            if downloaded is not None:
+                downloaded_files.append(downloaded)
 
-                resp = await asyncio.get_event_loop().run_in_executor(
-                    None, self.api_client.im.v1.message_resource.get, req
-                )
-
-                if not resp.success():
-                    logger.error(
-                        f"Failed to download Feishu file: {resp.code}, {resp.msg}, {resp.error}"
-                    )
-                    continue
-
-                if hasattr(resp, "file_name") and resp.file_name:
-                    file_name = resp.file_name
-                else:
-                    ext = ".jpg" if msg_type == "image" else ".bin"
-                    file_name = f"{file_key}{ext}"
-
-                from ...api.websocket import (
-                    build_unique_target_path,
-                    normalize_filename,
-                )
-
-                try:
-                    normalized_file_name = normalize_filename(file_name)
-                    target_path = build_unique_target_path(
-                        target_dir, normalized_file_name
-                    )
-                except ImportError:
-                    import time
-
-                    normalized_file_name = f"{int(time.time())}_{file_name}"
-                    target_path = Path(target_dir) / normalized_file_name
-
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # Write file content
-                if hasattr(resp, "file") and resp.file:
-                    with open(target_path, "wb") as f:
-                        f.write(resp.file.read())
-                else:
-                    logger.error(f"No file content in Feishu response for {file_key}")
-                    continue
-
-                mime_type, _ = mimetypes.guess_type(str(target_path))
-                if not mime_type:
-                    mime_type = "application/octet-stream"
-
-                file_size = target_path.stat().st_size
-
-                file_record = UploadedFileStore(db).create_from_local_path(
-                    local_path=target_path,
-                    user_id=user_id,
-                    task_id=task_id,
-                    filename=normalized_file_name,
-                    mime_type=mime_type,
-                )
-                file_record.file_size = file_size
-                db.flush()
-
-                agent_service.workspace.register_file(
-                    str(target_path),
-                    file_id=str(file_record.file_id),
-                    db_session=db,
-                )
-
-                uploaded_files_info.append(
-                    {
-                        "file_id": str(file_record.file_id),
-                        "name": normalized_file_name,
-                        "path": str(target_path),
-                        "type": mime_type,
-                        "size": file_size,
-                    }
-                )
-                logger.info(
-                    f"Successfully downloaded and registered Feishu file: {normalized_file_name}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to process Feishu file {f_info.get('file_key', 'unknown')}: {e}"
-                )
-
+        registered = await register_channel_uploaded_files(
+            workspace=agent_service.workspace,
+            task_id=task_id,
+            user_id=user_id,
+            files=tuple(downloaded_files),
+        )
+        uploaded_files_info = [item.to_file_info() for item in registered]
+        for item in registered:
+            logger.info(
+                "Successfully downloaded and registered Feishu file: %s",
+                item.name,
+            )
         return uploaded_files_info
+
+    def _download_feishu_file_sync(
+        self,
+        file_info: dict[str, Any],
+        target_dir: Path,
+    ) -> DownloadedChannelFile | None:
+        import mimetypes
+
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+        message_id = file_info["message_id"]
+        file_key = file_info["file_key"]
+        msg_type = file_info["type"]
+        req = (
+            GetMessageResourceRequest.builder()
+            .message_id(message_id)
+            .file_key(file_key)
+            .type(msg_type)
+            .build()
+        )
+
+        resp = self.api_client.im.v1.message_resource.get(req)
+        if not resp.success():
+            logger.error(
+                "Failed to download Feishu file: %s, %s, %s",
+                resp.code,
+                resp.msg,
+                resp.error,
+            )
+            return None
+
+        if hasattr(resp, "file_name") and resp.file_name:
+            file_name = resp.file_name
+        else:
+            ext = ".jpg" if msg_type == "image" else ".bin"
+            file_name = f"{file_key}{ext}"
+
+        from ...api.websocket import build_unique_target_path, normalize_filename
+
+        normalized_file_name = normalize_filename(file_name)
+        target_path = build_unique_target_path(target_dir, normalized_file_name)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not hasattr(resp, "file") or not resp.file:
+            logger.error("No file content in Feishu response for %s", file_key)
+            return None
+        with open(target_path, "wb") as target:
+            target.write(resp.file.read())
+
+        mime_type, _ = mimetypes.guess_type(str(target_path))
+        return DownloadedChannelFile(
+            name=normalized_file_name,
+            path=target_path,
+            mime_type=mime_type or "application/octet-stream",
+            size=target_path.stat().st_size,
+            source_id=str(file_key),
+        )
 
     async def _send_text(self, chat_id: str, text: str) -> Optional[str]:
         try:
@@ -613,6 +607,8 @@ class FeishuBotInstance:
             logger.error(f"Error updating Feishu message: {e}")
 
     async def start(self) -> None:
+        if not self._accepting:
+            return
         event_handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._handle_message_sync)
@@ -640,6 +636,10 @@ class FeishuBotInstance:
             else:
                 raise e
 
+        if not self._accepting:
+            await self.ws_client._disconnect()
+            return
+
         self._ping_task = asyncio.create_task(self.ws_client._ping_loop())
 
         # To keep the start task alive like ws_client.start() did with _select()
@@ -649,35 +649,84 @@ class FeishuBotInstance:
         except asyncio.CancelledError:
             pass
 
-    async def stop(self) -> None:
-        if self.ws_client:
-            # Keep auto_reconnect=True but override _reconnect to gracefully
-            # swallow the disconnect exception and stop the receive loop cleanly.
-            async def noop_reconnect() -> None:
-                pass
+    def _stop_lock_for_current_loop(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._stop_lock
+        if lock is None or (self._stop_loop is not loop and not lock.locked()):
+            lock = asyncio.Lock()
+            self._stop_lock = lock
+            self._stop_loop = loop
+        elif self._stop_loop is not loop:
+            raise RuntimeError("Feishu bot stop is already running on another loop")
+        return lock
 
-            self.ws_client._auto_reconnect = True
-            self.ws_client._reconnect = noop_reconnect
+    async def _drain_user_message_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = {
+            task for task in self.user_message_tasks.values() if task is not current
+        }
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
-            # Suppress the harmless normal-closure error logged by the Lark SDK
-            lark_logger = logging.getLogger("Lark")
+        async def drain_tasks() -> None:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-            class DisconnectFilter(logging.Filter):
-                def filter(self, record: logging.LogRecord) -> bool:
-                    return "receive message loop exit" not in record.getMessage()
+        cleanup_task = asyncio.create_task(drain_tasks())
+        try:
+            await drain_async_task_cancellation_safe(cleanup_task)
+        finally:
+            self.user_message_tasks.clear()
+            self.user_message_queues.clear()
 
-            log_filter = DisconnectFilter()
-            lark_logger.addFilter(log_filter)
+    async def _stop_ingress(self) -> None:
+        try:
+            if self.ws_client:
+                # Keep auto_reconnect=True but override _reconnect to gracefully
+                # swallow the disconnect exception and stop the receive loop cleanly.
+                async def noop_reconnect() -> None:
+                    pass
 
+                self.ws_client._auto_reconnect = True
+                self.ws_client._reconnect = noop_reconnect
+
+                # Suppress the harmless normal-closure error logged by the Lark SDK
+                lark_logger = logging.getLogger("Lark")
+
+                class DisconnectFilter(logging.Filter):
+                    def filter(self, record: logging.LogRecord) -> bool:
+                        return "receive message loop exit" not in record.getMessage()
+
+                log_filter = DisconnectFilter()
+                lark_logger.addFilter(log_filter)
+
+                try:
+                    await self.ws_client._disconnect()
+                    # Give the receive loop a moment to exit and process the suppressed log
+                    await asyncio.sleep(0.1)
+                finally:
+                    lark_logger.removeFilter(log_filter)
+        finally:
+            if self._ping_task is not None:
+                ping_task = self._ping_task
+                self._ping_task = None
+                await cancel_and_drain_async_task(ping_task)
+
+    async def _stop_once(self, lock: asyncio.Lock) -> None:
+        async with lock:
             try:
-                await self.ws_client._disconnect()
-                # Give the receive loop a moment to exit and process the suppressed log
-                await asyncio.sleep(0.1)
+                if not self._ingress_stopped:
+                    await self._stop_ingress()
+                    self._ingress_stopped = True
             finally:
-                lark_logger.removeFilter(log_filter)
+                await self._drain_user_message_tasks()
 
-        if hasattr(self, "_ping_task") and self._ping_task:
-            self._ping_task.cancel()
+    async def stop(self) -> None:
+        self._accepting = False
+        stop_task = asyncio.create_task(
+            self._stop_once(self._stop_lock_for_current_loop())
+        )
+        await drain_async_task_cancellation_safe(stop_task)
 
 
 class FeishuChannelManager:
@@ -685,6 +734,7 @@ class FeishuChannelManager:
 
     def __init__(self) -> None:
         self.bots: Dict[str, FeishuBotInstance] = {}
+        self._bot_stop_tasks: Dict[str, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
         await self._sync_bots_async()
@@ -697,35 +747,24 @@ class FeishuChannelManager:
         active_app_ids = set()
         channel_info_by_appid: Dict[str, Dict] = {}
 
-        db_gen = get_db()
-        db = next(db_gen)
         try:
-            channels = (
-                db.query(UserChannel)
-                .filter(
-                    UserChannel.channel_type == "feishu",
-                    UserChannel.is_active.is_(True),
-                )
-                .all()
+            channels = await load_active_channel_configs(
+                channel_type="feishu",
+                required_config_keys=("app_id", "app_secret"),
             )
             for ch in channels:
-                app_id = ch.config.get("app_id")
-                app_secret = ch.config.get("app_secret")
+                app_id = ch.config_value("app_id")
+                app_secret = ch.config_value("app_secret")
                 if app_id and app_secret:
                     active_app_ids.add(app_id)
                     channel_info_by_appid[app_id] = {
                         "app_secret": app_secret,
-                        "id": ch.id,
+                        "id": ch.channel_id,
                         "name": ch.channel_name,
                     }
         except Exception as e:
             logger.error(f"Failed to load feishu channels for sync: {e}")
             return
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
 
         current_app_ids = set(self.bots.keys())
 
@@ -749,16 +788,38 @@ class FeishuChannelManager:
             self.bots[app_id] = bot
             bot.polling_task = asyncio.create_task(bot.start())
 
-    async def _stop_bot_for_appid(self, app_id: str) -> None:
-        if app_id in self.bots:
-            bot = self.bots[app_id]
+    async def _shutdown_bot_for_appid(
+        self,
+        app_id: str,
+        bot: FeishuBotInstance,
+    ) -> None:
+        try:
             try:
                 await bot.stop()
             except Exception as e:
                 logger.error(f"Error while stopping feishu bot: {e}")
-            if bot.polling_task and not bot.polling_task.done():
-                bot.polling_task.cancel()
-            del self.bots[app_id]
+        finally:
+            try:
+                if bot.polling_task is not None:
+                    await cancel_and_drain_async_task(bot.polling_task)
+            finally:
+                if self.bots.get(app_id) is bot:
+                    self.bots.pop(app_id, None)
+
+    async def _stop_bot_for_appid(self, app_id: str) -> None:
+        stop_task = self._bot_stop_tasks.get(app_id)
+        if stop_task is None:
+            bot = self.bots.get(app_id)
+            if bot is None:
+                return
+            stop_task = asyncio.create_task(self._shutdown_bot_for_appid(app_id, bot))
+            self._bot_stop_tasks[app_id] = stop_task
+
+        try:
+            await drain_async_task_cancellation_safe(stop_task)
+        finally:
+            if stop_task.done() and self._bot_stop_tasks.get(app_id) is stop_task:
+                self._bot_stop_tasks.pop(app_id, None)
 
 
 _feishu_manager = None

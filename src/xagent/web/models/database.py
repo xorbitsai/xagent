@@ -2,6 +2,7 @@ import logging
 from typing import Any, Generator
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
@@ -123,6 +124,41 @@ def get_engine() -> Engine:
     return _engine
 
 
+def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
+    """Migrate, create, and seed the schema under one startup ownership lock."""
+
+    from ...db.migration import (
+        database_startup_lock,
+        is_database_empty,
+        try_upgrade_db,
+    )
+    from ..builtin_mcp_registry import (
+        seed_builtin_oauth_and_public_mcp_apps,
+        validate_builtin_public_mcp_apps,
+    )
+
+    with database_startup_lock(engine) as locked_connection:
+        startup_bind: Engine | Connection = (
+            locked_connection if locked_connection is not None else engine
+        )
+        should_seed_builtin_mcp_registry = is_database_empty(startup_bind)
+        try_upgrade_db(
+            engine,
+            locked_connection=locked_connection,
+        )
+        Base.metadata.create_all(bind=startup_bind)
+
+        if locked_connection is not None:
+            if should_seed_builtin_mcp_registry:
+                seed_builtin_oauth_and_public_mcp_apps(locked_connection)
+            return validate_builtin_public_mcp_apps(locked_connection)
+
+        with engine.begin() as connection:
+            if should_seed_builtin_mcp_registry:
+                seed_builtin_oauth_and_public_mcp_apps(connection)
+            return validate_builtin_public_mcp_apps(connection)
+
+
 def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
     # Import all models to ensure they are registered with Base.metadata
@@ -194,25 +230,7 @@ def init_db(db_url: str | None = None) -> None:
     # Create session factory
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
 
-    # Try upgrade db to head first
-    from ...db.migration import is_database_empty, try_upgrade_db
-
-    should_seed_builtin_mcp_registry = is_database_empty(_engine)
-
-    try_upgrade_db(_engine)
-
-    # Create all tables
-    Base.metadata.create_all(bind=_engine)
-
-    from ..builtin_mcp_registry import (
-        seed_builtin_oauth_and_public_mcp_apps,
-        validate_builtin_public_mcp_apps,
-    )
-
-    with _engine.begin() as conn:
-        if should_seed_builtin_mcp_registry:
-            seed_builtin_oauth_and_public_mcp_apps(conn)
-        builtin_mcp_mismatches = validate_builtin_public_mcp_apps(conn)
+    builtin_mcp_mismatches = _initialize_database_schema(_engine)
 
     for mismatch in builtin_mcp_mismatches:
         logger.warning(

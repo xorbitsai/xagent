@@ -172,6 +172,7 @@ async def test_execute_task_releases_sandbox_workers_after_task(sandbox_mgr) -> 
         agent_service=agent_service,
         task="run",
         task_id="1",
+        manage_task_lease=False,
     )
 
     assert result == {"success": True}
@@ -199,6 +200,7 @@ async def test_execute_task_evicts_agents_for_released_sandbox_provider(
         agent_service=agent_service,
         task="run",
         task_id="1",
+        manage_task_lease=False,
     )
 
     assert "user::7" not in sandbox_mgr._lease_providers
@@ -241,6 +243,7 @@ async def test_execute_task_keeps_workers_until_last_same_user_task_finishes(
             agent_service=first_agent_service,
             task="first",
             task_id="1",
+            manage_task_lease=False,
         )
     )
     await first_started.wait()
@@ -250,6 +253,7 @@ async def test_execute_task_keeps_workers_until_last_same_user_task_finishes(
             agent_service=second_agent_service,
             task="second",
             task_id="2",
+            manage_task_lease=False,
         )
     )
     await second_started.wait()

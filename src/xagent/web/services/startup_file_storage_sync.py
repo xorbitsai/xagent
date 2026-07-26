@@ -7,10 +7,11 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from filelock import FileLock, Timeout
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
+from sqlalchemy.orm import Session, sessionmaker
 
 from ...core.file_storage import (
     FsspecFileStorage,
@@ -19,8 +20,16 @@ from ...core.file_storage import (
     get_user_file_storage,
 )
 from ...core.file_storage.keys import build_upload_storage_key
+from ..models.database import release_db_connection_if_clean
 from ..models.uploaded_file import UploadedFile
 from .managed_file_ref import ManagedFileRef
+from .uploaded_file_store import (
+    StagedUploadedFile,
+    UploadedFileStore,
+    UploadedFileVersionConflict,
+    UploadedFileVersionSnapshot,
+    snapshot_uploaded_file_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +48,106 @@ class StartupFileStorageSyncResult:
     locked: bool = False
 
 
+@dataclass
+class _StartupFileStorageCandidate:
+    """Detached mutable record used only during one storage reconciliation."""
+
+    id: int
+    file_id: str
+    user_id: int
+    task_id: int | None
+    filename: str
+    storage_path: str
+    storage_backend: str | None
+    storage_key: str | None
+    storage_uri: str | None
+    checksum: str | None
+    etag: str | None
+    workspace_relative_path: str | None
+    workspace_category: str | None
+    storage_status: str
+    mime_type: str | None
+    file_size: int
+
+    @classmethod
+    def from_record(cls, record: UploadedFile) -> "_StartupFileStorageCandidate":
+        return cls(
+            id=int(record.id),
+            file_id=str(record.file_id),
+            user_id=int(record.user_id),
+            task_id=int(record.task_id) if record.task_id is not None else None,
+            filename=str(record.filename),
+            storage_path=str(record.storage_path),
+            storage_backend=(
+                str(record.storage_backend)
+                if record.storage_backend is not None
+                else None
+            ),
+            storage_key=(
+                str(record.storage_key) if record.storage_key is not None else None
+            ),
+            storage_uri=(
+                str(record.storage_uri) if record.storage_uri is not None else None
+            ),
+            checksum=str(record.checksum) if record.checksum is not None else None,
+            etag=str(record.etag) if record.etag is not None else None,
+            workspace_relative_path=(
+                str(record.workspace_relative_path)
+                if record.workspace_relative_path is not None
+                else None
+            ),
+            workspace_category=(
+                str(record.workspace_category)
+                if record.workspace_category is not None
+                else None
+            ),
+            storage_status=str(record.storage_status),
+            mime_type=(str(record.mime_type) if record.mime_type is not None else None),
+            file_size=int(record.file_size or 0),
+        )
+
+    def to_staged(self) -> StagedUploadedFile:
+        storage_key = str(self.storage_key or "").strip()
+        checksum = str(self.checksum or "").strip()
+        if self.storage_status != "available" or not storage_key or not checksum:
+            raise ValueError("Startup sync did not produce complete durable metadata")
+        return StagedUploadedFile(
+            file_id=self.file_id,
+            user_id=self.user_id,
+            task_id=self.task_id,
+            filename=self.filename,
+            storage_path=self.storage_path,
+            storage_backend=self.storage_backend,
+            storage_key=storage_key,
+            storage_uri=self.storage_uri,
+            checksum=checksum,
+            etag=self.etag,
+            workspace_relative_path=self.workspace_relative_path,
+            workspace_category=self.workspace_category,
+            mime_type=self.mime_type,
+            file_size=self.file_size,
+        )
+
+
+_StartupSyncCursor = tuple[int, int]
+_SessionFactory = Callable[[], Session]
+
+
 def sync_registered_files_to_durable_storage(
-    db: Session,
+    db: Session | None = None,
     *,
     storage: FsspecFileStorage | Any | None = None,
     batch_size: int = 500,
+    session_factory: _SessionFactory | None = None,
 ) -> StartupFileStorageSyncResult:
-    """Reconcile registered local files with S3-backed durable storage."""
+    """Reconcile DB registrations without holding a connection during storage I/O.
+
+    ``db`` remains a compatibility input for existing callers. A clean caller
+    transaction is rolled back to release its pooled connection before a new
+    short-session factory is derived; a session with pending writes is rejected
+    rather than carried across storage I/O. New runtime callers should pass
+    neither argument and use the configured session factory.
+    """
     backend = _detect_backend(storage)
 
     if backend != "s3":
@@ -61,10 +163,10 @@ def sync_registered_files_to_durable_storage(
 
     file_lock = None
     try:
+        SessionLocal = _resolve_session_factory(db, session_factory)
         file_lock = _acquire_file_lock_after_contention()
-
         return _sync_registered_files(
-            db,
+            SessionLocal,
             storage=storage,
             batch_size=batch_size,
         )
@@ -72,6 +174,25 @@ def sync_registered_files_to_durable_storage(
         if file_lock is not None:
             _release_file_lock(file_lock)
         _sync_lock.release()
+
+
+def _resolve_session_factory(
+    db: Session | None,
+    session_factory: _SessionFactory | None,
+) -> _SessionFactory:
+    if db is not None:
+        if not release_db_connection_if_clean(db):
+            raise RuntimeError(
+                "Cannot run startup file storage sync while the caller "
+                "database session has pending writes"
+            )
+    if session_factory is not None:
+        return session_factory
+    if db is not None:
+        return sessionmaker(bind=db.get_bind())
+    from ..models.database import get_session_local
+
+    return get_session_local()
 
 
 def _acquire_file_lock_after_contention() -> Any:
@@ -107,7 +228,7 @@ def _user_scoped_storage(
 
 
 def _sync_registered_files(
-    db: Session,
+    session_factory: _SessionFactory,
     *,
     storage: FsspecFileStorage | Any | None,
     batch_size: int,
@@ -118,89 +239,100 @@ def _sync_registered_files(
     skipped_missing_local = 0
     failed = 0
 
-    rows = (
-        db.query(UploadedFile)
-        .order_by(UploadedFile.user_id.asc(), UploadedFile.id.asc())
-        .yield_per(batch_size)
-    )
+    resolved_batch_size = max(1, int(batch_size))
+    cursor: _StartupSyncCursor | None = None
     current_user_id: int | None = None
     user_storage: ScopedFileStorage | None = None
     remote_objects: dict[str, Any] = {}
-    batch_updates = 0
+    while True:
+        candidates, next_cursor = _load_startup_sync_candidates(
+            session_factory,
+            after=cursor,
+            limit=resolved_batch_size,
+        )
+        if not candidates:
+            break
+        for candidate, expected_version in candidates:
+            scanned += 1
+            user_id = candidate.user_id
+            if user_id != current_user_id or user_storage is None:
+                current_user_id = user_id
+                user_storage = _user_scoped_storage(storage, user_id)
+                remote_objects = _list_remote_objects_for_user(user_storage)
 
-    for record in rows:
-        scanned += 1
-        user_id = int(getattr(record, "user_id"))
-        if user_id != current_user_id or user_storage is None:
-            current_user_id = user_id
-            user_storage = _user_scoped_storage(storage, user_id)
-            remote_objects = _list_remote_objects_for_user(user_storage)
-
-        expected_key = _expected_storage_key(record)
-        remote_object = remote_objects.get(expected_key)
-        if remote_object is not None:
-            if not _has_complete_durable_metadata(record):
-                try:
-                    adopt_result = ManagedFileRef(
-                        record, storage=user_storage
-                    ).adopt_existing_object(expected_key)
-                except Exception:
-                    failed += 1
-                    logger.exception(
-                        "Failed startup durable adoption for file_id=%s key=%s",
-                        getattr(record, "file_id", None),
-                        expected_key,
-                    )
-                    continue
-                if adopt_result == "missing":
-                    local_path = Path(str(getattr(record, "storage_path", "")))
-                    if not local_path.exists() or not local_path.is_file():
-                        skipped_missing_local += 1
-                    else:
+            expected_key = _expected_storage_key(candidate)
+            remote_object = remote_objects.get(expected_key)
+            if remote_object is not None:
+                if not _has_complete_durable_metadata(candidate):
+                    try:
+                        adopt_result = ManagedFileRef(
+                            candidate, storage=user_storage
+                        ).adopt_existing_object(expected_key)
+                    except Exception:
                         failed += 1
-                    continue
-                if adopt_result == "uploaded":
-                    uploaded += 1
-                batch_updates += 1
-            already_present += 1
-            continue
+                        logger.exception(
+                            "Failed startup durable adoption for file_id=%s key=%s",
+                            candidate.file_id,
+                            expected_key,
+                        )
+                        continue
+                    if adopt_result == "missing":
+                        local_path = Path(candidate.storage_path)
+                        if not local_path.exists() or not local_path.is_file():
+                            skipped_missing_local += 1
+                        else:
+                            failed += 1
+                        continue
+                    if not _persist_startup_sync_candidate(
+                        session_factory,
+                        candidate,
+                        expected=expected_version,
+                    ):
+                        failed += 1
+                        continue
+                    if adopt_result == "uploaded":
+                        uploaded += 1
+                already_present += 1
+                continue
 
-        local_path = Path(str(getattr(record, "storage_path", "")))
-        if not local_path.exists() or not local_path.is_file():
-            skipped_missing_local += 1
-            logger.warning(
-                "Skipping startup durable sync for missing local file: file_id=%s path=%s",
-                getattr(record, "file_id", None),
-                local_path,
-            )
-            continue
+            local_path = Path(candidate.storage_path)
+            if not local_path.exists() or not local_path.is_file():
+                skipped_missing_local += 1
+                logger.warning(
+                    "Skipping startup durable sync for missing local file: "
+                    "file_id=%s path=%s",
+                    candidate.file_id,
+                    local_path,
+                )
+                continue
 
-        try:
-            stored_object = ManagedFileRef(
-                record, storage=user_storage
-            ).sync_to_durable(
-                storage_key=expected_key,
-                mime_type=getattr(record, "mime_type", None),
-            )
+            try:
+                stored_object = ManagedFileRef(
+                    candidate, storage=user_storage
+                ).sync_to_durable(
+                    storage_key=expected_key,
+                    mime_type=candidate.mime_type,
+                )
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "Failed startup durable sync for file_id=%s path=%s key=%s",
+                    candidate.file_id,
+                    local_path,
+                    expected_key,
+                )
+                continue
+            if not _persist_startup_sync_candidate(
+                session_factory,
+                candidate,
+                expected=expected_version,
+            ):
+                failed += 1
+                continue
             remote_objects[expected_key] = stored_object
             uploaded += 1
-            batch_updates += 1
-        except Exception:
-            failed += 1
-            logger.exception(
-                "Failed startup durable sync for file_id=%s path=%s key=%s",
-                getattr(record, "file_id", None),
-                local_path,
-                expected_key,
-            )
-            continue
 
-        if batch_updates >= batch_size:
-            db.commit()
-            batch_updates = 0
-
-    if batch_updates:
-        db.commit()
+        cursor = next_cursor
 
     result = StartupFileStorageSyncResult(
         scanned=scanned,
@@ -220,7 +352,79 @@ def _sync_registered_files(
     return result
 
 
-def _expected_storage_key(record: UploadedFile) -> str:
+def _load_startup_sync_candidates(
+    session_factory: _SessionFactory,
+    *,
+    after: _StartupSyncCursor | None,
+    limit: int,
+) -> tuple[
+    tuple[
+        tuple[_StartupFileStorageCandidate, UploadedFileVersionSnapshot],
+        ...,
+    ],
+    _StartupSyncCursor | None,
+]:
+    with session_factory() as db:
+        query = db.query(UploadedFile).filter(
+            UploadedFile.storage_status != "compensating"
+        )
+        if after is not None:
+            after_user_id, after_row_id = after
+            query = query.filter(
+                or_(
+                    UploadedFile.user_id > after_user_id,
+                    and_(
+                        UploadedFile.user_id == after_user_id,
+                        UploadedFile.id > after_row_id,
+                    ),
+                )
+            )
+        records = (
+            query.order_by(UploadedFile.user_id.asc(), UploadedFile.id.asc())
+            .limit(limit)
+            .all()
+        )
+        candidates = tuple(
+            (
+                _StartupFileStorageCandidate.from_record(record),
+                snapshot_uploaded_file_version(record),
+            )
+            for record in records
+        )
+    next_cursor = (
+        (candidates[-1][0].user_id, candidates[-1][0].id) if candidates else None
+    )
+    return candidates, next_cursor
+
+
+def _persist_startup_sync_candidate(
+    session_factory: _SessionFactory,
+    candidate: _StartupFileStorageCandidate,
+    *,
+    expected: UploadedFileVersionSnapshot,
+) -> bool:
+    with session_factory() as db:
+        try:
+            UploadedFileStore(db).upsert_already_durable(
+                candidate.to_staged(),
+                expected=expected,
+            )
+            db.commit()
+            return True
+        except UploadedFileVersionConflict:
+            db.rollback()
+            logger.warning(
+                "Uploaded file %s changed during startup storage sync; "
+                "retrying on the next startup pass",
+                candidate.file_id,
+            )
+            return False
+        except Exception:
+            db.rollback()
+            raise
+
+
+def _expected_storage_key(record: UploadedFile | _StartupFileStorageCandidate) -> str:
     existing_key = str(getattr(record, "storage_key", "") or "").strip()
     if existing_key:
         return existing_key
@@ -231,7 +435,9 @@ def _expected_storage_key(record: UploadedFile) -> str:
     )
 
 
-def _has_complete_durable_metadata(record: UploadedFile) -> bool:
+def _has_complete_durable_metadata(
+    record: UploadedFile | _StartupFileStorageCandidate,
+) -> bool:
     return bool(
         getattr(record, "storage_key", None)
         and getattr(record, "storage_backend", None) == "s3"

@@ -5,10 +5,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
-from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.web import dynamic_memory_store as dynamic_memory_store_module
+from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
 from xagent.web.api.websocket import (
@@ -16,15 +19,12 @@ from xagent.web.api.websocket import (
     _normalize_file_outputs,
     handle_build_preview_execution,
 )
+from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.schemas.chat import TaskCreateResponse
-from xagent.web.services.managed_file_ref import (
-    DurableStorageOperationError,
-    build_task_output_storage_key,
-)
 
 
 class _BlockingPreviewWebSocket:
@@ -305,7 +305,60 @@ def test_inline_preview_agent_config_uses_in_memory_disabled_policy():
     assert policy.memory_enabled is False
 
 
-def test_normalize_file_outputs_rolls_back_when_durable_storage_fails(
+@pytest.mark.asyncio
+async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A real QueuePool wait must run off-loop and remain a visible failure."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'memory-policy-timeout.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+    )
+    session_factory = sessionmaker(bind=engine)
+
+    def get_test_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    monkeypatch.setattr(dynamic_memory_store_module, "get_db", get_test_db)
+    memory_manager = DynamicMemoryStoreManager()
+    monkeypatch.setattr(chat_api, "get_memory_store", memory_manager.get_memory_store)
+
+    held_connection = engine.connect()
+    stop_ticker = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop_ticker.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        with pytest.raises(SQLAlchemyTimeoutError):
+            await chat_api.resolve_agent_service_memory_policy_async(
+                agent_config={},
+            )
+    finally:
+        stop_ticker.set()
+        await ticker_task
+        held_connection.close()
+        engine.dispose()
+
+    assert ticks >= 3
+
+
+def test_historical_file_projection_never_writes_unregistered_output(
     monkeypatch, tmp_path
 ):
     engine = create_engine("sqlite:///:memory:")
@@ -331,28 +384,28 @@ def test_normalize_file_outputs_rolls_back_when_durable_storage_fails(
         from xagent.core.file_storage.storage import FsspecFileStorage
 
         def fail_put_file(self, source, key, content_type=None):
-            raise RuntimeError("simulated durable output outage")
+            raise AssertionError("historical projection must not write storage")
 
         monkeypatch.setattr(FsspecFileStorage, "put_file", fail_put_file)
 
-        with pytest.raises(DurableStorageOperationError):
-            _normalize_file_outputs(
-                db,
-                task_id=321,
-                task_user_id=int(user.id),
-                file_outputs=[str(output_path)],
-            )
+        normalized_outputs, path_to_file_id = _normalize_file_outputs(
+            db,
+            task_id=321,
+            task_user_id=int(user.id),
+            file_outputs=[str(output_path)],
+        )
 
-        db.rollback()
+        assert normalized_outputs == [str(output_path)]
+        assert path_to_file_id == {}
         assert db.query(UploadedFile).filter_by(task_id=321).all() == []
     finally:
         db.close()
         engine.dispose()
 
 
-def test_normalize_file_outputs_refreshes_existing_output_row(monkeypatch, tmp_path):
-    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_unscoped_file_storage.cache_clear()
+def test_historical_file_projection_does_not_refresh_existing_output(
+    monkeypatch, tmp_path
+):
     engine = create_engine("sqlite:///:memory:")
     SessionLocal = sessionmaker(bind=engine)
     Base.metadata.create_all(engine)
@@ -369,26 +422,32 @@ def test_normalize_file_outputs_refreshes_existing_output_row(monkeypatch, tmp_p
         output_path = uploads_dir / "user_1" / "web_task_654" / "output" / "report.txt"
         output_path.parent.mkdir(parents=True)
         output_path.write_text("old-data", encoding="utf-8")
-        monkeypatch.setattr(
-            "xagent.web.api.websocket.get_uploads_dir", lambda: uploads_dir
-        )
-
-        _normalize_file_outputs(
-            db,
+        record = UploadedFile(
+            file_id="historical-output",
+            user_id=int(user.id),
             task_id=654,
-            task_user_id=int(user.id),
-            file_outputs=[str(output_path)],
+            filename="report.txt",
+            storage_path=str(output_path),
+            storage_key="users/1/legacy/report.txt",
+            storage_status="legacy",
+            checksum="original-checksum",
+            workspace_relative_path="output/report.txt",
+            workspace_category="output",
+            mime_type="text/plain",
+            file_size=len("old-data"),
         )
-        record = db.query(UploadedFile).filter_by(task_id=654).one()
-        storage_key = build_task_output_storage_key(
-            int(user.id),
-            654,
-            str(record.file_id),
-            "output/report.txt",
-        )
+        db.add(record)
+        db.commit()
+
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        def fail_put_file(self, source, key, content_type=None):
+            raise AssertionError("historical projection must not refresh storage")
+
+        monkeypatch.setattr(FsspecFileStorage, "put_file", fail_put_file)
 
         output_path.write_text("new-data", encoding="utf-8")
-        _normalize_file_outputs(
+        normalized_outputs, path_to_file_id = _normalize_file_outputs(
             db,
             task_id=654,
             task_user_id=int(user.id),
@@ -396,13 +455,14 @@ def test_normalize_file_outputs_refreshes_existing_output_row(monkeypatch, tmp_p
         )
 
         db.refresh(record)
-        assert record.checksum is not None
-        with get_unscoped_file_storage().open_read(storage_key) as handle:
-            assert handle.read() == b"new-data"
+        assert normalized_outputs[0]["file_id"] == "historical-output"
+        assert path_to_file_id[str(output_path)] == "historical-output"
+        assert record.checksum == "original-checksum"
+        assert record.storage_key == "users/1/legacy/report.txt"
+        assert record.storage_status == "legacy"
     finally:
         db.close()
         engine.dispose()
-        get_unscoped_file_storage.cache_clear()
 
 
 @pytest.mark.asyncio

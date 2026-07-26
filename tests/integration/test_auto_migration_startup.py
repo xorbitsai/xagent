@@ -740,13 +740,31 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
         pass
 
     migration_called = {"value": False}
+    lease_recovery_starts = []
+    runtime_start_order: list[str] = []
     created_tasks: list[asyncio.Task] = []
     original_create_task = asyncio.create_task
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    websocket_module = importlib.import_module("xagent.web.api.websocket")
+    monkeypatch.setattr(
+        websocket_module.background_task_manager,
+        "start_accepting",
+        lambda: runtime_start_order.append("admission"),
+    )
     monkeypatch.setattr(
         web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "start_trigger_dispatcher_task",
+        lambda _app: runtime_start_order.append("trigger"),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "start_task_lease_recovery_task",
+        lambda app_instance: lease_recovery_starts.append(app_instance),
     )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -807,6 +825,8 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
 
     assert created_tasks == []
     assert migration_called["value"] is False
+    assert lease_recovery_starts == [web_app_module.app]
+    assert runtime_start_order == ["admission", "trigger"]
 
 
 @pytest.mark.asyncio

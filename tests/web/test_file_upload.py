@@ -15,13 +15,14 @@ from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api.auth import hash_password
 from xagent.web.api.files import _content_disposition_header, file_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
 
 @pytest.fixture(scope="function")
-def test_db():
+def test_db(monkeypatch: pytest.MonkeyPatch):
     """Create test database with isolated engine and session"""
     # Create a temporary database file for each test
     temp_db_fd, temp_db_path = tempfile.mkstemp(suffix=".db")
@@ -34,6 +35,11 @@ def test_db():
     TestingSessionLocal = sessionmaker(
         autocommit=False, autoflush=False, bind=test_engine
     )
+    # Upload metadata is now committed by a worker-owned short Session rather
+    # than the request dependency. Point the canonical Session factory at this
+    # test's isolated database as well as overriding FastAPI's dependency.
+    monkeypatch.setattr(database_module, "_engine", test_engine)
+    monkeypatch.setattr(database_module, "_SessionLocal", TestingSessionLocal)
 
     # Create override function that uses this test's session
     def override_get_db():
@@ -1364,6 +1370,44 @@ class TestFileManagement:
             # If upload failed, skip delete test
             pytest.skip("Upload failed, skipping delete test")
 
+    def test_delete_legacy_file_uses_only_path_keyed_cache_identity(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        import hashlib
+
+        import xagent.web.api.legacy_file as legacy_file_module
+
+        monkeypatch.setattr(
+            legacy_file_module,
+            "get_uploads_dir",
+            lambda: temp_uploads_dir,
+        )
+        storage_root = tmp_path / "storage"
+        monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(storage_root))
+        legacy_path = temp_uploads_dir / "user_1" / "legacy.svg"
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_bytes(b"legacy")
+        path_key = hashlib.sha256(str(legacy_path.resolve()).encode()).hexdigest()[:24]
+
+        svg_cache_dir = storage_root / "svg_png_cache"
+        pdf_cache_dir = storage_root / "pptx_pdf_cache"
+        svg_cache_dir.mkdir(parents=True)
+        pdf_cache_dir.mkdir(parents=True)
+        legacy_svg_cache = svg_cache_dir / f"{path_key}.preview.png"
+        legacy_pdf_cache = pdf_cache_dir / f"{path_key}.preview.pdf"
+        legacy_svg_cache.write_bytes(b"legacy svg preview")
+        legacy_pdf_cache.write_bytes(b"legacy pdf preview")
+        unrelated_cache = svg_cache_dir / "registered.unrelated.preview.png"
+        unrelated_cache.write_bytes(b"unrelated")
+
+        response = client.delete("/api/files/legacy.svg", headers=auth_headers)
+
+        assert response.status_code == 200, response.text
+        assert not legacy_path.exists()
+        assert not legacy_svg_cache.exists()
+        assert not legacy_pdf_cache.exists()
+        assert unrelated_cache.exists()
+
     def test_delete_file_keeps_record_when_durable_cleanup_fails(
         self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
     ):
@@ -1718,6 +1762,16 @@ class TestFileUploadSecurity:
         self, client, test_db, auth_headers
     ):
         """Test listing files with pagination and server-side filters."""
+        from xagent.web.models.task import Task
+
+        admin_user, test_app = test_db
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(Task(id=123, title="Task 123", user_id=admin_user.id))
+            db.commit()
+        finally:
+            db.close()
+
         uploaded = [
             ("alpha.txt", None),
             ("beta.txt", None),
@@ -1851,6 +1905,52 @@ class TestSvgPreviewSecurity:
         assert preview.headers["content-type"] == "image/png"
         assert preview.content.startswith(b"\x89PNG")
 
+    def test_durable_svg_preview_bypasses_redirects_and_rasterizes(
+        self,
+        client,
+        test_db,
+        temp_uploads_dir,
+        auth_headers,
+        monkeypatch,
+    ):
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        _, test_app = test_db
+        file_id = self._upload_svg(client, auth_headers)
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            record = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+            )
+            Path(str(record.storage_path)).unlink()
+        finally:
+            db.close()
+
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED", "true")
+
+        def unexpected_signed_redirect(self, **_kwargs):
+            del self
+            raise AssertionError("SVG preview must not use a signed raw-byte URL")
+
+        monkeypatch.setattr(
+            ManagedFileRef,
+            "signed_access_url",
+            unexpected_signed_redirect,
+        )
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert preview.status_code == 200
+        assert preview.headers["content-type"] == "image/png"
+        assert preview.content.startswith(b"\x89PNG")
+        assert "location" not in preview.headers
+        assert "x-accel-redirect" not in preview.headers
+
     def test_public_preview_svg_returns_png(
         self, client, temp_uploads_dir, auth_headers
     ):
@@ -1886,3 +1986,36 @@ class TestSvgPreviewSecurity:
         assert download.status_code == 200
         assert download.headers["content-disposition"].startswith("attachment")
         assert download.headers["x-content-type-options"] == "nosniff"
+
+    def test_signed_svg_download_forces_attachment(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        file_id = self._upload_svg(client, auth_headers, content=_CLEAN_SVG)
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        dispositions: list[str | None] = []
+
+        def signed_access_url(
+            self,
+            *,
+            expires,
+            content_type=None,
+            content_disposition=None,
+        ):
+            del self, expires, content_type
+            dispositions.append(content_disposition)
+            return "https://cdn.example.com/private/logo.svg?sig=abc"
+
+        monkeypatch.setattr(ManagedFileRef, "signed_access_url", signed_access_url)
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert download.status_code == 307
+        assert dispositions == [
+            "attachment; filename=\"logo.svg\"; filename*=UTF-8''logo.svg"
+        ]

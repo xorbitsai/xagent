@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 from uuid import uuid4
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import and_, false, or_
 
 from ...config import get_public_api_base_url
 from ..models.agent import Agent, AgentStatus
 from ..models.task import Task, TaskStatus
+from .task_execution_controller import TaskControlState
 
 A2A_MEDIA_TYPE = "application/a2a+json"
 A2A_VERSION = "1.0"
@@ -30,6 +33,98 @@ ALL_TASK_STATES = frozenset(
         "TASK_STATE_AUTH_REQUIRED",
     }
 )
+_A2A_OVERRIDE_STATES = frozenset(
+    {
+        "TASK_STATE_CANCELED",
+        "TASK_STATE_REJECTED",
+        "TASK_STATE_AUTH_REQUIRED",
+    }
+)
+_TASK_STATUS_TO_A2A_STATE = {
+    TaskStatus.PENDING: "TASK_STATE_SUBMITTED",
+    TaskStatus.RUNNING: "TASK_STATE_WORKING",
+    TaskStatus.PAUSED: "TASK_STATE_INPUT_REQUIRED",
+    TaskStatus.WAITING_FOR_USER: "TASK_STATE_INPUT_REQUIRED",
+    TaskStatus.COMPLETED: "TASK_STATE_COMPLETED",
+    TaskStatus.FAILED: "TASK_STATE_FAILED",
+}
+
+
+@dataclass(frozen=True)
+class A2AAgentCardSnapshot:
+    """Detached public Agent fields used to build an A2A Agent Card."""
+
+    id: int
+    name: str
+    description: str | None
+    status: str
+    suggested_prompts: tuple[Any, ...]
+    logo_url: str | None
+
+    @classmethod
+    def from_agent(cls, agent: Agent) -> A2AAgentCardSnapshot:
+        raw_suggested: Any = agent.suggested_prompts
+        return cls(
+            id=int(agent.id),
+            name=str(agent.name),
+            description=(
+                str(agent.description) if agent.description is not None else None
+            ),
+            status=str(getattr(agent.status, "value", agent.status)),
+            suggested_prompts=(
+                tuple(raw_suggested) if isinstance(raw_suggested, list) else ()
+            ),
+            logo_url=str(agent.logo_url) if agent.logo_url is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class A2ATaskSnapshot:
+    """Detached task fields shared by A2A response and polling paths."""
+
+    id: int
+    user_id: int
+    agent_id: int | None
+    source: str
+    status: TaskStatus
+    control_state: str | None
+    run_id: str | None
+    agent_config: dict[str, Any]
+    output: str | None
+    error_message: str | None
+    updated_at: datetime | None
+
+    @classmethod
+    def from_task(cls, task: Task) -> A2ATaskSnapshot:
+        return cls(
+            id=int(task.id),
+            user_id=int(task.user_id),
+            agent_id=int(task.agent_id) if task.agent_id is not None else None,
+            source=str(task.source),
+            status=TaskStatus(task.status),
+            control_state=(
+                str(task.control_state) if task.control_state is not None else None
+            ),
+            run_id=str(task.run_id) if task.run_id is not None else None,
+            agent_config=(
+                dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
+            ),
+            output=str(task.output) if task.output is not None else None,
+            error_message=(
+                str(task.error_message) if task.error_message is not None else None
+            ),
+            updated_at=cast(datetime | None, task.updated_at),
+        )
+
+
+@dataclass(frozen=True)
+class A2ATaskPageSnapshot:
+    """Detached result of one A2A task-list database transaction."""
+
+    tasks: tuple[A2ATaskSnapshot, ...]
+    next_page_token: str
+    page_size: int
+    total_size: int
 
 
 class A2AApiError(Exception):
@@ -92,7 +187,7 @@ def a2a_error(
     return A2AApiError(code, message, status_code=status_code, details=details)
 
 
-def is_published_agent(agent: Agent | None) -> bool:
+def is_published_agent(agent: object | None) -> bool:
     if agent is None:
         return False
     status = getattr(agent, "status", None)
@@ -105,7 +200,10 @@ def normalize_agent_card_base_url(request: Request, agent_id: int) -> str:
     return f"{root}/api/a2a/agents/{agent_id}"
 
 
-def build_agent_card(agent: Agent, request: Request) -> dict[str, Any]:
+def build_agent_card(
+    agent: Agent | A2AAgentCardSnapshot,
+    request: Request,
+) -> dict[str, Any]:
     if not is_published_agent(agent):
         raise a2a_error(
             "agent_not_found",
@@ -118,7 +216,7 @@ def build_agent_card(agent: Agent, request: Request) -> dict[str, Any]:
     # private execution instructions when an owner omitted a description.
     description = str(agent.description or agent.name)
     raw_suggested: Any = agent.suggested_prompts
-    suggested_source = raw_suggested if isinstance(raw_suggested, list) else []
+    suggested_source = raw_suggested if isinstance(raw_suggested, (list, tuple)) else []
     suggested = [
         item for item in suggested_source if isinstance(item, str) and item.strip()
     ]
@@ -310,7 +408,7 @@ def message_task_id(message: Mapping[str, Any], body: Mapping[str, Any]) -> int 
     )
 
 
-def task_context_id(task: Task) -> str:
+def task_context_id(task: Task | A2ATaskSnapshot) -> str:
     agent_config: dict[str, Any] = (
         task.agent_config if isinstance(task.agent_config, dict) else {}
     )
@@ -320,7 +418,11 @@ def task_context_id(task: Task) -> str:
     return str(task.id)
 
 
-def task_to_a2a(task: Task, *, include_artifacts: bool = True) -> dict[str, Any]:
+def task_to_a2a(
+    task: Task | A2ATaskSnapshot,
+    *,
+    include_artifacts: bool = True,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "id": str(task.id),
         "contextId": task_context_id(task),
@@ -343,43 +445,79 @@ def task_to_a2a(task: Task, *, include_artifacts: bool = True) -> dict[str, Any]
     return result
 
 
-def task_state(task_or_status: Task | Any) -> str:
-    task = task_or_status if isinstance(task_or_status, Task) else None
-    status = task.status if task is not None else task_or_status
+def task_state(task_or_status: Task | A2ATaskSnapshot | Any) -> str:
+    task = (
+        task_or_status if isinstance(task_or_status, (Task, A2ATaskSnapshot)) else None
+    )
+    status: Any = task.status if task is not None else task_or_status
     if task is not None:
         agent_config: dict[str, Any] = (
             task.agent_config if isinstance(task.agent_config, dict) else {}
         )
         override = agent_config.get("a2a_state")
-        if override in {
-            "TASK_STATE_CANCELED",
-            "TASK_STATE_REJECTED",
-            "TASK_STATE_AUTH_REQUIRED",
-        }:
+        if override in _A2A_OVERRIDE_STATES:
             return str(override)
     if isinstance(status, str):
         try:
             status = TaskStatus(status)
         except ValueError:
             return "TASK_STATE_UNSPECIFIED"
-    if status == TaskStatus.PENDING:
-        return "TASK_STATE_SUBMITTED"
-    if status == TaskStatus.RUNNING:
+    if (
+        task is not None
+        and status == TaskStatus.WAITING_FOR_USER
+        and task.control_state == TaskControlState.RESUME_REQUESTED.value
+    ):
         return "TASK_STATE_WORKING"
-    if status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
-        return "TASK_STATE_INPUT_REQUIRED"
-    if status == TaskStatus.COMPLETED:
-        return "TASK_STATE_COMPLETED"
-    if status == TaskStatus.FAILED:
-        return "TASK_STATE_FAILED"
+    if isinstance(status, TaskStatus):
+        return _TASK_STATUS_TO_A2A_STATE.get(
+            status,
+            "TASK_STATE_UNSPECIFIED",
+        )
     return "TASK_STATE_UNSPECIFIED"
 
 
-def sse_task_snapshot(task: Task) -> str:
+def a2a_task_state_filter(state: str) -> Any:
+    """Build the SQL predicate matching :func:`task_state`."""
+
+    stored_override = Task.agent_config["a2a_state"].as_string()
+    if state in _A2A_OVERRIDE_STATES:
+        return stored_override == state
+
+    projected_statuses = [
+        status
+        for status, projected_state in _TASK_STATUS_TO_A2A_STATE.items()
+        if projected_state == state and status != TaskStatus.WAITING_FOR_USER
+    ]
+    state_filters: list[Any] = [Task.status == status for status in projected_statuses]
+    if state == "TASK_STATE_WORKING":
+        state_filters.append(
+            and_(
+                Task.status == TaskStatus.WAITING_FOR_USER,
+                Task.control_state == TaskControlState.RESUME_REQUESTED.value,
+            )
+        )
+    elif state == "TASK_STATE_INPUT_REQUIRED":
+        state_filters.append(
+            and_(
+                Task.status == TaskStatus.WAITING_FOR_USER,
+                Task.control_state != TaskControlState.RESUME_REQUESTED.value,
+            )
+        )
+
+    return and_(
+        or_(
+            stored_override.is_(None),
+            ~stored_override.in_(_A2A_OVERRIDE_STATES),
+        ),
+        or_(*state_filters) if state_filters else false(),
+    )
+
+
+def sse_task_snapshot(task: Task | A2ATaskSnapshot) -> str:
     return _sse_event({"task": task_to_a2a(task)})
 
 
-def sse_task_update(task: Task) -> str:
+def sse_task_update(task: Task | A2ATaskSnapshot) -> str:
     return _sse_event(
         {
             "statusUpdate": {
@@ -392,7 +530,7 @@ def sse_task_update(task: Task) -> str:
 
 
 def sse_task_artifacts(
-    task: Task,
+    task: Task | A2ATaskSnapshot,
     *,
     text: str | None = None,
     append: bool = False,
@@ -418,7 +556,10 @@ def sse_task_artifacts(
     )
 
 
-def _agent_message(content: str, task: Task) -> dict[str, Any]:
+def _agent_message(
+    content: str,
+    task: Task | A2ATaskSnapshot,
+) -> dict[str, Any]:
     return {
         "messageId": f"task-{task.id}-status",
         "contextId": task_context_id(task),

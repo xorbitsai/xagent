@@ -6,7 +6,7 @@ import io
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from jose import jwt as jose_jwt
@@ -39,6 +39,7 @@ from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 from .conftest import (
     _admin_headers,
     _direct_db_session,
+    _install_one_slot_queue_pool,
     _register_second_user,
     client,
 )
@@ -76,6 +77,87 @@ def _create_agent(headers: dict[str, str], name: str = "Test Agent") -> int:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["id"]
+
+
+def test_create_from_template_releases_request_session_before_async_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy wrapper must enter template I/O with no request pool slot held."""
+
+    headers = _admin_headers()
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    checked_out_during_template_load: list[int] = []
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            checked_out_during_template_load.append(engine.pool.checkedout())
+            return {
+                "id": template_id,
+                "name": "Detached legacy template",
+                "descriptions": {"en": "Created through the shared runtime"},
+                "agent_config": {
+                    "instructions": "Use the worker-owned management runtime.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        TemplateManagerStub(),
+        raising=False,
+    )
+
+    try:
+        response = client.post(
+            "/api/agents/from-template",
+            headers=headers,
+            json={"template_id": "detached-legacy-template"},
+        )
+        assert response.status_code == 200, response.text
+        assert checked_out_during_template_load == [0]
+        assert response.json()["name"] == "Detached legacy template"
+        assert response.json()["visibility"] == "team"
+    finally:
+        engine.dispose()
+
+
+def test_create_from_template_fails_closed_when_request_session_is_not_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy wrapper must not cross an await with pending request DB state."""
+
+    headers = _admin_headers()
+    template_calls: list[str] = []
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            template_calls.append(template_id)
+            return {}
+
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        TemplateManagerStub(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agents_api,
+        "release_db_connection_if_clean",
+        lambda _db: False,
+    )
+
+    response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "must-not-load"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "Agent creation requires a clean request database transaction"
+    )
+    assert template_calls == []
 
 
 def _create_agent_row(
@@ -475,6 +557,41 @@ def test_widget_embed_ticket_rejected_for_disallowed_origin() -> None:
     assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
 
 
+def test_widget_embed_ticket_rejects_malformed_persisted_agent_allowlist(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Malformed Allowlist Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        cast(Any, agent).allowed_domains = {
+            "do-not-log-this-policy-value.example": True
+        }
+        db.commit()
+    finally:
+        db.close()
+
+    response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=agent owner_id={agent_id} reason=not_list"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
+
+
 def test_embed_ticket_requires_valid_widget_key_despite_spoofed_origin() -> None:
     """#742 (embed-ticket path): a forged allowlisted Origin is worthless
     without the unguessable per-agent widget key."""
@@ -824,6 +941,47 @@ def test_widget_auth_rechecks_ticket_origin_against_current_allowlist() -> None:
     )
     assert response.status_code == 403
     assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+
+
+def test_widget_auth_rejects_ticket_when_agent_allowlist_becomes_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Malformed Live Allowlist Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    ticket = _issue_embed_ticket(agent_id, "https://trusted-site.com").json()["ticket"]
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        cast(Any, agent).allowed_domains = [
+            "do-not-log-this-policy-value.example",
+            None,
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=agent owner_id={agent_id} reason=non_string_entry"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
 
 
 def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
@@ -1301,6 +1459,38 @@ def test_enabling_widget_generates_missing_key() -> None:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         assert agent is not None
         assert isinstance(agent.widget_key, str) and len(agent.widget_key) >= 32
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "blank_domain",
+    ["", "   ", "\u001c"],
+    ids=["empty", "spaces", "unicode-control-separator"],
+)
+def test_agent_update_rejects_blank_widget_allowed_domain(
+    blank_domain: str,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Validated Widget Domain Agent")
+    configured = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"allowed_domains": ["existing.example"]},
+    )
+    assert configured.status_code == 200, configured.text
+
+    response = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"allowed_domains": [blank_domain]},
+    )
+
+    assert response.status_code == 422, response.text
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        assert agent.allowed_domains == ["existing.example"]
     finally:
         db.close()
 

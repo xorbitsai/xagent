@@ -31,7 +31,9 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
+from sqlalchemy import Engine, create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.web.api.a2a import router as a2a_router
 from xagent.web.api.agent_api_keys import router as agent_api_keys_router
@@ -280,3 +282,39 @@ def _direct_db_session() -> Session:
     non-NULL after DELETE). Always close the session in a try/finally.
     """
     return next(get_db())
+
+
+def _install_one_slot_queue_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pool_timeout: float = 0.15,
+) -> Engine:
+    """Rebind the current test database through a real one-slot QueuePool.
+
+    Call this only after arranging the test's seed data. The database file and
+    schema stay unchanged; only the engine/session factory used by subsequent
+    requests changes. This reproduces the production ownership boundary where
+    a request-held connection and a worker-owned turn transaction must not
+    overlap.
+    """
+
+    from xagent.web.models import database as database_module
+
+    current_engine = get_engine()
+    database_url = str(current_engine.url)
+    current_engine.dispose()
+    engine = create_engine(
+        database_url,
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=pool_timeout,
+    )
+    monkeypatch.setattr(database_module, "_engine", engine)
+    monkeypatch.setattr(
+        database_module,
+        "_SessionLocal",
+        sessionmaker(autocommit=False, autoflush=False, bind=engine),
+    )
+    return engine

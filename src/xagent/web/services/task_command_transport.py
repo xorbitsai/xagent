@@ -26,6 +26,12 @@ from ...config import (
 )
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
+from .db_runtime import (
+    await_task_settlement,
+    is_database_pool_timeout,
+    propagate_deferred_cancellation,
+    run_db_io_cancellation_safe,
+)
 from .task_lease_service import get_runner_id
 
 logger = logging.getLogger(__name__)
@@ -83,6 +89,39 @@ class ClaimedTaskCommand:
     attempt_count: int
     failure_count: int = 0
     defer_count: int = 0
+
+
+@dataclass(frozen=True)
+class TaskCommandStateSnapshot:
+    """Immutable command state safe to return across a worker boundary."""
+
+    command_db_id: int
+    status: str
+    error: str | None
+    rejection_reason: str | None
+    attempt_count: int
+    failure_count: int
+    defer_count: int
+
+    @property
+    def result(self) -> dict[str, Any]:
+        """Return the legacy result shape without exposing mutable snapshot state."""
+
+        if self.rejection_reason is None:
+            return {}
+        return {"rejection_reason": self.rejection_reason}
+
+
+@dataclass(frozen=True)
+class TaskCommandClaimHeartbeatOutcome:
+    """Last confirmed health of a processing-command claim."""
+
+    claim_lost: bool = False
+    pool_timeout: BaseException | None = None
+
+    @property
+    def requires_ttl_recovery(self) -> bool:
+        return self.claim_lost or self.pool_timeout is not None
 
 
 def _utc_now() -> datetime:
@@ -334,6 +373,24 @@ def claim_task_command(
     )
 
 
+def _claim_task_command_isolated(
+    *,
+    runner_id: str,
+    command_db_id: int | None,
+) -> ClaimedTaskCommand | None:
+    """Claim in a worker-owned short session and return a detached snapshot."""
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return claim_task_command(
+            db,
+            runner_id=runner_id,
+            command_db_id=command_db_id,
+        )
+
+
 def renew_task_command_claim(
     command_db_id: int,
     runner_id: str,
@@ -371,22 +428,26 @@ async def _claim_heartbeat(
     runner_id: str,
     attempt_count: int,
     stop_event: asyncio.Event,
-) -> None:
+) -> TaskCommandClaimHeartbeatOutcome:
     interval = get_task_lease_heartbeat_seconds()
+    pool_timeout: BaseException | None = None
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            return
+            return TaskCommandClaimHeartbeatOutcome(pool_timeout=pool_timeout)
         except asyncio.TimeoutError:
             pass
         try:
-            renewed = await asyncio.to_thread(
-                renew_task_command_claim,
-                command_db_id,
-                runner_id,
-                expected_attempt_count=attempt_count,
+            renewed = await run_db_io_cancellation_safe(
+                lambda: renew_task_command_claim(
+                    command_db_id,
+                    runner_id,
+                    expected_attempt_count=attempt_count,
+                )
             )
         except Exception as exc:  # noqa: BLE001
+            if is_database_pool_timeout(exc):
+                pool_timeout = exc
             logger.warning(
                 "Failed to renew task command claim %s: %s",
                 command_db_id,
@@ -394,8 +455,10 @@ async def _claim_heartbeat(
                 exc_info=True,
             )
             continue
+        pool_timeout = None
         if not renewed:
-            return
+            return TaskCommandClaimHeartbeatOutcome(claim_lost=True)
+    return TaskCommandClaimHeartbeatOutcome(pool_timeout=pool_timeout)
 
 
 def finish_task_command(
@@ -583,11 +646,8 @@ def defer_task_command(
 def retry_failed_task_command(
     db: Session,
     command_db_id: int,
-    *,
-    target_run_id: str | None,
-    target_runner_id: str | None,
 ) -> bool:
-    """Atomically reset a terminal command for an explicit client retry."""
+    """Reset one failed command without retargeting its immutable execution."""
 
     now = _utc_now()
     updated = (
@@ -605,8 +665,6 @@ def retry_failed_task_command(
                 TaskExecutionCommand.result: None,
                 TaskExecutionCommand.claimed_by: None,
                 TaskExecutionCommand.claim_expires_at: None,
-                TaskExecutionCommand.target_run_id: target_run_id,
-                TaskExecutionCommand.target_runner_id: target_runner_id,
                 TaskExecutionCommand.completed_at: None,
                 TaskExecutionCommand.updated_at: now,
             },
@@ -648,6 +706,7 @@ def task_has_live_foreign_runner(
 
 
 CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
+CommandDisposition = Callable[[], bool]
 _dispatcher_wakeup: asyncio.Event | None = None
 _dispatcher_task: asyncio.Task[Any] | None = None
 _dispatcher_loop: asyncio.AbstractEventLoop | None = None
@@ -661,21 +720,56 @@ def notify_task_command_dispatcher() -> None:
         loop.call_soon_threadsafe(wakeup.set)
 
 
+async def _persist_task_command_disposition(
+    command: ClaimedTaskCommand,
+    *,
+    disposition: str,
+    operation: CommandDisposition,
+) -> bool:
+    """Persist one final state without retrying an exhausted pool checkout."""
+
+    try:
+        persisted = await run_db_io_cancellation_safe(operation)
+    except Exception as exc:  # noqa: BLE001
+        if not is_database_pool_timeout(exc):
+            raise
+        # The command is still fenced by claimed_by + attempt_count. Avoid an
+        # immediate second checkout; expiry is the durable recovery boundary.
+        logger.error(
+            "task_id=%s component=task-command-disposition disposition=%s "
+            "database pool checkout timed out; retaining command claim for "
+            "expiry (command_id=%s, kind=%s, attempt=%s): %s",
+            command.task_id,
+            disposition,
+            command.command_id,
+            command.kind.value,
+            command.attempt_count,
+            exc,
+            exc_info=True,
+        )
+        return False
+    if not persisted:
+        logger.warning(
+            "Lost claim while persisting task command %s disposition=%s attempt=%s",
+            command.id,
+            disposition,
+            command.attempt_count,
+        )
+    return persisted
+
+
 async def dispatch_one_task_command(
     executor: CommandExecutor,
     *,
     command_db_id: int | None = None,
 ) -> bool:
-    from ..models.database import get_session_local
-
     runner_id = get_runner_id()
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        command = claim_task_command(
-            db,
+    command = await run_db_io_cancellation_safe(
+        lambda: _claim_task_command_isolated(
             runner_id=runner_id,
             command_db_id=command_db_id,
         )
+    )
     if command is None:
         return False
 
@@ -683,6 +777,10 @@ async def dispatch_one_task_command(
     heartbeat = asyncio.get_running_loop().create_task(
         _claim_heartbeat(command.id, runner_id, command.attempt_count, stop_event)
     )
+    disposition_name: str | None = None
+    disposition_operation: CommandDisposition | None = None
+    heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
+    heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
         result = await executor(command)
     except asyncio.CancelledError:
@@ -690,56 +788,111 @@ async def dispatch_one_task_command(
         # after the claim expires, which avoids concurrent replay on shutdown.
         raise
     except TaskCommandDeferred as exc:
-        await asyncio.to_thread(
-            defer_task_command,
-            command.id,
-            runner_id,
-            str(exc),
-            expected_attempt_count=command.attempt_count,
-        )
+        reason = str(exc)
+
+        def persist_deferral() -> bool:
+            return defer_task_command(
+                command.id,
+                runner_id,
+                reason,
+                expected_attempt_count=command.attempt_count,
+            )
+
+        disposition_name = "defer_task_command"
+        disposition_operation = persist_deferral
     except TaskCommandRejected as exc:
-        await asyncio.to_thread(
-            fail_task_command,
-            command.id,
-            runner_id,
-            str(exc),
-            force_terminal=True,
-            expected_attempt_count=command.attempt_count,
-            result=(
-                {"rejection_reason": exc.reason} if exc.reason is not None else None
-            ),
+        error = str(exc)
+        rejection_result = (
+            {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
+
+        def persist_rejection() -> bool:
+            return fail_task_command(
+                command.id,
+                runner_id,
+                error,
+                force_terminal=True,
+                expected_attempt_count=command.attempt_count,
+                result=rejection_result,
+            )
+
+        disposition_name = "fail_task_command"
+        disposition_operation = persist_rejection
     except Exception as exc:  # noqa: BLE001
-        logger.exception(
-            "Task command %s (%s) failed on attempt %s",
-            command.command_id,
-            command.kind.value,
-            command.attempt_count,
-        )
-        await asyncio.to_thread(
-            fail_task_command,
-            command.id,
-            runner_id,
-            str(exc),
-            expected_attempt_count=command.attempt_count,
-        )
+        if is_database_pool_timeout(exc):
+            # The handler already waited for an exhausted checkout. Persisting
+            # command failure here would immediately request a second
+            # connection. Keep the fenced processing claim intact; another
+            # dispatcher may reclaim it only after claim expiry.
+            logger.error(
+                "task_id=%s component=task-command-handler database pool "
+                "checkout timed out; retaining command claim for expiry "
+                "(command_id=%s, kind=%s, attempt=%s): %s",
+                command.task_id,
+                command.command_id,
+                command.kind.value,
+                command.attempt_count,
+                exc,
+                exc_info=True,
+            )
+        else:
+            logger.exception(
+                "Task command %s (%s) failed on attempt %s",
+                command.command_id,
+                command.kind.value,
+                command.attempt_count,
+            )
+            error = str(exc)
+
+            def persist_failure() -> bool:
+                return fail_task_command(
+                    command.id,
+                    runner_id,
+                    error,
+                    expected_attempt_count=command.attempt_count,
+                )
+
+            disposition_name = "fail_task_command"
+            disposition_operation = persist_failure
     else:
-        if not await asyncio.to_thread(
-            finish_task_command,
-            command.id,
-            runner_id,
-            result=result,
-            expected_attempt_count=command.attempt_count,
-        ):
-            logger.warning("Lost claim while completing task command %s", command.id)
+
+        def persist_completion() -> bool:
+            return finish_task_command(
+                command.id,
+                runner_id,
+                result=result,
+                expected_attempt_count=command.attempt_count,
+            )
+
+        disposition_name = "finish_task_command"
+        disposition_operation = persist_completion
     finally:
         stop_event.set()
-        heartbeat.cancel()
-        try:
-            await heartbeat
-        except asyncio.CancelledError:
-            pass
-    return True
+        heartbeat_outcome, heartbeat_cancellation = await await_task_settlement(
+            heartbeat
+        )
+
+    with propagate_deferred_cancellation(heartbeat_cancellation):
+        if heartbeat_outcome.requires_ttl_recovery:
+            logger.error(
+                "task_id=%s component=task-command-heartbeat claim is unresolved; "
+                "retaining command claim for expiry (command_id=%s, kind=%s, "
+                "attempt=%s, claim_lost=%s, pool_timeout=%s)",
+                command.task_id,
+                command.command_id,
+                command.kind.value,
+                command.attempt_count,
+                heartbeat_outcome.claim_lost,
+                heartbeat_outcome.pool_timeout,
+            )
+            return True
+        if disposition_name is not None and disposition_operation is not None:
+            await _persist_task_command_disposition(
+                command,
+                disposition=disposition_name,
+                operation=disposition_operation,
+            )
+        return True
 
 
 async def dispatch_task_command_promptly(
@@ -790,7 +943,22 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
         # claim remains set, so an empty claim cannot erase that wakeup and
         # sleep while work is waiting.
         wakeup.clear()
-        processed = await dispatch_one_task_command(executor)
+        try:
+            processed = await dispatch_one_task_command(executor)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "component=task-command-dispatcher command dispatch failed; "
+                "worker continuing: %s",
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            continue
         if processed:
             continue
         try:
@@ -846,18 +1014,36 @@ async def stop_task_command_dispatcher() -> None:
             pass
 
 
-def load_task_command(command_db_id: int) -> TaskExecutionCommand | None:
+def load_task_command(command_db_id: int) -> TaskCommandStateSnapshot | None:
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        command = (
-            db.query(TaskExecutionCommand)
+        row = (
+            db.query(
+                TaskExecutionCommand.id,
+                TaskExecutionCommand.status,
+                TaskExecutionCommand.error,
+                TaskExecutionCommand.result,
+                TaskExecutionCommand.attempt_count,
+                TaskExecutionCommand.failure_count,
+                TaskExecutionCommand.defer_count,
+            )
             .filter(TaskExecutionCommand.id == command_db_id)
             .first()
         )
-        if command is not None:
-            # Make the session boundary explicit. Callers only read scalar
-            # command state and must never depend on a live/lazy session.
-            db.expunge(command)
-        return command
+        if row is None:
+            return None
+        result = row.result if isinstance(row.result, dict) else {}
+        rejection_reason = result.get("rejection_reason")
+        return TaskCommandStateSnapshot(
+            command_db_id=int(row.id),
+            status=str(row.status),
+            error=str(row.error) if row.error is not None else None,
+            rejection_reason=(
+                rejection_reason if isinstance(rejection_reason, str) else None
+            ),
+            attempt_count=int(row.attempt_count or 0),
+            failure_count=int(row.failure_count or 0),
+            defer_count=int(row.defer_count or 0),
+        )

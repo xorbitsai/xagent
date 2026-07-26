@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import io
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -117,6 +117,25 @@ def _enable_widget(
     key = body["widget_key"]
     assert isinstance(key, str) and key
     return str(key)
+
+
+def _set_workforce_allowed_domains_raw(
+    workforce_id: int, allowed_domains: object
+) -> None:
+    db = _direct_db_session()
+    try:
+        deployment = (
+            db.query(Deployment)
+            .filter(
+                Deployment.owner_type == DeploymentOwnerType.WORKFORCE.value,
+                Deployment.owner_id == workforce_id,
+            )
+            .one()
+        )
+        cast(Any, deployment).allowed_domains = allowed_domains
+        db.commit()
+    finally:
+        db.close()
 
 
 def _authenticate_widget_guest_by_key(
@@ -230,6 +249,31 @@ def test_widget_allowed_domains_update_independent_of_enable() -> None:
     assert updated.json()["allowed_domains"] == ["a.com", "b.com"]
     # widget_enabled untouched when only domains are sent.
     assert updated.json()["widget_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "blank_domain",
+    ["", "   ", "\u001c"],
+    ids=["empty", "spaces", "unicode-control-separator"],
+)
+def test_workforce_widget_update_rejects_blank_allowed_domain(
+    blank_domain: str,
+) -> None:
+    workforce_id = _create_workforce("Validated Domains Widget Workforce")
+    _enable_widget(workforce_id, allowed_domains=["existing.example"])
+
+    response = client.put(
+        f"/api/workforces/{workforce_id}/widget",
+        headers=_admin_headers(),
+        json={"allowed_domains": [blank_domain]},
+    )
+
+    assert response.status_code == 422, response.text
+    fetched = client.get(
+        f"/api/workforces/{workforce_id}/widget-key", headers=_admin_headers()
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["allowed_domains"] == ["existing.example"]
 
 
 def test_widget_requires_workforce_owner() -> None:
@@ -374,6 +418,65 @@ def test_widget_embed_ticket_enforces_allowed_domains() -> None:
         headers={"origin": "https://example.com"},
     )
     assert allowed.status_code == 200, allowed.text
+
+
+def test_widget_embed_ticket_rejects_malformed_workforce_allowlist(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
+    workforce_id = _create_workforce("Malformed Domain Gate Widget Workforce")
+    key = _enable_widget(workforce_id, allowed_domains=["example.com"])
+    _set_workforce_allowed_domains_raw(
+        workforce_id, "do-not-log-this-policy-value.example"
+    )
+
+    response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": key},
+        headers={"origin": "https://example.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: example.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=workforce owner_id={workforce_id} reason=not_list"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
+
+
+def test_widget_auth_rejects_ticket_when_workforce_allowlist_becomes_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
+    workforce_id = _create_workforce("Malformed Live Allowlist Widget Workforce")
+    key = _enable_widget(workforce_id, allowed_domains=["example.com"])
+    ticket_response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": key},
+        headers={"origin": "https://example.com"},
+    )
+    assert ticket_response.status_code == 200, ticket_response.text
+
+    _set_workforce_allowed_domains_raw(
+        workforce_id, [None, "do-not-log-this-policy-value.example"]
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "guest_id": "guest_test",
+            "embed_ticket": ticket_response.json()["ticket"],
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: example.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=workforce owner_id={workforce_id} reason=non_string_entry"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
 
 
 def test_widget_auth_rejects_unknown_key() -> None:

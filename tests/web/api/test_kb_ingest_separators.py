@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -81,7 +82,11 @@ def app_with_kb(mock_user):
     app.include_router(kb_router)
     app.dependency_overrides[get_current_user] = override_get_current_user
     app.dependency_overrides[get_db] = override_get_db
-    return app
+    with patch(
+        "xagent.web.api.kb._upsert_uploaded_file_record",
+        return_value=SimpleNamespace(file_id="test-file-id"),
+    ):
+        yield app
 
 
 @pytest.fixture

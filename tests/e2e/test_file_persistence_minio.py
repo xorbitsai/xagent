@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -51,6 +52,21 @@ def _fetch_file_record(session_factory: sessionmaker[Session], file_id: str) -> 
         return db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
     finally:
         db.close()
+
+
+def _assert_task_output_generation_key(
+    storage_key: str,
+    *,
+    user_id: int,
+    task_id: int,
+    file_id: str,
+    relative_path: str,
+) -> None:
+    prefix = f"users/{user_id}/tasks/{task_id}/outputs/{file_id}/_versions/"
+    assert storage_key.startswith(prefix)
+    generation, actual_relative_path = storage_key.removeprefix(prefix).split("/", 1)
+    assert UUID(generation)
+    assert actual_relative_path == relative_path
 
 
 def _wait_for_startup_file_storage_sync(client: TestClient) -> None:
@@ -185,9 +201,12 @@ def test_task_uploads_agent_outputs_and_startup_sync_persist_to_minio(
         assert output_record.storage_status == "available"
         assert output_record.workspace_category == "output"
         assert output_record.workspace_relative_path == "output/static-output.txt"
-        assert output_record.storage_key == (
-            f"users/{user_id}/tasks/{task_id}/outputs/"
-            f"{output_record.file_id}/output/static-output.txt"
+        _assert_task_output_generation_key(
+            output_record.storage_key,
+            user_id=user_id,
+            task_id=task_id,
+            file_id=output_record.file_id,
+            relative_path="output/static-output.txt",
         )
         assert minio_storage.object_bytes(output_record.storage_key) == (
             b"minio persistence e2e output\n"

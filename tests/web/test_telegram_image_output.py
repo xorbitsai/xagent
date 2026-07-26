@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from xagent.core.agent.trace import (
@@ -97,17 +99,6 @@ async def test_send_output_files_uploads_documents(tmp_path) -> None:
         storage_path = str(output_path)
         filename = "report.csv"
 
-    class FakeQuery:
-        def filter(self, *args):
-            return self
-
-        def all(self):
-            return [FakeRecord()]
-
-    class FakeDB:
-        def query(self, *args):
-            return FakeQuery()
-
     class FakeReply:
         def __init__(self) -> None:
             self.documents = []
@@ -118,15 +109,23 @@ async def test_send_output_files_uploads_documents(tmp_path) -> None:
     bot = object.__new__(TelegramBotInstance)
     reply = FakeReply()
 
-    failed_refs = await bot._send_output_files(
-        file_refs=[TelegramFileRef(file_id="file-1", label="report.csv")],
-        user_id=7,
-        task_id=423,
-        db=FakeDB(),  # type: ignore[arg-type]
-        reply_to=reply,  # type: ignore[arg-type]
-    )
+    with patch(
+        "xagent.web.channels.telegram.bot.load_channel_output_files",
+        new=AsyncMock(return_value=(FakeRecord(),)),
+    ) as load_files:
+        failed_refs = await bot._send_output_files(
+            file_refs=[TelegramFileRef(file_id="file-1", label="report.csv")],
+            user_id=7,
+            task_id=423,
+            reply_to=reply,  # type: ignore[arg-type]
+        )
 
     assert failed_refs == []
+    load_files.assert_awaited_once_with(
+        file_ids=["file-1"],
+        user_id=7,
+        task_id=423,
+    )
     assert len(reply.documents) == 1
     assert reply.documents[0][1] == "report.csv"
 

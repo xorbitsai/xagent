@@ -22,6 +22,7 @@ from xagent.web.models.workforce import Workforce
 from ..conftest import (
     _admin_headers,
     _direct_db_session,
+    _install_one_slot_queue_pool,
     client,
 )
 
@@ -223,6 +224,28 @@ def test_create_run_happy_path():
         assert int(run.workforce_id) == workforce_id
     finally:
         db.close()
+
+
+def test_create_run_uses_one_connection_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The /v1 adapter must not hold a request Session across run startup."""
+
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Single Slot Workforce")
+    full_key = _create_workforce_key(headers, workforce_id)
+    engine = _install_one_slot_queue_pool(monkeypatch)
+
+    try:
+        response = client.post(
+            f"/v1/workforces/{workforce_id}/runs",
+            headers=_bearer(full_key),
+            json={"message": {"role": "user", "content": "single-slot run"}},
+        )
+        assert response.status_code == 202, response.text
+        assert engine.pool.checkedout() == 0
+    finally:
+        engine.dispose()
 
 
 def test_bound_task_reachable_via_chat_tasks_with_workforce_key():
@@ -613,10 +636,14 @@ def test_append_workforce_turn_rejection_maps_to_stable_codes(monkeypatch):
         ("busy", "task_busy", 409),
     ):
 
-        async def _reject(reason=reason, **_kwargs):
+        def _reject(*_args, reason=reason, **_kwargs):
             raise TaskTurnError(reason)
 
-        monkeypatch.setattr(v1_tasks.TaskTurnOrchestrator, "begin_turn", _reject)
+        monkeypatch.setattr(
+            v1_tasks.TaskTurnOrchestrator,
+            "claim_append_turn_no_commit",
+            _reject,
+        )
         resp = client.post(
             f"/v1/chat/tasks/{task_id}/messages",
             headers=_bearer(full_key),

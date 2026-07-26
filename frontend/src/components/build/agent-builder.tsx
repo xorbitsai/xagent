@@ -9,6 +9,11 @@ import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { apiRequest, isJsonRecord } from "@/lib/api-wrapper"
+import {
+  getBackgroundJobFailureMessage,
+  isBackgroundJobResponse,
+  waitForBackgroundJob,
+} from "@/lib/background-jobs"
 import { getApiUrl } from "@/lib/utils"
 import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
 import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
@@ -1353,6 +1358,24 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         if (!res.ok) {
           const body = await res.json().catch(() => ({}))
           throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+        }
+        // 202 means the transfer runs as a durable background job. Agent
+        // promotion below requires the KB to already be team-owned, so wait for
+        // the job instead of racing it. Backends without a job queue send 204.
+        if (res.status === 202) {
+          const job = await res.json().catch(() => null)
+          // An unreadable 202 body leaves the transfer untrackable, so the KB
+          // may still be personal. Continuing would race the agent promotion
+          // that this wait exists to order.
+          if (!isBackgroundJobResponse(job)) {
+            throw new Error(t("builds.editor.error.unknown"))
+          }
+          const finished = await waitForBackgroundJob(getApiUrl(), job)
+          if (finished.status !== "succeeded") {
+            throw new Error(
+              getBackgroundJobFailureMessage(finished, t("builds.editor.error.unknown")),
+            )
+          }
         }
       }
       setUnsharedConnectors([])

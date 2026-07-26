@@ -5,12 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const toastWarningMock = vi.hoisted(() => vi.fn())
+const toastSuccessMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
 }))
 
-vi.mock("@/lib/utils", () => ({
+// Partial mock: only the API base URL is stubbed. Replacing the whole module
+// strips `cn`, which every rendered UI primitive calls.
+vi.mock("@/lib/utils", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/utils")>()),
   getApiUrl: () => "http://api.local",
 }))
 
@@ -30,13 +34,14 @@ vi.mock("@/contexts/i18n-context", () => ({
 vi.mock("@/contexts/auth-context", () => ({
   useAuth: () => ({
     user: { id: 1, is_admin: false },
+    inTeam: true,
   }),
 }))
 
 vi.mock("sonner", () => ({
   toast: {
     error: toastErrorMock,
-    success: vi.fn(),
+    success: toastSuccessMock,
     warning: toastWarningMock,
   },
 }))
@@ -55,6 +60,7 @@ vi.mock("lucide-react", () => {
     Settings2: Icon,
     Trash2: Icon,
     UploadCloud: Icon,
+    Users: Icon,
     X: Icon,
   }
 })
@@ -109,11 +115,32 @@ function createJsonResponse(body: unknown, ok = true) {
   }
 }
 
+function createStatusResponse(status: number, body?: unknown) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: vi.fn().mockResolvedValue(body ?? {}),
+  }
+}
+
+const ONE_COLLECTION = {
+  collections: [{
+    name: "demo",
+    documents: 1,
+    parses: 0,
+    chunks: 2,
+    embeddings: 3,
+    document_names: ["report.pdf"],
+    ownership: "personal",
+  }],
+}
+
 describe("KnowledgeBasePage", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
     toastWarningMock.mockReset()
+    toastSuccessMock.mockReset()
   })
 
   afterEach(() => {
@@ -228,5 +255,214 @@ describe("KnowledgeBasePage", () => {
       expect(screen.getByText("kb.emptyState.title")).toBeInTheDocument()
       expect(toastWarningMock).toHaveBeenCalledWith("cleanup warning")
     })
+  })
+
+  it("waits for the promotion job to finish before reporting success", async () => {
+    let jobPollCount = 0
+    let collectionFetchCount = 0
+
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      if (url === "http://api.local/api/kb/collections" && !options) {
+        collectionFetchCount += 1
+        return Promise.resolve(createJsonResponse(ONE_COLLECTION))
+      }
+
+      if (url === "http://api.local/api/knowledge-bases/demo/promote-team" && options?.method === "POST") {
+        return Promise.resolve(createStatusResponse(202, {
+          id: "job-1",
+          user_id: 1,
+          job_type: "kb.team.transfer",
+          queue: "kb",
+          status: "running",
+          attempts: 1,
+          max_attempts: 3,
+        }))
+      }
+
+      if (url === "http://api.local/api/jobs/job-1") {
+        jobPollCount += 1
+        return Promise.resolve(createJsonResponse({
+          id: "job-1",
+          user_id: 1,
+          job_type: "kb.team.transfer",
+          queue: "kb",
+          status: jobPollCount === 1 ? "running" : "succeeded",
+          attempts: 1,
+          max_attempts: 3,
+        }))
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    await screen.findByText("demo")
+
+    fireEvent.click(screen.getByTitle("kb.ownership.makeTeam"))
+
+    // First poll still reports running: the transfer is not done, so the user
+    // must not be told it succeeded yet.
+    await waitFor(() => {
+      expect(jobPollCount).toBe(1)
+    }, { timeout: 3000 })
+    expect(toastSuccessMock).not.toHaveBeenCalled()
+
+    await waitFor(() => {
+      expect(toastSuccessMock).toHaveBeenCalledWith("kb.ownership.teamSuccess")
+    }, { timeout: 4000 })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+
+    // Let the post-success refresh finish inside this test, so its request does
+    // not land on the next test's mock.
+    await waitFor(() => {
+      expect(collectionFetchCount).toBeGreaterThanOrEqual(2)
+    })
+  })
+
+  it("surfaces a failed promotion job as an error", async () => {
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      if (url === "http://api.local/api/kb/collections" && !options) {
+        return Promise.resolve(createJsonResponse(ONE_COLLECTION))
+      }
+
+      if (url === "http://api.local/api/knowledge-bases/demo/promote-team" && options?.method === "POST") {
+        return Promise.resolve(createStatusResponse(202, {
+          id: "job-2",
+          user_id: 1,
+          job_type: "kb.team.transfer",
+          queue: "kb",
+          status: "enqueued",
+          attempts: 1,
+          max_attempts: 3,
+        }))
+      }
+
+      if (url === "http://api.local/api/jobs/job-2") {
+        return Promise.resolve(createJsonResponse({
+          id: "job-2",
+          user_id: 1,
+          job_type: "kb.team.transfer",
+          queue: "kb",
+          status: "failed",
+          error_message: "team storage already contains this knowledge base",
+          attempts: 3,
+          max_attempts: 3,
+        }))
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    await screen.findByText("demo")
+
+    fireEvent.click(screen.getByTitle("kb.ownership.makeTeam"))
+
+    await waitFor(() => {
+      expect(toastErrorMock.mock.calls.map((call) => call[0])).toContain(
+        "team storage already contains this knowledge base",
+      )
+    }, { timeout: 3000 })
+    expect(toastSuccessMock).not.toHaveBeenCalled()
+  })
+
+  it("surfaces an error when the 202 job body is malformed", async () => {
+    const seenUrls: string[] = []
+    let collectionFetchCount = 0
+
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      seenUrls.push(url)
+
+      if (url === "http://api.local/api/kb/collections" && !options) {
+        collectionFetchCount += 1
+        return Promise.resolve(createJsonResponse(ONE_COLLECTION))
+      }
+
+      if (url === "http://api.local/api/knowledge-bases/demo/promote-team" && options?.method === "POST") {
+        // Accepted, but the body is not a job descriptor: the transfer cannot be
+        // tracked, so its completion is unknown and must not read as success.
+        return Promise.resolve(createStatusResponse(202, { not_a_valid_job: true }))
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    await screen.findByText("demo")
+
+    fireEvent.click(screen.getByTitle("kb.ownership.makeTeam"))
+
+    await waitFor(() => {
+      expect(toastErrorMock.mock.calls.map((call) => call[0])).toContain("kb.ownership.failed")
+    })
+    expect(toastSuccessMock).not.toHaveBeenCalled()
+    expect(seenUrls.some((url) => url.includes("/api/jobs/"))).toBe(false)
+    // No success means no post-success refresh: only the initial mount fetch.
+    expect(collectionFetchCount).toBe(1)
+  })
+
+  it("surfaces an error when the 202 job body cannot be parsed", async () => {
+    let collectionFetchCount = 0
+
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      if (url === "http://api.local/api/kb/collections" && !options) {
+        collectionFetchCount += 1
+        return Promise.resolve(createJsonResponse(ONE_COLLECTION))
+      }
+
+      if (url === "http://api.local/api/knowledge-bases/demo/promote-team" && options?.method === "POST") {
+        return Promise.resolve({
+          ok: true,
+          status: 202,
+          json: vi.fn().mockRejectedValue(new SyntaxError("Unexpected end of JSON input")),
+        })
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    await screen.findByText("demo")
+
+    fireEvent.click(screen.getByTitle("kb.ownership.makeTeam"))
+
+    await waitFor(() => {
+      expect(toastErrorMock.mock.calls.map((call) => call[0])).toContain("kb.ownership.failed")
+    })
+    expect(toastSuccessMock).not.toHaveBeenCalled()
+    expect(collectionFetchCount).toBe(1)
+  })
+
+  it("keeps the synchronous 204 contract when the backend has no job queue", async () => {
+    const seenUrls: string[] = []
+
+    apiRequestMock.mockImplementation((url: string, options?: { method?: string }) => {
+      seenUrls.push(url)
+
+      if (url === "http://api.local/api/kb/collections" && !options) {
+        return Promise.resolve(createJsonResponse(ONE_COLLECTION))
+      }
+
+      if (url === "http://api.local/api/knowledge-bases/demo/promote-team" && options?.method === "POST") {
+        return Promise.resolve(createStatusResponse(204))
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    await screen.findByText("demo")
+
+    fireEvent.click(screen.getByTitle("kb.ownership.makeTeam"))
+
+    await waitFor(() => {
+      expect(toastSuccessMock).toHaveBeenCalledWith("kb.ownership.teamSuccess")
+    })
+    expect(seenUrls.some((url) => url.includes("/api/jobs/"))).toBe(false)
   })
 })

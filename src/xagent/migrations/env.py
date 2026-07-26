@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from sqlalchemy import engine_from_config
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy import pool, text
+from sqlalchemy.engine import Connection
 
 # Load environment variables from .env file
 load_dotenv()
@@ -39,7 +40,9 @@ ALEMBIC_VERSION_TABLE = "alembic_version"
 ALEMBIC_VERSION_LENGTH = 255
 
 
-def ensure_wide_alembic_version_table(connection, *, commit: bool = False) -> None:
+def ensure_wide_alembic_version_table(
+    connection: Connection, *, commit: bool = False
+) -> None:
     """Ensure Alembic can store this project's long revision identifiers."""
     changed = False
     inspector = sqlalchemy_inspect(connection)
@@ -152,7 +155,17 @@ def run_migrations_online() -> None:
     if connection is not None:
         # Use provided connection
         ensure_wide_alembic_version_table(connection)
-        context.configure(connection=connection, target_metadata=target_metadata)
+        is_postgresql = connection.dialect.name == "postgresql"
+        if is_postgresql and connection.in_transaction():
+            # PostgreSQL online index migrations use an Alembic autocommit
+            # block.  Reflection above starts an implicit transaction; close
+            # it before Alembic takes ownership of per-migration boundaries.
+            connection.commit()
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            transaction_per_migration=is_postgresql,
+        )
         with context.begin_transaction():
             context.run_migrations()
     else:
@@ -174,8 +187,12 @@ def run_migrations_online() -> None:
         with connectable.connect() as connection:
             ensure_wide_alembic_version_table(connection, commit=True)
 
-        with connectable.begin() as connection:
-            context.configure(connection=connection, target_metadata=target_metadata)
+        with connectable.connect() as connection:
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+                transaction_per_migration=connection.dialect.name == "postgresql",
+            )
 
             with context.begin_transaction():
                 context.run_migrations()

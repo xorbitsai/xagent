@@ -455,14 +455,45 @@ def _sync_workforce_run_status_for_task_id(
     db: Session,
     task_id: int,
     status: TaskStatus,
+    *,
+    task_lease: TaskLease | None = None,
 ) -> bool:
-    task = db.query(Task).filter(Task.id == int(task_id)).first()
-    if task is None:
+    task_query = db.query(Task).filter(Task.id == int(task_id))
+    if task_lease is not None:
+        if task_lease.task_id != int(task_id) or task_lease.run_id is None:
+            return False
+        task_query = task_query.filter(
+            Task.runner_id == task_lease.runner_id,
+            Task.run_id == task_lease.run_id,
+        )
+    task = task_query.with_for_update().first()
+    # Project the locked source-of-truth status, never the caller's stale
+    # desired value. The requested status is only an eligibility assertion.
+    if task is None or task.status != status:
         return False
-    changed = sync_workforce_run_status(db, task, status)
+    changed = sync_workforce_run_status(db, task, task.status)
     if changed:
         db.commit()
     return changed
+
+
+def sync_workforce_run_status_for_task_id_isolated(
+    task_id: int,
+    status: TaskStatus,
+    *,
+    task_lease: TaskLease | None = None,
+) -> bool:
+    """Project the locked current task status in a worker-owned Session."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return _sync_workforce_run_status_for_task_id(
+            db,
+            task_id,
+            status,
+            task_lease=task_lease,
+        )
 
 
 def release_task_lease_with_workforce_sync(

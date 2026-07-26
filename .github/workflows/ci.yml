@@ -7,6 +7,12 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # Required once "CI Summary" is a required status check and a merge queue is
+  # enabled: without this the context is never reported on a merge group, its
+  # entries time out, and every merge stalls. Harmless before a queue exists --
+  # merge_group simply never fires. Note the jobs' `draft == false` guards all
+  # short-circuit on `github.event_name != 'pull_request'`, so they do run here.
+  merge_group:
 
 env:
   DEEPDOC_CACHE_PATH: .cache/deepdoc
@@ -636,6 +642,23 @@ jobs:
       - name: Install dependencies
         working-directory: ./frontend
         run: npm ci
+
+      - name: Run widget regression tests with coverage
+        working-directory: ./frontend
+        run: npm run test:widget:coverage
+
+      # The widget step above runs a hardcoded two-file list, so page-level
+      # component tests (e.g. src/components/pages/knowledge-base.test.tsx)
+      # never executed in CI and could break silently. This step uses the
+      # default vitest config scoped to the pages directory, so new test files
+      # added there are picked up automatically.
+      # TODO: widen this to the full `npm run test:run` suite once the known
+      # failures in src/components/kb/knowledge-base-creation-dialog.test.tsx,
+      # src/components/kb/knowledge-base-detail.component.test.tsx and
+      # src/app/workforces/workforces-routes.test.tsx are fixed.
+      - name: Run page component tests
+        working-directory: ./frontend
+        run: npm run test:pages
 
       # Static export is the default build (served by FastAPI in the pip/uvx
       # deployment). Verify it produces a servable bundle: index shell plus the

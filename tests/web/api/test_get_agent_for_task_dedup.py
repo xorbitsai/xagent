@@ -3,12 +3,10 @@ on the request session.
 
 Invariants pinned here:
 
-    * ``db.query(Task)`` fires at most once on the request session
-      (the existence check). The LLM-config block does not re-read
-      Task on the request session.
-    * ``db.query(Agent)`` fires zero times on the request session.
-      The published-agent lookup lives inside the off-loop snapshot
-      loader (``task_setup_snapshot.load_task_setup_snapshot_sync``),
+    * ``db.query(Task)``, ``db.query(Agent)``, and ``db.query(User)`` fire
+      zero times on the request session for an existing task.
+    * Existence, owner, and published-agent lookups live inside the off-loop
+      snapshot loader (``task_setup_snapshot.load_task_setup_snapshot_sync``),
       which uses its own ``SessionLocal``.
 
 Snapshot-internal query counts are not the responsibility of this
@@ -29,6 +27,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
 )
@@ -102,14 +101,11 @@ class _QueryCounter:
 
 @pytest.mark.asyncio
 async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
-    """Existing task + agent path: the request session sees only the
-    existence check.
+    """Existing task + agent path does not query the request session.
 
     Current invariant:
-      - ``db.query(Task)`` happens at most once (existence check).
-        The LLM-config block calls the off-loop snapshot loader,
-        which uses its own ``SessionLocal`` and is mocked out
-        here -- so it contributes nothing to the counter on ``db``.
+      - ``db.query(Task)`` happens zero times. The detached snapshot is the
+        SSOT for existence, owner, and runtime configuration.
       - ``db.query(Agent)`` happens zero times. The snapshot loader
         owns the Agent lookup; there is no published-agent
         re-read on the request session.
@@ -144,6 +140,8 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
             execution_mode="flash",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="single_call",
         task_llm=None,
         task_fast_llm=None,
@@ -183,7 +181,7 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
         patch(
             "xagent.web.api.chat.load_task_setup_snapshot_sync",
             return_value=snapshot_stub,
-        ),
+        ) as snapshot_loader,
         patch.object(
             manager,
             "_load_persisted_conversation_history",
@@ -212,11 +210,10 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
             # they're recorded before the failure point.
             pass
 
-    assert counter.calls_by_model[Task] == 1, (
+    assert counter.calls_by_model[Task] == 0, (
         f"Task queried {counter.calls_by_model[Task]} times on the request "
-        "session -- expected 1 (the existence check). If this jumps to 2+, "
-        "either the dedup regressed or a new code path is re-reading Task "
-        "via ``db`` instead of going through the snapshot."
+        "session -- expected 0. A non-zero count means task existence or "
+        "runtime configuration bypassed the worker-owned snapshot."
     )
     assert counter.calls_by_model[Agent] == 0, (
         f"Agent queried {counter.calls_by_model[Agent]} times on the "
@@ -225,3 +222,5 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
         "count here means something is bypassing the snapshot and "
         "re-doing the agent lookup on the loop thread."
     )
+    assert counter.calls_by_model[User] == 0
+    snapshot_loader.assert_called_once_with(42, None)

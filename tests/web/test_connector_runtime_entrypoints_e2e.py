@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import shutil
@@ -19,12 +20,18 @@ from xagent.web.api.share import share_router
 from xagent.web.api.websocket import handle_chat_message
 from xagent.web.api.widget import widget_router
 from xagent.web.channels.feishu.bot import FeishuBotInstance
+from xagent.web.channels.telegram import bot as telegram_bot_module
 from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.database import (
+    Base,
+    get_db,
+    get_engine,
+)
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 
@@ -172,6 +179,69 @@ def _task(task_id: int) -> Task:
         db.close()
 
 
+class _TelegramVoiceMessage:
+    from_user = SimpleNamespace(id=123)
+    chat = SimpleNamespace(id=456)
+    voice = SimpleNamespace(file_id="telegram-voice-id")
+
+    def __init__(self) -> None:
+        self.answers: list[str] = []
+
+    async def answer(self, text: str, **_kwargs: Any) -> SimpleNamespace:
+        self.answers.append(text)
+        return SimpleNamespace(message_id=1)
+
+
+def _telegram_voice_error_bot(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    channel_name: str,
+    asr_model: Any | None,
+) -> tuple[TelegramBotInstance, _TelegramVoiceMessage]:
+    user = _admin_user(db)
+    channel = UserChannel(
+        user_id=user.id,
+        channel_type="telegram",
+        channel_name=channel_name,
+        config={},
+        is_active=True,
+    )
+    db.add(channel)
+    db.commit()
+    db.refresh(channel)
+
+    agent_manager = _FakeAgentManager()
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_agent_manager",
+        lambda: agent_manager,
+    )
+
+    voice = SimpleNamespace(file_id="telegram-voice-id")
+    bot = object.__new__(TelegramBotInstance)
+    bot.channel_id = int(channel.id)
+    bot.channel_name = channel_name
+    bot.active_tasks = {}
+    bot.bot = object()
+    bot.user_preparing_executions = set()
+    bot.user_stop_events = {}
+    bot.user_active_executions = {}
+    bot._save_active_tasks = lambda: None
+    bot._clear_user_stop_request = lambda _user_id: None
+    bot._consume_user_stop_request = lambda _user_id: False
+    bot._resolve_voice_asr_model_isolated = lambda _user_id: asr_model
+
+    async def _extract_message_content(_message: Any) -> tuple[str, list[Any]]:
+        return "", [voice]
+
+    async def _download_and_register_files(**_kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    bot._extract_message_content = _extract_message_content
+    bot._download_and_register_files = _download_and_register_files
+    return bot, _TelegramVoiceMessage()
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_message"),
     [
@@ -198,34 +268,6 @@ async def test_telegram_voice_errors_are_reported_to_user(
     _setup_admin_headers()
     db = _db_session()
     try:
-        user = _admin_user(db)
-        channel = UserChannel(
-            user_id=user.id,
-            channel_type="telegram",
-            channel_name=f"Telegram voice {scenario}",
-            config={},
-            is_active=True,
-        )
-        db.add(channel)
-        db.commit()
-        db.refresh(channel)
-
-        agent_manager = _FakeAgentManager()
-        monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.get_agent_manager",
-            lambda: agent_manager,
-        )
-
-        async def _restore_telegram_task_context(
-            *_args: Any,
-            **_kwargs: Any,
-        ) -> None:
-            return None
-
-        monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.restore_telegram_task_context",
-            _restore_telegram_task_context,
-        )
 
         class _FakeASR:
             def __init__(self) -> None:
@@ -235,50 +277,83 @@ async def test_telegram_voice_errors_are_reported_to_user(
                 self.closed = True
 
         asr_model = _FakeASR()
-        voice = SimpleNamespace(file_id="telegram-voice-id")
-        bot = object.__new__(TelegramBotInstance)
-        bot.channel_id = int(channel.id)
-        bot.channel_name = f"Telegram voice {scenario}"
-        bot.active_tasks = {}
-        bot.bot = object()
-        bot.user_preparing_executions = set()
-        bot.user_stop_events = {}
-        bot.user_active_executions = {}
-        bot._save_active_tasks = lambda: None
-        bot._clear_user_stop_request = lambda _user_id: None
-        bot._consume_user_stop_request = lambda _user_id: False
-        bot._resolve_voice_asr_model = (
-            (lambda _db, _user: None)
-            if scenario == "no_asr"
-            else (lambda _db, _user: asr_model)
+        bot, message = _telegram_voice_error_bot(
+            db,
+            monkeypatch,
+            channel_name=f"Telegram voice {scenario}",
+            asr_model=None if scenario == "no_asr" else asr_model,
         )
 
-        async def _extract_message_content(_message: Any) -> tuple[str, list[Any]]:
-            return "", [voice]
+        await bot._process_user_messages_batch(123, [message])
 
-        async def _download_and_register_files(**_kwargs: Any) -> list[dict[str, Any]]:
-            return []
-
-        bot._extract_message_content = _extract_message_content
-        bot._download_and_register_files = _download_and_register_files
-
-        answers: list[str] = []
-
-        class _TelegramMessage:
-            from_user = SimpleNamespace(id=123)
-            chat = SimpleNamespace(id=456)
-            voice = SimpleNamespace(file_id="telegram-voice-id")
-
-            async def answer(self, text: str, **_kwargs: Any) -> SimpleNamespace:
-                answers.append(text)
-                return SimpleNamespace(message_id=1)
-
-        await bot._process_user_messages_batch(123, [_TelegramMessage()])
-
-        assert answers == [expected_message]
+        assert message.answers == [expected_message]
         if scenario == "missing_download":
             assert asr_model.closed is True
     finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_cancellation_during_voice_cleanup_closes_managed_lease(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_admin_headers()
+    db = _db_session()
+    managed_lease = None
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    try:
+        original_prepare = telegram_bot_module.prepare_channel_task
+        captured_leases: list[Any] = []
+
+        async def _capture_prepared_task(**kwargs: Any) -> Any:
+            prepared = await original_prepare(**kwargs)
+            assert prepared is not None
+            captured_leases.append(prepared.managed_lease)
+            return prepared
+
+        monkeypatch.setattr(
+            telegram_bot_module,
+            "prepare_channel_task",
+            _capture_prepared_task,
+        )
+
+        class _BlockingASR:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                close_started.set()
+                await allow_close.wait()
+                self.closed = True
+
+        asr_model = _BlockingASR()
+        bot, message = _telegram_voice_error_bot(
+            db,
+            monkeypatch,
+            channel_name="Telegram voice cancellation",
+            asr_model=asr_model,
+        )
+
+        process_task = asyncio.create_task(
+            bot._process_user_messages_batch(123, [message])
+        )
+        await asyncio.wait_for(close_started.wait(), timeout=2)
+        managed_lease = captured_leases[0]
+
+        process_task.cancel()
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await process_task
+
+        assert asr_model.closed is True
+        assert managed_lease._closed is True
+        assert 123 not in bot.user_preparing_executions
+    finally:
+        allow_close.set()
+        if managed_lease is not None and not managed_lease._closed:
+            await managed_lease.close()
         db.close()
 
 
@@ -327,6 +402,9 @@ class _FakeAgentService:
     def set_execution_context_messages(self, _messages: list[Any]) -> None:
         pass
 
+    def set_conversation_history(self, _messages: list[Any]) -> None:
+        pass
+
     def set_recovered_skill_context(self, _skill_context: Any) -> None:
         pass
 
@@ -340,9 +418,10 @@ class _FakeAgentManager:
     async def get_agent_for_task(
         self,
         _task_id: int,
-        _db: Session,
+        _db: Session | None = None,
         *,
-        user: User,
+        user: Any = None,
+        **_kwargs: Any,
     ) -> _FakeAgentService:
         return self.service
 
@@ -699,6 +778,125 @@ async def test_feishu_new_task_fallback_snapshots_empty(
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_feishu_existing_task_commits_registered_attachment_before_execution(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The channel must settle attachment writes before runtime Session handoff."""
+    _setup_admin_headers()
+    setup_db = _db_session()
+    try:
+        user = _admin_user(setup_db)
+        channel = UserChannel(
+            user_id=user.id,
+            channel_type="feishu",
+            channel_name="Feishu attachment test",
+            config={},
+            is_active=True,
+        )
+        task = Task(
+            user_id=user.id,
+            title="existing Feishu task",
+            description="existing task",
+            status=TaskStatus.PENDING,
+            execution_mode="balanced",
+            channel_name="Feishu attachment test",
+            connector_runtime_selected_refs=[],
+        )
+        setup_db.add_all([channel, task])
+        setup_db.commit()
+        setup_db.refresh(channel)
+        setup_db.refresh(task)
+        channel_id = int(channel.id)
+        task_id = int(task.id)
+        user_id = int(user.id)
+    finally:
+        setup_db.close()
+
+    class _BoundaryObservingAgentManager(_FakeAgentManager):
+        caller_session_is_none: bool | None = None
+        attachment_visible_at_entry: bool | None = None
+
+        async def execute_task(self, **kwargs: Any) -> dict[str, Any]:
+            self.caller_session_is_none = kwargs["db_session"] is None
+            verification_db = _db_session()
+            try:
+                self.attachment_visible_at_entry = (
+                    verification_db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == "feishu-existing-file")
+                    .one_or_none()
+                    is not None
+                )
+            finally:
+                verification_db.close()
+            return await super().execute_task(**kwargs)
+
+    agent_manager = _BoundaryObservingAgentManager()
+    monkeypatch.setattr(
+        "xagent.web.channels.feishu.bot.get_agent_manager",
+        lambda: agent_manager,
+    )
+
+    bot = object.__new__(FeishuBotInstance)
+    bot.channel_id = channel_id
+    bot.channel_name = "Feishu attachment test"
+    bot.active_tasks = {"open-id-existing": str(task_id)}
+    bot.api_client = object()
+    bot._save_active_tasks = lambda: None
+
+    async def _send_text(_chat_id: str, _text: str) -> None:
+        return None
+
+    async def _download_and_register_files(**kwargs: Any) -> list[dict[str, Any]]:
+        assert "db" not in kwargs
+        file_db = _db_session()
+        try:
+            file_db.add(
+                UploadedFile(
+                    file_id="feishu-existing-file",
+                    user_id=user_id,
+                    task_id=task_id,
+                    filename="existing.txt",
+                    storage_path="/tmp/feishu-existing.txt",
+                    storage_status="pending",
+                    mime_type="text/plain",
+                    file_size=7,
+                )
+            )
+            file_db.commit()
+        finally:
+            file_db.close()
+        return [
+            {
+                "file_id": "feishu-existing-file",
+                "name": "existing.txt",
+                "path": "/tmp/feishu-existing.txt",
+                "type": "text/plain",
+                "size": 7,
+            }
+        ]
+
+    bot._send_text = _send_text
+    bot._download_and_register_files = _download_and_register_files
+
+    message = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                chat_id="chat-existing",
+                message_id="msg-existing",
+                message_type="file",
+                content='{"file_key": "file-key-existing"}',
+            )
+        )
+    )
+    await bot._process_messages_batch("open-id-existing", [message])
+
+    assert agent_manager.caller_session_is_none is True
+    assert agent_manager.attachment_visible_at_entry is True
+    assert len(agent_manager.execute_calls) == 1
+
+
 @pytest.mark.parametrize(
     ("execution_result", "expected_persisted_turns"),
     [
@@ -735,18 +933,6 @@ async def test_telegram_new_task_fallback_snapshots_empty(
         db.add(channel)
         db.commit()
         db.refresh(channel)
-
-        async def _restore_telegram_task_context(*_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.restore_telegram_task_context",
-            _restore_telegram_task_context,
-        )
-        monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.persist_user_message",
-            lambda **_kwargs: None,
-        )
 
         agent_manager = _FakeAgentManager(execution_result)
         monkeypatch.setattr(
@@ -837,16 +1023,12 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
             lambda: agent_manager,
         )
 
-        async def _restore_telegram_task_context(*_args: Any, **_kwargs: Any) -> None:
-            return None
+        async def _finalize_managed_result(*_args: Any, **_kwargs: Any) -> bool:
+            return True
 
         monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.restore_telegram_task_context",
-            _restore_telegram_task_context,
-        )
-        monkeypatch.setattr(
-            "xagent.web.channels.telegram.bot.persist_telegram_assistant_turn",
-            lambda **_kwargs: None,
+            "xagent.web.services.managed_task_lease.ManagedTaskLease.finalize_result",
+            _finalize_managed_result,
         )
 
         class _FakeASR:
@@ -874,7 +1056,7 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
         bot._save_active_tasks = lambda: None
         bot._clear_user_stop_request = lambda _user_id: None
         bot._consume_user_stop_request = lambda _user_id: False
-        bot._resolve_voice_asr_model = lambda _db, _user: asr_model
+        bot._resolve_voice_asr_model_isolated = lambda _user_id: asr_model
 
         async def _extract_message_content(_message: Any) -> tuple[str, list[Any]]:
             return "", [voice]

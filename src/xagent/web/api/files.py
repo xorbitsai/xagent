@@ -14,7 +14,6 @@ from fastapi.responses import (
     Response,
 )
 from sqlalchemy import func, or_
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -25,6 +24,7 @@ from ...config import (
     get_storage_root,
     get_uploads_dir,
 )
+from ...core.execution_scope import resolve_execution_scope
 from ...core.file_storage import get_user_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
@@ -38,10 +38,14 @@ from ..config import (
     get_upload_path,
     is_allowed_file,
 )
-from ..models.database import get_db
+from ..models.database import get_db, release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.db_runtime import (
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
 from ..services.kb_file_service import aggregate_uploaded_file_statuses
 from ..services.managed_file_ref import (
     FILE_INTEGRITY_REUPLOAD_MESSAGE,
@@ -52,9 +56,13 @@ from ..services.managed_file_ref import (
     guess_media_type,
 )
 from ..services.uploaded_file_store import (
+    LocalUploadRegistration,
     UploadedFileStore,
-    delete_pptx_pdf_cache,
-    delete_svg_png_cache,
+    UploadedFileVersionConflict,
+    compensate_registered_uploads_sync,
+    delete_legacy_preview_caches,
+    delete_registered_preview_caches,
+    register_local_uploads_sync,
 )
 from .legacy_file import (
     infer_user_id_from_legacy_path,
@@ -139,6 +147,7 @@ def _svg_png_cache_path(svg_path: Path, file_id: Optional[str] = None) -> Path:
     prefix is kept so ``delete_svg_png_cache`` can still glob-remove every
     derived preview for a deleted upload.
     """
+
     import hashlib
 
     cache_dir = get_storage_root() / "svg_png_cache"
@@ -172,7 +181,11 @@ def _rasterize_svg_preview(svg_path: Path, file_id: Optional[str] = None) -> Pat
 
 
 async def _inline_preview_response(
-    path: Path, *, filename: str, media_type: str, file_id: Optional[str] = None
+    path: Path,
+    *,
+    filename: str,
+    media_type: str,
+    file_id: Optional[str] = None,
 ) -> FileResponse:
     """Build the final inline preview FileResponse, rasterizing SVG to PNG.
 
@@ -180,6 +193,7 @@ async def _inline_preview_response(
     execute on direct top-level navigation to this response. Every other
     media type is served as-is.
     """
+
     if media_type == "image/svg+xml":
         try:
             # CairoSVG rasterization is CPU-bound and can run up to the
@@ -190,7 +204,8 @@ async def _inline_preview_response(
             png_path = await asyncio.to_thread(_rasterize_svg_preview, path, file_id)
         except Exception as exc:
             raise HTTPException(
-                status_code=422, detail="SVG cannot be safely previewed"
+                status_code=422,
+                detail="SVG cannot be safely previewed",
             ) from exc
         return FileResponse(
             path=str(png_path),
@@ -293,7 +308,7 @@ async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path)
                         ),
                     )
                 buffer.write(chunk)
-    except Exception:
+    except BaseException:
         try:
             if target_path.exists():
                 target_path.unlink()
@@ -310,16 +325,26 @@ async def store_uploaded_files(
     task_type: str,
     task_id: str | None,
     folder: str | None,
-    user: User,
-    db: Session,
+    user_id: int,
     single_file_mode: bool,
 ) -> Dict[str, Any]:
+    """Store request bytes without retaining a database connection across I/O."""
+
     parsed_task_id = _parse_task_id(task_id)
-    uploaded_files = []
+    uploaded_files: list[dict[str, Any]] = []
     written_paths: list[Path] = []
-    written_storage_keys: list[str] = []
+    registrations: list[LocalUploadRegistration] = []
+    previews: dict[str, Any] = {}
+    completed = False
 
     try:
+        upload_execution_scope = (
+            await run_db_io_cancellation_safe(
+                lambda: resolve_execution_scope(parsed_task_id)
+            )
+            if parsed_task_id is not None
+            else None
+        )
         for uploaded in upload_items:
             if not uploaded.filename or not uploaded.filename.strip():
                 raise HTTPException(status_code=422, detail="No filename provided")
@@ -331,9 +356,7 @@ async def store_uploaded_files(
 
             try:
                 target_path = _build_unique_file_path(
-                    get_upload_path(
-                        uploaded.filename, task_id, folder, _user_id_value(user)
-                    )
+                    get_upload_path(uploaded.filename, task_id, folder, user_id)
                 )
             except ValueError as e:
                 logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
@@ -341,28 +364,19 @@ async def store_uploaded_files(
                     status_code=422, detail=f"Invalid folder name: {str(e)}"
                 ) from e
 
-            file_size = await _write_upload_with_size_limit(uploaded, target_path)
             written_paths.append(target_path)
             file_id = str(uuid4())
-            file_record = UploadedFileStore(db).create_from_local_path(
-                local_path=target_path,
-                user_id=_user_id_value(user),
-                file_id=file_id,
-                task_id=parsed_task_id,
-                filename=Path(uploaded.filename).name,
-                mime_type=uploaded.content_type,
-            )
-            if file_record.storage_key:
-                written_storage_keys.append(str(file_record.storage_key))
-            setattr(file_record, "file_size", file_size)
-            db.flush()
+            await _write_upload_with_size_limit(uploaded, target_path)
 
             content_preview = ""
             file_extension = Path(uploaded.filename).suffix.lower()
             if file_extension == ".pptx":
                 try:
-                    preview_content = await asyncio.to_thread(
-                        _pptx_text_preview, target_path
+                    preview_task = asyncio.create_task(
+                        asyncio.to_thread(_pptx_text_preview, target_path)
+                    )
+                    preview_content = await drain_async_task_cancellation_safe(
+                        preview_task
                     )
                     content_preview = (
                         preview_content[:500] + "..."
@@ -375,7 +389,12 @@ async def store_uploaded_files(
                 content_preview = ""
             elif file_extension not in BINARY_EXTENSIONS:
                 try:
-                    preview_content = read_file(str(target_path))
+                    preview_task = asyncio.create_task(
+                        asyncio.to_thread(read_file, str(target_path))
+                    )
+                    preview_content = await drain_async_task_cancellation_safe(
+                        preview_task
+                    )
                     content_preview = (
                         preview_content[:500] + "..."
                         if isinstance(preview_content, str)
@@ -385,46 +404,73 @@ async def store_uploaded_files(
                 except Exception:
                     content_preview = ""
 
+            previews[file_id] = content_preview
+            registrations.append(
+                LocalUploadRegistration(
+                    local_path=target_path,
+                    user_id=user_id,
+                    file_id=file_id,
+                    task_id=parsed_task_id,
+                    filename=Path(uploaded.filename).name,
+                    mime_type=uploaded.content_type,
+                    execution_scope=upload_execution_scope,
+                )
+            )
+
+        registered = await run_db_io_cancellation_safe(
+            lambda: register_local_uploads_sync(registrations)
+        )
+        for file_record in registered:
             uploaded_files.append(
                 {
                     "file_id": file_record.file_id,
                     "filename": file_record.filename,
                     "file_size": file_record.file_size,
                     "mime_type": file_record.mime_type,
-                    "content_preview": content_preview,
+                    "content_preview": previews.get(file_record.file_id, ""),
                 }
             )
-
-        db.commit()
+        completed = True
     except DurableStorageOperationError as exc:
-        db.rollback()
-        for storage_key in written_storage_keys:
-            try:
-                get_user_file_storage(_user_id_value(user)).delete(storage_key)
-            except Exception:
-                logger.warning("Failed to clean up durable upload: %s", storage_key)
-        for path in written_paths:
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
         logger.warning("Durable storage unavailable during upload: %s", exc)
         raise _durable_storage_unavailable() from exc
-    except Exception:
-        db.rollback()
-        for storage_key in written_storage_keys:
+    finally:
+        if not completed:
+
+            async def _cleanup() -> None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: compensate_registered_uploads_sync(
+                            tuple(
+                                registration.compensation_claim
+                                for registration in registrations
+                            )
+                        )
+                    )
+                finally:
+
+                    def _delete_local_paths() -> None:
+                        for path in written_paths:
+                            try:
+                                path.unlink(missing_ok=True)
+                            except OSError:
+                                logger.warning(
+                                    "Failed to clean up local upload: %s",
+                                    path,
+                                )
+
+                    cleanup_worker = asyncio.create_task(
+                        asyncio.to_thread(_delete_local_paths)
+                    )
+                    await drain_async_task_cancellation_safe(cleanup_worker)
+
+            cleanup_task = asyncio.create_task(_cleanup())
             try:
-                get_user_file_storage(_user_id_value(user)).delete(storage_key)
+                await drain_async_task_cancellation_safe(cleanup_task)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                logger.warning("Failed to clean up durable upload: %s", storage_key)
-        for path in written_paths:
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError:
-                pass
-        raise
+                logger.exception("Failed to compensate cancelled/failed upload")
 
     if single_file_mode:
         first_file = uploaded_files[0]
@@ -673,8 +719,11 @@ def _backfill_uploaded_file_records(db: Session, user: User) -> None:
     if not target_user_ids:
         return
 
-    existing_records: dict[str, UploadedFile] = {
-        cast(str, row.storage_path): row
+    existing_records: dict[str, tuple[str, bool]] = {
+        cast(str, row.storage_path): (
+            str(row.file_id),
+            bool(row.storage_key),
+        )
         for row in db.query(UploadedFile)
         .filter(UploadedFile.user_id.in_(target_user_ids))
         .all()
@@ -691,38 +740,50 @@ def _backfill_uploaded_file_records(db: Session, user: User) -> None:
                 continue
 
             storage_path: str = str(candidate)
-            existing_record = existing_records.get(storage_path)
-            if existing_record is not None:
-                if not existing_record.storage_key:
-                    setattr(existing_record, "user_id", target_user_id)
-                    setattr(existing_record, "storage_path", str(candidate))
-                    UploadedFileStore(db).sync_existing(
-                        existing_record, mime_type=guess_media_type(candidate.name)
-                    )
-                    created += 1
+            existing_identity = existing_records.get(storage_path)
+            if existing_identity is not None:
+                existing_file_id, has_storage_key = existing_identity
+                if not has_storage_key:
+                    try:
+                        UploadedFileStore(db).upsert_by_storage_path(
+                            user_id=target_user_id,
+                            file_id=existing_file_id,
+                            filename=candidate.name,
+                            storage_path=candidate,
+                            mime_type=guess_media_type(candidate.name),
+                            file_size=candidate.stat().st_size,
+                        )
+                    except UploadedFileVersionConflict:
+                        logger.warning(
+                            "Skipped uploaded-file backfill for an in-flight "
+                            "or concurrently changed record: %s",
+                            existing_file_id,
+                        )
+                    else:
+                        existing_records[storage_path] = (
+                            existing_file_id,
+                            True,
+                        )
+                        created += 1
                 continue
 
             file_id = str(uuid4())
-            file_record = UploadedFileStore(db).create_from_local_path(
-                local_path=candidate,
+            task_id = _infer_backfill_task_id(db, candidate, target_user_id)
+            file_record = UploadedFileStore(db).upsert_by_storage_path(
                 user_id=target_user_id,
                 file_id=file_id,
-                task_id=_infer_backfill_task_id(db, candidate, target_user_id),
                 filename=candidate.name,
                 mime_type=guess_media_type(candidate.name),
+                storage_path=candidate,
+                file_size=candidate.stat().st_size,
+                task_id=task_id,
             )
-            existing_records[storage_path] = file_record
+            existing_records[storage_path] = (str(file_record.file_id), True)
             created += 1
 
     if created > 0:
-        try:
-            db.commit()
-            logger.info(f"Backfilled {created} uploaded_files records")
-        except IntegrityError:
-            db.rollback()
-            logger.warning(
-                "Backfill commit hit unique constraint race; rolled back safely"
-            )
+        logger.info("Backfilled %s uploaded_files records", created)
+    release_db_connection_if_clean(db)
 
 
 def _get_file_record(db: Session, file_id: str) -> UploadedFile:
@@ -982,14 +1043,20 @@ async def upload_file(
     if not upload_items:
         raise HTTPException(status_code=422, detail="No files provided")
 
+    user_id = _user_id_value(user)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail="Upload authorization could not be finalized",
+        )
+
     single_file_mode = file is not None and (not files)
     return await store_uploaded_files(
         upload_items=upload_items,
         task_type=task_type,
         task_id=task_id,
         folder=folder,
-        user=user,
-        db=db,
+        user_id=user_id,
         single_file_mode=single_file_mode,
     )
 
@@ -1684,6 +1751,7 @@ async def delete_file(
         file_name = file_path.name
 
     _ensure_under_uploads(file_path, owner_user_id)
+    legacy_cache_source = file_path.resolve() if file_record is None else None
 
     if file_record:
         storage_key = str(file_record.storage_key or "")
@@ -1710,12 +1778,13 @@ async def delete_file(
     elif file_path.exists() and file_path.is_file():
         file_path.unlink()
 
-    # Remove any server-side PDF preview cache so derived content doesn't
-    # outlive the source upload.  Uses the same helper as UploadedFileStore.delete()
-    # so this HTTP route and every other deletion path (reconcile, orphan cleanup)
-    # behave identically.  Non-UUID ids are silently ignored by the helper.
-    delete_pptx_pdf_cache(file_id)
-    delete_svg_png_cache(file_id, source_path=None if file_record else file_path)
+    # Derived previews are invalidated only through their matching identity
+    # owner. A route path is never reused as a registered cache key.
+    if file_record is not None:
+        delete_registered_preview_caches(str(file_record.file_id))
+    else:
+        assert legacy_cache_source is not None
+        delete_legacy_preview_caches(legacy_cache_source)
 
     return {
         "success": True,

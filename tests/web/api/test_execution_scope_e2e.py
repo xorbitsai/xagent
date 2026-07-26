@@ -38,6 +38,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
 )
@@ -106,6 +107,8 @@ def _build_snapshot(task_id: int) -> TaskSetupSnapshot:
             execution_mode="flash",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="single_call",
         task_llm=None,
         task_fast_llm=None,

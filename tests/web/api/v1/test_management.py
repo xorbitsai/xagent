@@ -140,6 +140,55 @@ def test_v1_create_agent_can_skip_runtime_key():
     assert resp.json()["api_key"] is None
 
 
+def test_v1_list_agents_returns_detached_summary_contract():
+    key = _personal_key()
+    create = client.post(
+        "/v1/agents",
+        headers=_bearer(key),
+        json={
+            "name": "Listed SDK agent",
+            "instructions": "Be useful.",
+            "generate_runtime_key": False,
+        },
+    )
+    assert create.status_code == 200, create.text
+
+    response = client.get("/v1/agents", headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    listed = next(
+        item for item in response.json() if item["name"] == "Listed SDK agent"
+    )
+    assert listed["id"] == create.json()["agent"]["id"]
+    assert listed["status"] == "draft"
+    assert listed["allowed_domains"] == []
+
+
+def test_v1_rotate_agent_runtime_key_returns_one_shot_key():
+    key = _personal_key()
+    create = client.post(
+        "/v1/agents",
+        headers=_bearer(key),
+        json={
+            "name": "Rotated SDK agent",
+            "instructions": "Be useful.",
+            "generate_runtime_key": False,
+        },
+    )
+    assert create.status_code == 200, create.text
+    agent_id = create.json()["agent"]["id"]
+
+    response = client.post(
+        f"/v1/agents/{agent_id}/api-key",
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["full_key"].startswith("xag_")
+    assert response.json()["key_prefix"]
+    assert response.json()["created_at"]
+
+
 def test_v1_create_agent_rolls_back_agent_when_key_step_fails():
     """Agent + first runtime key commit atomically: if the key step
     fails, the agent row must not persist, so a client retry with the

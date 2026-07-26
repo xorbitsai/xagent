@@ -71,7 +71,15 @@ class Task(Base):  # type: ignore
     """Task model"""
 
     __tablename__ = "tasks"
-    __table_args__ = (Index("ix_tasks_agent_id_source", "agent_id", "source"),)
+    __table_args__ = (
+        Index("ix_tasks_agent_id_source", "agent_id", "source"),
+        Index(
+            "ix_tasks_status_lease_expires_at",
+            "status",
+            "lease_expires_at",
+            "id",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)

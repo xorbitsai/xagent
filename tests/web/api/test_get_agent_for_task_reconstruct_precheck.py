@@ -6,17 +6,15 @@ Background:
     to ``RUNNING`` before ``get_agent_for_task`` is called. A naive
     ``should_reconstruct = status in {RUNNING, PAUSED,
     WAITING_FOR_USER}`` test would route every brand-new SDK task
-    into ``_reconstruct_agent_from_history``, which queries
-    ``TraceEvent`` and ``DAGExecution.current_plan``, finds nothing,
-    logs a misleading "Failed to reconstruct agent from history"
-    warning, and falls through to normal creation. The full
-    reconstruct path is 1-2s of wasted DB work plus a noisy log line
-    that confuses incident triage.
+    into ``_reconstruct_agent_from_history``. The worker-owned task
+    snapshot finds no ``TraceEvent`` or ``DAGExecution`` state, so
+    reconstruction would only log a misleading warning and fall
+    through to normal creation.
 
-    ``_has_reconstructable_history`` gates the reconstruct branch
-    for ``RUNNING`` tasks: if neither a ``TraceEvent`` row nor a
-    ``DAGExecution`` row exists for the task, the reconstruct branch
-    is skipped and the function goes straight to normal creation.
+    ``TaskSetupSnapshot.has_reconstructable_history`` gates the
+    reconstruct branch for ``RUNNING`` tasks. The same detached
+    snapshot is then reused for reconstruction or normal creation;
+    no history probe is allowed on the asyncio event loop.
 
     ``PAUSED`` / ``WAITING_FOR_USER`` tasks are NOT gated on the
     pre-check -- those states by definition have prior runtime state
@@ -46,6 +44,13 @@ from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
+    TaskOwnerMismatchError,
+    TaskReconstructionSnapshot,
+    TaskSetupSnapshot,
+    _TaskFields,
+)
 
 
 def _make_user() -> User:
@@ -83,10 +88,66 @@ def _make_agent() -> Agent:
     )
 
 
+def _build_snapshot(
+    task: Task,
+    user: User,
+    *,
+    trace_event: Any | None = None,
+    dag_execution: Any | None = None,
+) -> TaskSetupSnapshot:
+    """Build the detached state produced by the worker-owned snapshot loader."""
+    has_history = trace_event is not None or dag_execution is not None
+    reconstruction = TaskReconstructionSnapshot(
+        tracer_events=(
+            (
+                {
+                    "id": "event-1",
+                    "event_type": "agent_step",
+                    "task_id": str(task.id),
+                    "step_id": None,
+                    "timestamp": None,
+                    "data": {},
+                    "parent_id": None,
+                },
+            )
+            if trace_event is not None
+            else ()
+        ),
+        plan_state={"steps": []} if dag_execution is not None else None,
+        has_history=has_history,
+    )
+    return TaskSetupSnapshot(
+        task=_TaskFields(
+            id=int(task.id),
+            user_id=int(task.user_id),
+            status=task.status,
+            source=task.source,
+            agent_id=task.agent_id,
+            agent_config=task.agent_config,
+            model_name=task.model_name,
+            compact_model_name=task.compact_model_name,
+            execution_mode=task.execution_mode,
+            agent_type=task.agent_type,
+        ),
+        runtime_user=RuntimeUserFields(
+            id=int(user.id),
+            is_admin=bool(user.is_admin),
+        ),
+        has_reconstructable_history=has_history,
+        task_pattern="single_call",
+        task_llm=MagicMock(),
+        task_fast_llm=None,
+        task_vision_llm=None,
+        task_compact_llm=None,
+        agent=None,
+        agent_config=None,
+        excluded_agent_id=None,
+        reconstruction=reconstruction,
+    )
+
+
 class _Fake:
-    """Sentinel for a non-None trace event / DAG plan row -- the
-    pre-check only does ``.first() is not None``, the row's contents
-    are not inspected by the pre-check itself."""
+    """Sentinel used to select trace- or DAG-backed snapshot history."""
 
 
 def _build_db(
@@ -193,12 +254,29 @@ async def test_running_with_no_history_skips_reconstruct() -> None:
         agent=agent_row,
         user=user,
     )
+    snapshot = _build_snapshot(task, user)
 
     reconstruct = AsyncMock()
-    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ) as snapshot_loader,
+        patch.object(
+            manager,
+            "_has_reconstructable_history",
+            side_effect=AssertionError("history pre-check ran on the event loop"),
+            create=True,
+        ),
+    ):
         with _Patches(_stub_downstream(manager)):
             try:
-                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+                await manager.get_agent_for_task(
+                    task_id=42,
+                    db=db,
+                    user=user,
+                )
             except Exception:
                 # Downstream stubs may raise during agent assembly; the
                 # reconstruct-call assertion below records its state
@@ -206,6 +284,7 @@ async def test_running_with_no_history_skips_reconstruct() -> None:
                 pass
 
     reconstruct.assert_not_awaited()
+    snapshot_loader.assert_called_once_with(42, None)
 
 
 @pytest.mark.asyncio
@@ -226,16 +305,38 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
         agent=agent_row,
         user=user,
     )
+    snapshot = _build_snapshot(task, user, trace_event=_Fake())
 
     reconstruct = AsyncMock()
-    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ) as snapshot_loader,
+        patch.object(
+            manager,
+            "_has_reconstructable_history",
+            side_effect=AssertionError("history pre-check ran on the event loop"),
+            create=True,
+        ),
+    ):
         with _Patches(_stub_downstream(manager)):
             try:
-                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+                await manager.get_agent_for_task(
+                    task_id=42,
+                    db=db,
+                    user=user,
+                )
             except Exception:
                 pass
-
-    reconstruct.assert_awaited_once_with(42, db, scope=None)
+    reconstruct.assert_awaited_once_with(
+        42,
+        db,
+        scope=None,
+        task_setup_snapshot=snapshot,
+    )
+    snapshot_loader.assert_called_once_with(42, None)
 
 
 @pytest.mark.asyncio
@@ -252,6 +353,7 @@ async def test_required_mcp_failure_does_not_fall_back_after_reconstruct() -> No
     error = RequiredMCPUnavailableError(
         [MCPUnavailableSummary.from_values("Gmail", "oauth_token_required")]
     )
+    snapshot = _build_snapshot(task, user, trace_event=_Fake())
 
     async def fail_reconstruct(*args, **kwargs):
         manager._agents[42] = MagicMock()
@@ -262,15 +364,52 @@ async def test_required_mcp_failure_does_not_fall_back_after_reconstruct() -> No
         patch.object(
             manager, "_reconstruct_agent_from_history", side_effect=fail_reconstruct
         ),
-        patch("xagent.web.api.chat.load_task_setup_snapshot_sync") as snapshot_loader,
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ) as snapshot_loader,
+        patch.object(
+            manager,
+            "_has_reconstructable_history",
+            side_effect=AssertionError("history pre-check ran on the event loop"),
+            create=True,
+        ),
     ):
         with pytest.raises(RequiredMCPUnavailableError) as exc_info:
-            await manager.get_agent_for_task(task_id=42, db=db, user=user)
+            await manager.get_agent_for_task(
+                task_id=42,
+                db=db,
+                user=user,
+            )
 
     assert exc_info.value is error
-    snapshot_loader.assert_not_called()
+    snapshot_loader.assert_called_once_with(42, None)
     assert 42 not in manager._agents
     assert 42 not in manager._agent_owner_ids
+
+
+@pytest.mark.asyncio
+async def test_active_snapshot_owner_mismatch_does_not_fall_back() -> None:
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    db = _build_db(task, agent=_make_agent(), user=user)
+    mismatch = TaskOwnerMismatchError(42, expected=999, actual=1)
+
+    with patch(
+        "xagent.web.api.chat.load_task_setup_snapshot_sync",
+        side_effect=mismatch,
+    ) as snapshot_loader:
+        with pytest.raises(TaskOwnerMismatchError) as exc_info:
+            await manager.get_agent_for_task(
+                task_id=42,
+                db=db,
+                user=user,
+                task_owner_user_id=999,
+            )
+
+    assert exc_info.value is mismatch
+    snapshot_loader.assert_called_once_with(42, 999)
 
 
 @pytest.mark.asyncio
@@ -289,16 +428,38 @@ async def test_running_with_dag_plan_runs_reconstruct() -> None:
         agent=agent_row,
         user=user,
     )
+    snapshot = _build_snapshot(task, user, dag_execution=_Fake())
 
     reconstruct = AsyncMock()
-    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ) as snapshot_loader,
+        patch.object(
+            manager,
+            "_has_reconstructable_history",
+            side_effect=AssertionError("history pre-check ran on the event loop"),
+            create=True,
+        ),
+    ):
         with _Patches(_stub_downstream(manager)):
             try:
-                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+                await manager.get_agent_for_task(
+                    task_id=42,
+                    db=db,
+                    user=user,
+                )
             except Exception:
                 pass
-
-    reconstruct.assert_awaited_once_with(42, db, scope=None)
+    reconstruct.assert_awaited_once_with(
+        42,
+        db,
+        scope=None,
+        task_setup_snapshot=snapshot,
+    )
+    snapshot_loader.assert_called_once_with(42, None)
 
 
 @pytest.mark.asyncio
@@ -320,16 +481,32 @@ async def test_paused_with_no_history_still_runs_reconstruct() -> None:
         agent=agent_row,
         user=user,
     )
+    snapshot = _build_snapshot(task, user)
 
     reconstruct = AsyncMock()
-    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ) as snapshot_loader,
+    ):
         with _Patches(_stub_downstream(manager)):
             try:
-                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+                await manager.get_agent_for_task(
+                    task_id=42,
+                    db=db,
+                    user=user,
+                )
             except Exception:
                 pass
-
-    reconstruct.assert_awaited_once_with(42, db, scope=None)
+    reconstruct.assert_awaited_once_with(
+        42,
+        db,
+        scope=None,
+        task_setup_snapshot=snapshot,
+    )
+    snapshot_loader.assert_called_once_with(42, None)
 
 
 @pytest.mark.asyncio
@@ -347,16 +524,32 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
         agent=agent_row,
         user=user,
     )
+    snapshot = _build_snapshot(task, user)
 
     reconstruct = AsyncMock()
-    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ) as snapshot_loader,
+    ):
         with _Patches(_stub_downstream(manager)):
             try:
-                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+                await manager.get_agent_for_task(
+                    task_id=42,
+                    db=db,
+                    user=user,
+                )
             except Exception:
                 pass
-
-    reconstruct.assert_awaited_once_with(42, db, scope=None)
+    reconstruct.assert_awaited_once_with(
+        42,
+        db,
+        scope=None,
+        task_setup_snapshot=snapshot,
+    )
+    snapshot_loader.assert_called_once_with(42, None)
 
 
 @pytest.mark.asyncio
@@ -368,6 +561,7 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
     db = _build_db(
         task, trace_event=None, dag_execution=None, agent=agent_row, user=user
     )
+    snapshot = _build_snapshot(task, user)
 
     class _ToolConfig:
         def __init__(self) -> None:
@@ -387,11 +581,21 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
 
     reconstructed_agent = _Agent()
 
-    async def reconstruct(task_id: int, _db: Any, scope: Any = None) -> None:
+    async def reconstruct(
+        task_id: int,
+        _db: Any,
+        scope: Any = None,
+        task_setup_snapshot: TaskSetupSnapshot | None = None,
+    ) -> None:
+        assert task_setup_snapshot is snapshot
         manager._agents[task_id] = reconstructed_agent
 
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ) as snapshot_loader,
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
     ):
@@ -403,6 +607,7 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
         )
 
     assert agent is reconstructed_agent
+    snapshot_loader.assert_called_once_with(42, None)
     assert reconstructed_agent.tool_config.turn_ids == ["turn-reconstructed"]
     assert reconstructed_agent.invalidated is True
 

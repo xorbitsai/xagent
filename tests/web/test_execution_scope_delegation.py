@@ -116,6 +116,30 @@ class TestSnapshotLoaderPreference:
         assert resolve_execution_scope(43).sandbox_key_suffix == "from-resolver"
         assert resolver_calls == ["43"]
 
+    def test_caller_supplied_snapshot_skips_registered_loader(self):
+        loader_calls = []
+        set_execution_scope_snapshot_loader(
+            lambda task_id: loader_calls.append(task_id)
+        )
+
+        assert resolve_execution_scope(42, persisted_snapshot=SCOPE) == SCOPE
+        assert loader_calls == []
+
+    def test_caller_supplied_missing_snapshot_falls_back_to_resolver(self):
+        loader_calls = []
+        resolver_calls = []
+        resolved = ExecutionScope(sandbox_key_suffix="from-resolver")
+        set_execution_scope_snapshot_loader(
+            lambda task_id: loader_calls.append(task_id)
+        )
+        set_execution_scope_resolver(
+            lambda task_id: resolver_calls.append(task_id) or resolved
+        )
+
+        assert resolve_execution_scope(42, persisted_snapshot=None) == resolved
+        assert loader_calls == []
+        assert resolver_calls == ["42"]
+
     def test_loader_exception_fails_the_turn(self):
         def loader(task_id):
             raise RuntimeError("db down")

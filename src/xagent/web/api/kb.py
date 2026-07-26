@@ -45,6 +45,7 @@ from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
+from ...config import get_kb_collections_timeout_seconds
 from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from ...core.tools.core.RAG_tools.core.parser_registry import (
@@ -158,7 +159,13 @@ from ..services.managed_file_ref import (
     DurableObjectMissingError,
     ManagedFileRef,
 )
-from ..services.uploaded_file_store import UploadedFileStore
+from ..services.uploaded_file_store import (
+    UploadedFileStore,
+    UploadedFileVersionConflict,
+    UploadedFileVersionSnapshot,
+    cleanup_superseded_uploaded_file_objects,
+    snapshot_uploaded_file_version,
+)
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -205,58 +212,70 @@ def _create_file_compensation_restore(
     backup_path: Optional[Path],
     record_snapshot: dict[str, Any],
     had_existing_file: bool = True,
+    previous_version: UploadedFileVersionSnapshot | None = None,
+    expected_current_version: UploadedFileVersionSnapshot | None = None,
 ) -> Callable[[], None]:
     """Create a FILE-boundary compensation callback for restoring a refreshed/recreated web file."""
 
     def _compensate() -> None:
+        _ = record_snapshot  # Retained for compatibility with downstream callers.
         if had_existing_file and (backup_path is None or not backup_path.exists()):
             raise FileNotFoundError(
                 f"Missing web ingest rollback backup: {backup_path}"
             )
+        _restore_ingest_file_backup(
+            file_path=existing_path,
+            backup_path=backup_path,
+            had_existing_file=had_existing_file,
+        )
         SessionLocal = get_session_local()
         rollback_db = SessionLocal()
+        cleanup_claim = None
         try:
             refreshed_record = (
                 rollback_db.query(UploadedFile)
                 .filter(UploadedFile.file_id == file_record_id)
                 .first()
             )
-            if refreshed_record is None:
-                _restore_ingest_file_backup(
-                    file_path=existing_path,
-                    backup_path=backup_path,
-                    had_existing_file=had_existing_file,
-                )
-            else:
-                current_storage_key = str(
-                    getattr(refreshed_record, "storage_key", "") or ""
-                )
-                previous_storage_key = str(record_snapshot.get("storage_key") or "")
-                if current_storage_key and current_storage_key != previous_storage_key:
-                    ManagedFileRef(refreshed_record).delete_durable()
-
-                _restore_ingest_file_backup(
-                    file_path=existing_path,
-                    backup_path=backup_path,
-                    had_existing_file=had_existing_file,
-                )
-                _restore_uploaded_file_record_snapshot(
-                    refreshed_record, record_snapshot
-                )
-                if previous_storage_key and backup_path is not None:
-                    UploadedFileStore(rollback_db).sync_existing(
-                        refreshed_record,
-                        storage_key=previous_storage_key,
-                        mime_type=record_snapshot.get("mime_type"),
+            if refreshed_record is not None:
+                if previous_version is None or expected_current_version is None:
+                    logger.warning(
+                        "Skipping legacy uploaded-file metadata rollback without "
+                        "both previous and applied version receipts: %s",
+                        file_record_id,
+                    )
+                elif had_existing_file:
+                    UploadedFileStore(rollback_db).upsert_by_storage_path(
+                        user_id=previous_version.user_id,
+                        file_id=previous_version.file_id,
+                        filename=previous_version.filename,
+                        storage_path=existing_path,
+                        mime_type=previous_version.mime_type,
+                        file_size=existing_path.stat().st_size,
+                        expected_version=expected_current_version,
+                        replacement_metadata=previous_version,
                     )
                 else:
-                    rollback_db.flush()
-            rollback_db.commit()
+                    applied = UploadedFileStore(
+                        rollback_db
+                    ).restore_metadata_version_no_commit(
+                        expected=expected_current_version,
+                        replacement=previous_version,
+                    )
+                    cleanup_claim = applied.superseded_cleanup_claim
+                rollback_db.commit()
         except Exception:
             rollback_db.rollback()
             raise
         finally:
             rollback_db.close()
+        if cleanup_claim is not None:
+            failed_claims = cleanup_superseded_uploaded_file_objects((cleanup_claim,))
+            if failed_claims:
+                raise RuntimeError(
+                    "Failed to clean superseded uploaded-file generation "
+                    "during rollback"
+                )
 
     return _compensate
 
@@ -2239,13 +2258,6 @@ def _snapshot_uploaded_file_record(file_record: UploadedFile) -> Dict[str, Any]:
     }
 
 
-def _restore_uploaded_file_record_snapshot(
-    file_record: UploadedFile, snapshot: Dict[str, Any]
-) -> None:
-    for field, value in snapshot.items():
-        setattr(file_record, field, value)
-
-
 def _cleanup_failed_web_uploaded_file_setup(
     db_session: Session,
     *,
@@ -2603,6 +2615,11 @@ def _refresh_existing_file_if_changed(
     """
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
+    previous_version = (
+        snapshot_uploaded_file_version(existing_record)
+        if getattr(existing_record, "id", None) is not None
+        else None
+    )
     if not existing_path.exists():
         try:
             existing_path = ManagedFileRef(existing_record).ensure_local()
@@ -2732,6 +2749,8 @@ def _refresh_existing_file_if_changed(
         existing_path=existing_path,
         backup_path=backup_path,
         record_snapshot=record_snapshot,
+        previous_version=previous_version,
+        expected_current_version=snapshot_uploaded_file_version(file_record),
     )
     document_compensation = _create_document_compensation(
         collection_name=collection_name,
@@ -2841,6 +2860,11 @@ def _recreate_missing_existing_file(
 ) -> FileHandlerResult:
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
+    previous_version = (
+        snapshot_uploaded_file_version(existing_record)
+        if getattr(existing_record, "id", None) is not None
+        else None
+    )
     ingestion_runs_snapshot = _snapshot_ingestion_runs_for_uploaded_file(
         str(existing_record.file_id)
     )
@@ -2910,27 +2934,14 @@ def _recreate_missing_existing_file(
                 .filter(UploadedFile.file_id == str(existing_record.file_id))
                 .first()
             )
-            if refreshed_record is not None:
-                current_storage_key = str(
-                    getattr(refreshed_record, "storage_key", "") or ""
+            if refreshed_record is not None and (
+                previous_version is None
+                or snapshot_uploaded_file_version(refreshed_record) != previous_version
+            ):
+                raise UploadedFileVersionConflict(
+                    "Uploaded file changed while recreate setup failed; "
+                    "skipped unsafe metadata rollback"
                 )
-                previous_storage_key = str(record_snapshot.get("storage_key") or "")
-                if current_storage_key and (
-                    current_storage_key != previous_storage_key or not had_existing_file
-                ):
-                    ManagedFileRef(refreshed_record).delete_durable()
-                _restore_uploaded_file_record_snapshot(
-                    refreshed_record, record_snapshot
-                )
-                if previous_storage_key and existing_path.exists():
-                    UploadedFileStore(db_session).sync_existing(
-                        refreshed_record,
-                        storage_key=previous_storage_key,
-                        mime_type=record_snapshot.get("mime_type"),
-                    )
-                else:
-                    db_session.flush()
-                db_session.commit()
         except Exception as exc:  # noqa: BLE001
             db_session.rollback()
             restore_error = exc
@@ -2967,6 +2978,8 @@ def _recreate_missing_existing_file(
         backup_path=backup_for_failure,
         record_snapshot=record_snapshot,
         had_existing_file=had_existing_file,
+        previous_version=previous_version,
+        expected_current_version=snapshot_uploaded_file_version(file_record),
     )
     document_compensation = _create_document_compensation(
         collection_name=collection_name,
@@ -4736,7 +4749,14 @@ async def list_collections_api(
     db: Session = Depends(get_db),
 ) -> ListCollectionsResult:
     """List all collections with their statistics."""
-    kb_collections_timeout_seconds = 15
+    # Per-scan deadline, not a whole-request budget: the personal scan and each
+    # team-owner scan each get this much time. It is configurable because the
+    # scans now run off the event loop (asyncio.to_thread), which made this
+    # deadline reachable for the first time - a blocking scan used to starve the
+    # timer and always eventually succeed. Known limitation: cancelling the
+    # asyncio.wait_for coroutine does not stop the underlying to_thread worker,
+    # so a timed-out scan keeps running to completion in the default executor.
+    kb_collections_timeout_seconds = get_kb_collections_timeout_seconds()
 
     try:
         result = await asyncio.wait_for(
@@ -4767,15 +4787,26 @@ async def list_collections_api(
         refs_by_owner: dict[int, list[KnowledgeBaseAccess]] = {}
         for ref in team_refs:
             refs_by_owner.setdefault(ref.storage_user_id, []).append(ref)
-        for storage_user_id, refs in refs_by_owner.items():
-            owner_result = await asyncio.wait_for(
-                list_collections(user_id=storage_user_id, is_admin=False),
-                timeout=kb_collections_timeout_seconds,
+        # Scan every distinct team-KB owner concurrently: total latency is then
+        # bounded by the slowest owner scan instead of the sum of all of them,
+        # which also collapses N sequential chances to hit the per-scan timeout.
+        owner_ids = list(refs_by_owner)
+        owner_results = await asyncio.gather(
+            *(
+                asyncio.wait_for(
+                    list_collections(user_id=storage_user_id, is_admin=False),
+                    timeout=kb_collections_timeout_seconds,
+                )
+                for storage_user_id in owner_ids
             )
+        )
+        # zip is safe: dict iteration order matches the gather order, so merge
+        # precedence for duplicate collection names is unchanged.
+        for storage_user_id, owner_result in zip(owner_ids, owner_results):
             owner_collections = {
                 collection.name: collection for collection in owner_result.collections
             }
-            for ref in refs:
+            for ref in refs_by_owner[storage_user_id]:
                 collection = owner_collections.get(ref.name)
                 if collection is None:
                     continue

@@ -231,8 +231,11 @@ examples/*.html
 # filelock artifacts from tests (mock paths like <MagicMock ...>.lock)
 *MagicMock*.lock
 
-# Root directory markdown files (except README.md, AGENTS.md, CLAUDE.md, CHANGELOG.md)
-*.md
+# Root directory markdown files (except README.md, AGENTS.md, CLAUDE.md, CHANGELOG.md).
+# The leading slash matters: a bare `*.md` matches at every depth, so any doc
+# added in a subdirectory was silently ignored unless it happened to be named
+# README.md (which `!README.md` below un-ignores at every depth).
+/*.md
 !README.md
 !AGENTS.md
 !CLAUDE.md

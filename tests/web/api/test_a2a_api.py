@@ -1,22 +1,42 @@
+import asyncio
+import inspect
 import json
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
+from threading import Event, get_ident
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.web.api import a2a as a2a_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
-from xagent.web.services.a2a_protocol import A2A_MAX_MESSAGE_TEXT_LENGTH
+from xagent.web.services.a2a_protocol import (
+    A2A_MAX_MESSAGE_TEXT_LENGTH,
+    A2AApiError,
+    A2ATaskSnapshot,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_FAILED,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
+    ClaimedTaskCommand,
+    TaskCommandKind,
+    TaskCommandRejected,
 )
-from xagent.web.services.task_orchestrator import TaskTurnError
+from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_lease_service import TaskLease, current_task_lease
+from xagent.web.services.task_orchestrator import (
+    TaskTurnError,
+    TaskTurnOrchestrator,
+    TaskTurnPayload,
+    TurnKind,
+)
 
 from .conftest import _admin_headers, _direct_db_session, client
 
@@ -364,7 +384,7 @@ def test_message_send_blocks_by_default_until_task_finishes() -> None:
         return object()
 
     with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        "xagent.web.api.a2a.TaskTurnOrchestrator.schedule_claimed_create_turn",
         new=_complete_turn,
     ):
         response = client.post(
@@ -411,11 +431,11 @@ def test_message_send_returns_working_task_when_wait_deadline_expires(
     assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
 
 
-def test_failed_create_does_not_leave_pending_a2a_task() -> None:
+def test_failed_create_scheduling_does_not_leave_pending_a2a_task() -> None:
     agent_id, full_key = _create_published_agent_with_key()
 
     with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        "xagent.web.services.task_orchestrator._schedule_bg",
         side_effect=TaskTurnError("busy"),
     ):
         response = client.post(
@@ -434,7 +454,11 @@ def test_failed_create_does_not_leave_pending_a2a_task() -> None:
     assert response.status_code == 400, response.text
     db = _direct_db_session()
     try:
-        assert db.query(Task).filter(Task.source == "a2a").count() == 0
+        tasks = db.query(Task).filter(Task.source == "a2a").all()
+        assert len(tasks) == 1
+        assert tasks[0].status == TaskStatus.FAILED
+        assert tasks[0].runner_id is None
+        assert tasks[0].lease_expires_at is None
     finally:
         db.close()
 
@@ -443,7 +467,7 @@ def test_unexpected_a2a_error_uses_internal_protocol_envelope() -> None:
     agent_id, full_key = _create_published_agent_with_key()
 
     with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        "xagent.web.services.task_orchestrator._schedule_bg",
         side_effect=RuntimeError("sensitive implementation detail"),
     ):
         response = client.post(
@@ -466,7 +490,11 @@ def test_unexpected_a2a_error_uses_internal_protocol_envelope() -> None:
     assert "sensitive implementation detail" not in response.text
     db = _direct_db_session()
     try:
-        assert db.query(Task).filter(Task.source == "a2a").count() == 0
+        tasks = db.query(Task).filter(Task.source == "a2a").all()
+        assert len(tasks) == 1
+        assert tasks[0].status == TaskStatus.FAILED
+        assert tasks[0].runner_id is None
+        assert tasks[0].lease_expires_at is None
     finally:
         db.close()
 
@@ -551,12 +579,34 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     try:
         row = db.query(Task).filter(Task.id == int(task_id)).one()
         row.status = TaskStatus.WAITING_FOR_USER
+        row.control_state = TaskControlState.WAITING_FOR_USER.value
+        row.runner_id = None
+        row.last_heartbeat_at = None
+        row.lease_expires_at = None
         db.commit()
     finally:
         db.close()
 
+    observed_lease: dict[str, object] = {}
+
+    async def post_user_message(*_args: object, **_kwargs: object) -> bool:
+        lease = current_task_lease()
+        assert lease is not None
+        assert lease.run_id is not None
+        observed_lease["lease"] = lease
+        lease_db = _direct_db_session()
+        try:
+            leased = lease_db.query(Task).filter(Task.id == int(task_id)).one()
+            assert leased.status == TaskStatus.RUNNING
+            assert leased.runner_id == lease.runner_id
+            assert leased.run_id == lease.run_id
+            assert leased.lease_expires_at is not None
+        finally:
+            lease_db.close()
+        return True
+
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_service.post_user_message = AsyncMock(side_effect=post_user_message)
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     begin_turn = AsyncMock()
@@ -598,13 +648,302 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     )
     begin_turn.assert_not_awaited()
     schedule_resume.assert_called_once()
+    scheduled_lease = schedule_resume.call_args.kwargs["task_lease"]
+    assert scheduled_lease == observed_lease["lease"]
     db = _direct_db_session()
     try:
         resumed = db.query(Task).filter(Task.id == int(task_id)).one()
         assert resumed.status == TaskStatus.RUNNING
+        assert resumed.control_state == TaskControlState.RUNNING.value
+        assert resumed.runner_id == scheduled_lease.runner_id
+        assert resumed.run_id == scheduled_lease.run_id
+        assert resumed.lease_expires_at is not None
         assert resumed.input == "follow up"
     finally:
         db.close()
+
+
+def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="waiting",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.WAITING_FOR_USER.value,
+            run_id="run-a",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-schedule-failure"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    scheduled_lease: dict[str, object] = {}
+
+    def fail_schedule(*, task_lease: TaskLease, **_kwargs: object) -> None:
+        scheduled_lease["lease"] = task_lease
+        schedule_db = _direct_db_session()
+        try:
+            durable = schedule_db.query(Task).filter(Task.id == task_id).one()
+            assert durable.status == TaskStatus.RUNNING
+            assert durable.runner_id == task_lease.runner_id
+            assert durable.run_id == task_lease.run_id
+            assert durable.lease_expires_at is not None
+        finally:
+            schedule_db.close()
+        raise RuntimeError("scheduler unavailable")
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch(
+            "xagent.web.api.a2a._schedule_waiting_a2a_resume",
+            side_effect=fail_schedule,
+        ),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-schedule-failure",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "retry safely"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 500
+    assert scheduled_lease["lease"] is not None
+    db = _direct_db_session()
+    try:
+        restored = db.query(Task).filter(Task.id == task_id).one()
+        assert restored.status == TaskStatus.WAITING_FOR_USER
+        assert restored.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert restored.run_id == "run-a"
+        assert restored.runner_id is None
+        assert restored.lease_expires_at is None
+    finally:
+        db.close()
+
+
+def test_recovered_paused_checkpoint_resumes_without_transcript_fallback() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="recovered checkpoint",
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
+            run_id="run-recovered",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-recovered"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    begin_turn = AsyncMock()
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume") as schedule_resume,
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-recovered",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "resume recovered run"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    agent_service.post_user_message.assert_awaited_once()
+    schedule_resume.assert_called_once()
+    begin_turn.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        resumed = db.query(Task).filter(Task.id == task_id).one()
+        assert resumed.status == TaskStatus.RUNNING
+        assert resumed.run_id == "run-recovered"
+        assert resumed.runner_id is not None
+        assert resumed.lease_expires_at is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_untagged_checkpoint_is_not_resumed_without_an_exact_run() -> None:
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="legacy waiting",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.WAITING_FOR_USER.value,
+            run_id=None,
+            last_checkpoint_event_id="legacy-checkpoint",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-legacy"},
+        )
+        db.add(task)
+        db.flush()
+        db.add(
+            TraceEvent(
+                task_id=int(task.id),
+                event_id="legacy-checkpoint",
+                event_type="system_update_general",
+                timestamp=datetime.now(UTC),
+                data={
+                    "checkpoint_type": "xagent.agent.checkpoint.v1",
+                    "snapshot": {"type": "checkpoint"},
+                },
+            )
+        )
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+
+        async def post_user_message(*_args: object, **_kwargs: object) -> bool:
+            lease = current_task_lease()
+            assert lease is not None
+            assert lease.task_id == task_id
+            assert lease.run_id is not None
+            verify_db = _direct_db_session()
+            try:
+                leased = verify_db.query(Task).filter(Task.id == task_id).one()
+                assert leased.run_id == lease.run_id
+                assert leased.last_checkpoint_event_id is None
+            finally:
+                verify_db.close()
+            return False
+
+        agent_service = MagicMock()
+        agent_service.post_user_message = AsyncMock(side_effect=post_user_message)
+        agent_manager = MagicMock()
+        agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+        with patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ):
+            with pytest.raises(A2AApiError) as exc_info:
+                await a2a_api._resume_input_required_a2a_task(
+                    agent_id=agent_id,
+                    task_owner_user_id=int(agent.user_id),
+                    task=A2ATaskSnapshot.from_task(task),
+                    text="legacy follow up",
+                    message_id="msg-legacy",
+                )
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.payload["details"][0]["reason"] == "UNSUPPORTED_OPERATION"
+        db.refresh(task)
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert task.runner_id is None
+        assert task.lease_expires_at is None
+        assert task.run_id is not None
+    finally:
+        db.close()
+
+
+def test_checkpoint_resume_rejects_duplicate_request_while_exact_lease_is_live() -> (
+    None
+):
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="resuming",
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="run-a",
+            runner_id="runner-a",
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-duplicate"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    begin_turn = AsyncMock(side_effect=TaskTurnError("busy"))
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+        ) as get_agent_manager,
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-duplicate",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "do not inject twice"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 400
+    get_agent_manager.assert_not_called()
+    begin_turn.assert_awaited_once()
 
 
 def test_failed_follow_up_restores_input_required_status() -> None:
@@ -809,6 +1148,55 @@ def test_list_tasks_uses_database_filters_and_pagination() -> None:
     assert recent.json()["totalSize"] == 2
 
 
+def test_list_tasks_projects_claimed_waiting_resume_as_working() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        waiting = Task(
+            user_id=owner_id,
+            title="waiting",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.WAITING_FOR_USER.value,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+        )
+        resume_requested = Task(
+            user_id=owner_id,
+            title="resume requested",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.RESUME_REQUESTED.value,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+        )
+        db.add_all([waiting, resume_requested])
+        db.commit()
+        waiting_id = int(waiting.id)
+        resume_requested_id = int(resume_requested.id)
+    finally:
+        db.close()
+
+    working = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"status": "TASK_STATE_WORKING"},
+    )
+    input_required = client.get(
+        f"/api/a2a/agents/{agent_id}/tasks",
+        headers=_bearer(full_key),
+        params={"status": "TASK_STATE_INPUT_REQUIRED"},
+    )
+
+    assert working.status_code == 200, working.text
+    assert [int(task["id"]) for task in working.json()["tasks"]] == [
+        resume_requested_id
+    ]
+    assert input_required.status_code == 200, input_required.text
+    assert [int(task["id"]) for task in input_required.json()["tasks"]] == [waiting_id]
+
+
 @pytest.mark.asyncio
 async def test_stream_artifact_updates_are_incremental_and_finalize(
     monkeypatch,
@@ -855,7 +1243,10 @@ async def test_stream_artifact_updates_are_incremental_and_finalize(
         lambda _agent_id, _task_id: next(fresh_tasks),
     )
 
-    response = a2a_api._task_stream_response(SimpleNamespace(id=7), task)
+    response = a2a_api._task_stream_response(
+        7,
+        A2ATaskSnapshot.from_task(task),
+    )
     events = [
         json.loads(chunk.removeprefix("data: "))
         async for chunk in response.body_iterator
@@ -870,6 +1261,338 @@ async def test_stream_artifact_updates_are_incremental_and_finalize(
     assert artifact_updates[1]["artifact"]["parts"] == [{"text": "partial"}]
     assert artifact_updates[1]["append"] is False
     assert artifact_updates[1]["lastChunk"] is True
+
+
+@pytest.mark.asyncio
+async def test_a2a_poll_pool_wait_does_not_block_event_loop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'a2a-poll-pool.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=1.0,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as db:
+        db.add(
+            Task(
+                id=101,
+                user_id=1,
+                title="poll",
+                status=TaskStatus.RUNNING,
+                agent_id=7,
+                source="a2a",
+                is_visible=False,
+                agent_config={"a2a_context_id": "ctx-poll"},
+            )
+        )
+        db.commit()
+
+    held_connection = engine.connect()
+    monkeypatch.setattr(a2a_api, "get_session_local", lambda: SessionLocal)
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    fetch_task = asyncio.create_task(a2a_api._fetch_fresh_a2a_task_isolated(7, 101))
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        await asyncio.sleep(0.08)
+        assert ticks >= 3, "A2A QueuePool checkout blocked the event loop"
+        assert not fetch_task.done()
+    finally:
+        held_connection.close()
+
+    try:
+        snapshot = await asyncio.wait_for(fetch_task, timeout=1.0)
+        assert snapshot is not None
+        assert snapshot.id == 101
+    finally:
+        ticker_stop.set()
+        await ticker_task
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a2a_task_page_pool_wait_runs_in_worker_without_blocking_loop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_loader = getattr(a2a_api, "_load_a2a_task_page_isolated", None)
+    sync_loader = getattr(a2a_api, "_load_a2a_task_page_sync", None)
+    assert page_loader is not None
+    assert sync_loader is not None
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'a2a-page-pool.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=1.0,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as db:
+        db.add(
+            Task(
+                id=101,
+                user_id=1,
+                title="page",
+                status=TaskStatus.RUNNING,
+                agent_id=7,
+                source="a2a",
+                is_visible=False,
+                agent_config={"a2a_context_id": "ctx-page"},
+            )
+        )
+        db.commit()
+
+    held_connection = engine.connect()
+    monkeypatch.setattr(a2a_api, "get_session_local", lambda: SessionLocal)
+    worker_started = Event()
+    worker_thread_ids: list[int] = []
+
+    def observed_loader(**kwargs: object) -> object:
+        worker_thread_ids.append(get_ident())
+        worker_started.set()
+        return sync_loader(**kwargs)
+
+    monkeypatch.setattr(a2a_api, "_load_a2a_task_page_sync", observed_loader)
+    ticker_stop = asyncio.Event()
+    ticks = 0
+    loop_thread_id = get_ident()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    load_task = asyncio.create_task(
+        page_loader(
+            agent_id=7,
+            context_id=None,
+            status=None,
+            status_timestamp_after=None,
+            offset=0,
+            page_size=50,
+        )
+    )
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 1.0)
+        await asyncio.sleep(0.08)
+        assert ticks >= 3, "A2A list QueuePool checkout blocked the event loop"
+        assert not load_task.done()
+    finally:
+        held_connection.close()
+
+    try:
+        page = await asyncio.wait_for(load_task, timeout=1.0)
+        assert [task.id for task in page.tasks] == [101]
+        assert page.total_size == 1
+        assert worker_thread_ids
+        assert worker_thread_ids[0] != loop_thread_id
+    finally:
+        ticker_stop.set()
+        await ticker_task
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_closes_loader_session_before_returning_stream(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert "db" not in inspect.signature(a2a_api.subscribe_task).parameters
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'a2a-subscribe-session.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=1.0,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_closed = Event()
+
+    class TrackingSession(Session):
+        def close(self) -> None:
+            try:
+                super().close()
+            finally:
+                session_closed.set()
+
+    SessionLocal = sessionmaker(bind=engine, class_=TrackingSession)
+    with SessionLocal() as db:
+        db.add(
+            Task(
+                id=101,
+                user_id=1,
+                title="subscribe",
+                status=TaskStatus.PAUSED,
+                agent_id=7,
+                source="a2a",
+                is_visible=False,
+                agent_config={"a2a_context_id": "ctx-subscribe"},
+            )
+        )
+        db.commit()
+    session_closed.clear()
+    monkeypatch.setattr(a2a_api, "get_session_local", lambda: SessionLocal)
+    agent = a2a_api.AgentPrincipalSnapshot(
+        id=7,
+        user_id=1,
+        execution_mode="balanced",
+        status="published",
+        origin="user",
+    )
+    key = a2a_api.RuntimeApiKeySnapshot(key_prefix="ABCDEF")
+
+    response = await a2a_api.subscribe_task(
+        agent_id=7,
+        task_id=101,
+        authed=(agent, key),
+    )
+
+    assert session_closed.is_set()
+    assert engine.pool.checkedout() == 0
+    await response.body_iterator.aclose()
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_start_a2a_turn_cancellation_drains_atomic_create_into_scheduling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        owner_user_id = int(agent.user_id)
+        execution_mode = str(agent.execution_mode)
+    finally:
+        db.close()
+
+    original_prepare = a2a_api._prepare_a2a_turn_sync
+    preparation_committed = Event()
+    allow_preparation_return = Event()
+    prepared_task_ids: list[int] = []
+
+    def delayed_prepare(**kwargs: object) -> a2a_api._A2ATurnPreparation:
+        preparation = original_prepare(**kwargs)
+        prepared_task_ids.append(preparation.task.id)
+        preparation_committed.set()
+        assert allow_preparation_return.wait(timeout=2.0)
+        return preparation
+
+    begin_turn = AsyncMock()
+    scheduled_claims: list[object] = []
+
+    async def schedule_claimed_create_turn(**kwargs: object) -> MagicMock:
+        scheduled_claims.append(kwargs["claimed"])
+
+        async def noop() -> None:
+            return None
+
+        return MagicMock(background_task=asyncio.create_task(noop()))
+
+    monkeypatch.setattr(a2a_api, "_prepare_a2a_turn_sync", delayed_prepare)
+    monkeypatch.setattr(a2a_api.TaskTurnOrchestrator, "begin_turn", begin_turn)
+    monkeypatch.setattr(
+        a2a_api.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        schedule_claimed_create_turn,
+    )
+
+    turn = asyncio.create_task(
+        a2a_api._start_a2a_turn(
+            agent_id=agent_id,
+            task_owner_user_id=owner_user_id,
+            agent_execution_mode=execution_mode,
+            text="cancelled during preparation",
+            message_id="msg-cancel-prepare",
+            context_id="ctx-cancel-prepare",
+            task_id=None,
+        )
+    )
+    assert await asyncio.to_thread(preparation_committed.wait, 2.0)
+
+    turn.cancel()
+    await asyncio.sleep(0)
+    allow_preparation_return.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    begin_turn.assert_not_awaited()
+    assert len(scheduled_claims) == 1
+    assert prepared_task_ids
+    db = _direct_db_session()
+    try:
+        task = db.get(Task, prepared_task_ids[0])
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.runner_id is not None
+        assert task.run_id is not None
+        assert task.lease_expires_at is not None
+    finally:
+        db.close()
+
+
+def test_a2a_send_has_no_request_session_during_runtime_await() -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+
+    async def start_turn(**kwargs: object) -> A2ATaskSnapshot:
+        return A2ATaskSnapshot(
+            id=101,
+            user_id=int(kwargs["task_owner_user_id"]),
+            agent_id=int(kwargs["agent_id"]),
+            source="a2a",
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="run-a",
+            agent_config={"a2a_context_id": "ctx-release"},
+            output=None,
+            error_message=None,
+            updated_at=datetime.now(UTC),
+        )
+
+    assert "db" not in inspect.signature(a2a_api.send_message).parameters
+
+    with (
+        patch(
+            "xagent.web.api.a2a._start_a2a_turn",
+            new=AsyncMock(side_effect=start_turn),
+        ),
+        patch("xagent.web.api.a2a.record_key_usage"),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-release",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "hello"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
 
 
 def test_cancel_is_idempotent_and_subscribe_rejects_terminal_task() -> None:
@@ -938,13 +1661,17 @@ def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).one()
         task = db.query(Task).filter(Task.id == task_id).one()
+        target_state_version = int(task.state_version or 0)
         db.add(
             TaskExecutionCommand(
                 task_id=task_id,
                 actor_user_id=int(agent.user_id),
-                command_id=f"cancel:{task_id}:{task.run_id or task.state_version}",
+                command_id=f"cancel:{task_id}:{target_state_version}",
                 kind="cancel",
-                payload={"agent_id": agent_id},
+                payload={
+                    "agent_id": agent_id,
+                    "target_state_version": target_state_version,
+                },
                 target_run_id=str(task.run_id) if task.run_id is not None else None,
                 target_runner_id=None,
                 status=COMMAND_FAILED,
@@ -978,6 +1705,541 @@ def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
         assert command.defer_count == 0
     finally:
         db.close()
+
+
+def test_prepare_cancel_command_persists_exact_state_version_target() -> None:
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="cancel target",
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="run-target",
+            state_version=7,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-cancel-target"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        owner_user_id = int(agent.user_id)
+    finally:
+        db.close()
+
+    prepared = a2a_api._prepare_a2a_cancel_command_sync(
+        task_id=task_id,
+        agent_id=agent_id,
+        task_owner_user_id=owner_user_id,
+    )
+
+    db = _direct_db_session()
+    try:
+        command = db.get(TaskExecutionCommand, prepared.command_db_id)
+        assert command is not None
+        assert command.command_id == f"cancel:{task_id}:7"
+        assert command.target_run_id == "run-target"
+        assert command.payload == {
+            "agent_id": agent_id,
+            "target_state_version": 7,
+        }
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("current_state_version", "expected_state_version"),
+    [(8, 8), (8, 7)],
+)
+def test_cancel_accepts_only_exact_canceled_terminal_replay(
+    current_state_version: int,
+    expected_state_version: int,
+) -> None:
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="completed cancel target",
+            status=TaskStatus.FAILED,
+            control_state=TaskControlState.FAILED.value,
+            run_id="run-canceled",
+            state_version=current_state_version,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={
+                "a2a_context_id": "ctx-cancel-completed",
+                "a2a_state": "TASK_STATE_CANCELED",
+            },
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    loaded = a2a_api._load_cancelable_a2a_task_sync(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-canceled",
+        expected_state_version=expected_state_version,
+    )
+    finalized = a2a_api._finalize_a2a_cancel_sync(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-canceled",
+        expected_state_version=expected_state_version,
+        local_cancel_requested=False,
+    )
+
+    assert loaded.status == TaskStatus.FAILED
+    assert finalized.status == TaskStatus.FAILED
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.state_version == current_state_version
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "current_run_id",
+        "current_state_version",
+        "status",
+        "control_state",
+    ),
+    [
+        ("run-replaced", 8, TaskStatus.FAILED, TaskControlState.FAILED.value),
+        ("run-canceled", 9, TaskStatus.FAILED, TaskControlState.FAILED.value),
+        ("run-canceled", 8, TaskStatus.RUNNING, TaskControlState.RUNNING.value),
+    ],
+)
+@pytest.mark.parametrize(
+    "operation",
+    [
+        a2a_api._load_cancelable_a2a_task_sync,
+        a2a_api._finalize_a2a_cancel_sync,
+    ],
+)
+def test_cancel_rejects_stale_or_nonterminal_canceled_marker(
+    current_run_id: str,
+    current_state_version: int,
+    status: TaskStatus,
+    control_state: str,
+    operation,
+) -> None:
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="stale cancel marker",
+            status=status,
+            control_state=control_state,
+            run_id=current_run_id,
+            state_version=current_state_version,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={
+                "a2a_context_id": "ctx-stale-cancel-marker",
+                "a2a_state": "TASK_STATE_CANCELED",
+            },
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    kwargs = {
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "expected_run_id": "run-canceled",
+        "expected_state_version": 7,
+    }
+    if operation is a2a_api._finalize_a2a_cancel_sync:
+        kwargs["local_cancel_requested"] = False
+    with pytest.raises(a2a_api.StaleTaskRunError):
+        operation(**kwargs)
+
+
+@pytest.mark.parametrize("initial_run_id", ["run-old", None])
+@pytest.mark.asyncio
+async def test_cancel_rejects_run_replaced_during_local_cancel_await(
+    initial_run_id: str | None,
+) -> None:
+    from xagent.web.api import websocket as websocket_api
+
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="cancel replacement race",
+            status=(
+                TaskStatus.RUNNING if initial_run_id is not None else TaskStatus.PENDING
+            ),
+            control_state=(
+                TaskControlState.RUNNING.value
+                if initial_run_id is not None
+                else TaskControlState.IDLE.value
+            ),
+            run_id=initial_run_id,
+            state_version=4,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-cancel-replacement"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    async def replace_run_during_cancel(_task_id: int) -> MagicMock:
+        concurrent_db = _direct_db_session()
+        try:
+            concurrent_task = concurrent_db.query(Task).filter(Task.id == task_id).one()
+            concurrent_task.status = TaskStatus.RUNNING
+            concurrent_task.control_state = TaskControlState.RUNNING.value
+            concurrent_task.run_id = "run-new"
+            concurrent_task.state_version = 5
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        return MagicMock(requested=True)
+
+    command = ClaimedTaskCommand(
+        id=101,
+        task_id=task_id,
+        actor_user_id=None,
+        command_id=f"cancel:{task_id}:4",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": agent_id, "target_state_version": 4},
+        target_run_id=initial_run_id,
+        attempt_count=1,
+    )
+    with patch(
+        "xagent.web.api.websocket.background_task_manager.cancel_task",
+        new=AsyncMock(side_effect=replace_run_during_cancel),
+    ):
+        with pytest.raises(TaskCommandRejected) as exc_info:
+            await websocket_api._execute_durable_task_command(command)
+
+    assert exc_info.value.reason == "stale_run"
+    db = _direct_db_session()
+    try:
+        current = db.query(Task).filter(Task.id == task_id).one()
+        assert current.status == TaskStatus.RUNNING
+        assert current.run_id == "run-new"
+        assert current.state_version == 5
+        assert current.agent_config.get("a2a_state") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_accepts_exact_same_run_local_settlement() -> None:
+    from xagent.web.api import websocket as websocket_api
+    from xagent.web.services.task_lease_service import get_runner_id
+
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="cancel local settlement",
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="run-local-settlement",
+            state_version=4,
+            runner_id=get_runner_id(),
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            last_heartbeat_at=datetime.now(UTC),
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-local-settlement"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    async def settle_cancelled_local_run(_task_id: int) -> MagicMock:
+        settle_db = _direct_db_session()
+        try:
+            settled = settle_db.query(Task).filter(Task.id == task_id).one()
+            assert settled.run_id == "run-local-settlement"
+            assert settled.state_version == 4
+            settled.status = TaskStatus.FAILED
+            settled.control_state = TaskControlState.FAILED.value
+            settled.state_version = 5
+            settled.runner_id = None
+            settled.lease_expires_at = None
+            settled.last_heartbeat_at = datetime.now(UTC)
+            settled.output = None
+            settled.error_message = "task execution cancelled"
+            settle_db.commit()
+        finally:
+            settle_db.close()
+        return MagicMock(requested=True)
+
+    command = ClaimedTaskCommand(
+        id=103,
+        task_id=task_id,
+        actor_user_id=None,
+        command_id=f"cancel:{task_id}:4",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": agent_id, "target_state_version": 4},
+        target_run_id="run-local-settlement",
+        attempt_count=1,
+    )
+    with patch(
+        "xagent.web.api.websocket.background_task_manager.cancel_task",
+        new=AsyncMock(side_effect=settle_cancelled_local_run),
+    ):
+        result = await websocket_api._execute_durable_task_command(command)
+
+    assert result is not None
+    db = _direct_db_session()
+    try:
+        canceled = db.query(Task).filter(Task.id == task_id).one()
+        assert canceled.status == TaskStatus.FAILED
+        assert canceled.control_state == TaskControlState.FAILED.value
+        assert canceled.run_id == "run-local-settlement"
+        assert canceled.state_version == 5
+        assert canceled.runner_id is None
+        assert canceled.lease_expires_at is None
+        assert canceled.last_heartbeat_at is None
+        assert canceled.agent_config["a2a_state"] == "TASK_STATE_CANCELED"
+        assert canceled.error_message == "Task canceled by A2A client."
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("local_cancel_requested", "runner_id", "lease_expires_at"),
+    [
+        (False, None, None),
+        (
+            True,
+            "still-settling-runner",
+            datetime.now(UTC) + timedelta(minutes=1),
+        ),
+    ],
+)
+def test_cancel_rejects_unattributed_or_incomplete_failed_settlement(
+    local_cancel_requested: bool,
+    runner_id: str | None,
+    lease_expires_at: datetime | None,
+) -> None:
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="unattributed cancel settlement",
+            status=TaskStatus.FAILED,
+            control_state=TaskControlState.FAILED.value,
+            run_id="run-unattributed-settlement",
+            state_version=5,
+            runner_id=runner_id,
+            lease_expires_at=lease_expires_at,
+            last_heartbeat_at=datetime.now(UTC),
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-unattributed-settlement"},
+            error_message="task execution failed",
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    with pytest.raises(a2a_api.StaleTaskRunError):
+        a2a_api._finalize_a2a_cancel_sync(
+            task_id=task_id,
+            agent_id=agent_id,
+            expected_run_id="run-unattributed-settlement",
+            expected_state_version=4,
+            local_cancel_requested=local_cancel_requested,
+        )
+
+    db = _direct_db_session()
+    try:
+        unchanged = db.query(Task).filter(Task.id == task_id).one()
+        assert unchanged.state_version == 5
+        assert unchanged.agent_config.get("a2a_state") is None
+        assert unchanged.error_message == "task execution failed"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_cancel_atomically_clears_execution_lease() -> None:
+    from xagent.web.services.task_lease_service import get_runner_id
+
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="direct cancel lease cleanup",
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="run-direct-cancel",
+            state_version=6,
+            runner_id=get_runner_id(),
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            last_heartbeat_at=datetime.now(UTC),
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-direct-cancel"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    with patch(
+        "xagent.web.api.websocket.background_task_manager.cancel_task",
+        new=AsyncMock(return_value=MagicMock(requested=False)),
+    ):
+        async with a2a_api.task_execution_controller.command(task_id):
+            await a2a_api._cancel_task_unserialized(
+                task_id=task_id,
+                agent_id=agent_id,
+                expected_run_id="run-direct-cancel",
+                expected_state_version=6,
+            )
+
+    db = _direct_db_session()
+    try:
+        canceled = db.query(Task).filter(Task.id == task_id).one()
+        assert canceled.status == TaskStatus.FAILED
+        assert canceled.control_state == TaskControlState.FAILED.value
+        assert canceled.run_id == "run-direct-cancel"
+        assert canceled.state_version == 7
+        assert canceled.runner_id is None
+        assert canceled.lease_expires_at is None
+        assert canceled.last_heartbeat_at is None
+        assert canceled.agent_config["a2a_state"] == "TASK_STATE_CANCELED"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_holds_local_command_gate_until_final_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api import websocket as websocket_api
+
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="cancel local gate",
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="run-gated",
+            state_version=3,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-cancel-gate"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        owner_user_id = int(agent.user_id)
+    finally:
+        db.close()
+
+    cancel_entered = asyncio.Event()
+    allow_cancel = asyncio.Event()
+    begin_entered = asyncio.Event()
+
+    async def blocking_cancel(_task_id: int) -> MagicMock:
+        cancel_entered.set()
+        await allow_cancel.wait()
+        return MagicMock(requested=True)
+
+    async def observe_begin(**_kwargs: object) -> MagicMock:
+        begin_entered.set()
+        return MagicMock()
+
+    monkeypatch.setattr(
+        websocket_api.background_task_manager,
+        "cancel_task",
+        blocking_cancel,
+    )
+    monkeypatch.setattr(
+        TaskTurnOrchestrator,
+        "_begin_turn_unserialized",
+        observe_begin,
+    )
+    command = ClaimedTaskCommand(
+        id=102,
+        task_id=task_id,
+        actor_user_id=owner_user_id,
+        command_id=f"cancel:{task_id}:3",
+        kind=TaskCommandKind.CANCEL,
+        payload={"agent_id": agent_id, "target_state_version": 3},
+        target_run_id="run-gated",
+        attempt_count=1,
+    )
+
+    cancel_command = asyncio.create_task(
+        websocket_api._execute_durable_task_command(command)
+    )
+    await cancel_entered.wait()
+    begin_turn = asyncio.create_task(
+        TaskTurnOrchestrator.begin_turn(
+            task_id=task_id,
+            task_owner_user_id=owner_user_id,
+            actor_user_id=owner_user_id,
+            payload=TaskTurnPayload("new local turn"),
+            kind=TurnKind.APPEND,
+        )
+    )
+    await asyncio.sleep(0.05)
+    entered_while_canceling = begin_entered.is_set()
+    allow_cancel.set()
+    await cancel_command
+    await begin_turn
+
+    assert not entered_while_canceling
+    assert begin_entered.is_set()
 
 
 def test_cancel_maps_stale_run_rejection_to_conflict() -> None:
@@ -1048,8 +2310,10 @@ async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
         db.commit()
         db.refresh(task)
         task_id = int(task.id)
+        expected_run_id = str(task.run_id) if task.run_id is not None else None
+        expected_state_version = int(task.state_version or 0)
 
-        async def complete_during_cancel(_task_id: int) -> None:
+        async def complete_during_cancel(_task_id: int) -> MagicMock:
             concurrent_db = _direct_db_session()
             try:
                 concurrent_task = (
@@ -1060,16 +2324,20 @@ async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
                 concurrent_db.commit()
             finally:
                 concurrent_db.close()
+            return MagicMock(requested=True)
 
         with patch(
             "xagent.web.api.websocket.background_task_manager.cancel_task",
             new=AsyncMock(side_effect=complete_during_cancel),
         ):
-            await a2a_api._cancel_task_unserialized(
-                task_id=task_id,
-                agent=agent,
-                db=db,
-            )
+            with pytest.raises(a2a_api.StaleTaskRunError):
+                async with a2a_api.task_execution_controller.command(task_id):
+                    await a2a_api._cancel_task_unserialized(
+                        task_id=task_id,
+                        agent_id=agent_id,
+                        expected_run_id=expected_run_id,
+                        expected_state_version=expected_state_version,
+                    )
 
         db.expire_all()
         completed = db.query(Task).filter(Task.id == task_id).one()
@@ -1136,6 +2404,44 @@ def test_subscribe_stream_ends_at_server_lifetime_limit(monkeypatch) -> None:
         db.commit()
         db.refresh(task)
         task_id = int(task.id)
+    finally:
+        db.close()
+    monkeypatch.setattr(a2a_api, "A2A_STREAM_MAX_DURATION_SECONDS", 0.0)
+
+    response = client.post(
+        f"/api/a2a/agents/{agent_id}/tasks/{task_id}:subscribe",
+        headers=_bearer(full_key),
+    )
+
+    assert response.status_code == 200, response.text
+    data_lines = [
+        line for line in response.text.splitlines() if line.startswith("data: ")
+    ]
+    assert len(data_lines) == 1
+    event = json.loads(data_lines[0].removeprefix("data: "))
+    assert event["task"]["status"]["state"] == "TASK_STATE_WORKING"
+
+
+def test_subscribe_projects_claimed_waiting_resume_as_working(monkeypatch) -> None:
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="resume requested",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.RESUME_REQUESTED.value,
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-resume-requested"},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        assert not a2a_api._task_stream_ended(task)
     finally:
         db.close()
     monkeypatch.setattr(a2a_api, "A2A_STREAM_MAX_DURATION_SECONDS", 0.0)

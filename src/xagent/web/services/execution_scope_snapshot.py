@@ -16,8 +16,8 @@ import logging
 from typing import Optional
 
 from ...core.execution_scope import (
-    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
     ExecutionScope,
+    execution_scope_from_agent_config,
     set_execution_scope_snapshot_loader,
 )
 
@@ -44,12 +44,9 @@ def load_task_execution_scope_snapshot(task_id: str) -> Optional[ExecutionScope]
     with SessionLocal() as db:
         row = db.query(Task.agent_config).filter(Task.id == task_key).first()
 
-    if row is None or not isinstance(row[0], dict):
+    if row is None:
         return None
-    data = row[0].get(EXECUTION_SCOPE_AGENT_CONFIG_KEY)
-    if not isinstance(data, dict):
-        return None
-    return ExecutionScope.from_dict(data)
+    return execution_scope_from_agent_config(row[0])
 
 
 def register_execution_scope_snapshot_loader() -> None:

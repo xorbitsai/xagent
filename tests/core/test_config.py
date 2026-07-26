@@ -49,6 +49,7 @@ from xagent.config import (
     HOT_PATH_CACHE_ENABLED,
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
+    KB_COLLECTIONS_TIMEOUT_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
@@ -80,10 +81,16 @@ from xagent.config import (
     SMTP_USE_TLS,
     SMTP_USERNAME,
     STORAGE_ROOT,
+    TASK_LEASE_RECOVERY_BATCH_SIZE,
+    TASK_LEASE_RECOVERY_INTERVAL_SECONDS,
+    TASK_LEASE_TTL_SECONDS,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
     TRUSTED_EGRESS_PROXY,
+    UPLOADED_FILE_RECOVERY_BATCH_SIZE,
+    UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS,
+    UPLOADED_FILE_RECOVERY_STALE_SECONDS,
     UPLOADS_DIR,
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
@@ -134,6 +141,7 @@ from xagent.config import (
     get_hot_path_cache_enabled,
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
+    get_kb_collections_timeout_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
@@ -165,10 +173,15 @@ from xagent.config import (
     get_smtp_use_tls,
     get_smtp_username,
     get_storage_root,
+    get_task_lease_recovery_batch_size,
+    get_task_lease_recovery_interval_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
     get_trusted_egress_proxy_enabled,
+    get_uploaded_file_recovery_batch_size,
+    get_uploaded_file_recovery_interval_seconds,
+    get_uploaded_file_recovery_stale_seconds,
     get_uploads_dir,
     get_web_crawl_tls_impersonate,
     get_web_dir,
@@ -214,6 +227,27 @@ class TestEnvironmentVariableConstants:
 
     def test_database_url_constant(self):
         assert DATABASE_URL == "DATABASE_URL"
+
+    def test_task_lease_recovery_constants(self):
+        assert (
+            TASK_LEASE_RECOVERY_INTERVAL_SECONDS
+            == "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
+        )
+        assert TASK_LEASE_RECOVERY_BATCH_SIZE == "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
+
+    def test_uploaded_file_recovery_constants(self):
+        assert (
+            UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS
+            == "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
+        )
+        assert (
+            UPLOADED_FILE_RECOVERY_STALE_SECONDS
+            == "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
+        )
+        assert (
+            UPLOADED_FILE_RECOVERY_BATCH_SIZE
+            == "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
+        )
 
     def test_max_upload_size_constant(self):
         assert MAX_UPLOAD_SIZE == "XAGENT_MAX_UPLOAD_SIZE"
@@ -550,6 +584,45 @@ class TestCeleryBackgroundJobConfig:
         assert get_trigger_dispatcher_enabled() is False
         assert get_trigger_dispatcher_interval_seconds() == 9
         assert get_trigger_dispatcher_batch_size() == 3
+
+    def test_task_lease_recovery_tuning(self, monkeypatch):
+        monkeypatch.setenv(TASK_LEASE_TTL_SECONDS, "60")
+        monkeypatch.delenv(TASK_LEASE_RECOVERY_INTERVAL_SECONDS, raising=False)
+        monkeypatch.delenv(TASK_LEASE_RECOVERY_BATCH_SIZE, raising=False)
+        assert get_task_lease_recovery_interval_seconds() == 20
+        assert get_task_lease_recovery_batch_size() == 100
+
+        monkeypatch.setenv(TASK_LEASE_RECOVERY_INTERVAL_SECONDS, "7")
+        monkeypatch.setenv(TASK_LEASE_RECOVERY_BATCH_SIZE, "3")
+        assert get_task_lease_recovery_interval_seconds() == 7
+        assert get_task_lease_recovery_batch_size() == 3
+
+        monkeypatch.setenv(TASK_LEASE_RECOVERY_INTERVAL_SECONDS, "")
+        monkeypatch.setenv(TASK_LEASE_RECOVERY_BATCH_SIZE, "0")
+        assert get_task_lease_recovery_interval_seconds() == 20
+        assert get_task_lease_recovery_batch_size() == 100
+
+    def test_uploaded_file_recovery_tuning(self, monkeypatch):
+        monkeypatch.delenv(UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS, raising=False)
+        monkeypatch.delenv(UPLOADED_FILE_RECOVERY_STALE_SECONDS, raising=False)
+        monkeypatch.delenv(UPLOADED_FILE_RECOVERY_BATCH_SIZE, raising=False)
+        assert get_uploaded_file_recovery_interval_seconds() == 60
+        assert get_uploaded_file_recovery_stale_seconds() == 300
+        assert get_uploaded_file_recovery_batch_size() == 100
+
+        monkeypatch.setenv(UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS, "7")
+        monkeypatch.setenv(UPLOADED_FILE_RECOVERY_STALE_SECONDS, "45")
+        monkeypatch.setenv(UPLOADED_FILE_RECOVERY_BATCH_SIZE, "3")
+        assert get_uploaded_file_recovery_interval_seconds() == 7
+        assert get_uploaded_file_recovery_stale_seconds() == 45
+        assert get_uploaded_file_recovery_batch_size() == 3
+
+        monkeypatch.setenv(UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS, "")
+        monkeypatch.setenv(UPLOADED_FILE_RECOVERY_STALE_SECONDS, "0")
+        monkeypatch.setenv(UPLOADED_FILE_RECOVERY_BATCH_SIZE, "-1")
+        assert get_uploaded_file_recovery_interval_seconds() == 60
+        assert get_uploaded_file_recovery_stale_seconds() == 300
+        assert get_uploaded_file_recovery_batch_size() == 100
 
 
 class TestGetWebSearchProvider:
@@ -1134,6 +1207,29 @@ class TestGetLancedbPath:
         monkeypatch.setenv(LANCEDB_PATH, "/custom/lancedb")
         result = get_lancedb_path()
         assert result == Path("/custom/lancedb")
+
+
+class TestGetKbCollectionsTimeoutSeconds:
+    """Test get_kb_collections_timeout_seconds() function."""
+
+    def test_env_var_constant(self):
+        assert KB_COLLECTIONS_TIMEOUT_SECONDS == "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(KB_COLLECTIONS_TIMEOUT_SECONDS, raising=False)
+        assert get_kb_collections_timeout_seconds() == 30
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(KB_COLLECTIONS_TIMEOUT_SECONDS, "90")
+        assert get_kb_collections_timeout_seconds() == 90
+
+    def test_invalid_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(KB_COLLECTIONS_TIMEOUT_SECONDS, "not-a-number")
+        assert get_kb_collections_timeout_seconds() == 30
+
+    def test_non_positive_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(KB_COLLECTIONS_TIMEOUT_SECONDS, "0")
+        assert get_kb_collections_timeout_seconds() == 30
 
 
 class TestGetDefaultSqliteDbPath:

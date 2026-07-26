@@ -16,7 +16,11 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
-from xagent.web.models.background_job import BackgroundJobStatus, BackgroundJobType
+from xagent.web.models.background_job import (
+    BackgroundJob,
+    BackgroundJobStatus,
+    BackgroundJobType,
+)
 from xagent.web.models.database import get_session_local, init_db
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -1427,3 +1431,287 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         assert job.progress["message"] == "Requeued stale background job"
     finally:
         db.close()
+
+
+def test_registered_external_handler_receives_job(tmp_path):
+    """Downstream distributions register handlers for job types xagent cannot import."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-external-handler.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "external-handler")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type="kb.team.transfer",
+            payload={"collection": "kb1"},
+        )
+        # kb.* routes to the existing kb queue, so no Celery routing change is
+        # needed for a downstream job type.
+        assert job.queue == "kb"
+
+        calls: list[str] = []
+
+        def handler(session, received):
+            assert session is db
+            calls.append(str(received.id))
+            return {"status": "ok"}
+
+        tasks_module.register_background_job_handler("kb.team.transfer", handler)
+        try:
+            result = tasks_module._execute_job_handler(db, job)
+        finally:
+            tasks_module._EXTRA_HANDLERS.pop("kb.team.transfer", None)
+
+        assert result == {"status": "ok"}
+        assert calls == [str(job.id)]
+    finally:
+        db.close()
+
+
+def test_jobs_package_exports_handler_registration_api():
+    """Downstream distributions get a public API, not a private module path.
+
+    Without these exports, out-of-tree callers must import from
+    ``xagent.web.jobs.tasks`` and probe the private ``_EXTRA_HANDLERS`` dict to
+    assert a handler is wired up.
+    """
+    from xagent.web.jobs import (
+        is_background_job_handler_registered,
+        register_background_job_handler,
+    )
+
+    assert is_background_job_handler_registered("kb.team.transfer") is False
+
+    def handler(_session, _job):
+        return {"status": "ok"}
+
+    register_background_job_handler("kb.team.transfer", handler)
+    try:
+        assert is_background_job_handler_registered("kb.team.transfer") is True
+    finally:
+        from xagent.web.jobs import tasks as tasks_module
+
+        tasks_module._EXTRA_HANDLERS.pop("kb.team.transfer", None)
+
+    assert is_background_job_handler_registered("kb.team.transfer") is False
+
+
+def test_register_background_job_handler_rejects_duplicate(tmp_path):
+    """Duplicate registration is a bug, not a silent last-writer-wins overwrite."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    def first_handler(_session, _job):
+        return {"status": "first"}
+
+    def second_handler(_session, _job):
+        return {"status": "second"}
+
+    tasks_module.register_background_job_handler("kb.team.transfer", first_handler)
+    try:
+        with pytest.raises(ValueError, match="already registered"):
+            tasks_module.register_background_job_handler(
+                "kb.team.transfer", second_handler
+            )
+        assert tasks_module._EXTRA_HANDLERS["kb.team.transfer"] is first_handler
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop("kb.team.transfer", None)
+
+
+def test_register_background_job_handler_replace_overrides_existing(tmp_path):
+    """``replace=True`` is the explicit opt-in for swapping a registration."""
+    from xagent.web.jobs import tasks as tasks_module
+
+    def first_handler(_session, _job):
+        return {"status": "first"}
+
+    def second_handler(_session, _job):
+        return {"status": "second"}
+
+    tasks_module.register_background_job_handler("kb.team.transfer", first_handler)
+    try:
+        tasks_module.register_background_job_handler(
+            "kb.team.transfer", second_handler, replace=True
+        )
+        assert tasks_module._EXTRA_HANDLERS["kb.team.transfer"] is second_handler
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop("kb.team.transfer", None)
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_register_background_job_handler_rejects_builtin_job_type(replace):
+    """Shadowing a built-in type would register a handler that never fires.
+
+    ``_execute_job_handler`` checks the built-in job types before consulting
+    ``_EXTRA_HANDLERS``, so such a registration is dead on arrival and must be
+    rejected at registration time rather than failing silently at run time.
+    """
+    from xagent.web.jobs import tasks as tasks_module
+
+    def handler(_session, _job):
+        return {"status": "shadowed"}
+
+    for builtin in BackgroundJobType:
+        try:
+            with pytest.raises(ValueError, match="built-in"):
+                tasks_module.register_background_job_handler(
+                    builtin.value, handler, replace=replace
+                )
+            assert builtin.value not in tasks_module._EXTRA_HANDLERS
+        finally:
+            tasks_module._EXTRA_HANDLERS.pop(builtin.value, None)
+
+
+def test_unregistered_job_type_still_raises(tmp_path):
+    from xagent.web.jobs import tasks as tasks_module
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-unknown-handler.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "unknown-handler")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type="nope.unsupported",
+            payload={},
+        )
+        with pytest.raises(
+            BackgroundJobHandlerError, match="Unsupported background job type"
+        ) as excinfo:
+            tasks_module._execute_job_handler(db, job)
+        # Typed as a handler error so execute_background_job classifies it as
+        # permanent rather than falling through to the generic retry branch.
+        assert excinfo.value.retryable is False
+    finally:
+        db.close()
+
+
+def test_unknown_job_type_fails_fast_without_retry(tmp_path, monkeypatch):
+    """An unroutable job type is permanent, so the worker must not burn retries.
+
+    A worker that has no handler for ``job.job_type`` cannot grow one by waiting,
+    so ``execute_background_job`` must mark the job ``FAILED`` after a single
+    attempt instead of scheduling ``max_attempts`` retries with backoff.
+    """
+    from xagent.web.jobs import tasks as tasks_module
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-unknown-fail-fast.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "unknown-fail-fast")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type="nope.unsupported",
+            payload={},
+            max_attempts=3,
+        )
+        job_id = str(job.id)
+    finally:
+        db.close()
+
+    retry_calls: list[BaseException | None] = []
+
+    def fake_retry(*_args, **kwargs):
+        retry_calls.append(kwargs.get("exc"))
+        return RuntimeError("retry requested")
+
+    monkeypatch.setattr(tasks_module.execute_background_job, "retry", fake_retry)
+
+    outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+
+    assert retry_calls == []
+    assert isinstance(outcome.result, BackgroundJobHandlerError)
+    assert outcome.result.retryable is False
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.FAILED.value
+        assert refreshed.attempts == 1
+        assert "Unsupported background job type" in str(refreshed.error_message)
+    finally:
+        verify_db.close()
+
+
+def test_registered_handler_retryable_error_flows_through_execute_background_job(
+    tmp_path, monkeypatch
+):
+    """A registered downstream handler keeps the shared retry path, not just dispatch.
+
+    ``test_registered_external_handler_receives_job`` only drives the private
+    ``_execute_job_handler`` dispatch. Nothing verified that a registered
+    handler raising a retryable ``BackgroundJobHandlerError`` actually flows
+    through ``execute_background_job``'s retry machinery the same way the
+    built-in handlers do: job reset to ``ENQUEUED`` and ``self.retry`` invoked.
+    """
+    from xagent.web.jobs import tasks as tasks_module
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    job_type = "test.retryable_registered"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-registered-retryable.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "registered-retryable")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=job_type,
+            payload={},
+            max_attempts=3,
+        )
+        job_id = str(job.id)
+    finally:
+        db.close()
+
+    handler_calls: list[str] = []
+
+    def flaky_handler(session, received):
+        handler_calls.append(str(received.id))
+        raise BackgroundJobHandlerError("transient downstream failure", retryable=True)
+
+    tasks_module.register_background_job_handler(job_type, flaky_handler)
+
+    retry_calls: list[BaseException | None] = []
+
+    def fake_retry(*_args, **kwargs):
+        retry_calls.append(kwargs.get("exc"))
+        return RuntimeError("retry requested")
+
+    monkeypatch.setattr(tasks_module.execute_background_job, "retry", fake_retry)
+
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert handler_calls == [job_id]
+    assert len(retry_calls) == 1
+    assert isinstance(retry_calls[0], BackgroundJobHandlerError)
+    assert retry_calls[0].retryable is True
+    assert isinstance(outcome.result, RuntimeError)
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.ENQUEUED.value
+        assert refreshed.attempts == 1
+        assert "transient downstream failure" in str(refreshed.error_message)
+    finally:
+        verify_db.close()

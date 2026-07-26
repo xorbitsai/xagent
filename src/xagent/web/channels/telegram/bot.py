@@ -18,39 +18,45 @@ from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile
 from sqlalchemy.orm import Session
 
-from ....config import get_default_task_execution_mode
 from ....core.file_ref import build_file_id_ref
 from ...api.chat import get_agent_manager
-from ...models.database import get_db
-from ...models.task import Task, TaskStatus
-from ...models.uploaded_file import UploadedFile
+from ...models.database import get_session_local
+from ...models.task import TaskStatus
 from ...models.user import User
-from ...services.chat_history_service import persist_user_message
+from ...services.channel_runtime import (
+    ChannelAuthorizationError,
+    ChannelConfigurationError,
+    DownloadedChannelFile,
+    authorize_channel_sender,
+    load_active_channel_configs,
+    load_channel_output_files,
+    persist_channel_user_message,
+    prepare_channel_task,
+    register_channel_uploaded_files,
+    update_channel_task_fields,
+)
+from ...services.db_runtime import (
+    cancel_and_drain_async_task,
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
 from ...services.execution_result_projection import project_execution_result_for_channel
 from ...services.file_turn import (
     append_uploaded_files_context,
     build_uploaded_files_context,
     normalize_attachments_for_persistence,
 )
-from ...services.managed_task_lease import (
-    ManagedTaskLease,
-    claim_managed_task_lease,
+from ...services.managed_task_lease import ManagedTaskLease
+from ...services.task_execution_context_service import (
+    materialize_task_execution_recovery_state,
 )
-from ...services.task_execution_controller import (
-    StaleTaskRunError,
-    TaskControlState,
-    apply_task_control_transition,
-    control_state_for_status,
-    task_control_snapshot,
-    task_execution_controller,
-)
+from ...services.task_lease_service import TaskLeaseLostError
+from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
 from .handler import TelegramTraceHandler
 from .utils import (
     TelegramFileRef,
     TelegramImageRef,
     markdown_to_tg_html,
-    persist_telegram_assistant_turn,
-    restore_telegram_task_context,
     strip_telegram_file_refs,
     strip_telegram_image_refs,
 )
@@ -86,6 +92,10 @@ class TelegramBotInstance:
         self.user_active_executions: Dict[int, tuple[int, object]] = {}
         self.user_preparing_executions: set[int] = set()
         self.user_stop_events: Dict[int, asyncio.Event] = {}
+        self._accepting = True
+        self._ingress_stopped = False
+        self._stop_lock: asyncio.Lock | None = None
+        self._stop_loop: asyncio.AbstractEventLoop | None = None
 
         # Load active tasks state
         self.active_tasks_file = Path(f"data/telegram_active_tasks_{instance_id}.json")
@@ -139,6 +149,8 @@ class TelegramBotInstance:
 
         @self.dp.message(CommandStart())
         async def cmd_start(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
             logger.info(
                 f"Received /start from {message.from_user.id} on bot {self.instance_id}"
             )
@@ -148,6 +160,8 @@ class TelegramBotInstance:
 
         @self.dp.message(Command("new"))
         async def cmd_new(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
             logger.info(
                 f"Received /new from {message.from_user.id} on bot {self.instance_id}"
             )
@@ -158,6 +172,8 @@ class TelegramBotInstance:
 
         @self.dp.message(Command("stop", "pause"))
         async def cmd_stop(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
             logger.info(
                 f"Received stop command from {message.from_user.id} on bot {self.instance_id}"
             )
@@ -171,6 +187,8 @@ class TelegramBotInstance:
 
         @self.dp.message()
         async def handle_message(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
             msg_content = (
                 message.text
                 or message.caption
@@ -202,20 +220,25 @@ class TelegramBotInstance:
                     await message.answer("No active run to stop.")
                 return
 
-            if user_id not in self.user_message_queues:
-                self.user_message_queues[user_id] = []
-            self.user_message_queues[user_id].append(message)
+            self._enqueue_user_message(user_id, message)
 
-            if (
-                user_id not in self.user_message_tasks
-                or self.user_message_tasks[user_id].done()
-            ):
-                self._schedule_user_queue(user_id)
+    def _enqueue_user_message(self, user_id: int, message: Any) -> bool:
+        if not self._accepting:
+            return False
 
-    def _schedule_user_queue(self, user_id: int) -> None:
+        self.user_message_queues.setdefault(user_id, []).append(message)
+        task = self.user_message_tasks.get(user_id)
+        if task is None or task.done():
+            self._schedule_user_queue(user_id)
+        return True
+
+    def _schedule_user_queue(self, user_id: int) -> bool:
+        if not self._accepting:
+            return False
         self.user_message_tasks[user_id] = asyncio.create_task(
             self._process_user_queue(user_id)
         )
+        return True
 
     def _start_new_conversation(self, user_id: int) -> bool:
         stopped = self._request_current_conversation_stop(
@@ -318,7 +341,18 @@ class TelegramBotInstance:
                     return await execution_task
         finally:
             if not execution_task.done():
-                execution_task.cancel()
+                await cancel_and_drain_async_task(execution_task)
+
+    @staticmethod
+    async def _finalize_requested_stop(
+        managed_lease: ManagedTaskLease,
+        *,
+        task_id: int,
+    ) -> None:
+        if not await managed_lease.finalize_result(status=TaskStatus.PAUSED):
+            raise TaskLeaseLostError(
+                f"task {task_id} ownership changed before Telegram stop"
+            )
 
     def _is_stop_request_text(self, text: str) -> bool:
         normalized = text.strip().lower()
@@ -349,7 +383,7 @@ class TelegramBotInstance:
         self, message: types.Message
     ) -> tuple[str, list]:
         text = message.text or message.caption or ""
-        files = []
+        files: list[Any] = []
 
         if message.document:
             files.append(message.document)
@@ -377,6 +411,16 @@ class TelegramBotInstance:
                 return None
             raise
         return get_asr_model_instance(db_model)
+
+    def _resolve_voice_asr_model_isolated(self, user_id: int) -> Any | None:
+        """Resolve ASR in one worker-owned Session without leaking ORM state."""
+
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.id == user_id).first()
+            if user is None:
+                return None
+            return self._resolve_voice_asr_model(db, user)
 
     @staticmethod
     def _audio_format_from_file_info(file_info: dict[str, Any]) -> str | None:
@@ -497,15 +541,10 @@ class TelegramBotInstance:
         agent_service: "AgentService",
         task_id: int,
         user_id: int,
-        db: Session,
     ) -> list:
-        from ...services.uploaded_file_store import UploadedFileStore
-
-        uploaded_files_info: list[dict] = []
-
         if not agent_service.workspace:
             logger.warning("Agent service workspace is not available for file upload")
-            return uploaded_files_info
+            return []
 
         target_dir = getattr(
             agent_service.workspace,
@@ -513,15 +552,20 @@ class TelegramBotInstance:
             agent_service.workspace.workspace_dir / "input",
         )
 
+        downloaded_files: list[DownloadedChannelFile] = []
         for f in files:
             try:
                 file_id = f.file_id
                 tg_file = await self.bot.get_file(file_id)
+                if not tg_file.file_path:
+                    raise FileNotFoundError(
+                        f"Telegram file {file_id} has no downloadable path"
+                    )
 
                 if hasattr(f, "file_name") and f.file_name:
                     file_name = f.file_name
                 else:
-                    ext = Path(tg_file.file_path).suffix if tg_file.file_path else ""
+                    ext = Path(tg_file.file_path).suffix
                     if not ext and type(f).__name__ == "PhotoSize":
                         ext = ".jpg"
                     file_name = f"{file_id}{ext}"
@@ -549,41 +593,36 @@ class TelegramBotInstance:
                 mime_type = self._mime_type_for_telegram_file(f, target_path)
 
                 file_size = getattr(f, "file_size", None) or target_path.stat().st_size
-
-                file_record = UploadedFileStore(db).create_from_local_path(
-                    local_path=target_path,
-                    user_id=user_id,
-                    task_id=task_id,
-                    filename=normalized_file_name,
-                    mime_type=mime_type,
-                )
-                setattr(file_record, "file_size", int(file_size))
-                db.flush()
-
-                agent_service.workspace.register_file(
-                    str(target_path),
-                    file_id=str(file_record.file_id),
-                    db_session=db,
-                )
-
-                uploaded_files_info.append(
-                    {
-                        "file_id": str(file_record.file_id),
-                        "name": normalized_file_name,
-                        "path": str(target_path),
-                        "type": mime_type,
-                        "size": file_size,
-                        "telegram_file_id": str(file_id),
-                    }
-                )
-                logger.info(
-                    f"Successfully downloaded and registered Telegram file: {normalized_file_name}"
+                downloaded_files.append(
+                    DownloadedChannelFile(
+                        name=normalized_file_name,
+                        path=target_path,
+                        mime_type=mime_type,
+                        size=int(file_size),
+                        source_id=str(file_id),
+                    )
                 )
             except Exception as e:
                 logger.error(
-                    f"Failed to process Telegram file {getattr(f, 'file_id', 'unknown')}: {e}"
+                    "Failed to download Telegram file %s: %s",
+                    getattr(f, "file_id", "unknown"),
+                    e,
                 )
 
+        registered = await register_channel_uploaded_files(
+            workspace=agent_service.workspace,
+            task_id=task_id,
+            user_id=user_id,
+            files=tuple(downloaded_files),
+        )
+        uploaded_files_info = [
+            item.to_file_info(source_key="telegram_file_id") for item in registered
+        ]
+        for item in registered:
+            logger.info(
+                "Successfully downloaded and registered Telegram file: %s",
+                item.name,
+            )
         return uploaded_files_info
 
     async def _process_user_messages_batch(
@@ -613,44 +652,22 @@ class TelegramBotInstance:
         self.user_preparing_executions.add(user_id)
         self._clear_user_stop_request(user_id)
         claimed_task_id: int | None = None
-        claimed_run_id: str | None = None
         managed_lease: ManagedTaskLease | None = None
         voice_asr_model: Any | None = None
         try:
-            db_gen = get_db()
-            db = next(db_gen)
             try:
-                user = None
-                if self.channel_id:
-                    from ...models.user_channel import UserChannel
-
-                    channel = (
-                        db.query(UserChannel)
-                        .filter(UserChannel.id == self.channel_id)
-                        .first()
-                    )
-                    if channel:
-                        user = db.query(User).filter(User.id == channel.user_id).first()
-                        if channel.config:
-                            allowed_users = channel.config.get("allowed_users")
-                            if allowed_users is not None:
-                                if str(last_message.from_user.id) not in allowed_users:
-                                    await last_message.answer(
-                                        "🚫 You are not authorized to use this bot."
-                                    )
-                                    return
-
-                if not user:
-                    await last_message.answer(
-                        "Configuration error: Cannot find the owner of this bot."
-                    )
-                    return
-
-                if self._consume_user_stop_request(user_id):
-                    return
-
+                expected_owner_user_id: int | None = None
                 if voice_file_ids:
-                    voice_asr_model = self._resolve_voice_asr_model(db, user)
+                    owner = await authorize_channel_sender(
+                        channel_id=self.channel_id,
+                        external_user_id=str(user_id),
+                    )
+                    expected_owner_user_id = owner.user_id
+                    voice_asr_model = await run_db_io_cancellation_safe(
+                        lambda: self._resolve_voice_asr_model_isolated(
+                            expected_owner_user_id
+                        )
+                    )
                     if voice_asr_model is None:
                         await last_message.answer(
                             "I couldn't understand that voice message because no "
@@ -660,345 +677,321 @@ class TelegramBotInstance:
                         return
 
                 active_task_id = self.active_tasks.get(user_id)
-                task = None
-
-                if active_task_id == -1:
-                    pass
-                elif active_task_id:
-                    task = (
-                        db.query(Task)
-                        .filter(Task.id == active_task_id, Task.user_id == user.id)
-                        .first()
-                    )
-
-                is_new_task = False
-                if not task:
-                    task_title = text if text else "Untitled Task"
-                    if len(task_title) > 50:
-                        task_title = task_title[:50] + "..."
-
-                    task = Task(
-                        user_id=user.id,
-                        title=task_title,
-                        description=text,
-                        status=TaskStatus.PENDING,
-                        execution_mode=get_default_task_execution_mode(),
-                        channel_id=self.channel_id,
-                        channel_name=self.channel_name,
-                        connector_runtime_selected_refs=[],
-                    )
-                    db.add(task)
-                    db.commit()
-                    db.refresh(task)
-                    self.active_tasks[user_id] = task.id
-                    self._save_active_tasks()
-                    is_new_task = True
-                else:
-                    db.refresh(task)
-
-                async with task_execution_controller.command(int(task.id)):
-                    db.refresh(task)
-                    managed_lease = claim_managed_task_lease(db, int(task.id))
-                    if managed_lease is None:
-                        await last_message.answer(
-                            "I'm still working on the previous message. "
-                            "Please wait for it to finish."
-                        )
-                        return
-                    db.refresh(task)
-                    run_snapshot = task_control_snapshot(task)
-                    claimed_task_id = int(task.id)
-                    claimed_run_id = run_snapshot.run_id
-
-                agent_manager = get_agent_manager()
-                agent_service = await agent_manager.get_agent_for_task(
-                    int(task.id),
-                    db,
-                    user=user,  # type: ignore
+                prepared_task = await prepare_channel_task(
+                    channel_id=self.channel_id,
+                    external_user_id=str(user_id),
+                    active_task_id=(
+                        int(active_task_id) if active_task_id is not None else None
+                    ),
+                    text=text,
+                    channel_name=self.channel_name,
+                    expected_owner_user_id=expected_owner_user_id,
                 )
+            except ChannelAuthorizationError:
+                await last_message.answer("🚫 You are not authorized to use this bot.")
+                return
+            except ChannelConfigurationError:
+                await last_message.answer(
+                    "Configuration error: Cannot find the owner of this bot."
+                )
+                return
 
-                await restore_telegram_task_context(agent_service, db, int(task.id))
+            if prepared_task is None:
+                await last_message.answer(
+                    "I'm still working on the previous message. "
+                    "Please wait for it to finish."
+                )
+                return
 
-                message_turn_id = str(uuid4())
-                context: dict = {"turn_id": message_turn_id}
+            # No await is allowed between receiving the committed claim and
+            # taking ownership of its managed heartbeat in this transport.
+            managed_lease = prepared_task.managed_lease
+            task_id = prepared_task.task_id
+            claimed_task_id = task_id
+            owner_user_id = prepared_task.user_id
+            is_new_task = prepared_task.is_new_task
+            if is_new_task:
+                self.active_tasks[user_id] = task_id
+                self._save_active_tasks()
 
-                if self._consume_user_stop_request(user_id):
-                    apply_task_control_transition(
-                        task,
-                        TaskControlState.PAUSED,
-                        status=TaskStatus.PAUSED,
-                        expected_run_id=run_snapshot.run_id,
+            if self._consume_user_stop_request(user_id):
+                await self._finalize_requested_stop(
+                    managed_lease,
+                    task_id=task_id,
+                )
+                return
+
+            setup_snapshot = await run_db_io_cancellation_safe(
+                lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
+            )
+            if setup_snapshot is None:
+                raise RuntimeError(f"Task {task_id} disappeared before execution")
+
+            agent_manager = get_agent_manager()
+            agent_service = await agent_manager.get_agent_for_task(
+                task_id,
+                user=setup_snapshot.runtime_user,
+                task_setup_snapshot=setup_snapshot,
+                task_owner_user_id=owner_user_id,
+            )
+            agent_service.set_conversation_history(
+                [dict(message) for message in setup_snapshot.conversation_history]
+            )
+            recovery_state = await materialize_task_execution_recovery_state(
+                setup_snapshot.execution_recovery
+            )
+            agent_service.set_execution_context_messages(
+                recovery_state.get("messages", [])
+            )
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
+
+            message_turn_id = str(uuid4())
+            context: dict = {"turn_id": message_turn_id}
+
+            if self._consume_user_stop_request(user_id):
+                await self._finalize_requested_stop(
+                    managed_lease,
+                    task_id=task_id,
+                )
+                return
+
+            uploaded_info: list[dict[str, Any]] = []
+            persisted_attachments: list[dict[str, Any]] = []
+            execution_text = text
+            display_message = text
+            if files:
+                uploaded_info = await self._download_and_register_files(
+                    files=files,
+                    agent_service=agent_service,
+                    task_id=task_id,
+                    user_id=owner_user_id,
+                )
+                if voice_file_ids and not uploaded_info:
+                    raise TelegramVoiceTranscriptionError(
+                        "Telegram voice input was not downloaded"
                     )
-                    db.commit()
-                    return
-
-                uploaded_info: list[dict[str, Any]] = []
-                persisted_attachments: list[dict[str, Any]] = []
-                execution_text = text
-                display_message = text
-                if files:
-                    uploaded_info = await self._download_and_register_files(
-                        files=files,
-                        agent_service=agent_service,
-                        task_id=int(task.id),  # type: ignore
-                        user_id=int(user.id),  # type: ignore
-                        db=db,
+                if uploaded_info:
+                    persisted_attachments = normalize_attachments_for_persistence(
+                        uploaded_info
                     )
-                    if voice_file_ids and not uploaded_info:
-                        raise TelegramVoiceTranscriptionError(
-                            "Telegram voice input was not downloaded"
+                    voice_transcripts: dict[str, str] = {}
+                    if voice_file_ids:
+                        voice_transcripts = await self._transcribe_uploaded_voice_files(
+                            voice_file_ids,
+                            uploaded_info,
+                            voice_asr_model,
                         )
-                    if uploaded_info:
-                        persisted_attachments = normalize_attachments_for_persistence(
-                            uploaded_info
-                        )
-                        voice_transcripts: dict[str, str] = {}
+                        await self._close_voice_asr_model(voice_asr_model)
+                        voice_asr_model = None
+
+                    text = self._compose_prompt_text(
+                        message_contents,
+                        voice_transcripts,
+                    )
+                    display_message = self._display_message_for_user(
+                        text,
+                        bool(uploaded_info),
+                    )
+                    voice_file_id_set = set(voice_file_ids)
+                    voice_uploaded_info = [
+                        info
+                        for info in uploaded_info
+                        if str(info.get("telegram_file_id")) in voice_file_id_set
+                    ]
+                    regular_uploaded_info = [
+                        info
+                        for info in uploaded_info
+                        if str(info.get("telegram_file_id")) not in voice_file_id_set
+                    ]
+                    file_info_list = [
+                        f"[{info['name']}]({build_file_id_ref(info['file_id'])})"
+                        for info in regular_uploaded_info
+                    ]
+                    if text and file_info_list:
+                        text += f"\n\n{' '.join(file_info_list)}"
+                    elif file_info_list:
+                        text = " ".join(file_info_list)
+                    execution_text = append_uploaded_files_context(
+                        text,
+                        build_uploaded_files_context(voice_uploaded_info),
+                    )
+                    if is_new_task:
+                        title = None
                         if voice_file_ids:
-                            voice_transcripts = (
-                                await self._transcribe_uploaded_voice_files(
-                                    voice_file_ids,
-                                    uploaded_info,
-                                    voice_asr_model,
-                                )
-                            )
-                            await self._close_voice_asr_model(voice_asr_model)
-                            voice_asr_model = None
-
-                        text = self._compose_prompt_text(
-                            message_contents,
-                            voice_transcripts,
+                            title = text if len(text) <= 50 else f"{text[:50]}..."
+                        await update_channel_task_fields(
+                            task_id=task_id,
+                            user_id=owner_user_id,
+                            description=text,
+                            title=title,
                         )
-                        display_message = self._display_message_for_user(
-                            text,
-                            bool(uploaded_info),
-                        )
-                        voice_file_id_set = set(voice_file_ids)
-                        voice_uploaded_info = [
-                            info
-                            for info in uploaded_info
-                            if str(info.get("telegram_file_id")) in voice_file_id_set
-                        ]
-                        regular_uploaded_info = [
-                            info
-                            for info in uploaded_info
-                            if str(info.get("telegram_file_id"))
-                            not in voice_file_id_set
-                        ]
-                        file_info_list = [
-                            f"[{info['name']}]({build_file_id_ref(info['file_id'])})"
-                            for info in regular_uploaded_info
-                        ]
-                        if text and file_info_list:
-                            text += f"\n\n{' '.join(file_info_list)}"
-                        elif file_info_list:
-                            text = " ".join(file_info_list)
-                        execution_text = append_uploaded_files_context(
-                            text,
-                            build_uploaded_files_context(voice_uploaded_info),
-                        )
-                        if is_new_task:
-                            task.description = text  # type: ignore
-                            if voice_file_ids or not task.title:
-                                title = text if len(text) <= 50 else f"{text[:50]}..."
-                                task.title = title  # type: ignore[assignment]
-                            db.commit()
 
-                        context["state"] = context.get("state", {})
-                        context["state"]["file_info"] = uploaded_info
-                        context["file_info"] = uploaded_info
-                        context["uploaded_files"] = [
-                            str(info["path"]) for info in uploaded_info
-                        ]
-                        context["files"] = persisted_attachments
-                        context["display_message"] = display_message
+                    context["state"] = context.get("state", {})
+                    context["state"]["file_info"] = uploaded_info
+                    context["file_info"] = uploaded_info
+                    context["uploaded_files"] = [
+                        str(info["path"]) for info in uploaded_info
+                    ]
+                    context["files"] = persisted_attachments
+                    context["display_message"] = display_message
 
+            if self._consume_user_stop_request(user_id):
+                await self._finalize_requested_stop(
+                    managed_lease,
+                    task_id=task_id,
+                )
+                return
+
+            await persist_channel_user_message(
+                task_id=task_id,
+                user_id=owner_user_id,
+                content=display_message,
+                attachments=persisted_attachments or None,
+                turn_id=message_turn_id,
+            )
+
+            loading_msg = await last_message.answer(
+                "Got it, I'm working on this now.\n"
+                "<i>I'll update this message as I make progress.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+
+            tg_handler = TelegramTraceHandler(
+                task_id,
+                self.bot,
+                last_message.chat.id,
+                message_id=loading_msg.message_id,
+            )
+            agent_service.tracer.add_handler(tg_handler)
+
+            from ...user_isolated_memory import UserContext
+
+            actual_task_id = str(task_id)
+            active_execution = (task_id, agent_service)
+            self.user_active_executions[user_id] = active_execution
+
+            try:
                 if self._consume_user_stop_request(user_id):
-                    apply_task_control_transition(
-                        task,
-                        TaskControlState.PAUSED,
-                        status=TaskStatus.PAUSED,
-                        expected_run_id=run_snapshot.run_id,
+                    await self._finalize_requested_stop(
+                        managed_lease,
+                        task_id=task_id,
                     )
-                    db.commit()
                     return
 
-                persist_user_message(
-                    db=db,
-                    task_id=int(task.id),  # type: ignore
-                    user_id=int(user.id),  # type: ignore
-                    content=display_message,
-                    attachments=persisted_attachments or None,
-                    turn_id=message_turn_id,
-                )
-
-                loading_msg = await last_message.answer(
-                    "Got it, I'm working on this now.\n"
-                    "<i>I'll update this message as I make progress.</i>",
-                    parse_mode=ParseMode.HTML,
-                )
-
-                tg_handler = TelegramTraceHandler(
-                    int(task.id),  # type: ignore
-                    self.bot,
-                    last_message.chat.id,
-                    message_id=loading_msg.message_id,
-                )
-                agent_service.tracer.add_handler(tg_handler)
-
-                from ...user_isolated_memory import UserContext
-
-                actual_task_id = str(task.id)
-                active_execution = (int(task.id), agent_service)  # type: ignore[arg-type]
-                self.user_active_executions[user_id] = active_execution
-
-                try:
-                    if self._consume_user_stop_request(user_id):
-                        apply_task_control_transition(
-                            task,
-                            TaskControlState.PAUSED,
-                            status=TaskStatus.PAUSED,
-                            expected_run_id=run_snapshot.run_id,
-                        )
-                        db.commit()
-                        return
-
-                    with UserContext(int(user.id)):  # type: ignore
-                        result = await self._await_execution_with_stop_monitor(
-                            user_id,
-                            agent_manager.execute_task(
-                                agent_service=agent_service,
-                                task=execution_text,
-                                context=context,
-                                task_id=actual_task_id,
-                                tracking_task_id=str(task.id),
-                                db_session=db,
-                                manage_task_lease=False,
-                            ),
-                            reason="Telegram stop requested",
-                        )
-                finally:
-                    if self.user_active_executions.get(user_id) == active_execution:
-                        self.user_active_executions.pop(user_id, None)
-                    if tg_handler in agent_service.tracer.handlers:
-                        agent_service.tracer.handlers.remove(tg_handler)
-
-                projection = project_execution_result_for_channel(result)
-                db.refresh(task)
-                projected_control_state = control_state_for_status(
-                    projection.task_status
-                )
-                if (
-                    task.status != projection.task_status
-                    or task.control_state != projected_control_state.value
-                ):
-                    try:
-                        apply_task_control_transition(
-                            task,
-                            projected_control_state,
-                            status=projection.task_status,
-                            expected_run_id=run_snapshot.run_id,
-                        )
-                        db.commit()
-                    except StaleTaskRunError:
-                        db.rollback()
-                        logger.info(
-                            "Skipping stale Telegram completion for task %s run %s",
-                            task.id,
-                            run_snapshot.run_id,
-                        )
-
-                persist_telegram_assistant_turn(
-                    db=db,
-                    task_id=int(task.id),  # type: ignore
-                    user_id=int(user.id),  # type: ignore
-                    content=projection.transcript_content,
-                    interactions=projection.interactions,
-                    message_type=projection.message_type,
-                )
-
-                output, image_refs, file_refs = self._extract_telegram_output_refs(
-                    projection.visible_text,
-                )
-                if not output and (image_refs or file_refs):
-                    output = "Task completed."
-
-                max_len = 4000
-                text_chunks = [
-                    output[i : i + max_len] for i in range(0, len(output), max_len)
-                ]
-
-                try:
-                    html_chunk0 = markdown_to_tg_html(text_chunks[0])
-                    await loading_msg.edit_text(html_chunk0, parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    if "message is not modified" not in str(e).lower():
-                        try:
-                            await loading_msg.edit_text(text_chunks[0])
-                        except Exception as e2:
-                            if "message is not modified" not in str(e2).lower():
-                                logger.warning(f"Failed to edit message: {e2}")
-
-                for chunk in text_chunks[1:]:
-                    try:
-                        html_chunk = markdown_to_tg_html(chunk)
-                        await last_message.answer(html_chunk, parse_mode=ParseMode.HTML)
-                    except Exception:
-                        await last_message.answer(chunk)
-
-                if image_refs:
-                    failed_image_refs = await self._send_output_images(
-                        image_refs=image_refs,
-                        user_id=int(user.id),  # type: ignore
-                        task_id=int(task.id),  # type: ignore
-                        db=db,
-                        reply_to=last_message,
+                with UserContext(owner_user_id):
+                    result = await self._await_execution_with_stop_monitor(
+                        user_id,
+                        agent_manager.execute_task(
+                            agent_service=agent_service,
+                            task=execution_text,
+                            context=context,
+                            task_id=actual_task_id,
+                            tracking_task_id=actual_task_id,
+                            db_session=None,
+                            manage_task_lease=False,
+                            task_lease=managed_lease.lease,
+                            task_lease_heartbeat_task=managed_lease.heartbeat_task,
+                        ),
+                        reason="Telegram stop requested",
                     )
-                    if failed_image_refs:
-                        await self._send_image_fallback_message(
-                            image_refs=failed_image_refs,
-                            reply_to=last_message,
-                        )
-                if file_refs:
-                    failed_file_refs = await self._send_output_files(
-                        file_refs=file_refs,
-                        user_id=int(user.id),  # type: ignore
-                        task_id=int(task.id),  # type: ignore
-                        db=db,
-                        reply_to=last_message,
-                    )
-                    if failed_file_refs:
-                        await self._send_file_fallback_message(
-                            file_refs=failed_file_refs,
-                            reply_to=last_message,
-                        )
-
             finally:
+                if self.user_active_executions.get(user_id) == active_execution:
+                    self.user_active_executions.pop(user_id, None)
+                if tg_handler in agent_service.tracer.handlers:
+                    agent_service.tracer.handlers.remove(tg_handler)
+
+            projection = project_execution_result_for_channel(result)
+            if not await managed_lease.finalize_result(
+                status=projection.task_status,
+                assistant_content=projection.transcript_content,
+                interactions=projection.interactions,
+                message_type=projection.message_type,
+            ):
+                raise TaskLeaseLostError(
+                    f"task {task_id} ownership changed before Telegram result"
+                )
+
+            output, image_refs, file_refs = self._extract_telegram_output_refs(
+                projection.visible_text,
+            )
+            if not output and (image_refs or file_refs):
+                output = "Task completed."
+
+            max_len = 4000
+            text_chunks = [
+                output[i : i + max_len] for i in range(0, len(output), max_len)
+            ]
+
+            try:
+                html_chunk0 = markdown_to_tg_html(text_chunks[0])
+                await loading_msg.edit_text(html_chunk0, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    try:
+                        await loading_msg.edit_text(text_chunks[0])
+                    except Exception as e2:
+                        if "message is not modified" not in str(e2).lower():
+                            logger.warning(f"Failed to edit message: {e2}")
+
+            for chunk in text_chunks[1:]:
                 try:
-                    next(db_gen)
-                except StopIteration:
-                    pass
+                    html_chunk = markdown_to_tg_html(chunk)
+                    await last_message.answer(html_chunk, parse_mode=ParseMode.HTML)
+                except Exception:
+                    await last_message.answer(chunk)
+
+            if image_refs:
+                failed_image_refs = await self._send_output_images(
+                    image_refs=image_refs,
+                    user_id=owner_user_id,
+                    task_id=task_id,
+                    reply_to=last_message,
+                )
+                if failed_image_refs:
+                    await self._send_image_fallback_message(
+                        image_refs=failed_image_refs,
+                        reply_to=last_message,
+                    )
+            if file_refs:
+                failed_file_refs = await self._send_output_files(
+                    file_refs=file_refs,
+                    user_id=owner_user_id,
+                    task_id=task_id,
+                    reply_to=last_message,
+                )
+                if failed_file_refs:
+                    await self._send_file_fallback_message(
+                        file_refs=failed_file_refs,
+                        reply_to=last_message,
+                    )
+        except TaskLeaseLostError:
+            logger.warning(
+                "Telegram execution lost task %s lease; skipping stale result",
+                claimed_task_id,
+            )
         except Exception as e:
             logger.error(f"Error processing Telegram message: {e}")
-            if claimed_task_id is not None and claimed_run_id is not None:
+            if managed_lease is not None:
                 try:
-                    snapshot = await task_execution_controller.snapshot(claimed_task_id)
-                    if (
-                        snapshot is not None
-                        and snapshot.run_id == claimed_run_id
-                        and snapshot.status == TaskStatus.RUNNING
-                    ):
-                        await task_execution_controller.transition(
-                            claimed_task_id,
-                            TaskControlState.FAILED,
-                            status=TaskStatus.FAILED,
-                            expected_run_id=claimed_run_id,
-                        )
+                    finalized = await managed_lease.finalize_result(
+                        status=TaskStatus.FAILED,
+                    )
                 except Exception:
                     logger.warning(
                         "Failed to finalize Telegram task %s after channel error",
                         claimed_task_id,
                         exc_info=True,
                     )
+                    return
+                if not finalized:
+                    logger.warning(
+                        "Telegram task %s ownership changed after channel error; "
+                        "skipping stale error response",
+                        claimed_task_id,
+                    )
+                    return
             if isinstance(e, TelegramVoiceTranscriptionError):
                 await last_message.answer(
                     "I couldn't transcribe that voice message. Please try again "
@@ -1009,12 +1002,21 @@ class TelegramBotInstance:
                     "Sorry, an error occurred while processing your request."
                 )
         finally:
-            if voice_asr_model is not None:
-                await self._close_voice_asr_model(voice_asr_model)
-            if managed_lease is not None:
-                await managed_lease.close()
-            self.user_preparing_executions.discard(user_id)
-            self._clear_user_stop_request(user_id)
+
+            async def _cleanup_message_batch() -> None:
+                try:
+                    if managed_lease is not None:
+                        await managed_lease.close()
+                finally:
+                    try:
+                        if voice_asr_model is not None:
+                            await self._close_voice_asr_model(voice_asr_model)
+                    finally:
+                        self.user_preparing_executions.discard(user_id)
+                        self._clear_user_stop_request(user_id)
+
+            cleanup_task = asyncio.create_task(_cleanup_message_batch())
+            await drain_async_task_cancellation_safe(cleanup_task)
 
     async def _send_output_images(
         self,
@@ -1022,24 +1024,17 @@ class TelegramBotInstance:
         image_refs: list[TelegramImageRef],
         user_id: int,
         task_id: int,
-        db: Session,
         reply_to: types.Message,
     ) -> list[TelegramImageRef]:
         ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in image_refs))
         failed_refs: list[TelegramImageRef] = []
 
-        file_records = (
-            db.query(UploadedFile)
-            .filter(
-                UploadedFile.file_id.in_(ordered_file_ids),
-                UploadedFile.user_id == user_id,
-                UploadedFile.task_id == task_id,
-            )
-            .all()
-            if ordered_file_ids
-            else []
+        file_records = await load_channel_output_files(
+            file_ids=ordered_file_ids,
+            user_id=user_id,
+            task_id=task_id,
         )
-        file_record_by_id = {str(record.file_id): record for record in file_records}
+        file_record_by_id = {record.file_id: record for record in file_records}
 
         sent_file_ids: set[str] = set()
         for image_ref in image_refs:
@@ -1154,24 +1149,17 @@ class TelegramBotInstance:
         file_refs: list[TelegramFileRef],
         user_id: int,
         task_id: int,
-        db: Session,
         reply_to: types.Message,
     ) -> list[TelegramFileRef]:
         ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in file_refs))
         failed_refs: list[TelegramFileRef] = []
 
-        file_records = (
-            db.query(UploadedFile)
-            .filter(
-                UploadedFile.file_id.in_(ordered_file_ids),
-                UploadedFile.user_id == user_id,
-                UploadedFile.task_id == task_id,
-            )
-            .all()
-            if ordered_file_ids
-            else []
+        file_records = await load_channel_output_files(
+            file_ids=ordered_file_ids,
+            user_id=user_id,
+            task_id=task_id,
         )
-        file_record_by_id = {str(record.file_id): record for record in file_records}
+        file_record_by_id = {record.file_id: record for record in file_records}
 
         sent_file_ids: set[str] = set()
         for file_ref in file_refs:
@@ -1199,7 +1187,7 @@ class TelegramBotInstance:
                 failed_refs.append(file_ref)
                 continue
 
-            record_filename = getattr(file_record, "filename", "")
+            record_filename = file_record.filename
             caption_source = file_ref.label or str(record_filename or "file")
             caption = html.escape(caption_source[:1024])
             try:
@@ -1233,9 +1221,13 @@ class TelegramBotInstance:
             await reply_to.answer(text)
 
     async def start(self) -> None:
+        if not self._accepting:
+            return
         try:
             # Drop pending updates to ignore messages sent while the bot was offline/inactive
             await self.bot.delete_webhook(drop_pending_updates=True)
+            if not self._accepting:
+                return
             # Get bot info manually just for logging (optional, since dp.start_polling also logs)
             # We remove the duplicate log to avoid confusion
             await self.dp.start_polling(self.bot, handle_signals=False)
@@ -1245,16 +1237,68 @@ class TelegramBotInstance:
                 exc_info=True,
             )
 
+    def _stop_lock_for_current_loop(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._stop_lock
+        if lock is None or (self._stop_loop is not loop and not lock.locked()):
+            lock = asyncio.Lock()
+            self._stop_lock = lock
+            self._stop_loop = loop
+        elif self._stop_loop is not loop:
+            raise RuntimeError("Telegram bot stop is already running on another loop")
+        return lock
+
+    async def _drain_user_message_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = {
+            task for task in self.user_message_tasks.values() if task is not current
+        }
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        async def drain_tasks() -> None:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        cleanup_task = asyncio.create_task(drain_tasks())
+        try:
+            await drain_async_task_cancellation_safe(cleanup_task)
+        finally:
+            self.user_message_tasks.clear()
+            self.user_message_queues.clear()
+            self.user_active_executions.clear()
+            self.user_preparing_executions.clear()
+            self.user_stop_events.clear()
+
+    async def _stop_ingress(self) -> None:
+        try:
+            if self.dp:
+                await self.dp.stop_polling()
+        finally:
+            if self.bot:
+                await self.bot.session.close()
+
+    async def _stop_once(self, lock: asyncio.Lock) -> None:
+        async with lock:
+            try:
+                if not self._ingress_stopped:
+                    await self._stop_ingress()
+                    self._ingress_stopped = True
+            finally:
+                await self._drain_user_message_tasks()
+
     async def stop(self) -> None:
-        if self.dp:
-            await self.dp.stop_polling()
-        if self.bot:
-            await self.bot.session.close()
+        self._accepting = False
+        stop_task = asyncio.create_task(
+            self._stop_once(self._stop_lock_for_current_loop())
+        )
+        await drain_async_task_cancellation_safe(stop_task)
 
 
 class TelegramChannelManager:
     def __init__(self) -> None:
         self.bots: Dict[str, TelegramBotInstance] = {}
+        self._bot_stop_tasks: Dict[str, asyncio.Task[None]] = {}
         self.enabled = True  # Always enabled, we load dynamically
 
     async def start(self) -> None:
@@ -1269,35 +1313,22 @@ class TelegramChannelManager:
         active_tokens = set()
         channel_info_by_token: Dict[str, Dict] = {}
 
-        db_gen = get_db()
-        db = next(db_gen)
         try:
-            from ...models.user_channel import UserChannel
-
-            channels = (
-                db.query(UserChannel)
-                .filter(
-                    UserChannel.channel_type == "telegram",
-                    UserChannel.is_active.is_(True),
-                )
-                .all()
+            channels = await load_active_channel_configs(
+                channel_type="telegram",
+                required_config_keys=("bot_token",),
             )
             for ch in channels:
-                token = ch.config.get("bot_token")
+                token = ch.config_value("bot_token")
                 if token:
                     active_tokens.add(token)
                     channel_info_by_token[token] = {
-                        "id": ch.id,
+                        "id": ch.channel_id,
                         "name": ch.channel_name,
                     }
         except Exception as e:
             logger.error(f"Failed to load user channels for sync: {e}")
             return  # Don't try to sync if we failed to load from db
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
 
         current_tokens = set(self.bots.keys())
 
@@ -1335,26 +1366,41 @@ class TelegramChannelManager:
             self.bots[token] = bot
             bot.polling_task = asyncio.create_task(bot.start())
 
-    async def _stop_bot_for_token(self, token: str) -> None:
-        if token in self.bots:
-            bot = self.bots[token]
-            logger.info(f"Stopping bot {bot.instance_id}...")
-
+    async def _shutdown_bot_for_token(
+        self,
+        token: str,
+        bot: TelegramBotInstance,
+    ) -> None:
+        logger.info(f"Stopping bot {bot.instance_id}...")
+        try:
             try:
                 # First try to stop the polling gracefully
                 await bot.stop()
             except Exception as e:
                 logger.error(f"Error while stopping bot {bot.instance_id}: {e}")
+        finally:
+            try:
+                if bot.polling_task is not None:
+                    await cancel_and_drain_async_task(bot.polling_task)
+            finally:
+                if self.bots.get(token) is bot:
+                    self.bots.pop(token, None)
+        logger.info(f"Successfully stopped and removed bot {bot.instance_id}")
 
-            if bot.polling_task and not bot.polling_task.done():
-                bot.polling_task.cancel()
-                try:
-                    await bot.polling_task
-                except asyncio.CancelledError:
-                    pass
+    async def _stop_bot_for_token(self, token: str) -> None:
+        stop_task = self._bot_stop_tasks.get(token)
+        if stop_task is None:
+            bot = self.bots.get(token)
+            if bot is None:
+                return
+            stop_task = asyncio.create_task(self._shutdown_bot_for_token(token, bot))
+            self._bot_stop_tasks[token] = stop_task
 
-            del self.bots[token]
-            logger.info(f"Successfully stopped and removed bot {bot.instance_id}")
+        try:
+            await drain_async_task_cancellation_safe(stop_task)
+        finally:
+            if stop_task.done() and self._bot_stop_tasks.get(token) is stop_task:
+                self._bot_stop_tasks.pop(token, None)
 
 
 _telegram_manager = None

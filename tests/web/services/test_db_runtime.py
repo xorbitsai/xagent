@@ -10,7 +10,9 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from xagent.web.services.db_runtime import (
     await_task_settlement,
+    drain_async_task_cancellation_safe,
     is_database_pool_timeout,
+    propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
 
@@ -19,6 +21,77 @@ async def _wait_for_thread_event(event: threading.Event) -> None:
     async with asyncio.timeout(1):
         while not event.is_set():
             await asyncio.sleep(0.001)
+
+
+def test_propagate_deferred_cancellation_without_capture_preserves_flow() -> None:
+    with propagate_deferred_cancellation(None):
+        pass
+
+
+def test_propagate_deferred_cancellation_without_capture_preserves_error() -> None:
+    late_error = RuntimeError("late durable work failed")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        with propagate_deferred_cancellation(None):
+            raise late_error
+
+    assert exc_info.value is late_error
+
+
+def test_propagate_deferred_cancellation_restores_capture_on_normal_exit() -> None:
+    cancellation = asyncio.CancelledError("caller cancelled")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            pass
+
+    assert exc_info.value is cancellation
+
+
+def test_propagate_deferred_cancellation_preserves_late_error_as_cause() -> None:
+    cancellation = asyncio.CancelledError("caller cancelled")
+    late_error = RuntimeError("late durable work failed")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            raise late_error
+
+    assert exc_info.value is cancellation
+    assert exc_info.value.__cause__ is late_error
+
+
+def test_propagate_deferred_cancellation_preserves_later_cancellation_as_cause() -> (
+    None
+):
+    cancellation = asyncio.CancelledError("caller cancelled")
+    later_cancellation = asyncio.CancelledError("cancelled again")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            raise later_cancellation
+
+    assert exc_info.value is cancellation
+    assert exc_info.value.__cause__ is later_cancellation
+
+
+@pytest.mark.parametrize(
+    "process_control_error",
+    [
+        SystemExit("shutdown"),
+        KeyboardInterrupt("interrupt"),
+        GeneratorExit("generator closed"),
+    ],
+)
+def test_propagate_deferred_cancellation_does_not_mask_process_control_error(
+    process_control_error: BaseException,
+) -> None:
+    cancellation = asyncio.CancelledError("caller cancelled")
+
+    with pytest.raises(type(process_control_error)) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            raise process_control_error
+
+    assert exc_info.value is process_control_error
 
 
 @pytest.mark.asyncio
@@ -114,6 +187,81 @@ async def test_await_task_settlement_returns_late_result_and_cancellation() -> N
     assert isinstance(cancellation, asyncio.CancelledError)
 
 
+@pytest.mark.asyncio
+async def test_drain_async_task_propagates_cancellation_after_child_settles() -> None:
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def operation() -> str:
+        await release.wait()
+        finished.set()
+        return "settled"
+
+    child = asyncio.create_task(operation())
+    waiter = asyncio.create_task(drain_async_task_cancellation_safe(child))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_drain_async_task_preserves_late_child_error_as_cancellation_cause() -> (
+    None
+):
+    release = asyncio.Event()
+    child_error = RuntimeError("cleanup failed after caller cancellation")
+
+    async def operation() -> None:
+        await release.wait()
+        raise child_error
+
+    child = asyncio.create_task(operation())
+    waiter = asyncio.create_task(drain_async_task_cancellation_safe(child))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await asyncio.wait_for(waiter, timeout=1)
+
+    assert exc_info.value.__cause__ is child_error
+
+
+@pytest.mark.asyncio
+async def test_drain_async_task_drains_after_repeated_cancellation() -> None:
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def operation() -> None:
+        await release.wait()
+        finished.set()
+
+    child = asyncio.create_task(operation())
+    waiter = asyncio.create_task(drain_async_task_cancellation_safe(child))
+    await asyncio.sleep(0)
+
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1)
+    assert finished.is_set()
+
+
 def test_pool_timeout_classifier_walks_exception_chain() -> None:
     timeout = SQLAlchemyTimeoutError("pool checkout timed out")
     wrapped = RuntimeError("database operation failed")
@@ -121,3 +269,20 @@ def test_pool_timeout_classifier_walks_exception_chain() -> None:
 
     assert is_database_pool_timeout(wrapped) is True
     assert is_database_pool_timeout(RuntimeError("different failure")) is False
+
+
+def test_pool_timeout_classifier_walks_context_only_chain() -> None:
+    timeout = SQLAlchemyTimeoutError("pool checkout timed out")
+    wrapped = RuntimeError("database operation failed")
+    wrapped.__context__ = timeout
+
+    assert is_database_pool_timeout(wrapped) is True
+
+
+def test_pool_timeout_classifier_stops_at_cause_context_cycle_without_timeout() -> None:
+    first = RuntimeError("first failure")
+    second = RuntimeError("second failure")
+    first.__cause__ = second
+    second.__context__ = first
+
+    assert is_database_pool_timeout(first) is False

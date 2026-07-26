@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -243,7 +242,7 @@ async def test_public_websocket_endpoint_disconnects_reassigned_connection_when_
     moved_task_id = 99
     websocket = _BlockingWebSocket()
     connection_manager = ConnectionManager()
-    access_context = SimpleNamespace(user=SimpleNamespace(id=7))
+    principal = websocket_api.WebSocketPrincipal(id=7, is_admin=False)
 
     async def reassign_during_initial_status(*args) -> None:
         connection_manager.register_connection(websocket, moved_task_id)
@@ -251,28 +250,13 @@ async def test_public_websocket_endpoint_disconnects_reassigned_connection_when_
     monkeypatch.setattr(public_chat_access, "manager", connection_manager)
     monkeypatch.setattr(
         public_chat_access,
-        "db_session_context",
-        lambda: nullcontext(object()),
+        "_authorize_public_chat_websocket",
+        AsyncMock(return_value=principal),
     )
     monkeypatch.setattr(
         public_chat_access,
-        "get_public_chat_user",
-        lambda *args, **kwargs: access_context,
-    )
-    monkeypatch.setattr(
-        public_chat_access,
-        "get_share_chat_user",
-        lambda *args, **kwargs: access_context,
-    )
-    monkeypatch.setattr(
-        public_chat_access,
-        "get_task_for_public_context",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        public_chat_access,
-        "get_task_for_share_context",
-        lambda *args, **kwargs: None,
+        "_authorize_share_chat_websocket",
+        AsyncMock(return_value=principal),
     )
     monkeypatch.setattr(
         public_chat_access,

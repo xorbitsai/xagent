@@ -30,15 +30,9 @@ def test_startup_file_storage_sync_runs_when_enabled(monkeypatch):
         StartupFileStorageSyncResult,
     )
 
-    db = Mock()
-    session_factory = Mock(return_value=db)
-    get_session_local = Mock(return_value=session_factory)
     sync_mock = Mock(return_value=StartupFileStorageSyncResult())
     monkeypatch.setattr(
         app_module, "get_file_storage_startup_sync_enabled", lambda: True
-    )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", get_session_local
     )
     monkeypatch.setattr(
         "xagent.web.services.startup_file_storage_sync.sync_registered_files_to_durable_storage",
@@ -47,10 +41,7 @@ def test_startup_file_storage_sync_runs_when_enabled(monkeypatch):
 
     app_module.run_startup_file_storage_sync()
 
-    get_session_local.assert_called_once_with()
-    session_factory.assert_called_once_with()
-    sync_mock.assert_called_once_with(db)
-    db.close.assert_called_once_with()
+    sync_mock.assert_called_once_with()
 
 
 def test_startup_file_storage_sync_raises_when_registered_file_sync_fails(
@@ -61,14 +52,8 @@ def test_startup_file_storage_sync_raises_when_registered_file_sync_fails(
         StartupFileStorageSyncResult,
     )
 
-    db = Mock()
-    session_factory = Mock(return_value=db)
-    get_session_local = Mock(return_value=session_factory)
     monkeypatch.setattr(
         app_module, "get_file_storage_startup_sync_enabled", lambda: True
-    )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", get_session_local
     )
     monkeypatch.setattr(
         "xagent.web.services.startup_file_storage_sync.sync_registered_files_to_durable_storage",
@@ -78,20 +63,12 @@ def test_startup_file_storage_sync_raises_when_registered_file_sync_fails(
     with pytest.raises(RuntimeError, match="failed for 1 registered file"):
         app_module.run_startup_file_storage_sync()
 
-    db.close.assert_called_once_with()
 
-
-def test_startup_file_storage_sync_propagates_errors_and_closes_db(monkeypatch):
+def test_startup_file_storage_sync_propagates_errors(monkeypatch):
     app_module = import_module("xagent.web.app")
 
-    db = Mock()
-    session_factory = Mock(return_value=db)
-    get_session_local = Mock(return_value=session_factory)
     monkeypatch.setattr(
         app_module, "get_file_storage_startup_sync_enabled", lambda: True
-    )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", get_session_local
     )
     monkeypatch.setattr(
         "xagent.web.services.startup_file_storage_sync.sync_registered_files_to_durable_storage",
@@ -100,8 +77,6 @@ def test_startup_file_storage_sync_propagates_errors_and_closes_db(monkeypatch):
 
     with pytest.raises(RuntimeError, match="s3 unavailable"):
         app_module.run_startup_file_storage_sync()
-
-    db.close.assert_called_once_with()
 
 
 def test_startup_file_storage_sync_gate_waits_for_http_requests():

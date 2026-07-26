@@ -31,12 +31,25 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
+from xagent.core.workspace import TaskWorkspace
+from xagent.web.api import chat as chat_module
 from xagent.web.api.chat import AgentServiceManager
+from xagent.web.models import Base, Task
+from xagent.web.models import database as database_module
 from xagent.web.models.task import TaskStatus
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import uploaded_file_store as uploaded_file_store_module
+from xagent.web.services.managed_file_ref import ensure_uploaded_file_local_path
 from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
 )
@@ -60,6 +73,8 @@ def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
             execution_mode="flash",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="single_call",
         task_llm=None,
         task_fast_llm=None,
@@ -69,6 +84,272 @@ def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
         agent_config=None,
         excluded_agent_id=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_live_request_session_releases_clean_read_before_snapshot_worker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A legacy request Session must not pin the worker's only pool slot."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'agent-setup-boundary.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.15,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
+
+    with session_factory() as setup_db:
+        user = User(
+            username="legacy-pool-user",
+            password_hash="hash",
+            is_admin=False,
+        )
+        setup_db.add(user)
+        setup_db.flush()
+        task = Task(
+            user_id=int(user.id),
+            title="legacy pool task",
+            description="test",
+            status=TaskStatus.PENDING,
+            execution_mode="flash",
+        )
+        setup_db.add(task)
+        setup_db.commit()
+        user_id = int(user.id)
+        task_id = int(task.id)
+
+    request_db = session_factory()
+    request_user = request_db.get(User, user_id)
+    assert request_user is not None
+    loaded_snapshots: list[TaskSetupSnapshot] = []
+    real_loader = chat_module.load_task_setup_snapshot_sync
+
+    def tracking_loader(
+        loaded_task_id: int,
+        owner_user_id: int | None,
+    ) -> TaskSetupSnapshot | None:
+        snapshot = real_loader(loaded_task_id, owner_user_id)
+        if snapshot is not None:
+            loaded_snapshots.append(snapshot)
+        return snapshot
+
+    runtime_users: list[RuntimeUserFields] = []
+
+    async def observed_create_default_tools(*_args: Any, **kwargs: Any):
+        runtime_user = kwargs["user"]
+        assert isinstance(runtime_user, RuntimeUserFields)
+        runtime_users.append(runtime_user)
+        assert engine.pool.checkedout() == 0
+        await asyncio.sleep(0.03)
+        assert engine.pool.checkedout() == 0
+        return [], MagicMock()
+
+    manager = AgentServiceManager()
+    with (
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            side_effect=tracking_loader,
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch(
+            "xagent.web.api.chat.create_default_tools",
+            new=observed_create_default_tools,
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.api.chat.AgentService", return_value=MagicMock()),
+    ):
+        await manager.get_agent_for_task(task_id, request_db, user=request_user)
+
+    assert len(loaded_snapshots) == 1
+    assert loaded_snapshots[0].task.id == task_id
+    assert runtime_users == [RuntimeUserFields(id=user_id, is_admin=False)]
+    assert engine.pool.checkedout() == 0
+    request_db.close()
+    engine.dispose()
+
+
+def test_selected_file_registration_materializes_after_read_session_closes(
+    tmp_path,
+    monkeypatch,
+    mock_workspace_db,
+) -> None:
+    del mock_workspace_db
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'selected-file-boundary.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.15,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
+    monkeypatch.setattr(
+        uploaded_file_store_module,
+        "get_session_local",
+        lambda: session_factory,
+    )
+
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+    source_dir = tmp_path / "uploads"
+    source_dir.mkdir()
+    source_path = source_dir / "selected.txt"
+    source_path.write_text("selected input", encoding="utf-8")
+
+    with session_factory() as setup_db:
+        user = User(
+            username="selected-file-boundary-user",
+            password_hash="hash",
+            is_admin=False,
+        )
+        setup_db.add(user)
+        setup_db.flush()
+        task = Task(
+            user_id=int(user.id),
+            title="selected file task",
+            description="test",
+            status=TaskStatus.PENDING,
+            execution_mode="flash",
+        )
+        setup_db.add(task)
+        setup_db.flush()
+        selected = UploadedFile(
+            file_id="selected-file-id",
+            user_id=int(user.id),
+            task_id=None,
+            filename=source_path.name,
+            storage_path=str(source_path),
+            storage_status="available",
+            mime_type="text/plain",
+            file_size=source_path.stat().st_size,
+        )
+        setup_db.add(selected)
+        setup_db.commit()
+        user_id = int(user.id)
+        task_id = int(task.id)
+
+    observed_checked_out: list[int] = []
+
+    def observed_materialization(record):
+        observed_checked_out.append(engine.pool.checkedout())
+        return ensure_uploaded_file_local_path(record)
+
+    monkeypatch.setattr(
+        chat_module,
+        "ensure_uploaded_file_local_path",
+        observed_materialization,
+    )
+    workspace = TaskWorkspace(
+        id=f"web_task_{task_id}",
+        base_dir=str(tmp_path / "workspaces"),
+        allowed_external_dirs=[str(source_dir)],
+    )
+
+    chat_module._register_selected_task_files_isolated(
+        workspace,
+        task_id=task_id,
+        task_owner_id=user_id,
+        selected_file_ids=["selected-file-id"],
+    )
+
+    assert observed_checked_out == [0]
+    assert engine.pool.checkedout() == 0
+    with session_factory() as verify_db:
+        record = (
+            verify_db.query(UploadedFile)
+            .filter(UploadedFile.file_id == "selected-file-id")
+            .one()
+        )
+        assert record.task_id == task_id
+        assert str(record.storage_key).startswith(
+            f"users/{user_id}/tasks/{task_id}/outputs/selected-file-id/_versions/"
+        )
+
+    get_unscoped_file_storage.cache_clear()
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_worker_rejects_caller_session_with_pending_writes() -> None:
+    """The boundary must not roll back writes or start a nested checkout."""
+
+    caller_db = MagicMock(spec=Session)
+    worker = AsyncMock()
+    with (
+        patch(
+            "xagent.web.api.chat.release_db_connection_if_clean",
+            return_value=False,
+        ),
+        patch(
+            "xagent.web.api.chat.run_db_io_cancellation_safe",
+            new=worker,
+        ),
+        pytest.raises(RuntimeError, match="pending writes"),
+    ):
+        await chat_module._load_task_setup_snapshot_for_agent(42, 1, caller_db)
+
+    worker.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_status", [TaskStatus.PENDING, TaskStatus.RUNNING])
+async def test_snapshot_pool_timeout_is_not_replaced_by_default_runtime(
+    tmp_path,
+    monkeypatch,
+    task_status: TaskStatus,
+) -> None:
+    """Pool exhaustion must propagate instead of building a fallback agent."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'agent-setup-timeout.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
+    held_connection = engine.connect()
+
+    task_row = MagicMock(status=task_status)
+    query = MagicMock()
+    query.filter.return_value.first.side_effect = [(1,), task_row]
+    caller_db = MagicMock()
+    caller_db.query.return_value = query
+    agent_constructor = MagicMock(return_value=MagicMock())
+
+    manager = AgentServiceManager()
+    with (
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch(
+            "xagent.web.api.chat.create_default_tools",
+            new=AsyncMock(return_value=([], MagicMock())),
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.api.chat.AgentService", new=agent_constructor),
+        pytest.raises(SQLAlchemyTimeoutError),
+    ):
+        await manager.get_agent_for_task(42, caller_db, user=_make_user())
+
+    agent_constructor.assert_not_called()
+    held_connection.close()
+    engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -247,6 +528,12 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
 
         def cleanup_workspace(self) -> None: ...
 
+        def set_conversation_history(self, _messages: list[dict[str, str]]) -> None: ...
+
+        def set_execution_context_messages(self, _messages: list[Any]) -> None: ...
+
+        def set_recovered_skill_context(self, _context: Any) -> None: ...
+
     manager = AgentServiceManager()
     user = _make_user()
     db = MagicMock()
@@ -364,6 +651,8 @@ async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -
             execution_mode="balanced",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="react",
         task_llm=None,
         task_fast_llm=None,

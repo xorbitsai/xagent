@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, inspect, text
 from xagent.db.config import create_alembic_config
 
 REVISION = "20260725_add_task_computer_runtime_kind"
-DOWN_REVISION = "20260724_seed_google_ads_mcp_app"
+DOWN_REVISION = "20260725_add_uploaded_file_recovery_index"
 
 
 def test_upgrade_adds_nullable_task_computer_runtime_kind() -> None:

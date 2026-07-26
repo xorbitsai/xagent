@@ -1,8 +1,10 @@
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.core.file_storage.types import StoredObject
 from xagent.web.models.database import Base
@@ -211,6 +213,143 @@ def test_sync_does_not_upload_when_remote_key_is_present(tmp_path):
     assert result.uploaded == 0
     assert storage.put_calls == []
     assert record.storage_status == "available"
+
+
+def test_sync_skips_compensating_rows_instead_of_reviving_them(tmp_path):
+    db = _session()
+    user = _user(db)
+    local_path = tmp_path / "uploads" / "cancelled.txt"
+    local_path.parent.mkdir()
+    local_path.write_text("content", encoding="utf-8")
+    key = f"users/{int(user.id)}/uploads/file-cancelled/cancelled.txt"
+    record = _record(
+        db,
+        user=user,
+        local_path=local_path,
+        file_id="file-cancelled",
+        storage_backend="s3",
+        storage_key=key,
+        storage_uri=f"s3://bucket/{key}",
+        storage_status="compensating",
+        checksum=sha256(local_path.read_bytes()).hexdigest(),
+    )
+    db.commit()
+    storage = FakeStorage(
+        {key},
+        object_sizes={key: local_path.stat().st_size},
+        object_checksums={key: sha256(local_path.read_bytes()).hexdigest()},
+    )
+
+    result = sync_registered_files_to_durable_storage(db, storage=storage)
+
+    db.refresh(record)
+    assert result.scanned == 0
+    assert storage.list_calls == []
+    assert storage.put_calls == []
+    assert record.storage_status == "compensating"
+
+
+def test_sync_releases_pool_before_storage_io(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'startup-sync.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.1,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    db = SessionLocal()
+    user = _user(db)
+    local_path = tmp_path / "uploads" / "pool.txt"
+    local_path.parent.mkdir()
+    local_path.write_text("content", encoding="utf-8")
+    _record(db, user=user, local_path=local_path, file_id="file-pool")
+    db.commit()
+    assert db.query(User).filter(User.id == user.id).one() is not None
+    assert engine.pool.checkedout() == 1
+
+    class PoolAwareStorage(FakeStorage):
+        def list(self, prefix: str) -> list[StoredObject]:
+            assert engine.pool.checkedout() == 0
+            return super().list(prefix)
+
+        def put_file(
+            self,
+            source: Path,
+            key: str,
+            content_type: str | None = None,
+        ) -> StoredObject:
+            assert engine.pool.checkedout() == 0
+            return super().put_file(source, key, content_type)
+
+    try:
+        result = sync_registered_files_to_durable_storage(
+            db,
+            storage=PoolAwareStorage(),
+            batch_size=1,
+        )
+        assert result.uploaded == 1
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_sync_rejects_dirty_compatibility_session_before_storage_io(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'startup-sync-dirty.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.1,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    db = SessionLocal()
+    db.add(User(username="dirty-sync-user", password_hash="hash", is_admin=False))
+    storage = FakeStorage()
+
+    try:
+        with pytest.raises(RuntimeError, match="pending writes"):
+            sync_registered_files_to_durable_storage(db, storage=storage)
+        assert storage.list_calls == []
+        assert storage.put_calls == []
+    finally:
+        db.rollback()
+        db.close()
+        engine.dispose()
+
+
+def test_sync_advances_detached_cursor_across_multiple_batches(tmp_path):
+    db = _session()
+    user = _user(db)
+    local_paths = []
+    for index in range(3):
+        local_path = tmp_path / "uploads" / f"batch-{index}.txt"
+        local_path.parent.mkdir(exist_ok=True)
+        local_path.write_text(f"content-{index}", encoding="utf-8")
+        _record(
+            db,
+            user=user,
+            local_path=local_path,
+            file_id=f"file-batch-{index}",
+        )
+        local_paths.append(local_path)
+    db.commit()
+    storage = FakeStorage()
+
+    result = sync_registered_files_to_durable_storage(
+        db,
+        storage=storage,
+        batch_size=1,
+    )
+
+    assert result.scanned == 3
+    assert result.uploaded == 3
+    assert [source for source, _key in storage.put_calls] == local_paths
+    assert storage.list_calls == [f"users/{int(user.id)}"]
 
 
 def test_sync_revalidates_available_row_without_checksum(tmp_path):

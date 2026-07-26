@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from contextlib import suppress
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -19,9 +19,14 @@ from ..config import (
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
     get_session_secret,
+    get_task_lease_recovery_batch_size,
+    get_task_lease_recovery_interval_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_uploaded_file_recovery_batch_size,
+    get_uploaded_file_recovery_interval_seconds,
+    get_uploaded_file_recovery_stale_seconds,
     get_uploads_dir,
 )
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
@@ -65,6 +70,10 @@ from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.task_lease_recovery import run_task_lease_recovery_loop
+from .services.uploaded_file_recovery import (
+    run_uploaded_file_compensation_recovery_loop,
+)
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
 setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
@@ -103,22 +112,15 @@ def run_startup_file_storage_sync() -> None:
         logger.info("Startup file storage sync is disabled")
         return
 
-    from .models.database import get_session_local
     from .services.startup_file_storage_sync import (
         sync_registered_files_to_durable_storage,
     )
 
-    SessionLocal = get_session_local()
-    db = SessionLocal()
-    try:
-        result = sync_registered_files_to_durable_storage(db)
-        if result.failed:
-            raise RuntimeError(
-                "Startup file storage sync failed for "
-                f"{result.failed} registered file(s)"
-            )
-    finally:
-        db.close()
+    result = sync_registered_files_to_durable_storage()
+    if result.failed:
+        raise RuntimeError(
+            f"Startup file storage sync failed for {result.failed} registered file(s)"
+        )
 
 
 async def _run_file_storage_startup_sync_with_retries(
@@ -318,6 +320,142 @@ def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | 
         batch_size,
     )
     return task
+
+
+def start_task_lease_recovery_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start automatic expired task-lease recovery for this backend process."""
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(
+            app_instance.state,
+            "task_lease_recovery_task",
+            None,
+        ),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error(
+                "Previous task lease recovery loop failed",
+                exc_info=failure,
+            )
+        app_instance.state.task_lease_recovery_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping task lease recovery loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_task_lease_recovery_interval_seconds()
+    batch_size = get_task_lease_recovery_batch_size()
+    task = asyncio.create_task(
+        run_task_lease_recovery_loop(
+            poll_interval_seconds=poll_interval_seconds,
+            batch_size=batch_size,
+        )
+    )
+    app_instance.state.task_lease_recovery_task = task
+    logger.info(
+        "Started task lease recovery loop (interval=%ss, batch_size=%s)",
+        poll_interval_seconds,
+        batch_size,
+    )
+    return task
+
+
+async def stop_task_lease_recovery_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's task lease recovery loop."""
+
+    task = getattr(app_instance.state, "task_lease_recovery_task", None)
+    app_instance.state.task_lease_recovery_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling task lease recovery loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Task lease recovery loop stopped after failure",
+                exc_info=exc,
+            )
+
+
+def start_uploaded_file_recovery_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start stale uploaded-file compensation recovery for this process."""
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "uploaded_file_recovery_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error(
+                "Previous uploaded-file recovery loop failed",
+                exc_info=failure,
+            )
+        app_instance.state.uploaded_file_recovery_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping uploaded-file recovery loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_uploaded_file_recovery_interval_seconds()
+    stale_after_seconds = get_uploaded_file_recovery_stale_seconds()
+    batch_size = get_uploaded_file_recovery_batch_size()
+    task = asyncio.create_task(
+        run_uploaded_file_compensation_recovery_loop(
+            poll_interval_seconds=poll_interval_seconds,
+            stale_after_seconds=stale_after_seconds,
+            batch_size=batch_size,
+        )
+    )
+    app_instance.state.uploaded_file_recovery_task = task
+    logger.info(
+        "Started uploaded-file recovery loop "
+        "(interval=%ss, stale_after=%ss, batch_size=%s)",
+        poll_interval_seconds,
+        stale_after_seconds,
+        batch_size,
+    )
+    return task
+
+
+async def stop_uploaded_file_recovery_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's uploaded-file recovery loop."""
+
+    task = getattr(app_instance.state, "uploaded_file_recovery_task", None)
+    app_instance.state.uploaded_file_recovery_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling uploaded-file recovery loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Uploaded-file recovery loop stopped after failure",
+                exc_info=exc,
+            )
 
 
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
@@ -669,8 +807,17 @@ async def startup_event() -> None:
     logger.info("Initializing database...")
     init_db()
     logger.info("Database initialized successfully")
+
+    # Reopen process-local task admission before any trigger, command, or
+    # channel ingress can create background execution work for this lifespan.
+    from .api.websocket import background_task_manager
+
+    background_task_manager.start_accepting()
+
     start_file_storage_startup_sync_task(app)
     start_trigger_dispatcher_task(app)
+    start_task_lease_recovery_task(app)
+    start_uploaded_file_recovery_task(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) are preferred
     # over the embedder's resolver during per-task scope resolution.
@@ -1150,6 +1297,9 @@ async def shutdown_event() -> None:
         await stop_task_command_dispatcher()
     _task_command_dispatcher_task = None
 
+    await stop_uploaded_file_recovery_task(app)
+    await stop_task_lease_recovery_task(app)
+
     if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
         logger.info("Cancelling sandbox idle sweep task...")
         _sandbox_idle_sweep_task.cancel()
@@ -1204,6 +1354,14 @@ async def shutdown_event() -> None:
         await feishu_channel.stop()
     except Exception as e:
         logger.error("Failed to stop Telegram channel: %s", e, exc_info=True)
+
+    # All producers are stopped. Drain task-owned finalizers and their shared
+    # lease heartbeats before tearing down the sandboxes those tasks may use.
+    from .api.websocket import background_task_manager
+    from .services.task_lease_service import wait_for_heartbeat_manager_idle
+
+    await background_task_manager.shutdown()
+    await wait_for_heartbeat_manager_idle()
 
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager

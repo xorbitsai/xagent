@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -9,6 +9,14 @@ from .database import Base
 
 class UploadedFile(Base):  # type: ignore
     __tablename__ = "uploaded_files"
+    __table_args__ = (
+        Index(
+            "ix_uploaded_files_status_updated_at_id",
+            "storage_status",
+            "updated_at",
+            "id",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     file_id = Column(

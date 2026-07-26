@@ -11,6 +11,7 @@ from ...core.tools.adapters.vibe.base import AGENT_CONFIG_UNASSIGNABLE_CATEGORIE
 from ...core.utils.type_check import ensure_list
 from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.agent_api_key import AgentApiKey
+from ..models.database import release_db_connection_if_clean
 from ..models.task import Task
 from .agent_team_scope import (
     get_agent_team_scope,
@@ -201,7 +202,13 @@ class AgentStore:
             team_id_of(team_scope),
             bool(team_scope and team_scope.is_team_admin),
         )
-        cached = cache_get(cache_key)
+        # A team-scope hook may query through this Session. End that read-only
+        # transaction before synchronous Redis I/O; if the hook left pending
+        # changes, bypass the optional cache rather than risk discarding them
+        # or pinning the database connection.
+        cached = (
+            cache_get(cache_key) if release_db_connection_if_clean(self.db) else None
+        )
         if isinstance(cached, list):
             return cached
 
@@ -213,7 +220,11 @@ class AgentStore:
             .all()
         )
         response = [self.agent_to_list_item_dict(agent) for agent in agents]
-        cache_set(cache_key, response)
+        # The response is detached plain data. Return the pool slot before the
+        # cache write so a slow or unavailable Redis backend cannot reduce
+        # database capacity.
+        if release_db_connection_if_clean(self.db):
+            cache_set(cache_key, response)
         return response
 
     def get_agent_response(self, user_id: int, agent_id: int) -> dict[str, Any] | None:

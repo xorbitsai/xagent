@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -13,19 +14,69 @@ from ...skills.utils import create_skill_manager
 from ..models.task import TraceEvent
 
 
+@dataclass(frozen=True)
+class TaskExecutionRecoverySnapshot:
+    """Detached DB portion of cross-round execution recovery.
+
+    Skill content is intentionally absent: loading it is async filesystem/plugin
+    work. The worker-side DB boundary only returns the selected skill name; the
+    event loop materializes that name after the snapshot Session is closed.
+    """
+
+    messages: tuple[Dict[str, str], ...] = ()
+    selected_skill_name: Optional[str] = None
+
+
+def load_task_execution_recovery_snapshot_sync(
+    db: Session,
+    task_id: int,
+    *,
+    max_tool_events: int = 8,
+) -> TaskExecutionRecoverySnapshot:
+    """Read the database-backed recovery inputs into detached primitives."""
+    return TaskExecutionRecoverySnapshot(
+        messages=tuple(
+            load_task_execution_context_messages(
+                db,
+                task_id,
+                max_tool_events=max_tool_events,
+            )
+        ),
+        selected_skill_name=load_task_recovered_skill_name(db, task_id),
+    )
+
+
+async def materialize_task_execution_recovery_state(
+    snapshot: TaskExecutionRecoverySnapshot,
+) -> Dict[str, Any]:
+    """Finish async skill loading after the DB snapshot has been detached."""
+    skill_context = None
+    if snapshot.selected_skill_name:
+        skill_context = await _load_skill_context_by_name(snapshot.selected_skill_name)
+    return {
+        "messages": [dict(message) for message in snapshot.messages],
+        "skill_context": skill_context,
+    }
+
+
 async def load_task_execution_recovery_state(
     db: Session,
     task_id: int,
     *,
     max_tool_events: int = 8,
 ) -> Dict[str, Any]:
-    """Load reusable execution recovery state for a task."""
-    return {
-        "messages": load_task_execution_context_messages(
-            db, task_id, max_tool_events=max_tool_events
-        ),
-        "skill_context": await load_task_recovered_skill_context(db, task_id),
-    }
+    """Load reusable execution recovery state for a task.
+
+    Compatibility wrapper for callers that still own a Session. Task-runtime
+    code should read :class:`TaskExecutionRecoverySnapshot` in its worker-owned
+    setup snapshot, then call :func:`materialize_task_execution_recovery_state`.
+    """
+    snapshot = load_task_execution_recovery_snapshot_sync(
+        db,
+        task_id,
+        max_tool_events=max_tool_events,
+    )
+    return await materialize_task_execution_recovery_state(snapshot)
 
 
 def load_task_execution_context_messages(
@@ -79,6 +130,15 @@ def load_task_execution_context_messages(
 
 async def load_task_recovered_skill_context(db: Session, task_id: int) -> Optional[str]:
     """Load the latest selected skill context for a task, if any."""
+    skill_name = load_task_recovered_skill_name(db, task_id)
+    if not skill_name:
+        return None
+
+    return await _load_skill_context_by_name(skill_name)
+
+
+def load_task_recovered_skill_name(db: Session, task_id: int) -> Optional[str]:
+    """Return the latest selected skill name without performing async I/O."""
     trace_event = (
         db.query(TraceEvent)
         .filter(
@@ -96,8 +156,7 @@ async def load_task_recovered_skill_context(db: Session, task_id: int) -> Option
     skill_name = str(trace_event.data.get("skill_name") or "").strip()
     if not selected or not skill_name:
         return None
-
-    return await _load_skill_context_by_name(skill_name)
+    return skill_name
 
 
 _BINARY_MAGIC_PREFIXES = (

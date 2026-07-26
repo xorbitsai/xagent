@@ -39,6 +39,13 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
+TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
+TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
+UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
+    "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
+)
+UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
+UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 BROWSER_RUNTIME_KIND = "XAGENT_BROWSER_RUNTIME_KIND"
 BROWSER_PROFILE_ROOT = "XAGENT_BROWSER_PROFILE_ROOT"
@@ -61,6 +68,7 @@ FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENAB
 FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
+KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
 DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
@@ -269,6 +277,40 @@ def get_task_lease_heartbeat_seconds() -> int:
         )
         return default
     return min(seconds, max(1, get_task_lease_ttl_seconds() - 1))
+
+
+def get_task_lease_recovery_interval_seconds() -> int:
+    """Get the interval between automatic expired-lease recovery scans."""
+
+    default = max(5, get_task_lease_ttl_seconds() // 3)
+    return _get_positive_int_env(
+        TASK_LEASE_RECOVERY_INTERVAL_SECONDS,
+        default,
+    )
+
+
+def get_task_lease_recovery_batch_size() -> int:
+    """Get the maximum number of expired leases scanned per recovery batch."""
+
+    return _get_positive_int_env(TASK_LEASE_RECOVERY_BATCH_SIZE, 100)
+
+
+def get_uploaded_file_recovery_interval_seconds() -> int:
+    """Get the interval between stale file-compensation recovery scans."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS, 60)
+
+
+def get_uploaded_file_recovery_stale_seconds() -> int:
+    """Get the minimum age of a compensation claim eligible for recovery."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_STALE_SECONDS, 300)
+
+
+def get_uploaded_file_recovery_batch_size() -> int:
+    """Get the maximum file-compensation claims examined per polling tick."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_BATCH_SIZE, 100)
 
 
 def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:
@@ -1530,6 +1572,27 @@ def get_lancedb_path() -> Path:
 
     # Default: storage_root/data/lancedb
     return get_storage_root() / "data" / "lancedb"
+
+
+def get_kb_collections_timeout_seconds() -> int:
+    """Get the deadline for a single knowledge base collection listing scan.
+
+    Bounds one ``list_collections`` scan so the /api/kb/collections endpoint
+    fails fast instead of hanging a request. The default is deliberately
+    generous: the scan runs off the event loop in a worker thread, so a slow
+    deployment now genuinely hits this deadline where previously the blocking
+    scan starved the timer and always eventually succeeded. Measured cost is
+    roughly 4s for a 400k-row table, so 30s keeps ~7x headroom while still
+    bounding the request.
+
+    Priority:
+        1. XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS environment variable
+        2. Default of 30 seconds
+
+    Returns:
+        Per-scan timeout in seconds
+    """
+    return _get_positive_int_env(KB_COLLECTIONS_TIMEOUT_SECONDS, 30)
 
 
 def get_default_sqlite_db_path() -> str:

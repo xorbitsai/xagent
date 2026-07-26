@@ -1,13 +1,21 @@
 import asyncio
+import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    ExecutionScope,
+    ExecutionScopeContext,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.web.api.chat import (
     AgentServiceManager,
@@ -15,6 +23,7 @@ from xagent.web.api.chat import (
     create_default_tools,
 )
 from xagent.web.models import Agent, Base, Task, User, Workforce, WorkforceRun
+from xagent.web.models import database as database_module
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import TaskStatus
@@ -60,6 +69,33 @@ def db_session() -> Session:
         session.close()
         _db_module._SessionLocal = _prev_session_local
         Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+@pytest.fixture()
+def single_connection_workforce_db(tmp_path, monkeypatch):
+    """Real one-slot pool shared by the caller and turn orchestrator."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'workforce-turn-boundary.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.15,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_local = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
+    db = session_local()
+    try:
+        yield engine, db
+    finally:
+        db.close()
         engine.dispose()
 
 
@@ -210,15 +246,23 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         selected_file_ids=["file-1"],
     )
     await result.background_task
+    assert not hasattr(result.task, "_sa_instance_state")
+    assert not hasattr(result.workforce_run, "_sa_instance_state")
 
-    task = result.task
-    workforce_run = result.workforce_run
-    db_session.refresh(task)
-    db_session.refresh(workforce_run)
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    workforce_run = (
+        db_session.query(WorkforceRun)
+        .filter(WorkforceRun.id == int(result.workforce_run.id))
+        .one()
+    )
     db_session.refresh(uploaded_file)
 
     assert task.status == TaskStatus.RUNNING
     assert task.agent_id == manager.id
+    assert result.task.agent_id == manager.id
+    assert result.task.run_id == task.run_id
+    assert result.task.state_version == task.state_version
+    assert result.task.control_state == task.control_state
     assert task.execution_mode == "think"
     assert task.input == "Coordinate a launch brief"
     assert task.agent_config["workforce_id"] == workforce.id
@@ -238,6 +282,201 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         .count()
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_releases_connection_before_worker_transaction(
+    single_connection_workforce_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, db = single_connection_workforce_db
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db, "single-pool-owner")
+    manager = _create_agent(db, user, "Manager")
+    worker_agent = _create_agent(db, user, "Analyst")
+    workforce = _create_workforce(db, user, manager)
+    _add_worker(db, user, workforce, worker_agent)
+    db.commit()
+
+    checked_out: list[int] = []
+    original = workforce_runs_module._create_claimed_workforce_run_isolated
+
+    def observed(*args: Any, **kwargs: Any):
+        checked_out.append(engine.pool.checkedout())
+        time.sleep(0.05)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        workforce_runs_module,
+        "_create_claimed_workforce_run_isolated",
+        observed,
+    )
+
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await create_workforce_run(
+            db,
+            user,
+            workforce,
+            message="Coordinate a launch brief",
+        )
+        await result.background_task
+    finally:
+        ticker_stop.set()
+        await ticker_task
+
+    assert result.task.status == TaskStatus.RUNNING
+    assert result.workforce_run.status == "running"
+    assert checked_out == [0]
+    assert ticks >= 3, "workforce turn startup blocked the asyncio event loop"
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_propagates_execution_scope_to_worker(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db_session, "scoped-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    worker_agent = _create_agent(db_session, user, "Analyst")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, worker_agent)
+    db_session.commit()
+    scope = ExecutionScope(
+        sandbox_key_suffix="tenant-a",
+        workspace_segments=("team", "tenant-a"),
+    )
+
+    with ExecutionScopeContext(scope):
+        result = await create_workforce_run(
+            db_session,
+            user,
+            workforce,
+            message="Run in the caller scope",
+        )
+    await result.background_task
+
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    assert task.agent_config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] == scope.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_drains_schedule_after_caller_cancellation(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule_entered = asyncio.Event()
+    allow_schedule = asyncio.Event()
+    schedule_calls = 0
+
+    async def delayed_schedule(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal schedule_calls
+        schedule_calls += 1
+        schedule_entered.set()
+        await allow_schedule.wait()
+
+        async def noop() -> None:
+            return None
+
+        return SimpleNamespace(background_task=asyncio.create_task(noop()))
+
+    monkeypatch.setattr(
+        task_orchestrator_module.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        delayed_schedule,
+    )
+    user = _create_user(db_session, "cancel-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    worker_agent = _create_agent(db_session, user, "Analyst")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, worker_agent)
+    db_session.commit()
+
+    caller = asyncio.create_task(
+        create_workforce_run(
+            db_session,
+            user,
+            workforce,
+            message="Keep the committed turn owned",
+        )
+    )
+    await schedule_entered.wait()
+    caller.cancel()
+    await asyncio.sleep(0)
+    assert not caller.done()
+    allow_schedule.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    task = db_session.query(Task).filter(Task.agent_id == manager.id).one()
+    workforce_run = db_session.query(WorkforceRun).one()
+    assert schedule_calls == 1
+    assert task.status == TaskStatus.RUNNING
+    assert workforce_run.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_claim_timeout_rolls_back_created_records(
+    single_connection_workforce_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _engine, db = single_connection_workforce_db
+    user = _create_user(db, "pool-timeout-owner")
+    manager = _create_agent(db, user, "Manager")
+    worker_agent = _create_agent(db, user, "Analyst")
+    workforce = _create_workforce(db, user, manager)
+    _add_worker(db, user, workforce, worker_agent)
+    uploaded_file = UploadedFile(
+        file_id="claim-timeout-file",
+        user_id=user.id,
+        filename="claim-timeout.txt",
+        storage_path="/tmp/claim-timeout.txt",
+        file_size=5,
+    )
+    db.add(uploaded_file)
+    db.commit()
+
+    synthetic_timeout = SQLAlchemyTimeoutError("synthetic turn-claim timeout")
+    invalidate_task_cache = MagicMock()
+
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_persist_claimed_turn_no_commit",
+        MagicMock(side_effect=synthetic_timeout),
+    )
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "invalidate_task_cache",
+        invalidate_task_cache,
+    )
+
+    with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
+        await create_workforce_run(
+            db,
+            user,
+            workforce,
+            message="Coordinate a launch brief",
+            selected_file_ids=["claim-timeout-file"],
+        )
+
+    assert exc_info.value is synthetic_timeout
+    db.rollback()
+    assert db.query(Task).count() == 0
+    assert db.query(WorkforceRun).count() == 0
+    assert db.query(TaskChatMessage).count() == 0
+    db.refresh(uploaded_file)
+    assert uploaded_file.task_id is None
+    invalidate_task_cache.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -275,9 +514,15 @@ async def test_create_workforce_run_allows_draft_only_for_preview(
     )
     await result.background_task
 
-    assert result.task.is_visible is False
-    assert result.workforce_run.status == "running"
-    assert result.workforce_run.is_preview is True
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    workforce_run = (
+        db_session.query(WorkforceRun)
+        .filter(WorkforceRun.id == int(result.workforce_run.id))
+        .one()
+    )
+    assert task.is_visible is False
+    assert workforce_run.status == "running"
+    assert workforce_run.is_preview is True
 
 
 @pytest.mark.asyncio
@@ -297,10 +542,12 @@ async def test_create_workforce_run_revalidates_after_lifecycle_fence(
     fence_calls: list[int] = []
 
     def fake_fence(db: Session, workforce_id: int) -> Workforce:
-        assert db is db_session
+        assert db is not db_session
         fence_calls.append(workforce_id)
-        workforce.status = "archived"
-        return workforce
+        fenced = db.get(Workforce, workforce_id)
+        assert fenced is not None
+        fenced.status = "archived"
+        return fenced
 
     monkeypatch.setattr(
         workforce_runs_module,
@@ -354,7 +601,7 @@ async def test_create_workforce_run_marks_task_failed_when_turn_start_fails_afte
     workforce_run = db_session.query(WorkforceRun).one()
 
     assert task.status == TaskStatus.FAILED
-    assert task.error_message == "Workforce run failed to start"
+    assert task.error_message == "turn scheduling failed after claim commit"
     assert task.output is None
     assert workforce_run.task_id == task.id
     assert workforce_run.status == "failed"
@@ -712,14 +959,14 @@ async def test_verified_workforce_run_scope_loads_manager_config(
         execution_mode="balanced",
     )
     await result.background_task
-    db_session.refresh(result.task)
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
 
     default_llm = MagicMock()
     default_llm.model_name = "default-model"
     with patch("xagent.web.api.chat.create_default_llm", return_value=default_llm):
         runtime_config = AgentServiceManager()._resolve_task_runtime_config(
             task_id=int(result.task.id),
-            task=result.task,
+            task=task,
             db=db_session,
             user=runner,
         )

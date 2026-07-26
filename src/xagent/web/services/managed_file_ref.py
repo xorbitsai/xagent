@@ -8,10 +8,12 @@ import mimetypes
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, NoReturn, Protocol
+from typing import Any, BinaryIO, Literal, NoReturn, Protocol, cast
 
 from ...core.execution_scope import (
+    EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
+    ExecutionScopeInput,
     get_execution_scope,
     resolve_execution_scope,
 )
@@ -133,7 +135,7 @@ class ManagedFileRef:
 
     record: UploadedFileLocalPathRecord
     storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
-    execution_scope: ExecutionScope | None = None
+    execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED
     _scope_segments: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -149,15 +151,17 @@ class ManagedFileRef:
         # sub-task carries its scope only in the persisted snapshot, and
         # without recovering it here ``sync_to_durable`` would write the file
         # under the owner root instead of the sub-task's scoped subtree.
-        # Passing ``execution_scope=None`` is equivalent to omitting it — there
-        # is no way to force owner-root over an active ambient/persisted scope.
-        scope = self.execution_scope
-        if scope is None:
+        # Explicit ``None`` means owner-root. Only an omitted argument may
+        # inherit the ambient turn scope or consult per-task resolution.
+        scope_input = self.execution_scope
+        if scope_input is EXECUTION_SCOPE_NOT_PROVIDED:
             scope = get_execution_scope()
-        if scope is None:
-            task_id = getattr(self.record, "task_id", None)
-            if task_id is not None:
-                scope = resolve_execution_scope(task_id)
+            if scope is None:
+                task_id = getattr(self.record, "task_id", None)
+                if task_id is not None:
+                    scope = resolve_execution_scope(task_id)
+        else:
+            scope = cast(ExecutionScope | None, scope_input)
         self._scope_segments = (
             scope.durable_storage_segments if scope is not None else ()
         )
@@ -446,9 +450,16 @@ def managed_file_from_record(file_record: UploadedFile) -> ManagedFileRef:
     return ManagedFileRef(file_record)
 
 
-def ensure_uploaded_file_local_path(file_record: UploadedFileLocalPathRecord) -> Path:
+def ensure_uploaded_file_local_path(
+    file_record: UploadedFileLocalPathRecord,
+    *,
+    execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED,
+) -> Path:
     try:
-        return ManagedFileRef(file_record).ensure_local()
+        return ManagedFileRef(
+            file_record,
+            execution_scope=execution_scope,
+        ).ensure_local()
     except DurableObjectMissingError:
         return Path(str(file_record.storage_path))
 

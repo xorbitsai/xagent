@@ -1,3 +1,6 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -11,6 +14,167 @@ from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 
 
 class TestTryUpgradeDb:
+    def test_postgresql_serializes_startup_migration_before_reading_revision(
+        self,
+        monkeypatch,
+    ):
+        events: list[str] = []
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
+        connection = MagicMock()
+        connection.in_transaction.return_value = False
+        engine.connect.return_value.__enter__.return_value = connection
+        connection.execute.side_effect = lambda statement, *_args, **_kwargs: (
+            events.append(
+                "lock"
+                if "pg_advisory_lock" in str(statement)
+                and "unlock" not in str(statement)
+                else "unlock"
+            )
+        )
+
+        def get_revision(connectable):
+            assert connectable is connection
+            events.append("revision")
+            return "abc123"
+
+        def upgrade(config, revision):
+            events.append("upgrade")
+            assert revision == "head"
+            assert config.attributes["connection"] is connection
+
+        monkeypatch.setattr(
+            "xagent.db.migration.get_alembic_revision",
+            get_revision,
+        )
+        monkeypatch.setattr(
+            "xagent.db.migration._check_revision_is_known",
+            lambda _config, _engine, _version: None,
+        )
+        monkeypatch.setattr("xagent.db.migration.command.upgrade", upgrade)
+
+        try_upgrade_db(engine)
+
+        assert events == ["lock", "revision", "upgrade", "unlock"]
+        assert connection.commit.call_count == 2
+
+    def test_database_startup_lock_covers_fresh_schema_creation_and_seed(
+        self,
+        monkeypatch,
+    ) -> None:
+        from xagent.web.models.database import Base, _initialize_database_schema
+
+        engine = MagicMock()
+        gate = threading.Barrier(2)
+        startup_mutex = threading.Lock()
+        state_lock = threading.Lock()
+        database_state = {"empty": True}
+        active_initializers = 0
+        max_active_initializers = 0
+        seed_calls = 0
+        empty_observations: list[bool] = []
+
+        @contextmanager
+        def startup_lock(_engine):
+            nonlocal active_initializers, max_active_initializers
+            with startup_mutex:
+                connection = MagicMock()
+                with state_lock:
+                    active_initializers += 1
+                    max_active_initializers = max(
+                        max_active_initializers,
+                        active_initializers,
+                    )
+                try:
+                    yield connection
+                finally:
+                    with state_lock:
+                        active_initializers -= 1
+
+        def is_empty(_bind):
+            with state_lock:
+                observed = bool(database_state["empty"])
+                empty_observations.append(observed)
+                return observed
+
+        def create_all(*, bind):
+            assert bind is not engine
+            with state_lock:
+                database_state["empty"] = False
+
+        def seed(_connection):
+            nonlocal seed_calls
+            with state_lock:
+                seed_calls += 1
+
+        monkeypatch.setattr(
+            "xagent.db.migration.database_startup_lock",
+            startup_lock,
+        )
+        monkeypatch.setattr("xagent.db.migration.is_database_empty", is_empty)
+        monkeypatch.setattr("xagent.db.migration.try_upgrade_db", Mock())
+        monkeypatch.setattr(Base.metadata, "create_all", create_all)
+        monkeypatch.setattr(
+            "xagent.web.builtin_mcp_registry.seed_builtin_oauth_and_public_mcp_apps",
+            seed,
+        )
+        monkeypatch.setattr(
+            "xagent.web.builtin_mcp_registry.validate_builtin_public_mcp_apps",
+            lambda _connection: [],
+        )
+
+        def initialize() -> None:
+            gate.wait()
+            _initialize_database_schema(engine)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(initialize) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=2)
+
+        assert max_active_initializers == 1
+        assert empty_observations == [True, False]
+        assert seed_calls == 1
+
+    def test_postgresql_releases_startup_migration_lock_after_failure(
+        self,
+        monkeypatch,
+    ):
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
+        connection = MagicMock()
+        connection.in_transaction.return_value = True
+        engine.connect.return_value.__enter__.return_value = connection
+
+        monkeypatch.setattr(
+            "xagent.db.migration.get_alembic_revision",
+            lambda _engine: "abc123",
+        )
+        monkeypatch.setattr(
+            "xagent.db.migration._check_revision_is_known",
+            lambda _config, _engine, _version: None,
+        )
+        monkeypatch.setattr(
+            "xagent.db.migration.command.upgrade",
+            Mock(side_effect=RuntimeError("upgrade failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="upgrade failed"):
+            try_upgrade_db(engine)
+
+        assert (
+            connection.execute.call_args_list[0]
+            .args[0]
+            .text.startswith("SELECT pg_advisory_lock")
+        )
+        assert (
+            connection.execute.call_args_list[-1]
+            .args[0]
+            .text.startswith("SELECT pg_advisory_unlock")
+        )
+        assert connection.rollback.call_count == 1
+        assert connection.commit.call_count == 2
+
     def test_sqlite_current_head_preserves_preexisting_fk_violations(self, tmp_path):
         engine = create_engine(f"sqlite:///{tmp_path / 'legacy-orphan.db'}")
         apply_sqlite_concurrency_pragmas(engine)
@@ -637,7 +801,10 @@ class TestTryUpgradeDb:
         try_upgrade_db(engine)
 
         mock_logger.info.assert_any_call("Starting database upgrade process")
-        mock_logger.info.assert_any_call("Current version: abc123, upgrading to head")
+        mock_logger.info.assert_any_call(
+            "Current version: %s, upgrading to head",
+            "abc123",
+        )
 
     @patch("xagent.db.migration.logger")
     @patch("xagent.db.migration.get_alembic_revision")

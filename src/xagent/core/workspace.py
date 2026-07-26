@@ -11,17 +11,34 @@ import mimetypes
 import os
 import re
 import shutil
-import threading
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from threading import RLock
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 from uuid import uuid4
 
 from ..config import get_uploads_dir
 from .execution_scope import validate_scope_component
 from .file_ref import parse_file_id_ref
+
+if TYPE_CHECKING:
+    from ..web.services.uploaded_file_store import (
+        StagedUploadedFile,
+        SupersededObjectCleanupClaim,
+        UploadedFileVersionSnapshot,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +49,12 @@ _auto_register = contextvars.ContextVar("_auto_register", default=False)
 
 # Runtime-internal files are intentionally absent from ``uploaded_files``:
 # screenshots and similar scratch artifacts must not appear as user
-# deliverables.  Tool instances currently reconstruct equivalent
-# ``TaskWorkspace`` objects for the same task, however, so an instance-local
-# mapping is not enough to preserve the FileRef contract across tools.  Keep a
-# process-local registry keyed by the canonical workspace root; this shares
-# internal handles only with another workspace instance for the exact same
-# task and does not make them durable across processes.
+# deliverables. Tool instances can reconstruct equivalent ``TaskWorkspace``
+# objects for the same task, so an instance-local mapping is not sufficient to
+# preserve the FileRef contract across tools. Keep a process-local registry
+# scoped to the canonical workspace root.
 _internal_file_registry: Dict[Tuple[str, str], Path] = {}
-_internal_file_registry_lock = threading.RLock()
+_internal_file_registry_lock = RLock()
 
 
 def scoped_user_root(
@@ -87,6 +102,53 @@ class AgentContext:
     workspace: Optional["TaskWorkspace"] = None
 
 
+@dataclass(frozen=True)
+class WorkspaceFileRegistration:
+    """Validated local metadata needed to register a workspace file."""
+
+    path: Path
+    relative_path: str
+    category: str
+    is_workspace_file: bool
+
+
+@dataclass(frozen=True)
+class WorkspaceUploadedFileSnapshot:
+    """Detached metadata consumed after the read Session releases its connection."""
+
+    version: "UploadedFileVersionSnapshot"
+    file_id: str
+    user_id: int
+    task_id: Optional[int]
+    mime_type: Optional[str]
+    workspace_relative_path: Optional[str]
+    workspace_category: Optional[str]
+
+
+@dataclass(frozen=True)
+class WorkspaceFileRegistrationPlan:
+    """Read-phase result for one workspace registration."""
+
+    registration: WorkspaceFileRegistration
+    file_id: str
+    task_id: Optional[int]
+    user_id: Optional[int]
+    existing: Optional[WorkspaceUploadedFileSnapshot]
+    occupied_storage_paths: tuple[tuple[str, str], ...]
+
+    @property
+    def should_persist(self) -> bool:
+        return self.task_id is not None and self.user_id is not None
+
+
+@dataclass(frozen=True)
+class PreparedWorkspaceFileRegistration:
+    """Storage-phase result passed into the short metadata transaction."""
+
+    plan: WorkspaceFileRegistrationPlan
+    staged: "StagedUploadedFile"
+
+
 class TaskWorkspace:
     """
     Task workspace manager that provides isolated working directories for tasks.
@@ -124,6 +186,7 @@ class TaskWorkspace:
             Path(base_dir).expanduser().resolve()
         )  # Resolve base_dir to absolute path for consistent workspace reconstruction
         self.db_session = None  # Optional database session for file registration
+        self._registration_lock = RLock()
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self.owner_user_id: Optional[int] = None
@@ -154,17 +217,23 @@ class TaskWorkspace:
         # Create directory structure
         self._ensure_directories()
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize durable workspace state without process-local synchronization."""
+
+        state = dict(self.__dict__)
+        state.pop("_registration_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore a fresh registration owner in the receiving process."""
+
+        self.__dict__.update(state)
+        self._registration_lock = RLock()
+
     def register_internal_file(
         self, file_path: str, file_id: Optional[str] = None
     ) -> str:
-        """Register a runtime-internal file without creating a user file record.
-
-        Files such as computer-use observation frames are execution scratch
-        data: they must be resolvable by file_id while the execution runs, but
-        they are not deliverables and must not appear in the user's file list.
-        Because no database row backs them, callers must tolerate a file_id
-        that no longer resolves (a later process, or after retention pruning).
-        """
+        """Register a runtime scratch file without creating a user file record."""
         resolved_path = Path(file_path).resolve()
         if not resolved_path.exists() or not resolved_path.is_file():
             raise FileNotFoundError(f"File not found for registration: {file_path}")
@@ -203,6 +272,584 @@ class TaskWorkspace:
     def register_file(
         self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
     ) -> str:
+        registered = self.register_files(
+            ((file_path, file_id),),
+            db_session=db_session,
+        )
+        return registered[0]
+
+    def register_files(
+        self,
+        files: Sequence[tuple[str, Optional[str]]],
+        *,
+        db_session: Any = None,
+    ) -> tuple[str, ...]:
+        """Serialize one workspace's registration read/stage/commit sequence."""
+
+        if not files:
+            return ()
+        with self._registration_lock:
+            return self._register_files_locked(files, db_session=db_session)
+
+    def _register_files_locked(
+        self,
+        files: Sequence[tuple[str, Optional[str]]],
+        *,
+        db_session: Any,
+    ) -> tuple[str, ...]:
+        """Register files through detached read, storage, and metadata phases.
+
+        ``db_session`` is a compatibility reference for the caller's database
+        bind, not the registration transaction owner. It must be clean so its
+        connection can be released before any filesystem or object-storage I/O.
+        Workspace-owned short Sessions perform the detached read and metadata
+        compare-and-swap, and the metadata Session commits before this method
+        returns. A later caller rollback therefore cannot orphan durable bytes.
+        """
+
+        resolved_db_session = db_session if db_session is not None else self.db_session
+        self._release_registration_session_if_clean(resolved_db_session)
+
+        # Path resolution, validation, and stat-like filesystem work happen
+        # only after any clean caller transaction has returned its connection.
+        registrations, result_indexes = self._normalize_file_registrations(files)
+        plans = self._load_file_registration_plans(
+            registrations,
+            db_session=resolved_db_session,
+        )
+
+        prepared: list[PreparedWorkspaceFileRegistration] = []
+        try:
+            for plan in plans:
+                if plan.should_persist:
+                    prepared.append(self._prepare_file_registration(plan))
+        except Exception:
+            self._compensate_prepared_file_registrations(prepared)
+            raise
+
+        cleanup_claims: tuple["SupersededObjectCleanupClaim", ...] = ()
+        try:
+            if prepared:
+                cleanup_claims = self._apply_prepared_file_registrations(
+                    prepared,
+                    reference_db=resolved_db_session,
+                )
+        except Exception:
+            self._compensate_prepared_file_registrations(prepared)
+            raise
+
+        # Cleanup happens only after the Workspace-owned metadata commit.
+        if cleanup_claims:
+            from ..web.services.uploaded_file_store import (
+                cleanup_superseded_uploaded_file_objects,
+            )
+
+            failed_claims = cleanup_superseded_uploaded_file_objects(cleanup_claims)
+            if failed_claims:
+                logger.warning(
+                    "Failed to clean %s superseded workspace file generation(s)",
+                    len(failed_claims),
+                )
+
+        for plan in plans:
+            self._remember_file_registration(
+                plan.file_id,
+                plan.registration.path,
+            )
+        unique_file_ids = tuple(plan.file_id for plan in plans)
+        return tuple(unique_file_ids[index] for index in result_indexes)
+
+    def _normalize_file_registrations(
+        self,
+        files: Sequence[tuple[str, Optional[str]]],
+    ) -> tuple[
+        tuple[tuple[WorkspaceFileRegistration, Optional[str]], ...],
+        tuple[int, ...],
+    ]:
+        """Collapse duplicate canonical paths before staging durable generations."""
+
+        unique: list[tuple[WorkspaceFileRegistration, Optional[str]]] = []
+        index_by_path: dict[str, int] = {}
+        path_by_requested_file_id: dict[str, str] = {}
+        result_indexes: list[int] = []
+
+        for file_path, file_id in files:
+            registration = self.describe_file_registration(file_path)
+            path_key = str(registration.path)
+            requested_file_id = str(file_id).strip() if file_id is not None else None
+            if not requested_file_id:
+                requested_file_id = None
+
+            existing_index = index_by_path.get(path_key)
+            if existing_index is not None:
+                existing_registration, existing_file_id = unique[existing_index]
+                if (
+                    existing_file_id is not None
+                    and requested_file_id is not None
+                    and existing_file_id != requested_file_id
+                ):
+                    raise ValueError(
+                        "One workspace path cannot be registered with multiple "
+                        "file ids in the same batch"
+                    )
+                if existing_file_id is None and requested_file_id is not None:
+                    unique[existing_index] = (
+                        existing_registration,
+                        requested_file_id,
+                    )
+                if requested_file_id is not None:
+                    existing_path = path_by_requested_file_id.get(requested_file_id)
+                    if existing_path is not None and existing_path != path_key:
+                        raise ValueError(
+                            "One file id cannot identify multiple workspace paths "
+                            "in the same batch"
+                        )
+                    path_by_requested_file_id[requested_file_id] = path_key
+                result_indexes.append(existing_index)
+                continue
+
+            if requested_file_id is not None:
+                existing_path = path_by_requested_file_id.get(requested_file_id)
+                if existing_path is not None and existing_path != path_key:
+                    raise ValueError(
+                        "One file id cannot identify multiple workspace paths "
+                        "in the same batch"
+                    )
+                path_by_requested_file_id[requested_file_id] = path_key
+
+            unique_index = len(unique)
+            index_by_path[path_key] = unique_index
+            unique.append((registration, requested_file_id))
+            result_indexes.append(unique_index)
+
+        return tuple(unique), tuple(result_indexes)
+
+    @staticmethod
+    def _release_registration_session_if_clean(db: Any) -> None:
+        if db is None:
+            return
+        from ..web.models.database import release_db_connection_if_clean
+
+        if not release_db_connection_if_clean(db):
+            raise RuntimeError(
+                "Cannot register workspace files while the caller database "
+                "session has pending writes"
+            )
+
+    def _load_file_registration_plans(
+        self,
+        registrations: Sequence[tuple[WorkspaceFileRegistration, Optional[str]]],
+        *,
+        db_session: Any,
+    ) -> tuple[WorkspaceFileRegistrationPlan, ...]:
+        db = self._create_registration_session(db_session)
+
+        try:
+            return tuple(
+                self._load_file_registration_plan(
+                    db,
+                    registration=registration,
+                    requested_file_id=requested_file_id,
+                )
+                for registration, requested_file_id in registrations
+            )
+        finally:
+            db.close()
+
+    @staticmethod
+    def _create_registration_session(reference_db: Any) -> Any:
+        """Open one Workspace-owned Session on the caller's database engine."""
+
+        if reference_db is None:
+            from ..web.models.database import get_session_local
+            from .storage.manager import create_db_session
+
+            try:
+                RegistrationSession = get_session_local()
+            except RuntimeError:
+                # Core-only callers may initialize the ad-hoc storage database
+                # without bootstrapping the web application's session factory.
+                return create_db_session()
+            return RegistrationSession()
+
+        from sqlalchemy.engine import Connection
+        from sqlalchemy.orm import sessionmaker
+
+        bind = reference_db.get_bind()
+        if isinstance(bind, Connection):
+            bind = bind.engine
+        RegistrationSession = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=bind,
+        )
+        return RegistrationSession()
+
+    def _load_file_registration_plan(
+        self,
+        db: Any,
+        *,
+        registration: WorkspaceFileRegistration,
+        requested_file_id: Optional[str],
+    ) -> WorkspaceFileRegistrationPlan:
+        from ..web.models.task import Task
+        from ..web.models.uploaded_file import UploadedFile
+        from ..web.services.uploaded_file_store import snapshot_uploaded_file_version
+
+        task_id = self.db_task_id
+        if task_id is None:
+            task_id = self._parse_task_id_from_workspace_id(self.id)
+
+        task_row = None
+        if task_id is not None:
+            task_row = (
+                db.query(Task.id, Task.user_id).filter(Task.id == int(task_id)).first()
+            )
+        if task_row is None:
+            if task_id is not None:
+                logger.warning("Task %s not found, cannot create file record", task_id)
+            final_file_id = requested_file_id or str(uuid4())
+            return WorkspaceFileRegistrationPlan(
+                registration=registration,
+                file_id=final_file_id,
+                task_id=None,
+                user_id=None,
+                existing=None,
+                occupied_storage_paths=(),
+            )
+
+        task_id = int(task_row.id)
+        task_user_id = int(task_row.user_id)
+        cached_file_id = self._recently_registered_files.get(str(registration.path))
+        candidate_file_id = cached_file_id or requested_file_id
+
+        existing_record = None
+        if candidate_file_id:
+            existing_record = (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.file_id == candidate_file_id,
+                    UploadedFile.storage_status != "compensating",
+                )
+                .first()
+            )
+        if existing_record is None:
+            existing_record = (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.storage_path == str(registration.path),
+                    UploadedFile.storage_status != "compensating",
+                )
+                .first()
+            )
+
+        existing = None
+        if existing_record is not None:
+            record_user_id = int(existing_record.user_id)
+            if record_user_id != task_user_id:
+                raise PermissionError(
+                    "Cannot register a workspace file over metadata owned by "
+                    "another user"
+                )
+            existing = WorkspaceUploadedFileSnapshot(
+                version=snapshot_uploaded_file_version(existing_record),
+                file_id=str(existing_record.file_id),
+                user_id=record_user_id,
+                task_id=(
+                    int(existing_record.task_id)
+                    if existing_record.task_id is not None
+                    else None
+                ),
+                mime_type=(
+                    str(existing_record.mime_type)
+                    if existing_record.mime_type is not None
+                    else None
+                ),
+                workspace_relative_path=(
+                    str(existing_record.workspace_relative_path)
+                    if existing_record.workspace_relative_path is not None
+                    else None
+                ),
+                workspace_category=(
+                    str(existing_record.workspace_category)
+                    if existing_record.workspace_category is not None
+                    else None
+                ),
+            )
+
+        final_file_id = (
+            existing.file_id
+            if existing is not None
+            else requested_file_id or str(uuid4())
+        )
+        occupied_storage_paths = tuple(
+            (str(storage_path), str(file_id))
+            for storage_path, file_id in (
+                db.query(UploadedFile.storage_path, UploadedFile.file_id)
+                .filter(
+                    UploadedFile.user_id == task_user_id,
+                    UploadedFile.storage_path.isnot(None),
+                )
+                .all()
+            )
+            if storage_path is not None
+        )
+        return WorkspaceFileRegistrationPlan(
+            registration=registration,
+            file_id=final_file_id,
+            task_id=task_id,
+            user_id=task_user_id,
+            existing=existing,
+            occupied_storage_paths=occupied_storage_paths,
+        )
+
+    def _prepare_file_registration(
+        self,
+        plan: WorkspaceFileRegistrationPlan,
+    ) -> PreparedWorkspaceFileRegistration:
+        from ..web.services.uploaded_file_store import (
+            stage_uploaded_file_from_local_path,
+        )
+        from .execution_scope import ExecutionScope
+        from .file_storage.keys import build_task_output_storage_key
+
+        assert plan.task_id is not None
+        assert plan.user_id is not None
+
+        local_path = plan.registration.path
+        relative_path: Optional[str] = plan.registration.relative_path
+        category: Optional[str] = plan.registration.category
+        if not plan.registration.is_workspace_file and plan.existing is not None:
+            relative_path = plan.existing.workspace_relative_path
+            category = plan.existing.workspace_category
+
+        if category == "output" and self._is_delegated_db_task_workspace(plan.task_id):
+            local_path, relative_path = self._materialize_delegated_output(
+                plan,
+                source_path=local_path,
+                relative_path=relative_path or local_path.name,
+            )
+            category = "output"
+
+        mime_type = plan.existing.mime_type if plan.existing is not None else None
+        if not mime_type:
+            mime_type, _ = mimetypes.guess_type(local_path.name)
+        mime_type = mime_type or "application/octet-stream"
+
+        logical_relative_path = relative_path or local_path.name
+        generation_relative_path = f"_versions/{uuid4().hex}/{logical_relative_path}"
+        staged = stage_uploaded_file_from_local_path(
+            local_path=local_path,
+            user_id=plan.user_id,
+            file_id=plan.file_id,
+            task_id=plan.task_id,
+            filename=local_path.name,
+            mime_type=mime_type,
+            storage_key=build_task_output_storage_key(
+                plan.user_id,
+                plan.task_id,
+                plan.file_id,
+                generation_relative_path,
+                scope_segments=self.scope_segments,
+            ),
+            workspace_relative_path=relative_path,
+            workspace_category=category,
+            execution_scope=ExecutionScope(
+                workspace_segments=self.scope_segments,
+                isolate_external_dirs=bool(self.scope_segments),
+            ),
+        )
+        return PreparedWorkspaceFileRegistration(plan=plan, staged=staged)
+
+    def _materialize_delegated_output(
+        self,
+        plan: WorkspaceFileRegistrationPlan,
+        *,
+        source_path: Path,
+        relative_path: str,
+    ) -> tuple[Path, str]:
+        assert plan.task_id is not None
+        assert plan.user_id is not None
+
+        relative_parts = Path(relative_path).parts
+        output_parts = [
+            part for part in relative_parts[1:] if part not in ("", ".", "..")
+        ]
+        if not output_parts:
+            output_parts = [source_path.name]
+
+        task_root = self._user_workspace_base_dir(plan.user_id) / (
+            f"web_task_{plan.task_id}"
+        )
+        output_root = (task_root / "output").resolve()
+        candidate = (task_root / Path("output", *output_parts)).resolve()
+        try:
+            candidate.relative_to(output_root)
+        except ValueError:
+            candidate = (output_root / source_path.name).resolve()
+
+        occupied_by_path = dict(plan.occupied_storage_paths)
+        stem = candidate.stem
+        suffix = candidate.suffix
+        index = 1
+        source_resolved = source_path.resolve()
+        while True:
+            candidate_resolved = candidate.resolve()
+            occupying_file_id = occupied_by_path.get(str(candidate))
+            same_record = occupying_file_id == plan.file_id
+            record_conflicts = (
+                occupying_file_id is not None and occupying_file_id != plan.file_id
+            )
+            path_conflicts = (
+                candidate.exists()
+                and candidate_resolved != source_resolved
+                and not same_record
+            )
+            if not record_conflicts and not path_conflicts:
+                break
+            candidate = candidate.parent / f"{stem}_{index}{suffix}"
+            index += 1
+
+        canonical_relative_path = candidate.relative_to(task_root).as_posix()
+        if candidate.resolve() != source_resolved:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, candidate)
+        return candidate, canonical_relative_path
+
+    def _apply_prepared_file_registrations(
+        self,
+        prepared: Sequence[PreparedWorkspaceFileRegistration],
+        *,
+        reference_db: Any,
+    ) -> tuple["SupersededObjectCleanupClaim", ...]:
+        from ..web.models.task import Task
+        from ..web.services.uploaded_file_store import UploadedFileStore
+
+        db = self._create_registration_session(reference_db)
+
+        cleanup_claims: list[SupersededObjectCleanupClaim] = []
+        try:
+            for item in prepared:
+                plan = item.plan
+                task_exists = (
+                    db.query(Task.id)
+                    .filter(
+                        Task.id == plan.task_id,
+                        Task.user_id == plan.user_id,
+                    )
+                    .first()
+                    is not None
+                )
+                if not task_exists:
+                    raise ValueError(
+                        f"Task {plan.task_id} is not owned by user {plan.user_id}"
+                    )
+                applied = UploadedFileStore(db).upsert_already_durable(
+                    item.staged,
+                    expected=(
+                        plan.existing.version if plan.existing is not None else None
+                    ),
+                    allow_task_rebind=(
+                        plan.existing is not None
+                        and plan.existing.task_id != plan.task_id
+                    ),
+                )
+                if applied.superseded_cleanup_claim is not None:
+                    cleanup_claims.append(applied.superseded_cleanup_claim)
+            db.commit()
+            return tuple(cleanup_claims)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                logger.warning(
+                    "Failed to roll back workspace file metadata Session",
+                    exc_info=True,
+                )
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _compensate_prepared_file_registrations(
+        prepared: Sequence[PreparedWorkspaceFileRegistration],
+    ) -> None:
+        if not prepared:
+            return
+        from ..web.services.uploaded_file_store import (
+            compensate_staged_uploaded_files,
+        )
+
+        failed_file_ids = compensate_staged_uploaded_files(
+            tuple(item.staged for item in prepared)
+        )
+        if failed_file_ids:
+            logger.warning(
+                "Failed to compensate %s staged workspace file generation(s)",
+                len(failed_file_ids),
+            )
+
+    def _create_file_record(
+        self,
+        file_id: str,
+        file_path: Path,
+        db_session: Any = None,
+    ) -> None:
+        """Compatibility facade for legacy callers and test seams.
+
+        Registration is owned by :meth:`register_files`; this private method
+        remains callable while downstream integrations migrate away from
+        patching the former single-phase persistence hook.
+        """
+
+        self.register_files(
+            ((str(file_path), file_id),),
+            db_session=db_session,
+        )
+
+    def bind_already_durable_file(
+        self,
+        registration: WorkspaceFileRegistration,
+        *,
+        file_id: str,
+    ) -> str:
+        """Bind a separately persisted durable file into this workspace cache.
+
+        This is deliberately distinct from :meth:`register_file`: it never
+        queries the database or uploads bytes.  The caller must first commit an
+        ``UploadedFile`` row whose durable metadata matches ``file_id``.
+        """
+
+        normalized_file_id = str(file_id).strip()
+        if not normalized_file_id:
+            raise ValueError("file_id is required for an already durable file")
+        with self._registration_lock:
+            self._remember_file_registration(normalized_file_id, registration.path)
+        return normalized_file_id
+
+    def describe_file_registration(self, file_path: str) -> WorkspaceFileRegistration:
+        """Return validated, persistence-ready metadata without side effects."""
+
+        resolved_path = self._resolve_file_for_registration(file_path)
+        try:
+            relative_path = resolved_path.relative_to(
+                self.workspace_dir.resolve()
+            ).as_posix()
+            is_workspace_file = True
+        except ValueError:
+            relative_path = resolved_path.name
+            is_workspace_file = False
+        category = relative_path.split("/", 1)[0] if relative_path else "workspace"
+        return WorkspaceFileRegistration(
+            path=resolved_path,
+            relative_path=relative_path,
+            category=category,
+            is_workspace_file=is_workspace_file,
+        )
+
+    def _resolve_file_for_registration(self, file_path: str) -> Path:
+        """Resolve and validate the shared path precondition for registration."""
+
         resolved_path = self.resolve_path(file_path, default_dir="output")
         if not resolved_path.exists() or not resolved_path.is_file():
             raise FileNotFoundError(f"File not found for registration: {file_path}")
@@ -225,42 +872,13 @@ class TaskWorkspace:
             raise ValueError(
                 f"Path {file_path} is outside workspace and allowed directories"
             )
-
-        # Check if file already exists in database
-        resolved_db_session = db_session or self.db_session
-        cached_file_id = self._recently_registered_files.get(str(resolved_path))
-        if cached_file_id:
-            self._sync_existing_file_record(
-                cached_file_id, resolved_path, resolved_db_session
-            )
-            self._remember_file_registration(cached_file_id, resolved_path)
-            return cached_file_id
-
-        existing_file_id = self._get_file_id_from_db(resolved_path, resolved_db_session)
-        if existing_file_id:
-            self._sync_existing_file_record(
-                existing_file_id, resolved_path, resolved_db_session
-            )
-            self._remember_file_registration(existing_file_id, resolved_path)
-            return existing_file_id
-
-        # Generate new file_id if not provided
-        final_file_id = str(file_id).strip() if file_id else ""
-        if not final_file_id:
-            final_file_id = str(uuid4())
-
-        # Create database record
-        self._create_file_record(final_file_id, resolved_path, db_session)
-        self._remember_file_registration(final_file_id, resolved_path)
-
-        return final_file_id
+        return resolved_path
 
     def _remember_file_registration(self, file_id: str, file_path: Path) -> None:
-        path_str = str(file_path)
-        resolved_str = str(file_path.resolve())
-        self._recently_registered_files[path_str] = file_id
-        self._recently_registered_files[resolved_str] = file_id
-        self._file_id_to_path[file_id] = file_path
+        with self._registration_lock:
+            path_str = str(file_path)
+            self._recently_registered_files[path_str] = file_id
+            self._file_id_to_path[file_id] = file_path
 
     def _is_delegated_db_task_workspace(self, task_id: int) -> bool:
         if self.db_task_id is None:
@@ -278,309 +896,6 @@ class TaskWorkspace:
         if self.base_dir.parts[-len(expected_tail) :] == expected_tail:
             return self.base_dir
         return scoped_user_root(self.base_dir, user_id, self.scope_segments)
-
-    @staticmethod
-    def _storage_path_record(
-        db: Any, storage_path: Path, file_id: Optional[str] = None
-    ) -> Any:
-        from ..web.models.uploaded_file import UploadedFile
-
-        query = db.query(UploadedFile).filter(
-            UploadedFile.storage_path == str(storage_path)
-        )
-        record = query.first()
-        if record is None or file_id is None or str(record.file_id) == str(file_id):
-            return record
-        return record
-
-    @classmethod
-    def _unique_registration_path(
-        cls, target_path: Path, source_path: Path, db: Any, file_id: str
-    ) -> Path:
-        stem = target_path.stem
-        suffix = target_path.suffix
-        parent = target_path.parent
-        candidate = target_path
-        index = 1
-
-        source_resolved = source_path.resolve()
-        while True:
-            try:
-                candidate_resolved = candidate.resolve()
-            except OSError:
-                candidate_resolved = candidate.absolute()
-            record = cls._storage_path_record(db, candidate, file_id)
-            same_record = record is not None and str(record.file_id) == str(file_id)
-            record_conflicts = record is not None and str(record.file_id) != str(
-                file_id
-            )
-            path_conflicts = (
-                candidate.exists()
-                and candidate_resolved != source_resolved
-                and not same_record
-            )
-            if not record_conflicts and not path_conflicts:
-                return candidate
-            candidate = parent / f"{stem}_{index}{suffix}"
-            index += 1
-
-    def _canonicalize_delegated_output_registration(
-        self,
-        *,
-        db: Any,
-        file_id: str,
-        file_path: Path,
-        task_id: int,
-        user_id: int,
-        relative_path: str,
-        category: str,
-    ) -> tuple[Path, str, str]:
-        if category != "output" or not self._is_delegated_db_task_workspace(task_id):
-            return file_path, relative_path, category
-
-        relative_parts = Path(relative_path).parts
-        output_parts = [
-            part for part in relative_parts[1:] if part not in ("", ".", "..")
-        ]
-        if not output_parts:
-            output_parts = [file_path.name]
-
-        canonical_relative_path = Path("output", *output_parts).as_posix()
-        task_root = self._user_workspace_base_dir(user_id) / f"web_task_{task_id}"
-        output_root = (task_root / "output").resolve()
-        canonical_path = (task_root / canonical_relative_path).resolve()
-        try:
-            canonical_path.relative_to(output_root)
-        except ValueError:
-            canonical_relative_path = Path("output", file_path.name).as_posix()
-            canonical_path = (task_root / canonical_relative_path).resolve()
-
-        canonical_path = self._unique_registration_path(
-            canonical_path, file_path, db, file_id
-        )
-        canonical_relative_path = canonical_path.relative_to(task_root).as_posix()
-        if canonical_path.resolve() != file_path.resolve():
-            canonical_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file_path, canonical_path)
-
-        return canonical_path, canonical_relative_path, "output"
-
-    def _create_file_record(
-        self, file_id: str, file_path: Path, db_session: Any = None
-    ) -> None:
-        """Create UploadedFile record in database"""
-        from .storage.manager import create_db_session
-
-        # Use provided session or create temporary one
-        if db_session:
-            db = db_session
-            should_close = False
-        else:
-            db = self.db_session if self.db_session else create_db_session()
-            should_close = self.db_session is None
-
-        try:
-            from ..web.models.task import Task
-            from ..web.models.uploaded_file import UploadedFile
-
-            # Check if record already exists
-            existing = (
-                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
-            )
-            if existing:
-                return
-
-            task_id = self.db_task_id
-            if task_id is None:
-                # Extract task_id from workspace id (e.g., 'web_task_265' -> 265).
-                # Delegated agent workspaces use non-DB ids such as
-                # 'agent_2_abcd1234', so callers should pass db_task_id explicitly.
-                try:
-                    task_id = int(self.id.split("_")[-1])
-                except (ValueError, IndexError):
-                    logger.debug(
-                        f"Skipping database registration for workspace '{self.id}' "
-                        f"without db_task_id, file_id={file_id}"
-                    )
-                    return
-
-            # Get user_id from task
-            task = db.query(Task).filter(Task.id == task_id).first()
-            if not task:
-                logger.warning(f"Task {task_id} not found, cannot create file record")
-                return
-
-            # Guess MIME type
-            mime_type, _ = mimetypes.guess_type(file_path.name)
-            if not mime_type:
-                mime_type = "application/octet-stream"
-
-            try:
-                relative_path = str(file_path.relative_to(self.workspace_dir))
-            except ValueError:
-                relative_path = file_path.name
-            category = relative_path.split("/", 1)[0] if relative_path else "workspace"
-
-            file_path, relative_path, category = (
-                self._canonicalize_delegated_output_registration(
-                    db=db,
-                    file_id=file_id,
-                    file_path=file_path,
-                    task_id=int(task_id),
-                    user_id=int(task.user_id),
-                    relative_path=relative_path,
-                    category=category,
-                )
-            )
-
-            # Import lazily: module-level file_storage imports would pull
-            # fsspec into sandboxed executions that ship minimal deps.
-            from ..web.services.uploaded_file_store import UploadedFileStore
-            from .file_storage.keys import build_task_output_storage_key
-
-            UploadedFileStore(db).create_from_local_path(
-                local_path=file_path,
-                user_id=int(task.user_id),
-                file_id=file_id,
-                task_id=task_id,
-                filename=file_path.name,
-                storage_key=build_task_output_storage_key(
-                    int(task.user_id),
-                    task_id,
-                    file_id,
-                    relative_path,
-                    scope_segments=self.scope_segments,
-                ),
-                workspace_relative_path=relative_path,
-                workspace_category=category,
-                mime_type=mime_type,
-            )
-            if should_close:
-                db.commit()
-            else:
-                db.flush()
-            logger.info(f"Created file record: file_id={file_id}, task_id={task_id}")
-        except Exception as e:
-            logger.error(f"Failed to create file record: {e}")
-            if should_close:
-                db.rollback()
-            raise  # Re-raise so caller knows registration failed
-        finally:
-            if should_close and db is not None:
-                db.close()
-
-    def _sync_existing_file_record(
-        self, file_id: str, file_path: Path, db_session: Any = None
-    ) -> None:
-        """Sync an existing UploadedFile row with current local bytes."""
-        from .file_storage.keys import build_task_output_storage_key
-        from .storage.manager import create_db_session
-
-        if db_session:
-            db = db_session
-            should_close = False
-        else:
-            db = self.db_session if self.db_session else create_db_session()
-            should_close = self.db_session is None
-
-        try:
-            from ..web.models.uploaded_file import UploadedFile
-            from ..web.services.uploaded_file_store import UploadedFileStore
-
-            record = (
-                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
-            )
-            if record is None:
-                return
-
-            mime_type, _ = mimetypes.guess_type(file_path.name)
-            if not mime_type:
-                mime_type = "application/octet-stream"
-
-            task_id = getattr(record, "task_id", None)
-            user_id = int(getattr(record, "user_id"))
-
-            try:
-                relative_path = str(file_path.relative_to(self.workspace_dir))
-            except ValueError:
-                UploadedFileStore(db).sync_existing(
-                    record,
-                    storage_key=getattr(record, "storage_key", None),
-                    mime_type=getattr(record, "mime_type", None) or mime_type,
-                )
-                if should_close:
-                    db.commit()
-                else:
-                    db.flush()
-                return
-
-            if self.db_task_id is not None:
-                from ..web.models.task import Task
-
-                task = db.query(Task).filter(Task.id == self.db_task_id).first()
-                if not task:
-                    logger.warning(
-                        f"Task {self.db_task_id} not found, cannot rebind file record"
-                    )
-                    return
-                task_user_id = int(task.user_id)
-                if user_id != task_user_id:
-                    logger.warning(
-                        "Skipping file record rebind across users: "
-                        f"file_id={file_id}, record_user_id={user_id}, "
-                        f"task_user_id={task_user_id}"
-                    )
-                    return
-                task_id = self.db_task_id
-                user_id = task_user_id
-
-            category = relative_path.split("/", 1)[0] if relative_path else "workspace"
-            file_path, relative_path, category = (
-                self._canonicalize_delegated_output_registration(
-                    db=db,
-                    file_id=file_id,
-                    file_path=file_path,
-                    task_id=int(task_id) if task_id is not None else 0,
-                    user_id=user_id,
-                    relative_path=relative_path,
-                    category=category,
-                )
-            )
-            storage_key = build_task_output_storage_key(
-                user_id,
-                int(task_id) if task_id is not None else 0,
-                file_id,
-                relative_path,
-                scope_segments=self.scope_segments,
-            )
-            if task_id is None:
-                storage_key = getattr(record, "storage_key", None) or storage_key
-
-            record.user_id = user_id
-            record.task_id = int(task_id) if task_id is not None else None
-            record.filename = file_path.name
-            record.storage_path = str(file_path)
-            record.file_size = file_path.stat().st_size
-            record.mime_type = mime_type
-            record.workspace_relative_path = relative_path
-            record.workspace_category = category
-            UploadedFileStore(db).sync_existing(
-                record,
-                storage_key=storage_key,
-                mime_type=mime_type,
-            )
-            if should_close:
-                db.commit()
-            else:
-                db.flush()
-        except Exception as e:
-            logger.error(f"Failed to sync existing file record: {e}")
-            if should_close:
-                db.rollback()
-            raise
-        finally:
-            if should_close and db is not None:
-                db.close()
 
     def _get_file_id_from_db(
         self, file_path: Path, db_session: Any = None
@@ -721,8 +1036,9 @@ class TaskWorkspace:
             return None
 
         # Check in-memory cache first
-        if file_id in self._file_id_to_path:
-            cached_path = self._file_id_to_path[file_id]
+        with self._registration_lock:
+            cached_path = self._file_id_to_path.get(file_id)
+        if cached_path is not None:
             if cached_path.exists():
                 logger.debug(
                     f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
@@ -733,7 +1049,9 @@ class TaskWorkspace:
                     f"resolve_file_id: Cached path doesn't exist: {cached_path}"
                 )
                 # Remove stale cache entry
-                del self._file_id_to_path[file_id]
+                with self._registration_lock:
+                    if self._file_id_to_path.get(file_id) == cached_path:
+                        self._file_id_to_path.pop(file_id, None)
 
         internal_path = self._resolve_internal_file_id(file_id)
         if internal_path is not None:
@@ -1230,38 +1548,47 @@ class TaskWorkspace:
 
         This is safer than relying on manual register_file() calls.
         """
-        # Scan files before operation
+        self._release_registration_session_if_clean(self.db_session)
         files_before = self._scan_all_files()
 
         try:
             yield self
         finally:
-            # Scan files after operation and register new/modified files.
+            self._release_registration_session_if_clean(self.db_session)
             files_after = self._scan_all_files()
             changed_files = files_after - files_before
-            changed_files.update(
-                file_path
-                for file_path in files_after & files_before
-                if self._get_file_id_from_db(file_path, self.db_session) is not None
-            )
+            for file_path in files_after & files_before:
+                with self._registration_lock:
+                    cached_file_id = self._recently_registered_files.get(str(file_path))
+                if cached_file_id or self._get_file_id_from_db(
+                    file_path, self.db_session
+                ):
+                    changed_files.add(file_path)
+            self._release_registration_session_if_clean(self.db_session)
 
-            for file_path in changed_files:
-                try:
-                    file_id = self.register_file(str(file_path))
-                    # Store path -> file_id mapping
-                    path_str = str(file_path)
-                    resolved_str = str(file_path.resolve())
-                    self._recently_registered_files[path_str] = file_id
-                    self._recently_registered_files[resolved_str] = file_id
-                    # Store file_id -> path reverse mapping
-                    self._file_id_to_path[file_id] = file_path
-                    logger.debug(f"Auto-registered file: {file_path} -> {file_id}")
-                except Exception as e:
-                    # Don't generate fake file_id - file will need to be backfilled later
-                    logger.error(
-                        f"Failed to auto-register file {file_path}: {e}. "
-                        f"File exists on disk but is not in database - will require backfill."
-                    )
+            if changed_files:
+                ordered_files = tuple(sorted(changed_files, key=str))
+                # Each file owns its metadata transaction and compensation so
+                # one failed artifact cannot roll back unrelated outputs. This
+                # deliberately trades batch Session/commit efficiency for
+                # per-file failure isolation.
+                for file_path in ordered_files:
+                    try:
+                        file_id = self.register_file(
+                            str(file_path),
+                            db_session=self.db_session,
+                        )
+                        logger.debug(
+                            "Auto-registered file: %s -> %s", file_path, file_id
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to auto-register workspace file %s: %s. "
+                            "The file exists on disk but is not in the database "
+                            "and requires backfill.",
+                            file_path,
+                            e,
+                        )
 
     def _scan_all_files(self) -> set[Path]:
         """Scan all files in workspace and return as set."""
@@ -1290,22 +1617,24 @@ class TaskWorkspace:
 
             # Check in-memory cache first (for files just registered)
             logger.debug(f"get_file_id_from_path: Looking for {resolved_str}")
+            with self._registration_lock:
+                cache_snapshot = dict(self._recently_registered_files)
             logger.debug(
-                f"get_file_id_from_path: Cache has {len(self._recently_registered_files)} entries: {list(self._recently_registered_files.keys())}"
+                f"get_file_id_from_path: Cache has {len(cache_snapshot)} entries: {list(cache_snapshot.keys())}"
             )
 
-            if resolved_str in self._recently_registered_files:
+            if resolved_str in cache_snapshot:
                 logger.debug(
-                    f"get_file_id_from_path: Found in cache: {self._recently_registered_files[resolved_str]}"
+                    f"get_file_id_from_path: Found in cache: {cache_snapshot[resolved_str]}"
                 )
-                return self._recently_registered_files[resolved_str]
+                return cache_snapshot[resolved_str]
 
             # Also try the original path (not resolved)
-            if file_path in self._recently_registered_files:
+            if file_path in cache_snapshot:
                 logger.debug(
-                    f"get_file_id_from_path: Found in cache with original path: {self._recently_registered_files[file_path]}"
+                    f"get_file_id_from_path: Found in cache with original path: {cache_snapshot[file_path]}"
                 )
-                return self._recently_registered_files[file_path]
+                return cache_snapshot[file_path]
 
             logger.debug("get_file_id_from_path: Not found in cache, checking DB")
             # Fall back to database query

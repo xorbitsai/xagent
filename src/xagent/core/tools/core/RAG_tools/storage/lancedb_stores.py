@@ -56,9 +56,13 @@ class LanceDBMetadataStore(MetadataStore):
         self._conn: Optional[DBConnection] = None
 
     async def _get_connection(self) -> DBConnection:
-        if self._conn is None:
-            self._conn = get_connection_from_env()
-        return self._conn
+        """Open (and memoise) the connection without stalling the event loop.
+
+        Opening a LanceDB connection is blocking I/O, so it is dispatched to a
+        worker thread. ``get_raw_connection`` is the synchronous equivalent for
+        callers already running off the loop.
+        """
+        return await asyncio.to_thread(self.get_raw_connection)
 
     async def get_collection(self, collection_name: str) -> CollectionInfo:
         from ..LanceDB.schema_manager import _safe_close_table
@@ -160,13 +164,16 @@ class LanceDBMetadataStore(MetadataStore):
             _safe_close_table(table)
 
     async def save_collections(self, collections: Sequence[CollectionInfo]) -> None:
-        from ..LanceDB.schema_manager import _safe_close_table
-
         if not collections:
             return
+        await asyncio.to_thread(self._save_collections_sync, collections)
 
-        conn = await self._get_connection()
-        await self.ensure_collection_metadata_table()
+    def _save_collections_sync(self, collections: Sequence[CollectionInfo]) -> None:
+        """Blocking body of :meth:`save_collections`; must not run on the loop."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self.get_raw_connection()
+        self._ensure_collection_metadata_table_sync(conn)
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         rows_by_name = OrderedDict()
@@ -195,8 +202,16 @@ class LanceDBMetadataStore(MetadataStore):
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> List[CollectionInfo]:
-        conn = await self._get_connection()
-        await self.ensure_collection_metadata_table()
+        return await asyncio.to_thread(self._list_collections_sync, user_id, is_admin)
+
+    def _list_collections_sync(
+        self,
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> List[CollectionInfo]:
+        """Blocking body of :meth:`list_collections`; must not run on the loop."""
+        conn = self.get_raw_connection()
+        self._ensure_collection_metadata_table_sync(conn)
         table = conn.open_table("collection_metadata")
         rows = table.search().to_arrow().to_pylist()
 
@@ -280,6 +295,14 @@ class LanceDBMetadataStore(MetadataStore):
 
     async def ensure_collection_metadata_table(self) -> None:
         conn = await self._get_connection()
+        await asyncio.to_thread(self._ensure_collection_metadata_table_sync, conn)
+
+    def _ensure_collection_metadata_table_sync(self, conn: DBConnection) -> None:
+        """Blocking body of :meth:`ensure_collection_metadata_table`.
+
+        Exposed synchronously so the other blocking bodies can call it inside
+        their own worker thread rather than paying a second thread hop.
+        """
         schema = pa.schema(
             [
                 ("name", pa.string()),
@@ -399,6 +422,17 @@ class LanceDBMetadataStore(MetadataStore):
         Returns:
             Config JSON string if found, None otherwise.
         """
+        return await asyncio.to_thread(
+            self._get_collection_config_sync, collection, user_id, is_admin
+        )
+
+    def _get_collection_config_sync(
+        self,
+        collection: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> str | None:
+        """Blocking body of :meth:`get_collection_config`; not for the loop."""
         from ..LanceDB.schema_manager import (
             _safe_close_table,
             ensure_collection_config_table,
@@ -406,7 +440,7 @@ class LanceDBMetadataStore(MetadataStore):
 
         table = None
         try:
-            conn = await self._get_connection()
+            conn = self.get_raw_connection()
             ensure_collection_config_table(conn)
 
             table = conn.open_table("collection_config")

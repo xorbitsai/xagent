@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, TypeVar
+from contextlib import contextmanager
+from typing import Callable, Iterator, TypeVar
 
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -56,6 +57,33 @@ async def await_task_settlement(
         return result, cancellation
 
 
+@contextmanager
+def propagate_deferred_cancellation(
+    cancellation: asyncio.CancelledError | None,
+) -> Iterator[None]:
+    """Restore captured caller cancellation on every scope exit.
+
+    Resource owners may need to finish durable work and best-effort follow-up
+    after :func:`await_task_settlement` records cancellation. Once that work
+    starts, neither an early return nor a later operational exception may
+    silently replace the caller's cancellation. Process-control exceptions
+    such as ``SystemExit`` and ``KeyboardInterrupt`` still propagate unchanged.
+    """
+
+    try:
+        yield
+    except asyncio.CancelledError as error:
+        if cancellation is not None:
+            raise cancellation from error
+        raise
+    except Exception as error:
+        if cancellation is not None:
+            raise cancellation from error
+        raise
+    if cancellation is not None:
+        raise cancellation
+
+
 async def run_db_io_cancellation_safe(operation: Callable[[], _T]) -> _T:
     """Run blocking database work without abandoning it on cancellation.
 
@@ -69,3 +97,24 @@ async def run_db_io_cancellation_safe(operation: Callable[[], _T]) -> _T:
     if cancellation is not None:
         raise cancellation
     return result
+
+
+async def drain_async_task_cancellation_safe(task: asyncio.Task[_T]) -> _T:
+    """Drain an owned asynchronous task before propagating cancellation."""
+    result, cancellation = await await_task_settlement(task)
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def cancel_and_drain_async_task(task: asyncio.Task[_T]) -> None:
+    """Cancel an owned task and drain all of its asynchronous cleanup."""
+
+    if not task.done():
+        task.cancel()
+
+    async def drain() -> None:
+        await asyncio.gather(task, return_exceptions=True)
+
+    cleanup = asyncio.create_task(drain())
+    await drain_async_task_cancellation_safe(cleanup)

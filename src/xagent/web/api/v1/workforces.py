@@ -17,46 +17,26 @@ with agent-as-tool behavior; LLM cost is captured by the quota system).
 """
 
 import logging
-from typing import NoReturn, Tuple
+from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session, joinedload, selectinload
 
-from ...models.agent_api_key import AgentApiKey
-from ...models.database import get_db
-from ...models.user import User
-from ...models.workforce import Workforce, WorkforceAgent
 from ...schemas.v1 import (
     CreateWorkforceRunRequest,
     CreateWorkforceRunResponse,
 )
 from ...services.workforce_errors import WorkforceRunErrorCode
-from ...services.workforce_runs import create_workforce_run
-from .deps import get_workforce_from_api_key, record_key_usage
+from ...services.workforce_runs import create_workforce_run_by_id
+from .deps import (
+    RuntimeApiKeySnapshot,
+    WorkforcePrincipalSnapshot,
+    get_workforce_from_api_key,
+    record_key_usage,
+)
 from .errors import V1ApiError, V1ErrorCode
 
 router = APIRouter(prefix="/workforces")
 logger = logging.getLogger(__name__)
-
-
-def _load_workforce_for_run(db: Session, workforce_id: int) -> Workforce | None:
-    """Eager-load the manager agent + workers the run service needs.
-
-    The auth dependency already loaded the ``Workforce`` row, but only
-    the bare row -- ``create_workforce_run`` walks ``manager_agent`` (for
-    the execution-mode fallback + connector runtime) and ``workers`` (for
-    the config snapshot), so re-load with those relationships pinned to
-    avoid lazy round-trips mid-run-creation.
-    """
-    return (
-        db.query(Workforce)
-        .options(
-            joinedload(Workforce.manager_agent),
-            selectinload(Workforce.workers).joinedload(WorkforceAgent.agent),
-        )
-        .filter(Workforce.id == workforce_id)
-        .first()
-    )
 
 
 # Stable service-layer code -> (v1 wire code, HTTP status). Switching on
@@ -116,8 +96,9 @@ def _raise_v1_for_workforce_http_error(exc: HTTPException) -> NoReturn:
 async def create_workforce_run_endpoint(
     workforce_id: int,
     request: CreateWorkforceRunRequest,
-    authed: Tuple[Workforce, AgentApiKey] = Depends(get_workforce_from_api_key),
-    db: Session = Depends(get_db),
+    authed: tuple[WorkforcePrincipalSnapshot, RuntimeApiKeySnapshot] = Depends(
+        get_workforce_from_api_key
+    ),
 ) -> CreateWorkforceRunResponse:
     """Create a workforce run and kick off its first turn.
 
@@ -147,22 +128,10 @@ async def create_workforce_run_endpoint(
     if workforce_id != int(bound_workforce.id):
         raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
 
-    workforce = _load_workforce_for_run(db, workforce_id)
-    if workforce is None:
-        raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
-
-    # ``create_workforce_run`` acts as the workforce owner. Resolve the
-    # user from the workforce's owner_user_id (the key carries no user
-    # session of its own).
-    owner = db.get(User, int(workforce.owner_user_id))
-    if owner is None:
-        raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
-
     try:
-        result = await create_workforce_run(
-            db,
-            owner,
-            workforce,
+        result = await create_workforce_run_by_id(
+            user_id=int(bound_workforce.owner_user_id),
+            workforce_id=int(bound_workforce.id),
             message=request.message.content,
             selected_file_ids=request.message.files,
             execution_mode=request.execution_mode,
@@ -186,11 +155,11 @@ async def create_workforce_run_endpoint(
     # delegations inside the run are never metered here (agent-as-tool
     # parity); LLM cost is tracked by the quota system.
     if result.created:
-        record_key_usage(str(key_row.key_prefix))
+        await record_key_usage(str(key_row.key_prefix))
 
     return CreateWorkforceRunResponse(
         workforce_run_id=int(workforce_run.id),
-        workforce_id=int(workforce.id),
+        workforce_id=int(bound_workforce.id),
         task_id=int(task.id),
         agent_id=int(task.agent_id),
         status=str(workforce_run.status),

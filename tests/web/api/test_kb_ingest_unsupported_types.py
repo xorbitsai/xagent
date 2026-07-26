@@ -10,6 +10,7 @@ These tests define the expected fail-fast behavior for the /ingest endpoint:
 import io
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -45,7 +46,11 @@ def app_with_kb(mock_user, mock_db):
     app.include_router(kb_router)
     app.dependency_overrides[get_current_user] = lambda: mock_user
     app.dependency_overrides[get_db] = lambda: mock_db
-    return app
+    with patch(
+        "xagent.web.api.kb._upsert_uploaded_file_record",
+        return_value=SimpleNamespace(file_id="test-file-id"),
+    ):
+        yield app
 
 
 def _post_ingest(client: TestClient, filename: str, content: bytes = b"x", **form_data):

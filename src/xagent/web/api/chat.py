@@ -6,10 +6,10 @@ import os
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar, Union, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -20,7 +20,9 @@ from ...config import (
 from ...core.agent.service import AgentService
 from ...core.agent.task_environment import build_task_environment
 from ...core.execution_scope import (
+    EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
+    ExecutionScopeNotProvided,
     ScopeFingerprint,
     get_execution_scope,
     resolve_execution_scope,
@@ -66,6 +68,11 @@ from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
+from ..services.db_runtime import (
+    drain_async_task_cancellation_safe,
+    is_database_pool_timeout,
+    run_db_io_cancellation_safe,
+)
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -80,24 +87,30 @@ from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
+    materialize_task_execution_recovery_state,
 )
 from ..services.task_lease_service import (
-    acquire_task_lease,
-    mark_task_paused_if_stale,
+    TaskLease,
+    TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
+    acquire_task_lease_cancellation_safe,
+    acquire_task_lease_isolated,
+    bind_task_lease_context,
     run_task_lease_heartbeat,
+    run_while_task_lease_owned,
     stop_task_lease_heartbeat,
 )
 from ..services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
     load_task_setup_snapshot_sync,
 )
-from ..services.trace_message_storage import decode_trace_events_data
 from ..services.workforce_runtime import (
     WorkforceTaskRuntime,
     release_task_lease_with_workforce_sync,
     resolve_workforce_task_runtime,
-    sync_workforce_run_status,
+    sync_workforce_run_status_for_task_id_isolated,
 )
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -109,6 +122,7 @@ logger = logging.getLogger(__name__)
 # Depth of the per-task recently-evicted scope-fingerprint memory used for
 # resolver-flap detection; catches scope cycles up to this period.
 _EVICTED_FINGERPRINT_MEMORY = 4
+
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -251,7 +265,7 @@ class AgentServiceMemoryPolicy:
 
 def resolve_agent_service_memory_policy(
     *,
-    task: Optional[Task] = None,
+    task: Optional[Any] = None,
     agent_config: Optional[Mapping[str, Any]] = None,
 ) -> AgentServiceMemoryPolicy:
     """Resolve the memory store and enablement for an AgentService runtime."""
@@ -267,6 +281,27 @@ def resolve_agent_service_memory_policy(
         return AgentServiceMemoryPolicy(get_memory_store(), False)
 
     return AgentServiceMemoryPolicy(get_memory_store(), True)
+
+
+async def resolve_agent_service_memory_policy_async(
+    *,
+    task: Optional[Any] = None,
+    agent_config: Optional[Mapping[str, Any]] = None,
+) -> AgentServiceMemoryPolicy:
+    """Resolve runtime memory without blocking the asyncio event loop.
+
+    ``get_memory_store`` refreshes its embedding-model configuration through
+    synchronous SQLAlchemy queries. Task setup supplies detached task/config
+    data here, while the worker owns the short database Session used by the
+    dynamic store manager.
+    """
+
+    return await run_db_io_cancellation_safe(
+        lambda: resolve_agent_service_memory_policy(
+            task=task,
+            agent_config=agent_config,
+        )
+    )
 
 
 def create_default_llm() -> Optional[BaseLLM]:
@@ -499,7 +534,7 @@ def _int_id_or_none(value: Any) -> Optional[int]:
 async def create_default_tools(
     db: Optional[Session],
     request: Any = None,
-    user: Optional[User] = None,
+    user: Optional[Union[User, RuntimeUserFields]] = None,
     task_id: Optional[str] = None,
     workspace_owner_id: Optional[int] = None,
     allowed_collections: Optional[List[str]] = None,
@@ -616,8 +651,82 @@ async def create_default_tools(
     return tools, tool_config
 
 
+def _selected_file_ids_from_agent_config(
+    agent_config: Any,
+) -> list[str]:
+    if not isinstance(agent_config, dict):
+        return []
+    raw_file_ids = agent_config.get("selected_file_ids")
+    if not isinstance(raw_file_ids, list):
+        return []
+    return [
+        str(file_id)
+        for file_id in raw_file_ids
+        if isinstance(file_id, str) and file_id.strip()
+    ]
+
+
+def _register_selected_task_files_isolated(
+    workspace: Any,
+    *,
+    task_id: int,
+    task_owner_id: int,
+    selected_file_ids: list[str],
+) -> None:
+    """Materialize selected files between short read and registration phases."""
+    if not selected_file_ids:
+        return
+
+    from ..models.database import get_session_local
+    from ..models.uploaded_file import UploadedFile
+    from ..services.uploaded_file_store import (
+        UploadedFileVersionSnapshot,
+        snapshot_uploaded_file_version,
+    )
+
+    SessionLocal = get_session_local()
+    selected_files: list[UploadedFileVersionSnapshot] = []
+    with SessionLocal() as file_db:
+        for selected_file_id in selected_file_ids:
+            uploaded_file = (
+                file_db.query(UploadedFile)
+                .filter(
+                    UploadedFile.file_id == selected_file_id,
+                    UploadedFile.user_id == task_owner_id,
+                    UploadedFile.storage_status != "compensating",
+                    or_(
+                        UploadedFile.task_id == task_id,
+                        UploadedFile.task_id.is_(None),
+                    ),
+                )
+                .first()
+            )
+            if uploaded_file is None:
+                continue
+            selected_files.append(snapshot_uploaded_file_version(uploaded_file))
+
+    registrations: list[tuple[str, Optional[str]]] = []
+    for selected_file in selected_files:
+        source_path = ensure_uploaded_file_local_path(selected_file)
+        if not source_path.exists() or not source_path.is_file():
+            continue
+
+        registrations.append(
+            (
+                str(source_path.resolve()),
+                selected_file.file_id,
+            )
+        )
+
+    if registrations:
+        workspace.register_files(registrations)
+
+
 async def update_task_title_from_agent(
-    agent_service: AgentService, task_id: int, db: Session
+    agent_service: AgentService,
+    task_id: int,
+    *,
+    task_lease: TaskLease | None = None,
 ) -> bool:
     """Update task title with generated task_name from agent service.
 
@@ -628,8 +737,6 @@ async def update_task_title_from_agent(
     Args:
         agent_service: The agent service that executed the task
         task_id: The task ID to update
-        db: Database session
-
     Returns:
         True if title was updated, False otherwise
     """
@@ -646,32 +753,175 @@ async def update_task_title_from_agent(
             logger.debug(f"No task_name in task info for task {task_id}")
             return False
 
-        # Update database (web layer responsibility)
-        from ..models.task import Task as TaskModel
-
-        task_record = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-        if not task_record:
-            logger.warning(f"No task record found for task_id={task_id}")
-            return False
-
-        # Only update if title is different
-        if task_record.title != task_name:
-            old_title = task_record.title
-            task_record.title = task_name
-            db.commit()
-            logger.info(
-                f"Updated task {task_id} title from '{old_title}' to '{task_name}'"
+        # Title persistence owns a short Session on a worker. A saturated
+        # QueuePool must not block the asyncio loop after the agent finishes.
+        return await run_db_io_cancellation_safe(
+            lambda: _update_task_title_isolated(
+                task_id,
+                str(task_name),
+                task_lease=task_lease,
             )
-            return True
-        else:
-            logger.debug(f"Task title already matches: '{task_record.title}'")
-            return False
+        )
 
     except Exception as e:
         logger.error(
             f"Failed to update task title for task {task_id}: {e}", exc_info=True
         )
         return False
+
+
+def _update_task_title_isolated(
+    task_id: int,
+    task_name: str,
+    *,
+    task_lease: TaskLease | None = None,
+) -> bool:
+    """Persist a generated title under an optional exact lease fence."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as title_db:
+        if task_lease is not None:
+            if task_lease.run_id is None:
+                return False
+            updated = title_db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.runner_id == task_lease.runner_id,
+                    Task.run_id == task_lease.run_id,
+                    Task.title != task_name,
+                )
+                .values(title=task_name)
+                .execution_options(synchronize_session=False)
+            )
+            if int(getattr(updated, "rowcount", 0) or 0) != 1:
+                title_db.rollback()
+                return False
+            title_db.commit()
+            logger.info(
+                "Updated task %s title under run %s",
+                task_id,
+                task_lease.run_id,
+            )
+            return True
+
+        task_record = title_db.query(Task).filter(Task.id == task_id).first()
+        if task_record is None:
+            logger.warning("No task record found for task_id=%s", task_id)
+            return False
+        if task_record.title == task_name:
+            logger.debug("Task title already matches: '%s'", task_record.title)
+            return False
+        old_title = str(task_record.title)
+        setattr(task_record, "title", task_name)
+        title_db.commit()
+        logger.info(
+            "Updated task %s title from '%s' to '%s'",
+            task_id,
+            old_title,
+            task_name,
+        )
+        return True
+
+
+def _load_task_run_gate_user_id_isolated(task_id: int) -> int | None:
+    """Load the detached quota-gate input in a worker-owned short Session."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as gate_db:
+        gate_task = gate_db.query(Task).filter(Task.id == task_id).first()
+        if gate_task is None:
+            logger.warning("Quota gate: task %s not found; allowing run", task_id)
+            return None
+        user_id = getattr(gate_task, "user_id", None)
+        return int(user_id) if user_id is not None else None
+
+
+def _check_task_run_gate_on_event_loop(
+    user_id: int | None,
+) -> str | dict[str, Any] | None:
+    """Invoke the legacy start hook on its established event-loop thread."""
+    from ..models.database import get_session_local
+    from ..services.quota_hooks import check_run_gate
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as gate_db:
+        gate_reason = check_run_gate(gate_db, user_id)
+        if isinstance(gate_reason, Mapping):
+            return dict(gate_reason)
+        return str(gate_reason) if gate_reason is not None else None
+
+
+def _release_managed_task_lease_isolated(
+    lease: TaskLease,
+    *,
+    status: TaskStatus,
+) -> bool:
+    """Release a manager-owned lease without reusing the caller Session."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as lease_db:
+        return release_task_lease_with_workforce_sync(
+            lease_db,
+            lease,
+            status=status,
+        )
+
+
+_RuntimeDBResult = TypeVar("_RuntimeDBResult")
+
+
+class _AgentRuntimeSessionBoundaryError(RuntimeError):
+    """The caller Session cannot yield its connection to a runtime worker."""
+
+
+def _release_agent_runtime_caller_session(caller_db: Optional[Session]) -> None:
+    """Establish the caller/worker Session handoff invariant.
+
+    Runtime database operations always open their own short-lived Session. A
+    legacy caller may still pass a request-owned Session after authorization or
+    message persistence; release its read-only transaction before any runtime
+    worker can request another pool slot. Pending writes are rejected instead
+    of being rolled back implicitly.
+    """
+
+    if isinstance(caller_db, Session) and not release_db_connection_if_clean(caller_db):
+        raise _AgentRuntimeSessionBoundaryError(
+            "Cannot start agent runtime database work while the caller "
+            "database session has pending writes"
+        )
+
+
+async def _run_agent_runtime_db_io(
+    caller_db: Optional[Session],
+    operation: Callable[[], _RuntimeDBResult],
+) -> _RuntimeDBResult:
+    """Run worker-owned DB work after releasing a clean caller transaction."""
+
+    _release_agent_runtime_caller_session(caller_db)
+    return await run_db_io_cancellation_safe(operation)
+
+
+async def _load_task_setup_snapshot_for_agent(
+    task_id: int,
+    task_owner_user_id: Optional[int],
+    caller_db: Optional[Session],
+) -> Optional[TaskSetupSnapshot]:
+    """Load one detached setup snapshot without a nested pool checkout.
+
+    Legacy transports still pass a request-owned Session. They may use it for
+    authorization or task lookup before this boundary, so a clean read
+    transaction must return its connection before the worker opens the short
+    Session owned by ``load_task_setup_snapshot_sync``. Pending writes are not
+    rolled back; callers must settle them before starting agent construction.
+    """
+
+    return await _run_agent_runtime_db_io(
+        caller_db, lambda: load_task_setup_snapshot_sync(task_id, task_owner_user_id)
+    )
 
 
 class AgentServiceManager:
@@ -1280,47 +1530,54 @@ class AgentServiceManager:
         self,
         *,
         task_id: int,
-        task: Task,
-        db: Session,
-        user: User,
+        task: Any,
+        db: Optional[Session],
+        user: Union[User, RuntimeUserFields],
         agent_config: Optional[dict],
         task_llm: Optional[BaseLLM],
         task_vision_llm: Optional[BaseLLM],
         parent_tracer: Optional[Any] = None,
         scope: Optional[ExecutionScope] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
-        workforce_runtime = resolve_workforce_task_runtime(db, task)
-        excluded_agent_id = None
-        current_agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
-        if current_agent and _is_published_agent(current_agent):
-            excluded_agent_id = int(current_agent.id)
-            logger.info(
-                f"Task {task_id} is associated with published agent "
-                f"{current_agent.id} ({current_agent.name}), will exclude from "
-                "agent tools"
-            )
-        elif agent_config and agent_config.get("preview_agent_id"):
-            preview_user_id = int(task.user_id)
-            current_agent = (
-                db.query(Agent)
-                .filter(
-                    Agent.id == agent_config["preview_agent_id"],
-                    owned_agent_clause(
-                        preview_user_id, get_agent_team_scope(db, preview_user_id)
-                    ),
-                )
-                .first()
-            )
-            if current_agent and current_agent.status == AgentStatus.PUBLISHED:
+        if task_setup_snapshot is not None:
+            workforce_runtime = task_setup_snapshot.workforce_runtime
+            excluded_agent_id = task_setup_snapshot.excluded_agent_id
+        else:
+            if db is None:
+                raise ValueError("Database session or task snapshot is required")
+            workforce_runtime = resolve_workforce_task_runtime(db, task)
+            excluded_agent_id = None
+            current_agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
+            if current_agent and _is_published_agent(current_agent):
                 excluded_agent_id = int(current_agent.id)
                 logger.info(
-                    f"Preview task {task_id} is for published agent "
+                    f"Task {task_id} is associated with published agent "
                     f"{current_agent.id} ({current_agent.name}), will exclude from "
                     "agent tools"
                 )
+            elif agent_config and agent_config.get("preview_agent_id"):
+                preview_user_id = int(task.user_id)
+                current_agent = (
+                    db.query(Agent)
+                    .filter(
+                        Agent.id == agent_config["preview_agent_id"],
+                        owned_agent_clause(
+                            preview_user_id,
+                            get_agent_team_scope(db, preview_user_id),
+                        ),
+                    )
+                    .first()
+                )
+                if current_agent and current_agent.status == AgentStatus.PUBLISHED:
+                    excluded_agent_id = int(current_agent.id)
+                    logger.info(
+                        f"Preview task {task_id} is for published agent "
+                        f"{current_agent.id} ({current_agent.name}), will exclude from "
+                        "agent tools"
+                    )
 
-        workforce_runtime = resolve_workforce_task_runtime(db, task)
         tool_selection_spec = _build_tool_selection_spec_for_task(
             agent_config, workforce_runtime, task_id=task_id
         )
@@ -1348,7 +1605,8 @@ class AgentServiceManager:
         # Sandbox startup is container/network work that can take seconds;
         # don't hold this session's read transaction (and its pool slot)
         # across it (issue #889).
-        release_db_connection_if_clean(db)
+        if db is not None:
+            release_db_connection_if_clean(db)
         sandbox = await self._get_or_create_task_sandbox(
             task_id=task_id,
             workspace_owner_id=workspace_owner_id,
@@ -1400,10 +1658,13 @@ class AgentServiceManager:
         self,
         task_id: int,
         db: Optional[Session] = None,
-        user: Optional[User] = None,
+        user: Optional[Union[User, RuntimeUserFields]] = None,
         task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
+        resolved_execution_scope: Union[
+            ExecutionScope, None, ExecutionScopeNotProvided
+        ] = EXECUTION_SCOPE_NOT_PROVIDED,
     ) -> AgentService:
         lock = self._agent_build_locks.get(task_id)
         if lock is None:
@@ -1417,16 +1678,20 @@ class AgentServiceManager:
                 task_setup_snapshot=task_setup_snapshot,
                 task_owner_user_id=task_owner_user_id,
                 connector_runtime_turn_id=connector_runtime_turn_id,
+                resolved_execution_scope=resolved_execution_scope,
             )
 
     async def _get_agent_for_task_unlocked(
         self,
         task_id: int,
         db: Optional[Session] = None,
-        user: Optional[User] = None,
+        user: Optional[Union[User, RuntimeUserFields]] = None,
         task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
+        resolved_execution_scope: Union[
+            ExecutionScope, None, ExecutionScopeNotProvided
+        ] = EXECUTION_SCOPE_NOT_PROVIDED,
     ) -> AgentService:
         """Get or create AgentService instance for specific task.
 
@@ -1445,6 +1710,26 @@ class AgentServiceManager:
         When omitted it falls back to the snapshot owner, then the task row's
         owner, then ``user.id``.
         """
+        # Track whether this invocation already tried the worker-owned snapshot
+        # boundary. Active-task reconstruction and normal creation must share
+        # that single read instead of probing history on the event loop and
+        # then checking out another connection for the full snapshot.
+        task_setup_snapshot_load_attempted = task_setup_snapshot is not None
+
+        # Normalize every cache-miss onto the detached snapshot before the
+        # legacy request Session performs owner/task reads. This keeps its
+        # synchronous QueuePool waits off the event loop and makes one snapshot
+        # the SSOT for existence, owner, runtime identity, configuration, and
+        # reconstruction state. A missing row retains the legacy auto-create
+        # fallback below.
+        if task_setup_snapshot is None and task_id not in self._agents:
+            task_setup_snapshot_load_attempted = True
+            task_setup_snapshot = await _load_task_setup_snapshot_for_agent(
+                task_id,
+                task_owner_user_id,
+                db,
+            )
+
         # Resolve the runtime identity (OWNER). Everything below — snapshot
         # load, model resolution, tool config, UserContext — runs as this
         # identity, never the acting principal. Precedence: explicit owner →
@@ -1465,29 +1750,42 @@ class AgentServiceManager:
                 runtime_user_id = None
         if runtime_user_id is None and user is not None and user.id is not None:
             runtime_user_id = int(user.id)
-        # The User object the runtime needs (tool overrides / tracer). Reuse the
-        # passed ``user`` when it already IS the owner; otherwise load the owner.
-        runtime_user: Optional[User] = user
-        if (
+        # Runtime identity for tool policy. Once a detached snapshot exists,
+        # never retain the caller's ORM User: releasing its Session expires the
+        # row, and later attribute access would silently re-checkout the request
+        # connection across async tool construction. The request identity is an
+        # actor/authorization input; the snapshot owner is the runtime identity.
+        runtime_user: Optional[Union[User, RuntimeUserFields]] = user
+        if task_setup_snapshot is not None:
+            snapshot_user = task_setup_snapshot.runtime_user
+            if (
+                snapshot_user is not None
+                and runtime_user_id is not None
+                and snapshot_user.id == runtime_user_id
+            ):
+                runtime_user = snapshot_user
+            else:
+                runtime_user = None
+        elif (
             runtime_user_id is not None
             and db is not None
             and (user is None or user.id is None or int(user.id) != runtime_user_id)
         ):
             runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
 
-        # One turn resolves once: an activated turn (the orchestrated
-        # execute/resume paths) already resolved this task's scope and
-        # carries it in the contextvar, so prefer that over a fresh
-        # loader/resolver round-trip. A None contextvar is ambiguous —
-        # "explicitly unscoped turn" and "not inside an activated turn"
-        # (pause/resume handlers, channels) look the same — so None falls
-        # back to resolving per call, at the same place the owner is
-        # resolved. Correctness is identical either way: the resolver is
-        # idempotent per task and every activation site wraps operations
-        # on the task it activated for.
-        scope = get_execution_scope()
-        if scope is None:
-            scope = resolve_execution_scope(task_id)
+        # One turn resolves once. Orchestrated execute/resume callers pass the
+        # resolved value explicitly, including ``None`` for an intentionally
+        # unscoped turn. Legacy callers omit it and retain the contextvar-first
+        # fallback used by channels and direct WS paths.
+        if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
+            scope = get_execution_scope()
+            if scope is None:
+                scope = await _run_agent_runtime_db_io(
+                    db,
+                    lambda: resolve_execution_scope(task_id),
+                )
+        else:
+            scope = cast(Optional[ExecutionScope], resolved_execution_scope)
         fingerprint = scope_fingerprint(scope)
 
         # Owner invariant: evict a cached AgentService built for a different
@@ -1565,18 +1863,25 @@ class AgentServiceManager:
 
         if task_id not in self._agents:
             # Check if task exists in database
-            task_exists = False
+            task_exists = task_setup_snapshot is not None
             # ``task`` is widened to ``Task | _TaskFields | None`` because
             # the LLM-config block below rebinds it from an ORM ``Task``
             # to a frozen ``_TaskFields`` once the snapshot lands.
             # Downstream consumers only read primitive attributes
             # (``user_id``, ``agent_id``, ``agent_config``, ``status``)
             # which both types expose identically.
-            task: Any = None
-            if db is not None:
+            task: Any = (
+                task_setup_snapshot.task if task_setup_snapshot is not None else None
+            )
+            if task_setup_snapshot is None and db is not None:
                 try:
                     task = db.query(Task).filter(Task.id == task_id).first()
                     task_exists = task is not None
+                    if task_exists:
+                        # The pre-query worker observed no row. A concurrent
+                        # creator may have committed it before this legacy
+                        # fallback query, so permit one fresh snapshot load.
+                        task_setup_snapshot_load_attempted = False
                 except Exception as e:
                     logger.warning(
                         f"Failed to check task existence for task {task_id}: {e}"
@@ -1598,6 +1903,7 @@ class AgentServiceManager:
                         db.add(new_task)
                         db.commit()
                         db.refresh(new_task)
+                        task_setup_snapshot_load_attempted = False
                         logger.info(
                             f"Created new task record for task {task_id} with user_id={user.id}"
                         )
@@ -1611,43 +1917,68 @@ class AgentServiceManager:
                     TaskStatus.PAUSED,
                     TaskStatus.WAITING_FOR_USER,
                 ]
-                # Brand-new SDK task pre-check: ``begin_turn`` flips the
-                # task to RUNNING before this code runs, but a freshly
-                # created task has no trace events or DAG plan to
-                # recover -- ``_reconstruct_agent_from_history`` would
-                # run two queries, find nothing, and log a misleading
-                # "Failed to reconstruct" warning. Short-circuit the
-                # wasted path here. ``PAUSED`` / ``WAITING_FOR_USER``
-                # always have prior state by definition; only gate on
-                # ``RUNNING``.
-                if (
-                    should_reconstruct
-                    and task is not None
-                    and task.status == TaskStatus.RUNNING
-                    and db is not None
-                    and not self._has_reconstructable_history(task_id, db)
-                ):
-                    logger.info(
-                        f"Task {task_id} is RUNNING but has no reconstructable "
-                        "history (no trace events, no DAG plan); skipping "
-                        "reconstruct and going to normal creation."
-                    )
-                    should_reconstruct = False
-                # Task exists in database, try to reconstruct from history only for active executions
-                if db is not None and should_reconstruct:
+                if should_reconstruct:
                     try:
-                        await self._reconstruct_agent_from_history(
-                            task_id, db, scope=scope
-                        )
-                        self._load_persisted_conversation_history(task_id, db)
-                        await self._load_persisted_execution_context(task_id, db)
-                        self._agent_owner_ids[task_id] = runtime_user_id
-                        self._agent_scope_fingerprints[task_id] = fingerprint
-                        self._sync_connector_runtime_turn(
-                            task_id, connector_runtime_turn_id
-                        )
-                        return self._agents[task_id]
-                    except HTTPException:
+                        if task_setup_snapshot is None:
+                            task_setup_snapshot_load_attempted = True
+                            task_setup_snapshot = (
+                                await _load_task_setup_snapshot_for_agent(
+                                    task_id,
+                                    runtime_user_id,
+                                    db,
+                                )
+                            )
+                            if task_setup_snapshot is not None:
+                                task = task_setup_snapshot.task
+                                runtime_user_id = int(task_setup_snapshot.task.user_id)
+                                runtime_user = task_setup_snapshot.runtime_user
+                            else:
+                                logger.info(
+                                    "Task %s disappeared before reconstruction "
+                                    "snapshot loading; skipping reconstruction",
+                                    task_id,
+                                )
+                                should_reconstruct = False
+
+                        # Brand-new SDK task pre-check: ``begin_turn`` flips
+                        # the task to RUNNING before this code runs, but a
+                        # freshly-created task has no history to recover. The
+                        # worker snapshot already owns both history probes, so
+                        # reuse its detached boolean here instead of querying
+                        # the request Session on the event loop.
+                        if (
+                            should_reconstruct
+                            and task is not None
+                            and task.status == TaskStatus.RUNNING
+                            and task_setup_snapshot is not None
+                            and not task_setup_snapshot.has_reconstructable_history
+                        ):
+                            logger.info(
+                                f"Task {task_id} is RUNNING but has no "
+                                "reconstructable history (no trace events, no "
+                                "DAG plan); skipping reconstruct and going to "
+                                "normal creation."
+                            )
+                            should_reconstruct = False
+
+                        if should_reconstruct:
+                            await self._reconstruct_agent_from_history(
+                                task_id,
+                                db,
+                                scope=scope,
+                                task_setup_snapshot=task_setup_snapshot,
+                            )
+                            self._agent_owner_ids[task_id] = runtime_user_id
+                            self._agent_scope_fingerprints[task_id] = fingerprint
+                            self._sync_connector_runtime_turn(
+                                task_id, connector_runtime_turn_id
+                            )
+                            return self._agents[task_id]
+                    except (
+                        HTTPException,
+                        TaskOwnerMismatchError,
+                        _AgentRuntimeSessionBoundaryError,
+                    ):
                         raise
                     except RequiredMCPUnavailableError:
                         self._agents.pop(task_id, None)
@@ -1656,9 +1987,6 @@ class AgentServiceManager:
                         self._agent_scope_fingerprints.pop(task_id, None)
                         raise
                     except Exception as e:
-                        logger.warning(
-                            f"Failed to reconstruct agent from history for task {task_id}: {e}"
-                        )
                         # Clean up any partial reconstruction that might have occurred
                         if task_id in self._agents:
                             logger.info(
@@ -1668,10 +1996,15 @@ class AgentServiceManager:
                             self._agent_owner_ids.pop(task_id, None)
                             self._agent_sandbox_keys.pop(task_id, None)
                             self._agent_scope_fingerprints.pop(task_id, None)
+                        if is_database_pool_timeout(e):
+                            raise
+                        logger.warning(
+                            f"Failed to reconstruct agent from history for task {task_id}: {e}"
+                        )
                         # Continue with normal agent creation
 
             # Create tracer with all necessary handlers
-            tracer = create_task_tracer(task_id, runtime_user)
+            tracer = create_task_tracer(task_id, user_id=runtime_user_id)
 
             # Load the contiguous synchronous DB block (Task row,
             # per-task LLM resolution, optional Agent Builder lookup
@@ -1687,9 +2020,6 @@ class AgentServiceManager:
             excluded_agent_id: Optional[int] = None
             snapshot: Optional[TaskSetupSnapshot] = None
             try:
-                if db is None:
-                    raise ValueError("Database session is required")
-
                 if task_setup_snapshot is not None:
                     # Caller already loaded the snapshot off-loop
                     # (typically ``_schedule_bg._runner``). Reuse it
@@ -1708,12 +2038,16 @@ class AgentServiceManager:
                             int(task_setup_snapshot.task.user_id),
                         )
                     snapshot = task_setup_snapshot
-                else:
-                    snapshot = await asyncio.to_thread(
-                        load_task_setup_snapshot_sync,
+                elif not task_setup_snapshot_load_attempted:
+                    task_setup_snapshot_load_attempted = True
+                    snapshot = await _load_task_setup_snapshot_for_agent(
                         task_id,
                         runtime_user_id,
+                        db,
                     )
+                    if snapshot is not None:
+                        runtime_user_id = int(snapshot.task.user_id)
+                        runtime_user = snapshot.runtime_user
 
                 if snapshot is not None:
                     task = snapshot.task
@@ -1806,13 +2140,19 @@ class AgentServiceManager:
                     task_fast_llm = None
                     task_vision_llm = None
                     task_compact_llm = None
-            except (HTTPException, TaskOwnerMismatchError):
+            except (
+                HTTPException,
+                TaskOwnerMismatchError,
+                _AgentRuntimeSessionBoundaryError,
+            ):
                 # Owner mismatch is an identity/authorization fault, not a
                 # recoverable "LLM config failed to load" -- it must not fall
                 # through to the default-LLM path, which would build the
                 # runtime as the wrong user. Propagate it.
                 raise
             except Exception as e:
+                if is_database_pool_timeout(e):
+                    raise
                 logger.error(
                     f"Failed to load LLM configuration from task {task_id} database: {e}"
                 )
@@ -1830,9 +2170,9 @@ class AgentServiceManager:
                         "Task owner / runtime user is required for agent creation"
                     )
 
-                if not db:
+                if snapshot is None and db is None:
                     raise ValueError(
-                        "Database connection is required for agent creation"
+                        "Task snapshot or database session is required for agent creation"
                     )
 
                 # ``excluded_agent_id`` for the legacy task-agent
@@ -1861,6 +2201,7 @@ class AgentServiceManager:
                 # (either task has an agent_id OR has inline preview).
                 if (
                     excluded_agent_id is None
+                    and snapshot is None
                     and agent_config
                     and agent_config.get("preview_agent_id")
                 ):
@@ -1871,6 +2212,7 @@ class AgentServiceManager:
                             f"Task {task_id} missing while resolving preview agent"
                         )
                     preview_user_id = int(task.user_id)
+                    assert db is not None
                     current_agent = (
                         db.query(Agent)
                         .filter(
@@ -1889,7 +2231,11 @@ class AgentServiceManager:
                         )
 
                 workforce_runtime = (
-                    resolve_workforce_task_runtime(db, task) if task else None
+                    snapshot.workforce_runtime
+                    if snapshot is not None
+                    else resolve_workforce_task_runtime(db, task)
+                    if db is not None and task is not None
+                    else None
                 )
                 workspace_owner_id = (
                     int(task.user_id)
@@ -1923,7 +2269,8 @@ class AgentServiceManager:
                 # Sandbox startup is container/network work that can take
                 # seconds; don't hold this session's read transaction (and
                 # its pool slot) across it (issue #889).
-                release_db_connection_if_clean(db)
+                if db is not None:
+                    release_db_connection_if_clean(db)
                 sandbox = await self._get_or_create_task_sandbox(
                     task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
@@ -2007,7 +2354,7 @@ class AgentServiceManager:
                         memory_similarity_threshold = agent_config[
                             "memory_similarity_threshold"
                         ]
-                    memory_policy = resolve_agent_service_memory_policy(
+                    memory_policy = await resolve_agent_service_memory_policy_async(
                         task=task,
                         agent_config=agent_config,
                     )
@@ -2050,56 +2397,20 @@ class AgentServiceManager:
                         ),
                     )
 
-                    selected_file_ids: list[str] = []
-                    if task and isinstance(task.agent_config, dict):
-                        raw_selected_file_ids = task.agent_config.get(
-                            "selected_file_ids"
-                        )
-                        if isinstance(raw_selected_file_ids, list):
-                            selected_file_ids = [
-                                str(item)
-                                for item in raw_selected_file_ids
-                                if isinstance(item, str) and item.strip()
-                            ]
+                    selected_file_ids = _selected_file_ids_from_agent_config(
+                        task.agent_config if task is not None else None
+                    )
 
                     workspace = self._agents[task_id].workspace
                     if selected_file_ids and workspace is not None:
-                        from ..models.uploaded_file import UploadedFile
-
-                        for selected_file_id in selected_file_ids:
-                            task_owner_id = (
-                                int(task.user_id) if task else int(runtime_user.id)
+                        await run_db_io_cancellation_safe(
+                            lambda: _register_selected_task_files_isolated(
+                                workspace,
+                                task_id=task_id,
+                                task_owner_id=int(runtime_user.id),
+                                selected_file_ids=selected_file_ids,
                             )
-                            uploaded_file = (
-                                db.query(UploadedFile)
-                                .filter(
-                                    UploadedFile.file_id == selected_file_id,
-                                    UploadedFile.user_id == task_owner_id,
-                                    or_(
-                                        UploadedFile.task_id == int(task_id),
-                                        UploadedFile.task_id.is_(None),
-                                    ),
-                                )
-                                .first()
-                            )
-                            if uploaded_file is None:
-                                continue
-
-                            source_path = ensure_uploaded_file_local_path(uploaded_file)
-                            if not source_path.exists() or not source_path.is_file():
-                                continue
-
-                            if uploaded_file.task_id is None:
-                                uploaded_file.task_id = int(task_id)
-                                db.flush()
-
-                            # Use the source file directly (user's upload directory) instead of copying
-                            # This avoids duplicate files across the system.
-                            # Resolve to an absolute path so Workspace.register_file
-                            # doesn't try to interpret it as workspace-relative.
-                            workspace.register_file(
-                                str(source_path.resolve()), file_id=selected_file_id
-                            )
+                        )
 
                 pattern_info = (
                     f"with DAG pattern and workspace using {llm_info}"
@@ -2110,7 +2421,21 @@ class AgentServiceManager:
                     f"Created new AgentService for task {task_id} {pattern_info}"
                 )
 
-                if task_exists and db is not None:
+                if task_exists and snapshot is not None:
+                    agent_service = self._agents[task_id]
+                    agent_service.set_conversation_history(
+                        [dict(message) for message in snapshot.conversation_history]
+                    )
+                    recovery_state = await materialize_task_execution_recovery_state(
+                        snapshot.execution_recovery
+                    )
+                    agent_service.set_execution_context_messages(
+                        recovery_state.get("messages", [])
+                    )
+                    agent_service.set_recovered_skill_context(
+                        recovery_state.get("skill_context")
+                    )
+                elif task_exists and db is not None:
                     self._load_persisted_conversation_history(task_id, db)
                     await self._load_persisted_execution_context(task_id, db)
 
@@ -2213,11 +2538,18 @@ class AgentServiceManager:
         db_session: Optional[Any] = None,
         *,
         manage_task_lease: bool = True,
+        task_lease: TaskLease | None = None,
+        task_lease_heartbeat_task: (
+            asyncio.Task[TaskLeaseHeartbeatOutcome] | None
+        ) = None,
     ) -> Dict[str, Any]:
         """
         Execute task with automatic token tracking.
 
-        This method wraps the agent's execute_task with token tracking if db_session is provided.
+        This method wraps the agent's execute_task with token tracking when a
+        ``tracking_task_id`` (or ``task_id`` fallback) is provided. Database
+        work owns isolated short Sessions; ``db_session`` remains only for
+        backward-compatible callers and is never used for runtime I/O.
 
         Args:
             agent_service: The AgentService instance to use
@@ -2225,13 +2557,20 @@ class AgentServiceManager:
             context: Optional context data
             task_id: Optional task identifier passed to agent execution
             tracking_task_id: Optional task identifier used only for token tracking
-            db_session: Optional database session for token tracking
+            db_session: Optional legacy caller Session. It must have no pending
+                writes; any read-only transaction is released before runtime
+                workers request their own short-lived Sessions.
             manage_task_lease: When False, skip acquire/release/heartbeat here.
                 ``TaskTurnOrchestrator._schedule_bg`` already owns the lease
                 lifecycle for REST/SDK turns; a nested acquire can return
                 ``running_elsewhere`` or release the row before
                 ``execute_task_background`` / ``finish_turn`` land the terminal
                 snapshot, leaving tasks stuck RUNNING for SDK clients.
+            task_lease: Lease owned by an outer orchestrator. Its run id fences
+                tracker writes when this method does not manage the lease.
+            task_lease_heartbeat_task: Heartbeat owned by an inline transport
+                for ``task_lease``. When provided, definitive ownership loss
+                cancels and drains agent execution before this method returns.
 
         Returns:
             Execution result dictionary
@@ -2244,29 +2583,28 @@ class AgentServiceManager:
         lease_heartbeat_task = None
         result: Dict[str, Any] | None = None
         sandbox_task_key = None
-        # Reused below for the workforce-status sync so we don't re-query the row.
-        gate_task = None
+        lease_ownership_lost = False
+
+        # Establish the caller/worker handoff before the first isolated quota,
+        # lease, workforce, or tracker checkout. A read-only legacy Session may
+        # otherwise pin one slot while the worker waits for a second.
+        _release_agent_runtime_caller_session(db_session)
 
         # Quota gate: refuse to start a run when the team is out of monthly
-        # quota. Fails open if the check itself errors, so quota infra problems
-        # never block execution.
-        if db_session and tracker_task_id:
+        # quota. Non-pool hook errors fail open. A pool checkout timeout propagates
+        # before this method performs further DB-backed runtime work, preventing an
+        # immediate cascade into workforce/tracker checkouts. Only the task lookup
+        # moves to a DB worker here. The application callback keeps its established
+        # event-loop affinity; its remaining blocking risk is tracked separately.
+        if tracker_task_id:
             try:
-                from ..services.quota_hooks import check_run_gate
-
-                gate_task = (
-                    db_session.query(Task)
-                    .filter(Task.id == int(tracker_task_id))
-                    .first()
+                gate_user_id = await run_db_io_cancellation_safe(
+                    lambda: _load_task_run_gate_user_id_isolated(int(tracker_task_id))
                 )
-                if gate_task is None:
-                    # Fail open (a delete-race can legitimately leave no row),
-                    # but surface it rather than silently allowing the run.
-                    logger.warning(
-                        "Quota gate: task %s not found; allowing run", tracker_task_id
-                    )
-                gate_reason = check_run_gate(
-                    db_session, getattr(gate_task, "user_id", None)
+                gate_reason = (
+                    _check_task_run_gate_on_event_loop(gate_user_id)
+                    if gate_user_id is not None
+                    else None
                 )
                 if gate_reason:
                     # The gate returns either a plain message or a structured
@@ -2296,16 +2634,32 @@ class AgentServiceManager:
                         "error_code": error_code,
                         "error_details": error_details,
                     }
-            except Exception:
+            except Exception as exc:
+                if is_database_pool_timeout(exc):
+                    logger.error(
+                        "task_id=%s component=quota-gate database pool checkout "
+                        "timed out; terminating before further runtime database "
+                        "work: %s",
+                        tracker_task_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
                 logger.warning("Quota gate check failed open", exc_info=True)
 
-        if manage_task_lease and db_session and tracker_task_id:
+        if manage_task_lease and tracker_task_id:
             from ..services.task_execution_controller import (
                 task_execution_controller,
             )
 
             async with task_execution_controller.command(int(tracker_task_id)):
-                lease = acquire_task_lease(db_session, int(tracker_task_id))
+                lease = await acquire_task_lease_cancellation_safe(
+                    lambda: acquire_task_lease_isolated(int(tracker_task_id)),
+                    lambda acquired: _release_managed_task_lease_isolated(
+                        acquired,
+                        status=TaskStatus.FAILED,
+                    ),
+                )
             if lease is None:
                 return {
                     "success": False,
@@ -2317,48 +2671,81 @@ class AgentServiceManager:
                 run_task_lease_heartbeat(lease, lease_stop_event)
             )
 
-        if db_session and tracker_task_id:
-            try:
-                # Reuse the row already fetched for the quota gate; only re-query
-                # if the gate path didn't run or errored before assigning it.
-                task_for_sync = gate_task
-                if task_for_sync is None:
-                    task_for_sync = (
-                        db_session.query(Task)
-                        .filter(Task.id == int(tracker_task_id))
-                        .first()
-                    )
-                if task_for_sync is not None and sync_workforce_run_status(
-                    db_session, task_for_sync, TaskStatus.RUNNING
-                ):
-                    db_session.commit()
-            except Exception:
-                logger.debug(
-                    "Failed to sync workforce run status after lease acquisition",
-                    exc_info=True,
-                )
-            try:
-                from ..tracking.task_tracker import TaskTracker
-
-                tracker = TaskTracker(
-                    task_id=int(tracker_task_id),
-                    db_session=db_session,
-                )
-                await tracker.start_tracking()
-                # Enforce quota mid-run: the pattern loop polls this every step
-                # (each LLM reply / tool call) and stops the run once its live
-                # cost would push the team over quota, instead of only metering at
-                # completion. Cleared in the finally so a reused agent_service
-                # never keeps a finished run's tracker as its checker.
-                agent_service.set_interrupt_checker(tracker.interrupt_reason_for_quota)
-                logger.info(f"Started token tracking for task {tracker_task_id}")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to start token tracking for task {tracker_task_id}: {e}"
-                )
-                tracker = None
-
+        pre_run_pool_timeout: BaseException | None = None
         try:
+            if tracker_task_id and (lease is not None or task_lease is None):
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: sync_workforce_run_status_for_task_id_isolated(
+                            int(tracker_task_id),
+                            TaskStatus.RUNNING,
+                            task_lease=lease,
+                        )
+                    )
+                except Exception as exc:
+                    if is_database_pool_timeout(exc):
+                        pre_run_pool_timeout = exc
+                        logger.error(
+                            "task_id=%s component=workforce-status database pool "
+                            "checkout timed out; terminating before tracker startup "
+                            "and retaining any acquired lease for TTL recovery: %s",
+                            tracker_task_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        raise
+                    logger.debug(
+                        "Failed to sync workforce run status after lease acquisition",
+                        exc_info=True,
+                    )
+            if tracker_task_id:
+                try:
+                    from ..tracking.task_tracker import TaskTracker
+
+                    tracking_lease = lease or task_lease
+                    tracker = TaskTracker(
+                        task_id=int(tracker_task_id),
+                        expected_run_id=(
+                            tracking_lease.run_id
+                            if tracking_lease is not None
+                            else None
+                        ),
+                        expected_runner_id=(
+                            tracking_lease.runner_id
+                            if tracking_lease is not None
+                            else None
+                        ),
+                    )
+                    await tracker.start_tracking()
+                    # Enforce quota mid-run: the pattern loop polls this every step
+                    # (each LLM reply / tool call) and stops the run once its live
+                    # cost would push the team over quota, instead of only metering at
+                    # completion. Cleared in the finally so a reused agent_service
+                    # never keeps a finished run's tracker as its checker.
+                    agent_service.set_interrupt_checker(
+                        tracker.interrupt_reason_for_quota
+                    )
+                    logger.info(f"Started token tracking for task {tracker_task_id}")
+                except Exception as exc:
+                    if is_database_pool_timeout(exc):
+                        pre_run_pool_timeout = exc
+                        tracker = None
+                        logger.error(
+                            "task_id=%s component=tracker-start database pool "
+                            "checkout timed out; terminating before execution and "
+                            "retaining any acquired lease for TTL recovery: %s",
+                            tracker_task_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        raise
+                    logger.warning(
+                        "Failed to start token tracking for task %s: %s",
+                        tracker_task_id,
+                        exc,
+                    )
+                    tracker = None
+
             # Inside the try so a reclaimed-sandbox raise still runs the
             # finally (heartbeat stop, lease release, tracker completion);
             # _release_sandbox_task(None) is a no-op when nothing attached.
@@ -2368,77 +2755,190 @@ class AgentServiceManager:
                 f"=== About to execute task: task_id={task_id}, has_db_session={db_session is not None} ==="
             )
 
-            # All pre-run DB writes (lease, status sync) are committed by
-            # now; release the session's pooled connection so it isn't
-            # pinned in ``idle in transaction`` for the entire agent run
-            # (issue #889). The tracker re-acquires per update and commits,
-            # so the slot is only held during actual DB work from here on.
-            release_db_connection_if_clean(db_session)
+            # Execute the task. The lease ContextVar is bound at the runtime
+            # owner rather than on the cached AgentService/trace handler so a
+            # reused service observes the exact current run.
+            execution_lease = lease or task_lease
 
-            # Execute the task
-            result = await agent_service.execute_task(
-                task=task, context=context, task_id=task_id
-            )
+            async def execute_agent_task() -> Dict[str, Any]:
+                if execution_lease is None:
+                    return await agent_service.execute_task(
+                        task=task,
+                        context=context,
+                        task_id=task_id,
+                    )
+                with bind_task_lease_context(execution_lease):
+                    return await agent_service.execute_task(
+                        task=task,
+                        context=context,
+                        task_id=task_id,
+                    )
 
-            # If a mid-run quota gate stopped the run, surface the reason the way
-            # the start gate does — a terminal quota_exceeded result carrying the
-            # reason as output — instead of the pattern-interrupt path's silent
-            # flip to PAUSED (which persists no message).
-            if tracker is not None and isinstance(result, dict):
-                quota_reason = getattr(tracker, "quota_interrupt_reason", None)
-                if quota_reason:
-                    result = {
-                        **result,
-                        "success": False,
-                        "status": "quota_exceeded",
-                        "output": quota_reason,
-                        "error": quota_reason,
-                        # A mid-run interrupt is always the quota checker, so the
-                        # code is known even though the reason is a plain string.
-                        # Match the start gate so the client pops the same dialog.
-                        "error_code": "quota_exceeded",
-                    }
+            async def execute_owned_turn() -> Dict[str, Any]:
+                turn_result = await execute_agent_task()
 
-            logger.info("=== Task executed successfully, updating title if needed ===")
+                # If a mid-run quota gate stopped the run, surface the reason
+                # the way the start gate does instead of silently pausing.
+                if tracker is not None and isinstance(turn_result, dict):
+                    quota_reason = getattr(
+                        tracker,
+                        "quota_interrupt_reason",
+                        None,
+                    )
+                    if quota_reason:
+                        turn_result = {
+                            **turn_result,
+                            "success": False,
+                            "status": "quota_exceeded",
+                            "output": quota_reason,
+                            "error": quota_reason,
+                            "error_code": "quota_exceeded",
+                        }
 
-            # Update task title with generated task_name (clean architecture: Core provides API, Web handles DB)
-            if db_session and task_id and result and result.get("success"):
-                await update_task_title_from_agent(
-                    agent_service, int(task_id), db_session
+                logger.info(
+                    "=== Task executed successfully, updating title if needed ==="
                 )
+                if task_id and turn_result.get("success"):
+                    await update_task_title_from_agent(
+                        agent_service,
+                        int(task_id),
+                        task_lease=execution_lease,
+                    )
+                return turn_result
+
+            execution_heartbeat_task = lease_heartbeat_task or task_lease_heartbeat_task
+            try:
+                if execution_heartbeat_task is None:
+                    result = await execute_owned_turn()
+                else:
+                    result = await run_while_task_lease_owned(
+                        execute_owned_turn(),
+                        execution_heartbeat_task,
+                    )
+            except TaskLeaseLostError:
+                lease_ownership_lost = True
+                raise
 
             return result
         finally:
-            await stop_task_lease_heartbeat(lease_heartbeat_task, lease_stop_event)
-            if manage_task_lease and db_session and lease:
-                if result is None:
-                    final_status = TaskStatus.FAILED
-                else:
-                    status = str(result.get("status") or "")
-                    if status == "waiting_for_user":
-                        final_status = TaskStatus.WAITING_FOR_USER
-                    elif status == "interrupted":
-                        final_status = TaskStatus.PAUSED
-                    elif result.get("success", False):
-                        final_status = TaskStatus.COMPLETED
-                    else:
-                        final_status = TaskStatus.FAILED
-                release_task_lease_with_workforce_sync(
-                    db_session, lease, status=final_status
-                )
-            # Complete tracking if it was started
-            if tracker:
-                # Drop the mid-run quota checker before metering so a reused
-                # agent_service can't keep calling this finished run's tracker.
-                agent_service.set_interrupt_checker(None)
+
+            async def finalize_execution_resources() -> None:
+                nonlocal lease_ownership_lost
+
+                tracker_pool_timeout: Exception | None = None
+                heartbeat_pool_timeout: BaseException | None = None
+                heartbeat_lost = False
+                primary_error: BaseException | None = None
                 try:
-                    await tracker.complete_tracking()
-                    logger.info(f"Completed token tracking for task {tracker_task_id}")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to complete token tracking for task {tracker_task_id}: {e}"
+                    # Persist usage before stopping/releasing the lease. Otherwise a
+                    # replacement run can acquire ownership and then receive a late
+                    # usage write from this completed run.
+                    if tracker:
+                        # Drop the mid-run quota checker before metering so a reused
+                        # agent_service can't keep calling this finished run's
+                        # tracker.
+                        agent_service.set_interrupt_checker(None)
+                        try:
+                            if lease_ownership_lost:
+                                await tracker.stop_periodic_updates()
+                            else:
+                                await tracker.complete_tracking()
+                                logger.info(
+                                    "Completed token tracking for task %s",
+                                    tracker_task_id,
+                                )
+                        except Exception as e:
+                            if is_database_pool_timeout(e):
+                                tracker_pool_timeout = e
+                                logger.error(
+                                    "task_id=%s component=tracker database pool "
+                                    "checkout timed out; retaining lease for TTL "
+                                    "recovery: %s",
+                                    tracker_task_id,
+                                    e,
+                                    exc_info=True,
+                                )
+                            else:
+                                logger.error(
+                                    "Failed to complete token tracking for task %s: %s",
+                                    tracker_task_id,
+                                    e,
+                                )
+
+                    heartbeat_outcome = await stop_task_lease_heartbeat(
+                        lease_heartbeat_task,
+                        lease_stop_event,
                     )
-            await self._release_sandbox_task(sandbox_task_key)
+                    if isinstance(heartbeat_outcome, TaskLeaseHeartbeatOutcome):
+                        heartbeat_pool_timeout = heartbeat_outcome.pool_timeout
+                        heartbeat_lost = heartbeat_outcome.lease_lost
+                        if heartbeat_outcome.requires_ttl_recovery:
+                            logger.error(
+                                "task_id=%s component=lease-heartbeat unhealthy "
+                                "at shutdown; retaining lease for TTL recovery "
+                                "(lost=%s, pool_timeout=%s)",
+                                tracker_task_id,
+                                heartbeat_lost,
+                                heartbeat_pool_timeout is not None,
+                            )
+                    if heartbeat_lost:
+                        lease_ownership_lost = True
+                        raise TaskLeaseLostError(
+                            "task execution result rejected after lease "
+                            "ownership was lost"
+                        )
+                    if (
+                        manage_task_lease
+                        and lease
+                        and pre_run_pool_timeout is None
+                        and tracker_pool_timeout is None
+                        and heartbeat_pool_timeout is None
+                        and not heartbeat_lost
+                        and not lease_ownership_lost
+                    ):
+                        if result is None:
+                            final_status = TaskStatus.FAILED
+                        else:
+                            status = str(result.get("status") or "")
+                            if status == "waiting_for_user":
+                                final_status = TaskStatus.WAITING_FOR_USER
+                            elif status == "interrupted":
+                                final_status = TaskStatus.PAUSED
+                            elif result.get("success", False):
+                                final_status = TaskStatus.COMPLETED
+                            else:
+                                final_status = TaskStatus.FAILED
+                        await run_db_io_cancellation_safe(
+                            lambda: _release_managed_task_lease_isolated(
+                                lease,
+                                status=final_status,
+                            )
+                        )
+                    if pre_run_pool_timeout is not None:
+                        raise pre_run_pool_timeout
+                    if tracker_pool_timeout is not None:
+                        raise tracker_pool_timeout
+                    if heartbeat_pool_timeout is not None:
+                        raise heartbeat_pool_timeout
+                except BaseException as exc:
+                    primary_error = exc
+
+                try:
+                    await self._release_sandbox_task(sandbox_task_key)
+                except BaseException:
+                    if primary_error is None:
+                        raise
+                    logger.error(
+                        "Failed to release sandbox while another execution cleanup "
+                        "error was already in flight",
+                        exc_info=True,
+                    )
+
+                if primary_error is not None:
+                    raise primary_error
+
+            cleanup_task = asyncio.create_task(finalize_execution_resources())
+            await drain_async_task_cancellation_safe(cleanup_task)
 
     def _cleanup_workspace_directory(
         self, task_id: int, user_id: Optional[int] = None
@@ -2498,257 +2998,155 @@ class AgentServiceManager:
                 f"No workspace directory found for task {task_id} (user {user_id})"
             )
 
-    def _has_reconstructable_history(self, task_id: int, db: Session) -> bool:
-        """Cheap pre-check: does the task have prior state that
-        ``_reconstruct_agent_from_history`` could actually recover?
-
-        Reconstruct depends on either:
-
-        * trace events from prior tool / LLM runs (``TraceEvent`` rows
-          for the task with ``build_id IS NULL`` -- VIBE phase only,
-          matches the same filter ``_reconstruct_agent_from_history``
-          uses)
-        * a ``DAGExecution.current_plan`` blob for the task
-
-        A brand-new SDK task whose status was just flipped to RUNNING
-        by ``begin_turn`` has neither -- ``_reconstruct_agent_from_history``
-        would run the same two queries, return empty, log a warning,
-        and fall through to normal creation. The check here saves the
-        wasted-work cost plus the noisy ``Failed to reconstruct agent
-        from history`` log line that misleads post-incident triage
-        into thinking something actually failed.
-
-        ``PAUSED`` / ``WAITING_FOR_USER`` tasks always have prior state
-        by definition; the caller in ``get_agent_for_task`` should only
-        gate on this check for ``RUNNING`` status.
-
-        Two ``.first()`` queries: trace short-circuits the plan check
-        when present (typical case for any agent that has run a step).
-        """
-        from ..models.task import DAGExecution, TraceEvent
-
-        has_trace = (
-            db.query(TraceEvent)
-            .filter(
-                TraceEvent.task_id == task_id,
-                TraceEvent.build_id.is_(None),
-            )
-            .first()
-            is not None
-        )
-        if has_trace:
-            return True
-        has_plan = (
-            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
-            is not None
-        )
-        return has_plan
-
     async def _reconstruct_agent_from_history(
         self,
         task_id: int,
-        db: Session,
+        db: Optional[Session],
         scope: Optional[ExecutionScope] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
     ) -> None:
-        """Reconstruct agent from historical data"""
+        """Reconstruct from the detached task-runtime snapshot.
+
+        Legacy callers may omit the snapshot; that fallback loads the same
+        snapshot through a worker-owned short Session before any runtime work.
+        """
         try:
-            # Get task user information from database
-            task = db.query(Task).filter(Task.id == task_id).first()
-            user_id = task.user_id if task else None
-
-            # Get tracer events from database
-            tracer_events = []
-            plan_state = None
-
-            # Query trace events
-            from ..models.task import DAGExecution, TraceEvent
-
-            # Get tracer events (only VIBE phase, exclude BUILD phase)
-            trace_events = (
-                db.query(TraceEvent)
-                .filter(
-                    TraceEvent.task_id == task_id,
-                    TraceEvent.build_id.is_(None),  # ← Only get VIBE events
+            snapshot = task_setup_snapshot
+            if snapshot is None:
+                snapshot = await run_db_io_cancellation_safe(
+                    lambda: load_task_setup_snapshot_sync(task_id, None)
                 )
-                .all()
-            )
-            decoded_event_data = decode_trace_events_data(
-                db,
-                task_id=task_id,
-                data_items=[event.data for event in trace_events],
-                strict=False,
-            )
-            for event, event_data in zip(trace_events, decoded_event_data):
-                tracer_events.append(
-                    {
-                        "id": event.event_id,
-                        "event_type": event.event_type,
-                        "task_id": str(event.task_id),
-                        "step_id": event.step_id,
-                        "timestamp": event.timestamp.timestamp()
-                        if event.timestamp
-                        else None,
-                        "data": event_data,
-                        "parent_id": event.parent_event_id,
-                    }
+            if snapshot is None:
+                raise ValueError(
+                    f"Task {task_id} not found during agent reconstruction"
                 )
 
-            # Get DAG execution data
-            dag_execution = (
-                db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
+            tracer_events = [
+                dict(event) for event in snapshot.reconstruction.tracer_events
+            ]
+            plan_state = (
+                dict(snapshot.reconstruction.plan_state)
+                if snapshot.reconstruction.plan_state is not None
+                else None
             )
-            if dag_execution and dag_execution.current_plan:
-                plan_state = (
-                    dict(dag_execution.current_plan)
-                    if dag_execution.current_plan
-                    else None
-                )
-
-            if tracer_events or plan_state:
-                # Create a minimal agent first
-                tracer = create_task_tracer(
+            if not tracer_events and plan_state is None:
+                logger.info(
+                    "No historical data found for task %s, will create new agent",
                     task_id,
-                    user_id=int(user_id) if user_id is not None else None,
                 )
-
-                # Get LLM configuration from task database record
-                try:
-                    task = db.query(Task).filter(Task.id == task_id).first()
-                    if task:
-                        user = (
-                            db.query(User).filter(User.id == task.user_id).first()
-                            if task.user_id
-                            else None
-                        )
-                        if user is None:
-                            raise ValueError(
-                                "User context is required for agent reconstruction"
-                            )
-
-                        runtime_config = self._resolve_task_runtime_config(
-                            task_id=task_id,
-                            task=task,
-                            db=db,
-                            user=user,
-                        )
-                        agent_config = runtime_config["agent_config"]
-                        task_llm = runtime_config["task_llm"]
-                        task_fast_llm = runtime_config["task_fast_llm"]
-                        task_vision_llm = runtime_config["task_vision_llm"]
-                        task_compact_llm = runtime_config["task_compact_llm"]
-                        task_pattern = runtime_config["task_pattern"]
-
-                        tools_list, tool_config = await self._build_tools_for_task(
-                            task_id=task_id,
-                            task=task,
-                            db=db,
-                            user=user,
-                            agent_config=agent_config,
-                            task_llm=task_llm,
-                            task_vision_llm=task_vision_llm,
-                            parent_tracer=tracer,
-                            scope=scope,
-                        )
-                    else:
-                        raise ValueError(
-                            f"Task {task_id} not found in database during agent reconstruction"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to rebuild runtime configuration for task {task_id}: {e}"
-                    )
-                    raise
-
-                # Build allowed external directories
-                allowed_external_dirs = _build_allowed_external_dirs(
-                    int(user_id) if user_id is not None else None,
-                    scope=scope,
-                )
-                scope_segments = scope.workspace_segments if scope is not None else ()
-
-                # Create agent with basic configuration
-                if user_id is not None:
-                    with UserContext(int(user_id)):
-                        from .agents import enhance_system_prompt_with_kb
-
-                        system_prompt = (
-                            agent_config.get("instructions") if agent_config else None
-                        )
-                        kb_list = (
-                            agent_config.get("knowledge_bases")
-                            if agent_config
-                            else None
-                        )
-                        system_prompt = enhance_system_prompt_with_kb(
-                            system_prompt, kb_list
-                        )
-                        system_prompt = _build_workforce_system_prompt(
-                            system_prompt,
-                            resolve_workforce_task_runtime(db, task),
-                        )
-                        memory_similarity_threshold = None
-                        if (
-                            agent_config
-                            and "memory_similarity_threshold" in agent_config
-                        ):
-                            memory_similarity_threshold = agent_config[
-                                "memory_similarity_threshold"
-                            ]
-                        memory_policy = resolve_agent_service_memory_policy(
-                            task=task,
-                            agent_config=agent_config,
-                        )
-                        self._agents[task_id] = AgentService(
-                            name=f"reconstructed_agent_task_{task_id}",
-                            id=f"web_task_{task_id}",  # Use task ID only for workspace
-                            llm=task_llm,
-                            fast_llm=task_fast_llm,
-                            vision_llm=task_vision_llm,
-                            compact_llm=task_compact_llm,
-                            tools=tools_list,
-                            tool_config=tool_config,
-                            memory=memory_policy.memory,
-                            pattern=task_pattern,
-                            tracer=tracer,
-                            system_prompt=system_prompt,
-                            enable_workspace=True,
-                            workspace_base_dir=str(
-                                scoped_user_root(
-                                    get_uploads_dir(), int(user_id), scope_segments
-                                )
-                            ),  # Use user- (and scope-) isolated base directory
-                            allowed_external_dirs=allowed_external_dirs,
-                            scope_segments=scope_segments,
-                            task_id=str(task_id),
-                            memory_similarity_threshold=memory_similarity_threshold,
-                            memory_enabled=memory_policy.memory_enabled,
-                            task_environment=build_task_environment(
-                                computer_runtime_kind=getattr(
-                                    task, "computer_runtime_kind", None
-                                )
-                            ),
-                        )
-                else:
-                    raise ValueError(
-                        "User context is required for agent reconstruction"
-                    )
-
-                await self._agents[task_id].reconstruct_from_history(
-                    str(task_id), tracer_events, plan_state
-                )
-                self._load_persisted_conversation_history(task_id, db)
-                await self._load_persisted_execution_context(task_id, db)
-
-                logger.info(
-                    f"Successfully reconstructed agent for task {task_id} from history"
-                )
-            else:
-                logger.info(
-                    f"No historical data found for task {task_id}, will create new agent"
-                )
-                # Don't create agent here, let the normal flow handle it
-                # Raise an exception to indicate reconstruction is not possible
                 raise ValueError(f"No historical data found for task {task_id}")
+
+            task = snapshot.task
+            user = snapshot.runtime_user
+            user_id = int(task.user_id)
+            if user is None:
+                raise ValueError("User context is required for agent reconstruction")
+
+            task_llm = snapshot.task_llm
+            if task_llm is None:
+                task_llm = self._pick_default_llm_with_warning(
+                    self._default_llm,
+                    task_id=task_id,
+                    has_agent_builder_config=snapshot.agent is not None,
+                    agent_id=task.agent_id,
+                    saved_model_ids=(snapshot.agent_config or {}).get(
+                        "saved_model_ids"
+                    ),
+                    saved_model_descriptors=(snapshot.agent_config or {}).get(
+                        "saved_model_descriptors"
+                    ),
+                    user_id=user_id,
+                )
+
+            tracer = create_task_tracer(task_id, user_id=user_id)
+            tools_list, tool_config = await self._build_tools_for_task(
+                task_id=task_id,
+                task=task,
+                db=db,
+                user=user,
+                agent_config=snapshot.agent_config,
+                task_llm=task_llm,
+                task_vision_llm=snapshot.task_vision_llm,
+                parent_tracer=tracer,
+                scope=scope,
+                task_setup_snapshot=snapshot,
+            )
+
+            from .agents import enhance_system_prompt_with_kb
+
+            agent_config = snapshot.agent_config
+            system_prompt = agent_config.get("instructions") if agent_config else None
+            kb_list = agent_config.get("knowledge_bases") if agent_config else None
+            system_prompt = enhance_system_prompt_with_kb(system_prompt, kb_list)
+            system_prompt = _build_workforce_system_prompt(
+                system_prompt,
+                snapshot.workforce_runtime,
+            )
+            memory_similarity_threshold = (
+                agent_config.get("memory_similarity_threshold")
+                if agent_config
+                else None
+            )
+            memory_policy = await resolve_agent_service_memory_policy_async(
+                task=task,
+                agent_config=agent_config,
+            )
+            allowed_external_dirs = _build_allowed_external_dirs(
+                user_id,
+                scope=scope,
+            )
+            scope_segments = scope.workspace_segments if scope is not None else ()
+
+            with UserContext(user_id):
+                self._agents[task_id] = AgentService(
+                    name=f"reconstructed_agent_task_{task_id}",
+                    id=f"web_task_{task_id}",
+                    llm=task_llm,
+                    fast_llm=snapshot.task_fast_llm,
+                    vision_llm=snapshot.task_vision_llm,
+                    compact_llm=snapshot.task_compact_llm,
+                    tools=tools_list,
+                    tool_config=tool_config,
+                    memory=memory_policy.memory,
+                    pattern=snapshot.task_pattern,
+                    tracer=tracer,
+                    system_prompt=system_prompt,
+                    enable_workspace=True,
+                    workspace_base_dir=str(
+                        scoped_user_root(get_uploads_dir(), user_id, scope_segments)
+                    ),
+                    allowed_external_dirs=allowed_external_dirs,
+                    scope_segments=scope_segments,
+                    task_id=str(task_id),
+                    memory_similarity_threshold=memory_similarity_threshold,
+                    memory_enabled=memory_policy.memory_enabled,
+                    task_environment=build_task_environment(
+                        computer_runtime_kind=task.computer_runtime_kind
+                    ),
+                )
+
+            agent_service = self._agents[task_id]
+            await agent_service.reconstruct_from_history(
+                str(task_id),
+                tracer_events,
+                plan_state,
+            )
+            agent_service.set_conversation_history(
+                [dict(message) for message in snapshot.conversation_history]
+            )
+            recovery_state = await materialize_task_execution_recovery_state(
+                snapshot.execution_recovery
+            )
+            agent_service.set_execution_context_messages(
+                recovery_state.get("messages", [])
+            )
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
+            logger.info(
+                "Successfully reconstructed agent for task %s from history",
+                task_id,
+            )
 
         except Exception as e:
             logger.error(
@@ -2830,6 +3228,7 @@ async def create_task(
                         UploadedFile.file_id == file_id,
                         UploadedFile.user_id == int(user.id),
                         UploadedFile.task_id.is_(None),
+                        UploadedFile.storage_status != "compensating",
                     )
                     .first()
                 )
@@ -3131,6 +3530,7 @@ async def create_task(
                     UploadedFile.file_id.in_(selected_file_ids),
                     UploadedFile.user_id == int(user.id),
                     UploadedFile.task_id.is_(None),
+                    UploadedFile.storage_status != "compensating",
                 )
                 .update(
                     {UploadedFile.task_id: int(task.id)},
@@ -3386,9 +3786,6 @@ async def get_task(
                 )
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
-
-            mark_task_paused_if_stale(db, task)
-            db.refresh(task)
 
             cache_key = web_task_detail_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)

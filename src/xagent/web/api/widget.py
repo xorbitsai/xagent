@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -28,6 +27,10 @@ from ..models.user import User
 from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
+from ..services.widget_domains import (
+    origin_to_domain,
+    require_domain_allowed,
+)
 from .auth import create_access_token
 from .public_chat_access import (
     PublicChatAccessContext,
@@ -100,42 +103,14 @@ EMBED_TICKET_OWNER_WORKFORCE = "workforce"
 @dataclass(frozen=True)
 class ResolvedWidgetOwner:
     """A validated widget owner (agent XOR workforce) plus the data the auth
-    and ticket paths need: the embedding allowlist and the resolved key."""
+    and ticket paths need: the raw persisted embedding allowlist and the
+    resolved key. The domain-policy service validates the JSON value before
+    using it as an authorization rule."""
 
-    allowed_domains: list[str]
+    allowed_domains: object
     widget_key: str
     agent: Agent | None = None
     workforce: Workforce | None = None
-
-
-def _origin_to_domain(origin: str) -> str:
-    """Extract a lowercased host[:port] from an origin/referer value."""
-    if not origin:
-        return ""
-    parsed = urlparse(origin)
-    return (parsed.netloc or parsed.path).lower()
-
-
-def _domain_allowed(origin_domain: str, allowed_domains: list[str]) -> bool:
-    """Check a domain against the agent allowlist (case-insensitive,
-    supports "*" and subdomain suffix matches)."""
-    for domain in allowed_domains:
-        normalized_domain = domain.strip().lower()
-        if (
-            normalized_domain == "*"
-            or normalized_domain == origin_domain
-            or (origin_domain and origin_domain.endswith("." + normalized_domain))
-        ):
-            return True
-    return False
-
-
-def _require_domain_allowed(origin_domain: str, allowed_domains: list[str]) -> None:
-    """Raise 403 unless the domain passes the agent allowlist."""
-    if not _domain_allowed(origin_domain, allowed_domains):
-        raise HTTPException(
-            status_code=403, detail=f"Domain not allowed: {origin_domain}"
-        )
 
 
 def _get_widget_enabled_agent(db: Session, agent_id: int) -> Agent:
@@ -185,7 +160,7 @@ def _resolve_widget_owner_by_key(db: Session, widget_key: str) -> ResolvedWidget
     agent = _resolve_widget_agent_by_key(db, widget_key)
     if agent is not None:
         return ResolvedWidgetOwner(
-            allowed_domains=list(agent.allowed_domains or []),
+            allowed_domains=agent.allowed_domains,
             widget_key=widget_key,
             agent=agent,
         )
@@ -199,7 +174,7 @@ def _resolve_widget_owner_by_key(db: Session, widget_key: str) -> ResolvedWidget
         )
         if workforce is not None and workforce.status == "active":
             return ResolvedWidgetOwner(
-                allowed_domains=list(deployment.allowed_domains or []),
+                allowed_domains=deployment.allowed_domains,
                 widget_key=widget_key,
                 workforce=workforce,
             )
@@ -235,8 +210,20 @@ async def issue_widget_embed_ticket(
     owner = _resolve_widget_owner_by_key(db, request.widget_key)
 
     origin = req.headers.get("origin") or req.headers.get("referer", "")
-    origin_domain = _origin_to_domain(origin)
-    _require_domain_allowed(origin_domain, owner.allowed_domains)
+    origin_domain = origin_to_domain(origin)
+    if owner.workforce is not None:
+        policy_owner_type = EMBED_TICKET_OWNER_WORKFORCE
+        policy_owner_id = int(owner.workforce.id)
+    else:
+        assert owner.agent is not None
+        policy_owner_type = EMBED_TICKET_OWNER_AGENT
+        policy_owner_id = int(owner.agent.id)
+    require_domain_allowed(
+        origin_domain,
+        owner.allowed_domains,
+        owner_type=policy_owner_type,
+        owner_id=policy_owner_id,
+    )
 
     # The ticket has no jti/nonce and is intentionally replayable within its
     # short TTL: it only re-certifies "this origin is allowed", which /auth
@@ -278,9 +265,14 @@ def _workforce_owner_from_ticket(
         or not deployment.widget_key
     ):
         raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
-    allowed_domains = list(deployment.allowed_domains or [])
+    allowed_domains = deployment.allowed_domains
     # Re-check so tickets die immediately if the allowlist shrinks.
-    _require_domain_allowed(origin_domain, allowed_domains)
+    require_domain_allowed(
+        origin_domain,
+        allowed_domains,
+        owner_type=EMBED_TICKET_OWNER_WORKFORCE,
+        owner_id=workforce_id,
+    )
     return ResolvedWidgetOwner(
         allowed_domains=allowed_domains,
         widget_key=str(deployment.widget_key),
@@ -322,11 +314,16 @@ def _owner_from_embed_ticket(db: Session, embed_ticket: str) -> ResolvedWidgetOw
     if not isinstance(ticket_agent_id, int):
         raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
     agent = _get_widget_enabled_agent(db, ticket_agent_id)
-    allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
+    allowed_domains = agent.allowed_domains
     # Re-check so tickets die immediately if the allowlist shrinks.
-    _require_domain_allowed(origin_domain, allowed_domains)
+    require_domain_allowed(
+        origin_domain,
+        allowed_domains,
+        owner_type=EMBED_TICKET_OWNER_AGENT,
+        owner_id=ticket_agent_id,
+    )
     return ResolvedWidgetOwner(
-        allowed_domains=list(allowed_domains),
+        allowed_domains=allowed_domains,
         widget_key=str(agent.widget_key or ""),
         agent=agent,
     )

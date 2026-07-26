@@ -19,7 +19,10 @@ which is also used by the WebSocket UI path so both transports share
 one state machine.
 """
 
+import asyncio
 import logging
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -29,9 +32,8 @@ from sqlalchemy.orm import Session
 from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...config import is_allowed_file
 from ...models.agent import Agent
-from ...models.database import get_db
+from ...models.database import get_session_local
 from ...models.task import Task, TaskStatus, TraceEvent
-from ...models.user import User
 from ...models.workforce import WorkforceRun
 from ...schemas.v1 import (
     AppendMessageRequest,
@@ -52,9 +54,13 @@ from ...services.connector_runtime import (
     prepare_create_connector_runtime,
     store_ephemeral_runtime_values,
 )
+from ...services.db_runtime import (
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
 from ...services.file_turn import (
     append_uploaded_files_context,
-    bind_turn_files,
+    bind_turn_files_no_commit,
     build_uploaded_files_context,
     normalize_attachments_for_persistence,
     resolve_turn_file_infos,
@@ -68,16 +74,14 @@ from ...services.hot_path_cache import (
     task_steps_key,
 )
 from ...services.managed_file_ref import DurableStorageOperationError
-from ...services.task_execution_controller import (
-    TaskControlState,
-    apply_task_control_transition,
-)
 from ...services.task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
+    TurnStarted,
+    _ClaimedTurn,
 )
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
@@ -87,6 +91,19 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
+
+
+def _resolve_upload_owner_user_id_isolated(
+    *,
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> int:
+    """Authorize an existing upload target in one short worker Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        return int(task.user_id)
 
 
 @router.post("/chat/files", response_model=UploadFilesResponse)
@@ -101,7 +118,6 @@ async def upload_task_files(
         ),
     ),
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
-    db: Session = Depends(get_db),
 ) -> UploadFilesResponse:
     """Store files for later attachment to a task turn.
 
@@ -122,12 +138,12 @@ async def upload_task_files(
 
     upload_owner_user_id = principal.owner_user_id
     if task_id is not None:
-        task = _resolve_task_or_404(task_id, principal, db)
-        upload_owner_user_id = int(task.user_id)
-
-    owner = db.query(User).filter(User.id == upload_owner_user_id).first()
-    if owner is None:
-        raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
+        upload_owner_user_id = await run_db_io_cancellation_safe(
+            lambda: _resolve_upload_owner_user_id_isolated(
+                task_id=task_id,
+                principal=principal,
+            )
+        )
 
     # Reject unsupported types up front with a clean v1 400. ``store_uploaded_files``
     # would otherwise raise a bare HTTPException (a 500 for unsupported type) that
@@ -146,8 +162,7 @@ async def upload_task_files(
             task_type="general",
             task_id=None,
             folder=None,
-            user=owner,
-            db=db,
+            user_id=upload_owner_user_id,
             single_file_mode=False,
         )
     except HTTPException as exc:
@@ -250,55 +265,16 @@ def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
     ) from exc
 
 
-def _rollback_runtime_setup_mark_failure(db: Session, task_id: int) -> None:
-    try:
-        db.rollback()
-    except Exception:
-        logger.warning(
-            "Failed to roll back task %s session after connector runtime setup error",
-            task_id,
-            exc_info=True,
-        )
-
-
-def _mark_task_failed_after_runtime_setup_error(db: Session, task_id: int) -> None:
-    """Best-effort terminal mark after pre-schedule runtime setup fails."""
-
-    try:
-        db.rollback()
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if task is not None:
-            orm_task = cast(Any, task)
-            apply_task_control_transition(
-                task,
-                TaskControlState.FAILED,
-                status=TaskStatus.FAILED,
-            )
-            orm_task.error_message = _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE
-            db.commit()
-    except Exception:
-        _rollback_runtime_setup_mark_failure(db, task_id)
-        logger.warning(
-            "Failed to mark task %s failed after connector runtime setup error",
-            task_id,
-            exc_info=True,
-        )
-
-
 def _store_connector_runtime_values_or_fail(
     *,
-    db: Session,
     task_id: int,
     turn_id: str,
     values_by_ref: dict,
-    mark_task_failed: bool,
 ) -> None:
     try:
         store_ephemeral_runtime_values(turn_id, values_by_ref)
     except Exception as exc:
         pop_ephemeral_runtime_values(turn_id)
-        if mark_task_failed:
-            _mark_task_failed_after_runtime_setup_error(db, task_id)
         logger.warning(
             "Connector runtime setup failed for task %s turn %s",
             task_id,
@@ -311,6 +287,232 @@ def _store_connector_runtime_values_or_fail(
         ) from exc
 
 
+@dataclass(frozen=True)
+class _PreparedCreateTaskStart:
+    """Detached result of the atomic create-and-claim transaction."""
+
+    task_id: int
+    agent_id: int
+    task_owner_user_id: int
+    created_at: datetime
+    payload: TaskTurnPayload
+    claimed_turn: _ClaimedTurn
+
+
+@dataclass(frozen=True)
+class _PreparedAppendTurn:
+    """Detached result of the atomic append claim transaction."""
+
+    task_id: int
+    agent_id: int
+    task_owner_user_id: int
+    payload: TaskTurnPayload
+    claimed_turn: _ClaimedTurn
+
+
+def _prepare_created_task_isolated(
+    *,
+    agent_id: int,
+    task_owner_user_id: int,
+    message: str,
+    file_ids: tuple[str, ...],
+    connector_runtime_context: tuple[dict[str, Any], ...],
+) -> _PreparedCreateTaskStart:
+    """Create, claim, and commit the first turn in one DB transaction."""
+
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    payload: TaskTurnPayload | None = None
+    try:
+        agent = db.get(Agent, agent_id)
+        if agent is None:
+            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+
+        file_infos = _resolve_turn_files_or_400(
+            file_ids=list(file_ids),
+            owner_user_id=task_owner_user_id,
+            db=db,
+            task_id=None,
+        )
+        task = Task(
+            user_id=task_owner_user_id,
+            title=message[:50] or "SDK task",
+            description=message,
+            status=TaskStatus.PENDING,
+            agent_id=agent_id,
+            input=message,
+            source="sdk",
+            is_visible=False,
+        )
+        try:
+            runtime_plan = prepare_create_connector_runtime(
+                db=db,
+                agent=agent,
+                task_source="sdk",
+                connector_user_id=task_owner_user_id,
+                payload_items=connector_runtime_context,
+            )
+            bind_create_connector_runtime_plan(task=task, plan=runtime_plan)
+        except ConnectorRuntimeError as exc:
+            _raise_v1_connector_runtime_error(exc)
+
+        db.add(task)
+        db.flush()
+        task_id = int(task.id)
+        persist_create_connector_runtime_context(
+            db=db,
+            task_id=task_id,
+            plan=runtime_plan,
+        )
+        payload = _turn_payload(message, file_infos)
+        claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
+            db,
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+        )
+        missing = bind_turn_files_no_commit(
+            file_ids=[str(info["file_id"]) for info in file_infos],
+            task_id=task_id,
+            owner_user_id=task_owner_user_id,
+            db=db,
+        )
+        if missing:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                400,
+                message="These file ids are not accessible: " + ", ".join(missing),
+            )
+        _store_connector_runtime_values_or_fail(
+            task_id=task_id,
+            turn_id=payload.turn_id,
+            values_by_ref=runtime_plan.ephemeral_by_ref,
+        )
+        created_at = db.query(Task.created_at).filter(Task.id == task_id).scalar()
+        if created_at is None:
+            raise RuntimeError("created task has no creation timestamp")
+        db.commit()
+        return _PreparedCreateTaskStart(
+            task_id=task_id,
+            agent_id=agent_id,
+            task_owner_user_id=task_owner_user_id,
+            created_at=created_at,
+            payload=payload,
+            claimed_turn=claimed_turn,
+        )
+    except Exception:
+        db.rollback()
+        if payload is not None:
+            pop_ephemeral_runtime_values(payload.turn_id)
+        raise
+    finally:
+        db.close()
+
+
+def _prepare_append_turn_isolated(
+    *,
+    task_id: int,
+    principal: ApiKeyPrincipal,
+    request_agent_id: int | None,
+    request_workforce_id: int | None,
+    message: str,
+    file_ids: tuple[str, ...],
+    connector_runtime_context: tuple[dict[str, Any], ...],
+) -> _PreparedAppendTurn:
+    """Resolve append authorization and runtime inputs into detached values."""
+
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    payload: TaskTurnPayload | None = None
+    try:
+        task = _resolve_task_or_404(task_id, principal, db)
+        task_owner_user_id = int(task.user_id)
+
+        # Task ownership is resolved first so an unrelated task remains an
+        # opaque task_not_found even when the body also names the wrong owner.
+        if principal.agent is not None:
+            if request_agent_id is None:
+                raise V1ApiError(
+                    V1ErrorCode.INVALID_INPUT,
+                    422,
+                    message="agent_id is required",
+                )
+            if request_agent_id != principal.agent.id:
+                raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+            if request_workforce_id is not None:
+                raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+        else:
+            assert principal.workforce is not None
+            if request_agent_id is not None:
+                raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+            if (
+                request_workforce_id is not None
+                and request_workforce_id != principal.workforce.id
+            ):
+                raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+
+        runtime_agent = db.get(Agent, int(task.agent_id))
+        if runtime_agent is None:
+            raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
+        try:
+            runtime_plan = prepare_append_connector_runtime(
+                db=db,
+                agent=runtime_agent,
+                task=task,
+                connector_user_id=task_owner_user_id,
+                payload_items=connector_runtime_context,
+            )
+        except ConnectorRuntimeError as exc:
+            _raise_v1_connector_runtime_error(exc)
+
+        file_infos = _resolve_turn_files_or_400(
+            file_ids=list(file_ids),
+            owner_user_id=task_owner_user_id,
+            db=db,
+            task_id=int(task.id),
+        )
+        payload = _turn_payload(message, file_infos)
+        claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
+            db,
+            task_id=int(task.id),
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+        )
+        missing = bind_turn_files_no_commit(
+            file_ids=[str(info["file_id"]) for info in file_infos],
+            task_id=int(task.id),
+            owner_user_id=task_owner_user_id,
+            db=db,
+        )
+        if missing:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                400,
+                message="These file ids are not accessible: " + ", ".join(missing),
+            )
+        _store_connector_runtime_values_or_fail(
+            task_id=int(task.id),
+            turn_id=payload.turn_id,
+            values_by_ref=runtime_plan.ephemeral_by_ref,
+        )
+        prepared = _PreparedAppendTurn(
+            task_id=int(task.id),
+            agent_id=int(task.agent_id),
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+            claimed_turn=claimed_turn,
+        )
+        db.commit()
+        return prepared
+    except Exception:
+        db.rollback()
+        if payload is not None:
+            pop_ephemeral_runtime_values(payload.turn_id)
+        raise
+    finally:
+        db.close()
+
+
 @router.post(
     "/chat/tasks",
     status_code=202,
@@ -319,7 +521,6 @@ def _store_connector_runtime_values_or_fail(
 async def create_chat_task(
     request: CreateTaskRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
-    db: Session = Depends(get_db),
 ) -> CreateTaskResponse:
     """Create a new SDK-driven task and kick off its first turn.
 
@@ -348,8 +549,6 @@ async def create_chat_task(
         authed: ``(Agent, AgentApiKey)`` tuple resolved by the auth
             dependency. The agent here is the *key-bound* agent, the
             single source of truth for what this caller may touch.
-        db: SQLAlchemy session.
-
     Returns:
         :class:`CreateTaskResponse` with the new ``task_id``,
         ``agent_id``, ``status='running'`` (the atomic claim inside
@@ -367,143 +566,55 @@ async def create_chat_task(
             ``{"error": {"code": "internal_error", ...}}`` and the raw
             exception message stays out of the response.
     """
-    # Task creation is agent-only: workforce runs are created via
-    # ``POST /v1/workforces/{id}/runs`` (the manager-delegation flow
-    # cannot be entered through a bare agent task). A workforce-bound
-    # key therefore never matches ``request.agent_id`` -- same 404 as
-    # any other unbound agent_id.
-    agent = principal.agent
-    _key = principal.key_row
-    task_source = "sdk"
-
-    # Server-side agent_id consistency check. The key already binds an
-    # agent; ``body.agent_id`` is required by the SDK contract for
-    # forward-compat (and Python/TS SDK symmetry), but the bound
-    # agent is the only authority. Mismatch is a 404 -- never a 403
-    # -- so the existence of agent_id=N elsewhere in the system isn't
-    # observable to this caller.
-    if agent is None or request.agent_id != agent.id:
+    agent_identity = principal.agent
+    if agent_identity is None or request.agent_id != agent_identity.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
-    task_owner_user_id = int(agent.user_id)
-    actor_user_id = int(agent.user_id)
-
-    # Validate any attached file ids BEFORE creating the task, so a bad id
-    # fails with 400 without leaving an orphan PENDING task behind. Binding
-    # happens after the turn is claimed (below).
-    file_infos = _resolve_turn_files_or_400(
-        file_ids=request.message.files or [],
-        owner_user_id=task_owner_user_id,
-        db=db,
-        task_id=None,
+    task_owner_user_id = int(agent_identity.user_id)
+    actor_user_id = int(agent_identity.user_id)
+    runtime_context = tuple(
+        item.model_dump() for item in request.connector_runtime_context or ()
     )
 
-    # title is what the web UI shows in its task list. Truncate to
-    # 50 chars (matches the WS handler convention) so very long
-    # user inputs don't fill the sidebar with a one-line wall of
-    # text. The full message is preserved in ``description`` /
-    # ``input`` / ``task_chat_messages``.
-    title = request.message.content[:50] or "SDK task"
-
-    # Create the Task row with SDK-specific fields populated.
-    # ``source='sdk'`` lets adoption metrics queries split SDK traffic
-    # from web/widget; ``is_visible=False`` keeps SDK/REST runs out of
-    # Web UI discovery surfaces while preserving exact task-id access
-    # for SDK polling and audit views; ``input`` records this turn's
-    # user message so GET endpoint can return it without going through
-    # task_chat_messages.
-    task = Task(
-        user_id=task_owner_user_id,
-        title=title,
-        description=request.message.content,
-        status=TaskStatus.PENDING,
-        agent_id=agent.id,
-        input=request.message.content,
-        source=task_source,
-        is_visible=False,
-    )
-    try:
-        runtime_plan = prepare_create_connector_runtime(
-            db=db,
-            agent=agent,
-            task_source=task_source,
-            connector_user_id=task_owner_user_id,
-            payload_items=request.connector_runtime_context,
+    async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
+        prepared = await run_db_io_cancellation_safe(
+            lambda: _prepare_created_task_isolated(
+                agent_id=int(agent_identity.id),
+                task_owner_user_id=task_owner_user_id,
+                message=request.message.content,
+                file_ids=tuple(request.message.files or ()),
+                connector_runtime_context=runtime_context,
+            )
         )
-        bind_create_connector_runtime_plan(task=task, plan=runtime_plan)
-    except ConnectorRuntimeError as exc:
-        _raise_v1_connector_runtime_error(exc)
+        try:
+            started = await TaskTurnOrchestrator.schedule_claimed_create_turn(
+                task_id=prepared.task_id,
+                task_owner_user_id=prepared.task_owner_user_id,
+                actor_user_id=actor_user_id,
+                payload=prepared.payload,
+                claimed=prepared.claimed_turn,
+            )
+        except TaskTurnError as exc:
+            pop_ephemeral_runtime_values(prepared.payload.turn_id)
+            raise_for_turn_rejection(exc.reason)
+        except BaseException:
+            pop_ephemeral_runtime_values(prepared.payload.turn_id)
+            raise
+        return prepared, started
 
-    db.add(task)
-    db.flush()
-    persist_create_connector_runtime_context(
-        db=db, task_id=int(task.id), plan=runtime_plan
-    )
-    db.commit()
-    db.refresh(task)
+    # The owned child starts before the first await. If the caller is cancelled
+    # after RUNNING commits, scheduling (or its exact-lease compensation) still
+    # settles before cancellation propagates.
+    start_task = asyncio.create_task(_prepare_and_schedule())
+    prepared, started = await drain_async_task_cancellation_safe(start_task)
 
-    # Orchestrator's begin_turn handles the full new-turn transition:
-    # bg-inflight guard, atomic status flip + transcript persist in one
-    # commit, and bg coroutine scheduling under a lease lifecycle.
-    # A brand-new task shouldn't ever hit busy -- but we map it
-    # anyway for defense.
-    payload = _turn_payload(request.message.content, file_infos)
-    _store_connector_runtime_values_or_fail(
-        db=db,
-        task_id=int(task.id),
-        turn_id=payload.turn_id,
-        values_by_ref=runtime_plan.ephemeral_by_ref,
-        mark_task_failed=True,
-    )
-    try:
-        started = await TaskTurnOrchestrator.begin_turn(
-            task_id=int(task.id),
-            task_owner_user_id=task_owner_user_id,
-            # SDK key resolves to the agent owner; actor == owner here.
-            actor_user_id=actor_user_id,
-            payload=payload,
-            kind=TurnKind.CREATE,
-            force_fresh=False,
-        )
-    except TaskTurnNotFoundError:
-        pop_ephemeral_runtime_values(payload.turn_id)
-        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
-    except TaskTurnError as exc:
-        pop_ephemeral_runtime_values(payload.turn_id)
-        raise_for_turn_rejection(exc.reason)
-    except Exception:
-        pop_ephemeral_runtime_values(payload.turn_id)
-        raise
+    await record_key_usage(str(principal.key.key_prefix))
 
-    # Bind files only after the turn is committed to running. This bind can
-    # race the background runner (begin_turn schedules it via create_task and
-    # may await further steps before returning here), but that's harmless: the
-    # runner's file query tolerates a NULL task_id (task_id == this OR IS NULL,
-    # owned by the user), so the just-uploaded files are readable whether or
-    # not this bind has landed. The bind is for durable task<->file association.
-    bind_turn_files(
-        file_ids=[info["file_id"] for info in file_infos],
-        task_id=int(task.id),
-        owner_user_id=task_owner_user_id,
-        db=db,
-    )
-
-    # Record usage here (not in the shared auth dependency) so read-only
-    # status/steps polling below doesn't count as a "call". Runtime validation
-    # and turn claim have already accepted this as a real task invocation.
-    record_key_usage(str(_key.key_prefix))
-
-    # ``status`` comes from the orchestrator's committed-row snapshot
-    # (``started.status`` == RUNNING), NOT the caller's ``task`` object --
-    # ``begin_turn`` now commits on an isolated worker-thread session and
-    # never refreshes this request's ORM row, so ``task.status`` is still
-    # the stale PENDING. ``created_at`` is set at task creation and isn't
-    # touched by the turn, so the in-memory value is correct.
     return CreateTaskResponse(
-        task_id=int(task.id),
-        agent_id=int(agent.id),
+        task_id=prepared.task_id,
+        agent_id=prepared.agent_id,
         status=started.status.value,
-        created_at=task.created_at,
+        created_at=prepared.created_at,
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
@@ -516,6 +627,54 @@ async def create_chat_task(
 # task end". For non-terminal states we return ``None`` so SDK
 # clients can disambiguate "still running" from "ended at <time>".
 _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+
+
+@dataclass(frozen=True)
+class _TaskInfoSnapshot:
+    """Detached task fields required by the public status response."""
+
+    task_id: int
+    agent_id: int
+    status: TaskStatus
+    run_id: str | None
+    state_version: int
+    control_state: str
+    input: str | None
+    output: str | None
+    error: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
+class _TaskStepsVersionSnapshot:
+    """Authorized task identity and the trace version used for cache lookup."""
+
+    task_id: int
+    agent_id: int
+    max_event_id: int
+
+
+@dataclass(frozen=True)
+class _TraceEventSnapshot:
+    """Trace fields consumed by the pure public-step mapper."""
+
+    task_id: int
+    event_id: str
+    event_type: str
+    timestamp: datetime
+    step_id: str | None
+    data: Any
+
+
+@dataclass(frozen=True)
+class _TaskStepsSnapshot:
+    """Revalidated task identity and detached ordered trace rows."""
+
+    task_id: int
+    agent_id: int
+    max_event_id: int
+    events: tuple[_TraceEventSnapshot, ...]
 
 
 def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) -> Task:
@@ -574,6 +733,163 @@ def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) 
     return task
 
 
+def _load_task_info_snapshot(
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> _TaskInfoSnapshot:
+    """Authorize and detach one task inside a worker-owned short Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        return _TaskInfoSnapshot(
+            task_id=int(task.id),
+            agent_id=int(task.agent_id),
+            status=task.status,
+            run_id=str(task.run_id) if task.run_id is not None else None,
+            state_version=int(task.state_version or 0),
+            control_state=str(task.control_state or "idle"),
+            input=cast(str | None, task.input),
+            output=cast(str | None, task.output),
+            error=cast(str | None, task.error_message),
+            created_at=cast(datetime | None, task.created_at),
+            updated_at=cast(datetime | None, task.updated_at),
+        )
+
+
+def _load_task_steps_version_snapshot(
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> _TaskStepsVersionSnapshot:
+    """Authorize a task and detach the trace version for cache lookup."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        max_event_id = (
+            db.query(func.max(TraceEvent.id))
+            .filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.build_id.is_(None),
+            )
+            .scalar()
+            or 0
+        )
+        return _TaskStepsVersionSnapshot(
+            task_id=int(task.id),
+            agent_id=int(task.agent_id),
+            max_event_id=int(max_event_id),
+        )
+
+
+def _load_task_steps_snapshot(
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> _TaskStepsSnapshot:
+    """Reauthorize and detach the ordered trace rows after a cache miss."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        rows = (
+            db.query(TraceEvent)
+            .filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.build_id.is_(None),
+            )
+            .order_by(TraceEvent.id.asc())
+            .all()
+        )
+        events = tuple(
+            _TraceEventSnapshot(
+                task_id=int(row.task_id),
+                event_id=str(row.event_id),
+                event_type=str(row.event_type),
+                timestamp=cast(datetime, row.timestamp),
+                step_id=str(row.step_id) if row.step_id is not None else None,
+                data=row.data,
+            )
+            for row in rows
+        )
+        return _TaskStepsSnapshot(
+            task_id=int(task.id),
+            agent_id=int(task.agent_id),
+            max_event_id=int(rows[-1].id) if rows else 0,
+            events=events,
+        )
+
+
+def _get_chat_task_sync(
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> TaskInfoResponse:
+    """Build one task response without retaining a Session during cache I/O."""
+
+    task = _load_task_info_snapshot(task_id, principal)
+    completed_at = task.updated_at if task.status in _TERMINAL_STATUSES else None
+    cache_key = task_snapshot_key(task_id)
+    task_updated_at = cache_version_token(task.updated_at)
+    cached = cache_get(cache_key)
+    if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
+        return TaskInfoResponse.model_validate(cached["response"])
+
+    response = TaskInfoResponse(
+        task_id=task.task_id,
+        agent_id=task.agent_id,
+        workforce_id=(
+            int(principal.workforce.id) if principal.workforce is not None else None
+        ),
+        status=task.status.value,
+        run_id=task.run_id,
+        state_version=task.state_version,
+        control_state=task.control_state,
+        input=task.input,
+        output=task.output,
+        error=task.error,
+        created_at=task.created_at,
+        completed_at=completed_at,
+    )
+    cache_set(
+        cache_key,
+        {
+            "updated_at": task_updated_at,
+            "response": response.model_dump(mode="json"),
+        },
+        ttl_seconds=task_cache_ttl_seconds(),
+    )
+    return response
+
+
+def _get_chat_task_steps_sync(
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> StepsResponse:
+    """Build public steps using two short authorization/read transactions."""
+
+    version = _load_task_steps_version_snapshot(task_id, principal)
+    cache_key = task_steps_key(task_id)
+    cached = cache_get(cache_key)
+    if isinstance(cached, dict) and cached.get("max_event_id") == version.max_event_id:
+        return StepsResponse.model_validate(cached["response"])
+
+    snapshot = _load_task_steps_snapshot(task_id, principal)
+    public_steps_data = map_trace_events_to_public_steps(list(snapshot.events))
+    response = StepsResponse(
+        task_id=snapshot.task_id,
+        agent_id=snapshot.agent_id,
+        steps=[PublicStep(**step) for step in public_steps_data],
+    )
+    cache_set(
+        cache_key,
+        {
+            "max_event_id": snapshot.max_event_id,
+            "response": response.model_dump(mode="json"),
+        },
+        ttl_seconds=task_cache_ttl_seconds(),
+    )
+    return response
+
+
 @router.post(
     "/chat/tasks/{task_id}/messages",
     status_code=202,
@@ -583,7 +899,6 @@ async def append_message_to_task(
     task_id: int,
     request: AppendMessageRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
-    db: Session = Depends(get_db),
 ) -> AppendMessageResponse:
     """Append the next user message to an existing task and kick off its next turn.
 
@@ -619,8 +934,6 @@ async def append_message_to_task(
         request: Validated :class:`AppendMessageRequest`. ``message.content``
             is guaranteed non-empty by Pydantic.
         principal: Key-bound owner from the auth dependency.
-        db: SQLAlchemy session.
-
     Returns:
         :class:`AppendMessageResponse` with the task identity and an
         ``accepted_at`` timestamp.
@@ -634,134 +947,56 @@ async def append_message_to_task(
             rejection code (not retryable).
         500: any other unexpected error (V1 envelope via global handler).
     """
-    # Resolve task first so cross-owner leak protection (404 instead
-    # of 403 for "not yours") fires before any body-level checks.
-    task = _resolve_task_or_404(task_id, principal, db)
-    task_owner_user_id = int(task.user_id)
     actor_user_id = principal.owner_user_id
-    _key = principal.key_row
+    runtime_context = tuple(
+        item.model_dump() for item in request.connector_runtime_context or ()
+    )
 
-    if principal.agent is not None:
-        # ``body.agent_id`` was a required field before workforce keys
-        # existed; keep that contract for agent keys (422, matching the
-        # old Pydantic required-field failure) now that the schema field
-        # is optional for the workforce case.
-        if request.agent_id is None:
-            raise V1ApiError(
-                V1ErrorCode.INVALID_INPUT,
-                422,
-                message="agent_id is required",
+    async def _prepare_and_begin() -> tuple[_PreparedAppendTurn, TurnStarted]:
+        # A runner may still be finishing local cleanup after its terminal
+        # status is visible in the database. Reject that tail window before
+        # the domain-owned transaction stages any append mutation. The atomic
+        # status predicate inside the transaction remains authoritative across
+        # workers and concurrent requests.
+        TaskTurnOrchestrator.ensure_no_background_turn(task_id)
+        prepared = await run_db_io_cancellation_safe(
+            lambda: _prepare_append_turn_isolated(
+                task_id=task_id,
+                principal=principal,
+                request_agent_id=request.agent_id,
+                request_workforce_id=request.workforce_id,
+                message=request.message.content,
+                file_ids=tuple(request.message.files or ()),
+                connector_runtime_context=runtime_context,
             )
-        # body.agent_id mismatch is also a 404 -- but agent_not_found,
-        # not task_not_found, because that's the field the caller got
-        # wrong. Choosing AGENT_NOT_FOUND keeps it consistent with the
-        # POST /v1/chat/tasks behavior for the same condition.
-        if request.agent_id != principal.agent.id:
-            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-        if request.workforce_id is not None:
-            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
-    else:
-        assert principal.workforce is not None
-        # A workforce key never speaks for a bare agent: naming one is
-        # the same "field you got wrong" 404 as an agent-key mismatch.
-        if request.agent_id is not None:
-            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-        # ``workforce_id`` is optional (the key already binds one) but
-        # must match when provided -- symmetry with the agent contract.
-        if (
-            request.workforce_id is not None
-            and request.workforce_id != principal.workforce.id
-        ):
-            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
-
-    # Connector runtime preparation always runs against the task's
-    # executing agent: the key-bound agent for agent keys, the
-    # workforce's manager agent (== task.agent_id) for workforce keys.
-    runtime_agent = principal.agent
-    if runtime_agent is None:
-        runtime_agent = db.get(Agent, int(task.agent_id))
-        if runtime_agent is None:
-            raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
-
-    try:
-        runtime_plan = prepare_append_connector_runtime(
-            db=db,
-            agent=runtime_agent,
-            task=task,
-            connector_user_id=task_owner_user_id,
-            payload_items=request.connector_runtime_context,
         )
-    except ConnectorRuntimeError as exc:
-        _raise_v1_connector_runtime_error(exc)
+        try:
+            started = await TaskTurnOrchestrator.schedule_claimed_turn(
+                task_id=prepared.task_id,
+                task_owner_user_id=prepared.task_owner_user_id,
+                actor_user_id=actor_user_id,
+                payload=prepared.payload,
+                claimed=prepared.claimed_turn,
+                kind=TurnKind.APPEND,
+            )
+        except BaseException:
+            pop_ephemeral_runtime_values(prepared.payload.turn_id)
+            raise
+        return prepared, started
 
-    # Validate attached file ids before claiming the turn: an unresolvable id
-    # is a 400 that must not mutate anything, and files must not be bound to a
-    # turn that then 409s (task busy). ``task_id`` is passed so files already
-    # bound to this task re-resolve idempotently. Binding runs after the claim.
-    file_infos = _resolve_turn_files_or_400(
-        file_ids=request.message.files or [],
-        owner_user_id=task_owner_user_id,
-        db=db,
-        task_id=int(task.id),
-    )
-
-    # Orchestrator does the atomic claim (status must be terminal --
-    # COMPLETED or FAILED -- to be appendable, so PENDING/RUNNING both
-    # 409), persists the new user message, and schedules the bg turn
-    # with a single-flight guard against concurrent kickoffs.
-    payload = _turn_payload(request.message.content, file_infos)
-    _store_connector_runtime_values_or_fail(
-        db=db,
-        task_id=int(task.id),
-        turn_id=payload.turn_id,
-        values_by_ref=runtime_plan.ephemeral_by_ref,
-        mark_task_failed=False,
-    )
+    start_task = asyncio.create_task(_prepare_and_begin())
     try:
-        started = await TaskTurnOrchestrator.begin_turn(
-            task_id=int(task.id),
-            task_owner_user_id=task_owner_user_id,
-            # The key-bound agent authorizes access; the persisted task owner
-            # remains the runtime identity when those identities have drifted.
-            actor_user_id=actor_user_id,
-            payload=payload,
-            kind=TurnKind.APPEND,
-            force_fresh=False,
-        )
+        prepared, started = await drain_async_task_cancellation_safe(start_task)
     except TaskTurnNotFoundError:
-        pop_ephemeral_runtime_values(payload.turn_id)
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     except TaskTurnError as exc:
-        pop_ephemeral_runtime_values(payload.turn_id)
         raise_for_turn_rejection(exc.reason)
-    except Exception:
-        pop_ephemeral_runtime_values(payload.turn_id)
-        raise
 
-    # Bind files only after the turn is claimed -- a 409 above leaves them
-    # unbound and reusable. The bind can race the background runner, but the
-    # runner's file query tolerates a NULL task_id (see create_chat_task), so
-    # visibility doesn't depend on this commit landing first.
-    bind_turn_files(
-        file_ids=[info["file_id"] for info in file_infos],
-        task_id=int(task.id),
-        owner_user_id=task_owner_user_id,
-        db=db,
-    )
+    await record_key_usage(str(principal.key.key_prefix))
 
-    # See the matching comment in create_chat_task: recorded here, not in
-    # the shared auth dependency, so status polling elsewhere never counts.
-    record_key_usage(str(_key.key_prefix))
-
-    # ``status`` / ``accepted_at`` come from the orchestrator's committed-row
-    # snapshot (``started``), not a post-call ``db.refresh(task)``. The
-    # refresh was itself a blocking SELECT on the event loop; ``begin_turn``
-    # already SELECTed ``updated_at`` (set by ``onupdate=func.now()`` on the
-    # atomic UPDATE) inside its off-loop transaction, so SDK clients still see
-    # a value matching what GET /v1/chat/tasks/{id} would return.
     return AppendMessageResponse(
-        task_id=int(task.id),
-        agent_id=int(task.agent_id),
+        task_id=prepared.task_id,
+        agent_id=prepared.agent_id,
         workforce_id=(
             int(principal.workforce.id) if principal.workforce is not None else None
         ),
@@ -777,20 +1012,17 @@ async def append_message_to_task(
 async def get_chat_task(
     task_id: int,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
-    db: Session = Depends(get_db),
 ) -> TaskInfoResponse:
     """Return a snapshot of one task's current state.
 
     SDK clients call this to poll a previously-submitted task for
     its status, latest output, or failure reason. The shape is
     deliberately flat -- detailed step-by-step execution data lives
-    behind ``GET /v1/chat/tasks/{task_id}/steps`` (commit F).
+    behind ``GET /v1/chat/tasks/{task_id}/steps``.
 
     Args:
         task_id: Path parameter; the target task's primary key.
         authed: ``(Agent, AgentApiKey)`` tuple.
-        db: SQLAlchemy session.
-
     Returns:
         :class:`TaskInfoResponse` with ``task_id``, ``agent_id``,
         ``status``, latest-turn ``input`` / ``output`` / ``error``,
@@ -801,54 +1033,15 @@ async def get_chat_task(
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task missing or not owned by the calling key.
     """
-    task = _resolve_task_or_404(task_id, principal, db)
-
-    # completed_at is derived from updated_at when the task is in a
-    # terminal state. Pre-terminal states return None so SDK clients
-    # don't mis-interpret an in-flight task's last write timestamp as
-    # a completion time.
-    completed_at = task.updated_at if task.status in _TERMINAL_STATUSES else None
-    cache_key = task_snapshot_key(task_id)
-    task_updated_at = cache_version_token(task.updated_at)
-    cached = cache_get(cache_key)
-    if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
-        return TaskInfoResponse.model_validate(cached["response"])
-
-    response = TaskInfoResponse(
-        task_id=int(task.id),
-        agent_id=int(task.agent_id),
-        # A task is reachable by exactly one owner type (manager agents
-        # can't hold keys), so caching the workforce identity inside the
-        # per-task snapshot can't leak across principals.
-        workforce_id=(
-            int(principal.workforce.id) if principal.workforce is not None else None
-        ),
-        status=task.status.value,
-        run_id=task.run_id,
-        state_version=int(task.state_version or 0),
-        control_state=str(task.control_state or "idle"),
-        input=task.input,
-        output=task.output,
-        error=task.error_message,
-        created_at=task.created_at,
-        completed_at=completed_at,
+    return await run_db_io_cancellation_safe(
+        lambda: _get_chat_task_sync(task_id, principal)
     )
-    cache_set(
-        cache_key,
-        {
-            "updated_at": task_updated_at,
-            "response": response.model_dump(mode="json"),
-        },
-        ttl_seconds=task_cache_ttl_seconds(),
-    )
-    return response
 
 
 @router.get("/chat/tasks/{task_id}/steps", response_model=StepsResponse)
 async def get_chat_task_steps(
     task_id: int,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
-    db: Session = Depends(get_db),
 ) -> StepsResponse:
     """Return the public-timeline steps for a task.
 
@@ -868,8 +1061,6 @@ async def get_chat_task_steps(
         task_id: Path parameter; the target task's primary key.
         authed: ``(Agent, AgentApiKey)`` tuple resolved by the auth
             dependency. The agent here is the key-bound agent.
-        db: SQLAlchemy session.
-
     Returns:
         :class:`StepsResponse` with ``task_id``, ``agent_id``, and the
         steps array in ``started_at`` ascending order. In-flight steps
@@ -880,52 +1071,6 @@ async def get_chat_task_steps(
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task missing or not owned by the calling key.
     """
-    task = _resolve_task_or_404(task_id, principal, db)
-
-    max_event_id = (
-        db.query(func.max(TraceEvent.id))
-        .filter(
-            TraceEvent.task_id == task_id,
-            TraceEvent.build_id.is_(None),
-        )
-        .scalar()
-        or 0
+    return await run_db_io_cancellation_safe(
+        lambda: _get_chat_task_steps_sync(task_id, principal)
     )
-    cache_key = task_steps_key(task_id)
-    cached = cache_get(cache_key)
-    if isinstance(cached, dict) and cached.get("max_event_id") == int(max_event_id):
-        return StepsResponse.model_validate(cached["response"])
-
-    # Ordered ASC by ``id`` -- the trace_events PK is monotonically
-    # increasing per write, so ordering by it gives us the same
-    # temporal ordering as ``timestamp`` but without depending on
-    # clock-skew within a single task's write fan-out.
-    events = (
-        db.query(TraceEvent)
-        .filter(
-            TraceEvent.task_id == task_id,
-            TraceEvent.build_id.is_(None),
-        )
-        .order_by(TraceEvent.id.asc())
-        .all()
-    )
-
-    # Pure mapping -- testable in isolation via
-    # tests/web/api/v1/test_steps_mapping.py without spinning up a
-    # FastAPI app or DB session.
-    public_steps_data = map_trace_events_to_public_steps(events)
-
-    response = StepsResponse(
-        task_id=int(task.id),
-        agent_id=int(task.agent_id),
-        steps=[PublicStep(**step) for step in public_steps_data],
-    )
-    cache_set(
-        cache_key,
-        {
-            "max_event_id": int(max_event_id),
-            "response": response.model_dump(mode="json"),
-        },
-        ttl_seconds=task_cache_ttl_seconds(),
-    )
-    return response

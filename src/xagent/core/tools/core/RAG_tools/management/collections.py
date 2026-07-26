@@ -6,6 +6,7 @@ system, including listing collections, managing documents, and handling deletion
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -548,25 +549,157 @@ async def _load_collection_ingestion_configs(
         uid = None
     else:
         uid = 0 if user_id is None else user_id
-    for collection in collection_keys:
-        try:
-            config_json = await metadata_store.get_collection_config(
-                collection, uid, is_admin=is_admin
+    # Fetch every collection's config concurrently: each lookup is a separate
+    # LanceDB round trip, so awaiting them in sequence made the total cost scale
+    # linearly with the number of collections.
+    config_results = await asyncio.gather(
+        *(
+            metadata_store.get_collection_config(collection, uid, is_admin=is_admin)
+            for collection in collection_keys
+        ),
+        return_exceptions=True,
+    )
+
+    for collection, config_json in zip(collection_keys, config_results):
+        if isinstance(config_json, BaseException):
+            logger.debug(
+                "Could not load config for collection %s: %s", collection, config_json
             )
-            if not config_json:
-                continue
-            try:
-                config_dict = json.loads(config_json)
-                collection_configs[collection] = IngestionConfig(**config_dict)
-            except Exception as e:
-                logger.warning(
-                    "Failed to parse config for collection %s: %s",
-                    collection,
-                    e,
-                )
+            continue
+        if not config_json:
+            continue
+        try:
+            config_dict = json.loads(config_json)
+            collection_configs[collection] = IngestionConfig(**config_dict)
         except Exception as e:
-            logger.debug("Could not load config for collection %s: %s", collection, e)
+            logger.warning(
+                "Failed to parse config for collection %s: %s",
+                collection,
+                e,
+            )
     return collection_configs
+
+
+def _scan_document_rows(
+    vector_store: Any,
+    *,
+    user_id: Optional[int],
+    is_admin: Optional[bool],
+) -> tuple[
+    Dict[str, Set[str]],
+    Dict[str, Set[int]],
+    Dict[str, List[CollectionDocumentMetadata]],
+]:
+    """Scan the documents table for collection names, owners and metadata.
+
+    Pure blocking LanceDB work. It must run in a worker thread: on the event
+    loop it stalls every other coroutine in the process, which on a
+    single-worker deployment means the whole API, ``/health`` included.
+    """
+    document_names: Dict[str, Set[str]] = defaultdict(set)
+    owners: Dict[str, Set[int]] = defaultdict(set)
+    document_metadata: Dict[str, List[CollectionDocumentMetadata]] = defaultdict(list)
+    document_metadata_seen: Dict[str, Set[tuple[str, str, str]]] = defaultdict(set)
+
+    def _normalize_optional_identifier(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    def _add_document_entry(
+        collection_key: str,
+        source_value: Any,
+        doc_id_value: Any,
+        file_id_value: Any,
+    ) -> None:
+        normalized_doc_id = _normalize_optional_identifier(doc_id_value)
+        normalized_file_id = _normalize_optional_identifier(file_id_value)
+        display_name = None
+        if source_value:
+            display_name = os.path.basename(str(source_value))
+        display_name = (display_name or normalized_doc_id or "").strip()
+        if not display_name:
+            return
+
+        document_names[collection_key].add(display_name)
+
+        dedupe_key = (
+            display_name,
+            normalized_file_id or "",
+            normalized_doc_id or "",
+        )
+        seen_keys = document_metadata_seen[collection_key]
+        if dedupe_key in seen_keys:
+            return
+        seen_keys.add(dedupe_key)
+        document_metadata[collection_key].append(
+            CollectionDocumentMetadata(
+                filename=display_name,
+                file_id=normalized_file_id,
+                doc_id=normalized_doc_id,
+            )
+        )
+
+    for batch in vector_store.iter_batches(
+        table_name="documents",
+        columns=[
+            "collection",
+            "source_path",
+            "doc_id",
+            "file_id",
+            "user_id",
+        ],
+        user_id=user_id,
+        is_admin=is_admin,
+    ):
+        collection_idx = batch.schema.get_field_index("collection")
+        source_idx = batch.schema.get_field_index("source_path")
+        doc_id_idx = batch.schema.get_field_index("doc_id")
+        file_id_idx = batch.schema.get_field_index("file_id")
+        user_idx = batch.schema.get_field_index("user_id")
+        if collection_idx == -1:
+            continue
+        collection_array = batch.column(collection_idx)
+        source_array = (
+            batch.column(source_idx)
+            if source_idx != -1
+            else pa.array([None] * batch.num_rows)
+        )
+        doc_id_array = (
+            batch.column(doc_id_idx)
+            if doc_id_idx != -1
+            else pa.array([None] * batch.num_rows)
+        )
+        file_id_array = (
+            batch.column(file_id_idx)
+            if file_id_idx != -1
+            else pa.array([None] * batch.num_rows)
+        )
+        user_array = (
+            batch.column(user_idx)
+            if user_idx != -1
+            else pa.array([None] * batch.num_rows)
+        )
+        for idx in range(batch.num_rows):
+            collection_raw = collection_array[idx].as_py()
+            if not collection_raw:
+                continue
+            collection_key = str(collection_raw)
+            _add_document_entry(
+                collection_key,
+                source_array[idx].as_py(),
+                doc_id_array[idx].as_py(),
+                file_id_array[idx].as_py(),
+            )
+            user_val = user_array[idx].as_py()
+            if user_val is not None:
+                try:
+                    owners[collection_key].add(int(user_val))
+                except (TypeError, ValueError):
+                    pass
+
+    return document_names, owners, document_metadata
 
 
 async def list_collections(
@@ -652,112 +785,14 @@ async def _list_collections_impl(
         except Exception as exc:
             logger.warning("Could not load persisted collection metadata: %s", exc)
 
-        document_names: Dict[str, Set[str]] = defaultdict(set)
-        owners: Dict[str, Set[int]] = defaultdict(set)
-        document_metadata: Dict[str, List[CollectionDocumentMetadata]] = defaultdict(
-            list
-        )
-        document_metadata_seen: Dict[str, Set[tuple[str, str, str]]] = defaultdict(set)
-
-        def _normalize_optional_identifier(value: Any) -> Optional[str]:
-            if not isinstance(value, str):
-                return None
-            normalized = value.strip()
-            return normalized or None
-
-        def _add_document_entry(
-            collection_key: str,
-            source_value: Any,
-            doc_id_value: Any,
-            file_id_value: Any,
-        ) -> None:
-            normalized_doc_id = _normalize_optional_identifier(doc_id_value)
-            normalized_file_id = _normalize_optional_identifier(file_id_value)
-            display_name = None
-            if source_value:
-                display_name = os.path.basename(str(source_value))
-            display_name = (display_name or normalized_doc_id or "").strip()
-            if not display_name:
-                return
-
-            document_names[collection_key].add(display_name)
-
-            dedupe_key = (
-                display_name,
-                normalized_file_id or "",
-                normalized_doc_id or "",
-            )
-            seen_keys = document_metadata_seen[collection_key]
-            if dedupe_key in seen_keys:
-                return
-            seen_keys.add(dedupe_key)
-            document_metadata[collection_key].append(
-                CollectionDocumentMetadata(
-                    filename=display_name,
-                    file_id=normalized_file_id,
-                    doc_id=normalized_doc_id,
-                )
-            )
-
         # Step 1: Scan documents table once to get collection list,
         # document names, and owners (real-time, user-filtered).
-        for batch in vector_store.iter_batches(
-            table_name="documents",
-            columns=[
-                "collection",
-                "source_path",
-                "doc_id",
-                "file_id",
-                "user_id",
-            ],
+        document_names, owners, document_metadata = await asyncio.to_thread(
+            _scan_document_rows,
+            vector_store,
             user_id=user_id,
             is_admin=is_admin,
-        ):
-            collection_idx = batch.schema.get_field_index("collection")
-            source_idx = batch.schema.get_field_index("source_path")
-            doc_id_idx = batch.schema.get_field_index("doc_id")
-            file_id_idx = batch.schema.get_field_index("file_id")
-            user_idx = batch.schema.get_field_index("user_id")
-            if collection_idx == -1:
-                continue
-            collection_array = batch.column(collection_idx)
-            source_array = (
-                batch.column(source_idx)
-                if source_idx != -1
-                else pa.array([None] * batch.num_rows)
-            )
-            doc_id_array = (
-                batch.column(doc_id_idx)
-                if doc_id_idx != -1
-                else pa.array([None] * batch.num_rows)
-            )
-            file_id_array = (
-                batch.column(file_id_idx)
-                if file_id_idx != -1
-                else pa.array([None] * batch.num_rows)
-            )
-            user_array = (
-                batch.column(user_idx)
-                if user_idx != -1
-                else pa.array([None] * batch.num_rows)
-            )
-            for idx in range(batch.num_rows):
-                collection_raw = collection_array[idx].as_py()
-                if not collection_raw:
-                    continue
-                collection_key = str(collection_raw)
-                _add_document_entry(
-                    collection_key,
-                    source_array[idx].as_py(),
-                    doc_id_array[idx].as_py(),
-                    file_id_array[idx].as_py(),
-                )
-                user_val = user_array[idx].as_py()
-                if user_val is not None:
-                    try:
-                        owners[collection_key].add(int(user_val))
-                    except (TypeError, ValueError):
-                        pass
+        )
 
         collection_keys = sorted(document_names.keys() | metadata_collection_names)
 
@@ -857,7 +892,8 @@ async def _list_collections_impl(
         ):
             used_realtime = True
             realtime_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
-            realtime_stats = vector_store.aggregate_collection_stats(
+            realtime_stats = await asyncio.to_thread(
+                vector_store.aggregate_collection_stats,
                 user_id=user_id,
                 is_admin=is_admin,
             )

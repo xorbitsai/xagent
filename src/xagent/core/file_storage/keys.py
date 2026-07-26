@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Sequence
+from uuid import UUID
 
 from ..execution_scope import validate_scope_component
 
@@ -55,6 +56,35 @@ def build_upload_storage_key(
     return (
         f"{build_user_key_prefix(user_id, scope_segments)}/uploads/"
         f"{file_id}/{safe_storage_filename(filename)}"
+    )
+
+
+def build_upload_generation_storage_key(
+    user_id: int,
+    file_id: str,
+    filename: str,
+    *,
+    generation: str,
+    scope_segments: Sequence[str] = (),
+) -> str:
+    """Build one immutable uploaded-file object generation.
+
+    ``file_id`` is the logical identity retained by the database row, while
+    ``generation`` gives each replacement a fresh object key. This prevents a
+    replacement from overwriting bytes still referenced by an older metadata
+    version and lets failed compare-and-swap attempts compensate only their
+    own staged object.
+    """
+
+    validate_scope_component(file_id, field_name="file_id")
+    try:
+        generation_component = UUID(generation).hex
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("generation must be a UUID") from exc
+    return (
+        f"{build_user_key_prefix(user_id, scope_segments)}/uploads/"
+        f"{file_id}/_versions/{generation_component}/"
+        f"{safe_storage_filename(filename)}"
     )
 
 

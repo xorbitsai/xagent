@@ -523,25 +523,28 @@ def _restore_uploaded_file_refresh_snapshot_impl(
                 effects=tuple(effects),
             )
 
-        for field_name, value in snapshot.row_fields.items():
-            setattr(file_record, field_name, value)
-        effects.append("uploaded_file_row_restored")
+        changed_fields = tuple(
+            field_name
+            for field_name, value in snapshot.row_fields.items()
+            if getattr(file_record, field_name, None) != value
+        )
+        if changed_fields:
+            current_status = str(getattr(file_record, "storage_status", "unknown"))
+            errors.append(
+                "UploadedFile changed after the refresh snapshot; skipped unsafe "
+                f"restore (status={current_status}, fields={','.join(changed_fields)})"
+            )
+            return FileCompensationResult(
+                status="incomplete",
+                side_effects_may_remain=True,
+                errors=tuple(errors),
+                effects=tuple(effects),
+            )
+        effects.append("uploaded_file_row_unchanged")
 
         if snapshot.user_id is not None:
             _file_status_cache.invalidate_user(snapshot.user_id)
             effects.append("file_status_cache_invalidated")
-
-        storage_key = snapshot.row_fields.get("storage_key")
-        if storage_key and snapshot.had_local_file and snapshot.previous_path.exists():
-            from .managed_file_ref import ManagedFileRef
-
-            ManagedFileRef(file_record).sync_to_durable(
-                storage_key=str(storage_key),
-                mime_type=snapshot.row_fields.get("mime_type"),
-            )
-            effects.append("durable_object_restored")
-
-        db.flush()
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to restore UploadedFile refresh snapshot for file_id=%s: %s",

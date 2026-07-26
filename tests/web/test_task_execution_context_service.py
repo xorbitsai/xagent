@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_execution_context_service as context_service
 from xagent.web.services.task_execution_context_service import (
     load_task_execution_context_messages,
     load_task_execution_recovery_state,
@@ -267,3 +268,80 @@ async def test_load_task_execution_recovery_state_recovers_skill_context(monkeyp
         assert recovery_state["messages"] == []
     finally:
         db_session.close()
+
+
+def test_recovery_snapshot_separates_database_read_from_skill_loading() -> None:
+    """The worker-side read returns primitives and never awaits skill I/O."""
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        now = datetime.now(timezone.utc)
+        db_session.add_all(
+            [
+                TraceEvent(
+                    task_id=int(task.id),
+                    build_id=None,
+                    event_id="tool-event-snapshot",
+                    event_type="tool_execution_end",
+                    timestamp=now,
+                    step_id="step_1",
+                    parent_event_id=None,
+                    data={
+                        "tool_name": "web_search",
+                        "success": True,
+                        "result": {"title": "Snapshot evidence"},
+                    },
+                ),
+                TraceEvent(
+                    task_id=int(task.id),
+                    build_id=None,
+                    event_id="skill-event-snapshot",
+                    event_type="skill_select_end",
+                    timestamp=now,
+                    step_id=None,
+                    parent_event_id=None,
+                    data={"selected": True, "skill_name": "translator"},
+                ),
+            ]
+        )
+        db_session.commit()
+
+        snapshot = context_service.load_task_execution_recovery_snapshot_sync(
+            db_session,
+            int(task.id),
+        )
+
+        assert snapshot.selected_skill_name == "translator"
+        assert len(snapshot.messages) == 1
+        assert "Snapshot evidence" in snapshot.messages[0]["content"]
+        assert isinstance(snapshot.messages, tuple)
+    finally:
+        db_session.close()
+
+
+@pytest.mark.asyncio
+async def test_materialize_recovery_snapshot_loads_skill_without_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only async skill loading remains after the DB snapshot is detached."""
+    snapshot = context_service.TaskExecutionRecoverySnapshot(
+        messages=({"role": "system", "content": "prior result"},),
+        selected_skill_name="translator",
+    )
+
+    async def fake_load_skill_context_by_name(skill_name: str) -> str:
+        assert skill_name == "translator"
+        return "## Available Skill: translator\n\nUse translation workflow."
+
+    monkeypatch.setattr(
+        context_service,
+        "_load_skill_context_by_name",
+        fake_load_skill_context_by_name,
+    )
+
+    state = await context_service.materialize_task_execution_recovery_state(snapshot)
+
+    assert state == {
+        "messages": [{"role": "system", "content": "prior result"}],
+        "skill_context": "## Available Skill: translator\n\nUse translation workflow.",
+    }

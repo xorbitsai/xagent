@@ -13,6 +13,10 @@ on:
       - 'tests/web/services/test_gmail_provisioning.py'
   pull_request:
     branches: [main]
+  # Required by the merge queue: without this the two required contexts below
+  # are never reported on a merge group, its entries time out, and every merge
+  # stalls. Harmless before a queue exists -- merge_group simply never fires.
+  merge_group:
 
 jobs:
   detect-migration-changes:
@@ -32,18 +36,43 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "should-test=true" >> "$GITHUB_OUTPUT"
-          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
-            src/xagent/migrations \
-            tests/migrations \
-            .github/workflows/test-migrations.yml \
-            src/xagent/db \
-            src/xagent/web/services/gmail_provisioning.py \
-            tests/web/services/test_gmail_provisioning.py; then
+          # Note: this is deliberately a two-dot diff (base tip vs head), not
+          # merge-base vs head. It over-triggers once main moves past a
+          # migration, and that over-triggering is load-bearing today -- it is
+          # what catches a migration that landed on main but is absent from
+          # this branch. Do not "fix" it to merge-base while that matters.
+          RELEVANT_PATHS=(
+            src/xagent/migrations
+            tests/migrations
+            .github/workflows/test-migrations.yml
+            src/xagent/db
+            src/xagent/web/services/gmail_provisioning.py
+            tests/web/services/test_gmail_provisioning.py
+          )
+
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$PR_BASE_SHA"
+              head="$PR_HEAD_SHA"
+              ;;
+            merge_group)
+              # The merge group branch contains main plus every entry ahead of
+              # this one plus this PR, so this diff covers the whole group.
+              base="$MERGE_GROUP_BASE_SHA"
+              head="$MERGE_GROUP_HEAD_SHA"
+              ;;
+            *)
+              echo "should-test=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if git diff --quiet "$base" "$head" -- "${RELEVANT_PATHS[@]}"; then
             echo "should-test=false" >> "$GITHUB_OUTPUT"
           else
             echo "should-test=true" >> "$GITHUB_OUTPUT"
@@ -175,3 +204,44 @@ jobs:
           pytest tests/web/services/test_gmail_provisioning.py -k contend -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+  migrations-summary:
+    name: Migrations Summary
+    runs-on: ubuntu-latest
+    # always() is what makes this fail-closed. Without it a failure in
+    # detect-migration-changes would skip this job too, and a *skipped* required
+    # check is reported to branch protection as a success -- so the merge would
+    # go through with neither migration job having run. The individual job names
+    # cannot be required contexts for the same reason; this one can, because it
+    # always runs and turns every non-success into an explicit failure.
+    if: always()
+    needs:
+      - detect-migration-changes
+      - test-sqlite-migrations
+      - test-postgresql-migrations
+
+    steps:
+      - name: Check required jobs
+        shell: bash
+        env:
+          DETECT_RESULT: ${{ needs.detect-migration-changes.result }}
+          SQLITE_RESULT: ${{ needs.test-sqlite-migrations.result }}
+          POSTGRESQL_RESULT: ${{ needs.test-postgresql-migrations.result }}
+        run: |
+          set -uo pipefail
+
+          failed=0
+          check_job() {
+            local name="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "::error::$name finished with result: $result"
+              failed=1
+            fi
+          }
+
+          check_job "detect-migration-changes" "$DETECT_RESULT"
+          check_job "test-sqlite-migrations" "$SQLITE_RESULT"
+          check_job "test-postgresql-migrations" "$POSTGRESQL_RESULT"
+
+          exit "$failed"

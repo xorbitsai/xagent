@@ -1,25 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic
-from typing import Any, Mapping, Tuple
+from typing import Any, Mapping
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import String, and_, cast, false, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy import String, and_, cast, func, or_, update
 
 from ..models.agent import Agent
-from ..models.agent_api_key import AgentApiKey
-from ..models.database import get_db, get_session_local
+from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..services.a2a_protocol import (
     A2A_VERSION,
     ALL_TASK_STATES,
+    A2AAgentCardSnapshot,
+    A2ATaskPageSnapshot,
+    A2ATaskSnapshot,
     a2a_error,
     a2a_json_response,
+    a2a_task_state_filter,
     build_agent_card,
     extract_message_text,
     is_published_agent,
@@ -33,6 +37,11 @@ from ..services.a2a_protocol import (
     task_state,
     task_to_a2a,
 )
+from ..services.db_runtime import (
+    cancel_and_drain_async_task,
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
 from ..services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -43,9 +52,21 @@ from ..services.task_command_transport import (
     retry_failed_task_command,
 )
 from ..services.task_execution_controller import (
+    StaleTaskRunError,
     TaskControlState,
-    apply_task_control_transition,
     task_execution_controller,
+)
+from ..services.task_lease_service import (
+    TaskLease,
+    TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
+    acquire_task_lease_cancellation_safe,
+    acquire_task_lease_no_commit,
+    bind_task_lease_context,
+    release_task_lease_no_commit,
+    run_task_lease_heartbeat,
+    run_while_task_lease_owned,
+    stop_task_lease_heartbeat,
 )
 from ..services.task_orchestrator import (
     TaskTurnError,
@@ -53,41 +74,39 @@ from ..services.task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
+    _ClaimedTurn,
 )
-from .v1.deps import get_agent_from_api_key, record_key_usage
+from .v1.deps import (
+    AgentPrincipalSnapshot,
+    RuntimeApiKeySnapshot,
+    get_agent_from_api_key,
+    record_key_usage,
+)
 from .v1.errors import V1ApiError
 
 router = APIRouter(prefix="/api/a2a", tags=["a2a"])
+logger = logging.getLogger(__name__)
 _bearer = HTTPBearer(auto_error=False)
 _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
-_STREAM_END_STATUSES = _TERMINAL_STATUSES | {
-    TaskStatus.PAUSED,
-    TaskStatus.WAITING_FOR_USER,
-}
-A2A_BLOCKING_WAIT_TIMEOUT_SECONDS = 60.0
-A2A_STREAM_MAX_DURATION_SECONDS = 60.0 * 60.0
-_A2A_OVERRIDE_STATES = (
+_STREAM_END_STATES = {
+    "TASK_STATE_INPUT_REQUIRED",
+    "TASK_STATE_COMPLETED",
+    "TASK_STATE_FAILED",
     "TASK_STATE_CANCELED",
     "TASK_STATE_REJECTED",
     "TASK_STATE_AUTH_REQUIRED",
-)
-_A2A_TASK_STATUS_MAP: dict[str, tuple[TaskStatus, ...]] = {
-    "TASK_STATE_SUBMITTED": (TaskStatus.PENDING,),
-    "TASK_STATE_WORKING": (TaskStatus.RUNNING,),
-    "TASK_STATE_INPUT_REQUIRED": (TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER),
-    "TASK_STATE_COMPLETED": (TaskStatus.COMPLETED,),
-    "TASK_STATE_FAILED": (TaskStatus.FAILED,),
 }
+A2A_BLOCKING_WAIT_TIMEOUT_SECONDS = 60.0
+A2A_STREAM_MAX_DURATION_SECONDS = 60.0 * 60.0
 
 
 async def _get_a2a_agent_from_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    db: Session = Depends(get_db),
-) -> Tuple[Agent, AgentApiKey]:
+) -> tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot]:
     _validate_a2a_version(request)
     try:
-        return await get_agent_from_api_key(credentials, db)
+        return await get_agent_from_api_key(credentials)
     except V1ApiError as exc:
         raise a2a_error(
             "invalid_api_key",
@@ -96,26 +115,23 @@ async def _get_a2a_agent_from_api_key(
         ) from exc
 
 
-def _resolve_published_agent(db: Session, agent_id: int) -> Agent:
-    agent = db.query(Agent).filter(Agent.id == agent_id).first()
-    if agent is None or not is_published_agent(agent):
-        raise a2a_error("agent_not_found", "Agent not found.", status_code=404)
-    return agent
+def _load_published_agent_card_sync(agent_id: int) -> A2AAgentCardSnapshot:
+    """Load public Agent Card fields in one worker-owned Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        if agent is None or not is_published_agent(agent):
+            raise a2a_error("agent_not_found", "Agent not found.", status_code=404)
+        return A2AAgentCardSnapshot.from_agent(agent)
 
 
-def _resolve_a2a_task(db: Session, task_id: int, agent: Agent) -> Task:
-    task = (
-        db.query(Task)
-        .filter(
-            Task.id == task_id,
-            Task.agent_id == int(agent.id),
-            Task.source == "a2a",
-        )
-        .first()
+async def _load_published_agent_card_isolated(
+    agent_id: int,
+) -> A2AAgentCardSnapshot:
+    return await run_db_io_cancellation_safe(
+        lambda: _load_published_agent_card_sync(agent_id)
     )
-    if task is None:
-        raise a2a_error("task_not_found", "Task not found.", status_code=404)
-    return task
 
 
 def _task_run_id(task: Task) -> str | None:
@@ -123,20 +139,24 @@ def _task_run_id(task: Task) -> str | None:
     return str(run_id) if run_id is not None else None
 
 
-def _require_bound_agent(path_agent_id: int, agent: Agent) -> None:
+def _require_bound_agent(path_agent_id: int, agent: AgentPrincipalSnapshot) -> None:
     if int(agent.id) != int(path_agent_id) or not is_published_agent(agent):
         raise a2a_error("agent_not_found", "Agent not found.", status_code=404)
 
 
-def _schedule_waiting_a2a_resume(
+async def _schedule_waiting_a2a_resume(
     *,
     task_id: int,
     agent_service: Any,
     task_owner_user_id: int,
-    run_id: str | None,
+    task_lease: TaskLease,
+    heartbeat_stop: asyncio.Event,
+    heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome],
 ) -> None:
     from .websocket import background_task_manager, execute_resume_background
 
+    if task_lease.task_id != task_id or task_lease.run_id is None:
+        raise ValueError("A2A resume scheduling requires an exact task lease")
     if not background_task_manager.reserve_resume(task_id):
         raise RuntimeError(f"Task {task_id} already has a resume in progress")
     previous_task = background_task_manager.running_tasks.get(task_id)
@@ -147,125 +167,288 @@ def _schedule_waiting_a2a_resume(
                 task_id=task_id,
                 agent_service=agent_service,
                 task_owner_user_id=task_owner_user_id,
-                expected_run_id=run_id,
+                expected_run_id=task_lease.run_id,
                 previous_task=previous_task,
+                preacquired_lease=task_lease,
+                preacquired_heartbeat_stop=heartbeat_stop,
+                preacquired_heartbeat_task=heartbeat_task,
             )
         )
         background_task_manager.register_reserved_resume(task_id, bg_task)
     except BaseException:
         if bg_task is not None:
-            bg_task.cancel()
+            await cancel_and_drain_async_task(bg_task)
         background_task_manager.release_resume_reservation(task_id)
         raise
 
 
-def _restore_waiting_resume_claim(db: Session, task_id: int) -> None:
-    db.rollback()
-    (
-        db.query(Task)
-        .filter(
-            Task.id == task_id,
-            Task.status == TaskStatus.RUNNING,
-            Task.runner_id.is_(None),
+def _acquire_a2a_resume_prelease_sync(
+    *,
+    task_id: int,
+    agent_id: int,
+    resumable_status: TaskStatus,
+    previous_run_id: str | None,
+) -> TaskLease | None:
+    """Claim and commit one exact A2A resume lease in a worker transaction."""
+
+    resumable_control_states = {
+        TaskControlState.IDLE.value,
+        (
+            TaskControlState.PAUSED.value
+            if resumable_status == TaskStatus.PAUSED
+            else TaskControlState.WAITING_FOR_USER.value
+        ),
+    }
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        claimed = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.agent_id == agent_id,
+                Task.source == "a2a",
+                Task.status == resumable_status,
+                Task.control_state.in_(resumable_control_states),
+            )
+            .update(
+                {
+                    Task.control_state: TaskControlState.RESUME_REQUESTED.value,
+                    Task.state_version: func.coalesce(Task.state_version, 0) + 1,
+                },
+                synchronize_session=False,
+            )
         )
-        .update(
-            {
-                Task.status: TaskStatus.WAITING_FOR_USER,
-                Task.control_state: TaskControlState.WAITING_FOR_USER.value,
-                Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-            },
-            synchronize_session=False,
+        if claimed != 1:
+            db.rollback()
+            return None
+        task_lease = acquire_task_lease_no_commit(
+            db,
+            task_id,
+            expected_run_id=previous_run_id,
+        )
+        if task_lease is None or task_lease.run_id is None:
+            db.rollback()
+            return None
+        db.commit()
+        return task_lease
+
+
+def _restore_a2a_resume_prelease_sync(
+    task_lease: TaskLease,
+    *,
+    status: TaskStatus = TaskStatus.WAITING_FOR_USER,
+) -> bool:
+    """Release one exact A2A prelease in a worker-owned short Session.
+
+    A successful restore retains the run id and its tagged checkpoint, so a
+    retry with the same A2A message id is idempotent at the runner boundary.
+    If ownership changed, no row is mutated and the current owner remains the
+    sole lifecycle authority.
+    """
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        restored = release_task_lease_no_commit(
+            db,
+            task_lease,
+            status=status,
+        )
+        if restored:
+            db.commit()
+        else:
+            db.rollback()
+        return restored
+
+
+async def _restore_a2a_resume_prelease_isolated(
+    task_lease: TaskLease,
+    *,
+    status: TaskStatus,
+) -> bool:
+    return await run_db_io_cancellation_safe(
+        lambda: _restore_a2a_resume_prelease_sync(
+            task_lease,
+            status=status,
         )
     )
-    db.commit()
-    db.expire_all()
 
 
-async def _resume_waiting_a2a_task(
+def _update_a2a_resume_input_sync(
+    task_lease: TaskLease,
+    text: str,
+) -> bool:
+    """Persist A2A input only while the exact prelease remains current."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        updated = (
+            db.query(Task)
+            .filter(
+                Task.id == task_lease.task_id,
+                Task.status == TaskStatus.RUNNING,
+                Task.runner_id == task_lease.runner_id,
+                Task.run_id == task_lease.run_id,
+            )
+            .update(
+                {
+                    Task.input: text,
+                    Task.output: None,
+                    Task.error_message: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+
+
+async def _resume_input_required_a2a_task(
     *,
-    db: Session,
-    agent: Agent,
-    task: Task,
+    agent_id: int,
+    task_owner_user_id: int,
+    task: A2ATaskSnapshot,
     text: str,
     message_id: str,
 ) -> bool:
     task_id = int(task.id)
-    claimed = (
-        db.query(Task)
-        .filter(
-            Task.id == task_id,
-            Task.agent_id == int(agent.id),
-            Task.source == "a2a",
-            Task.status == TaskStatus.WAITING_FOR_USER,
-        )
-        .update(
-            {
-                Task.status: TaskStatus.RUNNING,
-                Task.runner_id: None,
-                Task.lease_expires_at: None,
-                Task.last_heartbeat_at: None,
-                Task.control_state: TaskControlState.RESUME_REQUESTED.value,
-                Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-            },
-            synchronize_session=False,
-        )
+    resumable_status = task.status
+    if resumable_status not in {
+        TaskStatus.PAUSED,
+        TaskStatus.WAITING_FOR_USER,
+    }:
+        return False
+    task_lease = await acquire_task_lease_cancellation_safe(
+        lambda: _acquire_a2a_resume_prelease_sync(
+            task_id=task_id,
+            agent_id=agent_id,
+            resumable_status=resumable_status,
+            previous_run_id=task.run_id,
+        ),
+        lambda acquired: _restore_a2a_resume_prelease_sync(
+            acquired,
+            status=resumable_status,
+        ),
     )
-    db.commit()
-    if claimed != 1:
-        db.expire_all()
+    if task_lease is None or task_lease.run_id is None:
         raise a2a_error(
             "unsupported_operation",
             "Task is currently running and cannot accept a new message.",
             status_code=400,
             details={"taskId": task_id},
         )
-    db.refresh(task)
+
+    heartbeat_stop = asyncio.Event()
+    heartbeat_task = asyncio.create_task(
+        run_task_lease_heartbeat(task_lease, heartbeat_stop)
+    )
+    ownership_transferred = False
+    prelease_cleanup_done = False
+
+    async def stop_and_restore_prelease() -> bool:
+        nonlocal prelease_cleanup_done
+        if prelease_cleanup_done:
+            return False
+        prelease_cleanup_done = True
+        try:
+            outcome = await stop_task_lease_heartbeat(
+                heartbeat_task,
+                heartbeat_stop,
+            )
+        except BaseException:
+            logger.error(
+                "A2A prelease heartbeat failed before task %s could be restored; "
+                "retaining run %s for TTL recovery",
+                task_id,
+                task_lease.run_id,
+                exc_info=True,
+            )
+            return False
+        if outcome.requires_ttl_recovery:
+            logger.error(
+                "A2A prelease for task %s became unhealthy; retaining run %s "
+                "for TTL recovery (lost=%s, pool_timeout=%s)",
+                task_id,
+                task_lease.run_id,
+                outcome.lease_lost,
+                outcome.pool_timeout is not None,
+            )
+            return False
+        return await _restore_a2a_resume_prelease_isolated(
+            task_lease,
+            status=resumable_status,
+        )
 
     try:
-        from .chat import get_agent_manager
 
-        agent_service = await get_agent_manager().get_agent_for_task(
-            task_id,
-            db,
-            task_owner_user_id=int(agent.user_id),
+        async def inject_user_message() -> tuple[Any, bool]:
+            from .chat import get_agent_manager
+
+            agent_service = await get_agent_manager().get_agent_for_task(
+                task_id,
+                None,
+                task_owner_user_id=task_owner_user_id,
+            )
+            posted = await agent_service.post_user_message(
+                str(task_id),
+                execution_message=text,
+                display_message=text,
+                turn_id=f"a2a:{task_id}:{message_id}",
+                request_interrupt=False,
+                reason="A2A input-required response",
+            )
+            return agent_service, bool(posted)
+
+        with bind_task_lease_context(task_lease):
+            agent_service, posted = await run_while_task_lease_owned(
+                inject_user_message(),
+                heartbeat_task,
+            )
+
+        if not posted:
+            # Untagged or otherwise unreadable legacy checkpoints are never
+            # resumed under a fabricated run or transcript fallback. Release
+            # the exact prelease back to the prior input-required state and
+            # fail closed so a caller must start a new task explicitly.
+            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
+            if not await drain_async_task_cancellation_safe(cleanup_task):
+                raise TaskLeaseLostError(
+                    f"Task {task_id} lease changed before A2A fallback"
+                )
+            raise a2a_error(
+                "unsupported_operation",
+                "No run-fenced checkpoint is available for this task.",
+                status_code=400,
+                details={"taskId": task_id},
+            )
+
+        updated = await run_db_io_cancellation_safe(
+            lambda: _update_a2a_resume_input_sync(task_lease, text)
         )
-        posted = await agent_service.post_user_message(
-            str(task_id),
-            execution_message=text,
-            display_message=text,
-            turn_id=f"a2a:{task_id}:{message_id}",
-            request_interrupt=False,
-            reason="A2A input-required response",
+        if not updated:
+            raise TaskLeaseLostError(
+                f"Task {task_id} lease changed before A2A resume scheduling"
+            )
+
+        await _schedule_waiting_a2a_resume(
+            task_id=task_id,
+            agent_service=agent_service,
+            task_owner_user_id=task_owner_user_id,
+            task_lease=task_lease,
+            heartbeat_stop=heartbeat_stop,
+            heartbeat_task=heartbeat_task,
         )
-    except Exception:
-        _restore_waiting_resume_claim(db, task_id)
+        ownership_transferred = True
+    except BaseException:
+        if not ownership_transferred and not prelease_cleanup_done:
+            cleanup_task = asyncio.create_task(stop_and_restore_prelease())
+            await drain_async_task_cancellation_safe(cleanup_task)
         raise
-
-    if not posted:
-        # A WAITING_FOR_USER checkpoint should normally be durable. If it is
-        # unavailable, retain the previous restart-safe behavior by starting a
-        # new turn from transcript history instead of leaving the task stuck.
-        apply_task_control_transition(
-            task,
-            TaskControlState.PAUSED,
-            status=TaskStatus.PAUSED,
-            expected_run_id=_task_run_id(task),
-        )
-        db.commit()
-        db.refresh(task)
-        return False
-
-    setattr(task, "input", text)
-    setattr(task, "output", None)
-    setattr(task, "error_message", None)
-    db.commit()
-    db.refresh(task)
-    _schedule_waiting_a2a_resume(
-        task_id=task_id,
-        agent_service=agent_service,
-        task_owner_user_id=int(agent.user_id),
-        run_id=_task_run_id(task),
-    )
+    finally:
+        if not ownership_transferred and not prelease_cleanup_done:
+            await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
     return True
 
 
@@ -342,168 +525,211 @@ def _validate_send_configuration(body: Mapping[str, Any]) -> bool:
     return return_immediately
 
 
+@dataclass(frozen=True)
+class _A2ATurnPreparation:
+    """Detached result of the worker-owned A2A preparation transaction."""
+
+    task: A2ATaskSnapshot
+    created_task: bool
+    kind: TurnKind
+    payload: TaskTurnPayload
+    claimed_turn: _ClaimedTurn | None
+
+
+def _prepare_a2a_turn_sync(
+    *,
+    agent_id: int,
+    task_owner_user_id: int,
+    agent_execution_mode: str,
+    text: str,
+    context_id: str | None,
+    task_id: int | None,
+) -> _A2ATurnPreparation:
+    """Create/claim or validate an A2A turn in one worker-owned transaction."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        payload = TaskTurnPayload(transcript_message=text)
+        created_task = task_id is None
+        if task_id is None:
+            context_id = context_id or new_context_id()
+            task = Task(
+                user_id=task_owner_user_id,
+                title=(text[:50] or "A2A task"),
+                description=text,
+                status=TaskStatus.PENDING,
+                agent_id=agent_id,
+                input=text,
+                source="a2a",
+                is_visible=False,
+                execution_mode=agent_execution_mode,
+                agent_config={"a2a_context_id": context_id},
+            )
+            db.add(task)
+            db.flush()
+            claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
+                db,
+                task_id=int(task.id),
+                task_owner_user_id=task_owner_user_id,
+                payload=payload,
+            )
+            db.flush()
+            db.refresh(task)
+            task_snapshot = A2ATaskSnapshot.from_task(task)
+            db.commit()
+            kind = TurnKind.CREATE
+        else:
+            existing_task = (
+                db.query(Task)
+                .filter(
+                    Task.id == task_id,
+                    Task.agent_id == agent_id,
+                    Task.user_id == task_owner_user_id,
+                    Task.source == "a2a",
+                )
+                .first()
+            )
+            if existing_task is None:
+                raise a2a_error(
+                    "task_not_found",
+                    "Task not found.",
+                    status_code=404,
+                )
+            task = existing_task
+            if task.status in _TERMINAL_STATUSES:
+                raise a2a_error(
+                    "unsupported_operation",
+                    "Messages cannot be appended to a terminal A2A task.",
+                    status_code=400,
+                    details={"taskId": task.id},
+                )
+            stored_context_id = task_context_id(task)
+            if context_id is not None and context_id != stored_context_id:
+                raise a2a_error(
+                    "invalid_argument",
+                    "The supplied contextId does not match the referenced task.",
+                    status_code=400,
+                    details={"taskId": task.id, "contextId": context_id},
+                )
+            agent_config: dict[str, Any] = (
+                dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
+            )
+            if not agent_config.get("a2a_context_id"):
+                agent_config["a2a_context_id"] = stored_context_id
+                setattr(task, "agent_config", agent_config)
+                db.commit()
+                db.refresh(task)
+            task_snapshot = A2ATaskSnapshot.from_task(task)
+            claimed_turn = None
+            kind = TurnKind.APPEND
+        return _A2ATurnPreparation(
+            task=task_snapshot,
+            created_task=created_task,
+            kind=kind,
+            payload=payload,
+            claimed_turn=claimed_turn,
+        )
+
+
 async def _start_a2a_turn(
     *,
-    db: Session,
-    agent: Agent,
+    agent_id: int,
+    task_owner_user_id: int,
+    agent_execution_mode: str,
     text: str,
     message_id: str,
     context_id: str | None,
     task_id: int | None,
-) -> Task:
-    async def start_unserialized() -> Task:
-        return await _start_a2a_turn_unserialized(
-            db=db,
-            agent=agent,
-            text=text,
-            message_id=message_id,
-            context_id=context_id,
-            task_id=task_id,
+) -> A2ATaskSnapshot:
+    async def start_unserialized() -> A2ATaskSnapshot:
+        preparation = await run_db_io_cancellation_safe(
+            lambda: _prepare_a2a_turn_sync(
+                agent_id=agent_id,
+                task_owner_user_id=task_owner_user_id,
+                agent_execution_mode=agent_execution_mode,
+                text=text,
+                context_id=context_id,
+                task_id=task_id,
+            )
         )
+
+        prepared_task = preparation.task
+        if prepared_task.status in {
+            TaskStatus.PAUSED,
+            TaskStatus.WAITING_FOR_USER,
+        }:
+            await _resume_input_required_a2a_task(
+                agent_id=agent_id,
+                task_owner_user_id=task_owner_user_id,
+                task=prepared_task,
+                text=text,
+                message_id=message_id,
+            )
+            fresh = await _fetch_fresh_a2a_task_isolated(
+                agent_id,
+                prepared_task.id,
+            )
+            if fresh is None:
+                raise a2a_error(
+                    "task_not_found",
+                    "Task not found.",
+                    status_code=404,
+                )
+            return fresh
+
+        try:
+            if preparation.created_task:
+                if preparation.claimed_turn is None:
+                    raise RuntimeError(
+                        "created A2A task did not stage its initial turn"
+                    )
+                await TaskTurnOrchestrator.schedule_claimed_create_turn(
+                    task_id=prepared_task.id,
+                    task_owner_user_id=task_owner_user_id,
+                    actor_user_id=task_owner_user_id,
+                    payload=preparation.payload,
+                    claimed=preparation.claimed_turn,
+                )
+            else:
+                await TaskTurnOrchestrator.begin_turn(
+                    task_id=prepared_task.id,
+                    task_owner_user_id=task_owner_user_id,
+                    actor_user_id=task_owner_user_id,
+                    payload=preparation.payload,
+                    kind=preparation.kind,
+                    force_fresh=False,
+                )
+        except TaskTurnNotFoundError as exc:
+            raise a2a_error(
+                "task_not_found",
+                "Task not found.",
+                status_code=404,
+            ) from exc
+        except TaskTurnError as exc:
+            raise a2a_error(
+                "unsupported_operation",
+                "Task is currently running and cannot accept a new message.",
+                status_code=400,
+                details={"taskId": prepared_task.id},
+            ) from exc
+
+        fresh = await _fetch_fresh_a2a_task_isolated(
+            agent_id,
+            prepared_task.id,
+        )
+        if fresh is None:
+            raise a2a_error(
+                "task_not_found",
+                "Task not found.",
+                status_code=404,
+            )
+        return fresh
 
     if task_id is not None:
         async with task_execution_controller.command(task_id):
             return await start_unserialized()
-    return await start_unserialized()
-
-
-async def _start_a2a_turn_unserialized(
-    *,
-    db: Session,
-    agent: Agent,
-    text: str,
-    message_id: str,
-    context_id: str | None,
-    task_id: int | None,
-) -> Task:
-    created_task = task_id is None
-    normalized_waiting_task = False
-    if task_id is None:
-        context_id = context_id or new_context_id()
-        task = Task(
-            user_id=int(agent.user_id),
-            title=(text[:50] or "A2A task"),
-            description=text,
-            status=TaskStatus.PENDING,
-            agent_id=int(agent.id),
-            input=text,
-            source="a2a",
-            is_visible=False,
-            execution_mode=agent.execution_mode,
-            agent_config={"a2a_context_id": context_id},
-        )
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-        kind = TurnKind.CREATE
-    else:
-        task = _resolve_a2a_task(db, task_id, agent)
-        if task.status in _TERMINAL_STATUSES:
-            raise a2a_error(
-                "unsupported_operation",
-                "Messages cannot be appended to a terminal A2A task.",
-                status_code=400,
-                details={"taskId": task.id},
-            )
-        stored_context_id = task_context_id(task)
-        if context_id is not None and context_id != stored_context_id:
-            raise a2a_error(
-                "invalid_argument",
-                "The supplied contextId does not match the referenced task.",
-                status_code=400,
-                details={"taskId": task.id, "contextId": context_id},
-            )
-        context_id = stored_context_id
-        agent_config: dict[str, Any] = (
-            dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
-        )
-        if not agent_config.get("a2a_context_id"):
-            agent_config["a2a_context_id"] = context_id
-            setattr(task, "agent_config", agent_config)
-            db.commit()
-            db.refresh(task)
-        if task.status == TaskStatus.WAITING_FOR_USER:
-            # Resume the trace-backed checkpoint so DAG/React step state is
-            # preserved across workers and restarts. Only a missing checkpoint
-            # falls back to the durable APPEND/replan path.
-            if await _resume_waiting_a2a_task(
-                db=db,
-                agent=agent,
-                task=task,
-                text=text,
-                message_id=message_id,
-            ):
-                return task
-            normalized_waiting_task = True
-        kind = TurnKind.APPEND
-
-    payload = TaskTurnPayload(transcript_message=text)
-    try:
-        await TaskTurnOrchestrator.begin_turn(
-            task_id=int(task.id),
-            task_owner_user_id=int(agent.user_id),
-            actor_user_id=int(agent.user_id),
-            payload=payload,
-            kind=kind,
-            force_fresh=False,
-        )
-    except TaskTurnNotFoundError as exc:
-        _recover_failed_turn_start(
-            db,
-            int(task.id),
-            created_task=created_task,
-            restore_waiting=normalized_waiting_task,
-        )
-        raise a2a_error("task_not_found", "Task not found.", status_code=404) from exc
-    except TaskTurnError as exc:
-        _recover_failed_turn_start(
-            db,
-            int(task.id),
-            created_task=created_task,
-            restore_waiting=normalized_waiting_task,
-        )
-        raise a2a_error(
-            "unsupported_operation",
-            "Task is currently running and cannot accept a new message.",
-            status_code=400,
-            details={"taskId": task.id},
-        ) from exc
-    except Exception:
-        _recover_failed_turn_start(
-            db,
-            int(task.id),
-            created_task=created_task,
-            restore_waiting=normalized_waiting_task,
-        )
-        raise
-
-    db.expire_all()
-    return _resolve_a2a_task(db, int(task.id), agent)
-
-
-def _recover_failed_turn_start(
-    db: Session,
-    task_id: int,
-    *,
-    created_task: bool,
-    restore_waiting: bool,
-) -> None:
-    db.expire_all()
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if task is None:
-        return
-    if created_task and task.status == TaskStatus.PENDING:
-        db.delete(task)
-        db.commit()
-        return
-    if restore_waiting and task.status == TaskStatus.PAUSED:
-        apply_task_control_transition(
-            task,
-            TaskControlState.WAITING_FOR_USER,
-            status=TaskStatus.WAITING_FOR_USER,
-            expected_run_id=_task_run_id(task),
-        )
-        db.commit()
+    start_task = asyncio.create_task(start_unserialized())
+    return await drain_async_task_cancellation_safe(start_task)
 
 
 async def _json_body(request: Request) -> Mapping[str, Any]:
@@ -545,12 +771,16 @@ def _message_id(message: Mapping[str, Any]) -> str:
     )
 
 
-def _fetch_fresh_a2a_task(agent_id: int, task_id: int) -> Task | None:
-    session_local = get_session_local()
-    local_db = session_local()
-    try:
+def _fetch_fresh_a2a_task(
+    agent_id: int,
+    task_id: int,
+) -> A2ATaskSnapshot | None:
+    """Load one detached A2A task snapshot in a worker-owned Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
         fresh = (
-            local_db.query(Task)
+            db.query(Task)
             .filter(
                 Task.id == task_id,
                 Task.agent_id == agent_id,
@@ -558,39 +788,62 @@ def _fetch_fresh_a2a_task(agent_id: int, task_id: int) -> Task | None:
             )
             .first()
         )
-        if fresh is not None:
-            local_db.expunge(fresh)
-        return fresh
-    finally:
-        local_db.close()
+        return A2ATaskSnapshot.from_task(fresh) if fresh is not None else None
 
 
-def _task_stream_response(agent: Agent, task: Task) -> StreamingResponse:
+async def _fetch_fresh_a2a_task_isolated(
+    agent_id: int,
+    task_id: int,
+) -> A2ATaskSnapshot | None:
+    return await run_db_io_cancellation_safe(
+        lambda: _fetch_fresh_a2a_task(agent_id, task_id)
+    )
+
+
+async def _load_a2a_task_or_error(
+    agent_id: int,
+    task_id: int,
+) -> A2ATaskSnapshot:
+    task = await _fetch_fresh_a2a_task_isolated(agent_id, task_id)
+    if task is None:
+        raise a2a_error("task_not_found", "Task not found.", status_code=404)
+    return task
+
+
+def _task_stream_ended(task: Task | A2ATaskSnapshot) -> bool:
+    return task_state(task) in _STREAM_END_STATES
+
+
+def _task_stream_response(
+    agent_id: int,
+    task: A2ATaskSnapshot,
+) -> StreamingResponse:
     started_task_id = int(task.id)
 
     async def _events() -> Any:
         deadline = monotonic() + A2A_STREAM_MAX_DURATION_SECONDS
         yield sse_task_snapshot(task)
-        if task.status in _STREAM_END_STATUSES:
+        if _task_stream_ended(task):
             return
         previous_state = task_state(task)
         previous_output = str(task.output or "")
         previous_error = str(task.error_message or "")
-        artifact_finalized = (
-            bool(previous_output) and task.status in _STREAM_END_STATUSES
-        )
+        artifact_finalized = bool(previous_output) and _task_stream_ended(task)
         while True:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 return
             await asyncio.sleep(min(0.5, remaining))
-            fresh = _fetch_fresh_a2a_task(int(agent.id), started_task_id)
+            fresh = await _fetch_fresh_a2a_task_isolated(
+                agent_id,
+                started_task_id,
+            )
             if fresh is None:
                 return
             fresh_output = str(fresh.output or "")
             fresh_state = task_state(fresh)
             fresh_error = str(fresh.error_message or "")
-            stream_ended = fresh.status in _STREAM_END_STATUSES
+            stream_ended = _task_stream_ended(fresh)
             if fresh_output and fresh_output != previous_output:
                 append = bool(previous_output) and fresh_output.startswith(
                     previous_output
@@ -630,8 +883,11 @@ def _task_stream_response(agent: Agent, task: Task) -> StreamingResponse:
     )
 
 
-async def _wait_for_task(agent: Agent, task: Task) -> Task:
-    if task.status in _STREAM_END_STATUSES:
+async def _wait_for_task(
+    agent_id: int,
+    task: A2ATaskSnapshot,
+) -> A2ATaskSnapshot:
+    if _task_stream_ended(task):
         return task
     task_id = int(task.id)
     deadline = monotonic() + A2A_BLOCKING_WAIT_TIMEOUT_SECONDS
@@ -641,11 +897,11 @@ async def _wait_for_task(agent: Agent, task: Task) -> Task:
         if remaining <= 0:
             return fresh
         await asyncio.sleep(min(0.25, remaining))
-        fetched = _fetch_fresh_a2a_task(int(agent.id), task_id)
+        fetched = await _fetch_fresh_a2a_task_isolated(agent_id, task_id)
         if fetched is None:
             raise a2a_error("task_not_found", "Task not found.", status_code=404)
         fresh = fetched
-        if fresh.status in _STREAM_END_STATUSES:
+        if _task_stream_ended(fresh):
             return fresh
 
 
@@ -662,13 +918,78 @@ def _page_offset(page_token: str | None) -> int:
     )
 
 
+def _load_a2a_task_page_sync(
+    *,
+    agent_id: int,
+    context_id: str | None,
+    status: str | None,
+    status_timestamp_after: datetime | None,
+    offset: int,
+    page_size: int,
+) -> A2ATaskPageSnapshot:
+    """Load one stable A2A task page in a worker-owned Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        query = db.query(Task).filter(
+            Task.agent_id == agent_id,
+            Task.source == "a2a",
+        )
+        if context_id is not None:
+            stored_context_id = Task.agent_config["a2a_context_id"].as_string()
+            query = query.filter(
+                or_(
+                    stored_context_id == context_id,
+                    and_(
+                        stored_context_id.is_(None),
+                        cast(Task.id, String) == context_id,
+                    ),
+                )
+            )
+        if status is not None:
+            query = query.filter(a2a_task_state_filter(status))
+        if status_timestamp_after is not None:
+            query = query.filter(Task.updated_at > status_timestamp_after)
+
+        total_size = query.count()
+        rows = query.order_by(Task.id.desc()).offset(offset).limit(page_size).all()
+        tasks = tuple(A2ATaskSnapshot.from_task(task) for task in rows)
+        next_offset = offset + len(tasks)
+        return A2ATaskPageSnapshot(
+            tasks=tasks,
+            next_page_token=(str(next_offset) if next_offset < total_size else ""),
+            page_size=page_size,
+            total_size=total_size,
+        )
+
+
+async def _load_a2a_task_page_isolated(
+    *,
+    agent_id: int,
+    context_id: str | None,
+    status: str | None,
+    status_timestamp_after: datetime | None,
+    offset: int,
+    page_size: int,
+) -> A2ATaskPageSnapshot:
+    return await run_db_io_cancellation_safe(
+        lambda: _load_a2a_task_page_sync(
+            agent_id=agent_id,
+            context_id=context_id,
+            status=status,
+            status_timestamp_after=status_timestamp_after,
+            offset=offset,
+            page_size=page_size,
+        )
+    )
+
+
 @router.get("/agents/{agent_id}/.well-known/agent-card.json")
 async def get_agent_card_well_known(
     agent_id: int,
     request: Request,
-    db: Session = Depends(get_db),
 ) -> Any:
-    agent = _resolve_published_agent(db, agent_id)
+    agent = await _load_published_agent_card_isolated(agent_id)
     return a2a_json_response(build_agent_card(agent, request))
 
 
@@ -676,11 +997,16 @@ async def get_agent_card_well_known(
 async def send_message(
     agent_id: int,
     request: Request,
-    authed: Tuple[Agent, AgentApiKey] = Depends(_get_a2a_agent_from_api_key),
-    db: Session = Depends(get_db),
+    authed: tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot] = Depends(
+        _get_a2a_agent_from_api_key
+    ),
 ) -> Any:
     agent, key = authed
     _require_bound_agent(agent_id, agent)
+    bound_agent_id = int(agent.id)
+    task_owner_user_id = int(agent.user_id)
+    agent_execution_mode = str(agent.execution_mode)
+    key_prefix = str(key.key_prefix)
     body = await _json_body(request)
     return_immediately = _validate_send_configuration(body)
     message = _message_payload(body)
@@ -689,16 +1015,17 @@ async def send_message(
     context_id = message_context_id(message, body)
     task_id = message_task_id(message, body)
     task = await _start_a2a_turn(
-        db=db,
-        agent=agent,
+        agent_id=bound_agent_id,
+        task_owner_user_id=task_owner_user_id,
+        agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
         context_id=context_id,
         task_id=task_id,
     )
-    record_key_usage(str(key.key_prefix))
+    await record_key_usage(key_prefix)
     if not return_immediately:
-        task = await _wait_for_task(agent, task)
+        task = await _wait_for_task(bound_agent_id, task)
     return a2a_json_response({"task": task_to_a2a(task)})
 
 
@@ -706,11 +1033,16 @@ async def send_message(
 async def stream_message(
     agent_id: int,
     request: Request,
-    authed: Tuple[Agent, AgentApiKey] = Depends(_get_a2a_agent_from_api_key),
-    db: Session = Depends(get_db),
+    authed: tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot] = Depends(
+        _get_a2a_agent_from_api_key
+    ),
 ) -> StreamingResponse:
     agent, key = authed
     _require_bound_agent(agent_id, agent)
+    bound_agent_id = int(agent.id)
+    task_owner_user_id = int(agent.user_id)
+    agent_execution_mode = str(agent.execution_mode)
+    key_prefix = str(key.key_prefix)
     body = await _json_body(request)
     _validate_send_configuration(body)
     message = _message_payload(body)
@@ -719,27 +1051,29 @@ async def stream_message(
     context_id = message_context_id(message, body)
     task_id = message_task_id(message, body)
     task = await _start_a2a_turn(
-        db=db,
-        agent=agent,
+        agent_id=bound_agent_id,
+        task_owner_user_id=task_owner_user_id,
+        agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
         context_id=context_id,
         task_id=task_id,
     )
-    record_key_usage(str(key.key_prefix))
-    return _task_stream_response(agent, task)
+    await record_key_usage(key_prefix)
+    return _task_stream_response(bound_agent_id, task)
 
 
 @router.get("/agents/{agent_id}/tasks/{task_id}")
 async def get_task(
     agent_id: int,
     task_id: int,
-    authed: Tuple[Agent, AgentApiKey] = Depends(_get_a2a_agent_from_api_key),
-    db: Session = Depends(get_db),
+    authed: tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot] = Depends(
+        _get_a2a_agent_from_api_key
+    ),
 ) -> Any:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
-    task = _resolve_a2a_task(db, task_id, agent)
+    task = await _load_a2a_task_or_error(int(agent.id), task_id)
     return a2a_json_response(task_to_a2a(task))
 
 
@@ -759,26 +1093,12 @@ async def list_tasks(
             "this is backed by Task.updated_at."
         ),
     ),
-    authed: Tuple[Agent, AgentApiKey] = Depends(_get_a2a_agent_from_api_key),
-    db: Session = Depends(get_db),
+    authed: tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot] = Depends(
+        _get_a2a_agent_from_api_key
+    ),
 ) -> Any:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
-    query = db.query(Task).filter(
-        Task.agent_id == int(agent.id),
-        Task.source == "a2a",
-    )
-    if context_id is not None:
-        stored_context_id = Task.agent_config["a2a_context_id"].as_string()
-        query = query.filter(
-            or_(
-                stored_context_id == context_id,
-                and_(
-                    stored_context_id.is_(None),
-                    cast(Task.id, String) == context_id,
-                ),
-            )
-        )
     if status is not None:
         if status not in ALL_TASK_STATES:
             raise a2a_error(
@@ -787,38 +1107,25 @@ async def list_tasks(
                 status_code=400,
                 details={"field": "status"},
             )
-        stored_a2a_state = Task.agent_config["a2a_state"].as_string()
-        state_filters: list[Any] = []
-        if status in _A2A_OVERRIDE_STATES:
-            state_filters.append(stored_a2a_state == status)
-        task_statuses = _A2A_TASK_STATUS_MAP.get(status)
-        if task_statuses:
-            state_filters.append(
-                and_(
-                    or_(
-                        stored_a2a_state.is_(None),
-                        ~stored_a2a_state.in_(_A2A_OVERRIDE_STATES),
-                    ),
-                    Task.status.in_(task_statuses),
-                )
-            )
-        query = query.filter(or_(*state_filters) if state_filters else false())
-    if status_timestamp_after is not None:
-        query = query.filter(Task.updated_at > status_timestamp_after)
 
     offset = _page_offset(page_token)
-    total_size = query.count()
-    page = query.order_by(Task.id.desc()).offset(offset).limit(page_size).all()
-    next_offset = offset + len(page)
-    next_page_token = str(next_offset) if next_offset < total_size else ""
+    page = await _load_a2a_task_page_isolated(
+        agent_id=int(agent.id),
+        context_id=context_id,
+        status=status,
+        status_timestamp_after=status_timestamp_after,
+        offset=offset,
+        page_size=page_size,
+    )
     return a2a_json_response(
         {
             "tasks": [
-                task_to_a2a(task, include_artifacts=include_artifacts) for task in page
+                task_to_a2a(task, include_artifacts=include_artifacts)
+                for task in page.tasks
             ],
-            "nextPageToken": next_page_token,
-            "pageSize": page_size,
-            "totalSize": total_size,
+            "nextPageToken": page.next_page_token,
+            "pageSize": page.page_size,
+            "totalSize": page.total_size,
         }
     )
 
@@ -829,58 +1136,43 @@ async def list_tasks(
 async def subscribe_task(
     agent_id: int,
     task_id: int,
-    authed: Tuple[Agent, AgentApiKey] = Depends(_get_a2a_agent_from_api_key),
-    db: Session = Depends(get_db),
+    authed: tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot] = Depends(
+        _get_a2a_agent_from_api_key
+    ),
 ) -> StreamingResponse:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
-    task = _resolve_a2a_task(db, task_id, agent)
-    if task.status in _TERMINAL_STATUSES:
+    bound_agent_id = int(agent.id)
+    task_snapshot = await _load_a2a_task_or_error(bound_agent_id, task_id)
+    if task_snapshot.status in _TERMINAL_STATUSES:
         raise a2a_error(
             "unsupported_operation",
             "A terminal task cannot be subscribed to.",
             status_code=400,
-            details={"taskId": task.id},
+            details={"taskId": task_snapshot.id},
         )
-    return _task_stream_response(agent, task)
+    return _task_stream_response(bound_agent_id, task_snapshot)
 
 
 @router.post("/agents/{agent_id}/tasks/{task_id}:cancel")
 async def cancel_task(
     agent_id: int,
     task_id: int,
-    authed: Tuple[Agent, AgentApiKey] = Depends(_get_a2a_agent_from_api_key),
-    db: Session = Depends(get_db),
+    authed: tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot] = Depends(
+        _get_a2a_agent_from_api_key
+    ),
 ) -> Any:
     agent, _key = authed
     _require_bound_agent(agent_id, agent)
-    task = _resolve_a2a_task(db, task_id, agent)
-    command_identity = f"cancel:{task_id}:{task.run_id or task.state_version}"
-    enqueued = enqueue_task_command(
-        db,
-        task_id=task_id,
-        actor_user_id=int(agent.user_id),
-        command_id=command_identity,
-        kind=TaskCommandKind.CANCEL,
-        payload={"agent_id": int(agent.id)},
+    bound_agent_id = int(agent.id)
+    task_owner_user_id = int(agent.user_id)
+    command = await run_db_io_cancellation_safe(
+        lambda: _prepare_a2a_cancel_command_sync(
+            task_id=task_id,
+            agent_id=bound_agent_id,
+            task_owner_user_id=task_owner_user_id,
+        )
     )
-    if not enqueued.payload_matches:
-        raise a2a_error(
-            "invalid_request",
-            "Cancel command identity conflicts with a different request.",
-            status_code=409,
-        )
-    if enqueued.status == COMMAND_FAILED:
-        retry_failed_task_command(
-            db,
-            enqueued.command_id,
-            target_run_id=_task_run_id(task),
-            target_runner_id=(
-                str(task.runner_id)
-                if task.status == TaskStatus.RUNNING and task.runner_id is not None
-                else None
-            ),
-        )
 
     from .websocket import execute_durable_task_command
 
@@ -889,14 +1181,22 @@ async def cancel_task(
     # completes it; polling here preserves the synchronous A2A cancel contract.
     await dispatch_one_task_command(
         execute_durable_task_command,
-        command_db_id=enqueued.command_id,
+        command_db_id=command.command_db_id,
     )
     deadline = monotonic() + 10.0
     while True:
-        stored = await asyncio.to_thread(load_task_command, enqueued.command_id)
+        stored = await run_db_io_cancellation_safe(
+            lambda: load_task_command(command.command_db_id)
+        )
         if stored is not None and stored.status == COMMAND_COMPLETED:
-            db.expire_all()
-            return a2a_json_response(task_to_a2a(_resolve_a2a_task(db, task_id, agent)))
+            fresh = await _fetch_fresh_a2a_task_isolated(bound_agent_id, task_id)
+            if fresh is None:
+                raise a2a_error(
+                    "task_not_found",
+                    "Task not found.",
+                    status_code=404,
+                )
+            return a2a_json_response(task_to_a2a(fresh))
         if stored is not None and stored.status == COMMAND_FAILED:
             rejection_reason = (
                 stored.result.get("rejection_reason")
@@ -908,7 +1208,10 @@ async def cancel_task(
                     "invalid_request",
                     "Task run changed before cancellation was applied; retry the request.",
                     status_code=409,
-                    details={"taskId": task_id, "commandId": command_identity},
+                    details={
+                        "taskId": task_id,
+                        "commandId": command.command_identity,
+                    },
                 )
             raise a2a_error(
                 "internal_error",
@@ -920,22 +1223,285 @@ async def cancel_task(
                 "temporarily_unavailable",
                 "Task cancellation was accepted but is still being applied.",
                 status_code=503,
-                details={"taskId": task_id, "commandId": command_identity},
+                details={"taskId": task_id, "commandId": command.command_identity},
             )
         await asyncio.sleep(0.05)
+
+
+@dataclass(frozen=True)
+class _A2ACancelCommand:
+    command_db_id: int
+    command_identity: str
+
+
+def _prepare_a2a_cancel_command_sync(
+    *,
+    task_id: int,
+    agent_id: int,
+    task_owner_user_id: int,
+) -> _A2ACancelCommand:
+    """Authorize and persist one A2A cancel command in a short transaction."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.agent_id == agent_id,
+                Task.user_id == task_owner_user_id,
+                Task.source == "a2a",
+            )
+            .first()
+        )
+        if task is None:
+            raise a2a_error("task_not_found", "Task not found.", status_code=404)
+        target_state_version = int(task.state_version or 0)
+        command_identity = f"cancel:{task_id}:{target_state_version}"
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=task_owner_user_id,
+            command_id=command_identity,
+            kind=TaskCommandKind.CANCEL,
+            payload={
+                "agent_id": agent_id,
+                "target_state_version": target_state_version,
+            },
+        )
+        if not enqueued.payload_matches:
+            raise a2a_error(
+                "invalid_request",
+                "Cancel command identity conflicts with a different request.",
+                status_code=409,
+            )
+        if enqueued.status == COMMAND_FAILED:
+            retry_failed_task_command(db, enqueued.command_id)
+        return _A2ACancelCommand(
+            command_db_id=enqueued.command_id,
+            command_identity=command_identity,
+        )
+
+
+def _load_cancelable_a2a_task_sync(
+    *,
+    task_id: int,
+    agent_id: int,
+    expected_run_id: str | None,
+    expected_state_version: int,
+) -> A2ATaskSnapshot:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.agent_id == agent_id,
+                Task.source == "a2a",
+            )
+            .first()
+        )
+        if task is None:
+            raise a2a_error("task_not_found", "Task not found.", status_code=404)
+        if _is_completed_a2a_cancel_target(
+            task,
+            expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
+        ):
+            return A2ATaskSnapshot.from_task(task)
+        _assert_a2a_cancel_target(
+            task,
+            expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
+        )
+        return A2ATaskSnapshot.from_task(task)
+
+
+def _assert_a2a_cancel_target(
+    task: Task,
+    *,
+    expected_run_id: str | None,
+    expected_state_version: int,
+) -> None:
+    """Reject a cancel command whose immutable task-state target is stale."""
+
+    current_run_id = _task_run_id(task)
+    current_state_version = int(task.state_version or 0)
+    if (
+        current_run_id != expected_run_id
+        or current_state_version != expected_state_version
+    ):
+        raise StaleTaskRunError(
+            f"task {task.id} changed from run/version "
+            f"{expected_run_id}/{expected_state_version} to "
+            f"{current_run_id}/{current_state_version}"
+        )
+
+
+def _is_completed_a2a_cancel_target(
+    task: Task,
+    *,
+    expected_run_id: str | None,
+    expected_state_version: int,
+) -> bool:
+    """Validate an idempotent cancel replay against its immutable target."""
+
+    agent_config: dict[str, Any] = (
+        task.agent_config if isinstance(task.agent_config, dict) else {}
+    )
+    if agent_config.get("a2a_state") != "TASK_STATE_CANCELED":
+        return False
+
+    current_run_id = _task_run_id(task)
+    current_state_version = int(task.state_version or 0)
+    is_exact_completion = (
+        current_run_id == expected_run_id
+        and current_state_version
+        in {expected_state_version, expected_state_version + 1}
+        and task.status == TaskStatus.FAILED
+        and task.control_state == TaskControlState.FAILED.value
+    )
+    if not is_exact_completion:
+        raise StaleTaskRunError(
+            f"task {task.id} has a canceled marker outside command target "
+            f"{expected_run_id}/{expected_state_version}; current state is "
+            f"{current_run_id}/{current_state_version}/"
+            f"{task.status.value}/{task.control_state}"
+        )
+    return True
+
+
+def _finalize_a2a_cancel_sync(
+    *,
+    task_id: int,
+    agent_id: int,
+    expected_run_id: str | None,
+    expected_state_version: int,
+    local_cancel_requested: bool,
+) -> A2ATaskSnapshot:
+    """Atomically persist cancellation for one exact task-state target."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.agent_id == agent_id,
+                Task.source == "a2a",
+            )
+            .first()
+        )
+        if task is None:
+            raise a2a_error("task_not_found", "Task not found.", status_code=404)
+        agent_config: dict[str, Any] = (
+            dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
+        )
+        if _is_completed_a2a_cancel_target(
+            task,
+            expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
+        ):
+            return A2ATaskSnapshot.from_task(task)
+
+        current_run_id = _task_run_id(task)
+        current_state_version = int(task.state_version or 0)
+        same_run = current_run_id == expected_run_id
+        settled_local_cancel = (
+            local_cancel_requested
+            and same_run
+            and current_state_version == expected_state_version + 1
+            and task.status == TaskStatus.FAILED
+            and task.control_state == TaskControlState.FAILED.value
+            and task.runner_id is None
+            and task.lease_expires_at is None
+        )
+        direct_cancel = (
+            same_run
+            and current_state_version == expected_state_version
+            and task.status not in _TERMINAL_STATUSES
+        )
+        if not settled_local_cancel and not direct_cancel:
+            raise StaleTaskRunError(
+                f"task {task.id} cannot finalize cancel target "
+                f"{expected_run_id}/{expected_state_version}; current state is "
+                f"{current_run_id}/{current_state_version}/"
+                f"{task.status.value}/{task.control_state}"
+            )
+
+        agent_config["a2a_state"] = "TASK_STATE_CANCELED"
+        target_state_version = current_state_version
+        final_state_version = (
+            current_state_version
+            if settled_local_cancel
+            else expected_state_version + 1
+        )
+        statement = (
+            update(Task)
+            .where(
+                Task.id == task_id,
+                Task.agent_id == agent_id,
+                Task.source == "a2a",
+                func.coalesce(Task.state_version, 0) == target_state_version,
+            )
+            .values(
+                agent_config=agent_config,
+                status=TaskStatus.FAILED,
+                control_state=TaskControlState.FAILED.value,
+                state_version=final_state_version,
+                runner_id=None,
+                lease_expires_at=None,
+                last_heartbeat_at=None,
+                output=None,
+                error_message="Task canceled by A2A client.",
+            )
+        )
+        if expected_run_id is None:
+            statement = statement.where(Task.run_id.is_(None))
+        else:
+            statement = statement.where(Task.run_id == expected_run_id)
+        if settled_local_cancel:
+            statement = statement.where(
+                Task.status == TaskStatus.FAILED,
+                Task.control_state == TaskControlState.FAILED.value,
+                Task.runner_id.is_(None),
+                Task.lease_expires_at.is_(None),
+            )
+        else:
+            statement = statement.where(Task.status.notin_(_TERMINAL_STATUSES))
+
+        updated = db.execute(
+            statement.returning(Task).execution_options(synchronize_session=False)
+        ).scalar_one_or_none()
+        if updated is None:
+            db.rollback()
+            raise StaleTaskRunError(
+                f"task {task_id} changed while finalizing cancel target "
+                f"{expected_run_id}/{expected_state_version}"
+            )
+        snapshot = A2ATaskSnapshot.from_task(updated)
+        db.commit()
+        return snapshot
 
 
 async def _cancel_task_unserialized(
     *,
     task_id: int,
-    agent: Agent,
-    db: Session,
+    agent_id: int,
+    expected_run_id: str | None,
+    expected_state_version: int,
 ) -> Any:
-    task = _resolve_a2a_task(db, task_id, agent)
-    agent_config: dict[str, Any] = (
-        dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
+    """Cancel one exact durable-command target while the caller owns its gate."""
+
+    task = await run_db_io_cancellation_safe(
+        lambda: _load_cancelable_a2a_task_sync(
+            task_id=task_id,
+            agent_id=agent_id,
+            expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
+        )
     )
-    if agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+    if task.agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
         return a2a_json_response(task_to_a2a(task))
     if task.status in _TERMINAL_STATUSES:
         raise a2a_error(
@@ -947,27 +1513,14 @@ async def _cancel_task_unserialized(
 
     from .websocket import background_task_manager
 
-    await background_task_manager.cancel_task(int(task.id))
-    db.expire(task)
-    db.refresh(task)
-    agent_config = (
-        dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
+    cancel_outcome = await background_task_manager.cancel_task(task.id)
+    finalized = await run_db_io_cancellation_safe(
+        lambda: _finalize_a2a_cancel_sync(
+            task_id=task_id,
+            agent_id=agent_id,
+            expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
+            local_cancel_requested=cancel_outcome.requested,
+        )
     )
-    if agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
-        return a2a_json_response(task_to_a2a(task))
-    if task.status in _TERMINAL_STATUSES:
-        return a2a_json_response(task_to_a2a(task))
-    agent_config["a2a_state"] = "TASK_STATE_CANCELED"
-    setattr(task, "agent_config", agent_config)
-    apply_task_control_transition(
-        task,
-        TaskControlState.FAILED,
-        status=TaskStatus.FAILED,
-        expected_run_id=_task_run_id(task),
-        expected_state_version=int(task.state_version or 0),
-    )
-    setattr(task, "output", None)
-    setattr(task, "error_message", "Task canceled by A2A client.")
-    db.commit()
-    db.refresh(task)
-    return a2a_json_response(task_to_a2a(task))
+    return a2a_json_response(task_to_a2a(finalized))

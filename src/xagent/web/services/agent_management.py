@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal, cast
 
 from sqlalchemy import func, or_, select
@@ -11,14 +12,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
 from ...core.tools.core.document_search import find_missing_knowledge_bases
+from ...core.utils.api_key import (
+    PREFIX_COLLISION_RETRIES,
+    ApiKeyKind,
+    generate_api_key,
+)
 from ...templates.manager import TemplateManager
 from ..models.agent import Agent
+from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.user import User
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from ..schemas.agent_api_key import APIKeyGenerateResponse
 from ..services.agent_store import AgentStore, invalidate_agent_cache
-from .api_keys import AgentApiKeyService, KeyRotationConflict
+from .api_keys import AgentApiKeyService, ApiKeyCandidate, KeyRotationConflict
+from .db_runtime import run_db_io_cancellation_safe
 from .workforce_access import can_edit_workforce, filter_visible_workforces
 from .workforce_lifecycle import is_workforce_manager_discard_safe
 
@@ -43,6 +51,152 @@ class InvalidAgentModelConfigError(ValueError):
 
 class InvalidKnowledgeBaseError(ValueError):
     """Raised when KB selection fails the knowledge-tool or visibility rule."""
+
+
+@dataclass(frozen=True)
+class AgentCreateSpec:
+    """Detached input for one agent-management create transaction."""
+
+    name: str
+    description: str | None
+    instructions: str | None
+    execution_mode: str | None
+    models: tuple[tuple[str, int | None], ...] | None
+    knowledge_bases: tuple[str, ...]
+    skills: tuple[str, ...]
+    tool_categories: tuple[str, ...]
+    suggested_prompts: tuple[str, ...]
+    generate_runtime_key: bool
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        name: str,
+        description: str | None,
+        instructions: str | None,
+        execution_mode: str | None,
+        models: dict[str, Any] | None,
+        knowledge_bases: list[str] | tuple[str, ...] | None,
+        skills: list[str] | tuple[str, ...] | None,
+        tool_categories: list[str] | tuple[str, ...] | None,
+        suggested_prompts: list[str] | tuple[str, ...] | None,
+        generate_runtime_key: bool,
+    ) -> AgentCreateSpec:
+        frozen_models: tuple[tuple[str, int | None], ...] | None = None
+        if models is not None:
+            frozen_models = tuple(
+                (str(slot), cast("int | None", model_id))
+                for slot, model_id in models.items()
+            )
+        return cls(
+            name=name,
+            description=description,
+            instructions=instructions,
+            execution_mode=execution_mode,
+            models=frozen_models,
+            knowledge_bases=tuple(knowledge_bases or ()),
+            skills=tuple(skills or ()),
+            tool_categories=tuple(tool_categories or ()),
+            suggested_prompts=tuple(suggested_prompts or ()),
+            generate_runtime_key=generate_runtime_key,
+        )
+
+    def model_mapping(self) -> dict[str, Any] | None:
+        return dict(self.models) if self.models is not None else None
+
+
+@dataclass(frozen=True)
+class AgentSummarySnapshot:
+    """Frozen V1 list item detached from its worker-owned Session."""
+
+    id: int
+    name: str
+    description: str | None
+    logo_url: str | None
+    status: str
+    created_at: str
+    updated_at: str
+    widget_enabled: bool
+    allowed_domains: tuple[str, ...]
+    share_enabled: bool
+    share_updated_at: str | None
+
+
+@dataclass(frozen=True)
+class AgentResponseSnapshot:
+    """Frozen agent detail detached from its worker-owned Session."""
+
+    id: int
+    user_id: int
+    team_id: int | None
+    name: str
+    description: str | None
+    instructions: str | None
+    execution_mode: str
+    models: tuple[tuple[str, int | None], ...] | None
+    knowledge_bases: tuple[str, ...]
+    skills: tuple[str, ...]
+    tool_categories: tuple[str, ...]
+    suggested_prompts: tuple[str, ...]
+    logo_url: str | None
+    status: str
+    visibility: str
+    published_at: str | None
+    created_at: str
+    updated_at: str
+    widget_enabled: bool
+    allowed_domains: tuple[str, ...]
+    share_enabled: bool
+    share_updated_at: str | None
+
+    def model_mapping(self) -> dict[str, Any] | None:
+        return dict(self.models) if self.models is not None else None
+
+    def to_response_dict(self) -> dict[str, Any]:
+        """Return the shared detached payload consumed by web and V1 schemas."""
+
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "team_id": self.team_id,
+            "name": self.name,
+            "description": self.description,
+            "instructions": self.instructions,
+            "execution_mode": self.execution_mode,
+            "models": self.model_mapping(),
+            "knowledge_bases": list(self.knowledge_bases),
+            "skills": list(self.skills),
+            "tool_categories": list(self.tool_categories),
+            "suggested_prompts": list(self.suggested_prompts),
+            "logo_url": self.logo_url,
+            "status": self.status,
+            "visibility": self.visibility,
+            "published_at": self.published_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "widget_enabled": self.widget_enabled,
+            "allowed_domains": list(self.allowed_domains),
+            "share_enabled": self.share_enabled,
+            "share_updated_at": self.share_updated_at,
+        }
+
+
+@dataclass(frozen=True)
+class RuntimeKeySnapshot:
+    """One-shot runtime key returned after its write transaction commits."""
+
+    full_key: str
+    key_prefix: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class AgentCreateSnapshot:
+    """Detached result of atomic agent + optional runtime-key creation."""
+
+    agent: AgentResponseSnapshot
+    api_key: RuntimeKeySnapshot | None
 
 
 @dataclass(frozen=True)
@@ -326,21 +480,12 @@ class AgentManagementService:
         :meth:`create_agent` entry point rather than the sync transaction
         executor.
         """
-        if not knowledge_bases:
-            return
-        if KNOWLEDGE_TOOL_CATEGORY not in (tool_categories or []):
-            raise InvalidKnowledgeBaseError(
-                "Knowledge bases are selected but the Knowledge tool "
-                "category is not enabled."
-            )
-        missing = await find_missing_knowledge_bases(
-            knowledge_bases, user_id=user_id, is_admin=is_admin
+        await _validate_agent_knowledge_bases(
+            knowledge_bases=tuple(knowledge_bases or ()),
+            tool_categories=tuple(tool_categories or ()),
+            user_id=user_id,
+            is_admin=is_admin,
         )
-        if missing:
-            raise InvalidKnowledgeBaseError(
-                "Knowledge base(s) not found or not visible to this user: "
-                + ", ".join(missing)
-            )
 
     async def create_agent(
         self,
@@ -397,6 +542,7 @@ class AgentManagementService:
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
         generate_runtime_key: bool = True,
+        runtime_key_candidate: ApiKeyCandidate | None = None,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
         """Create an agent and (optionally) its first runtime key in a
         single transaction. Internal transaction executor: assumes
@@ -446,18 +592,19 @@ class AgentManagementService:
         staged_key = None
         try:
             if generate_runtime_key:
-                staged_key = self.key_service.stage_rotated_key(int(agent.id))
+                staged_key = self.key_service.stage_rotated_key(
+                    int(agent.id),
+                    candidate=runtime_key_candidate,
+                )
             self.db.commit()  # single transaction boundary for both writes
         except IntegrityError as exc:
             self.db.rollback()
             raise KeyRotationConflict(str(exc)) from exc
 
-        self.db.refresh(agent)
-        invalidate_agent_cache(
-            user_id, int(agent.id), cast("int | None", agent.team_id)
-        )
-
         key_resp: APIKeyGenerateResponse | None = None
+        self.db.refresh(agent)
+        agent_id = int(agent.id)
+        agent_team_id = cast("int | None", agent.team_id)
         if staged_key is not None:
             new_row, full_key = staged_key
             self.db.refresh(new_row)
@@ -466,6 +613,17 @@ class AgentManagementService:
                 key_prefix=new_row.key_prefix,
                 created_at=new_row.created_at,
             )
+        # Preserve the fully-loaded response row as a detached object. The
+        # read-only transaction release below expires attached ORM state.
+        self.db.expunge(agent)
+        # Refreshes above open a new read-only transaction. End it before
+        # cache invalidation, which may perform synchronous remote I/O.
+        release_db_connection_if_clean(self.db)
+        invalidate_agent_cache(
+            user_id,
+            agent_id,
+            agent_team_id,
+        )
         return agent, key_resp
 
     async def create_agent_from_template(
@@ -538,12 +696,19 @@ class AgentManagementService:
         )
 
     def generate_agent_runtime_key(
-        self, *, user_id: int, agent_id: int
+        self,
+        *,
+        user_id: int,
+        agent_id: int,
+        runtime_key_candidate: ApiKeyCandidate | None = None,
     ) -> APIKeyGenerateResponse | None:
         agent = self.store.get_owned_agent(user_id, agent_id)
         if agent is None:
             return None
-        return self.key_service.rotate_key(agent_id)
+        return self.key_service.rotate_key(
+            agent_id,
+            candidate=runtime_key_candidate,
+        )
 
     def _validate_models(
         self, models: dict[str, Any] | None, *, user_id: int
@@ -573,3 +738,320 @@ class AgentManagementService:
                 raise InvalidAgentModelConfigError(slot)
             normalized[slot] = model_id
         return normalized
+
+
+def _agent_summary_snapshot(payload: dict[str, Any]) -> AgentSummarySnapshot:
+    return AgentSummarySnapshot(
+        id=int(payload["id"]),
+        name=str(payload["name"]),
+        description=cast("str | None", payload.get("description")),
+        logo_url=cast("str | None", payload.get("logo_url")),
+        status=str(payload["status"]),
+        created_at=str(payload["created_at"]),
+        updated_at=str(payload["updated_at"]),
+        widget_enabled=bool(payload["widget_enabled"]),
+        allowed_domains=tuple(payload.get("allowed_domains") or ()),
+        share_enabled=bool(payload["share_enabled"]),
+        share_updated_at=cast("str | None", payload.get("share_updated_at")),
+    )
+
+
+def _agent_response_snapshot(payload: dict[str, Any]) -> AgentResponseSnapshot:
+    raw_models = payload.get("models")
+    frozen_models = (
+        tuple(
+            (str(slot), cast("int | None", model_id))
+            for slot, model_id in raw_models.items()
+        )
+        if isinstance(raw_models, dict)
+        else None
+    )
+    return AgentResponseSnapshot(
+        id=int(payload["id"]),
+        user_id=int(payload["user_id"]),
+        team_id=(
+            int(payload["team_id"]) if payload.get("team_id") is not None else None
+        ),
+        name=str(payload["name"]),
+        description=cast("str | None", payload.get("description")),
+        instructions=cast("str | None", payload.get("instructions")),
+        execution_mode=str(payload["execution_mode"]),
+        models=frozen_models,
+        knowledge_bases=tuple(payload.get("knowledge_bases") or ()),
+        skills=tuple(payload.get("skills") or ()),
+        tool_categories=tuple(payload.get("tool_categories") or ()),
+        suggested_prompts=tuple(payload.get("suggested_prompts") or ()),
+        logo_url=cast("str | None", payload.get("logo_url")),
+        status=str(payload["status"]),
+        visibility=str(payload["visibility"]),
+        published_at=cast("str | None", payload.get("published_at")),
+        created_at=str(payload["created_at"]),
+        updated_at=str(payload["updated_at"]),
+        widget_enabled=bool(payload["widget_enabled"]),
+        allowed_domains=tuple(payload.get("allowed_domains") or ()),
+        share_enabled=bool(payload["share_enabled"]),
+        share_updated_at=cast("str | None", payload.get("share_updated_at")),
+    )
+
+
+def _runtime_key_snapshot(
+    response: APIKeyGenerateResponse | None,
+) -> RuntimeKeySnapshot | None:
+    if response is None:
+        return None
+    return RuntimeKeySnapshot(
+        full_key=response.full_key,
+        key_prefix=response.key_prefix,
+        created_at=response.created_at,
+    )
+
+
+def _is_runtime_key_prefix_collision(error: BaseException) -> bool:
+    """Recognize the authoritative key-prefix unique constraint failure."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if "key_prefix" in message and (
+            "agent_api_keys" in message or "unique" in message or "duplicate" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def _validate_agent_knowledge_bases(
+    *,
+    knowledge_bases: tuple[str, ...],
+    tool_categories: tuple[str, ...],
+    user_id: int,
+    is_admin: bool,
+) -> None:
+    """Validate detached KB inputs without retaining a SQLAlchemy Session."""
+
+    if not knowledge_bases:
+        return
+    if KNOWLEDGE_TOOL_CATEGORY not in tool_categories:
+        raise InvalidKnowledgeBaseError(
+            "Knowledge bases are selected but the Knowledge tool "
+            "category is not enabled."
+        )
+    missing = await find_missing_knowledge_bases(
+        list(knowledge_bases),
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+    if missing:
+        raise InvalidKnowledgeBaseError(
+            "Knowledge base(s) not found or not visible to this user: "
+            + ", ".join(missing)
+        )
+
+
+class AgentManagementRuntime:
+    """Async owner for V1 agent management.
+
+    The runtime itself owns no Session. Async template and knowledge-base
+    materialization operate on detached values, while every synchronous SQL
+    transaction runs in a worker that creates and closes its own Session.
+    """
+
+    def __init__(self, template_manager: TemplateManager | None = None) -> None:
+        self.template_manager = template_manager
+
+    async def list_agents(
+        self,
+        *,
+        user_id: int,
+    ) -> tuple[AgentSummarySnapshot, ...]:
+        return await run_db_io_cancellation_safe(
+            lambda: self._list_agents_sync(user_id=user_id)
+        )
+
+    @staticmethod
+    def _list_agents_sync(*, user_id: int) -> tuple[AgentSummarySnapshot, ...]:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            payloads = AgentManagementService(db).list_agents_for_user(user_id)
+            return tuple(_agent_summary_snapshot(payload) for payload in payloads)
+
+    async def create_agent(
+        self,
+        *,
+        user_id: int,
+        is_admin: bool,
+        spec: AgentCreateSpec,
+    ) -> AgentCreateSnapshot:
+        await _validate_agent_knowledge_bases(
+            knowledge_bases=spec.knowledge_bases,
+            tool_categories=spec.tool_categories,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        return await run_db_io_cancellation_safe(
+            lambda: self._create_agent_with_retry_sync(
+                user_id=user_id,
+                spec=spec,
+            )
+        )
+
+    @staticmethod
+    def _create_agent_with_retry_sync(
+        *,
+        user_id: int,
+        spec: AgentCreateSpec,
+    ) -> AgentCreateSnapshot:
+        attempts = PREFIX_COLLISION_RETRIES if spec.generate_runtime_key else 1
+        for attempt in range(attempts):
+            # Candidate generation includes bcrypt. It deliberately precedes
+            # Session creation so CPU work never pins a pool checkout.
+            candidate = (
+                generate_api_key(None, kind=ApiKeyKind.AGENT)
+                if spec.generate_runtime_key
+                else None
+            )
+            SessionLocal = get_session_local()
+            try:
+                with SessionLocal() as db:
+                    service = AgentManagementService(db)
+                    agent, key_response = service.create_agent_with_optional_key(
+                        user_id=user_id,
+                        name=spec.name,
+                        description=spec.description,
+                        instructions=spec.instructions,
+                        execution_mode=spec.execution_mode,
+                        models=spec.model_mapping(),
+                        knowledge_bases=list(spec.knowledge_bases),
+                        skills=list(spec.skills),
+                        tool_categories=list(spec.tool_categories),
+                        suggested_prompts=list(spec.suggested_prompts),
+                        generate_runtime_key=spec.generate_runtime_key,
+                        runtime_key_candidate=candidate,
+                    )
+                    agent_snapshot = _agent_response_snapshot(
+                        service.store.agent_to_response_dict(agent)
+                    )
+                    return AgentCreateSnapshot(
+                        agent=agent_snapshot,
+                        api_key=_runtime_key_snapshot(key_response),
+                    )
+            except KeyRotationConflict as exc:
+                if (
+                    candidate is not None
+                    and _is_runtime_key_prefix_collision(exc)
+                    and attempt + 1 < attempts
+                ):
+                    continue
+                raise
+        raise KeyRotationConflict(
+            "Failed to generate a unique runtime key prefix after retrying."
+        )
+
+    async def create_agent_from_template(
+        self,
+        *,
+        user_id: int,
+        is_admin: bool,
+        template_id: str,
+        name: str | None,
+        description: str | None,
+        instructions: str | None,
+        execution_mode: str | None,
+        models: dict[str, Any] | None,
+        knowledge_bases: list[str] | None,
+        skills: list[str] | None,
+        tool_categories: list[str] | None,
+        suggested_prompts: list[str] | None,
+        generate_runtime_key: bool,
+    ) -> AgentCreateSnapshot:
+        if self.template_manager is None:
+            raise TemplateNotFoundError(template_id)
+        template = await self.template_manager.get_template(template_id)
+        if template is None:
+            raise TemplateNotFoundError(template_id)
+
+        agent_config = template.get("agent_config") or {}
+        final_description = description
+        if final_description is None:
+            descriptions = template.get("descriptions") or {}
+            if isinstance(descriptions, dict):
+                final_description = descriptions.get("en") or ""
+            elif isinstance(descriptions, str):
+                final_description = descriptions
+
+        spec = AgentCreateSpec.from_values(
+            name=name or template.get("name") or template_id,
+            description=final_description,
+            instructions=(
+                instructions
+                if instructions is not None
+                else agent_config.get("instructions")
+            ),
+            execution_mode=execution_mode or agent_config.get("execution_mode"),
+            models=models if models is not None else agent_config.get("models"),
+            knowledge_bases=(
+                knowledge_bases
+                if knowledge_bases is not None
+                else agent_config.get("knowledge_bases") or []
+            ),
+            skills=skills if skills is not None else agent_config.get("skills") or [],
+            tool_categories=(
+                tool_categories
+                if tool_categories is not None
+                else agent_config.get("tool_categories") or []
+            ),
+            suggested_prompts=(
+                suggested_prompts
+                if suggested_prompts is not None
+                else agent_config.get("suggested_prompts") or []
+            ),
+            generate_runtime_key=generate_runtime_key,
+        )
+        return await self.create_agent(
+            user_id=user_id,
+            is_admin=is_admin,
+            spec=spec,
+        )
+
+    async def rotate_agent_runtime_key(
+        self,
+        *,
+        user_id: int,
+        agent_id: int,
+    ) -> RuntimeKeySnapshot | None:
+        return await run_db_io_cancellation_safe(
+            lambda: self._rotate_agent_runtime_key_with_retry_sync(
+                user_id=user_id,
+                agent_id=agent_id,
+            )
+        )
+
+    @staticmethod
+    def _rotate_agent_runtime_key_with_retry_sync(
+        *,
+        user_id: int,
+        agent_id: int,
+    ) -> RuntimeKeySnapshot | None:
+        for attempt in range(PREFIX_COLLISION_RETRIES):
+            candidate = generate_api_key(None, kind=ApiKeyKind.AGENT)
+            SessionLocal = get_session_local()
+            try:
+                with SessionLocal() as db:
+                    response = AgentManagementService(db).generate_agent_runtime_key(
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        runtime_key_candidate=candidate,
+                    )
+                    return _runtime_key_snapshot(response)
+            except KeyRotationConflict as exc:
+                if (
+                    _is_runtime_key_prefix_collision(exc)
+                    and attempt + 1 < PREFIX_COLLISION_RETRIES
+                ):
+                    continue
+                raise
+        raise KeyRotationConflict(
+            "Failed to generate a unique runtime key prefix after retrying."
+        )

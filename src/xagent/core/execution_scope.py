@@ -35,11 +35,26 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional, Union, cast
 
 logger = logging.getLogger(__name__)
 
 _SCOPE_COMPONENT_RE = re.compile(r"[a-zA-Z0-9_-]{1,63}")
+
+
+class ExecutionScopeNotProvided:
+    """Marker distinguishing an omitted scope from an explicit ``None``."""
+
+    __slots__ = ()
+
+
+EXECUTION_SCOPE_NOT_PROVIDED = ExecutionScopeNotProvided()
+
+ExecutionScopeInput = Union[
+    "ExecutionScope",
+    None,
+    ExecutionScopeNotProvided,
+]
 
 
 class InvalidScopeComponentError(ValueError):
@@ -256,6 +271,25 @@ class ExecutionScope:
 # the snapshot is written at task creation and preferred over the resolver.
 EXECUTION_SCOPE_AGENT_CONFIG_KEY = "execution_scope"
 
+
+def execution_scope_from_agent_config(
+    agent_config: Any,
+) -> Optional[ExecutionScope]:
+    """Decode the persisted scope snapshot owned by a task config.
+
+    ``None`` means the task has no persisted snapshot and the canonical
+    resolution flow may consult the registered resolver. Invalid snapshots
+    propagate instead of silently degrading to an unscoped namespace.
+    """
+
+    if not isinstance(agent_config, Mapping):
+        return None
+    scope_data = agent_config.get(EXECUTION_SCOPE_AGENT_CONFIG_KEY)
+    if not isinstance(scope_data, Mapping):
+        return None
+    return ExecutionScope.from_dict(scope_data)
+
+
 # Metadata-key prefix under which ExecutionScope.memory_dimensions are
 # stamped onto memory notes (flat, string-valued entries — the memory
 # backends apply plain string-equality filters). The prefix keeps dimension
@@ -421,13 +455,20 @@ def set_execution_scope_snapshot_loader(
     _execution_scope_snapshot_loader = loader
 
 
-def resolve_execution_scope(task_id: str | int) -> Optional[ExecutionScope]:
+def resolve_execution_scope(
+    task_id: str | int,
+    *,
+    persisted_snapshot: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED,
+) -> Optional[ExecutionScope]:
     """Resolve the scope for ``task_id``.
 
     A persisted snapshot (see :func:`set_execution_scope_snapshot_loader`)
     is preferred over the resolver; with neither registered, or both
     returning None, the task runs unscoped. Loader/resolver exceptions
-    propagate to the caller.
+    propagate to the caller. A database owner that already read the persisted
+    snapshot may pass it explicitly; this skips the registered loader while
+    preserving the same snapshot-then-resolver precedence. Explicit ``None``
+    means "snapshot absent", not "force an unscoped task".
 
     Raises:
         ValueError: ``task_id`` is None — ``str(None)`` would silently
@@ -440,10 +481,16 @@ def resolve_execution_scope(task_id: str | int) -> Optional[ExecutionScope]:
             "task_id cannot be None; a caller without a task identity "
             "must treat the execution as unscoped instead"
         )
-    if _execution_scope_snapshot_loader is not None:
-        snapshot = _execution_scope_snapshot_loader(str(task_id))
-        if snapshot is not None:
-            return snapshot
+    if persisted_snapshot is EXECUTION_SCOPE_NOT_PROVIDED:
+        snapshot = (
+            _execution_scope_snapshot_loader(str(task_id))
+            if _execution_scope_snapshot_loader is not None
+            else None
+        )
+    else:
+        snapshot = cast(Optional[ExecutionScope], persisted_snapshot)
+    if snapshot is not None:
+        return snapshot
     if _execution_scope_resolver is None:
         return None
     return _execution_scope_resolver(str(task_id))

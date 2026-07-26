@@ -259,6 +259,15 @@ class TestDurableStorageSegments:
 
 
 class TestContextvarHelpers:
+    def test_not_provided_sentinel_is_a_shared_typed_value(self):
+        from xagent.core.execution_scope import (
+            EXECUTION_SCOPE_NOT_PROVIDED,
+            ExecutionScopeNotProvided,
+        )
+
+        assert EXECUTION_SCOPE_NOT_PROVIDED is not None
+        assert type(EXECUTION_SCOPE_NOT_PROVIDED) is ExecutionScopeNotProvided
+
     def test_default_is_none(self):
         assert get_execution_scope() is None
 

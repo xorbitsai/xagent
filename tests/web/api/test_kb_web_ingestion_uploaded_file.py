@@ -38,6 +38,7 @@ from xagent.web.api.kb import (
     _build_ingest_backup_path,
     _compensate_new_web_ingest_files,
     _copy_upload_file_to_path,
+    _create_file_compensation_restore,
     _create_web_uploaded_file_record,
     _delete_web_rag_side_effects_for_file_id,
     _get_file_sha256,
@@ -55,6 +56,11 @@ from xagent.web.api.kb import (
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services.uploaded_file_store import (
+    UploadedFileStore,
+    UploadedFileVersionConflict,
+    snapshot_uploaded_file_version,
+)
 
 
 class TestNormalizeWebTitleForFilename:
@@ -473,14 +479,6 @@ class TestWebIngestionUploadedFilePersistence:
         )
 
         def failing_upsert(*_args, **_kwargs):
-            from xagent.web.services.uploaded_file_store import UploadedFileStore
-
-            UploadedFileStore(db_session).sync_existing(
-                existing_record,
-                storage_key=str(existing_record.storage_key),
-                mime_type="text/markdown",
-            )
-            db_session.commit()
             raise RuntimeError("durable sync failed")
 
         ingestion_runs_snapshot = object()
@@ -895,7 +893,6 @@ class TestWebIngestionUploadedFilePersistence:
         old_file_id = str(existing_record.file_id)
         old_storage_key = str(existing_record.storage_key)
         from xagent.web.services.managed_file_ref import ManagedFileRef
-        from xagent.web.services.uploaded_file_store import UploadedFileStore
 
         ManagedFileRef(existing_record).delete_durable()
         existing_path.unlink()
@@ -909,18 +906,13 @@ class TestWebIngestionUploadedFilePersistence:
             mime_type: str,
             file_size: int,
         ) -> UploadedFile:
-            refreshed_record = (
-                db_session_arg.query(UploadedFile)
-                .filter(UploadedFile.file_id == old_file_id)
-                .first()
-            )
-            assert refreshed_record is not None
-            refreshed_record.filename = filename
-            refreshed_record.file_size = file_size
-            UploadedFileStore(db_session_arg).sync_existing(
-                refreshed_record,
-                storage_key=old_storage_key,
+            UploadedFileStore(db_session_arg).upsert_by_storage_path(
+                user_id=user_id,
+                file_id=old_file_id,
+                filename=filename,
+                storage_path=storage_path,
                 mime_type=mime_type,
+                file_size=file_size,
             )
             db_session_arg.commit()
             raise RuntimeError("post-commit failure")
@@ -943,7 +935,10 @@ class TestWebIngestionUploadedFilePersistence:
                 side_effect=failing_upsert,
             ),
         ):
-            with pytest.raises(RuntimeError, match="post-commit failure"):
+            with pytest.raises(
+                UploadedFileVersionConflict,
+                match="skipped unsafe metadata rollback",
+            ):
                 _recreate_missing_existing_file(
                     existing_record=existing_record,
                     temp_file_path=temp_file_path,
@@ -957,15 +952,101 @@ class TestWebIngestionUploadedFilePersistence:
                 )
 
         assert not existing_path.exists()
-        assert get_unscoped_file_storage().list("users") == []
         row = (
             db_session.query(UploadedFile)
             .filter(UploadedFile.file_id == old_file_id)
             .first()
         )
         assert row is not None
-        assert row.storage_key == old_storage_key
+        assert row.storage_key != old_storage_key
+        with get_unscoped_file_storage().open_read(str(row.storage_key)) as handle:
+            assert handle.read() == b"new content"
         mock_restore_runs.assert_called_once_with(ingestion_runs_snapshot)
+
+    def test_file_compensation_does_not_overwrite_a_later_uploaded_file_version(
+        self,
+        db_session: Session,
+        mock_user: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+        get_unscoped_file_storage.cache_clear()
+        SessionLocal = sessionmaker(bind=db_session.get_bind())
+        monkeypatch.setattr(
+            "xagent.web.api.kb.get_session_local",
+            lambda: SessionLocal,
+        )
+
+        existing_path = tmp_path / "uploads" / "existing.md"
+        existing_path.parent.mkdir(parents=True)
+        existing_path.write_text("old content", encoding="utf-8")
+        original = _upsert_uploaded_file_record(
+            db_session,
+            user_id=int(mock_user.id),
+            filename="existing.md",
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+        previous_version = snapshot_uploaded_file_version(original)
+        record_snapshot = {
+            field: getattr(original, field)
+            for field in (
+                "filename",
+                "storage_path",
+                "storage_key",
+                "mime_type",
+                "file_size",
+            )
+        }
+        backup_path = tmp_path / "existing.md.backup"
+        backup_path.write_text("old content", encoding="utf-8")
+
+        existing_path.write_text("first replacement", encoding="utf-8")
+        first_replacement = _upsert_uploaded_file_record(
+            db_session,
+            user_id=int(mock_user.id),
+            filename="existing.md",
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+        applied_version = snapshot_uploaded_file_version(first_replacement)
+        compensation = _create_file_compensation_restore(
+            file_record_id=str(original.file_id),
+            existing_path=existing_path,
+            backup_path=backup_path,
+            record_snapshot=record_snapshot,
+            previous_version=previous_version,
+            expected_current_version=applied_version,
+        )
+
+        existing_path.write_text("later version", encoding="utf-8")
+        later = _upsert_uploaded_file_record(
+            db_session,
+            user_id=int(mock_user.id),
+            filename="existing.md",
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+        later_version = snapshot_uploaded_file_version(later)
+
+        with pytest.raises(UploadedFileVersionConflict):
+            compensation()
+
+        db_session.expire_all()
+        persisted = (
+            db_session.query(UploadedFile)
+            .filter(UploadedFile.file_id == original.file_id)
+            .one()
+        )
+        assert snapshot_uploaded_file_version(persisted) == later_version
+        with get_unscoped_file_storage().open_read(
+            str(persisted.storage_key)
+        ) as handle:
+            assert handle.read() == b"later version"
 
     def test_in_memory_cache_deduplication(
         self, db_session: Session, test_user: User, mock_user: MagicMock

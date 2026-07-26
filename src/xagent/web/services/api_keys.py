@@ -37,6 +37,8 @@ from .personal_key_scope import PersonalKeyAccessScope
 
 logger = logging.getLogger(__name__)
 
+ApiKeyCandidate = tuple[str, str, str]
+
 
 class KeyRotationConflict(RuntimeError):
     """Raised when a concurrent key rotation wins the active-key race."""
@@ -60,7 +62,12 @@ class AgentApiKeyService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def stage_rotated_key(self, agent_id: int) -> tuple[AgentApiKey, str]:
+    def stage_rotated_key(
+        self,
+        agent_id: int,
+        *,
+        candidate: ApiKeyCandidate | None = None,
+    ) -> tuple[AgentApiKey, str]:
         """Revoke the active key (if any) and stage a new one, then flush.
 
         Does NOT commit -- the caller owns the transaction boundary. This
@@ -91,7 +98,7 @@ class AgentApiKeyService:
             )
         )
 
-        full_key, key_prefix, key_hash = generate_api_key(
+        full_key, key_prefix, key_hash = candidate or generate_api_key(
             self.db, kind=ApiKeyKind.AGENT
         )
         new_row = AgentApiKey(
@@ -109,7 +116,12 @@ class AgentApiKeyService:
         )
         return new_row, full_key
 
-    def rotate_key(self, agent_id: int) -> APIKeyGenerateResponse:
+    def rotate_key(
+        self,
+        agent_id: int,
+        *,
+        candidate: ApiKeyCandidate | None = None,
+    ) -> APIKeyGenerateResponse:
         """Single-step rotate: stage + commit. Used by the JWT-gated
         ``/api/agents/{id}/api-key`` endpoint, which owns its own
         transaction: returns a one-shot key, commits itself, and maps a
@@ -125,7 +137,10 @@ class AgentApiKeyService:
         each just revokes-then-inserts independently).
         """
         try:
-            new_row, full_key = self.stage_rotated_key(agent_id)
+            new_row, full_key = self.stage_rotated_key(
+                agent_id,
+                candidate=candidate,
+            )
             self.db.commit()
         except IntegrityError as exc:
             self.db.rollback()

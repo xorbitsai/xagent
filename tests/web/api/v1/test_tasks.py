@@ -14,6 +14,10 @@ real :class:`TraceEvent` rows inserted directly into the test DB to
 drive the mapping.
 """
 
+import asyncio
+import io
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -21,9 +25,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from fastapi.datastructures import UploadFile
 
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
+from xagent.web.api.v1.deps import (
+    AgentPrincipalSnapshot,
+    ApiKeyPrincipal,
+    RuntimeApiKeySnapshot,
+)
 from xagent.web.models.agent import Agent
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -60,6 +70,7 @@ from xagent.web.tools.config import (
 from ..conftest import (
     _admin_headers,
     _direct_db_session,
+    _install_one_slot_queue_pool,
     _register_second_user,
     client,
 )
@@ -319,6 +330,30 @@ def test_create_task_happy_path(mock_start_task):
     assert kwargs["payload"].transcript_message == "first user message"
 
 
+def test_create_task_uses_one_connection_at_a_time(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request must not pin a pool slot while the turn worker claims it."""
+
+    agent_id, full_key = _create_agent_with_key()
+    engine = _install_one_slot_queue_pool(monkeypatch)
+
+    try:
+        response = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "single-slot create"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert engine.pool.checkedout() == 0
+    finally:
+        engine.dispose()
+
+
 def test_create_task_records_key_usage_but_polling_does_not(mock_start_task):
     """Creating/appending tasks bumps usage; polling status/steps does not."""
 
@@ -447,6 +482,134 @@ def test_upload_and_attach_files_to_task(mock_start_task):
         assert rec.task_id == task_id
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_durable_phase_releases_pool_and_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable object I/O precedes the short metadata transaction off-loop."""
+
+    from xagent.web.api.files import store_uploaded_files
+    from xagent.web.services.managed_file_ref import ManagedFileRef
+
+    agent_id, _full_key = _create_agent_with_key()
+    db = _direct_db_session()
+    try:
+        user_id = int(
+            db.query(User.id)
+            .join(Agent, Agent.user_id == User.id)
+            .filter(Agent.id == agent_id)
+            .scalar()
+        )
+    finally:
+        db.close()
+
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    checked_out_during_durable: list[int] = []
+    original_sync = ManagedFileRef.sync_to_durable
+
+    def delayed_sync(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        checked_out_during_durable.append(engine.pool.checkedout())
+        time.sleep(0.1)
+        return original_sync(self, *args, **kwargs)
+
+    monkeypatch.setattr(ManagedFileRef, "sync_to_durable", delayed_sync)
+    upload = UploadFile(
+        filename="nonblocking-upload.txt",
+        file=io.BytesIO(b"payload"),
+        headers={"content-type": "text/plain"},
+    )
+
+    async def upload_once() -> None:
+        await store_uploaded_files(
+            upload_items=[upload],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            single_file_mode=False,
+            user_id=user_id,
+        )
+
+    started_at = asyncio.get_running_loop().time()
+    upload_task = asyncio.create_task(upload_once())
+    ticker_task = asyncio.create_task(asyncio.sleep(0.02))
+    try:
+        await ticker_task
+        assert asyncio.get_running_loop().time() - started_at < 0.08
+        await upload_task
+        assert checked_out_during_durable == [0]
+        assert engine.pool.checkedout() == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation drains upload cleanup instead of leaving an orphan."""
+
+    from xagent.web.api import files as files_api
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    agent_id, _full_key = _create_agent_with_key()
+    db = _direct_db_session()
+    try:
+        user = (
+            db.query(User)
+            .join(Agent, Agent.user_id == User.id)
+            .filter(Agent.id == agent_id)
+            .one()
+        )
+        user_id = int(user.id)
+    finally:
+        db.close()
+
+    write_started = asyncio.Event()
+    allow_write = asyncio.Event()
+    written_path = None
+
+    async def delayed_write(_uploaded, target_path):  # type: ignore[no-untyped-def]
+        nonlocal written_path
+        written_path = target_path
+        target_path.write_bytes(b"partial")
+        write_started.set()
+        await allow_write.wait()
+        return 7
+
+    monkeypatch.setattr(files_api, "_write_upload_with_size_limit", delayed_write)
+    upload = UploadFile(
+        filename="cancelled-upload.txt",
+        file=io.BytesIO(b"payload"),
+        headers={"content-type": "text/plain"},
+    )
+    upload_task = asyncio.create_task(
+        files_api.store_uploaded_files(
+            upload_items=[upload],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            single_file_mode=False,
+            user_id=user_id,
+        )
+    )
+    await write_started.wait()
+    upload_task.cancel()
+    allow_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await upload_task
+
+    assert written_path is not None
+    assert not written_path.exists()
+    check_db = _direct_db_session()
+    try:
+        assert (
+            check_db.query(UploadedFile).filter(UploadedFile.user_id == user_id).count()
+            == 0
+        )
+    finally:
+        check_db.close()
 
 
 def test_upload_rejects_unsupported_type_with_v1_envelope(mock_start_task):
@@ -1197,7 +1360,7 @@ def test_connector_runtime_view_reports_not_provided_when_resolver_omits_secret(
     }
 
 
-def test_create_task_marks_failed_when_runtime_secret_store_fails(mock_start_task):
+def test_create_task_rolls_back_when_runtime_secret_store_fails(mock_start_task):
     agent_id, full_key = _create_agent_with_key()
     server_id = _install_runtime_mcp_connector(
         agent_id, required=False, secret_required=True
@@ -1238,38 +1401,15 @@ def test_create_task_marks_failed_when_runtime_secret_store_fails(mock_start_tas
 
     db = _direct_db_session()
     try:
-        task = (
+        assert (
             db.query(Task)
             .filter(Task.agent_id == agent_id)
             .filter(Task.input == "runtime secret store create failure")
-            .one()
+            .count()
+            == 0
         )
-        assert task.status == TaskStatus.FAILED
-        assert task.error_message == "Connector runtime setup failed."
     finally:
         db.close()
-
-
-def test_runtime_setup_failed_mark_swallows_secondary_rollback_failure(caplog):
-    class RollbackFailingDB:
-        rollback_calls = 0
-
-        def rollback(self):
-            self.rollback_calls += 1
-            if self.rollback_calls > 1:
-                raise RuntimeError("rollback failed")
-
-        def query(self, _model):
-            raise RuntimeError("query failed")
-
-    db = RollbackFailingDB()
-
-    with caplog.at_level("WARNING", logger="xagent.web.api.v1.tasks"):
-        v1_tasks._mark_task_failed_after_runtime_setup_error(db, 123)
-
-    assert db.rollback_calls == 2
-    assert "Failed to roll back task 123 session" in caplog.text
-    assert "Failed to mark task 123 failed" in caplog.text
 
 
 def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
@@ -1751,6 +1891,49 @@ def _create_task(full_key: str, agent_id: int, content: str = "hello") -> int:
 # ===== POST /v1/chat/tasks/{task_id}/messages =====
 
 
+def test_append_task_uses_one_connection_at_a_time(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detached append preparation must release the only slot before claim."""
+
+    agent_id, full_key = _create_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="single-slot append",
+            description="first turn",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent_id,
+            input="first turn",
+            source="sdk",
+            is_visible=False,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    try:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "single-slot append"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert engine.pool.checkedout() == 0
+    finally:
+        engine.dispose()
+
+
 def _force_task_status(task_id: int, status: TaskStatus) -> None:
     """Bypass the bg coroutine and flip a task to a desired status.
 
@@ -1860,9 +2043,9 @@ def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
 
     with patch.object(
         v1_tasks.TaskTurnOrchestrator,
-        "begin_turn",
-        wraps=v1_tasks.TaskTurnOrchestrator.begin_turn,
-    ) as begin_turn:
+        "schedule_claimed_turn",
+        wraps=v1_tasks.TaskTurnOrchestrator.schedule_claimed_turn,
+    ) as schedule_claimed_turn:
         response = client.post(
             f"/v1/chat/tasks/{task_id}/messages",
             headers=_bearer(full_key),
@@ -1873,11 +2056,14 @@ def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
         )
 
     assert response.status_code == 202, response.text
-    assert begin_turn.await_count == 1
-    assert begin_turn.await_args.kwargs["task_owner_user_id"] == (
+    assert schedule_claimed_turn.await_count == 1
+    assert schedule_claimed_turn.await_args.kwargs["task_owner_user_id"] == (
         persisted_task_owner_id
     )
-    assert begin_turn.await_args.kwargs["actor_user_id"] == current_agent_owner_id
+    assert (
+        schedule_claimed_turn.await_args.kwargs["actor_user_id"]
+        == current_agent_owner_id
+    )
 
     from xagent.web.models.chat_message import TaskChatMessage
 
@@ -2435,7 +2621,9 @@ def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
         db.close()
 
 
-def test_append_message_cleans_runtime_secret_when_task_is_busy(mock_start_task):
+def test_append_message_does_not_store_runtime_secret_when_task_is_busy(
+    mock_start_task,
+):
     agent_id, full_key = _create_agent_with_key()
     server_id = _install_runtime_mcp_connector(
         agent_id, required=False, secret_required=True
@@ -2492,8 +2680,7 @@ def test_append_message_cleans_runtime_secret_when_task_is_busy(mock_start_task)
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "task_busy"
-    assert turn_ids
-    assert get_ephemeral_runtime_values(turn_ids[0]) is None
+    assert turn_ids == []
     assert "append-token" not in resp.text
     assert mock_start_task.call_count == 0
 
@@ -2683,6 +2870,9 @@ def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task)
             # affected.
             background_task_manager.running_tasks.pop(task_id, None)
             fake_inflight.cancel()
+            loop.run_until_complete(
+                asyncio.gather(fake_inflight, return_exceptions=True)
+            )
     finally:
         loop.close()
 
@@ -2824,6 +3014,105 @@ def test_get_task_failed_returns_error(mock_start_task):
     assert body["error"] == "agent crashed"
     assert body["output"] is None
     assert body["completed_at"] is not None
+
+
+def test_get_task_cache_io_runs_after_database_session_closes(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task snapshot cache I/O must never pin the request's pool slot."""
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    checked_out: list[tuple[str, int]] = []
+
+    def recording_cache_get(_key: str):
+        checked_out.append(("get", engine.pool.checkedout()))
+        return None
+
+    def recording_cache_set(
+        _key: str,
+        _value: object,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        del ttl_seconds
+        checked_out.append(("set", engine.pool.checkedout()))
+
+    monkeypatch.setattr(v1_tasks, "cache_get", recording_cache_get)
+    monkeypatch.setattr(v1_tasks, "cache_set", recording_cache_set)
+
+    try:
+        response = client.get(
+            f"/v1/chat/tasks/{task_id}",
+            headers=_bearer(full_key),
+        )
+        assert response.status_code == 200, response.text
+        assert checked_out == [("get", 0), ("set", 0)]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_surface", ["task", "steps"])
+async def test_task_read_pool_wait_does_not_block_event_loop(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+    read_surface: str,
+) -> None:
+    """Both polling surfaces wait for the one-slot pool in a DB worker."""
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        principal = ApiKeyPrincipal(
+            key=RuntimeApiKeySnapshot(key_prefix="xag_test"),
+            agent=AgentPrincipalSnapshot(
+                id=agent_id,
+                user_id=int(agent.user_id),
+                execution_mode=str(agent.execution_mode),
+                status=str(agent.status.value),
+                origin=str(agent.origin),
+            ),
+        )
+    finally:
+        db.close()
+
+    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=0.5)
+    held_connection = engine.connect()
+    worker_entered = threading.Event()
+    helper_name = (
+        "_load_task_info_snapshot"
+        if read_surface == "task"
+        else "_load_task_steps_version_snapshot"
+    )
+    original_helper = getattr(v1_tasks, helper_name)
+
+    def recording_helper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        worker_entered.set()
+        return original_helper(*args, **kwargs)
+
+    monkeypatch.setattr(v1_tasks, helper_name, recording_helper)
+    operation = asyncio.create_task(
+        v1_tasks.get_chat_task(task_id, principal)
+        if read_surface == "task"
+        else v1_tasks.get_chat_task_steps(task_id, principal)
+    )
+
+    try:
+        assert await asyncio.to_thread(worker_entered.wait, 1)
+        await asyncio.wait_for(asyncio.sleep(0.02), timeout=0.1)
+        assert not operation.done()
+    finally:
+        held_connection.close()
+
+    response = await operation
+    assert response.task_id == task_id
+    assert engine.pool.checkedout() == 0
+    engine.dispose()
 
 
 def test_get_missing_task_returns_404(mock_start_task):
@@ -3123,6 +3412,58 @@ def test_get_steps_cache_reuses_mapping_until_trace_event_changes(mock_start_tas
             assert len(third.json()["steps"]) == 2
     finally:
         set_cache_backend_for_testing(None)
+
+
+def test_get_steps_cache_miss_revalidates_after_releasing_first_session(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache miss reloads the authorized trace snapshot in a second Session."""
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-before-cache",
+        timestamp=base,
+        data={"content": "before cache"},
+    )
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    cache_checked_out: list[int] = []
+    inserted = False
+
+    def cache_miss_after_concurrent_trace(_key: str):
+        nonlocal inserted
+        cache_checked_out.append(engine.pool.checkedout())
+        if not inserted:
+            inserted = True
+            _insert_trace_event(
+                task_id=task_id,
+                event_type="ai_message",
+                event_id="evt-during-cache",
+                timestamp=base.replace(second=1),
+                data={"content": "during cache"},
+            )
+        return None
+
+    monkeypatch.setattr(v1_tasks, "cache_get", cache_miss_after_concurrent_trace)
+    monkeypatch.setattr(v1_tasks, "cache_set", lambda *_args, **_kwargs: None)
+
+    try:
+        response = client.get(
+            f"/v1/chat/tasks/{task_id}/steps",
+            headers=_bearer(full_key),
+        )
+        assert response.status_code == 200, response.text
+        assert cache_checked_out == [0]
+        assert [step["data"]["content"] for step in response.json()["steps"]] == [
+            "before cache",
+            "during cache",
+        ]
+    finally:
+        engine.dispose()
 
 
 def test_get_steps_redacts_runtime_secrets_before_cache_write(mock_start_task):

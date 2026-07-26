@@ -350,11 +350,13 @@ async def test_create_workforce_run_threads_source_and_idempotency(
 ) -> None:
     workforce_id = _create_active_workforce("Source Workforce")
 
-    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+    async def _stub_schedule_claimed_turn(**_kwargs: Any) -> SimpleNamespace:
         return _stub_turn_started()
 
     monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
+        workforce_runs_service.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        _stub_schedule_claimed_turn,
     )
 
     db = _direct_db_session()
@@ -369,9 +371,13 @@ async def test_create_workforce_run_threads_source_and_idempotency(
             source="widget",
             idempotency_key="retry-abc",
         )
+        task = db.get(Task, int(result.task.id))
+        run = db.get(WorkforceRun, int(result.workforce_run.id))
+        assert task is not None
+        assert run is not None
         assert result.created is True
-        assert result.task.source == "widget"
-        assert result.workforce_run.idempotency_key == "retry-abc"
+        assert task.source == "widget"
+        assert run.idempotency_key == "retry-abc"
         first_run_id = int(result.workforce_run.id)
 
         replay = await workforce_runs_service.create_workforce_run(
@@ -396,11 +402,13 @@ async def test_idempotency_replay_with_deleted_task_conflicts(
 
     workforce_id = _create_active_workforce("Deleted Task Workforce")
 
-    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+    async def _stub_schedule_claimed_turn(**_kwargs: Any) -> SimpleNamespace:
         return _stub_turn_started()
 
     monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
+        workforce_runs_service.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        _stub_schedule_claimed_turn,
     )
 
     db = _direct_db_session()
@@ -438,11 +446,13 @@ async def test_create_workforce_run_defaults_to_internal_source(
 ) -> None:
     workforce_id = _create_active_workforce("Default Source Workforce")
 
-    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+    async def _stub_schedule_claimed_turn(**_kwargs: Any) -> SimpleNamespace:
         return _stub_turn_started()
 
     monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
+        workforce_runs_service.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        _stub_schedule_claimed_turn,
     )
 
     db = _direct_db_session()
@@ -452,8 +462,12 @@ async def test_create_workforce_run_defaults_to_internal_source(
         result = await workforce_runs_service.create_workforce_run(
             db, user, workforce, message="hello"
         )
-        assert result.task.source == "internal"
-        assert result.workforce_run.idempotency_key is None
+        task = db.get(Task, int(result.task.id))
+        run = db.get(WorkforceRun, int(result.workforce_run.id))
+        assert task is not None
+        assert run is not None
+        assert task.source == "internal"
+        assert run.idempotency_key is None
     finally:
         db.close()
 
@@ -567,11 +581,13 @@ async def test_idempotency_concurrent_insert_falls_back_to_winner(
     run instead of surfacing a 500."""
     workforce_id = _create_active_workforce("Race Workforce")
 
-    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+    async def _stub_schedule_claimed_turn(**_kwargs: Any) -> SimpleNamespace:
         return _stub_turn_started()
 
     monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
+        workforce_runs_service.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        _stub_schedule_claimed_turn,
     )
 
     db = _direct_db_session()

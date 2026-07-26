@@ -199,7 +199,18 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         state before executing. Never alter or invent approval fields. If a
         result says an action was already declined, do not propose it again.
         """
-        if self._browser_runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT:
+        if self._browser_runtime_kind is BrowserRuntimeKind.EPHEMERAL_PLAYWRIGHT:
+            description += """
+
+        This task uses a new isolated temporary browser. It is not the user's
+        existing browser, does not inherit the user's signed-in sessions, and
+        cannot inspect a tab the user approved through the Xagent extension.
+        Never describe it as the user's current or authorized browser. If the
+        user asks about their existing browser or current tab, explain that no
+        user-browser access was granted to this task and ask them to add
+        Computer access > My browser to a new task.
+        """
+        elif self._browser_runtime_kind is BrowserRuntimeKind.PERSISTENT_PLAYWRIGHT:
             description += """
 
         This task uses a visible persistent browser profile. If login, CAPTCHA,
@@ -410,6 +421,11 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             f"{observation.frame_id}. "
             "Use this exact frame_id for the next state-changing action."
         )
+        if self._browser_runtime_kind is BrowserRuntimeKind.EPHEMERAL_PLAYWRIGHT:
+            message += (
+                " This is an isolated temporary browser, not the user's existing "
+                "or extension-approved browser."
+            )
         if observation.metadata.get(ELEMENTS_TRUNCATED_KEY) is True:
             message += (
                 " The element list hit its cap, so it is not exhaustive; scroll "

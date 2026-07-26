@@ -133,6 +133,7 @@ async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -
     assert initial["browser_runtime_kind"] == "ephemeral_playwright"
     assert initial["frame_id"] == "frame-1"
     assert initial[CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == "image-1"
+    assert "isolated temporary browser" in initial["message"]
 
     missing_frame = await tool.run_json_async(
         {
@@ -614,6 +615,19 @@ def test_extension_computer_tool_selects_relay_environment() -> None:
     assert tool._environment_factory is ExtensionComputerEnvironment
     assert "explicitly approved" in tool.description
     assert tool._session_binding("ignored").require_user_id() == 9
+
+
+def test_ephemeral_computer_tool_does_not_claim_user_browser_access() -> None:
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=EnvironmentFactory(),
+    )
+
+    assert "isolated temporary browser" in tool.description
+    assert "Never describe it as the user's current or authorized browser" in (
+        tool.description
+    )
 
 
 @pytest.mark.asyncio

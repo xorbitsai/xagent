@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +29,17 @@ DEFAULT_USER_FILE_LIST_LIMIT = 50
 
 # Context variable for auto-registration mode
 _auto_register = contextvars.ContextVar("_auto_register", default=False)
+
+# Runtime-internal files are intentionally absent from ``uploaded_files``:
+# screenshots and similar scratch artifacts must not appear as user
+# deliverables.  Tool instances currently reconstruct equivalent
+# ``TaskWorkspace`` objects for the same task, however, so an instance-local
+# mapping is not enough to preserve the FileRef contract across tools.  Keep a
+# process-local registry keyed by the canonical workspace root; this shares
+# internal handles only with another workspace instance for the exact same
+# task and does not make them durable across processes.
+_internal_file_registry: Dict[Tuple[str, str], Path] = {}
+_internal_file_registry_lock = threading.RLock()
 
 
 def scoped_user_root(
@@ -158,7 +170,35 @@ class TaskWorkspace:
             raise FileNotFoundError(f"File not found for registration: {file_path}")
         final_file_id = str(file_id).strip() if file_id else str(uuid4())
         self._remember_file_registration(final_file_id, resolved_path)
+        registry_key = self._internal_file_registry_key(final_file_id)
+        with _internal_file_registry_lock:
+            _internal_file_registry[registry_key] = resolved_path
         return final_file_id
+
+    def _internal_file_registry_key(self, file_id: str) -> Tuple[str, str]:
+        return (str(self.workspace_dir.resolve()), file_id)
+
+    def _resolve_internal_file_id(self, file_id: str) -> Optional[Path]:
+        registry_key = self._internal_file_registry_key(file_id)
+        with _internal_file_registry_lock:
+            registered_path = _internal_file_registry.get(registry_key)
+            if registered_path is None:
+                return None
+            if not registered_path.exists() or not registered_path.is_file():
+                _internal_file_registry.pop(registry_key, None)
+                return None
+
+        self._remember_file_registration(file_id, registered_path)
+        return registered_path
+
+    def _forget_internal_files(self) -> None:
+        workspace_key = str(self.workspace_dir.resolve())
+        with _internal_file_registry_lock:
+            stale_keys = [
+                key for key in _internal_file_registry if key[0] == workspace_key
+            ]
+            for key in stale_keys:
+                _internal_file_registry.pop(key, None)
 
     def register_file(
         self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
@@ -695,6 +735,15 @@ class TaskWorkspace:
                 # Remove stale cache entry
                 del self._file_id_to_path[file_id]
 
+        internal_path = self._resolve_internal_file_id(file_id)
+        if internal_path is not None:
+            logger.debug(
+                "resolve_file_id: Found task-scoped internal file: %s -> %s",
+                file_id,
+                internal_path,
+            )
+            return internal_path
+
         # Query from database
         from .storage.manager import create_db_session
 
@@ -1134,6 +1183,7 @@ class TaskWorkspace:
 
     def cleanup(self) -> None:
         """Clean up the entire workspace"""
+        self._forget_internal_files()
         if self.workspace_dir.exists():
             logger.info(f"Removing workspace directory: {self.workspace_dir}")
             shutil.rmtree(self.workspace_dir)

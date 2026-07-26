@@ -158,6 +158,33 @@ def test_resolve_file_id_accepts_internal_file_refs(workspace, file_ref):
     assert workspace.resolve_file_id(file_ref) == target
 
 
+def test_internal_file_id_resolves_across_same_task_workspace_instances(
+    tmp_path,
+):
+    producer = TaskWorkspace("task7", str(tmp_path))
+    consumer = TaskWorkspace("task7", str(tmp_path))
+    target = producer.temp_dir / "computer_observations" / "frame.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"png")
+
+    file_id = producer.register_internal_file(str(target))
+
+    assert consumer.resolve_file_id(file_id) == target.resolve()
+    assert consumer.resolve_path_with_search(file_id) == target.resolve()
+
+
+def test_internal_file_id_is_scoped_to_exact_task_workspace(tmp_path):
+    producer = TaskWorkspace("task7", str(tmp_path))
+    other_task = TaskWorkspace("task8", str(tmp_path))
+    target = producer.temp_dir / "computer_observations" / "frame.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"png")
+
+    file_id = producer.register_internal_file(str(target))
+
+    assert other_task.resolve_file_id(file_id) is None
+
+
 def test_resolve_path_with_search_rejects_symlink_escape_in_fuzzy_match(
     workspace, tmp_path
 ):

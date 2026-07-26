@@ -1259,6 +1259,26 @@ class TestVisionToolDetectObjects:
 class TestVisionToolHelperMethods:
     """Test cases for helper methods"""
 
+    @pytest.mark.asyncio
+    async def test_understand_internal_file_id_registered_by_peer_workspace(
+        self, mock_vision_model, tmp_path
+    ):
+        from xagent.core.workspace import TaskWorkspace
+
+        producer = TaskWorkspace("task-vision", str(tmp_path))
+        consumer = TaskWorkspace("task-vision", str(tmp_path))
+        screenshot = producer.temp_dir / "computer_observations" / "frame.png"
+        screenshot.parent.mkdir(parents=True, exist_ok=True)
+        screenshot.write_bytes(b"png")
+        file_id = producer.register_internal_file(str(screenshot))
+
+        tool = VisionTool(mock_vision_model, consumer)
+        result = await tool.understand_media(file_id, "What is visible?")
+
+        assert tool._resolve_media_path(file_id) == str(screenshot.resolve())
+        assert result.success is True
+        assert result.images_processed == 1
+
     def test_convert_image_to_base64(self, vision_tool_without_workspace):
         """Test _convert_image_to_base64 method"""
         # Test with URL - should return as-is

@@ -2728,6 +2728,10 @@ Build when you need.`,
       label: "My computer",
       description: "Control windows authorized in the desktop companion.",
     },
+    messageBadge: {
+      browser: "Computer use · My browser",
+      desktop: "Computer use · My computer",
+    },
   },
   agent: {
     logo: "Agent Logo",

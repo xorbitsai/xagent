@@ -2728,6 +2728,10 @@ const zh = {
       label: "我的电脑",
       description: "操作桌面伴侣中已授权的窗口。",
     },
+    messageBadge: {
+      browser: "电脑操作 · 我的浏览器",
+      desktop: "电脑操作 · 我的电脑",
+    },
   },
   agent: {
     logo: "Agent 标识",

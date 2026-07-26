@@ -62,7 +62,9 @@ vi.mock("dagre", () => {
 
 vi.mock("@/components/chat/ChatMessage", () => ({
   ChatMessage: ({
+    role,
     content,
+    computerRuntimeKind,
     interactionsActive,
     traceEvents,
     taskStatus,
@@ -70,7 +72,9 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     showEmptyStatus,
     onOpenExecutionPlan,
   }: {
+    role?: string
     content?: string | null
+    computerRuntimeKind?: string
     interactionsActive?: boolean
     traceEvents?: unknown[]
     taskStatus?: string
@@ -80,6 +84,8 @@ vi.mock("@/components/chat/ChatMessage", () => ({
   }) => (
     <div
       data-testid="chat-message"
+      data-role={role || ""}
+      data-computer-runtime-kind={computerRuntimeKind || ""}
       data-active={interactionsActive ? "true" : "false"}
       data-trace-count={traceEvents?.length ?? 0}
       data-task-status={taskStatus || ""}
@@ -210,6 +216,36 @@ describe("TaskConversationPanel", () => {
 
     expect(screen.getByText("common.loading")).toBeInTheDocument()
     expect(screen.queryByText("Which dataset should I use?")).not.toBeInTheDocument()
+  })
+
+  it("marks user messages with the task computer runtime", () => {
+    appState.messages = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Check the signed-in page",
+        timestamp: "1000",
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Browser task",
+      description: "Browser task",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      computerRuntimeKind: "extension_relay",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const userMessage = screen.getByText("Check the signed-in page").closest(
+      '[data-testid="chat-message"]',
+    )
+    expect(userMessage).toHaveAttribute(
+      "data-computer-runtime-kind",
+      "extension_relay",
+    )
   })
 
   it("does not surface ordinary agent messages as waiting prompts", () => {

@@ -1,5 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { Bot, ChevronDown, ChevronUp, Copy, Check } from "lucide-react";
+import {
+  Bot,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  Globe2,
+  Monitor,
+} from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
@@ -70,6 +78,7 @@ export interface ChatMessageProps {
   taskStatus?: string;
   processStatus?: string;
   timestamp?: number | string;
+  computerRuntimeKind?: "extension_relay" | "desktop_relay";
   interactions?: any[];
   interactionsActive?: boolean;
   showEmptyStatus?: boolean;
@@ -279,6 +288,7 @@ export function ChatMessage({
   taskStatus,
   processStatus,
   timestamp,
+  computerRuntimeKind,
   interactions,
   interactionsActive = true,
   showEmptyStatus = true,
@@ -427,6 +437,22 @@ export function ChatMessage({
                 )
               ) : (
                 !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={resolvedProcessStatus || taskStatus} errorMessage={errorMessage} />
+              )}
+              {isUser && computerRuntimeKind && (
+                <div className="mt-2 flex">
+                  <span className="inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-background/55 px-2 py-1 text-xs font-medium text-muted-foreground">
+                    {computerRuntimeKind === "extension_relay" ? (
+                      <Globe2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    ) : (
+                      <Monitor className="h-3.5 w-3.5" aria-hidden="true" />
+                    )}
+                    {t(
+                      computerRuntimeKind === "extension_relay"
+                        ? "computerRuntime.messageBadge.browser"
+                        : "computerRuntime.messageBadge.desktop"
+                    )}
+                  </span>
+                </div>
               )}
               {!isUser && interactions && interactions.length > 0 && (
                 <div className="mt-4 border-t pt-4">

@@ -704,6 +704,11 @@ export function TaskConversationPanel({
                               : undefined
                         }
                         timestamp={item.timestamp}
+                        computerRuntimeKind={
+                          item.role === "user"
+                            ? state.currentTask?.computerRuntimeKind
+                            : undefined
+                        }
                         interactions={item.interactions}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}

@@ -7,6 +7,12 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # Required once "CI Summary" is a required status check and a merge queue is
+  # enabled: without this the context is never reported on a merge group, its
+  # entries time out, and every merge stalls. Harmless before a queue exists --
+  # merge_group simply never fires. Note the jobs' `draft == false` guards all
+  # short-circuit on `github.event_name != 'pull_request'`, so they do run here.
+  merge_group:
 
 env:
   DEEPDOC_CACHE_PATH: .cache/deepdoc

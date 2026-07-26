@@ -326,6 +326,10 @@ const zh = {
   settings: {
     title: "系统设置",
     description: "管理系统的基本配置和高级选项",
+    tabs: {
+      general: "基本设置",
+      computerAccess: "Computer 访问",
+    },
     language: {
       title: "语言设置",
       description: "选择界面显示语言",

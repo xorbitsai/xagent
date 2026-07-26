@@ -122,7 +122,10 @@ describe("ComposerAddMenu", () => {
     const link = await screen.findByRole("link", {
       name: /computerRuntime\.desktop\.label/,
     })
-    expect(link).toHaveAttribute("href", "/settings#desktop-relay")
+    expect(link).toHaveAttribute(
+      "href",
+      "/settings?tab=computer#desktop-relay"
+    )
   })
 
   it("shows a removable chip for an explicit task grant", async () => {
@@ -169,6 +172,6 @@ describe("ComposerAddMenu", () => {
       screen.getByRole("link", {
         name: "computerRuntime.manageConnections",
       })
-    ).toHaveAttribute("href", "/settings#desktop-relay")
+    ).toHaveAttribute("href", "/settings?tab=computer#desktop-relay")
   })
 })

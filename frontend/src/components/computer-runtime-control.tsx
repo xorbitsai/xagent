@@ -277,7 +277,7 @@ export function ComposerAddMenu({
                     return (
                       <Link
                         key={option.value}
-                        href={`/settings#${option.settingsHash}`}
+                        href={`/settings?tab=computer#${option.settingsHash}`}
                         className="flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-accent"
                         onClick={closeMenu}
                       >
@@ -311,7 +311,7 @@ export function ComposerAddMenu({
 
               <div className="mt-2 border-t px-2 pt-2">
                 <Link
-                  href={`/settings#${selectedOption?.settingsHash ?? "browser-relay"}`}
+                  href={`/settings?tab=computer#${selectedOption?.settingsHash ?? "browser-relay"}`}
                   className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
                   onClick={closeMenu}
                 >

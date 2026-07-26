@@ -326,6 +326,10 @@ Build when you need.`,
   settings: {
     title: "System Settings",
     description: "Manage basic configuration and advanced options",
+    tabs: {
+      general: "General",
+      computerAccess: "Computer access",
+    },
     language: {
       title: "Language",
       description: "Choose the display language",

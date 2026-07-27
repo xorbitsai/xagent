@@ -282,14 +282,22 @@ function TaskHomePageContent() {
               </Button>
             </div>
           ));
-          // Keep local state in sync so sending from this template again in
-          // the same session (without a page reload) reuses this agent
-          // instead of creating another one.
-          setAgents((prev) => [
+        }
+        // Keep local state in sync so sending from this template again in the
+        // same session (without a page reload) resolves instantly instead of
+        // re-querying the backend - this also covers the case where the
+        // agent was resolved via the 400-retry lookup (created === false)
+        // rather than freshly created, which the local list wouldn't know
+        // about otherwise.
+        setAgents((prev) => {
+          if (prev.some((agent) => Number(agent.id) === result.agentId)) {
+            return prev;
+          }
+          return [
             ...prev,
             { id: result.agentId, name: selectedTemplate.name, status: "published" },
-          ]);
-        }
+          ];
+        });
       } catch (error) {
         console.error("Failed to create agent from template:", error);
         toast.error(t("chatPage.templateQuickAccess.createAgentError"));

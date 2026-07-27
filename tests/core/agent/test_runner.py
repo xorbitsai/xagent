@@ -362,6 +362,33 @@ async def test_runner_passes_waiting_status_to_tool_teardown(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_runner_passes_failed_status_when_tool_setup_raises(
+    tmp_path: Path,
+) -> None:
+    class SetupFailingTool(StatusAwareTeardownTool):
+        async def setup(self, task_id: str | None = None) -> None:
+            raise RuntimeError("setup failed")
+
+    tool = SetupFailingTool()
+    runner = AgentRunner(
+        agent=Agent(
+            name="setup-failure",
+            patterns=[FakePattern({"success": True, "output": "unused"})],
+        ),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        await runner.run(
+            task="Initialize tools",
+            execution_id="setup-failure-task",
+            extra_tools=[tool],
+        )
+
+    assert tool.teardown_calls == [("setup-failure-task", "failed")]
+
+
+@pytest.mark.asyncio
 async def test_runner_awaits_async_memory_manager(tmp_path: Path) -> None:
     memory_manager = AsyncMemoryManager()
     pattern = FakePattern({"success": True, "output": "done"})

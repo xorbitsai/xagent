@@ -22,6 +22,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_INTERACTION_CONTROL_KEYS = (
+    "type",
+    "field",
+    "id",
+    "name",
+    "value",
+    "action_type",
+)
+
 
 def _accepts_kwarg(func: Any, name: str) -> bool:
     """Return whether ``func`` accepts ``name`` as a keyword argument."""
@@ -212,13 +221,52 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
 
         filtered["status"] = WAITING_FOR_USER_STATUS
         assert isinstance(result, dict)
-        for key in (
-            "interaction_id",
-            "message",
-            "message_type",
-            "interactions",
-        ):
-            if key not in result:
-                continue
-            filtered[key] = self._filter.filter(result[key], self._target.name)
+        for key in ("interaction_id", "message_type"):
+            if key in result:
+                filtered[key] = result[key]
+        if "message" in result:
+            filtered["message"] = self._filter.filter(
+                result["message"], self._target.name
+            )
+        if "interactions" in result:
+            filtered["interactions"] = self._filter_interactions(result["interactions"])
         return filtered
+
+    def _filter_interactions(self, interactions: Any) -> Any:
+        """Filter display text while preserving interaction routing fields."""
+
+        if not isinstance(interactions, list):
+            return self._filter.filter(interactions, self._target.name)
+
+        return [
+            self._filter_interaction_item(item)
+            for item in interactions[: self._filter.max_fields]
+            if isinstance(item, dict)
+        ]
+
+    def _filter_interaction_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        filtered: dict[str, Any] = {
+            key: item[key] for key in _INTERACTION_CONTROL_KEYS if key in item
+        }
+        if "options" in item:
+            filtered["options"] = self._filter_interaction_options(item["options"])
+
+        display_fields = 0
+        for key, value in item.items():
+            if key in _INTERACTION_CONTROL_KEYS or key == "options":
+                continue
+            if display_fields >= self._filter.max_fields:
+                break
+            filtered[key] = self._filter.filter(value, self._target.name)
+            display_fields += 1
+        return filtered
+
+    def _filter_interaction_options(self, options: Any) -> Any:
+        if not isinstance(options, list):
+            return self._filter.filter(options, self._target.name)
+
+        return [
+            self._filter_interaction_item(option)
+            for option in options[: self._filter.max_fields]
+            if isinstance(option, dict)
+        ]

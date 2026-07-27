@@ -146,13 +146,13 @@ class AgentRunner:
 
             tools = [*getattr(self.agent, "tools", []), *(extra_tools or [])]
             pattern_errors: list[dict[str, Any]] = []
-            teardown_status: str | None = None
+            teardown_status: str | None = "failed"
 
             try:
                 await self._setup_tools(tools, task_id=execution_id)
                 for pattern in patterns:
                     load_pattern_checkpoint(pattern, checkpoint)
-                    teardown_status = None
+                    teardown_status = "failed"
                     try:
                         result = await pattern.run(
                             **self._build_pattern_kwargs(

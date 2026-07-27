@@ -97,7 +97,10 @@ async def test_serial_then_ask_user_waits() -> None:
     assert [r["tool_name"] for r in context.tool_results] == [
         "s1",
         "ask_user_question",
+        "s2",
     ]
+    assert context.tool_results[-1]["result"]["status"] == "cancelled"
+    assert pattern.pending_tool_calls == []
     statuses = _checkpoint_statuses(runtime)
     assert "before_tool" in statuses  # serial path used for the lone safe tool
 

@@ -77,15 +77,27 @@ async def test_waiting_control_envelope_survives_field_filtering() -> None:
             return {
                 "large_unrelated_field": "x" * 100,
                 "status": "waiting_for_user",
-                "interaction_id": "interaction-1",
+                "interaction_id": "14ee67d1-d18e-47e0-a8f8-b28ef31262f5",
                 "message": "Provide a value.",
                 "message_type": "question",
-                "interactions": [{"type": "text", "field": "value"}],
+                "interactions": [
+                    {
+                        "type": "select_one",
+                        "field": "exact-routing-field",
+                        "label": "Choose the desired operation",
+                        "options": [
+                            {
+                                "label": "Approve this operation",
+                                "value": "exact-routing-option-value",
+                            }
+                        ],
+                    }
+                ],
             }
 
     wrapper = OutputFilteredToolWrapper(
         target_tool=WaitingTool(),
-        max_chars=20,
+        max_chars=8,
         max_fields=1,
         max_recursion=3,
     )
@@ -93,12 +105,16 @@ async def test_waiting_control_envelope_survives_field_filtering() -> None:
     result = await wrapper.run_json_async({})
 
     assert result["status"] == "waiting_for_user"
-    assert result["interaction_id"] == "interaction-1"
-    assert result["message"].startswith("Provide a value.")
+    assert result["interaction_id"] == "14ee67d1-d18e-47e0-a8f8-b28ef31262f5"
+    assert result["message"].startswith("Provide ")
     assert result["message_type"] == "question"
-    assert result["interactions"] == [
-        {"type": "text", "... and 1 more keys": "[truncated]"}
-    ]
+    assert result["interactions"][0]["type"] == "select_one"
+    assert result["interactions"][0]["field"] == "exact-routing-field"
+    assert result["interactions"][0]["label"].startswith("Choose t")
+    assert result["interactions"][0]["options"][0]["value"] == (
+        "exact-routing-option-value"
+    )
+    assert result["interactions"][0]["options"][0]["label"].startswith("Approve ")
 
 
 @pytest.mark.asyncio

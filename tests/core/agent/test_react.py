@@ -3466,9 +3466,7 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool() -> (
-    None
-):
+async def test_react_pattern_replans_after_waiting_control_tool() -> None:
     llm = FakeLLM(
         responses=[
             {
@@ -3500,14 +3498,29 @@ async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool(
     first = await pattern.run(context=context, tools=[tool], llm=llm)
 
     assert first["status"] == "waiting_for_user"
-    assert pattern.pending_tool_calls == [
-        {"id": "call_calc", "name": "calculator", "args": {"expression": "5+5"}}
-    ]
+    assert pattern.pending_tool_calls == []
+    assert pattern.tool_ledger["call_calc"].status == "cancelled"
+    assert tool.calls == []
 
     context.add_user_message("B")
     resumed_pattern = ReActPattern(max_iterations=4)
     resumed_pattern.load_state(pattern.get_state())
-    resumed_llm = FakeLLM([{"content": "The result is 10.", "done": True}])
+    resumed_llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_replanned",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"5+5"}',
+                        },
+                    }
+                ]
+            },
+            {"content": "The result is 10.", "done": True},
+        ]
+    )
 
     resumed = await resumed_pattern.run(
         context=context,
@@ -3517,19 +3530,16 @@ async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool(
 
     assert resumed["success"] is True
     assert tool.calls == [{"expression": "5+5"}]
-    assert context.get_messages_by_role("tool")[-1].tool_call_id == "call_calc"
+    assert context.get_messages_by_role("tool")[-1].tool_call_id == (
+        "call_calc_replanned"
+    )
     resumed_messages = resumed_llm.calls[0]["messages"]
-    resumed_tool_result = next(
+    cancelled_tool_result = next(
         message
         for message in resumed_messages
         if message.get("role") == "tool" and message.get("tool_call_id") == "call_calc"
     )
-    resumed_tool_envelope_index = resumed_messages.index(resumed_tool_result) - 1
-    assert resumed_messages[resumed_tool_envelope_index]["role"] == "assistant"
-    assert resumed_messages[resumed_tool_envelope_index]["tool_calls"][0]["id"] == (
-        "call_calc"
-    )
-    assert "Tool calculator returned" in resumed_tool_result["content"]
+    assert "cancelled" in cancelled_tool_result["content"]
 
 
 @pytest.mark.asyncio
@@ -4484,7 +4494,23 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
                 "user_response": response,
             }
 
+    class MutationTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="mutation",
+                description="Mutate state.",
+            )
+            self.calls: list[dict[str, Any]] = []
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            return {"success": True}
+
     first_tool = ResumableTool()
+    first_mutation = MutationTool()
     context = ExecutionContext(execution_id="interaction-task")
     context.add_user_message("Run the gated action.")
     tracer = TraceEventRecorder()
@@ -4492,7 +4518,7 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     pattern = ReActPattern(max_iterations=4)
     waiting = await pattern.run(
         context=context,
-        tools=[first_tool],
+        tools=[first_tool, first_mutation],
         llm=FakeLLM(
             [
                 {
@@ -4503,7 +4529,14 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
                                 "name": "approval_gate",
                                 "arguments": '{"expression":"2+2"}',
                             },
-                        }
+                        },
+                        {
+                            "id": "stale-mutation",
+                            "function": {
+                                "name": "mutation",
+                                "arguments": '{"expression":"99"}',
+                            },
+                        },
                     ]
                 }
             ]
@@ -4514,6 +4547,9 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     assert waiting["status"] == "waiting_for_user"
     assert waiting["message"] == "Should the action continue?"
     assert pattern.tool_ledger["wait-call"].status == "waiting_for_user"
+    assert pattern.tool_ledger["stale-mutation"].status == "cancelled"
+    assert pattern.pending_tool_calls == []
+    assert first_mutation.calls == []
     assert runtime.outbound_messages[0]["expect_response"] is True
     assert any(
         event["event_type"] == "action_end_tool"
@@ -4526,11 +4562,12 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
 
     context.add_user_message("Continue")
     resumed_tool = ResumableTool()
+    resumed_mutation = MutationTool()
     resumed_pattern = ReActPattern(max_iterations=4)
     resumed_pattern.load_state(pattern.get_state())
     resumed = await resumed_pattern.run(
         context=context,
-        tools=[resumed_tool],
+        tools=[resumed_tool, resumed_mutation],
         llm=FakeLLM(
             [
                 {
@@ -4568,6 +4605,7 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     assert resumed_tool.resume_calls == [
         {"interaction_id": "interaction-1", "response": "Continue"}
     ]
+    assert resumed_mutation.calls == []
     assert resumed_pattern.pending_tool_interaction_responses == []
     response_metadata = next(
         message.metadata
@@ -4590,6 +4628,74 @@ def test_tool_interaction_response_queue_ignores_malformed_requests(
         response="Continue",
     )
 
+    assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
+    class ResumableTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="approval_gate",
+                description="Resume exact interactions.",
+            )
+            self.calls: list[dict[str, str]] = []
+            self.fail_interaction_id = "interaction-2"
+
+        def resume_user_interaction(
+            self,
+            *,
+            interaction_id: str,
+            response: str,
+        ) -> None:
+            self.calls.append({"interaction_id": interaction_id, "response": response})
+            if interaction_id == self.fail_interaction_id:
+                raise RuntimeError("delivery failed")
+
+    pending = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Approve first",
+        },
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-2",
+            "interaction_id": "interaction-2",
+            "response": "Reject second",
+        },
+    ]
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = list(pending)
+    tool = ResumableTool()
+    context = ExecutionContext(execution_id="interaction-delivery")
+    runtime = PatternRuntime(execution_id="interaction-delivery")
+
+    with pytest.raises(RuntimeError, match="delivery failed"):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=runtime,
+        )
+
+    assert tool.calls == [
+        {"interaction_id": "interaction-1", "response": "Approve first"},
+        {"interaction_id": "interaction-2", "response": "Reject second"},
+    ]
+    assert pattern.pending_tool_interaction_responses == [pending[1]]
+
+    tool.fail_interaction_id = ""
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert tool.calls[-1] == {
+        "interaction_id": "interaction-2",
+        "response": "Reject second",
+    }
     assert pattern.pending_tool_interaction_responses == []
 
 
@@ -4624,9 +4730,27 @@ async def test_concurrent_tool_interactions_pause_in_one_deterministic_message()
                 ],
             }
 
+    class MutationTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="mutation",
+                description="Mutate state.",
+                concurrency_safe=False,
+            )
+            self.calls: list[dict[str, Any]] = []
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            return {"success": True}
+
+    mutation_tool = MutationTool()
     tools = [
         ConcurrentWaitingTool("first_gate", "Answer the first question."),
         ConcurrentWaitingTool("second_gate", "Answer the second question."),
+        mutation_tool,
     ]
     pattern = ReActPattern(
         max_iterations=2,
@@ -4658,6 +4782,13 @@ async def test_concurrent_tool_interactions_pause_in_one_deterministic_message()
                                 "arguments": '{"expression":"2"}',
                             },
                         },
+                        {
+                            "id": "stale-mutation",
+                            "function": {
+                                "name": "mutation",
+                                "arguments": '{"expression":"3"}',
+                            },
+                        },
                     ]
                 }
             ]
@@ -4678,6 +4809,9 @@ async def test_concurrent_tool_interactions_pause_in_one_deterministic_message()
     assert len(runtime.outbound_messages) == 1
     assert pattern.tool_ledger["first-call"].status == "waiting_for_user"
     assert pattern.tool_ledger["second-call"].status == "waiting_for_user"
+    assert pattern.tool_ledger["stale-mutation"].status == "cancelled"
+    assert pattern.pending_tool_calls == []
+    assert mutation_tool.calls == []
 
 
 @pytest.mark.asyncio

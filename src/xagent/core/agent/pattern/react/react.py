@@ -293,16 +293,22 @@ class ReActPattern(AgentPattern):
                     runtime=runtime,
                     similarity_threshold=kwargs.get("memory_similarity_threshold"),
                 )
+            context_tools = await self._with_context_tools(
+                tools=tools,
+                context=context,
+                task_text=task_text,
+                runtime=runtime,
+                skill_manager=kwargs.get("skill_manager"),
+                allowed_skills=kwargs.get("allowed_skills"),
+            )
+            await self._deliver_pending_tool_interaction_responses(
+                tools=context_tools,
+                context=context,
+                runtime=runtime,
+            )
             result = await self._run_tool_calling_loop(
                 context=context,
-                tools=await self._with_context_tools(
-                    tools=tools,
-                    context=context,
-                    task_text=task_text,
-                    runtime=runtime,
-                    skill_manager=kwargs.get("skill_manager"),
-                    allowed_skills=kwargs.get("allowed_skills"),
-                ),
+                tools=context_tools,
                 llm=active_llm,
                 compact_llm=compact_llm,
                 runtime=runtime,
@@ -1101,6 +1107,7 @@ class ReActPattern(AgentPattern):
         self.pending_tool_interaction_responses = [
             {
                 "tool_name": str(item.get("tool_name") or ""),
+                "tool_call_id": str(item.get("tool_call_id") or ""),
                 "interaction_id": str(item.get("interaction_id") or ""),
                 "response": str(item.get("response") or ""),
             }
@@ -1166,6 +1173,11 @@ class ReActPattern(AgentPattern):
             self.task_text = str(waiting_task)
         self.waiting_for_user_request = None
         self.status = "thinking"
+        await runtime.checkpoint(
+            "tool_interaction_response_received",
+            context=context,
+            pattern=self,
+        )
         return None
 
     def _task_text(self, context: Any) -> str:
@@ -1228,6 +1240,7 @@ class ReActPattern(AgentPattern):
             self.pending_tool_interaction_responses.append(
                 {
                     "tool_name": tool_name,
+                    "tool_call_id": str(request.get("tool_call_id") or ""),
                     "interaction_id": str(
                         request.get("interaction_id")
                         or request.get("tool_call_id")
@@ -1235,6 +1248,45 @@ class ReActPattern(AgentPattern):
                     ),
                     "response": response,
                 }
+            )
+
+    async def _deliver_pending_tool_interaction_responses(
+        self,
+        *,
+        tools: list[Any],
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Deliver checkpointed replies to their exact suspended interactions."""
+
+        while self.pending_tool_interaction_responses:
+            pending = self.pending_tool_interaction_responses[0]
+            tool_name = pending.get("tool_name", "")
+            tool = self._find_tool(tool_name, tools)
+            resume = user_interaction_resume_callable(tool)
+            if resume is None:
+                raise ValueError(
+                    f"Tool {tool_name} cannot resume a pending user interaction."
+                )
+
+            resumed = resume(
+                interaction_id=pending.get("interaction_id", ""),
+                response=pending.get("response", ""),
+            )
+            if inspect.isawaitable(resumed):
+                await resumed
+
+            # Keep the response retryable until the tool acknowledges delivery.
+            self.pending_tool_interaction_responses.pop(0)
+            await runtime.checkpoint(
+                "tool_interaction_response_delivered",
+                context=context,
+                pattern=self,
+                metadata={
+                    "tool_name": tool_name,
+                    "tool_call_id": pending.get("tool_call_id", ""),
+                    "interaction_id": pending.get("interaction_id", ""),
+                },
             )
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
@@ -1797,6 +1849,29 @@ class ReActPattern(AgentPattern):
         )
         self._forget_tool_call_content(tool_call)
 
+    def _discard_pending_tool_plan_after_pause(self, context: Any) -> None:
+        """Close unexecuted calls so resume always starts with a fresh LLM plan."""
+
+        discarded_calls = self.pending_tool_calls
+        self.pending_tool_calls = []
+        self.repeated_tool_decision = None
+        self.force_final_answer_next = False
+        for tool_call in discarded_calls:
+            result = {
+                "success": False,
+                "status": "cancelled",
+                "error": (
+                    "Discarded because an earlier tool requires user input; "
+                    "the agent will replan after the user responds."
+                ),
+            }
+            self._backfill_result(tool_call, result, context)
+            self._record_tool_call(
+                tool_call,
+                status="cancelled",
+                result=result,
+            )
+
     async def _pause_for_tool_results(
         self,
         *,
@@ -2033,6 +2108,7 @@ class ReActPattern(AgentPattern):
                         self.pending_tool_calls = []
                         return control_result
                     if control_result.get("status") == "waiting_for_user":
+                        self._discard_pending_tool_plan_after_pause(context)
                         return control_result
                 continue
 
@@ -2049,6 +2125,7 @@ class ReActPattern(AgentPattern):
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 if tool_result_waits_for_user(result):
                     assert isinstance(result, dict)
+                    self._discard_pending_tool_plan_after_pause(context)
                     return await self._pause_for_tool_results(
                         waiting_pairs=[(tool_call, result)],
                         context=context,
@@ -2079,6 +2156,7 @@ class ReActPattern(AgentPattern):
                     and isinstance(waiting_result, dict)
                 ]
                 if waiting_pairs:
+                    self._discard_pending_tool_plan_after_pause(context)
                     return await self._pause_for_tool_results(
                         waiting_pairs=waiting_pairs,
                         context=context,
@@ -2893,10 +2971,6 @@ class ReActPattern(AgentPattern):
 
     async def _execute_tool(self, tool_call: dict[str, Any], tools: list[Any]) -> Any:
         tool = self._find_tool(tool_call["name"], tools)
-        await self._resume_tool_interaction_if_pending(
-            tool=tool,
-            tool_name=self._tool_name(tool),
-        )
         args = self._tool_args_for_execution(tool_call, tool)
 
         execute = getattr(tool, "execute", None)
@@ -2918,29 +2992,6 @@ class ReActPattern(AgentPattern):
         raise ValueError(
             f"Tool {tool_call['name']} does not expose a supported executor."
         )
-
-    async def _resume_tool_interaction_if_pending(
-        self,
-        *,
-        tool: Any,
-        tool_name: str,
-    ) -> None:
-        """Deliver one checkpointed user response to a matching capable tool."""
-
-        resume = user_interaction_resume_callable(tool)
-        if resume is None:
-            return
-        for index, pending in enumerate(self.pending_tool_interaction_responses):
-            if pending.get("tool_name") != tool_name:
-                continue
-            pending_response = self.pending_tool_interaction_responses.pop(index)
-            resumed = resume(
-                interaction_id=pending_response.get("interaction_id", ""),
-                response=pending_response.get("response", ""),
-            )
-            if inspect.isawaitable(resumed):
-                await resumed
-            return
 
     def _tool_args_for_execution(
         self, tool_call: dict[str, Any], tool: Any

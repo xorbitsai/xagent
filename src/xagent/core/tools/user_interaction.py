@@ -2,9 +2,9 @@
 
 Tools opt into the control flow by returning a mapping whose ``status`` is
 ``waiting_for_user``.  The execution pattern presents the returned message,
-checkpoints, and stops the current run.  After the user replies, a resumable
-tool can receive that reply through ``resume_user_interaction`` immediately
-before its next invocation.
+checkpoints, and stops the current run. After the user replies, the runtime
+delivers that reply to the exact suspended interaction through
+``resume_user_interaction`` before asking the model to replan.
 
 The response is delivered through a runtime capability instead of model
 arguments.  This keeps server-owned interaction state out of the prompt and
@@ -28,7 +28,7 @@ class ResumableUserInteractionTool(Protocol):
         interaction_id: str,
         response: str,
     ) -> Any:
-        """Accept one user response for the tool's next invocation."""
+        """Accept one user response identified by the suspended interaction."""
 
 
 def tool_result_waits_for_user(result: Any) -> bool:

@@ -128,7 +128,10 @@ def test_list_page_posts_uses_page_access_token(monkeypatch):
         assert url == "https://graph.facebook.com/v25.0/page-1/feed"
         assert kwargs["headers"]["Authorization"] == "Bearer page-token"
         assert kwargs["params"] == {
-            "fields": "id,message,created_time,permalink_url,full_picture,status_type",
+            "fields": (
+                "id,message,created_time,permalink_url,full_picture,status_type,"
+                "likes.summary(true),comments.summary(true),shares"
+            ),
             "limit": 5,
         }
         return MockResponse(
@@ -145,6 +148,62 @@ def test_list_page_posts_uses_page_access_token(monkeypatch):
     assert result == {
         "status": "success",
         "posts": [{"id": "post-1", "message": "hello"}],
+        "next_link": "https://graph.facebook.com/next",
+    }
+
+
+def test_list_post_comments_uses_page_access_token(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {
+                    "data": [
+                        {
+                            "id": "page-1",
+                            "name": "Launch Page",
+                            "access_token": "page-token",
+                        }
+                    ]
+                }
+            )
+        assert method == "GET"
+        assert url == "https://graph.facebook.com/v25.0/page-1_post-1/comments"
+        assert kwargs["headers"]["Authorization"] == "Bearer page-token"
+        assert kwargs["params"] == {
+            "fields": "id,message,created_time,from",
+            "filter": "stream",
+            "limit": 5,
+        }
+        return MockResponse(
+            {
+                "data": [
+                    {
+                        "id": "comment-1",
+                        "message": "Great news!",
+                        "from": {"id": "fan-1", "name": "A Fan"},
+                    }
+                ],
+                "paging": {"next": "https://graph.facebook.com/next"},
+            }
+        )
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(
+        facebook.facebook_list_post_comments("page-1", "page-1_post-1", limit=5)
+    )
+
+    assert result == {
+        "status": "success",
+        "comments": [
+            {
+                "id": "comment-1",
+                "message": "Great news!",
+                "from": {"id": "fan-1", "name": "A Fan"},
+            }
+        ],
         "next_link": "https://graph.facebook.com/next",
     }
 

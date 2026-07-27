@@ -233,9 +233,53 @@ descriptions:
         assert template["author"] == "Xagent"
         assert template["version"] == "1.0"
         assert template["featured"] is False
+        assert template["sample_prompts"] == {}
         assert template["agent_config"]["instructions"] == ""
         assert template["agent_config"]["skills"] == []
         assert template["agent_config"]["tool_categories"] == []
+
+    @pytest.mark.asyncio
+    async def test_get_template_with_sample_prompts(self, temp_templates_dir):
+        """测试模板的 sample_prompts 能正确加载并保留本地化结构"""
+        template_with_prompts = temp_templates_dir / "with_prompts.yaml"
+        template_with_prompts.write_text(
+            """
+id: with_prompts
+name: Template With Prompts
+category: Support
+descriptions:
+  en: A template with sample prompts
+  zh: 一个带有示例提示词的模板
+sample_prompts:
+  en:
+  - title: Do the thing
+    prompt: 'Do the thing: paste input.'
+    highlights:
+    - paste input
+  - title: Do another thing
+    prompt: Do another thing entirely.
+    highlights: []
+  zh:
+  - title: 做这件事
+    prompt: 做这件事：粘贴输入。
+    highlights:
+    - 粘贴输入
+  - title: 做另一件事
+    prompt: 做另一件完全不同的事。
+    highlights: []
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("with_prompts")
+
+        assert template is not None
+        assert len(template["sample_prompts"]["en"]) == 2
+        assert template["sample_prompts"]["en"][0]["title"] == "Do the thing"
+        assert template["sample_prompts"]["en"][0]["highlights"] == ["paste input"]
+        assert template["sample_prompts"]["zh"][0]["title"] == "做这件事"
 
     @pytest.mark.asyncio
     async def test_skip_invalid_templates(self, temp_templates_dir):

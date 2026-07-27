@@ -14,6 +14,27 @@ features:
   - 基于潜在客户列表或 CRM，为每位联系人起草个性化邮件
   - 每封草稿均基于过往对话历史并遵循您的品牌语气
   - 仅在您批准后发送，并记录到 HubSpot 或更新上传的文件
+sample_prompts:
+  en:
+  - title: Draft outreach emails
+    prompt: Draft one personalised email per contact in prospect list / CRM segment, grounded in past conversations and our brand tone. Queue everything for my approval.
+    highlights:
+    - prospect list / CRM segment
+  - title: Follow-up sequence
+    prompt: "Write a N-step follow-up sequence for prospects who haven't replied to campaign."
+    highlights:
+    - N
+    - campaign
+  zh:
+  - title: 起草外联邮件
+    prompt: 为 潜在客户列表 / CRM 分组 中的每位联系人起草一封个性化邮件，基于过往对话并遵循我们的品牌语气，全部加入待我审批的队列。
+    highlights:
+    - 潜在客户列表 / CRM 分组
+  - title: 跟进序列
+    prompt: 为未回复 营销活动 的潜在客户撰写一套 N 步跟进序列。
+    highlights:
+    - N
+    - 营销活动
 connections:
 - name: HubSpot
   logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64

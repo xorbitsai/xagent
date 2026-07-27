@@ -14,6 +14,27 @@ features:
   - 构建销售演示文稿、宣传册和单页
   - 确保所有输出符合您的品牌指南
   - 生成准备好演示的视觉效果和幻灯片
+sample_prompts:
+  en:
+  - title: Build a sales deck
+    prompt: 'Build a sales deck about topic or product for audience. Keep it on-brand.'
+    highlights:
+    - topic or product
+    - audience
+  - title: Create a one-pager
+    prompt: 'Turn this into a one-pager: paste content or brief. Match our brand guidelines.'
+    highlights:
+    - paste content or brief
+  zh:
+  - title: 制作销售演示文稿
+    prompt: 为 受众 制作一份关于 主题或产品 的销售演示文稿，保持品牌一致性。
+    highlights:
+    - 主题或产品
+    - 受众
+  - title: 生成单页文档
+    prompt: 将以下内容转化为单页文档：粘贴内容或简报。需符合我们的品牌规范。
+    highlights:
+    - 粘贴内容或简报
 connections:
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

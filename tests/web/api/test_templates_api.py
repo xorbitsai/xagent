@@ -141,6 +141,23 @@ tags:
 descriptions:
   en: Professional sales assistant
   zh: 专业的销售助手
+sample_prompts:
+  en:
+  - title: Draft an outreach email
+    prompt: 'Draft an outreach email for contact.'
+    highlights:
+    - contact
+  - title: Summarise a call
+    prompt: Summarise our last call and suggest next steps.
+    highlights: []
+  zh:
+  - title: 起草外联邮件
+    prompt: 为 联系人 起草一封外联邮件。
+    highlights:
+    - 联系人
+  - title: 总结通话
+    prompt: 总结我们上次的通话并给出下一步建议。
+    highlights: []
 author: Xagent
 version: "1.0"
 
@@ -280,6 +297,42 @@ class TestTemplatesAPI:
             assert "customer support assistant" in agent_config["instructions"].lower()
             assert agent_config["skills"] == ["product_knowledge"]
             assert agent_config["tool_categories"] == ["web_search"]
+
+    def test_sample_prompts_localization_and_default(
+        self, mock_app_state, admin_headers
+    ):
+        """测试 sample_prompts 按语言解析，且未定义时默认为空列表"""
+        with patch.object(client.app, "state", mock_app_state):
+            # Template without sample_prompts defaults to an empty list.
+            response = client.get(
+                "/api/templates/customer_support?lang=en", headers=admin_headers
+            )
+            assert response.status_code == 200
+            assert response.json()["sample_prompts"] == []
+
+            # Template with sample_prompts resolves the requested locale.
+            response = client.get(
+                "/api/templates/sales_assistant?lang=en", headers=admin_headers
+            )
+            assert response.status_code == 200
+            en_prompts = response.json()["sample_prompts"]
+            assert len(en_prompts) == 2
+            assert en_prompts[0]["title"] == "Draft an outreach email"
+            assert en_prompts[0]["highlights"] == ["contact"]
+
+            response = client.get(
+                "/api/templates/sales_assistant?lang=zh", headers=admin_headers
+            )
+            assert response.status_code == 200
+            zh_prompts = response.json()["sample_prompts"]
+            assert zh_prompts[0]["title"] == "起草外联邮件"
+
+            # The list endpoint carries the same field.
+            response = client.get("/api/templates/?lang=en", headers=admin_headers)
+            assert response.status_code == 200
+            listed = {t["id"]: t for t in response.json()}
+            assert len(listed["sales_assistant"]["sample_prompts"]) == 2
+            assert listed["customer_support"]["sample_prompts"] == []
 
     def test_get_template_not_found(self, mock_app_state, admin_headers):
         """测试获取不存在的模板"""

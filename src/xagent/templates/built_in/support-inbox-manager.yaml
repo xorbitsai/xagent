@@ -14,6 +14,23 @@ features:
   - 读取并摘要新邮件和未读邮件线程，并附优先级标签
   - 以您的语气起草回复——保存为草稿，未经批准不会发送
   - 标记敏感或高风险邮件，提醒您亲自处理
+sample_prompts:
+  en:
+  - title: Prioritise my inbox
+    prompt: Read and summarise my new and unread email threads with priority labels, flagging sensitive or high-stakes messages for my attention.
+    highlights: []
+  - title: Draft replies
+    prompt: 'Draft replies to threads in my voice and save them to Drafts — never send without my approval.'
+    highlights:
+    - threads
+  zh:
+  - title: 整理我的收件箱
+    prompt: 阅读并总结我新收到的未读邮件线程，标注优先级，并标记需要我关注的敏感或重要邮件。
+    highlights: []
+  - title: 起草回复
+    prompt: 以我的语气为 邮件线程 起草回复，保存到草稿箱——未经批准绝不发送。
+    highlights:
+    - 邮件线程
 connections:
 - name: Gmail
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64

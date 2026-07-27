@@ -14,6 +14,25 @@ features:
   - 解析源文档，识别主题并标记缺口或内容冲突
   - 起草整洁的 Markdown 知识库文章和 FAQ，每篇聚焦一个主题
   - 随源文档更新保持文章同步，并提供变更记录
+sample_prompts:
+  en:
+  - title: Draft KB articles
+    prompt: 'Parse source docs and draft clean Markdown KB articles and FAQs — one topic per article — flagging any gaps or conflicts.'
+    highlights:
+    - source docs
+  - title: Update stale articles
+    prompt: Compare our KB against changed source docs and update the affected articles with changelogs.
+    highlights:
+    - changed source docs
+  zh:
+  - title: 起草知识库文章
+    prompt: 解析 源文档 并起草整洁的 Markdown 知识库文章和 FAQ——每篇聚焦一个主题——标记出任何缺口或冲突。
+    highlights:
+    - 源文档
+  - title: 更新过期文章
+    prompt: 将我们的知识库与 已变更的源文档 进行比对，更新受影响的文章并附上变更记录。
+    highlights:
+    - 已变更的源文档
 connections:
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

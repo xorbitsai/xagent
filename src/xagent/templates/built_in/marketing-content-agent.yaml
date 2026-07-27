@@ -14,6 +14,27 @@ features:
   - 研究主题并撰写完整的博客文章
   - 添加内部链接以提升您网站的SEO
   - 生成SEO标签以帮助内容在Google上排名
+sample_prompts:
+  en:
+  - title: Write a blog article
+    prompt: "Research and write a full blog article on topic, with internal links to boost our site's SEO and tags to help it rank on Google."
+    highlights:
+    - topic
+  - title: Refresh an old post
+    prompt: 'Rewrite existing article / URL for the keyword keyword — update the structure, internal links and SEO tags.'
+    highlights:
+    - existing article / URL
+    - keyword
+  zh:
+  - title: 撰写博客文章
+    prompt: 围绕 主题 调研并撰写一篇完整的博客文章，添加内部链接提升网站 SEO，并附带有助于 Google 排名的标签。
+    highlights:
+    - 主题
+  - title: 刷新旧文章
+    prompt: 重写 已有文章 / 链接（针对关键词 关键词）——更新结构、内部链接和 SEO 标签。
+    highlights:
+    - 已有文章 / 链接
+    - 关键词
 connections:
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

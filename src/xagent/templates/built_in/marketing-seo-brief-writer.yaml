@@ -14,6 +14,25 @@ features:
   - 拉取 SERP 和关键词数据，并按搜索意图聚类
   - 起草包含大纲、角度、标题和关键词的结构化简报
   - 结合知识库和云盘中的品牌规范，与现有内容保持一致
+sample_prompts:
+  en:
+  - title: Brief from a keyword
+    prompt: 'Pull SERP and keyword data for keyword and draft a structured brief with outline, angle, headings and terms to include.'
+    highlights:
+    - keyword
+  - title: Cluster keywords
+    prompt: 'Cluster these keywords by search intent and suggest one brief per cluster: paste keywords.'
+    highlights:
+    - paste keywords
+  zh:
+  - title: 关键词简报
+    prompt: 拉取 关键词 的 SERP 和关键词数据，起草包含大纲、切入角度、标题和需覆盖术语的结构化简报。
+    highlights:
+    - 关键词
+  - title: 关键词聚类
+    prompt: 按搜索意图对这些关键词聚类，并为每个聚类给出一份简报建议：粘贴关键词。
+    highlights:
+    - 粘贴关键词
 connections:
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

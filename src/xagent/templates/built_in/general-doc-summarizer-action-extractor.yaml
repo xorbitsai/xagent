@@ -20,6 +20,25 @@ features:
   - 生成完整文档的清晰、结构化摘要
   - 提取文本中隐藏的每一项行动项、截止日期和负责人
   - 在同一对话线程中回答关于文档的后续问题
+sample_prompts:
+  en:
+  - title: Summarise a document
+    prompt: 'Summarise the attached PDF / Word / PowerPoint and pull out the key points and decisions.'
+    highlights:
+    - PDF / Word / PowerPoint
+  - title: Extract action items
+    prompt: 'Extract every action item from document / meeting notes, grouped by owner with deadlines.'
+    highlights:
+    - document / meeting notes
+  zh:
+  - title: 总结文档
+    prompt: 总结附加的 PDF / Word / PowerPoint 文档，并提炼要点和结论。
+    highlights:
+    - PDF / Word / PowerPoint
+  - title: 提取行动项
+    prompt: 从 文档 / 会议纪要 中提取每一项行动项，按负责人和截止日期归类。
+    highlights:
+    - 文档 / 会议纪要
 connections: []
 setup_time:
   en: 2 min setup

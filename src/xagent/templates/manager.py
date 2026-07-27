@@ -113,6 +113,7 @@ class TemplateManager:
         data.setdefault("author", "Xagent")
         data.setdefault("version", "1.0")
         data.setdefault("featured", False)
+        data.setdefault("sample_prompts", {})
 
         # agent_config default values
         agent_config = data["agent_config"]
@@ -158,6 +159,7 @@ class TemplateManager:
             "featured": template.get("featured", False),
             "descriptions": template.get("descriptions", {}),
             "features": template.get("features", []),
+            "sample_prompts": template.get("sample_prompts", {}),
             "connections": connections,
             "setup_time": template.get("setup_time", "5 min setup"),
             "tags": template.get("tags", []),

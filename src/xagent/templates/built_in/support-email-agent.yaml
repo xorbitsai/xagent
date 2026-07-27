@@ -14,6 +14,23 @@ features:
   - 按紧急程度和截止日期对支持工单进行排序
   - 起草常见客户问题的回复以供批准
   - 仅提供准确、经过验证的信息
+sample_prompts:
+  en:
+  - title: Sort today's tickets
+    prompt: "Sort today's support tickets by urgency and deadline, and surface the ones that need me first."
+    highlights: []
+  - title: Draft ticket replies
+    prompt: 'Draft replies to common customer questions in queue, using only accurate, verified information, ready for agent approval.'
+    highlights:
+    - queue
+  zh:
+  - title: 整理今日工单
+    prompt: 按紧急程度和截止日期整理今天的支持工单，优先呈现需要我处理的工单。
+    highlights: []
+  - title: 起草工单回复
+    prompt: 为 队列 中的常见客户问题起草回复，仅使用准确、经过验证的信息，供客服审批。
+    highlights:
+    - 队列
 connections:
 - name: Gmail
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64

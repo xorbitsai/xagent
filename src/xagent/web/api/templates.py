@@ -75,6 +75,17 @@ class ConnectionInfo(BaseModel):
     logo: Optional[str] = Field(default=None, description="URL to the logo image")
 
 
+class SamplePrompt(BaseModel):
+    """A quick-access sample prompt shown on a template card"""
+
+    title: str = Field(..., description="Short label shown on the template card")
+    prompt: str = Field(..., description="Prompt text to fill into the chat input")
+    highlights: list[str] = Field(
+        default_factory=list,
+        description="Substrings within prompt to visually highlight as placeholders",
+    )
+
+
 class TemplateInfo(BaseModel):
     """Template brief information"""
 
@@ -86,6 +97,9 @@ class TemplateInfo(BaseModel):
     )
     description: str = Field(..., description="Template description")
     features: list[str] = Field(default_factory=list, description="Template features")
+    sample_prompts: list[SamplePrompt] = Field(
+        default_factory=list, description="Quick-access sample prompts"
+    )
     connections: list[ConnectionInfo] = Field(
         default_factory=list, description="App connections"
     )
@@ -247,6 +261,9 @@ async def list_templates(
         # Get localized values
         description = get_localized_value(template.get("descriptions", {}), lang, "")
         features = get_localized_value(template.get("features", {}), lang, [])
+        sample_prompts = get_localized_value(
+            template.get("sample_prompts", {}), lang, []
+        )
         setup_time = get_localized_value(
             template.get("setup_time", {}), lang, "5 min setup"
         )
@@ -261,6 +278,7 @@ async def list_templates(
                 featured=bool(template.get("featured", False)),
                 description=description,
                 features=features,
+                sample_prompts=sample_prompts,
                 connections=connections,
                 setup_time=setup_time,
                 tags=tags,
@@ -313,6 +331,7 @@ async def get_template(
     # Get localized values
     description = get_localized_value(template.get("descriptions", {}), lang, "")
     features = get_localized_value(template.get("features", {}), lang, [])
+    sample_prompts = get_localized_value(template.get("sample_prompts", {}), lang, [])
     setup_time = get_localized_value(
         template.get("setup_time", {}), lang, "5 min setup"
     )
@@ -326,6 +345,7 @@ async def get_template(
         featured=bool(template.get("featured", False)),
         description=description,
         features=features,
+        sample_prompts=sample_prompts,
         connections=connections,
         setup_time=setup_time,
         tags=tags,

@@ -12,6 +12,12 @@ export interface ConnectionInfo {
   logo?: string;
 }
 
+export interface SamplePrompt {
+  title: string;
+  prompt: string;
+  highlights?: string[];
+}
+
 export interface Template {
   id: string;
   name: string;
@@ -19,6 +25,7 @@ export interface Template {
   featured?: boolean;
   description: string;
   features: string[];
+  sample_prompts?: SamplePrompt[];
   connections: ConnectionInfo[];
   setup_time: string;
   tags: string[];

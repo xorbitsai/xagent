@@ -14,6 +14,25 @@ features:
   - 收集公开的企业信息、角色信号和购买信号
   - 生成包含公司速览、关键联系人、信号和沟通要点的结构化简报
   - 将简报导出为 Google 文档，并在获批后回写 HubSpot CRM
+sample_prompts:
+  en:
+  - title: Research a company
+    prompt: 'Research company — firmographics, role signals and buying signals — and build a structured brief with snapshot, contacts and talking points.'
+    highlights:
+    - company
+  - title: Enrich CRM records
+    prompt: Enrich the HubSpot records in list / segment with fresh firmographic data and flag anything that changed.
+    highlights:
+    - list / segment
+  zh:
+  - title: 调研公司
+    prompt: 调研 公司——包括企业信息、角色信号和购买信号——并生成包含速览、联系人和沟通要点的结构化简报。
+    highlights:
+    - 公司
+  - title: 丰富 CRM 记录
+    prompt: 为 列表 / 分组 中的 HubSpot 记录补充最新的企业信息，并标记发生变化的内容。
+    highlights:
+    - 列表 / 分组
 connections:
 - name: HubSpot
   logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64

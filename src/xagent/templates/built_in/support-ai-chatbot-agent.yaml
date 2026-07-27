@@ -14,6 +14,25 @@ features:
   - 回答公司/群组的常见问题
   - 同时处理多个客户聊天
   - 帮助客户排查问题
+sample_prompts:
+  en:
+  - title: Answer common questions
+    prompt: 'Answer commonly asked questions about company / product using our knowledge base, handling many customer chats at the same time.'
+    highlights:
+    - company / product
+  - title: Troubleshooting helper
+    prompt: 'Help customers troubleshoot product area step by step, escalating to a human when needed.'
+    highlights:
+    - product area
+  zh:
+  - title: 回答常见问题
+    prompt: 使用我们的知识库回答关于 公司 / 产品 的常见问题，可同时处理多个客户对话。
+    highlights:
+    - 公司 / 产品
+  - title: 故障排查助手
+    prompt: 帮助客户逐步排查 产品领域 的问题，必要时上报人工处理。
+    highlights:
+    - 产品领域
 connections:
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

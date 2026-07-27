@@ -217,25 +217,19 @@ const en = {
       startingPrompts: "STARTING PROMPTS",
       chatWithAgents: "CHAT WITH AGENTS",
     },
-    cards: {
-      research: {
-        title: "Research a topic in depth",
-      },
-      linkedin: {
-        title: "Write a LinkedIn post about an achievement",
-      },
-      poster: {
-        title: "Design a poster for an event",
-      },
-      compare: {
-        title: "Compare products with deep research",
-      },
-      visual: {
-        title: "Create visual for a topic",
-      },
-      presentation: {
-        title: "Turn a topic into a presentation deck",
-      }
+    agents: {
+      researcher: "Researcher Agent",
+      poster: "Poster Maker",
+      linkedin: "LinkedIn Post Creator",
+    },
+    templateQuickAccess: {
+      featuredLabel: "Featured",
+      categoryHeading: "{category} AI Agents",
+      allTemplates: "All templates →",
+      usingTemplateLabel: "Agent template:",
+      agentCreatedToast: "Agent \"{name}\" created from template",
+      viewInAgents: "View in Agents",
+      createAgentError: "Couldn't create the agent from this template. Please try again.",
     },
     input: {
       placeholder: "Describe your task...",

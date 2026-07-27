@@ -14,6 +14,25 @@ features:
   - 自动响应来自 Gmail / O365 邮箱的新入站线索邮件
   - 按您的标准对线索评分，并创建或更新 HubSpot 记录
   - 提供会议时间、预订日历并将全部活动记录到 CRM
+sample_prompts:
+  en:
+  - title: Score new leads
+    prompt: Score new inbound lead emails against criteria and create or update the matching HubSpot records.
+    highlights:
+    - criteria
+  - title: Book a meeting
+    prompt: Reply to lead with meeting times, book the calendar event once confirmed, and log everything to CRM.
+    highlights:
+    - lead
+  zh:
+  - title: 线索评分
+    prompt: 根据 标准 对新的入站线索邮件评分，并创建或更新匹配的 HubSpot 记录。
+    highlights:
+    - 标准
+  - title: 预约会议
+    prompt: 回复 线索 提供会议时间，确认后预订日历事件，并将全部内容记录到 CRM。
+    highlights:
+    - 线索
 connections:
 - name: HubSpot
   logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64

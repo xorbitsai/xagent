@@ -14,6 +14,25 @@ features:
   - 撰写适用于 LinkedIn 的思想领导力帖子和动态更新
   - 创建符合 LinkedIn 尺寸规范的配套视觉内容
   - 将你的品牌声音、语气和视觉风格应用到每一条帖子中
+sample_prompts:
+  en:
+  - title: LinkedIn announcement
+    prompt: 'Write a LinkedIn announcement about news in our brand voice, with a matching visual in LinkedIn-ready dimensions.'
+    highlights:
+    - news
+  - title: Thought-leadership post
+    prompt: 'Draft a thought-leadership LinkedIn post on topic with a strong hook, three insights and a closing question.'
+    highlights:
+    - topic
+  zh:
+  - title: LinkedIn 动态公告
+    prompt: 以我们的品牌语气撰写一条关于 动态 的 LinkedIn 公告，并附带符合 LinkedIn 尺寸规范的配套视觉内容。
+    highlights:
+    - 动态
+  - title: 思想领导力文章
+    prompt: 围绕 主题 起草一篇思想领导力 LinkedIn 帖子，包含有力的开头、三个洞察点和一个结尾问题。
+    highlights:
+    - 主题
 connections:
 - name: LinkedIn
   logo: https://www.google.com/s2/favicons?domain=linkedin.com&sz=64

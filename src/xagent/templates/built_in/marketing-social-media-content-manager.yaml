@@ -14,6 +14,27 @@ features:
   - 将话题或简报转化为适用于 LinkedIn、Instagram 和 Facebook 的平台原生文案
   - 为每个平台创建正确尺寸的配套视觉内容
   - 将品牌语气、声音和视觉规范应用到每一条帖子中
+sample_prompts:
+  en:
+  - title: Week of social posts
+    prompt: 'Create a week of social posts about topic for LinkedIn, Instagram and Facebook, with matching visuals sized for each platform.'
+    highlights:
+    - topic
+  - title: Turn a brief into posts
+    prompt: 'Turn this brief into platform-native posts for channels: paste brief. Apply our brand tone and visual guidelines.'
+    highlights:
+    - channels
+    - paste brief
+  zh:
+  - title: 生成一周社媒帖子
+    prompt: 为 主题 创建一周的社交媒体帖子，覆盖 LinkedIn、Instagram 和 Facebook，并附带适配各平台尺寸的配套视觉内容。
+    highlights:
+    - 主题
+  - title: 将简报转化为帖子
+    prompt: 将这份简报转化为适用于 渠道 的平台原生帖子：粘贴简报。应用我们的品牌语气和视觉规范。
+    highlights:
+    - 渠道
+    - 粘贴简报
 connections:
 - name: LinkedIn
   logo: https://www.google.com/s2/favicons?domain=linkedin.com&sz=64

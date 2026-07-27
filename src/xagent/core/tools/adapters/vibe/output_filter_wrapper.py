@@ -22,13 +22,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_INTERACTION_CONTROL_KEYS = (
-    "type",
-    "field",
-    "id",
-    "name",
-    "value",
-    "action_type",
+_INTERACTION_DISPLAY_KEYS = frozenset(
+    {
+        "description",
+        "help_text",
+        "label",
+        "message",
+        "placeholder",
+        "prompt",
+        "title",
+    }
 )
 
 
@@ -233,40 +236,38 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         return filtered
 
     def _filter_interactions(self, interactions: Any) -> Any:
-        """Filter display text while preserving interaction routing fields."""
+        """Filter display text without changing interaction cardinality."""
 
         if not isinstance(interactions, list):
             return self._filter.filter(interactions, self._target.name)
 
         return [
-            self._filter_interaction_item(item)
-            for item in interactions[: self._filter.max_fields]
-            if isinstance(item, dict)
+            self._filter_interaction_item(item) if isinstance(item, dict) else item
+            for item in interactions
         ]
 
     def _filter_interaction_item(self, item: dict[str, Any]) -> dict[str, Any]:
-        filtered: dict[str, Any] = {
-            key: item[key] for key in _INTERACTION_CONTROL_KEYS if key in item
-        }
-        if "options" in item:
-            filtered["options"] = self._filter_interaction_options(item["options"])
-
-        display_fields = 0
+        filtered: dict[str, Any] = {}
         for key, value in item.items():
-            if key in _INTERACTION_CONTROL_KEYS or key == "options":
-                continue
-            if display_fields >= self._filter.max_fields:
-                break
-            filtered[key] = self._filter.filter(value, self._target.name)
-            display_fields += 1
+            if key in _INTERACTION_DISPLAY_KEYS:
+                filtered[key] = self._filter.filter(value, self._target.name)
+            elif key in {"actions", "options"}:
+                filtered[key] = self._filter_interaction_options(value)
+            elif key == "properties" and isinstance(value, dict):
+                filtered[key] = self._filter_interaction_item(value)
+            else:
+                # Control, routing, cardinality, and submitted-value properties
+                # must remain byte-for-byte equivalent to the tool result.
+                filtered[key] = value
         return filtered
 
     def _filter_interaction_options(self, options: Any) -> Any:
         if not isinstance(options, list):
-            return self._filter.filter(options, self._target.name)
+            return options
 
         return [
             self._filter_interaction_item(option)
-            for option in options[: self._filter.max_fields]
             if isinstance(option, dict)
+            else option
+            for option in options
         ]

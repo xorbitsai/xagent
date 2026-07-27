@@ -82,16 +82,29 @@ async def test_waiting_control_envelope_survives_field_filtering() -> None:
                 "message_type": "question",
                 "interactions": [
                     {
-                        "type": "select_one",
+                        "type": "file_upload",
                         "field": "exact-routing-field",
                         "label": "Choose the desired operation",
+                        "accept": ["video/mp4", "audio/mpeg"],
+                        "multiple": False,
+                        "multiline": False,
                         "options": [
                             {
                                 "label": "Approve this operation",
                                 "value": "exact-routing-option-value",
-                            }
+                            },
+                            {
+                                "label": "Reject this operation",
+                                "value": "second-routing-option-value",
+                            },
                         ],
-                    }
+                    },
+                    {
+                        "type": "confirm",
+                        "field": "second-routing-field",
+                        "label": "Continue to the next step?",
+                        "default": False,
+                    },
                 ],
             }
 
@@ -108,13 +121,23 @@ async def test_waiting_control_envelope_survives_field_filtering() -> None:
     assert result["interaction_id"] == "14ee67d1-d18e-47e0-a8f8-b28ef31262f5"
     assert result["message"].startswith("Provide ")
     assert result["message_type"] == "question"
-    assert result["interactions"][0]["type"] == "select_one"
+    assert len(result["interactions"]) == 2
+    assert result["interactions"][0]["type"] == "file_upload"
     assert result["interactions"][0]["field"] == "exact-routing-field"
     assert result["interactions"][0]["label"].startswith("Choose t")
+    assert result["interactions"][0]["accept"] == ["video/mp4", "audio/mpeg"]
+    assert result["interactions"][0]["multiple"] is False
+    assert result["interactions"][0]["multiline"] is False
+    assert len(result["interactions"][0]["options"]) == 2
     assert result["interactions"][0]["options"][0]["value"] == (
         "exact-routing-option-value"
     )
     assert result["interactions"][0]["options"][0]["label"].startswith("Approve ")
+    assert result["interactions"][0]["options"][1]["value"] == (
+        "second-routing-option-value"
+    )
+    assert result["interactions"][1]["field"] == "second-routing-field"
+    assert result["interactions"][1]["default"] is False
 
 
 @pytest.mark.asyncio

@@ -252,6 +252,7 @@ class ReActPattern(AgentPattern):
         waiting_result = await self._resume_waiting_for_user_if_needed(
             context=context,
             runtime=runtime,
+            tools=tools,
         )
         if waiting_result is not None:
             await runtime.on_pattern_end(
@@ -1135,6 +1136,7 @@ class ReActPattern(AgentPattern):
         *,
         context: Any,
         runtime: PatternRuntime,
+        tools: list[Any],
     ) -> dict[str, Any] | None:
         if self.status != "waiting_for_user" or not self.waiting_for_user_request:
             return None
@@ -1167,6 +1169,7 @@ class ReActPattern(AgentPattern):
         self._queue_tool_interaction_responses(
             waiting_request=self.waiting_for_user_request,
             response=response or "",
+            tools=tools,
         )
         waiting_task = self.waiting_for_user_request.get("task_text")
         if waiting_task and self.task_text is None:
@@ -1221,8 +1224,9 @@ class ReActPattern(AgentPattern):
         *,
         waiting_request: Any,
         response: str,
+        tools: list[Any],
     ) -> None:
-        """Persist a user's answer for each tool interaction in the pause."""
+        """Queue replies only for tools that expose the optional resume callback."""
 
         if (
             not isinstance(waiting_request, dict)
@@ -1236,6 +1240,14 @@ class ReActPattern(AgentPattern):
                 continue
             tool_name = str(request.get("tool_name") or "")
             if not tool_name:
+                continue
+            try:
+                tool = self._find_tool(tool_name, tools)
+            except ValueError:
+                continue
+            if user_interaction_resume_callable(tool) is None:
+                # Callback-less tools resume through the normal ReAct replan. The
+                # user's answer remains in context with waiting-response metadata.
                 continue
             self.pending_tool_interaction_responses.append(
                 {
@@ -1262,12 +1274,30 @@ class ReActPattern(AgentPattern):
         while self.pending_tool_interaction_responses:
             pending = self.pending_tool_interaction_responses[0]
             tool_name = pending.get("tool_name", "")
-            tool = self._find_tool(tool_name, tools)
-            resume = user_interaction_resume_callable(tool)
+            try:
+                tool = self._find_tool(tool_name, tools)
+            except ValueError:
+                tool = None
+            resume = (
+                user_interaction_resume_callable(tool) if tool is not None else None
+            )
             if resume is None:
-                raise ValueError(
-                    f"Tool {tool_name} cannot resume a pending user interaction."
+                # Legacy checkpoints may contain callback delivery for a tool that
+                # no longer exists or never implemented the optional capability.
+                # The annotated user message is sufficient for the model to replan.
+                self.pending_tool_interaction_responses.pop(0)
+                await runtime.checkpoint(
+                    "tool_interaction_response_skipped",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_call_id": pending.get("tool_call_id", ""),
+                        "interaction_id": pending.get("interaction_id", ""),
+                        "reason": "resume_callback_unavailable",
+                    },
                 )
+                continue
 
             resumed = resume(
                 interaction_id=pending.get("interaction_id", ""),

@@ -4626,9 +4626,103 @@ def test_tool_interaction_response_queue_ignores_malformed_requests(
     pattern._queue_tool_interaction_responses(
         waiting_request=waiting_request,
         response="Continue",
+        tools=[],
     )
 
     assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_callback_less_tool_interaction_resumes_by_replanning() -> None:
+    class CallbackLessTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="clarification_gate",
+                description="Ask for clarification without retaining server state.",
+            )
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": "interaction-1",
+                "message": "Which value should be used?",
+                "message_type": "question",
+                "interactions": [
+                    {
+                        "type": "text_input",
+                        "field": "value",
+                        "label": "Value",
+                    }
+                ],
+            }
+
+    tool = CallbackLessTool()
+    context = ExecutionContext(execution_id="callback-less-interaction")
+    context.add_user_message("Use the requested value.")
+    pattern = ReActPattern(max_iterations=2)
+    waiting = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "clarification_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert waiting["status"] == "waiting_for_user"
+
+    context.add_user_message("Use 42")
+    resumed_pattern = ReActPattern(max_iterations=2)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-call",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"Using 42.",'
+                                    '"outcome":"completed"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert resumed["success"] is True
+    assert resumed["completion_outcome"] == "completed"
+    assert resumed_pattern.pending_tool_interaction_responses == []
+    response_message = next(
+        message
+        for message in context.messages
+        if message.role == "user" and message.content == "Use 42"
+    )
+    waiting_metadata = response_message.metadata["response_to_waiting_for_user"]
+    assert waiting_metadata["requests"][0]["tool_name"] == "clarification_gate"
 
 
 @pytest.mark.asyncio
@@ -4696,6 +4790,34 @@ async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
         "interaction_id": "interaction-2",
         "response": "Reject second",
     }
+    assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_pending_interaction_without_resume_callback_is_skipped() -> None:
+    class CallbackLessTool:
+        metadata = SimpleNamespace(
+            name="clarification_gate",
+            description="No resume callback.",
+        )
+
+    pending = {
+        "tool_name": "clarification_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Use 42",
+    }
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [pending]
+    context = ExecutionContext(execution_id="callback-less-delivery")
+    runtime = PatternRuntime(execution_id="callback-less-delivery")
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[CallbackLessTool()],
+        context=context,
+        runtime=runtime,
+    )
+
     assert pattern.pending_tool_interaction_responses == []
 
 

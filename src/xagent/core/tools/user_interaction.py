@@ -2,13 +2,15 @@
 
 Tools opt into the control flow by returning a mapping whose ``status`` is
 ``waiting_for_user``.  The execution pattern presents the returned message,
-checkpoints, and stops the current run. After the user replies, the runtime
-delivers that reply to the exact suspended interaction through
-``resume_user_interaction`` before asking the model to replan.
+checkpoints, and stops the current run. After the user replies, the runtime asks
+the model to replan with the annotated response in context. Tools that keep
+server-owned interaction state may additionally implement
+``resume_user_interaction``; the runtime then delivers the reply to that exact
+suspended interaction before replanning.
 
-The response is delivered through a runtime capability instead of model
-arguments.  This keeps server-owned interaction state out of the prompt and
-lets tools decide how to interpret the user's answer.
+The optional runtime capability keeps server-owned interaction state out of
+model-generated tool arguments and lets those tools decide how to interpret the
+user's answer. Callback-less tools use the normal ReAct context and replan path.
 """
 
 from __future__ import annotations

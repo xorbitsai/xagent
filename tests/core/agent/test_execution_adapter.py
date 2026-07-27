@@ -963,6 +963,31 @@ def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None
     assert result["error"] == "ReActPattern interrupted."
 
 
+def test_execution_adapter_preserves_completion_outcome() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="partial",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = adapter._normalize_result(
+        result={
+            "status": "completed",
+            "success": True,
+            "output": "One item remains.",
+            "completion_outcome": "partial",
+        },
+        execution_type="agent_react",
+        execution_id="partial-exec",
+    )
+
+    assert result["completion_outcome"] == "partial"
+    assert result["metadata"]["completion_outcome"] == "partial"
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> None:
     tracer = TracerCheckpointStore()

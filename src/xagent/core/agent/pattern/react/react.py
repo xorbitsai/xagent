@@ -43,6 +43,10 @@ from typing import Any, cast
 
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
+from ....tools.user_interaction import (
+    tool_result_waits_for_user,
+    user_interaction_resume_callable,
+)
 from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
@@ -216,6 +220,7 @@ class ReActPattern(AgentPattern):
         self.force_final_answer_next = False
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
+        self.pending_tool_interaction_responses: list[dict[str, str]] = []
         self.task_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
@@ -743,7 +748,9 @@ class ReActPattern(AgentPattern):
                 "Produce the final user-facing answer by calling the final_answer "
                 "control tool exactly once using the accumulated conversation and "
                 "tool results. Do not call any other tool and do not output "
-                "tool-call markup as plain text. "
+                "tool-call markup as plain text. Set outcome=completed only when "
+                "every requested action or verification succeeded; otherwise set "
+                "outcome=partial or outcome=blocked and say what remains. "
                 f"{final_answer_language_rule()}"
             )
         elif has_tools:
@@ -1034,6 +1041,9 @@ class ReActPattern(AgentPattern):
             "force_final_answer_next": self.force_final_answer_next,
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
+            "pending_tool_interaction_responses": (
+                self.pending_tool_interaction_responses
+            ),
             "task_text": self.task_text,
             "last_response": self.last_response,
             "pending_tool_calls": self.pending_tool_calls,
@@ -1087,6 +1097,20 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request = (
             dict(waiting_request) if isinstance(waiting_request, dict) else None
         )
+        pending_interaction_responses = state.get("pending_tool_interaction_responses")
+        self.pending_tool_interaction_responses = [
+            {
+                "tool_name": str(item.get("tool_name") or ""),
+                "interaction_id": str(item.get("interaction_id") or ""),
+                "response": str(item.get("response") or ""),
+            }
+            for item in (
+                pending_interaction_responses
+                if isinstance(pending_interaction_responses, list)
+                else []
+            )
+            if isinstance(item, dict)
+        ]
         stored_task_text = state.get("task_text")
         self.task_text = str(stored_task_text) if stored_task_text else None
         self.last_response = state.get("last_response")
@@ -1129,9 +1153,13 @@ class ReActPattern(AgentPattern):
                 "context": context,
             }
 
-        self._mark_latest_user_message_as_waiting_response(
+        response = self._mark_latest_user_message_as_waiting_response(
             context=context,
             after_message_count=waiting_message_count,
+        )
+        self._queue_tool_interaction_responses(
+            waiting_request=self.waiting_for_user_request,
+            response=response or "",
         )
         waiting_task = self.waiting_for_user_request.get("task_text")
         if waiting_task and self.task_text is None:
@@ -1151,10 +1179,10 @@ class ReActPattern(AgentPattern):
         *,
         context: Any,
         after_message_count: int,
-    ) -> None:
+    ) -> str | None:
         messages = getattr(context, "messages", [])
         if not isinstance(messages, list):
-            return
+            return None
 
         for index in range(len(messages) - 1, after_message_count - 1, -1):
             message = messages[index]
@@ -1162,7 +1190,7 @@ class ReActPattern(AgentPattern):
                 continue
             metadata = dict(getattr(message, "metadata", {}) or {})
             if metadata.get("response_to_waiting_for_user"):
-                return
+                return str(getattr(message, "content", "") or "")
             waiting_request = self.waiting_for_user_request or {}
             metadata["response_to_waiting_for_user"] = {
                 "tool_name": waiting_request.get("tool_name"),
@@ -1170,9 +1198,41 @@ class ReActPattern(AgentPattern):
                 "question": waiting_request.get("message", ""),
                 "message_type": waiting_request.get("message_type", "question"),
                 "interactions": waiting_request.get("interactions"),
+                "requests": waiting_request.get("requests"),
             }
             messages[index] = replace(message, metadata=metadata)
+            return str(getattr(message, "content", "") or "")
+        return None
+
+    def _queue_tool_interaction_responses(
+        self,
+        *,
+        waiting_request: dict[str, Any],
+        response: str,
+    ) -> None:
+        """Persist a user's answer for each tool interaction in the pause."""
+
+        if waiting_request.get("kind") != "tool_waiting_for_user":
             return
+        raw_requests = waiting_request.get("requests")
+        requests = raw_requests if isinstance(raw_requests, list) else [waiting_request]
+        for request in requests:
+            if not isinstance(request, dict):
+                continue
+            tool_name = str(request.get("tool_name") or "")
+            if not tool_name:
+                continue
+            self.pending_tool_interaction_responses.append(
+                {
+                    "tool_name": tool_name,
+                    "interaction_id": str(
+                        request.get("interaction_id")
+                        or request.get("tool_call_id")
+                        or ""
+                    ),
+                    "response": response,
+                }
+            )
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
         if isinstance(response, str):
@@ -1355,10 +1415,15 @@ class ReActPattern(AgentPattern):
                     "name": "final_answer",
                     "description": (
                         "Finish the current ReAct step and send the final answer to "
-                        "the user. Use this once the latest tool results satisfy the "
-                        "current user request. Do not call additional tools after "
-                        "this. Set response_language to the target output language "
-                        "for this answer. "
+                        "the user. Set outcome=completed only when every requested "
+                        "action and verification succeeded. Use outcome=partial when "
+                        "some useful work succeeded but the request remains "
+                        "unfinished, or outcome=blocked when no further progress is "
+                        "possible without user input or an external state change. "
+                        "Never mark an answer completed when it admits work is "
+                        "unfinished. Do not call additional tools after this. Set "
+                        "response_language to the target output language for this "
+                        "answer. "
                         f"{final_answer_language_rule()}"
                     ),
                     "parameters": {
@@ -1377,8 +1442,19 @@ class ReActPattern(AgentPattern):
                                     f"{final_answer_language_rule()}"
                                 ),
                             },
+                            "outcome": {
+                                "type": "string",
+                                "enum": ["completed", "partial", "blocked"],
+                                "description": (
+                                    "Semantic outcome of the request. completed "
+                                    "means the whole request was carried out and "
+                                    "verified; partial means only part succeeded; "
+                                    "blocked means progress requires the user or an "
+                                    "external state change."
+                                ),
+                            },
                         },
-                        "required": ["response_language", "answer"],
+                        "required": ["response_language", "answer", "outcome"],
                     },
                 },
             },
@@ -1511,23 +1587,25 @@ class ReActPattern(AgentPattern):
 
         if name == "final_answer":
             answer = str(args.get("answer", ""))
+            outcome = self._final_answer_outcome(args.get("outcome"))
             self._record_tool_call(
                 tool_call,
                 status="completed",
-                result={"answer": answer},
+                result={"answer": answer, "outcome": outcome},
             )
             self.status = "completed"
             context.add_tool_result(
                 tool_name=name,
-                result={"answer": answer},
+                result={"answer": answer, "outcome": outcome},
                 tool_call_id=tool_call.get("id"),
             )
             if answer:
                 context.add_assistant_message(answer)
-            return await self._finalize_success(
+            return await self._finalize_outcome(
                 context=context,
                 runtime=runtime,
                 response=answer,
+                outcome=outcome,
             )
 
         if name == "send_message":
@@ -1716,6 +1794,97 @@ class ReActPattern(AgentPattern):
         )
         self._forget_tool_call_content(tool_call)
 
+    async def _pause_for_tool_results(
+        self,
+        *,
+        waiting_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any]:
+        """Publish tool-originated questions and checkpoint the suspended run."""
+
+        requests: list[dict[str, Any]] = []
+        interactions: list[dict[str, Any]] = []
+        used_fields: set[str] = set()
+        for tool_call, result in waiting_pairs:
+            request_interactions = _normalize_ask_user_interactions(
+                result.get("interactions", [])
+            )
+            for interaction in request_interactions:
+                item = dict(interaction)
+                base_field = str(item.get("field") or "response")
+                field = base_field
+                suffix = 2
+                while field in used_fields:
+                    field = f"{base_field}_{suffix}"
+                    suffix += 1
+                item["field"] = field
+                used_fields.add(field)
+                interactions.append(item)
+
+            requests.append(
+                {
+                    "tool_call_id": str(tool_call.get("id") or ""),
+                    "tool_name": str(tool_call.get("name") or ""),
+                    "interaction_id": str(
+                        result.get("interaction_id") or tool_call.get("id") or ""
+                    ),
+                    "message": str(
+                        result.get("message")
+                        or result.get("error")
+                        or "This tool requires user input before it can continue."
+                    ),
+                    "message_type": str(result.get("message_type") or "question"),
+                    "interactions": request_interactions,
+                }
+            )
+
+        if len(requests) == 1:
+            message = requests[0]["message"]
+            message_type = requests[0]["message_type"]
+        else:
+            message = "Multiple tools need your input before the task can continue:\n\n"
+            message += "\n".join(
+                f"- {request['tool_name']}: {request['message']}"
+                for request in requests
+            )
+            message_type = "question"
+
+        await runtime.send_message(
+            message=message,
+            message_type=message_type,
+            expect_response=True,
+            visible=True,
+            metadata={"interactions": interactions},
+        )
+        self.status = "waiting_for_user"
+        self.waiting_for_user_request = {
+            "kind": "tool_waiting_for_user",
+            "requests": requests,
+            "message": message,
+            "message_type": message_type,
+            "interactions": interactions,
+            "task_text": self.task_text,
+            "message_count": len(getattr(context, "messages", [])),
+        }
+        waiting_result = {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": message,
+            "message_type": message_type,
+            "interactions": interactions,
+            "context": context,
+        }
+        await runtime.checkpoint(
+            "waiting_for_user",
+            context=context,
+            pattern=self,
+            metadata={
+                "waiting_for_user_request": self.waiting_for_user_request,
+            },
+        )
+        return waiting_result
+
     async def _run_concurrent_batch(
         self,
         batch: list[dict[str, Any]],
@@ -1873,6 +2042,13 @@ class ReActPattern(AgentPattern):
                 result = await self._execute_tool_safely(tool_call, tools, runtime)
                 self._backfill_result(tool_call, result, context)
                 self.pending_tool_calls = self.pending_tool_calls[1:]
+                if tool_result_waits_for_user(result):
+                    assert isinstance(result, dict)
+                    return await self._pause_for_tool_results(
+                        waiting_pairs=[(tool_call, result)],
+                        context=context,
+                        runtime=runtime,
+                    )
                 await runtime.checkpoint(
                     "after_tool",
                     context=context,
@@ -1891,6 +2067,18 @@ class ReActPattern(AgentPattern):
                     segment, tools, runtime, context
                 )
                 self.pending_tool_calls = self.pending_tool_calls[len(segment) :]
+                waiting_pairs = [
+                    (waiting_call, waiting_result)
+                    for waiting_call, waiting_result in zip(segment, results)
+                    if tool_result_waits_for_user(waiting_result)
+                    and isinstance(waiting_result, dict)
+                ]
+                if waiting_pairs:
+                    return await self._pause_for_tool_results(
+                        waiting_pairs=waiting_pairs,
+                        context=context,
+                        runtime=runtime,
+                    )
                 await runtime.checkpoint(
                     "after_tool_batch",
                     context=context,
@@ -2271,15 +2459,44 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
         response: Any,
     ) -> dict[str, Any]:
+        return await self._finalize_outcome(
+            context=context,
+            runtime=runtime,
+            response=response,
+            outcome="completed",
+        )
+
+    @staticmethod
+    def _final_answer_outcome(value: Any) -> str:
+        outcome = str(value or "completed").strip().lower()
+        if outcome not in {"completed", "partial", "blocked"}:
+            return "blocked"
+        return outcome
+
+    async def _finalize_outcome(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        response: Any,
+        outcome: str,
+    ) -> dict[str, Any]:
+        """Finish the run while preserving its semantic completion outcome."""
+
         self.pending_tool_calls = []
         self.waiting_for_user_request = None
+        self.pending_tool_interaction_responses = []
         self.force_final_answer_next = False
         self.status = "completed"
         await runtime.checkpoint("final", context=context, pattern=self)
         result = PatternResult(
             success=True,
             output=response,
-            metadata={"response": response, "status": self.status},
+            metadata={
+                "response": response,
+                "status": self.status,
+                "completion_outcome": outcome,
+            },
         ).to_dict()
         return result
 
@@ -2443,6 +2660,16 @@ class ReActPattern(AgentPattern):
                 )
                 recorded_terminal = True
                 return error_result
+
+            if tool_result_waits_for_user(result):
+                self._record_tool_call(
+                    tool_call,
+                    status="waiting_for_user",
+                    result=result,
+                )
+                recorded_terminal = True
+                await runtime.on_tool_end(tool_call=tool_call, result=result)
+                return result
 
             if not self._tool_result_success(result):
                 error_message = str(
@@ -2661,6 +2888,10 @@ class ReActPattern(AgentPattern):
 
     async def _execute_tool(self, tool_call: dict[str, Any], tools: list[Any]) -> Any:
         tool = self._find_tool(tool_call["name"], tools)
+        await self._resume_tool_interaction_if_pending(
+            tool=tool,
+            tool_name=self._tool_name(tool),
+        )
         args = self._tool_args_for_execution(tool_call, tool)
 
         execute = getattr(tool, "execute", None)
@@ -2682,6 +2913,29 @@ class ReActPattern(AgentPattern):
         raise ValueError(
             f"Tool {tool_call['name']} does not expose a supported executor."
         )
+
+    async def _resume_tool_interaction_if_pending(
+        self,
+        *,
+        tool: Any,
+        tool_name: str,
+    ) -> None:
+        """Deliver one checkpointed user response to a matching capable tool."""
+
+        resume = user_interaction_resume_callable(tool)
+        if resume is None:
+            return
+        for index, pending in enumerate(self.pending_tool_interaction_responses):
+            if pending.get("tool_name") != tool_name:
+                continue
+            response = self.pending_tool_interaction_responses.pop(index)
+            resumed = resume(
+                interaction_id=response.get("interaction_id", ""),
+                response=response.get("response", ""),
+            )
+            if inspect.isawaitable(resumed):
+                await resumed
+            return
 
     def _tool_args_for_execution(
         self, tool_call: dict[str, Any], tool: Any

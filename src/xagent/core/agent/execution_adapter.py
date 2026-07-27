@@ -345,6 +345,10 @@ class AgentExecutionAdapter:
             },
             "agent_result": result,
         }
+        completion_outcome = result.get("completion_outcome")
+        if completion_outcome in {"completed", "partial", "blocked"}:
+            normalized["completion_outcome"] = completion_outcome
+            normalized["metadata"]["completion_outcome"] = completion_outcome
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

@@ -180,6 +180,21 @@ class FailingUserMessageCallback:
         raise RuntimeError("trace callback failed")
 
 
+class StatusAwareTeardownTool:
+    def __init__(self) -> None:
+        self.teardown_calls: list[tuple[str | None, str | None]] = []
+
+    async def setup(self, task_id: str | None = None) -> None:
+        return None
+
+    async def teardown(
+        self,
+        task_id: str | None = None,
+        execution_status: str | None = None,
+    ) -> None:
+        self.teardown_calls.append((task_id, execution_status))
+
+
 class RecordingTraceEventTracer:
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -314,6 +329,36 @@ async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None
     assert isinstance(pattern_call["runtime"], PatternRuntime)
     assert workspace_manager.calls[0]["task_id"] == "exec-1"
     assert callback.events == [("start", "exec-1"), ("end", "exec-1")]
+
+
+@pytest.mark.asyncio
+async def test_runner_passes_waiting_status_to_tool_teardown(tmp_path: Path) -> None:
+    tool = StatusAwareTeardownTool()
+    agent = Agent(
+        name="interactive",
+        patterns=[
+            FakePattern(
+                {
+                    "success": False,
+                    "status": "waiting_for_user",
+                    "message": "Provide the missing value.",
+                }
+            )
+        ],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task="Run an interactive tool",
+        execution_id="interaction-task",
+        extra_tools=[tool],
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert tool.teardown_calls == [("interaction-task", "waiting_for_user")]
 
 
 @pytest.mark.asyncio

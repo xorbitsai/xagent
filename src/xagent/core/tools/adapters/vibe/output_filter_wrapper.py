@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel
 
+from ...user_interaction import (
+    WAITING_FOR_USER_STATUS,
+    tool_result_waits_for_user,
+)
 from .base import AbstractBaseTool
 from .output_filter import OutputValueFilter
 
@@ -17,6 +21,27 @@ if TYPE_CHECKING:
     from .base import ToolCategory
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    """Return whether ``func`` accepts ``name`` as a keyword argument."""
+
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == name
+            and parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        )
+        for parameter in signature.parameters.values()
+    )
 
 
 class OutputFilteredToolWrapper(AbstractBaseTool):
@@ -92,12 +117,12 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         """Execute tool synchronously with output filtering."""
         result = self._target.run_json_sync(args)
-        return self._filter.filter(result, self._target.name)
+        return self._filter_result(result)
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute tool asynchronously with output filtering."""
         result = await self._target.run_json_async(args)
-        return self._filter.filter(result, self._target.name)
+        return self._filter_result(result)
 
     async def save_state_json(self) -> Mapping[str, Any]:
         """Save state (delegates to target tool)."""
@@ -112,10 +137,35 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         if hasattr(self._target, "setup"):
             await self._target.setup(task_id)
 
-    async def teardown(self, task_id: Optional[str] = None) -> None:
-        """Teardown tool (delegates to target tool)."""
-        if hasattr(self._target, "teardown"):
-            await self._target.teardown(task_id)
+    async def teardown(
+        self,
+        task_id: Optional[str] = None,
+        execution_status: Optional[str] = None,
+    ) -> None:
+        """Teardown the target without hiding the execution's final state."""
+
+        teardown = getattr(self._target, "teardown", None)
+        if teardown is None:
+            return
+        kwargs: dict[str, Any] = {"task_id": task_id}
+        if execution_status is not None and _accepts_kwarg(
+            teardown, "execution_status"
+        ):
+            kwargs["execution_status"] = execution_status
+        result = teardown(**kwargs)
+        if inspect.isawaitable(result):
+            await result
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate optional runtime capabilities to the wrapped tool."""
+
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            target = object.__getattribute__(self, "_target")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(target, name)
 
     @property
     def func(self) -> Any:
@@ -140,7 +190,7 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
 
         def wrapped_func(*args: Any, **kwargs: Any) -> Any:
             result = original_func(*args, **kwargs)
-            return self._filter.filter(result, self._target.name)
+            return self._filter_result(result)
 
         return wrapped_func
 
@@ -149,6 +199,26 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
 
         async def wrapped_func_async(*args: Any, **kwargs: Any) -> Any:
             result = await original_func(*args, **kwargs)
-            return self._filter.filter(result, self._target.name)
+            return self._filter_result(result)
 
         return wrapped_func_async
+
+    def _filter_result(self, result: Any) -> Any:
+        """Filter output without dropping the user-interaction control envelope."""
+
+        filtered = self._filter.filter(result, self._target.name)
+        if not tool_result_waits_for_user(result) or not isinstance(filtered, dict):
+            return filtered
+
+        filtered["status"] = WAITING_FOR_USER_STATUS
+        assert isinstance(result, dict)
+        for key in (
+            "interaction_id",
+            "message",
+            "message_type",
+            "interactions",
+        ):
+            if key not in result:
+                continue
+            filtered[key] = self._filter.filter(result[key], self._target.name)
+        return filtered

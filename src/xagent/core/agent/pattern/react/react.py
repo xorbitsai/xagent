@@ -1207,12 +1207,15 @@ class ReActPattern(AgentPattern):
     def _queue_tool_interaction_responses(
         self,
         *,
-        waiting_request: dict[str, Any],
+        waiting_request: Any,
         response: str,
     ) -> None:
         """Persist a user's answer for each tool interaction in the pause."""
 
-        if waiting_request.get("kind") != "tool_waiting_for_user":
+        if (
+            not isinstance(waiting_request, dict)
+            or waiting_request.get("kind") != "tool_waiting_for_user"
+        ):
             return
         raw_requests = waiting_request.get("requests")
         requests = raw_requests if isinstance(raw_requests, list) else [waiting_request]
@@ -1810,6 +1813,7 @@ class ReActPattern(AgentPattern):
             request_interactions = _normalize_ask_user_interactions(
                 result.get("interactions", [])
             )
+            deduplicated_request_interactions: list[dict[str, Any]] = []
             for interaction in request_interactions:
                 item = dict(interaction)
                 base_field = str(item.get("field") or "response")
@@ -1821,6 +1825,7 @@ class ReActPattern(AgentPattern):
                 item["field"] = field
                 used_fields.add(field)
                 interactions.append(item)
+                deduplicated_request_interactions.append(item)
 
             requests.append(
                 {
@@ -1835,7 +1840,7 @@ class ReActPattern(AgentPattern):
                         or "This tool requires user input before it can continue."
                     ),
                     "message_type": str(result.get("message_type") or "question"),
-                    "interactions": request_interactions,
+                    "interactions": deduplicated_request_interactions,
                 }
             )
 
@@ -2928,10 +2933,10 @@ class ReActPattern(AgentPattern):
         for index, pending in enumerate(self.pending_tool_interaction_responses):
             if pending.get("tool_name") != tool_name:
                 continue
-            response = self.pending_tool_interaction_responses.pop(index)
+            pending_response = self.pending_tool_interaction_responses.pop(index)
             resumed = resume(
-                interaction_id=response.get("interaction_id", ""),
-                response=response.get("response", ""),
+                interaction_id=pending_response.get("interaction_id", ""),
+                response=pending_response.get("response", ""),
             )
             if inspect.isawaitable(resumed):
                 await resumed

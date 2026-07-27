@@ -4579,6 +4579,20 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     )
 
 
+@pytest.mark.parametrize("waiting_request", [None, [], "malformed"])
+def test_tool_interaction_response_queue_ignores_malformed_requests(
+    waiting_request: Any,
+) -> None:
+    pattern = ReActPattern()
+
+    pattern._queue_tool_interaction_responses(
+        waiting_request=waiting_request,
+        response="Continue",
+    )
+
+    assert pattern.pending_tool_interaction_responses == []
+
+
 @pytest.mark.asyncio
 async def test_concurrent_tool_interactions_pause_in_one_deterministic_message() -> (
     None
@@ -4657,6 +4671,10 @@ async def test_concurrent_tool_interactions_pause_in_one_deterministic_message()
         "decision",
         "decision_2",
     ]
+    assert [
+        request["interactions"][0]["field"]
+        for request in pattern.waiting_for_user_request["requests"]
+    ] == ["decision", "decision_2"]
     assert len(runtime.outbound_messages) == 1
     assert pattern.tool_ledger["first-call"].status == "waiting_for_user"
     assert pattern.tool_ledger["second-call"].status == "waiting_for_user"

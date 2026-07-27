@@ -1539,7 +1539,8 @@ Build when you need.`,
       general_productivity: "General & Productivity",
       customer_service: "Customer Service",
       finance_lms_ops: "Finance, LMS & Ops",
-      security: "Security"
+      security: "Security",
+      operations: "Operations"
     },
     sections: {
       knowledge: "Knowledge & Research",

@@ -1539,7 +1539,8 @@ const zh = {
       general_productivity: "通用与效率",
       customer_service: "客户服务",
       finance_lms_ops: "金融、LMS 与运营",
-      security: "安全"
+      security: "安全",
+      operations: "运维"
     },
     sections: {
       knowledge: "知识与研究",

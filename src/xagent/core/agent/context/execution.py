@@ -40,6 +40,8 @@ from .skill_tool import LOADED_SKILLS_METADATA_KEY, SKILL_INDEX_METADATA_KEY
 READ_FILE_CONTEXT_LIMIT = 12_000
 COMPACT_SUMMARY_MAX_TOKENS = 1024
 COMPACT_SUMMARY_MIN_TOKENS = 256
+COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
+COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
 
 
 def _utcnow() -> datetime:
@@ -993,8 +995,11 @@ class ExecutionContext:
             )
 
         latest_user = self._latest_visible_user_message()
-        compacted_context_refs = self._context_refs_removed_by_compaction(latest_user)
-        summary_message = Message.role_system(
+        compacted_context_refs, dropped_context_refs = (
+            self._context_refs_removed_by_compaction(latest_user)
+        )
+        dropped_refs_notice = self._dropped_context_refs_notice(dropped_context_refs)
+        summary_content = (
             "Compacted conversation summary:\n"
             f"{summary}\n\n"
             "Use this summary as the current execution state. Continue from the "
@@ -1002,7 +1007,12 @@ class ExecutionContext:
             "regenerate completed artifacts unless the latest user request "
             "explicitly asks to restart, revise, or regenerate them. Current system "
             "instructions still take precedence, and the latest user request remains "
-            "the overall goal.",
+            "the overall goal."
+        )
+        if dropped_refs_notice:
+            summary_content = f"{summary_content}\n\n{dropped_refs_notice}"
+        summary_message = Message.role_system(
+            summary_content,
             metadata={"compacted_context": True},
             context_refs=compacted_context_refs,
         )
@@ -1019,6 +1029,8 @@ class ExecutionContext:
                 "removed_count": max(0, original_count - len(self.messages)),
                 "summary_chars": len(summary),
                 "compact_model": getattr(llm, "model_name", None),
+                "retained_context_ref_count": len(compacted_context_refs),
+                "dropped_context_ref_count": len(dropped_context_refs),
             },
         )
         if original_tokens is not None:
@@ -1027,23 +1039,69 @@ class ExecutionContext:
 
     def _context_refs_removed_by_compaction(
         self, latest_user: Message | None
-    ) -> tuple[ContextReference, ...]:
+    ) -> tuple[tuple[ContextReference, ...], tuple[ContextReference, ...]]:
         seen = (
             {reference.identity_key() for reference in latest_user.context_refs}
             if latest_user is not None
             else set()
         )
+        latest_user_tokens = (
+            sum(reference.estimated_tokens() for reference in latest_user.context_refs)
+            if latest_user is not None
+            else 0
+        )
+        remaining_tokens = max(
+            0,
+            min(
+                COMPACT_CONTEXT_REF_MAX_TOKENS,
+                max(0, self.compact_config.threshold // 8),
+            )
+            - latest_user_tokens,
+        )
         retained: list[ContextReference] = []
-        for message in self.messages:
+        dropped: list[ContextReference] = []
+        for message in reversed(self.messages):
             if message.hidden or message is latest_user:
                 continue
-            for reference in message.context_refs:
+            for reference in reversed(message.context_refs):
                 identity = reference.identity_key()
                 if identity in seen:
                     continue
                 seen.add(identity)
-                retained.append(reference)
-        return tuple(retained)
+                reference_tokens = reference.estimated_tokens()
+                if reference_tokens <= remaining_tokens:
+                    retained.append(reference)
+                    remaining_tokens -= reference_tokens
+                else:
+                    dropped.append(reference)
+        retained.reverse()
+        return tuple(retained), tuple(dropped)
+
+    @staticmethod
+    def _dropped_context_refs_notice(
+        references: tuple[ContextReference, ...],
+    ) -> str:
+        if not references:
+            return ""
+        prefix = (
+            "Older image references exceeded the structured-reference budget and "
+            "will not be automatically rematerialized after compaction. Durable "
+            "handles retained in this summary:\n"
+        )
+        lines: list[str] = []
+        current_chars = len(prefix)
+        omitted = 0
+        for reference in references:
+            filename = reference.safe_file_ref.get("filename") or "image"
+            line = f"- [image: {filename}, file_id={reference.file_id}]"
+            if current_chars + len(line) + 1 > COMPACT_DROPPED_REF_NOTICE_MAX_CHARS:
+                omitted += 1
+                continue
+            lines.append(line)
+            current_chars += len(line) + 1
+        if omitted:
+            lines.append(f"- ... {omitted} additional older reference(s) omitted")
+        return prefix + "\n".join(lines)
 
     def _latest_visible_user_message(self) -> Message | None:
         for message in reversed(self.messages):

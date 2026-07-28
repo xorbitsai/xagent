@@ -66,6 +66,10 @@ _MODALITY_ABILITIES = {
 }
 
 
+class RouterModalityRoutingError(RuntimeError):
+    """The installed router cannot enforce required input modalities."""
+
+
 def _should_retry_without_thinking(
     exc: Exception,
     *,
@@ -564,6 +568,8 @@ class RouterLLM(BaseLLM):
                 prompt,
                 preferred_input_modalities,
             )
+        except RouterModalityRoutingError:
+            raise
         except Exception as exc:  # noqa: BLE001 - routing must not crash the agent
             if self._fallback_model:
                 logger.warning(
@@ -602,6 +608,14 @@ class RouterLLM(BaseLLM):
         )
         if preferred_input_modalities and supports_modality_preferences:
             route_kwargs["preferred_input_modalities"] = preferred_input_modalities
+        elif preferred_input_modalities:
+            requested = ", ".join(preferred_input_modalities)
+            raise RouterModalityRoutingError(
+                "The installed xrouter-llm RoutingService cannot enforce input "
+                f"modalities ({requested}). Choose an explicit compatible model or "
+                "install an xrouter-llm build whose route() API accepts "
+                "preferred_input_modalities."
+            )
         result = service.route(prompt, **route_kwargs)
         return list(result.get("selected") or [])
 

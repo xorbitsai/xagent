@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -69,6 +69,7 @@ def _validated_metadata(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError("metadata must be an object")
     result = dict(value)
+    _validate_metadata_tree(result)
     try:
         serialized = json.dumps(
             result,
@@ -80,8 +81,12 @@ def _validated_metadata(value: Any) -> dict[str, Any]:
         raise ValueError("metadata must be JSON serializable") from exc
     if len(serialized.encode("utf-8")) > 32_768:
         raise ValueError("metadata must be at most 32 KiB")
-    _validate_metadata_tree(result)
-    return result
+    normalized_value: object = json.loads(serialized)
+    if not isinstance(normalized_value, dict):
+        raise ValueError("metadata must be an object")
+    normalized = cast(dict[str, Any], normalized_value)
+    _validate_metadata_tree(normalized)
+    return normalized
 
 
 def _validated_text_fallback(value: Any) -> str | None:

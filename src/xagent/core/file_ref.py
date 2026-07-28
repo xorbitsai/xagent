@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
@@ -189,9 +189,17 @@ def sanitize_file_ref_for_context(file_ref: dict[str, Any]) -> dict[str, Any]:
     )
     relative_path = file_ref.get("relative_path")
     if relative_path is not None:
-        relative = Path(str(relative_path))
-        if not relative.is_absolute() and ".." not in relative.parts:
-            result["relative_path"] = str(relative)
+        raw_relative = str(relative_path).strip()
+        windows_relative = PureWindowsPath(raw_relative)
+        relative = Path(raw_relative.replace("\\", "/"))
+        is_windows_rooted = bool(windows_relative.drive or windows_relative.root)
+        if (
+            raw_relative
+            and not is_windows_rooted
+            and not relative.is_absolute()
+            and ".." not in relative.parts
+        ):
+            result["relative_path"] = relative.as_posix()
     return result
 
 

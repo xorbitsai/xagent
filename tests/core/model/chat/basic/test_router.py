@@ -8,7 +8,10 @@ import pytest
 
 from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from xagent.core.model.chat.basic.base import BaseLLM
-from xagent.core.model.chat.basic.router import RouterLLM
+from xagent.core.model.chat.basic.router import (
+    RouterLLM,
+    RouterModalityRoutingError,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 _OPENROUTER_TOOL_CHOICE_ERROR = (
@@ -274,12 +277,11 @@ def test_route_sync_forwards_modalities_when_router_supports_them(
     ]
 
 
-def test_route_sync_keeps_older_router_api_compatible(monkeypatch) -> None:
-    calls: list[tuple[str, str]] = []
-
+def test_route_sync_rejects_older_router_api_for_modality_requests(
+    monkeypatch,
+) -> None:
     class Service:
         def route(self, prompt: str, *, config_name: str) -> dict[str, Any]:
-            calls.append((prompt, config_name))
             return {"selected": ["text/model"]}
 
     monkeypatch.setattr(
@@ -287,10 +289,30 @@ def test_route_sync_keeps_older_router_api_compatible(monkeypatch) -> None:
         lambda: Service(),
     )
 
-    selected = RouterLLM()._route_sync("inspect", ("image",))
+    with pytest.raises(RouterModalityRoutingError, match="image"):
+        RouterLLM()._route_sync("inspect", ("image",))
 
-    assert selected == ["text/model"]
-    assert calls == [("inspect", "auto")]
+
+@pytest.mark.asyncio
+async def test_modality_support_error_is_not_hidden_by_generic_fallback(
+    monkeypatch,
+) -> None:
+    class Service:
+        def route(self, prompt: str, *, config_name: str) -> dict[str, Any]:
+            return {"selected": ["text/model"]}
+
+    monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "fallback/model")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+    router = RouterLLM()
+
+    with pytest.raises(RouterModalityRoutingError, match="explicit compatible model"):
+        await router._select_model(
+            "inspect",
+            preferred_input_modalities=("image",),
+        )
 
 
 @pytest.mark.asyncio

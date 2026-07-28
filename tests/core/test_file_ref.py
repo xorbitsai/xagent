@@ -4,6 +4,7 @@ from xagent.core.file_ref import (
     build_file_id_ref,
     build_file_ref,
     parse_file_id_ref,
+    sanitize_file_ref_for_context,
 )
 
 
@@ -64,3 +65,39 @@ def test_build_file_ref_uses_canonical_file_id_ref() -> None:
 def test_build_file_id_ref_rejects_path_like_values(file_id: str) -> None:
     with pytest.raises(ValueError):
         build_file_id_ref(file_id)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        r"C:\Users\name\file.png",
+        r"..\secret.png",
+        r"images\..\secret.png",
+        r"\\server\share\file.png",
+        r"\rooted\file.png",
+    ],
+)
+def test_context_file_ref_rejects_windows_shaped_paths(relative_path: str) -> None:
+    result = sanitize_file_ref_for_context(
+        {
+            "file_id": "image-1",
+            "filename": "frame.png",
+            "mime_type": "image/png",
+            "relative_path": relative_path,
+        }
+    )
+
+    assert "relative_path" not in result
+
+
+def test_context_file_ref_normalizes_safe_windows_separators() -> None:
+    result = sanitize_file_ref_for_context(
+        {
+            "file_id": "image-1",
+            "filename": "frame.png",
+            "mime_type": "image/png",
+            "relative_path": r"images\frame.png",
+        }
+    )
+
+    assert result["relative_path"] == "images/frame.png"

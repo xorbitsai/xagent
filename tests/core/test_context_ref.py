@@ -6,7 +6,11 @@ import pytest
 from pydantic import ValidationError
 
 from xagent.core.agent.context import ExecutionContext, Message
-from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
+from xagent.core.context_ref import (
+    CONTEXT_REFS_KEY,
+    ContextReference,
+    ImageDetail,
+)
 
 
 def image_reference() -> ContextReference:
@@ -92,6 +96,30 @@ def test_context_reference_rejects_paths_nested_in_metadata() -> None:
                 "mime_type": "image/png",
             },
             metadata={"source": "/private/frame.png"},
+        )
+
+
+def test_context_reference_validates_json_normalized_tuple_metadata() -> None:
+    reference = ContextReference(
+        file_ref={
+            "file_id": "image-1",
+            "filename": "frame.png",
+            "mime_type": "image/png",
+        },
+        metadata={"viewport": (1280, 720)},
+    )
+
+    assert reference.metadata == {"viewport": [1280, 720]}
+    assert ContextReference.model_validate(reference.durable_dict()) == reference
+
+    with pytest.raises(ValidationError, match="absolute filesystem paths"):
+        ContextReference(
+            file_ref={
+                "file_id": "image-1",
+                "filename": "frame.png",
+                "mime_type": "image/png",
+            },
+            metadata={"values": ("/private/frame.png",)},
         )
 
 
@@ -188,3 +216,31 @@ def test_llm_compaction_deduplicates_refs_already_on_latest_user() -> None:
 
     assert context.messages[0].context_refs == ()
     assert context.messages[1].context_refs == (image_reference(),)
+
+
+def test_llm_compaction_bounds_structured_refs_and_keeps_recent_handles() -> None:
+    context = ExecutionContext()
+    for index in range(5):
+        context.add_user_message(
+            f"inspect {index}",
+            context_refs=[
+                ContextReference(
+                    file_ref={
+                        "file_id": f"image-{index}",
+                        "filename": f"frame-{index}.png",
+                        "mime_type": "image/png",
+                    },
+                    detail=ImageDetail.HIGH,
+                )
+            ],
+        )
+    context.add_user_message("continue")
+
+    result = context.compact_with_llm_response("Continue the image analysis.")
+
+    retained_ids = [reference.file_id for reference in context.messages[0].context_refs]
+    assert retained_ids == ["image-3", "image-4"]
+    assert "file_id=image-2" in context.messages[0].content
+    assert "file_id=image-0" in context.messages[0].content
+    assert result.metadata["retained_context_ref_count"] == 2
+    assert result.metadata["dropped_context_ref_count"] == 3

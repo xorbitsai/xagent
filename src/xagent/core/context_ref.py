@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from enum import Enum
 from typing import Any, Literal
 
@@ -9,6 +10,57 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .file_ref import sanitize_file_ref_for_context
 
 CONTEXT_REFS_KEY = "_xagent_context_refs"
+
+_PATH_METADATA_PARTS = {
+    "cwd",
+    "dir",
+    "directory",
+    "directories",
+    "home",
+    "path",
+    "paths",
+}
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_COMMON_PRIVATE_PATH_RE = re.compile(
+    r"(?:^|\s)/(?:Users|home|private|root|tmp|var/folders|workspace)(?:/|\s|$)"
+)
+
+
+def _contains_materialized_image(value: str) -> bool:
+    normalized = value.lower()
+    return "data:image/" in normalized and ";base64," in normalized
+
+
+def _metadata_key_is_path_like(key: str) -> bool:
+    parts = {part for part in re.split(r"[^a-z0-9]+", key.lower()) if part}
+    return bool(parts & _PATH_METADATA_PARTS)
+
+
+def _validate_metadata_tree(value: Any, *, key: str | None = None) -> None:
+    if key is not None and _metadata_key_is_path_like(key):
+        if value not in (None, "", [], {}):
+            raise ValueError(f"metadata field {key!r} must not contain a path")
+
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            if not isinstance(child_key, str):
+                raise ValueError("metadata keys must be strings")
+            _validate_metadata_tree(child_value, key=child_key)
+        return
+    if isinstance(value, list):
+        for child in value:
+            _validate_metadata_tree(child)
+        return
+    if isinstance(value, str):
+        if _contains_materialized_image(value):
+            raise ValueError("metadata must not contain materialized image data")
+        stripped = value.strip()
+        if _WINDOWS_ABSOLUTE_PATH_RE.match(stripped) or (
+            stripped.startswith("/") and not stripped.startswith("//")
+        ):
+            raise ValueError("metadata must not contain absolute filesystem paths")
+        if _COMMON_PRIVATE_PATH_RE.search(value):
+            raise ValueError("metadata must not contain private filesystem paths")
 
 
 def _validated_metadata(value: Any) -> dict[str, Any]:
@@ -28,10 +80,17 @@ def _validated_metadata(value: Any) -> dict[str, Any]:
         raise ValueError("metadata must be JSON serializable") from exc
     if len(serialized.encode("utf-8")) > 32_768:
         raise ValueError("metadata must be at most 32 KiB")
-    normalized = serialized.lower()
-    if "data:image/" in normalized and ";base64," in normalized:
-        raise ValueError("metadata must not contain materialized image data")
+    _validate_metadata_tree(result)
     return result
+
+
+def _validated_text_fallback(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if _contains_materialized_image(text):
+        raise ValueError("text_fallback must not contain materialized image data")
+    return text
 
 
 class ImageDetail(str, Enum):
@@ -73,6 +132,11 @@ class ContextReference(BaseModel):
     def _copy_metadata(cls, value: Any) -> dict[str, Any]:
         return _validated_metadata(value)
 
+    @field_validator("text_fallback", mode="before")
+    @classmethod
+    def _sanitize_text_fallback(cls, value: Any) -> str | None:
+        return _validated_text_fallback(value)
+
     @property
     def file_id(self) -> str:
         return str(self.safe_file_ref["file_id"])
@@ -88,8 +152,9 @@ class ContextReference(BaseModel):
             "detail": self.detail.value,
             "metadata": _validated_metadata(self.metadata),
         }
-        if self.text_fallback is not None:
-            result["text_fallback"] = self.text_fallback
+        text_fallback = _validated_text_fallback(self.text_fallback)
+        if text_fallback is not None:
+            result["text_fallback"] = text_fallback
         return result
 
     def identity_key(self) -> str:

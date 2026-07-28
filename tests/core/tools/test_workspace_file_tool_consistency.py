@@ -391,6 +391,47 @@ class TestWorkspaceFileToolConsistency:
 
         assert workspace.resolve_file_id("foreign-file") is None
 
+    def test_resolve_file_id_detached_uses_worker_owned_session(self, tmp_path, mocker):
+        """Detached resolution must not reuse the caller's SQLAlchemy session."""
+        registered_file = tmp_path / "registered.txt"
+        registered_file.write_text("content")
+        workspace = TaskWorkspace("web_task_10", str(tmp_path))
+
+        class BoundSession:
+            def query(self, *_args):
+                raise AssertionError("caller-owned session must not be reused")
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return SimpleNamespace(
+                    file_id="registered-file",
+                    user_id=1,
+                    task_id=None,
+                    storage_path=str(registered_file),
+                )
+
+        class WorkerSession:
+            closed = False
+
+            def query(self, *_args):
+                return FakeQuery()
+
+            def close(self):
+                self.closed = True
+
+        worker_session = WorkerSession()
+        workspace.db_session = BoundSession()
+        mocker.patch(
+            "xagent.core.storage.manager.create_db_session",
+            return_value=worker_session,
+        )
+
+        assert workspace.resolve_file_id_detached("registered-file") == registered_file
+        assert worker_session.closed is True
+
     def test_resolve_file_id_rejects_durable_only_other_user_records(
         self, tmp_path, mocker
     ):

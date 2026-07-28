@@ -982,6 +982,24 @@ class TaskWorkspace:
         return resolved == scoped_root or resolved.is_relative_to(scoped_root)
 
     def resolve_file_id(self, file_id: str) -> Optional[Path]:
+        return self._resolve_file_id(file_id, use_bound_db_session=True)
+
+    def resolve_file_id_detached(self, file_id: str) -> Optional[Path]:
+        """Resolve a file ID without reusing the caller's database session.
+
+        This variant is safe to invoke from a worker thread. It preserves the
+        same workspace ownership and scope checks as :meth:`resolve_file_id`,
+        while opening and closing its own session when a database lookup is
+        needed.
+        """
+        return self._resolve_file_id(file_id, use_bound_db_session=False)
+
+    def _resolve_file_id(
+        self,
+        file_id: str,
+        *,
+        use_bound_db_session: bool,
+    ) -> Optional[Path]:
         raw_file_id = str(file_id).strip()
         file_id = parse_file_id_ref(raw_file_id) or raw_file_id
         if not file_id:
@@ -1011,7 +1029,7 @@ class TaskWorkspace:
         try:
             from ..web.models.uploaded_file import UploadedFile
 
-            if self.db_session is not None:
+            if use_bound_db_session and self.db_session is not None:
                 db = self.db_session
                 should_close = False
             else:

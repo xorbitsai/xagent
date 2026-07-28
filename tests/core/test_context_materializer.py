@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -215,6 +216,7 @@ async def test_nonvision_model_receives_file_ref_text_fallback() -> None:
 @pytest.mark.asyncio
 async def test_workspace_resolver_enforces_size_limit_and_caches(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     image_path = tmp_path / "frame.png"
     image_path.write_bytes(b"image")
@@ -233,17 +235,83 @@ async def test_workspace_resolver_enforces_size_limit_and_caches(
         cache_size=1,
         max_image_bytes=5,
     )
+    read_calls = 0
+    original_read_generation = resolver._read_generation
+
+    def counted_read_generation(*args: Any) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        return original_read_generation(*args)
+
+    monkeypatch.setattr(resolver, "_read_generation", counted_read_generation)
 
     first = await resolver.resolve_image(image_reference())
     second = await resolver.resolve_image(image_reference())
 
     assert first == second
-    assert workspace.calls == 1
+    assert workspace.calls == 2
+    assert read_calls == 1
 
     image_path.write_bytes(b"too-large")
     resolver.clear()
     with pytest.raises(RuntimeError, match="exceeds"):
         await resolver.resolve_image(image_reference())
+
+
+@pytest.mark.asyncio
+async def test_workspace_resolver_invalidates_cache_when_file_id_generation_changes(
+    tmp_path: Path,
+) -> None:
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    first_path.write_bytes(b"first")
+    second_path.write_bytes(b"second")
+
+    class Workspace:
+        current_path = first_path
+
+        def resolve_file_id(self, file_id: str) -> Path:
+            assert file_id == "image-1"
+            return self.current_path
+
+    workspace = Workspace()
+    resolver = WorkspaceContextReferenceResolver(workspace)
+
+    first = await resolver.resolve_image(image_reference())
+    workspace.current_path = second_path
+    second = await resolver.resolve_image(image_reference())
+
+    assert first.endswith("Zmlyc3Q=")
+    assert second.endswith("c2Vjb25k")
+    assert first != second
+
+
+@pytest.mark.asyncio
+async def test_workspace_resolver_prefers_detached_resolution_off_event_loop(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "frame.png"
+    image_path.write_bytes(b"image")
+    event_loop_thread = threading.get_ident()
+
+    class Workspace:
+        resolver_thread: int | None = None
+
+        def resolve_file_id(self, file_id: str) -> Path:
+            raise AssertionError("bound-session resolver must not be used")
+
+        def resolve_file_id_detached(self, file_id: str) -> Path:
+            assert file_id == "image-1"
+            self.resolver_thread = threading.get_ident()
+            return image_path
+
+    workspace = Workspace()
+    resolver = WorkspaceContextReferenceResolver(workspace)
+
+    await resolver.resolve_image(image_reference())
+
+    assert workspace.resolver_thread is not None
+    assert workspace.resolver_thread != event_loop_thread
 
 
 @pytest.mark.asyncio
@@ -307,6 +375,34 @@ async def test_react_materializes_refs_only_at_llm_boundary() -> None:
     durable_payload = json.dumps(context.to_dict())
     assert "image-1" in durable_payload
     assert "base64" not in durable_payload
+
+
+@pytest.mark.asyncio
+async def test_llm_compaction_retains_and_materializes_older_context_refs() -> None:
+    context = ExecutionContext(system_prompt="Inspect the image.")
+    context.add_user_message("What was visible?", context_refs=[image_reference()])
+    context.add_assistant_message("I will inspect it.")
+    context.add_user_message("Continue from the prior image.")
+
+    result = context.compact_with_llm_response("The image still needs inspection.")
+
+    assert result.compacted is True
+    assert context.messages[0].context_refs == (image_reference(),)
+    assert context.messages[1].context_refs == ()
+    assert "base64" not in json.dumps(context.to_dict())
+
+    materialized = await materialize_messages(
+        llm=VisionLLM(),
+        messages=context.get_messages_for_llm(),
+        resolver=Resolver(),
+    )
+
+    continuity = next(
+        message for message in materialized if isinstance(message.get("content"), list)
+    )
+    assert continuity["content"][1]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
 
 
 @pytest.mark.asyncio

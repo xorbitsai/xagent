@@ -73,6 +73,40 @@ def test_context_reference_rejects_materialized_image_in_metadata() -> None:
         )
 
 
+def test_context_reference_rejects_paths_nested_in_metadata() -> None:
+    with pytest.raises(ValidationError, match="must not contain a path"):
+        ContextReference(
+            file_ref={
+                "file_id": "image-1",
+                "filename": "frame.png",
+                "mime_type": "image/png",
+            },
+            metadata={"capture": {"file_path": "/private/frame.png"}},
+        )
+
+    with pytest.raises(ValidationError, match="absolute filesystem paths"):
+        ContextReference(
+            file_ref={
+                "file_id": "image-1",
+                "filename": "frame.png",
+                "mime_type": "image/png",
+            },
+            metadata={"source": "/private/frame.png"},
+        )
+
+
+def test_context_reference_rejects_materialized_image_in_text_fallback() -> None:
+    with pytest.raises(ValidationError, match="text_fallback"):
+        ContextReference(
+            file_ref={
+                "file_id": "image-1",
+                "filename": "frame.png",
+                "mime_type": "image/png",
+            },
+            text_fallback="data:image/png;base64,c2NyZWVuc2hvdA==",
+        )
+
+
 def test_durable_dict_resanitizes_nested_mutations() -> None:
     reference = image_reference()
     reference.file_ref["file_path"] = "/private/late-mutation.png"
@@ -83,6 +117,10 @@ def test_durable_dict_resanitizes_nested_mutations() -> None:
 
     reference.metadata.pop("image")
     assert "file_path" not in reference.durable_dict()["file_ref"]
+
+    reference.metadata["capture"] = {"file_path": "/private/late-mutation.png"}
+    with pytest.raises(ValueError, match="must not contain a path"):
+        reference.durable_dict()
 
 
 def test_context_reference_survives_checkpoint_round_trip() -> None:
@@ -138,3 +176,15 @@ def test_compaction_transcript_preserves_file_id_without_binary_data() -> None:
     assert "file_id=image-1" in transcript
     assert "base64" not in transcript
     assert context.estimate_context_tokens() > len("inspect") // 4
+
+
+def test_llm_compaction_deduplicates_refs_already_on_latest_user() -> None:
+    context = ExecutionContext()
+    context.add_user_message("inspect", context_refs=[image_reference()])
+    context.add_assistant_message("continuing")
+    context.add_user_message("use it again", context_refs=[image_reference()])
+
+    context.compact_with_llm_response("Continue inspecting the same image.")
+
+    assert context.messages[0].context_refs == ()
+    assert context.messages[1].context_refs == (image_reference(),)

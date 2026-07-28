@@ -8,6 +8,8 @@ from typing import Any
 from uuid import uuid4
 
 from ...context_ref import (
+    CONTEXT_REFS_KEY,
+    ContextReference,
     normalize_context_references,
     split_tool_result_context_references,
 )
@@ -345,17 +347,20 @@ class ExecutionContext:
             if include_system and message_dict.get("role") == "system":
                 content = str(message_dict.get("content") or "").strip()
                 if content:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Previous system-context message retained for "
-                                "continuity. Current system instructions above "
-                                "take precedence:\n"
-                                f"{content}"
-                            ),
-                        }
-                    )
+                    continuity_message: dict[str, Any] = {
+                        "role": "user",
+                        "content": (
+                            "Previous system-context message retained for "
+                            "continuity. Current system instructions above "
+                            "take precedence:\n"
+                            f"{content}"
+                        ),
+                    }
+                    if CONTEXT_REFS_KEY in message_dict:
+                        continuity_message[CONTEXT_REFS_KEY] = message_dict[
+                            CONTEXT_REFS_KEY
+                        ]
+                    messages.append(continuity_message)
                 continue
             messages.append(message_dict)
 
@@ -988,6 +993,7 @@ class ExecutionContext:
             )
 
         latest_user = self._latest_visible_user_message()
+        compacted_context_refs = self._context_refs_removed_by_compaction(latest_user)
         summary_message = Message.role_system(
             "Compacted conversation summary:\n"
             f"{summary}\n\n"
@@ -998,6 +1004,7 @@ class ExecutionContext:
             "instructions still take precedence, and the latest user request remains "
             "the overall goal.",
             metadata={"compacted_context": True},
+            context_refs=compacted_context_refs,
         )
         next_messages = [summary_message]
         if latest_user is not None:
@@ -1017,6 +1024,26 @@ class ExecutionContext:
         if original_tokens is not None:
             return self._annotate_compact_result(result, original_tokens)
         return result
+
+    def _context_refs_removed_by_compaction(
+        self, latest_user: Message | None
+    ) -> tuple[ContextReference, ...]:
+        seen = (
+            {reference.identity_key() for reference in latest_user.context_refs}
+            if latest_user is not None
+            else set()
+        )
+        retained: list[ContextReference] = []
+        for message in self.messages:
+            if message.hidden or message is latest_user:
+                continue
+            for reference in message.context_refs:
+                identity = reference.identity_key()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                retained.append(reference)
+        return tuple(retained)
 
     def _latest_visible_user_message(self) -> Message | None:
         for message in reversed(self.messages):

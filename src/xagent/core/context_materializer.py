@@ -6,7 +6,7 @@ import logging
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from .context_ref import (
     CONTEXT_REFS_KEY,
@@ -21,6 +21,18 @@ _IMAGE_CONTEXT_PLACEHOLDER = "Image context for the preceding message."
 
 class ContextReferenceResolutionError(RuntimeError):
     """A durable context reference could not be safely materialized."""
+
+
+class _FileGenerationChanged(RuntimeError):
+    """The resolved file changed while it was being materialized."""
+
+
+class _FileGeneration(NamedTuple):
+    path: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
 
 
 class ContextReferenceResolver(Protocol):
@@ -45,60 +57,112 @@ class WorkspaceContextReferenceResolver:
         self._cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
 
     async def resolve_image(self, reference: ContextReference) -> str:
-        cache_key = self._cache_key(reference)
-        cached = self._cache.get(cache_key)
-        now = time.monotonic()
-        if cached is not None:
-            created_at, data_url = cached
-            if now - created_at <= self.cache_ttl_seconds:
-                self._cache.move_to_end(cache_key)
-                return data_url
-            self._cache.pop(cache_key, None)
-
-        resolve_file_id = getattr(self.workspace, "resolve_file_id", None)
-        if not callable(resolve_file_id):
-            raise ContextReferenceResolutionError(
-                "workspace must expose resolve_file_id"
-            )
-        path = resolve_file_id(reference.file_id)
-        if path is None:
-            raise FileNotFoundError(
-                f"unable to resolve context FileRef {reference.file_id!r}"
-            )
-
-        resolved_path = Path(path)
-        file_size = await asyncio.to_thread(lambda: resolved_path.stat().st_size)
-        if file_size > self.max_image_bytes:
-            raise ContextReferenceResolutionError(
-                f"context image exceeds {self.max_image_bytes} bytes"
-            )
         mime_type = str(reference.safe_file_ref.get("mime_type") or "image/png")
         if not mime_type.startswith("image/"):
             raise ContextReferenceResolutionError(
                 f"unsupported context image MIME type: {mime_type}"
             )
 
-        image_bytes = await asyncio.to_thread(resolved_path.read_bytes)
-        if len(image_bytes) > self.max_image_bytes:
-            raise ContextReferenceResolutionError(
-                f"context image exceeds {self.max_image_bytes} bytes"
+        for attempt in range(2):
+            resolved_path, generation = await asyncio.to_thread(
+                self._resolve_generation,
+                reference.file_id,
             )
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        data_url = f"data:{mime_type};base64,{encoded}"
-        self._cache[cache_key] = (now, data_url)
-        while len(self._cache) > self.cache_size:
-            self._cache.popitem(last=False)
-        return data_url
+            if generation.size > self.max_image_bytes:
+                raise ContextReferenceResolutionError(
+                    f"context image exceeds {self.max_image_bytes} bytes"
+                )
+
+            cache_key = self._cache_key(reference, generation)
+            now = time.monotonic()
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                created_at, data_url = cached
+                if now - created_at <= self.cache_ttl_seconds:
+                    self._cache.move_to_end(cache_key)
+                    return data_url
+                self._cache.pop(cache_key, None)
+
+            try:
+                image_bytes = await asyncio.to_thread(
+                    self._read_generation,
+                    resolved_path,
+                    generation,
+                )
+            except _FileGenerationChanged as exc:
+                if attempt == 0:
+                    continue
+                raise ContextReferenceResolutionError(
+                    "context image changed while it was being read"
+                ) from exc
+
+            if len(image_bytes) > self.max_image_bytes:
+                raise ContextReferenceResolutionError(
+                    f"context image exceeds {self.max_image_bytes} bytes"
+                )
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            data_url = f"data:{mime_type};base64,{encoded}"
+            self._cache[cache_key] = (time.monotonic(), data_url)
+            while len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+            return data_url
+
+        raise ContextReferenceResolutionError("unable to read a stable context image")
 
     def clear(self) -> None:
         self._cache.clear()
 
+    def _resolve_generation(
+        self,
+        file_id: str,
+    ) -> tuple[Path, _FileGeneration]:
+        resolve_file_id = getattr(self.workspace, "resolve_file_id_detached", None)
+        if not callable(resolve_file_id):
+            resolve_file_id = getattr(self.workspace, "resolve_file_id", None)
+        if not callable(resolve_file_id):
+            raise ContextReferenceResolutionError(
+                "workspace must expose resolve_file_id"
+            )
+        path = resolve_file_id(file_id)
+        if path is None:
+            raise FileNotFoundError(f"unable to resolve context FileRef {file_id!r}")
+
+        resolved_path = Path(path).resolve(strict=True)
+        return resolved_path, self._generation(resolved_path)
+
     @staticmethod
-    def _cache_key(reference: ContextReference) -> str:
+    def _generation(path: Path) -> _FileGeneration:
+        stat = path.stat()
+        return _FileGeneration(
+            path=str(path),
+            device=stat.st_dev,
+            inode=stat.st_ino,
+            size=stat.st_size,
+            modified_ns=stat.st_mtime_ns,
+        )
+
+    def _read_generation(
+        self,
+        path: Path,
+        expected: _FileGeneration,
+    ) -> bytes:
+        if self._generation(path) != expected:
+            raise _FileGenerationChanged
+        image_bytes = path.read_bytes()
+        if self._generation(path) != expected:
+            raise _FileGenerationChanged
+        return image_bytes
+
+    @staticmethod
+    def _cache_key(
+        reference: ContextReference,
+        generation: _FileGeneration,
+    ) -> str:
         digest = reference.metadata.get("sha256")
+        generation_key = ":".join(str(part) for part in generation)
         if isinstance(digest, str) and digest:
-            return f"{reference.file_id}:{digest}"
-        return reference.file_id
+            return f"{reference.file_id}:{digest}:{generation_key}"
+        return f"{reference.file_id}:{generation_key}"
 
 
 def llm_supports_vision(llm: Any) -> bool:

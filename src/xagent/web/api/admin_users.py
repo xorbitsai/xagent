@@ -6,7 +6,11 @@ from sqlalchemy.orm import Session
 
 from ...core.task_runtime import TaskRuntimeContext
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db, get_session_local
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
 from ..models.task import Task
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
@@ -94,13 +98,6 @@ async def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Delete related data in correct order to respect foreign key constraints
-    from ..models.mcp import UserMCPServer
-
-    # Existing deployments may still have the removed Text2SQL table. Clean it
-    # up by table name so user deletion keeps working under strict FK checks.
-    _delete_legacy_text2sql_rows(db, user_id)
-
     session_factory = get_session_local()
     task_runtime_contexts = [
         TaskRuntimeContext(
@@ -117,17 +114,7 @@ async def delete_user(
         .filter(Task.user_id == user_id)
         .all()
     ]
-
-    # Delete user's tasks
-    db.query(Task).filter(Task.user_id == user_id).delete()
-
-    # Delete user's MCP server associations (not the servers themselves)
-    db.query(UserMCPServer).filter(UserMCPServer.user_id == user_id).delete()
-
-    # Delete the user (UserModel and UserDefaultModel have cascade delete)
-    db.delete(user)
-    db.commit()
-    ModelStore(db).invalidate_after_user_delete()
+    release_db_connection_if_clean(db)
 
     for context in task_runtime_contexts:
         try:
@@ -139,5 +126,29 @@ async def delete_user(
                 context.task_id,
                 exc_info=True,
             )
+
+    # Re-read after the await: releasing the clean read transaction above may
+    # expire ORM state, and extension hooks use their own short sessions.
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Delete related data in correct order to respect foreign key constraints.
+    from ..models.mcp import UserMCPServer
+
+    # Existing deployments may still have the removed Text2SQL table. Clean it
+    # up by table name so user deletion keeps working under strict FK checks.
+    _delete_legacy_text2sql_rows(db, user_id)
+
+    # Delete user's tasks
+    db.query(Task).filter(Task.user_id == user_id).delete()
+
+    # Delete user's MCP server associations (not the servers themselves)
+    db.query(UserMCPServer).filter(UserMCPServer.user_id == user_id).delete()
+
+    # Delete the user (UserModel and UserDefaultModel have cascade delete)
+    db.delete(user)
+    db.commit()
+    ModelStore(db).invalidate_after_user_delete()
 
     return {"message": "User deleted successfully"}

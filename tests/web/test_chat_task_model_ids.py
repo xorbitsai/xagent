@@ -1227,6 +1227,7 @@ class _TaskRuntimeProvider:
         self.metadata_error = metadata_error
         self.events: list[tuple[str, int]] = []
         self.configuration: dict | None = None
+        self.task_existed_on_delete: list[bool] = []
 
     async def on_task_created(self, context, configuration):
         self.events.append(("created", context.task_id))
@@ -1245,6 +1246,15 @@ class _TaskRuntimeProvider:
         return {"target": self.configuration["target"]} if self.configuration else {}
 
     async def on_task_deleted(self, context):
+        from xagent.web.models.task import Task
+
+        db = context.session_factory()
+        try:
+            self.task_existed_on_delete.append(
+                db.query(Task).filter(Task.id == context.task_id).count() == 1
+            )
+        finally:
+            db.close()
         self.events.append(("deleted", context.task_id))
 
 
@@ -1299,6 +1309,7 @@ def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
             ("created", task_id),
             ("deleted", task_id),
         ]
+        assert provider.task_existed_on_delete == [True]
     finally:
         unregister_task_extension("test_runtime")
 

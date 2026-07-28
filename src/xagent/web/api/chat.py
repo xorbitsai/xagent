@@ -4327,72 +4327,89 @@ async def delete_task(
 ) -> Dict[str, Any]:
     """Delete a task and all related data"""
     try:
-        # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _delete_task_sync() -> tuple[Task, TaskRuntimeContext]:
-            # Get task - admin can delete any task, regular users can only delete their own
-            if user.is_admin:
-                task = db.query(Task).filter(Task.id == task_id).first()
-            else:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
-                    .first()
-                )
-            if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
-            runtime_context = _task_runtime_context(
-                task_id=int(task.id),
-                user_id=int(task.user_id),
-                source=task.source,
+        requester_user_id = int(user.id)
+        # Load detached task details on the request thread before awaiting
+        # provider cleanup. Providers may need their task-bound rows to release
+        # external resources, so the hook must run before the core DELETE.
+        if user.is_admin:
+            task = db.query(Task).filter(Task.id == task_id).first()
+        else:
+            task = (
+                db.query(Task)
+                .filter(Task.id == task_id, Task.user_id == user.id)
+                .first()
             )
-
-            # Delete related data in correct order to respect foreign key constraints
-            logger.info(f"Deleting task {task_id} and all related data")
-
-            # Delete task-owned rows that do not all have DB-level cascades.
-            from ..models.task import (
-                DAGExecution,
-                TraceCheckpointBlob,
-                TraceEvent,
-                TraceMessageBlob,
-            )
-
-            db.query(TraceCheckpointBlob).filter(
-                TraceCheckpointBlob.task_id == task_id
-            ).delete(synchronize_session=False)
-            db.query(TraceMessageBlob).filter(
-                TraceMessageBlob.task_id == task_id
-            ).delete(synchronize_session=False)
-            db.query(TraceEvent).filter(TraceEvent.task_id == task_id).delete(
-                synchronize_session=False
-            )
-            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).delete(
-                synchronize_session=False
-            )
-
-            # Note: tool_usages, agents, and agent_tools tables have been removed
-
-            # Delete the task itself
-            db.delete(task)
-            db.commit()
-
-            return task, runtime_context
-
-        # Execute database operations in thread pool to avoid blocking
-        task, runtime_context = await asyncio.to_thread(_delete_task_sync)
-        invalidate_task_cache(task_id)
-
-        # Remove agent from manager if it exists
-        get_agent_manager(request).remove_agent(task_id, int(user.id))
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        task_title = str(task.title)
+        runtime_context = _task_runtime_context(
+            task_id=int(task.id),
+            user_id=int(task.user_id),
+            source=task.source,
+        )
+        release_db_connection_if_clean(db)
 
         try:
             await delete_task_extensions(runtime_context)
         except TaskRuntimeExtensionError:
             logger.warning(
-                "Task %s was deleted but runtime extension cleanup failed",
+                "Runtime extension cleanup failed before deleting task %s",
                 task_id,
                 exc_info=True,
             )
+
+        # Use an operation-local session inside the worker. SQLAlchemy sessions
+        # are not thread-safe, so the request session must never cross this
+        # boundary.
+        def _delete_task_sync() -> None:
+            session_factory = get_session_local()
+            delete_db = session_factory()
+            try:
+                task_to_delete = (
+                    delete_db.query(Task).filter(Task.id == task_id).first()
+                )
+                if task_to_delete is None:
+                    return
+                # Delete related data in the correct foreign-key order.
+                logger.info(f"Deleting task {task_id} and all related data")
+
+                # Delete task-owned rows that do not all have DB-level cascades.
+                from ..models.task import (
+                    DAGExecution,
+                    TraceCheckpointBlob,
+                    TraceEvent,
+                    TraceMessageBlob,
+                )
+
+                delete_db.query(TraceCheckpointBlob).filter(
+                    TraceCheckpointBlob.task_id == task_id
+                ).delete(synchronize_session=False)
+                delete_db.query(TraceMessageBlob).filter(
+                    TraceMessageBlob.task_id == task_id
+                ).delete(synchronize_session=False)
+                delete_db.query(TraceEvent).filter(
+                    TraceEvent.task_id == task_id
+                ).delete(synchronize_session=False)
+                delete_db.query(DAGExecution).filter(
+                    DAGExecution.task_id == task_id
+                ).delete(synchronize_session=False)
+
+                # Note: tool_usages, agents, and agent_tools tables have been removed
+
+                # Delete the task itself
+                delete_db.delete(task_to_delete)
+                delete_db.commit()
+            except Exception:
+                delete_db.rollback()
+                raise
+            finally:
+                delete_db.close()
+
+        await asyncio.to_thread(_delete_task_sync)
+        invalidate_task_cache(task_id)
+
+        # Remove agent from manager if it exists
+        get_agent_manager(request).remove_agent(task_id, requester_user_id)
 
         from .websocket import background_task_manager, manager
 
@@ -4412,7 +4429,7 @@ async def delete_task(
 
         return {
             "success": True,
-            "message": f"Task '{task.title}' deleted successfully",
+            "message": f"Task '{task_title}' deleted successfully",
             "task_id": task_id,
         }
 

@@ -93,14 +93,11 @@ def validate_task_extension_requests(value: Any) -> dict[str, dict[str, Any]]:
         name = _normalize_extension_name(str(raw_name))
         if name not in _task_runtime_extensions:
             raise ValueError(f"Task runtime extension '{name}' is not registered")
-        if raw_configuration is None:
-            configuration: dict[str, Any] = {}
-        elif isinstance(raw_configuration, Mapping):
-            configuration = dict(raw_configuration)
-        else:
+        if not isinstance(raw_configuration, Mapping):
             raise TypeError(
                 f"Task runtime extension '{name}' configuration must be an object"
             )
+        configuration = dict(raw_configuration)
         _ensure_json_compatible(configuration, label=f"'{name}' configuration")
         normalized[name] = configuration
     return normalized
@@ -172,11 +169,11 @@ async def get_task_runtime_public_metadata(
 
 
 async def delete_task_extensions(context: TaskRuntimeContext) -> None:
-    """Release provider-owned state for a deleted task.
+    """Release provider-owned state before the core task row is deleted.
 
     All providers are attempted even when one fails. A combined extension error
-    is raised afterwards so callers can log cleanup failures without hiding a
-    successful core task deletion.
+    is raised afterwards so callers can log cleanup failures and decide whether
+    to continue deleting the core task.
     """
 
     failures: list[tuple[str, BaseException]] = []

@@ -3,8 +3,14 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
+from xagent.core.task_runtime import TaskRuntimeContribution
 from xagent.web.api.admin_users import delete_user, get_users
+from xagent.web.models.task import Task
 from xagent.web.models.user import User
+from xagent.web.services.task_runtime import (
+    register_task_extension,
+    unregister_task_extension,
+)
 from xagent.web.services.user_admin_scope import set_hidden_user_filter
 
 from .conftest import _admin_headers, _direct_db_session, _register_second_user
@@ -16,6 +22,29 @@ pytestmark = pytest.mark.usefixtures("_test_db")
 def _reset_hidden_filter():
     yield
     set_hidden_user_filter(None)
+
+
+class _DeleteObserverProvider:
+    def __init__(self) -> None:
+        self.task_existed_on_delete: list[bool] = []
+
+    async def on_task_created(self, context, configuration) -> None:
+        return None
+
+    async def build_runtime(self, context) -> TaskRuntimeContribution:
+        return TaskRuntimeContribution()
+
+    async def public_metadata(self, context) -> dict:
+        return {}
+
+    async def on_task_deleted(self, context) -> None:
+        db = context.session_factory()
+        try:
+            self.task_existed_on_delete.append(
+                db.query(Task).filter(Task.id == context.task_id).count() == 1
+            )
+        finally:
+            db.close()
 
 
 @pytest.mark.asyncio
@@ -46,4 +75,35 @@ async def test_hidden_users_excluded_from_admin_list_and_delete():
         assert exc.value.status_code == 404
         assert db.query(User).filter(User.id == ghost_id).count() == 1
     finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
+    _admin_headers()
+    _register_second_user("runtime-user", "runtimepass1")
+    provider = _DeleteObserverProvider()
+    register_task_extension("delete_observer", provider)
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "runtime-user").one()
+        task = Task(
+            user_id=int(target.id),
+            title="runtime task",
+            description="runtime task",
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+        target_id = int(target.id)
+
+        response = await delete_user(target_id, admin, db)
+
+        assert response == {"message": "User deleted successfully"}
+        assert provider.task_existed_on_delete == [True]
+        assert db.query(Task).filter(Task.id == task_id).count() == 0
+        assert db.query(User).filter(User.id == target_id).count() == 0
+    finally:
+        unregister_task_extension("delete_observer")
         db.close()

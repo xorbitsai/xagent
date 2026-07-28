@@ -361,6 +361,9 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.task_runtime_contribution = contribution
+
         async def refresh_runtime_policy(self) -> None:
             raise AssertionError("create_default_tools must not pre-refresh policy")
 

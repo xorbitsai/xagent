@@ -175,6 +175,25 @@ def test_durable_dict_resanitizes_nested_mutations() -> None:
         reference.durable_dict()
 
 
+@pytest.mark.parametrize(
+    ("unsafe_key", "message"),
+    [
+        ("data:image/png;base64,c2NyZWVuc2hvdA==", "materialized image data"),
+        ("/private/frame.png", "absolute filesystem paths"),
+        (r"\\server\share\frame.png", "absolute filesystem paths"),
+    ],
+)
+def test_durable_dict_rejects_sensitive_metadata_keys(
+    unsafe_key: str,
+    message: str,
+) -> None:
+    reference = image_reference()
+    reference.metadata[unsafe_key] = "value"
+
+    with pytest.raises(ValueError, match=message):
+        reference.durable_dict()
+
+
 def test_context_reference_survives_checkpoint_round_trip() -> None:
     context = ExecutionContext(execution_id="execution-1")
     context.add_user_message("inspect", context_refs=[image_reference()])

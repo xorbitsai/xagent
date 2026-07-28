@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -300,6 +301,45 @@ async def test_workspace_resolver_bounds_cache_by_encoded_bytes(
     assert read_calls == 3
     assert len(resolver._cache) == 1
     assert resolver._cache_bytes <= 35
+
+
+@pytest.mark.asyncio
+async def test_workspace_resolver_counts_concurrent_same_key_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "frame.png"
+    image_path.write_bytes(b"image")
+    read_barrier = threading.Barrier(2)
+
+    class Workspace:
+        def resolve_file_id(self, file_id: str) -> Path:
+            assert file_id == "image-1"
+            return image_path
+
+    resolver = WorkspaceContextReferenceResolver(Workspace())
+    original_read_generation = resolver._read_generation
+
+    def synchronized_read_generation(*args: Any) -> bytes:
+        read_barrier.wait(timeout=5)
+        return original_read_generation(*args)
+
+    monkeypatch.setattr(
+        resolver,
+        "_read_generation",
+        synchronized_read_generation,
+    )
+
+    first, second = await asyncio.gather(
+        resolver.resolve_image(image_reference()),
+        resolver.resolve_image(image_reference()),
+    )
+
+    assert first == second
+    assert len(resolver._cache) == 1
+    assert resolver._cache_bytes == sum(
+        entry.encoded_bytes for entry in resolver._cache.values()
+    )
 
 
 @pytest.mark.asyncio

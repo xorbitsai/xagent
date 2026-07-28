@@ -44,6 +44,15 @@ def _looks_like_absolute_filesystem_path(value: str) -> bool:
     return stripped.startswith("/") or bool(windows_path.drive or windows_path.root)
 
 
+def _validate_metadata_string(value: str) -> None:
+    if _contains_materialized_image(value):
+        raise ValueError("metadata must not contain materialized image data")
+    if _looks_like_absolute_filesystem_path(value):
+        raise ValueError("metadata must not contain absolute filesystem paths")
+    if _COMMON_PRIVATE_PATH_RE.search(value):
+        raise ValueError("metadata must not contain private filesystem paths")
+
+
 def _validate_metadata_tree(value: Any, *, key: str | None = None) -> None:
     if key is not None and _metadata_key_is_path_like(key):
         if value not in (None, "", [], {}):
@@ -53,6 +62,7 @@ def _validate_metadata_tree(value: Any, *, key: str | None = None) -> None:
         for child_key, child_value in value.items():
             if not isinstance(child_key, str):
                 raise ValueError("metadata keys must be strings")
+            _validate_metadata_string(child_key)
             _validate_metadata_tree(child_value, key=child_key)
         return
     if isinstance(value, list):
@@ -60,12 +70,7 @@ def _validate_metadata_tree(value: Any, *, key: str | None = None) -> None:
             _validate_metadata_tree(child)
         return
     if isinstance(value, str):
-        if _contains_materialized_image(value):
-            raise ValueError("metadata must not contain materialized image data")
-        if _looks_like_absolute_filesystem_path(value):
-            raise ValueError("metadata must not contain absolute filesystem paths")
-        if _COMMON_PRIVATE_PATH_RE.search(value):
-            raise ValueError("metadata must not contain private filesystem paths")
+        _validate_metadata_string(value)
 
 
 def _validated_metadata(value: Any) -> dict[str, Any]:

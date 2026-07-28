@@ -117,6 +117,9 @@ class WorkspaceContextReferenceResolver:
             data_url = f"data:{mime_type};base64,{encoded}"
             encoded_bytes = len(data_url)
             if encoded_bytes <= self.max_cache_bytes:
+                replaced = self._cache.pop(cache_key, None)
+                if replaced is not None:
+                    self._cache_bytes -= replaced.encoded_bytes
                 while self._cache and (
                     len(self._cache) >= self.cache_size
                     or self._cache_bytes + encoded_bytes > self.max_cache_bytes
@@ -179,10 +182,7 @@ class WorkspaceContextReferenceResolver:
         reference: ContextReference,
         generation: _FileGeneration,
     ) -> str:
-        digest = reference.metadata.get("sha256")
         generation_key = ":".join(str(part) for part in generation)
-        if isinstance(digest, str) and digest:
-            return f"{reference.file_id}:{digest}:{generation_key}"
         return f"{reference.file_id}:{generation_key}"
 
 

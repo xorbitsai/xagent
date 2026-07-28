@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from enum import Enum
+from pathlib import PureWindowsPath
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -20,7 +21,6 @@ _PATH_METADATA_PARTS = {
     "path",
     "paths",
 }
-_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _COMMON_PRIVATE_PATH_RE = re.compile(
     r"(?:^|\s)/(?:Users|home|private|root|tmp|var/folders|workspace)(?:/|\s|$)"
 )
@@ -34,6 +34,14 @@ def _contains_materialized_image(value: str) -> bool:
 def _metadata_key_is_path_like(key: str) -> bool:
     parts = {part for part in re.split(r"[^a-z0-9]+", key.lower()) if part}
     return bool(parts & _PATH_METADATA_PARTS)
+
+
+def _looks_like_absolute_filesystem_path(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    windows_path = PureWindowsPath(stripped)
+    return stripped.startswith("/") or bool(windows_path.drive or windows_path.root)
 
 
 def _validate_metadata_tree(value: Any, *, key: str | None = None) -> None:
@@ -54,10 +62,7 @@ def _validate_metadata_tree(value: Any, *, key: str | None = None) -> None:
     if isinstance(value, str):
         if _contains_materialized_image(value):
             raise ValueError("metadata must not contain materialized image data")
-        stripped = value.strip()
-        if _WINDOWS_ABSOLUTE_PATH_RE.match(stripped) or (
-            stripped.startswith("/") and not stripped.startswith("//")
-        ):
+        if _looks_like_absolute_filesystem_path(value):
             raise ValueError("metadata must not contain absolute filesystem paths")
         if _COMMON_PRIVATE_PATH_RE.search(value):
             raise ValueError("metadata must not contain private filesystem paths")

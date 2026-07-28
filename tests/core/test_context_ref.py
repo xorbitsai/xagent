@@ -99,6 +99,30 @@ def test_context_reference_rejects_paths_nested_in_metadata() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"source": r"\\server\share\frame.png"},
+        {"source": r"\rooted\frame.png"},
+        {"source": "//server/share/frame.png"},
+        {"capture": {"source": r"\\server\share\frame.png"}},
+        {"values": [r"\rooted\frame.png"]},
+    ],
+)
+def test_context_reference_rejects_cross_platform_absolute_metadata_paths(
+    metadata: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="absolute filesystem paths"):
+        ContextReference(
+            file_ref={
+                "file_id": "image-1",
+                "filename": "frame.png",
+                "mime_type": "image/png",
+            },
+            metadata=metadata,
+        )
+
+
 def test_context_reference_validates_json_normalized_tuple_metadata() -> None:
     reference = ContextReference(
         file_ref={

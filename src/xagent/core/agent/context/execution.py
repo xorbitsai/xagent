@@ -1054,7 +1054,7 @@ class ExecutionContext:
             0,
             min(
                 COMPACT_CONTEXT_REF_MAX_TOKENS,
-                max(0, self.compact_config.threshold // 8),
+                self.compact_config.threshold // 8,
             )
             - latest_user_tokens,
         )

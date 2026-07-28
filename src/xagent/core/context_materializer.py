@@ -17,6 +17,10 @@ from .context_ref import (
 logger = logging.getLogger(__name__)
 
 _IMAGE_CONTEXT_PLACEHOLDER = "Image context for the preceding message."
+_DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
+_DEFAULT_CONTEXT_REF_TOKEN_BUDGET = 8_192
+_MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST = 32 * 1024 * 1024
+_CONTEXT_REF_TOKEN_BUDGET_RATIO = 0.25
 
 
 class ContextReferenceResolutionError(RuntimeError):
@@ -35,6 +39,12 @@ class _FileGeneration(NamedTuple):
     modified_ns: int
 
 
+class _CacheEntry(NamedTuple):
+    created_at: float
+    data_url: str
+    encoded_bytes: int
+
+
 class ContextReferenceResolver(Protocol):
     async def resolve_image(self, reference: ContextReference) -> str: ...
 
@@ -49,12 +59,15 @@ class WorkspaceContextReferenceResolver:
         cache_size: int = 8,
         cache_ttl_seconds: float = 300,
         max_image_bytes: int = 20 * 1024 * 1024,
+        max_cache_bytes: int = _DEFAULT_CACHE_BYTES,
     ) -> None:
         self.workspace = workspace
         self.cache_size = max(1, cache_size)
         self.cache_ttl_seconds = max(0, cache_ttl_seconds)
         self.max_image_bytes = max(1, max_image_bytes)
-        self._cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self.max_cache_bytes = max(0, max_cache_bytes)
+        self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._cache_bytes = 0
 
     async def resolve_image(self, reference: ContextReference) -> str:
         mime_type = str(reference.safe_file_ref.get("mime_type") or "image/png")
@@ -77,11 +90,11 @@ class WorkspaceContextReferenceResolver:
             now = time.monotonic()
             cached = self._cache.get(cache_key)
             if cached is not None:
-                created_at, data_url = cached
-                if now - created_at <= self.cache_ttl_seconds:
+                if now - cached.created_at <= self.cache_ttl_seconds:
                     self._cache.move_to_end(cache_key)
-                    return data_url
+                    return cached.data_url
                 self._cache.pop(cache_key, None)
+                self._cache_bytes -= cached.encoded_bytes
 
             try:
                 image_bytes = await asyncio.to_thread(
@@ -102,15 +115,23 @@ class WorkspaceContextReferenceResolver:
                 )
             encoded = base64.b64encode(image_bytes).decode("ascii")
             data_url = f"data:{mime_type};base64,{encoded}"
-            self._cache[cache_key] = (time.monotonic(), data_url)
-            while len(self._cache) > self.cache_size:
-                self._cache.popitem(last=False)
+            encoded_bytes = len(data_url)
+            if encoded_bytes <= self.max_cache_bytes:
+                while self._cache and (
+                    len(self._cache) >= self.cache_size
+                    or self._cache_bytes + encoded_bytes > self.max_cache_bytes
+                ):
+                    _, evicted = self._cache.popitem(last=False)
+                    self._cache_bytes -= evicted.encoded_bytes
+                self._cache[cache_key] = _CacheEntry(
+                    time.monotonic(),
+                    data_url,
+                    encoded_bytes,
+                )
+                self._cache_bytes += encoded_bytes
             return data_url
 
         raise ContextReferenceResolutionError("unable to read a stable context image")
-
-    def clear(self) -> None:
-        self._cache.clear()
 
     def _resolve_generation(
         self,
@@ -187,6 +208,31 @@ def _append_text(content: Any, text: str) -> Any:
     return f"{current}\n{text}".strip()
 
 
+def _context_ref_token_budget(llm: Any) -> int:
+    context_window = getattr(llm, "context_window", None)
+    if isinstance(context_window, int) and context_window > 0:
+        return max(1, int(context_window * _CONTEXT_REF_TOKEN_BUDGET_RATIO))
+    return _DEFAULT_CONTEXT_REF_TOKEN_BUDGET
+
+
+def _enforce_context_ref_request_budget(
+    llm: Any,
+    messages: list[dict[str, Any]],
+) -> None:
+    references = [
+        reference
+        for message in messages
+        for reference in normalize_context_references(message.get(CONTEXT_REFS_KEY))
+    ]
+    estimated_tokens = sum(reference.estimated_tokens() for reference in references)
+    token_budget = _context_ref_token_budget(llm)
+    if estimated_tokens > token_budget:
+        raise ContextReferenceResolutionError(
+            "context image request exceeds the materialization token budget "
+            f"({estimated_tokens} estimated tokens > {token_budget})"
+        )
+
+
 async def materialize_messages(
     *,
     llm: Any,
@@ -196,8 +242,11 @@ async def materialize_messages(
     """Materialize durable context refs without mutating persisted messages."""
 
     supports_vision = llm_supports_vision(llm)
+    if supports_vision and resolver is not None:
+        _enforce_context_ref_request_budget(llm, messages)
     result: list[dict[str, Any]] = []
     deferred_user_messages: list[dict[str, Any]] = []
+    materialized_image_bytes = 0
 
     def flush_deferred() -> None:
         if deferred_user_messages:
@@ -254,6 +303,17 @@ async def materialize_messages(
                 unresolved.append(reference)
                 continue
 
+            image_bytes = len(url.encode("utf-8"))
+            if (
+                materialized_image_bytes + image_bytes
+                > _MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST
+            ):
+                raise ContextReferenceResolutionError(
+                    "context image request exceeds the materialized byte budget "
+                    f"({materialized_image_bytes + image_bytes} bytes > "
+                    f"{_MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST})"
+                )
+            materialized_image_bytes += image_bytes
             image_url: dict[str, Any] = {"url": url}
             detail = (
                 "high"

@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import xagent.core.context_materializer as context_materializer
 from xagent.core.agent import (
     Agent,
     AgentRunner,
@@ -15,6 +16,7 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.context_materializer import (
+    ContextReferenceResolutionError,
     WorkspaceContextReferenceResolver,
     materialize_messages,
 )
@@ -26,11 +28,15 @@ from xagent.core.context_ref import (
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 
-def image_reference(*, detail: ImageDetail = ImageDetail.AUTO) -> ContextReference:
+def image_reference(
+    *,
+    detail: ImageDetail = ImageDetail.AUTO,
+    file_id: str = "image-1",
+) -> ContextReference:
     return ContextReference(
         file_ref={
-            "file_id": "image-1",
-            "filename": "frame.png",
+            "file_id": file_id,
+            "filename": f"{file_id}.png",
             "mime_type": "image/png",
         },
         detail=detail,
@@ -253,9 +259,47 @@ async def test_workspace_resolver_enforces_size_limit_and_caches(
     assert read_calls == 1
 
     image_path.write_bytes(b"too-large")
-    resolver.clear()
     with pytest.raises(RuntimeError, match="exceeds"):
         await resolver.resolve_image(image_reference())
+
+
+@pytest.mark.asyncio
+async def test_workspace_resolver_bounds_cache_by_encoded_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    first_path.write_bytes(b"first")
+    second_path.write_bytes(b"second")
+    paths = {"image-1": first_path, "image-2": second_path}
+
+    class Workspace:
+        def resolve_file_id(self, file_id: str) -> Path:
+            return paths[file_id]
+
+    resolver = WorkspaceContextReferenceResolver(
+        Workspace(),
+        cache_size=8,
+        max_cache_bytes=35,
+    )
+    read_calls = 0
+    original_read_generation = resolver._read_generation
+
+    def counted_read_generation(*args: Any) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        return original_read_generation(*args)
+
+    monkeypatch.setattr(resolver, "_read_generation", counted_read_generation)
+
+    await resolver.resolve_image(image_reference(file_id="image-1"))
+    await resolver.resolve_image(image_reference(file_id="image-2"))
+    await resolver.resolve_image(image_reference(file_id="image-1"))
+
+    assert read_calls == 3
+    assert len(resolver._cache) == 1
+    assert resolver._cache_bytes <= 35
 
 
 @pytest.mark.asyncio
@@ -284,6 +328,62 @@ async def test_workspace_resolver_invalidates_cache_when_file_id_generation_chan
     assert first.endswith("Zmlyc3Q=")
     assert second.endswith("c2Vjb25k")
     assert first != second
+
+
+@pytest.mark.asyncio
+async def test_materializer_rejects_image_request_over_token_budget() -> None:
+    class VisionLLMWithContextWindow(VisionLLM):
+        context_window = 32_768
+
+    references = [
+        image_reference(detail=ImageDetail.HIGH, file_id=f"image-{index}")
+        for index in range(12)
+    ]
+
+    with pytest.raises(
+        ContextReferenceResolutionError,
+        match="materialization token budget",
+    ):
+        await materialize_messages(
+            llm=VisionLLMWithContextWindow(),
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Inspect every image",
+                    CONTEXT_REFS_KEY: [
+                        reference.durable_dict() for reference in references
+                    ],
+                }
+            ],
+            resolver=Resolver(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_materializer_rejects_aggregate_materialized_image_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        context_materializer,
+        "_MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST",
+        32,
+    )
+
+    with pytest.raises(
+        ContextReferenceResolutionError,
+        match="materialized byte budget",
+    ):
+        await materialize_messages(
+            llm=VisionLLM(),
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Inspect this image",
+                    CONTEXT_REFS_KEY: [image_reference().durable_dict()],
+                }
+            ],
+            resolver=Resolver(),
+        )
 
 
 @pytest.mark.asyncio

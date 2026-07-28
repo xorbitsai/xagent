@@ -214,11 +214,6 @@ const zh = {
       startingPrompts: "快捷指令",
       chatWithAgents: "与智能体聊天",
     },
-    agents: {
-      researcher: "研究助手",
-      poster: "海报设计师",
-      linkedin: "LinkedIn 发帖助手",
-    },
     cards: {
       research: {
         title: "深入研究一个话题",

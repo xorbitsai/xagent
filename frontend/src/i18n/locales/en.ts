@@ -214,11 +214,6 @@ const en = {
       startingPrompts: "STARTING PROMPTS",
       chatWithAgents: "CHAT WITH AGENTS",
     },
-    agents: {
-      researcher: "Researcher Agent",
-      poster: "Poster Maker",
-      linkedin: "LinkedIn Post Creator",
-    },
     cards: {
       research: {
         title: "Research a topic in depth",

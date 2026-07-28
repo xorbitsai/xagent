@@ -123,6 +123,43 @@ def test_context_reference_rejects_cross_platform_absolute_metadata_paths(
         )
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"description": "saved at (/private/frame.png)"},
+        {"capture": {"description": "file:///private/frame.png"}},
+        {"values": [r"source=C:\Users\name\frame.png"]},
+        {"description": r"saved at (\\server\share\frame.png)"},
+        {"description": r"source=\rooted\frame.png"},
+    ],
+)
+def test_context_reference_rejects_embedded_absolute_metadata_paths(
+    metadata: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="absolute filesystem paths"):
+        ContextReference(
+            file_ref={
+                "file_id": "image-1",
+                "filename": "frame.png",
+                "mime_type": "image/png",
+            },
+            metadata=metadata,
+        )
+
+
+def test_context_reference_allows_remote_urls_with_path_segments() -> None:
+    reference = ContextReference(
+        file_ref={
+            "file_id": "image-1",
+            "filename": "frame.png",
+            "mime_type": "image/png",
+        },
+        metadata={"source": "https://example.com/private/frame.png"},
+    )
+
+    assert reference.metadata["source"] == "https://example.com/private/frame.png"
+
+
 def test_context_reference_validates_json_normalized_tuple_metadata() -> None:
     reference = ContextReference(
         file_ref={
@@ -172,6 +209,12 @@ def test_durable_dict_resanitizes_nested_mutations() -> None:
 
     reference.metadata["capture"] = {"file_path": "/private/late-mutation.png"}
     with pytest.raises(ValueError, match="must not contain a path"):
+        reference.durable_dict()
+
+    reference.metadata["capture"] = {
+        "description": "saved at (/private/late-mutation.png)"
+    }
+    with pytest.raises(ValueError, match="absolute filesystem paths"):
         reference.durable_dict()
 
 

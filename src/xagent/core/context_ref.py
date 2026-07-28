@@ -22,7 +22,16 @@ _PATH_METADATA_PARTS = {
     "paths",
 }
 _COMMON_PRIVATE_PATH_RE = re.compile(
-    r"(?:^|\s)/(?:Users|home|private|root|tmp|var/folders|workspace)(?:/|\s|$)"
+    r"(?<![A-Za-z0-9])/(?:Users|home|private|root|tmp|var/folders|workspace)"
+    r"(?:/|(?=[\s)\]}>,'\";:]|$))"
+)
+_FILE_URI_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9])file:/{1,3}\S+")
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\"'<>]+")
+_UNC_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9:])(?:\\\\|//)[^\\/\s\"'<>]+[\\/][^\\/\s\"'<>]+"
+)
+_WINDOWS_ROOTED_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9\\/:])\\(?!\\)[^\\\s\"'<>]+(?:\\[^\\\s\"'<>]+)+"
 )
 
 
@@ -41,7 +50,18 @@ def _looks_like_absolute_filesystem_path(value: str) -> bool:
     if not stripped:
         return False
     windows_path = PureWindowsPath(stripped)
-    return stripped.startswith("/") or bool(windows_path.drive or windows_path.root)
+    if stripped.startswith("/") or bool(windows_path.drive or windows_path.root):
+        return True
+    return any(
+        pattern.search(value)
+        for pattern in (
+            _FILE_URI_PATH_RE,
+            _COMMON_PRIVATE_PATH_RE,
+            _WINDOWS_DRIVE_PATH_RE,
+            _UNC_PATH_RE,
+            _WINDOWS_ROOTED_PATH_RE,
+        )
+    )
 
 
 def _validate_metadata_string(value: str) -> None:
@@ -49,8 +69,6 @@ def _validate_metadata_string(value: str) -> None:
         raise ValueError("metadata must not contain materialized image data")
     if _looks_like_absolute_filesystem_path(value):
         raise ValueError("metadata must not contain absolute filesystem paths")
-    if _COMMON_PRIVATE_PATH_RE.search(value):
-        raise ValueError("metadata must not contain private filesystem paths")
 
 
 def _validate_metadata_tree(value: Any, *, key: str | None = None) -> None:

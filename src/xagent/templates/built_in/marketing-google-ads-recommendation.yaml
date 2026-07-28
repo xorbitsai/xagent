@@ -12,7 +12,7 @@ features:
   - Ranks and recommends budget, keyword, negative-keyword and copy changes for you to approve
   zh:
   - 从 Google Ads 拉取花费、点击率、单次转化成本、转化数和搜索词数据
-  - 通过广告系列 / UTM 匹配，结合 Google Analytics Analyzer agent 输出的网站端"广告信号"
+  - 通过广告系列 / UTM 匹配，结合 Google Analytics Analyzer agent 输出的网站端「广告信号」
   - 按收入影响排序，推荐预算、关键词、否定关键词与文案调整，等待您审批
 connections:
 - name: Google Ads

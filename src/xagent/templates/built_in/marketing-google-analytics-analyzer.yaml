@@ -13,7 +13,7 @@ features:
   zh:
   - 按需拉取任意日期范围和媒体资源的 GA4 指标
   - 与上一周期对比，按渠道、广告系列、落地页和细分维度标记异常
-  - 输出可供 Google Ads agent 消费的结构化"广告信号"数据块
+  - 输出可供 Google Ads agent 消费的结构化「广告信号」数据块
 connections:
 - name: Google Docs
   logo: https://www.google.com/s2/favicons?domain=docs.google.com&sz=64

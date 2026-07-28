@@ -92,6 +92,39 @@ async def test_prepare_llm_for_context_passes_runtime_modality_preferences() -> 
 
 
 @pytest.mark.asyncio
+async def test_prepare_llm_for_context_reads_runtime_metadata_once() -> None:
+    class PreparedLLM:
+        pass
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert preferred_input_modalities == ("image",)
+            return PreparedLLM()
+
+    class Context:
+        metadata_reads = 0
+
+        @property
+        def metadata(self) -> dict[str, list[str]]:
+            self.metadata_reads += 1
+            return {PREFERRED_INPUT_MODALITIES_METADATA_KEY: ["image"]}
+
+    context = Context()
+    await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "inspect the selected target"}],
+        context=context,
+    )
+
+    assert context.metadata_reads == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("context_window", [None, 128_000])
 async def test_prepare_llm_for_context_preserves_plain_llm_threshold(
     context_window: int | None,

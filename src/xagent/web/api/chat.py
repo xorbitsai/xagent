@@ -3738,11 +3738,18 @@ async def create_task(
             get_agent_manager(request).remove_agent(task_id, int(user.id))
             if isinstance(exc.cause, PermissionError):
                 status_code = 403
+                detail = str(exc)
             elif isinstance(exc.cause, (TypeError, ValueError)):
                 status_code = 400
+                detail = str(exc)
             else:
                 status_code = 503
-            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+                detail = "Service unavailable"
+                logger.exception(
+                    "Task runtime extension creation failed for task %s",
+                    task_id,
+                )
+            raise HTTPException(status_code=status_code, detail=detail) from exc
 
         try:
             runtime_extensions = await get_task_runtime_public_metadata(runtime_context)
@@ -4310,11 +4317,18 @@ async def get_task_runtime_extensions(
     except TaskRuntimeExtensionError as exc:
         if isinstance(exc.cause, PermissionError):
             status_code = 403
+            detail = str(exc)
         elif isinstance(exc.cause, (TypeError, ValueError, AttributeError)):
             status_code = 400
+            detail = str(exc)
         else:
             status_code = 500
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+            detail = "Internal server error"
+            logger.exception(
+                "Failed to load public runtime metadata for task %s",
+                task_id,
+            )
+        raise HTTPException(status_code=status_code, detail=detail) from exc
     return {"task_id": task_id, "runtime_extensions": extensions}
 
 

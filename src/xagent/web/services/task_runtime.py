@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -30,6 +31,7 @@ _PROVIDER_METHODS = (
     "on_task_deleted",
 )
 _task_runtime_extensions: dict[str, TaskRuntimeExtensionProvider] = {}
+logger = logging.getLogger(__name__)
 
 
 class TaskRuntimeExtensionError(RuntimeError):
@@ -210,6 +212,12 @@ async def _cleanup_after_create_failure(
         except Exception:
             # The original create failure remains primary. Providers should make
             # deletion idempotent so operators can retry cleanup safely.
+            logger.warning(
+                "Cleanup failed for task runtime extension '%s' after task "
+                "creation failure",
+                name,
+                exc_info=True,
+            )
             continue
 
 

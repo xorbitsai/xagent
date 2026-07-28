@@ -65,12 +65,11 @@ async def prepare_llm_for_context(
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
     if callable(prepare):
+        metadata = getattr(context, "metadata", None)
         preferred_modalities = normalize_input_modalities(
-            getattr(context, "metadata", {}).get(
-                PREFERRED_INPUT_MODALITIES_METADATA_KEY
-            )
-            if isinstance(getattr(context, "metadata", None), dict)
-            else ()
+            ()
+            if not metadata or not isinstance(metadata, dict)
+            else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
         )
         supports_preferences = False
         try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -50,12 +51,14 @@ class _Provider:
         contribution: TaskRuntimeContribution | None = None,
         metadata: dict[str, Any] | None = None,
         fail_create: Exception | None = None,
+        fail_delete: BaseException | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.name = name
         self.contribution = contribution
         self.metadata = metadata
         self.fail_create = fail_create
+        self.fail_delete = fail_delete
         self.events = events if events is not None else []
         self.created_configuration: dict[str, Any] | None = None
 
@@ -83,6 +86,8 @@ class _Provider:
 
     async def on_task_deleted(self, context: TaskRuntimeContext) -> None:
         self.events.append(f"delete:{self.name}")
+        if self.fail_delete is not None:
+            raise self.fail_delete
 
 
 def _register(
@@ -176,6 +181,51 @@ async def test_create_failure_cleans_up_completed_and_failing_providers(
         "delete:second",
         "delete:first",
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_failure_logs_cleanup_error_and_preserves_create_error(
+    registered_names: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first = _Provider("first", fail_delete=RuntimeError("cleanup unavailable"))
+    second = _Provider("second", fail_create=ValueError("invalid binding"))
+    _register("first_runtime", first, registered_names)
+    _register("second_runtime", second, registered_names)
+
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(TaskRuntimeExtensionError) as exc_info,
+    ):
+        await create_task_extensions(
+            _context(),
+            {
+                "first_runtime": {},
+                "second_runtime": {},
+            },
+        )
+
+    assert isinstance(exc_info.value.cause, ValueError)
+    assert "Cleanup failed for task runtime extension 'first_runtime'" in caplog.text
+    assert "cleanup unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_create_failure_cleanup_does_not_swallow_process_control_exception(
+    registered_names: list[str],
+) -> None:
+    provider = _Provider(
+        "interrupting",
+        fail_create=ValueError("invalid binding"),
+        fail_delete=SystemExit("stop"),
+    )
+    _register("interrupting_runtime", provider, registered_names)
+
+    with pytest.raises(SystemExit, match="stop"):
+        await create_task_extensions(
+            _context(),
+            {"interrupting_runtime": {}},
+        )
 
 
 def test_registry_rejects_unknown_invalid_and_incomplete_providers(

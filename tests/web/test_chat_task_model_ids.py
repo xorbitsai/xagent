@@ -1315,11 +1315,11 @@ def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
 
 
 @pytest.mark.parametrize(
-    ("metadata_error", "expected_status"),
+    ("metadata_error", "expected_status", "expected_detail"),
     [
-        (PermissionError("target denied"), 403),
-        (TypeError("invalid metadata"), 400),
-        (RuntimeError("database unavailable"), 500),
+        (PermissionError("target denied"), 403, "target denied"),
+        (TypeError("invalid metadata"), 400, "invalid metadata"),
+        (RuntimeError("database unavailable"), 500, "Internal server error"),
     ],
 )
 def test_task_runtime_metadata_maps_provider_error_status(
@@ -1327,6 +1327,7 @@ def test_task_runtime_metadata_maps_provider_error_status(
     user1_headers,
     metadata_error,
     expected_status,
+    expected_detail,
 ):
     from xagent.web.services.task_runtime import (
         register_task_extension,
@@ -1354,6 +1355,10 @@ def test_task_runtime_metadata_maps_provider_error_status(
         )
 
         assert metadata.status_code == expected_status
+        if expected_status < 500:
+            assert expected_detail in metadata.json()["detail"]
+        else:
+            assert metadata.json()["detail"] == expected_detail
     finally:
         if task_id is not None:
             client.delete(
@@ -1399,5 +1404,49 @@ def test_task_runtime_extension_create_failure_compensates_task(
             "created",
             "deleted",
         ]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_create_server_error_is_sanitized(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+
+    async def fail_create(context, configuration):
+        provider.events.append(("created", context.task_id))
+        raise RuntimeError("database password leaked")
+
+    provider.on_task_created = fail_create
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "unavailable runtime task",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Service unavailable"
+        assert "database password leaked" not in response.text
+        db = next(get_db())
+        try:
+            assert (
+                db.query(Task).filter(Task.title == "unavailable runtime task").count()
+                == 0
+            )
+        finally:
+            db.close()
     finally:
         unregister_task_extension("test_runtime")

@@ -287,6 +287,65 @@ descriptions:
 
         assert not offenders
 
+    def test_builtin_templates_directory_loads_every_file_without_silent_skips(self):
+        """TemplateManager.reload() silently skips a file that fails to parse or is
+        missing a required field (see manager.py's except/continue in reload()). Assert
+        every real built_in/*.yaml is actually indexed, so a broken new template fails
+        this test instead of just vanishing from the UI at runtime."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        yaml_files = list(built_in_dir.glob("*.yaml"))
+        assert yaml_files, "expected at least one built-in template file"
+
+        manager = TemplateManager(templates_root=built_in_dir)
+        ids = {manager._parse_yaml_file(f)["id"] for f in yaml_files}
+
+        assert len(ids) == len(yaml_files)
+        for expected_id in (
+            "sales-meeting-agent",
+            "marketing-google-analytics-analyzer",
+            "marketing-google-ads-recommendation",
+            "operations-devops-ai-agent",
+        ):
+            assert expected_id in ids
+
+    def test_builtin_template_connections_resolve_to_a_registered_mcp_app(self):
+        """A connections[].name that the build wizard can't resolve to a registered
+        built-in MCP app (src/xagent/web/builtin_mcp_registry.py) makes its Configure
+        step un-completable (see PR #1023 review). Mirror the frontend's lenient
+        name/app_id matching (lowercase + trim, plus a hyphen-for-space variant) so
+        this doesn't false-flag entries the wizard would actually resolve."""
+        from src.xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+        def lookup_keys(*values):
+            keys = set()
+            for value in values:
+                normalized = str(value or "").strip().lower()
+                if not normalized:
+                    continue
+                keys.add(normalized)
+                keys.add(normalized.replace(" ", "-"))
+            return keys
+
+        registered_keys = set()
+        for row in get_builtin_public_mcp_app_rows():
+            registered_keys |= lookup_keys(row.get("name"), row.get("app_id"))
+
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        offenders: list[str] = []
+
+        for template_file in built_in_dir.glob("*.yaml"):
+            data = yaml.safe_load(template_file.read_text(encoding="utf-8")) or {}
+            for conn in data.get("connections") or []:
+                name = conn.get("name") if isinstance(conn, dict) else conn
+                if name and not (lookup_keys(name) & registered_keys):
+                    offenders.append(f"{template_file.name}: {name}")
+
+        assert not offenders
+
     @pytest.mark.asyncio
     async def test_nonexistent_templates_directory(self, tmp_path):
         """测试不存在的模板目录"""

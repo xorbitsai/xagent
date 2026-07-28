@@ -52,6 +52,8 @@ CATEGORY_DISPLAY_NAMES = {
     "agent": "Agent",
     "mcp": "MCP",
     "skill": "Skill",
+    "ssh": "SSH",
+    "database": "Database",
     "other": "Other",
 }
 

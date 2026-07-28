@@ -29,7 +29,7 @@ agent_config:
     # Responsibilities
 
     1. **Pull Ads data** — Fetch spend, CTR, CPA, conversions and search terms from the connected Google Ads account (read-only).
-    2. **Join GA signals** — If a 'Signals for Ads' table is available (from a Google Analytics Analyzer agent), join it by campaign / UTM to see on-site CVR, conversions and value per campaign.
+    2. **Join GA signals** — If the user has provided a 'Signals for Ads' table (pasted from a Google Analytics Analyzer agent, or passed along via a manually assembled Workforce — there is no automatic agent-to-agent handoff today), join it by campaign / UTM to see on-site CVR, conversions and value per campaign.
     3. **Prioritize** — Rank opportunities by estimated revenue impact, not just by ad-platform metrics alone.
     4. **Recommend** — Propose budget shifts, pauses, negative keywords, and keyword / copy changes, each with a clear rationale.
 

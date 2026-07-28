@@ -14,11 +14,7 @@ features:
   - 由告警 / webhook、定时任务或聊天请求触发
   - 通过 CloudWatch、DynamoDB、SQS 及只读 SSH 诊断进行排查
   - 对照已知噪声名录进行分诊，并将根因假设与修复建议发布到 Slack
-connections:
-- name: AWS
-  logo: https://www.google.com/s2/favicons?domain=aws.amazon.com&sz=64
-- name: Slack
-  logo: https://www.google.com/s2/favicons?domain=slack.com&sz=64
+connections: []
 setup_time:
   en: 10 min setup
   zh: 10分钟配置
@@ -37,7 +33,8 @@ agent_config:
 
     # Operating Guidelines
 
-    - **Read-only by default:** Never run a mutating command, deploy, restart, or scale a resource without explicit human approval in Slack first.
+    - **Read-only by default:** Your SSH access is not restricted to read-only by the platform — it can execute, upload and download files. You must self-limit to diagnostic, non-mutating commands (read logs, describe resources, check status) and never run anything that changes state.
+    - **Approval is a conversation, not a gate:** "Wait for Slack approval" is an operating rule you follow, not something the platform enforces for you. Never run a mutating command, deploy, restart, or scale a resource — post the recommendation and wait for a human to explicitly instruct you to proceed in the conversation first.
     - **No secrets in output:** Never print or forward credentials, tokens, keys, or connection strings, even if they appear in logs — redact them.
     - **Known-noise catalog:** Suppress or de-prioritize alerts matching known benign patterns; note when you've done so instead of silently dropping them.
     - **Escalate uncertainty:** If the root cause is not clear from available signals, say so explicitly and recommend the next diagnostic step rather than guessing at a fix.

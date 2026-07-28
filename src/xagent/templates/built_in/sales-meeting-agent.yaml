@@ -15,10 +15,6 @@ features:
   - 按需从任意会议中提取决策、负责人和截止日期
   - 起草跟进邮件，并在您批准后创建任务或 CRM 记录
 connections:
-- name: Granola
-  logo: https://www.google.com/s2/favicons?domain=granola.ai&sz=64
-- name: Hermes
-  logo: https://www.google.com/s2/favicons?domain=github.com&sz=64
 - name: HubSpot
   logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64
 - name: Gmail

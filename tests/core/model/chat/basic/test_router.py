@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator
 
 import pytest
 
+from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.types import ChunkType, StreamChunk
@@ -162,6 +163,134 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     assert prepared.context_window == 1_048_576
     assert await prepared.chat([{"role": "user", "content": "continue"}]) == "ok"
     assert selected == ["make a podcast"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_for_call_prefers_and_exposes_context_ref_modality(
+    monkeypatch,
+):
+    downstream = _ScriptedChatLLM([])
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    selected: list[tuple[str, tuple[str, ...]]] = []
+
+    async def select_model(
+        prompt: str,
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> str:
+        selected.append((prompt, preferred_input_modalities))
+        return "openai/gpt-5.5"
+
+    reference = ContextReference(
+        file_ref={
+            "file_id": "image-1",
+            "filename": "image.png",
+            "mime_type": "image/png",
+        }
+    )
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: 128_000)
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda _model_id: ("text", "image"),
+    )
+
+    prepared = await router.prepare_for_call(
+        [
+            {
+                "role": "user",
+                "content": "inspect",
+                CONTEXT_REFS_KEY: [reference.durable_dict()],
+            }
+        ]
+    )
+
+    assert selected == [("inspect", ("image",))]
+    assert prepared.has_ability("vision")
+
+
+def test_router_detects_modalities_from_refs_and_content_parts() -> None:
+    reference = ContextReference(
+        file_ref={
+            "file_id": "image-1",
+            "filename": "image.png",
+            "mime_type": "image/png",
+        }
+    )
+
+    modalities = RouterLLM._preferred_input_modalities(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect"},
+                    {"type": "input_audio", "input_audio": {}},
+                ],
+                CONTEXT_REFS_KEY: [reference.durable_dict()],
+            }
+        ]
+    )
+
+    assert modalities == ("audio", "image")
+
+
+def test_route_sync_forwards_modalities_when_router_supports_them(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class Service:
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> dict[str, Any]:
+            calls.append(
+                {
+                    "prompt": prompt,
+                    "config_name": config_name,
+                    "preferred_input_modalities": preferred_input_modalities,
+                }
+            )
+            return {"selected": ["openai/gpt-5.5"]}
+
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    selected = RouterLLM()._route_sync("inspect", ("image",))
+
+    assert selected == ["openai/gpt-5.5"]
+    assert calls == [
+        {
+            "prompt": "inspect",
+            "config_name": "auto",
+            "preferred_input_modalities": ("image",),
+        }
+    ]
+
+
+def test_route_sync_keeps_older_router_api_compatible(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Service:
+        def route(self, prompt: str, *, config_name: str) -> dict[str, Any]:
+            calls.append((prompt, config_name))
+            return {"selected": ["text/model"]}
+
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    selected = RouterLLM()._route_sync("inspect", ("image",))
+
+    assert selected == ["text/model"]
+    assert calls == [("inspect", "auto")]
 
 
 @pytest.mark.asyncio

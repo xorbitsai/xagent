@@ -15,6 +15,10 @@ from ..agent.trace import (
     TraceScope,
     normalize_llm_trace_payload,
 )
+from ..context_materializer import (
+    ContextReferenceResolver,
+    materialize_llm_kwargs,
+)
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
@@ -103,6 +107,7 @@ class PatternRuntime:
     execution_id: str | None = None
     interrupt_checker: Callable[[], bool] | Callable[[], Any] | None = None
     outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
+    context_ref_resolver: ContextReferenceResolver | None = None
     _interrupt_requested: bool = False
     interrupt_reason: str | None = None
     last_checkpoint: dict[str, Any] | None = None
@@ -162,6 +167,11 @@ class PatternRuntime:
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         """Run an LLM call as a cancellable subtask owned by this runtime."""
 
+        kwargs = await materialize_llm_kwargs(
+            llm=llm,
+            kwargs=kwargs,
+            resolver=self.context_ref_resolver,
+        )
         call = llm.chat(**kwargs)
         if not inspect.isawaitable(call):
             return call
@@ -249,6 +259,11 @@ class PatternRuntime:
         stream_chat = getattr(llm, "stream_chat", None)
         if not callable(stream_chat) or not self._has_native_stream_chat(llm):
             return await self.run_llm_call(llm, **kwargs)
+        kwargs = await materialize_llm_kwargs(
+            llm=llm,
+            kwargs=kwargs,
+            resolver=self.context_ref_resolver,
+        )
 
         async def consume_stream() -> Any:
             content_parts: list[str] = []

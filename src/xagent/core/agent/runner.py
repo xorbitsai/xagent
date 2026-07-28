@@ -3,10 +3,13 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
 from ...config import get_compact_threshold_default, get_compact_threshold_ratio
+from ..context_materializer import WorkspaceContextReferenceResolver
+from ..context_ref import CONTEXT_REFS_KEY
 from ..model.intent import enter_goal, exit_goal
 from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
@@ -84,8 +87,9 @@ class AgentRunner:
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
             execution_id = context.execution_id
+            workspace = None
         else:
-            context = await self._build_context(
+            context, workspace = await self._build_context(
                 task=task,
                 execution_id=execution_id,
                 user_id=user_id,
@@ -98,8 +102,17 @@ class AgentRunner:
             for message in initial_messages or []:
                 role = str(message.get("role") or "").strip()
                 content = str(message.get("content") or "").strip()
-                if role and content:
-                    context.add_message(role, content)
+                context_refs = message.get(
+                    CONTEXT_REFS_KEY, message.get("context_refs", ())
+                )
+                if role and (content or context_refs):
+                    context.add_message(
+                        role,
+                        content,
+                        context_refs=context_refs,
+                        tool_calls=message.get("tool_calls"),
+                        tool_call_id=message.get("tool_call_id"),
+                    )
             if task:
                 context.add_user_message(
                     task,
@@ -112,6 +125,20 @@ class AgentRunner:
             interrupt_checker=interrupt_checker,
             outbound_message_handler=self.outbound_message_handler,
         )
+        if runtime.context_ref_resolver is None:
+            if workspace is None:
+                workspace_base = base_dir or self.workspace_base_dir
+                if context.workspace_path:
+                    workspace_base = str(Path(context.workspace_path).parent)
+                workspace = self.workspace_manager.get_or_create_workspace(
+                    base_dir=workspace_base,
+                    task_id=context.workspace_id or workspace_id or execution_id,
+                    allowed_external_dirs=allowed_external_dirs,
+                    scope_segments=self.scope_segments,
+                )
+                if inspect.isawaitable(workspace):
+                    workspace = await workspace
+            runtime.context_ref_resolver = WorkspaceContextReferenceResolver(workspace)
         self._active_controls[execution_id] = ExecutionControl(
             runtime=runtime,
             task=task,
@@ -551,7 +578,7 @@ class AgentRunner:
         allowed_external_dirs: list[str] | None,
         base_dir: str | None,
         metadata: dict[str, Any] | None,
-    ) -> ExecutionContext:
+    ) -> tuple[ExecutionContext, Any]:
         workspace = self.workspace_manager.get_or_create_workspace(
             base_dir=base_dir or self.workspace_base_dir,
             task_id=workspace_id or execution_id,
@@ -593,7 +620,7 @@ class AgentRunner:
             memory_id, snapshot = memory_session
             context.attach_memory_session(memory_id, snapshot)
 
-        return context
+        return context, workspace
 
     def _resolve_compact_threshold(self) -> int:
         """Derive the context-compaction threshold from the model's context window.

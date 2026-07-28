@@ -28,11 +28,13 @@ Env overrides (all optional; default to the bundled package data):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import threading
 from typing import Any, AsyncIterator, Callable, List, Optional, cast
 
+from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
 from ....model import ChatModelConfig
 from ...providers import default_base_url_for_provider
 from ..types import StreamChunk
@@ -43,6 +45,25 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
 _DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
+_CONTENT_PART_MODALITIES = {
+    "audio": "audio",
+    "audio_url": "audio",
+    "file": "file",
+    "file_url": "file",
+    "image": "image",
+    "image_url": "image",
+    "input_audio": "audio",
+    "input_file": "file",
+    "input_image": "image",
+    "input_video": "video",
+    "video": "video",
+    "video_url": "video",
+}
+_MODALITY_ABILITIES = {
+    "audio": "audio",
+    "image": "vision",
+    "video": "video",
+}
 
 
 def _should_retry_without_thinking(
@@ -212,8 +233,9 @@ class RouterLLM(BaseLLM):
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
         self.timeout = timeout
-        # xrouter-llm currently routes from text only and does not filter
-        # candidates by multimodal or reasoning support.
+        # A virtual router cannot advertise one candidate's dynamic abilities.
+        # The resolved per-call wrapper derives those from the selected model's
+        # profile after xrouter applies any input-modality preferences.
         self._abilities = [
             ability
             for ability in (abilities or _DEFAULT_ROUTER_ABILITIES)
@@ -426,7 +448,11 @@ class RouterLLM(BaseLLM):
         routing a second time, and carries the selected model's context window
         from xrouter's model profile catalog.
         """
-        model_id, downstream = await self._resolve_route(messages)
+        preferred_input_modalities = self._preferred_input_modalities(messages)
+        model_id, downstream = await self._resolve_route(
+            messages,
+            preferred_input_modalities=preferred_input_modalities,
+        )
         context_window = getattr(self, "context_window", None)
         if not context_window:
             context_window = await asyncio.to_thread(
@@ -434,15 +460,24 @@ class RouterLLM(BaseLLM):
             )
         if not context_window:
             context_window = getattr(downstream, "context_window", None)
+        input_modalities = (
+            self._profile_input_modalities(model_id)
+            if preferred_input_modalities
+            else ()
+        )
         return _ResolvedRouterLLM(
             router=self,
             downstream=downstream,
             selected_model=model_id,
             context_window=context_window,
+            input_modalities=input_modalities,
         )
 
     async def _resolve_route(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
     ) -> tuple[str, BaseLLM]:
         # Route on the agent's current goal (the user's request, or a DAG step's
         # objective) rather than the scaffolded sub-prompt this particular LLM
@@ -450,7 +485,13 @@ class RouterLLM(BaseLLM):
         from ...intent import current_goal
 
         prompt = current_goal() or self._extract_prompt(messages)
-        model_id = await self._select_model(prompt)
+        if preferred_input_modalities:
+            model_id = await self._select_model(
+                prompt,
+                preferred_input_modalities=preferred_input_modalities,
+            )
+        else:
+            model_id = await self._select_model(prompt)
         logger.info("xrouter selected %s -> openrouter", model_id)
         if self._downstream_resolver is not None:
             # Reuse the user-configured OpenRouter model (credentials + base_url).
@@ -489,11 +530,40 @@ class RouterLLM(BaseLLM):
             return None
         return value if isinstance(value, int) and value > 0 else None
 
-    async def _select_model(self, prompt: str) -> str:
+    @staticmethod
+    def _profile_input_modalities(model_id: str) -> tuple[str, ...]:
+        try:
+            profile = _get_service().profiles.get(model_id)
+            values = getattr(profile, "input_modalities", ())
+        except Exception as exc:  # noqa: BLE001 - metadata is best effort
+            logger.warning(
+                "Could not resolve xrouter input modalities for %s: %s",
+                model_id,
+                exc,
+            )
+            return ()
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            return ()
+        return tuple(
+            dict.fromkeys(
+                str(value).strip().lower() for value in values if str(value).strip()
+            )
+        )
+
+    async def _select_model(
+        self,
+        prompt: str,
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> str:
         # The decision loads/embeds in-process and is CPU-bound, so run it in a
         # worker thread to avoid blocking the event loop.
         try:
-            selected = await asyncio.to_thread(self._route_sync, prompt)
+            selected = await asyncio.to_thread(
+                self._route_sync,
+                prompt,
+                preferred_input_modalities,
+            )
         except Exception as exc:  # noqa: BLE001 - routing must not crash the agent
             if self._fallback_model:
                 logger.warning(
@@ -512,10 +582,53 @@ class RouterLLM(BaseLLM):
             raise RuntimeError("xrouter-llm returned no selected model")
         return str(selected[0])
 
-    def _route_sync(self, prompt: str) -> list[str]:
+    def _route_sync(
+        self,
+        prompt: str,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> list[str]:
         service = _get_service()
-        result = service.route(prompt, config_name=self._config_name)
+        route_kwargs: dict[str, Any] = {"config_name": self._config_name}
+        try:
+            route_parameters = dict(inspect.signature(service.route).parameters)
+        except (TypeError, ValueError):
+            route_parameters = {}
+        supports_modality_preferences = (
+            "preferred_input_modalities" in route_parameters
+            or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in route_parameters.values()
+            )
+        )
+        if preferred_input_modalities and supports_modality_preferences:
+            route_kwargs["preferred_input_modalities"] = preferred_input_modalities
+        result = service.route(prompt, **route_kwargs)
         return list(result.get("selected") or [])
+
+    @staticmethod
+    def _preferred_input_modalities(
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, ...]:
+        modalities: set[str] = set()
+        for message in messages:
+            try:
+                references = normalize_context_references(message.get(CONTEXT_REFS_KEY))
+            except (TypeError, ValueError):
+                references = ()
+            modalities.update(reference.type for reference in references)
+
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                modality = _CONTENT_PART_MODALITIES.get(
+                    str(part.get("type") or "").lower()
+                )
+                if modality is not None:
+                    modalities.add(modality)
+        return tuple(sorted(modalities))
 
     @staticmethod
     def _extract_prompt(messages: list[dict[str, Any]]) -> str:
@@ -550,11 +663,18 @@ class _ResolvedRouterLLM(BaseLLM):
         downstream: BaseLLM,
         selected_model: str,
         context_window: int | None,
+        input_modalities: tuple[str, ...],
     ) -> None:
         self._router = router
         self._downstream = downstream
         self._selected_model = selected_model
         self.context_window = context_window
+        abilities = list(router.abilities)
+        for modality in input_modalities:
+            ability = _MODALITY_ABILITIES.get(modality)
+            if ability is not None and ability not in abilities:
+                abilities.append(ability)
+        self._abilities = abilities
 
     @property
     def model_id(self) -> str:
@@ -566,7 +686,7 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def abilities(self) -> List[str]:
-        return self._router.abilities
+        return self._abilities
 
     @property
     def model_name(self) -> str:

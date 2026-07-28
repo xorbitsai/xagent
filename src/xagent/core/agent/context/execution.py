@@ -7,6 +7,10 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from ...context_ref import (
+    normalize_context_references,
+    split_tool_result_context_references,
+)
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ...tools.artifacts import (
     format_tool_result_for_observation,
@@ -155,8 +159,23 @@ class ExecutionContext:
         tool_name: str,
         result: Any,
         tool_call_id: str | None = None,
+        *,
+        context_refs: Any = (),
     ) -> Message:
-        context_result = self._sanitize_tool_result_for_context(tool_name, result)
+        public_result, embedded_refs = split_tool_result_context_references(result)
+        explicit_refs = normalize_context_references(context_refs)
+        all_context_refs = []
+        seen_context_refs: set[str] = set()
+        for reference in (*explicit_refs, *embedded_refs):
+            identity = reference.identity_key()
+            if identity in seen_context_refs:
+                continue
+            seen_context_refs.add(identity)
+            all_context_refs.append(reference)
+
+        context_result = self._sanitize_tool_result_for_context(
+            tool_name, public_result
+        )
         content = self._format_tool_result(tool_name, context_result)
         metadata = {
             "tool_name": tool_name,
@@ -171,6 +190,7 @@ class ExecutionContext:
             content,
             tool_call_id=tool_call_id,
             metadata=metadata,
+            context_refs=tuple(all_context_refs),
         )
 
     def attach_workspace(
@@ -541,6 +561,7 @@ class ExecutionContext:
             tool_call_id=response_message.tool_call_id,
             hidden=response_message.hidden,
             output_tokens=output_tokens,
+            context_refs=response_message.context_refs,
         )
         self.messages.append(updated_response)
         self.llm_calls.append(
@@ -752,6 +773,9 @@ class ExecutionContext:
                     "tool_call_id": message.tool_call_id,
                     "hidden": message.hidden,
                     "output_tokens": message.output_tokens,
+                    "context_refs": [
+                        reference.durable_dict() for reference in message.context_refs
+                    ],
                 }
                 for message in self.messages
             ],
@@ -797,6 +821,7 @@ class ExecutionContext:
                 tool_call_id=item.get("tool_call_id"),
                 hidden=item.get("hidden", False),
                 output_tokens=item.get("output_tokens"),
+                context_refs=item.get("context_refs", ()),
             )
             for item in data.get("messages", [])
         ]
@@ -1057,6 +1082,8 @@ class ExecutionContext:
                     + json.dumps(message.tool_calls, ensure_ascii=False, default=str)
                 )
             chunks.append(message.content)
+            if message.context_refs:
+                chunks.append(message.context_refs_text())
         return "\n".join(chunks)
 
     def _compact_response_text(self, response: Any) -> str:
@@ -1103,10 +1130,16 @@ class ExecutionContext:
         return self._estimate_message_tokens(self.messages)
 
     def _estimate_message_tokens(self, messages: list[Message]) -> int:
-        return sum(max(1, len(message.content) // 4) for message in messages)
+        return sum(
+            max(1, len(message.content) // 4) + message.context_refs_token_estimate()
+            for message in messages
+        )
 
     def _message_content_chars(self, messages: list[Message]) -> int:
-        return sum(len(message.content) for message in messages)
+        return sum(
+            len(message.content) + (4 * message.context_refs_token_estimate())
+            for message in messages
+        )
 
     def _tail_window_preserving_tool_pairs(self, keep_count: int) -> list[Message]:
         """Keep recent messages without cutting a native tool-call exchange."""
@@ -1176,9 +1209,14 @@ class ExecutionContext:
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
             if message.role == "assistant" and message.output_tokens is not None:
-                message_tokens = message.output_tokens
+                message_tokens = (
+                    message.output_tokens + message.context_refs_token_estimate()
+                )
             else:
-                message_tokens = max(1, len(message.content) // 4)
+                message_tokens = (
+                    max(1, len(message.content) // 4)
+                    + message.context_refs_token_estimate()
+                )
 
             if current_tokens + message_tokens > max_tokens:
                 break

@@ -845,6 +845,11 @@ async def create_public_chat_task(
     db: Session,
     default_channel_name: str,
 ) -> TaskCreateResponse:
+    if request.runtime_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Task runtime extensions are not supported for public widget tasks.",
+        )
     if access_context.widget_workforce_id is not None:
         return await _create_workforce_widget_chat_task(
             request=request, access_context=access_context, db=db
@@ -982,6 +987,11 @@ async def create_share_chat_task(
     db: Session,
     default_channel_name: str,
 ) -> TaskCreateResponse:
+    if request.runtime_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Task runtime extensions are not supported for shared-link tasks.",
+        )
     if access_context.workforce is not None:
         return await _create_workforce_share_chat_task(
             request=request, access_context=access_context, db=db

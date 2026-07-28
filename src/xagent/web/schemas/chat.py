@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 class ChatMessage(BaseModel):
@@ -60,6 +60,7 @@ class TaskCreateRequest(BaseModel):
     )
     agent_type: Optional[str] = "standard"
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
+    runtime_extensions: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     is_preview: bool = False  # Backward-compatible alias for is_visible=False.
     is_visible: bool = True
 
@@ -108,6 +109,7 @@ class TaskCreateResponse(BaseModel):
     run_id: Optional[str] = None
     state_version: int = 0
     control_state: str = "idle"
+    runtime_extensions: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ExecutionStatus(BaseModel):

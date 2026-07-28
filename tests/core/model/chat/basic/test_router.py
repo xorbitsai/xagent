@@ -213,6 +213,45 @@ async def test_prepare_for_call_prefers_and_exposes_context_ref_modality(
     assert prepared.has_ability("vision")
 
 
+@pytest.mark.asyncio
+async def test_prepare_for_call_merges_runtime_and_message_modalities(monkeypatch):
+    downstream = _ScriptedChatLLM([])
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    selected: list[tuple[str, tuple[str, ...]]] = []
+
+    async def select_model(
+        prompt: str,
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> str:
+        selected.append((prompt, preferred_input_modalities))
+        return "openai/gpt-5.5"
+
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: 128_000)
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda _model_id: ("text", "image"),
+    )
+
+    prepared = await router.prepare_for_call(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect"},
+                    {"type": "input_audio", "input_audio": {}},
+                ],
+            }
+        ],
+        preferred_input_modalities=("IMAGE",),
+    )
+
+    assert selected == [("inspect", ("image", "audio"))]
+    assert prepared.has_ability("vision")
+
+
 def test_router_detects_modalities_from_refs_and_content_parts() -> None:
     reference = ContextReference(
         file_ref={

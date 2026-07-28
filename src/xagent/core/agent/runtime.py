@@ -24,6 +24,10 @@ from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
+from ..task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
 from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
@@ -61,7 +65,29 @@ async def prepare_llm_for_context(
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
     if callable(prepare):
-        prepared = prepare(messages)
+        preferred_modalities = normalize_input_modalities(
+            getattr(context, "metadata", {}).get(
+                PREFERRED_INPUT_MODALITIES_METADATA_KEY
+            )
+            if isinstance(getattr(context, "metadata", None), dict)
+            else ()
+        )
+        supports_preferences = False
+        try:
+            parameters = inspect.signature(prepare).parameters
+            supports_preferences = "preferred_input_modalities" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            pass
+        if preferred_modalities and supports_preferences:
+            prepared = prepare(
+                messages,
+                preferred_input_modalities=preferred_modalities,
+            )
+        else:
+            prepared = prepare(messages)
         if inspect.isawaitable(prepared):
             prepared = await prepared
 

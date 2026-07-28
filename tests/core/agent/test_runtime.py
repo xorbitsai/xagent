@@ -17,6 +17,7 @@ from xagent.core.agent.runtime import (
     resolved_llm_metadata,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 class SlowLLM:
@@ -55,6 +56,39 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
         "selected_model": "deepseek/deepseek-v4-flash",
         "context_window": 1_048_576,
     }
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_passes_runtime_modality_preferences() -> None:
+    captured: list[tuple[str, ...]] = []
+
+    class PreparedLLM:
+        context_window = 128_000
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            captured.append(preferred_input_modalities)
+            return PreparedLLM()
+
+    context = ExecutionContext()
+    context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = [
+        "IMAGE",
+        "image",
+        "audio",
+    ]
+
+    await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "inspect the selected target"}],
+        context=context,
+    )
+
+    assert captured == [("image", "audio")]
 
 
 @pytest.mark.asyncio

@@ -276,9 +276,15 @@ class ToolFactory:
 
     @staticmethod
     async def create_all_tools(
-        config: BaseToolConfig, apply_user_override_filter: bool = True
+        config: BaseToolConfig,
+        apply_user_override_filter: bool = True,
+        additional_tools: Iterable[Tool] | None = None,
     ) -> list[Tool]:
-        """Create tools within the config's optional prepared-runtime boundary."""
+        """Create tools within the config's optional prepared-runtime boundary.
+
+        Task runtime extensions may supply ``additional_tools``; they enter the
+        pipeline before selection, user policy, sandbox, and output filtering.
+        """
         prepare_factory_runtime = getattr(type(config), "prepare_factory_runtime", None)
         handoff_factory_runtime = getattr(type(config), "handoff_factory_runtime", None)
         release_factory_runtime = getattr(
@@ -289,16 +295,29 @@ class ToolFactory:
 
         async def build_tools() -> list[Tool]:
             nonlocal body_failed
-            if callable(prepare_factory_runtime):
-                try:
-                    await prepare_factory_runtime(config)
-                except BaseException:
-                    body_failed = True
-                    raise
             try:
+                if callable(prepare_factory_runtime):
+                    await prepare_factory_runtime(config)
+                resolved_additional_tools = additional_tools
+                if resolved_additional_tools is None:
+                    contribution_getter = getattr(
+                        config, "get_task_runtime_contribution", None
+                    )
+                    contribution = (
+                        contribution_getter()
+                        if callable(contribution_getter)
+                        else None
+                    )
+                    resolved_additional_tools = getattr(contribution, "tools", ())
+                resolved_additional_tools = tuple(resolved_additional_tools or ())
+                prepared_kwargs: dict[str, Any] = {
+                    "apply_user_override_filter": apply_user_override_filter
+                }
+                if resolved_additional_tools:
+                    prepared_kwargs["additional_tools"] = resolved_additional_tools
                 return await ToolFactory._create_all_tools_prepared(
                     config,
-                    apply_user_override_filter=apply_user_override_filter,
+                    **prepared_kwargs,
                 )
             except BaseException:
                 body_failed = True
@@ -325,7 +344,9 @@ class ToolFactory:
 
     @staticmethod
     async def _create_all_tools_prepared(
-        config: BaseToolConfig, apply_user_override_filter: bool = True
+        config: BaseToolConfig,
+        apply_user_override_filter: bool = True,
+        additional_tools: Iterable[Tool] = (),
     ) -> list[Tool]:
         """
         Create all tools based on configuration.
@@ -345,6 +366,19 @@ class ToolFactory:
         """
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
+        extension_tools = list(additional_tools)
+        if extension_tools:
+            existing_names = {tool.name for tool in tools}
+            extension_names: set[str] = set()
+            for tool in extension_tools:
+                name = str(tool.name)
+                if name in existing_names or name in extension_names:
+                    raise ValueError(
+                        f"Task runtime extension contributed duplicate tool '{name}'"
+                    )
+                extension_names.add(name)
+            tools.extend(extension_tools)
+            tools = ToolRegistry._sort_tools_by_category(tools)
 
         # Name-level filter via the spec's ``compute_allowed_names``
         # dispatch. The three return shapes encode the three modes:

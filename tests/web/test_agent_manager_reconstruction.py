@@ -431,8 +431,9 @@ class TestAgentServiceManagerReconstruction:
         async def create_all_tools(
             config,
             apply_user_override_filter: bool = True,
+            additional_tools=(),
         ):
-            return [basic_tool, browser_tool]
+            return [basic_tool, browser_tool, *additional_tools]
 
         monkeypatch.setattr(
             "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
@@ -481,8 +482,12 @@ class TestAgentServiceManagerReconstruction:
     ):
         sample_task.source = source
 
-        async def create_all_tools(config, apply_user_override_filter=True):
-            return []
+        async def create_all_tools(
+            config,
+            apply_user_override_filter=True,
+            additional_tools=(),
+        ):
+            return list(additional_tools)
 
         monkeypatch.setattr(
             "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",

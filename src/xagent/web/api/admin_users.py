@@ -1,16 +1,21 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+from ...core.task_runtime import TaskRuntimeContext
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local
 from ..models.task import Task
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
+from ..services.task_runtime import TaskRuntimeExtensionError, delete_task_extensions
 from ..services.user_admin_scope import hidden_user_ids
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
+logger = logging.getLogger(__name__)
 
 
 def _delete_legacy_text2sql_rows(db: Session, user_id: int) -> None:
@@ -96,6 +101,23 @@ async def delete_user(
     # up by table name so user deletion keeps working under strict FK checks.
     _delete_legacy_text2sql_rows(db, user_id)
 
+    session_factory = get_session_local()
+    task_runtime_contexts = [
+        TaskRuntimeContext(
+            task_id=int(task_id),
+            user_id=int(task_user_id),
+            source=str(source) if source is not None else None,
+            session_factory=session_factory,
+        )
+        for task_id, task_user_id, source in db.query(
+            Task.id,
+            Task.user_id,
+            Task.source,
+        )
+        .filter(Task.user_id == user_id)
+        .all()
+    ]
+
     # Delete user's tasks
     db.query(Task).filter(Task.user_id == user_id).delete()
 
@@ -106,5 +128,16 @@ async def delete_user(
     db.delete(user)
     db.commit()
     ModelStore(db).invalidate_after_user_delete()
+
+    for context in task_runtime_contexts:
+        try:
+            await delete_task_extensions(context)
+        except TaskRuntimeExtensionError:
+            logger.warning(
+                "User %s was deleted but runtime extension cleanup failed for task %s",
+                user_id,
+                context.task_id,
+                exc_info=True,
+            )
 
     return {"message": "User deleted successfully"}

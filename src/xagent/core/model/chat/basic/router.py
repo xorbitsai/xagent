@@ -445,14 +445,30 @@ class RouterLLM(BaseLLM):
                 current_thinking = next_thinking
 
     # ---- Routing ------------------------------------------------------------
-    async def prepare_for_call(self, messages: list[dict[str, Any]]) -> BaseLLM:
+    async def prepare_for_call(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> BaseLLM:
         """Resolve one xrouter decision into a reusable per-call LLM.
 
         The returned wrapper keeps RouterLLM's compatibility retries without
         routing a second time, and carries the selected model's context window
         from xrouter's model profile catalog.
         """
-        preferred_input_modalities = self._preferred_input_modalities(messages)
+        preferred_input_modalities = tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        str(modality).strip().lower()
+                        for modality in preferred_input_modalities
+                        if str(modality).strip()
+                    ),
+                    *self._preferred_input_modalities(messages),
+                )
+            )
+        )
         model_id, downstream = await self._resolve_route(
             messages,
             preferred_input_modalities=preferred_input_modalities,

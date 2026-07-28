@@ -35,6 +35,11 @@ from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
+from ...core.task_runtime import (
+    EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    TaskRuntimeContext,
+    TaskRuntimeContribution,
+)
 from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
@@ -45,7 +50,11 @@ from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
-from ..models.database import get_db, release_db_connection_if_clean
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
@@ -98,6 +107,14 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
+)
+from ..services.task_runtime import (
+    TaskRuntimeExtensionError,
+    build_task_runtime,
+    create_task_extensions,
+    delete_task_extensions,
+    get_task_runtime_public_metadata,
+    validate_task_extension_requests,
 )
 from ..services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -551,6 +568,7 @@ async def create_default_tools(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[List[int]] = None,
     scope: Optional[ExecutionScope] = None,
+    task_runtime_context: TaskRuntimeContext | None = None,
     connector_runtime_turn_id: Optional[str] = None,
     mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
     mcp_load_summary_tracer: Optional[Any] = None,
@@ -641,11 +659,78 @@ async def create_default_tools(
 
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
+    runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
+    if task_runtime_context is not None:
+        workspace = ToolFactory._create_workspace(tool_config.get_workspace_config())
+        runtime_contribution = await build_task_runtime(
+            task_runtime_context.with_workspace(workspace)
+        )
+    tool_config.set_task_runtime_contribution(runtime_contribution)
+
     # Use ToolFactory to create proper xagent tools
     tools = await ToolFactory.create_all_tools(tool_config)
 
     logger.info(f"Created {len(tools)} default tools using ToolFactory")
     return tools, tool_config
+
+
+def _task_runtime_context(
+    *,
+    task_id: int,
+    user_id: int,
+    source: Any,
+) -> TaskRuntimeContext:
+    return TaskRuntimeContext(
+        task_id=task_id,
+        user_id=user_id,
+        source=str(source) if source is not None else None,
+        session_factory=get_session_local(),
+    )
+
+
+def _task_runtime_contribution(tool_config: Any) -> TaskRuntimeContribution:
+    getter = getattr(tool_config, "get_task_runtime_contribution", None)
+    if not callable(getter):
+        return EMPTY_TASK_RUNTIME_CONTRIBUTION
+    value = getter()
+    return (
+        value
+        if isinstance(value, TaskRuntimeContribution)
+        else EMPTY_TASK_RUNTIME_CONTRIBUTION
+    )
+
+
+def _append_runtime_environment(
+    system_prompt: Optional[str],
+    contribution: TaskRuntimeContribution,
+) -> Optional[str]:
+    parts = [
+        value.strip()
+        for value in (system_prompt, contribution.environment)
+        if isinstance(value, str) and value.strip()
+    ]
+    return "\n\n".join(parts) or None
+
+
+def _compensate_failed_task_extension_create(
+    db: Session,
+    *,
+    task_id: int,
+) -> None:
+    """Remove a just-created task after provider binding setup failed."""
+
+    from ..models.uploaded_file import UploadedFile
+
+    db.rollback()
+    db.query(UploadedFile).filter(UploadedFile.task_id == task_id).update(
+        {UploadedFile.task_id: None},
+        synchronize_session=False,
+    )
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is not None:
+        db.delete(task)
+    db.commit()
+    invalidate_task_cache(task_id)
 
 
 def _selected_file_ids_from_agent_config(
@@ -1642,6 +1727,11 @@ class AgentServiceManager:
             task_id=f"web_task_{task_id}",
             workspace_owner_id=int(task.user_id),
             scope=scope,
+            task_runtime_context=_task_runtime_context(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                source=getattr(task, "source", None),
+            ),
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
             else None,
@@ -2313,6 +2403,11 @@ class AgentServiceManager:
                     task_id=f"web_task_{task_id}",
                     workspace_owner_id=workspace_owner_id,
                     scope=scope,
+                    task_runtime_context=_task_runtime_context(
+                        task_id=task_id,
+                        user_id=workspace_owner_id,
+                        source=getattr(task, "source", None),
+                    ),
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
@@ -2350,6 +2445,7 @@ class AgentServiceManager:
                 with UserContext(runtime_user_id):
                     # Unpack tools and tool_config from create_default_tools
                     tools_list, tool_config = tools
+                    runtime_contribution = _task_runtime_contribution(tool_config)
 
                     # Get system prompt from agent config (if available)
                     from .agents import enhance_system_prompt_with_kb
@@ -2365,6 +2461,10 @@ class AgentServiceManager:
                     )
                     system_prompt = _build_workforce_system_prompt(
                         system_prompt, workforce_runtime
+                    )
+                    system_prompt = _append_runtime_environment(
+                        system_prompt,
+                        runtime_contribution,
                     )
 
                     # Extract memory similarity threshold from agent config
@@ -2409,6 +2509,9 @@ class AgentServiceManager:
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=memory_policy.memory_enabled,
                         system_prompt=system_prompt,  # Pass agent builder instructions
+                        preferred_input_modalities=(
+                            runtime_contribution.preferred_input_modalities
+                        ),
                     )
 
                     selected_file_ids = _selected_file_ids_from_agent_config(
@@ -3138,6 +3241,7 @@ class AgentServiceManager:
                 scope=scope,
                 task_setup_snapshot=snapshot,
             )
+            runtime_contribution = _task_runtime_contribution(tool_config)
 
             from .agents import enhance_system_prompt_with_kb
 
@@ -3148,6 +3252,10 @@ class AgentServiceManager:
             system_prompt = _build_workforce_system_prompt(
                 system_prompt,
                 snapshot.workforce_runtime,
+            )
+            system_prompt = _append_runtime_environment(
+                system_prompt,
+                runtime_contribution,
             )
             memory_similarity_threshold = (
                 agent_config.get("memory_similarity_threshold")
@@ -3187,6 +3295,9 @@ class AgentServiceManager:
                     task_id=str(task_id),
                     memory_similarity_threshold=memory_similarity_threshold,
                     memory_enabled=memory_policy.memory_enabled,
+                    preferred_input_modalities=(
+                        runtime_contribution.preferred_input_modalities
+                    ),
                 )
 
             agent_service = self._agents[task_id]
@@ -3273,6 +3384,13 @@ async def create_task(
 ) -> TaskCreateResponse:
     """Create new chat task"""
     try:
+        try:
+            runtime_extension_requests = validate_task_extension_requests(
+                request.runtime_extensions
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         # Build task description with file information
         task_description = request.description or ""
 
@@ -3604,6 +3722,38 @@ async def create_task(
         db.commit()
         db.refresh(task)
 
+        runtime_context = _task_runtime_context(
+            task_id=int(task.id),
+            user_id=int(task.user_id),
+            source=task.source,
+        )
+        try:
+            await create_task_extensions(
+                runtime_context,
+                runtime_extension_requests,
+            )
+        except TaskRuntimeExtensionError as exc:
+            task_id = int(task.id)
+            _compensate_failed_task_extension_create(db, task_id=task_id)
+            get_agent_manager(request).remove_agent(task_id, int(user.id))
+            if isinstance(exc.cause, PermissionError):
+                status_code = 403
+            elif isinstance(exc.cause, (TypeError, ValueError)):
+                status_code = 400
+            else:
+                status_code = 503
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+        try:
+            runtime_extensions = await get_task_runtime_public_metadata(runtime_context)
+        except TaskRuntimeExtensionError:
+            logger.warning(
+                "Failed to load public runtime metadata for task %s",
+                task.id,
+                exc_info=True,
+            )
+            runtime_extensions = {}
+
         return TaskCreateResponse(
             task_id=task.id,
             title=task.title,
@@ -3628,6 +3778,7 @@ async def create_task(
             run_id=task.run_id,
             state_version=int(task.state_version or 0),
             control_state=str(task.control_state or "idle"),
+            runtime_extensions=runtime_extensions,
         )
 
     except HTTPException:
@@ -4134,6 +4285,33 @@ async def update_task(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@chat_router.get("/task/{task_id}/runtime-extensions")
+async def get_task_runtime_extensions(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return live, provider-approved runtime metadata for one task."""
+
+    query = db.query(Task).filter(Task.id == task_id)
+    if not user.is_admin:
+        query = query.filter(Task.user_id == user.id)
+    task = query.first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    context = _task_runtime_context(
+        task_id=int(task.id),
+        user_id=int(task.user_id),
+        source=task.source,
+    )
+    try:
+        extensions = await get_task_runtime_public_metadata(context)
+    except TaskRuntimeExtensionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"task_id": task_id, "runtime_extensions": extensions}
+
+
 @chat_router.delete("/task/{task_id}")
 async def delete_task(
     task_id: int,
@@ -4144,7 +4322,7 @@ async def delete_task(
     """Delete a task and all related data"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _delete_task_sync() -> Task:
+        def _delete_task_sync() -> tuple[Task, TaskRuntimeContext]:
             # Get task - admin can delete any task, regular users can only delete their own
             if user.is_admin:
                 task = db.query(Task).filter(Task.id == task_id).first()
@@ -4156,6 +4334,11 @@ async def delete_task(
                 )
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
+            runtime_context = _task_runtime_context(
+                task_id=int(task.id),
+                user_id=int(task.user_id),
+                source=task.source,
+            )
 
             # Delete related data in correct order to respect foreign key constraints
             logger.info(f"Deleting task {task_id} and all related data")
@@ -4187,14 +4370,23 @@ async def delete_task(
             db.delete(task)
             db.commit()
 
-            return task
+            return task, runtime_context
 
         # Execute database operations in thread pool to avoid blocking
-        task = await asyncio.to_thread(_delete_task_sync)
+        task, runtime_context = await asyncio.to_thread(_delete_task_sync)
         invalidate_task_cache(task_id)
 
         # Remove agent from manager if it exists
         get_agent_manager(request).remove_agent(task_id, int(user.id))
+
+        try:
+            await delete_task_extensions(runtime_context)
+        except TaskRuntimeExtensionError:
+            logger.warning(
+                "Task %s was deleted but runtime extension cleanup failed",
+                task_id,
+                exc_info=True,
+            )
 
         from .websocket import background_task_manager, manager
 

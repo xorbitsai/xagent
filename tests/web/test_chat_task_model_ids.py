@@ -1214,3 +1214,122 @@ def test_delete_task_keeps_cross_user_access_denied(
         assert db.query(Task).filter(Task.id == task_id).count() == 1
     finally:
         db.close()
+
+
+class _TaskRuntimeProvider:
+    def __init__(self, *, fail_create: bool = False):
+        self.fail_create = fail_create
+        self.events: list[tuple[str, int]] = []
+        self.configuration: dict | None = None
+
+    async def on_task_created(self, context, configuration):
+        self.events.append(("created", context.task_id))
+        self.configuration = dict(configuration)
+        if self.fail_create:
+            raise ValueError("invalid target")
+
+    async def build_runtime(self, context):
+        from xagent.core.task_runtime import TaskRuntimeContribution
+
+        return TaskRuntimeContribution()
+
+    async def public_metadata(self, context):
+        return {"target": self.configuration["target"]} if self.configuration else {}
+
+    async def on_task_deleted(self, context):
+        self.events.append(("deleted", context.task_id))
+
+
+def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
+    test_db,
+    user1_headers,
+    user2_headers,
+):
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "runtime task",
+                "description": "inspect the selected target",
+                "runtime_extensions": {"test_runtime": {"target": "approved_browser"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+        assert response.json()["runtime_extensions"] == {
+            "test_runtime": {"target": "approved_browser"}
+        }
+        metadata = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user1_headers,
+        )
+        assert metadata.status_code == 200
+        assert metadata.json()["runtime_extensions"] == {
+            "test_runtime": {"target": "approved_browser"}
+        }
+        denied = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user2_headers,
+        )
+        assert denied.status_code == 404
+
+        deleted = client.delete(
+            f"/api/chat/task/{task_id}",
+            headers=user1_headers,
+        )
+        assert deleted.status_code == 200
+        assert provider.events == [
+            ("created", task_id),
+            ("deleted", task_id),
+        ]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_create_failure_compensates_task(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider(fail_create=True)
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "invalid runtime task",
+                "description": "must be compensated",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 400
+        db = next(get_db())
+        try:
+            assert (
+                db.query(Task).filter(Task.title == "invalid runtime task").count() == 0
+            )
+        finally:
+            db.close()
+        assert [event for event, _task_id in provider.events] == [
+            "created",
+            "deleted",
+        ]
+    finally:
+        unregister_task_extension("test_runtime")

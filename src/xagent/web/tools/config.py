@@ -1137,6 +1137,7 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_failure_policy = mcp_failure_policy
         self._mcp_load_summary_tracer = mcp_load_summary_tracer
         self._mcp_load_summary_trace_task_id = mcp_load_summary_trace_task_id
+        self._task_runtime_contribution: Any = None
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -1707,6 +1708,16 @@ class WebToolConfig(BaseToolConfig):
     def get_browser_tools_enabled(self) -> bool:
         """Whether to include browser automation tools."""
         return self._browser_tools_enabled
+
+    def set_task_runtime_contribution(self, contribution: Any) -> None:
+        """Attach the detached contribution built for this task."""
+
+        self._task_runtime_contribution = contribution
+
+    def get_task_runtime_contribution(self) -> Any:
+        """Return the contribution consumed while building ``AgentService``."""
+
+        return self._task_runtime_contribution
 
     def get_task_id(self) -> Optional[str]:
         """Get task ID for session tracking."""

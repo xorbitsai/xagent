@@ -11,6 +11,7 @@ from ...config import get_uploads_dir
 from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
+from ..task_runtime import normalize_input_modalities
 from ..tools.adapters.vibe import Tool
 from ..tools.adapters.vibe.config import (
     RequiredMCPUnavailableError,
@@ -55,6 +56,7 @@ class AgentService:
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
+        preferred_input_modalities: tuple[str, ...] | list[str] | None = None,
         tools_initialized: bool | None = None,
         **agent_kwargs: Any,
     ) -> None:
@@ -69,6 +71,9 @@ class AgentService:
         self.vision_llm = vision_llm
         self.compact_llm = compact_llm
         self.system_prompt = system_prompt
+        self.preferred_input_modalities = normalize_input_modalities(
+            preferred_input_modalities
+        )
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
         if tools is not None and tool_config is not None:
@@ -458,6 +463,9 @@ class AgentService:
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
             )
+            self._execution_adapter.config.preferred_input_modalities = (
+                self.preferred_input_modalities
+            )
 
         return cast(
             dict[str, Any],
@@ -507,6 +515,7 @@ class AgentService:
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,
+                preferred_input_modalities=self.preferred_input_modalities,
             )
         )
 

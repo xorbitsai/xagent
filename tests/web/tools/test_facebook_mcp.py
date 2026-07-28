@@ -130,7 +130,7 @@ def test_list_page_posts_uses_page_access_token(monkeypatch):
         assert kwargs["params"] == {
             "fields": (
                 "id,message,created_time,permalink_url,full_picture,status_type,"
-                "likes.summary(true),comments.summary(true),shares"
+                "likes.limit(0).summary(true),comments.limit(0).summary(true),shares"
             ),
             "limit": 5,
         }

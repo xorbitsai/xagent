@@ -26,15 +26,15 @@ requests = meta_graph.requests  # exposed for test monkeypatching
 
 
 def _page_path(page_id: str, suffix: str) -> str:
-    if not page_id.strip():
+    if not page_id or not str(page_id).strip():
         raise ValueError("page_id is required")
-    return f"/{quote(page_id.strip(), safe='')}/{suffix}"
+    return f"/{quote(str(page_id).strip(), safe='')}/{suffix}"
 
 
 def _post_path(post_id: str, suffix: str) -> str:
-    if not post_id.strip():
+    if not post_id or not str(post_id).strip():
         raise ValueError("post_id is required")
-    return f"/{quote(post_id.strip(), safe='')}/{suffix}"
+    return f"/{quote(str(post_id).strip(), safe='')}/{suffix}"
 
 
 def _normalize_page(page: dict[str, Any]) -> dict[str, Any]:
@@ -117,7 +117,7 @@ def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
             params={
                 "fields": (
                     "id,message,created_time,permalink_url,full_picture,status_type,"
-                    "likes.summary(true),comments.summary(true),shares"
+                    "likes.limit(0).summary(true),comments.limit(0).summary(true),shares"
                 ),
                 "limit": _bounded_limit(limit),
             },

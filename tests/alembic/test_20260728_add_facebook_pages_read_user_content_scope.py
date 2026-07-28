@@ -1,0 +1,114 @@
+"""Tests for adding the pages_read_user_content Facebook scope."""
+
+import importlib.util
+from pathlib import Path
+from unittest.mock import patch
+
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import create_engine, text
+
+
+def _load_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260728_add_facebook_pages_read_user_content_scope.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_facebook_scope_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _operations(connection):
+    return Operations(MigrationContext.configure(connection))
+
+
+def _create_table(connection):
+    connection.execute(
+        text(
+            """
+            CREATE TABLE public_mcp_apps (
+                id INTEGER PRIMARY KEY,
+                app_id VARCHAR(100) NOT NULL UNIQUE,
+                oauth_scopes JSON
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO public_mcp_apps (app_id, oauth_scopes) "
+            'VALUES (\'facebook\', \'["pages_show_list", "pages_read_engagement", '
+            '"pages_manage_posts"]\')'
+        )
+    )
+
+
+def _scopes(connection):
+    import json
+
+    row = connection.execute(
+        text("SELECT oauth_scopes FROM public_mcp_apps WHERE app_id='facebook'")
+    ).first()
+    value = row[0]
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def test_upgrade_adds_pages_read_user_content(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _scopes(connection) == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+            "pages_read_user_content",
+        ]
+
+
+def test_upgrade_is_idempotent(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.upgrade()
+        assert _scopes(connection) == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+            "pages_read_user_content",
+        ]
+
+
+def test_downgrade_removes_pages_read_user_content(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert _scopes(connection) == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+        ]
+
+
+def test_migration_scopes_match_registry():
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    migration = _load_migration_module()
+    registry_row = next(
+        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "facebook"
+    )
+    assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]

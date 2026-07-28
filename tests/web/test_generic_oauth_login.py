@@ -226,7 +226,8 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     qs = parse_qs(urlparse(_location(resp)).query)
 
     assert qs["scope"] == [
-        "public_profile,pages_manage_posts,pages_read_engagement,pages_show_list"
+        "public_profile,pages_manage_posts,pages_read_engagement,"
+        "pages_read_user_content,pages_show_list"
     ]
 
 

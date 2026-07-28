@@ -245,7 +245,7 @@ async def test_prepare_for_call_merges_runtime_and_message_modalities(monkeypatc
                 ],
             }
         ],
-        preferred_input_modalities=("IMAGE",),
+        preferred_input_modalities=(None, "IMAGE"),  # type: ignore[arg-type]
     )
 
     assert selected == [("inspect", ("image", "audio"))]

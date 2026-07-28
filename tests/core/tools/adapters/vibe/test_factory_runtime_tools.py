@@ -80,3 +80,21 @@ async def test_runtime_tools_cannot_shadow_existing_tool(monkeypatch) -> None:
             ToolConfig({}),
             additional_tools=(_tool("computer"),),
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_tools_require_a_non_empty_string_name(monkeypatch) -> None:
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+
+    with pytest.raises(TypeError, match="non-empty string 'name'"):
+        await ToolFactory.create_all_tools(
+            ToolConfig({}),
+            additional_tools=(SimpleNamespace(),),
+        )

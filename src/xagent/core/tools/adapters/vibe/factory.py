@@ -371,7 +371,12 @@ class ToolFactory:
             existing_names = {tool.name for tool in tools}
             extension_names: set[str] = set()
             for tool in extension_tools:
-                name = str(tool.name)
+                name = getattr(tool, "name", None)
+                if not isinstance(name, str) or not name.strip():
+                    raise TypeError(
+                        "Task runtime extension contributed a tool without a "
+                        "non-empty string 'name' attribute"
+                    )
                 if name in existing_names or name in extension_names:
                     raise ValueError(
                         f"Task runtime extension contributed duplicate tool '{name}'"

@@ -9,6 +9,7 @@ import pytest
 from xagent.core.task_runtime import (
     TaskRuntimeContext,
     TaskRuntimeContribution,
+    normalize_input_modalities,
 )
 from xagent.web.services.task_runtime import (
     TaskRuntimeExtensionError,
@@ -91,6 +92,10 @@ def _register(
 ) -> None:
     register_task_extension(name, provider)
     registered_names.append(name)
+
+
+def test_normalize_input_modalities_ignores_none() -> None:
+    assert normalize_input_modalities((None, " IMAGE ", None, "image")) == ("image",)
 
 
 @pytest.mark.asyncio

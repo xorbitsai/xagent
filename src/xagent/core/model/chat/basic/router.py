@@ -36,6 +36,7 @@ from typing import Any, AsyncIterator, Callable, List, Optional, cast
 
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
 from ....model import ChatModelConfig
+from ....task_runtime import normalize_input_modalities
 from ...providers import default_base_url_for_provider
 from ..types import StreamChunk
 from .base import BaseLLM
@@ -460,11 +461,7 @@ class RouterLLM(BaseLLM):
         preferred_input_modalities = tuple(
             dict.fromkeys(
                 (
-                    *(
-                        str(modality).strip().lower()
-                        for modality in preferred_input_modalities
-                        if str(modality).strip()
-                    ),
+                    *normalize_input_modalities(preferred_input_modalities),
                     *self._preferred_input_modalities(messages),
                 )
             )

@@ -4308,7 +4308,13 @@ async def get_task_runtime_extensions(
     try:
         extensions = await get_task_runtime_public_metadata(context)
     except TaskRuntimeExtensionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if isinstance(exc.cause, PermissionError):
+            status_code = 403
+        elif isinstance(exc.cause, (TypeError, ValueError, AttributeError)):
+            status_code = 400
+        else:
+            status_code = 500
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     return {"task_id": task_id, "runtime_extensions": extensions}
 
 

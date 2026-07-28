@@ -1217,8 +1217,14 @@ def test_delete_task_keeps_cross_user_access_denied(
 
 
 class _TaskRuntimeProvider:
-    def __init__(self, *, fail_create: bool = False):
+    def __init__(
+        self,
+        *,
+        fail_create: bool = False,
+        metadata_error: Exception | None = None,
+    ):
         self.fail_create = fail_create
+        self.metadata_error = metadata_error
         self.events: list[tuple[str, int]] = []
         self.configuration: dict | None = None
 
@@ -1234,6 +1240,8 @@ class _TaskRuntimeProvider:
         return TaskRuntimeContribution()
 
     async def public_metadata(self, context):
+        if self.metadata_error is not None:
+            raise self.metadata_error
         return {"target": self.configuration["target"]} if self.configuration else {}
 
     async def on_task_deleted(self, context):
@@ -1292,6 +1300,55 @@ def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
             ("deleted", task_id),
         ]
     finally:
+        unregister_task_extension("test_runtime")
+
+
+@pytest.mark.parametrize(
+    ("metadata_error", "expected_status"),
+    [
+        (PermissionError("target denied"), 403),
+        (TypeError("invalid metadata"), 400),
+        (RuntimeError("database unavailable"), 500),
+    ],
+)
+def test_task_runtime_metadata_maps_provider_error_status(
+    test_db,
+    user1_headers,
+    metadata_error,
+    expected_status,
+):
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider(metadata_error=metadata_error)
+    register_task_extension("test_runtime", provider)
+    task_id = None
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "runtime metadata error",
+                "runtime_extensions": {"test_runtime": {"target": "approved_browser"}},
+            },
+            headers=user1_headers,
+        )
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+
+        metadata = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user1_headers,
+        )
+
+        assert metadata.status_code == expected_status
+    finally:
+        if task_id is not None:
+            client.delete(
+                f"/api/chat/task/{task_id}",
+                headers=user1_headers,
+            )
         unregister_task_extension("test_runtime")
 
 

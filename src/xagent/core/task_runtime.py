@@ -91,7 +91,7 @@ def normalize_input_modalities(values: Any) -> tuple[str, ...]:
         dict.fromkeys(
             normalized
             for item in candidates
-            if (normalized := str(item).strip().lower())
+            if item is not None and (normalized := str(item).strip().lower())
         )
     )
 

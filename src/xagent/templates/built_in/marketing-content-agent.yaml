@@ -21,7 +21,7 @@ sample_prompts:
     highlights:
     - topic
   - title: Refresh an old post
-    prompt: 'Rewrite existing article / URL for the keyword keyword — update the structure, internal links and SEO tags.'
+    prompt: 'Rewrite existing article / URL to target keyword — update the structure, internal links and SEO tags.'
     highlights:
     - existing article / URL
     - keyword
@@ -31,7 +31,7 @@ sample_prompts:
     highlights:
     - 主题
   - title: 刷新旧文章
-    prompt: 重写 已有文章 / 链接（针对关键词 关键词）——更新结构、内部链接和 SEO 标签。
+    prompt: 围绕 关键词 重写 已有文章 / 链接——更新结构、内部链接和 SEO 标签。
     highlights:
     - 已有文章 / 链接
     - 关键词

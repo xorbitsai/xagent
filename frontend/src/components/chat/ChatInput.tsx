@@ -25,6 +25,47 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 
+// Shared accent styling for the "Using @agent" / "Agent template: X" chips
+// rendered above the input.
+const CHIP_ACCENT_STYLE = { borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" };
+
+// The "Using @agent" and "Agent template: X" chips are the same shape (an
+// italic label, a pill with the value, an optional remove button) - one
+// component instead of two near-identical blocks.
+function SelectionChip({
+  label,
+  value,
+  onRemove,
+  removeLabel,
+}: {
+  label: string;
+  value: string;
+  onRemove?: () => void;
+  removeLabel: string;
+}) {
+  return (
+    <div
+      className="inline-flex h-9 items-center gap-1 rounded-t-xl rounded-b-none border border-b-0 px-3 text-xs font-medium shadow-[0_-1px_0_rgba(53,88,255,0.08)]"
+      style={CHIP_ACCENT_STYLE}
+    >
+      <span className="italic">{label}</span>
+      <span className="rounded-md border px-2 py-0.5 not-italic" style={CHIP_ACCENT_STYLE}>
+        {value}
+      </span>
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          className="rounded-sm p-0.5 hover:bg-[#dfe6ff]"
+          title={removeLabel}
+        >
+          <X className="h-3 w-3" />
+        </button>
+      )}
+    </div>
+  );
+}
+
 interface ChatInputProps {
   onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
   isLoading?: boolean;
@@ -837,49 +878,21 @@ export function ChatInput({
         {hasTopChip && (
           <div className="absolute top-0 z-10 flex flex-wrap gap-2">
             {selectedAgents.map((agent) => (
-              <div
+              <SelectionChip
                 key={agent.id}
-                className="inline-flex h-9 items-center gap-1 rounded-t-xl rounded-b-none border border-b-0 px-3 text-xs font-medium shadow-[0_-1px_0_rgba(53,88,255,0.08)]"
-                style={{ borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" }}
-              >
-                <span className="italic">Using</span>
-                <span
-                  className="rounded-md border px-2 py-0.5 not-italic"
-                  style={{ borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" }}
-                >{`@${agent.name}`}</span>
-                {onRemoveSelectedAgent && (
-                  <button
-                    type="button"
-                    onClick={() => onRemoveSelectedAgent(agent.id)}
-                    className="rounded-sm p-0.5 hover:bg-[#dfe6ff]"
-                    title={t("common.remove")}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
+                label={t("chatPage.input.usingAgentLabel")}
+                value={`@${agent.name}`}
+                onRemove={onRemoveSelectedAgent ? () => onRemoveSelectedAgent(agent.id) : undefined}
+                removeLabel={t("common.remove")}
+              />
             ))}
             {selectedTemplate && (
-              <div
-                className="inline-flex h-9 items-center gap-1 rounded-t-xl rounded-b-none border border-b-0 px-3 text-xs font-medium shadow-[0_-1px_0_rgba(53,88,255,0.08)]"
-                style={{ borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" }}
-              >
-                <span className="italic">{t("chatPage.templateQuickAccess.usingTemplateLabel")}</span>
-                <span
-                  className="rounded-md border px-2 py-0.5 not-italic"
-                  style={{ borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" }}
-                >{selectedTemplate.name}</span>
-                {onRemoveSelectedTemplate && (
-                  <button
-                    type="button"
-                    onClick={() => onRemoveSelectedTemplate()}
-                    className="rounded-sm p-0.5 hover:bg-[#dfe6ff]"
-                    title={t("common.remove")}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
+              <SelectionChip
+                label={t("chatPage.templateQuickAccess.usingTemplateLabel")}
+                value={selectedTemplate.name}
+                onRemove={onRemoveSelectedTemplate}
+                removeLabel={t("common.remove")}
+              />
             )}
           </div>
         )}

@@ -30,6 +30,10 @@ export interface AgentCard {
   status?: string;
   readonly?: boolean;
   can_edit?: boolean;
+  // Built-in template id this agent was instantiated from, or null/undefined
+  // for agents built from scratch. Used to key template-reuse matching off a
+  // stable id instead of the user-editable display name.
+  template_id?: string | null;
 }
 
 interface ChatStartScreenProps {

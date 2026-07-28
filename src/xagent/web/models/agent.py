@@ -5,10 +5,18 @@ from datetime import datetime
 
 from sqlalchemy import JSON, Boolean, Column, DateTime
 from sqlalchemy import Enum as SQLEnum
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.orm import relationship
 
 from .database import Base
+
+# Per-user name uniqueness, excluding workforce-generated manager agents
+# (which are allowed to share names - see agent_name_exists). Declared here
+# so brand-new databases get it via Base.metadata.create_all(); existing
+# databases get the same index from the
+# 20260728_add_agent_template_id_and_name_uniqueness migration, which also
+# dedupes any pre-existing collisions first.
+_NON_WORKFORCE_MANAGER_CLAUSE = text("origin != 'workforce_generated_manager'")
 
 
 class AgentStatus(enum.Enum):
@@ -57,6 +65,11 @@ class Agent(Base):  # type: ignore
     name = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
     instructions = Column(Text, nullable=True)  # System prompt/instructions
+    # Built-in template id this agent was instantiated from (e.g. via
+    # "/api/agents/from-template"), or NULL for agents built from scratch.
+    # Lets create-or-reuse flows key off a stable id instead of the
+    # user-editable display name.
+    template_id = Column(String(255), nullable=True, index=True)
 
     # Configuration
     execution_mode = Column(
@@ -103,6 +116,17 @@ class Agent(Base):  # type: ignore
         nullable=False,
     )  # type: ignore[assignment]
     published_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_agents_user_id_name_active",
+            "user_id",
+            "name",
+            unique=True,
+            sqlite_where=_NON_WORKFORCE_MANAGER_CLAUSE,
+            postgresql_where=_NON_WORKFORCE_MANAGER_CLAUSE,
+        ),
+    )
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), default=datetime.now, nullable=False)

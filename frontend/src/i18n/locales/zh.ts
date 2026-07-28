@@ -234,6 +234,7 @@ const zh = {
     input: {
       placeholder: "描述您的任务...",
       processing: "处理中",
+      usingAgentLabel: "使用",
       actions: {
         config: "配置模型",
         upload: "上传文件",

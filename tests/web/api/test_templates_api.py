@@ -334,6 +334,15 @@ class TestTemplatesAPI:
             assert len(listed["sales_assistant"]["sample_prompts"]) == 2
             assert listed["customer_support"]["sample_prompts"] == []
 
+            # An unrecognised locale falls back to English rather than
+            # erroring or returning an empty list.
+            response = client.get(
+                "/api/templates/sales_assistant?lang=fr", headers=admin_headers
+            )
+            assert response.status_code == 200
+            fr_prompts = response.json()["sample_prompts"]
+            assert fr_prompts == en_prompts
+
     def test_get_template_not_found(self, mock_app_state, admin_headers):
         """测试获取不存在的模板"""
         with patch.object(client.app, "state", mock_app_state):

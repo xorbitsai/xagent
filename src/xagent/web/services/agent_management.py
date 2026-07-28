@@ -84,6 +84,7 @@ class AgentCreateSpec:
     tool_categories: tuple[str, ...]
     suggested_prompts: tuple[str, ...]
     generate_runtime_key: bool
+    template_id: str | None = None
 
     @classmethod
     def from_values(
@@ -99,6 +100,7 @@ class AgentCreateSpec:
         tool_categories: list[str] | tuple[str, ...] | None,
         suggested_prompts: list[str] | tuple[str, ...] | None,
         generate_runtime_key: bool,
+        template_id: str | None = None,
     ) -> AgentCreateSpec:
         frozen_models: tuple[tuple[str, int | None], ...] | None = None
         if models is not None:
@@ -116,6 +118,7 @@ class AgentCreateSpec:
             skills=tuple(skills or ()),
             tool_categories=tuple(tool_categories or ()),
             suggested_prompts=tuple(suggested_prompts or ()),
+            template_id=template_id,
             generate_runtime_key=generate_runtime_key,
         )
 
@@ -166,6 +169,7 @@ class AgentResponseSnapshot:
     allowed_domains: tuple[str, ...]
     share_enabled: bool
     share_updated_at: str | None
+    template_id: str | None = None
 
     def model_mapping(self) -> dict[str, Any] | None:
         return dict(self.models) if self.models is not None else None
@@ -196,6 +200,7 @@ class AgentResponseSnapshot:
             "allowed_domains": list(self.allowed_domains),
             "share_enabled": self.share_enabled,
             "share_updated_at": self.share_updated_at,
+            "template_id": self.template_id,
         }
 
 
@@ -538,6 +543,7 @@ class AgentManagementService:
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
         generate_runtime_key: bool = True,
+        template_id: str | None = None,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
         """Sole external create entry point: validate KBs (async) then
         run the transactional create. Every public create path
@@ -562,6 +568,7 @@ class AgentManagementService:
             tool_categories=tool_categories,
             suggested_prompts=suggested_prompts,
             generate_runtime_key=generate_runtime_key,
+            template_id=template_id,
         )
 
     def create_agent_with_optional_key(
@@ -579,6 +586,7 @@ class AgentManagementService:
         suggested_prompts: list[str] | None = None,
         generate_runtime_key: bool = True,
         runtime_key_candidate: ApiKeyCandidate | None = None,
+        template_id: str | None = None,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
         """Create an agent and (optionally) its first runtime key in a
         single transaction. Internal transaction executor: assumes
@@ -593,15 +601,17 @@ class AgentManagementService:
         commits once at the boundary, rolling back atomically on any
         failure.
 
-        Conflict contract: the only IntegrityError this path can raise
-        comes from the runtime key's ``key_prefix`` unique constraint
-        (the ``uq_agent_api_keys_agent_active`` partial index that used
-        to also live here was dropped for multi-key support -- an agent
-        may hold more than one active key now); the agent table has no
-        unique constraint and therefore does not contribute one. If a
-        ``(user_id, name)`` unique constraint is ever added to agents,
-        the conflict translation here must be split by source (agent ->
-        duplicate-name 400, key -> 409).
+        Conflict contract: ``agent_name_exists`` is a fast-path pre-check,
+        not the source of truth -- the ``uq_agents_user_id_name_active``
+        partial unique index (excludes workforce-generated-manager agents,
+        matching ``agent_name_exists``) is what actually prevents a
+        concurrent-request race, so the agent insert's flush can itself
+        raise IntegrityError and is translated to ``DuplicateAgentNameError``
+        below. The only other IntegrityError source is the runtime key's
+        ``key_prefix`` unique constraint (the ``uq_agent_api_keys_agent_active``
+        partial index that used to also live here was dropped for multi-key
+        support -- an agent may hold more than one active key now), handled
+        separately inside ``complete_runtime_key_delivery``.
 
         Delivery contract: once a runtime-key receipt exists, an ambiguous
         commit result or post-commit response failure is wrapped in
@@ -614,23 +624,29 @@ class AgentManagementService:
 
         models = self._validate_models(models, user_id=user_id)
 
-        agent = self.store.add_agent(  # flush, no commit
-            user_id=user_id,
-            name=name,
-            description=description,
-            instructions=instructions,
-            execution_mode=execution_mode or "balanced",
-            models=models,
-            knowledge_bases=knowledge_bases or [],
-            skills=skills or [],
-            tool_categories=tool_categories or [],
-            suggested_prompts=suggested_prompts or [],
-        )
+        try:
+            agent = self.store.add_agent(  # flush, no commit
+                user_id=user_id,
+                name=name,
+                description=description,
+                instructions=instructions,
+                execution_mode=execution_mode or "balanced",
+                models=models,
+                knowledge_bases=knowledge_bases or [],
+                skills=skills or [],
+                tool_categories=tool_categories or [],
+                suggested_prompts=suggested_prompts or [],
+                template_id=template_id,
+            )
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise DuplicateAgentNameError(name) from exc
 
-        # The runtime key is the only write that can raise IntegrityError
-        # here (agent has no unique constraint), so the conflict-to-409
-        # translation wraps key staging + commit together. See the
-        # contract note in the docstring above.
+        # The agent-name race is handled above via the add_agent flush; the
+        # runtime key is the only remaining write that can raise
+        # IntegrityError here, so its conflict-to-409 translation happens
+        # inside complete_runtime_key_delivery. See the contract note in the
+        # docstring above.
         def stage_runtime_key() -> tuple[AgentApiKey, str] | None:
             if generate_runtime_key:
                 staged_key = self.key_service.stage_rotated_key(
@@ -725,6 +741,7 @@ class AgentManagementService:
             generate_runtime_key=generate_runtime_key,
             name=final_name,
             description=final_description,
+            template_id=template_id,
             instructions=(
                 instructions
                 if instructions is not None
@@ -848,6 +865,7 @@ def _agent_response_snapshot(payload: dict[str, Any]) -> AgentResponseSnapshot:
         allowed_domains=tuple(payload.get("allowed_domains") or ()),
         share_enabled=bool(payload["share_enabled"]),
         share_updated_at=cast("str | None", payload.get("share_updated_at")),
+        template_id=cast("str | None", payload.get("template_id")),
     )
 
 
@@ -1076,6 +1094,7 @@ class AgentManagementRuntime:
                     suggested_prompts=list(spec.suggested_prompts),
                     generate_runtime_key=spec.generate_runtime_key,
                     runtime_key_candidate=candidate,
+                    template_id=spec.template_id,
                 )
                 agent_snapshot = _agent_response_snapshot(
                     service.store.agent_to_response_dict(agent)
@@ -1141,6 +1160,7 @@ class AgentManagementRuntime:
         spec = AgentCreateSpec.from_values(
             name=name or template.get("name") or template_id,
             description=final_description,
+            template_id=template_id,
             instructions=(
                 instructions
                 if instructions is not None

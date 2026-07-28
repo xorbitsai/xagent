@@ -12,6 +12,7 @@ import { SegmentedTabs } from "@/components/ui/segmented-tabs";
 import type { Template } from "@/types/template";
 import { LibraryTemplateCard } from "@/components/templates/library-template-card";
 import type { TranslationKey } from "@/i18n/translations";
+import { normalizeCategoryKey, orderCategoriesWithPreferred } from "@/lib/template-categories";
 
 interface CategorySection {
   id: string;
@@ -32,9 +33,6 @@ const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   security: "templates.categoryTitles.security",
   operations: "templates.categoryTitles.operations",
 };
-
-const normalizeCategoryKey = (category: string) =>
-  category.toLowerCase().replace(/\s*&\s*/g, "_").replace(/\s+/g, "_");
 
 const formatFallbackLabel = (category: string) =>
   category
@@ -76,10 +74,7 @@ export default function TemplatesPage() {
   const categories = useMemo(() => {
     const preferred = ["Sales", "Marketing", "Support", "Research", "Productivity"];
     const dynamic = Array.from(new Set(templates.map((template) => template.category).filter(Boolean)));
-    const orderedDynamic = [
-      ...preferred.filter((category) => dynamic.includes(category)),
-      ...dynamic.filter((category) => !preferred.includes(category)),
-    ];
+    const orderedDynamic = orderCategoriesWithPreferred(dynamic, preferred);
 
     return [
       { id: "All", label: t("templates.categoryTitles.all") },

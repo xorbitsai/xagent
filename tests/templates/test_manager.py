@@ -229,7 +229,11 @@ descriptions:
         template = await manager.get_template("minimal_template")
 
         assert template is not None
-        assert template["tags"] == []
+        # tags/features are per-locale dicts (like descriptions/sample_prompts),
+        # so their "not authored" default is {} - get_localized_value resolves
+        # that to [] per-locale at the API layer (see test_template_data_structure).
+        assert template["tags"] == {}
+        assert template["features"] == {}
         assert template["author"] == "Xagent"
         assert template["version"] == "1.0"
         assert template["featured"] is False
@@ -280,6 +284,67 @@ sample_prompts:
         assert template["sample_prompts"]["en"][0]["title"] == "Do the thing"
         assert template["sample_prompts"]["en"][0]["highlights"] == ["paste input"]
         assert template["sample_prompts"]["zh"][0]["title"] == "做这件事"
+
+    @pytest.mark.asyncio
+    async def test_malformed_sample_prompts_entry_is_skipped_not_fatal(
+        self, temp_templates_dir
+    ):
+        """一个模板的 sample_prompts 条目缺少必需字段时，该模板应被跳过而不是让
+        整个模板目录加载失败（避免单个作者错误导致 GET /api/templates/ 500）。"""
+        bad_template = temp_templates_dir / "bad_prompts.yaml"
+        bad_template.write_text(
+            """
+id: bad_prompts
+name: Bad Prompts Template
+category: Support
+descriptions:
+  en: A template with a malformed sample prompt
+  zh: 一个带有格式错误提示词的模板
+sample_prompts:
+  en:
+  - title: Missing the prompt field
+    highlights: []
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("bad_prompts")
+        assert template is None
+
+        templates = await manager.list_templates()
+        template_ids = [t["id"] for t in templates]
+        assert "bad_prompts" not in template_ids
+        # The other, valid templates in the fixture directory still load.
+        assert "customer_support" in template_ids
+        assert "sales_assistant" in template_ids
+
+    @pytest.mark.asyncio
+    async def test_flat_list_sample_prompts_is_rejected(self, temp_templates_dir):
+        """sample_prompts 必须按语言分组（{"en": [...]}），写成扁平列表会静默
+        跳过本地化解析，因此在解析阶段就应当拒绝该写法。"""
+        bad_template = temp_templates_dir / "flat_prompts.yaml"
+        bad_template.write_text(
+            """
+id: flat_prompts
+name: Flat Prompts Template
+category: Support
+descriptions:
+  en: A template with a flat-list sample_prompts shape
+  zh: 一个 sample_prompts 为扁平列表的模板
+sample_prompts:
+- title: Not locale-keyed
+  prompt: This should have been nested under 'en'.
+  highlights: []
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("flat_prompts")
+        assert template is None
 
     @pytest.mark.asyncio
     async def test_skip_invalid_templates(self, temp_templates_dir):
@@ -389,6 +454,62 @@ sample_prompts:
                     offenders.append(f"{template_file.name}: {name}")
 
         assert not offenders
+
+    def test_builtin_sample_prompt_highlights_are_literal_substrings(self):
+        """Every highlight must be a literal substring of its own prompt, in
+        both locales - otherwise the frontend's highlight matching
+        (replaceFirstOccurrence) silently underlines nothing, or the wrong
+        word if an earlier literal duplicate shadows the intended placeholder
+        (this caught a real bug: see marketing-content-agent and
+        marketing-seo-brief-writer's original prompt wording)."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        offenders: list[str] = []
+
+        for template_file in sorted(built_in_dir.glob("*.yaml")):
+            data = yaml.safe_load(template_file.read_text(encoding="utf-8")) or {}
+            sample_prompts = data.get("sample_prompts") or {}
+            if not isinstance(sample_prompts, dict):
+                offenders.append(
+                    f"{template_file.name}: sample_prompts is not a per-locale dict"
+                )
+                continue
+
+            for locale, prompts in sample_prompts.items():
+                for entry in prompts or []:
+                    prompt_text = entry.get("prompt") or ""
+                    for highlight in entry.get("highlights") or []:
+                        if highlight not in prompt_text:
+                            offenders.append(
+                                f"{template_file.name} [{locale}]: highlight "
+                                f"{highlight!r} not found in prompt {prompt_text!r}"
+                            )
+
+        assert not offenders, "\n".join(offenders)
+
+    def test_builtin_templates_cap_sample_prompts_at_two(self):
+        """The Task-page quick-access grid only ever renders the first 2
+        sample prompts per template (TemplateQuickAccess.tsx), so authoring
+        more than that on a built-in template is dead content that silently
+        never shows - catch it at authoring time instead."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        offenders: list[str] = []
+
+        for template_file in sorted(built_in_dir.glob("*.yaml")):
+            data = yaml.safe_load(template_file.read_text(encoding="utf-8")) or {}
+            sample_prompts = data.get("sample_prompts") or {}
+            if not isinstance(sample_prompts, dict):
+                continue
+            for locale, prompts in sample_prompts.items():
+                if isinstance(prompts, list) and len(prompts) > 2:
+                    offenders.append(
+                        f"{template_file.name} [{locale}]: {len(prompts)} sample_prompts (max 2 are shown)"
+                    )
+
+        assert not offenders, "\n".join(offenders)
 
     @pytest.mark.asyncio
     async def test_nonexistent_templates_directory(self, tmp_path):

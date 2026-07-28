@@ -165,6 +165,116 @@ def test_create_from_template_fails_closed_when_request_session_is_not_clean(
     assert template_calls == []
 
 
+def test_create_from_template_persists_template_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The created (and later listed) agent must carry its source template id."""
+
+    headers = _admin_headers()
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            return {
+                "id": template_id,
+                "name": "Template-Linked Agent",
+                "descriptions": {"en": "Created from a template"},
+                "agent_config": {
+                    "instructions": "Follow the template.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state, "template_manager", TemplateManagerStub(), raising=False
+    )
+
+    response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "linked-template-id"},
+    )
+    assert response.status_code == 200, response.text
+    agent_id = response.json()["id"]
+    assert response.json()["template_id"] == "linked-template-id"
+
+    list_response = client.get("/api/agents", headers=headers)
+    assert list_response.status_code == 200, list_response.text
+    listed = next(a for a in list_response.json() if a["id"] == agent_id)
+    assert listed["template_id"] == "linked-template-id"
+
+    detail_response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert detail_response.status_code == 200, detail_response.text
+    assert detail_response.json()["template_id"] == "linked-template-id"
+
+
+def test_manually_created_agent_has_no_template_id() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Hand-built agent")
+
+    response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["template_id"] is None
+
+
+def test_duplicate_agent_name_returns_400_with_stable_detail() -> None:
+    """The frontend keys retry logic off this exact detail string."""
+
+    headers = _admin_headers()
+    _create_agent(headers, name="Duplicate Name Agent")
+
+    response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Duplicate Name Agent",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Agent with this name already exists"
+
+
+def test_db_constraint_catches_name_race_the_app_precheck_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Simulates two concurrent requests both passing the app-level
+    pre-check before either commits: the DB partial unique index must still
+    reject the second insert with a clean DuplicateAgentNameError (400), not
+    a raw IntegrityError (500).
+    """
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    monkeypatch.setattr(AgentStore, "agent_name_exists", lambda self, *a, **k: False)
+
+    first = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Raced Agent Name",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Raced Agent Name",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert second.status_code == 400, second.text
+    assert second.json()["detail"] == "Agent with this name already exists"
+
+
 def _create_agent_row(
     *,
     user_id: int,

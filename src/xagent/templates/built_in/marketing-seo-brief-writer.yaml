@@ -17,7 +17,7 @@ features:
 sample_prompts:
   en:
   - title: Brief from a keyword
-    prompt: 'Pull SERP and keyword data for keyword and draft a structured brief with outline, angle, headings and terms to include.'
+    prompt: 'Pull SERP and ranking data for keyword and draft a structured brief with outline, angle, headings and terms to include.'
     highlights:
     - keyword
   - title: Cluster keywords

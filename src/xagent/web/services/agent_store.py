@@ -152,6 +152,7 @@ class AgentStore:
             "name": agent.name,
             "description": agent.description,
             "instructions": agent.instructions,
+            "template_id": agent.template_id,
             "execution_mode": agent.execution_mode or "graph",
             "models": agent.models,
             "knowledge_bases": ensure_list(agent.knowledge_bases) or [],
@@ -180,6 +181,7 @@ class AgentStore:
             "team_id": agent.team_id,
             "name": agent.name,
             "description": agent.description,
+            "template_id": agent.template_id,
             "logo_url": agent.logo_url,
             "status": agent.status.value,
             "visibility": agent.visibility,
@@ -326,6 +328,7 @@ class AgentStore:
         share_token: str | None = None,
         share_updated_at: datetime | None = None,
         visibility: str | None = None,
+        template_id: str | None = None,
     ) -> Agent:
         agent = self.add_agent(
             user_id=user_id,
@@ -347,6 +350,7 @@ class AgentStore:
             share_token=share_token,
             share_updated_at=share_updated_at,
             visibility=visibility,
+            template_id=template_id,
         )
         self.db.commit()
         self.db.refresh(agent)
@@ -378,6 +382,7 @@ class AgentStore:
         share_token: str | None = None,
         share_updated_at: datetime | None = None,
         visibility: str | None = None,
+        template_id: str | None = None,
     ) -> Agent:
         if status == AgentStatus.PUBLISHED and published_at is None:
             published_at = datetime.now(timezone.utc)
@@ -396,6 +401,7 @@ class AgentStore:
             name=name,
             description=description,
             instructions=instructions,
+            template_id=template_id,
             execution_mode=execution_mode or "graph",
             models=models,
             knowledge_bases=knowledge_bases or [],

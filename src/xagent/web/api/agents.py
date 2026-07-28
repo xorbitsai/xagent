@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
@@ -123,6 +124,7 @@ class AgentResponse(BaseModel):
     name: str
     description: Optional[str]
     instructions: Optional[str]
+    template_id: Optional[str] = None
     execution_mode: str
     models: Optional[dict]
     knowledge_bases: List[str]
@@ -153,6 +155,7 @@ class AgentListItem(BaseModel):
     team_id: Optional[int] = None
     name: str
     description: Optional[str]
+    template_id: Optional[str] = None
     logo_url: Optional[str]
     status: str
     visibility: str = "team"
@@ -576,19 +579,29 @@ async def create_agent(
         )
         await _validate_knowledge_bases_exist(agent_data.knowledge_bases, current_user)
 
-        agent = store.create_agent(
-            user_id=user_id,
-            name=agent_data.name,
-            description=agent_data.description,
-            instructions=agent_data.instructions,
-            execution_mode=agent_data.execution_mode or "graph",
-            models=agent_data.models,
-            knowledge_bases=agent_data.knowledge_bases,
-            skills=agent_data.skills,
-            tool_categories=agent_data.tool_categories,
-            suggested_prompts=agent_data.suggested_prompts,
-            visibility=agent_data.visibility,
-        )
+        # agent_name_exists above is a fast-path pre-check, not the source of
+        # truth: uq_agents_user_id_name_active is what actually prevents a
+        # concurrent-request race, so the insert itself can still raise
+        # IntegrityError here.
+        try:
+            agent = store.create_agent(
+                user_id=user_id,
+                name=agent_data.name,
+                description=agent_data.description,
+                instructions=agent_data.instructions,
+                execution_mode=agent_data.execution_mode or "graph",
+                models=agent_data.models,
+                knowledge_bases=agent_data.knowledge_bases,
+                skills=agent_data.skills,
+                tool_categories=agent_data.tool_categories,
+                suggested_prompts=agent_data.suggested_prompts,
+                visibility=agent_data.visibility,
+            )
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(
+                status_code=400, detail="Agent with this name already exists"
+            )
 
         # Save logo if provided
         if agent_data.logo_base64:

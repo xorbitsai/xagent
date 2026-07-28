@@ -105,15 +105,20 @@ class TemplateManager:
         if "agent_config" not in data:
             data["agent_config"] = {}
 
-        # Set default values
-        data.setdefault("tags", [])
-        data.setdefault("features", [])
+        # Set default values. tags/features/sample_prompts are per-locale
+        # dicts (like descriptions), so their "not authored" default must be
+        # {} not [] - get_localized_value falls back to [] per-call anyway,
+        # but a [] here would silently bypass localization if ever read
+        # directly instead of through get_localized_value.
+        data.setdefault("tags", {})
+        data.setdefault("features", {})
         data.setdefault("connections", [])
         data.setdefault("setup_time", "5 min setup")
         data.setdefault("author", "Xagent")
         data.setdefault("version", "1.0")
         data.setdefault("featured", False)
         data.setdefault("sample_prompts", {})
+        self._validate_sample_prompts(data["sample_prompts"])
 
         # agent_config default values
         agent_config = data["agent_config"]
@@ -123,6 +128,49 @@ class TemplateManager:
         agent_config.setdefault("execution_mode", "balanced")
 
         return data
+
+    def _validate_sample_prompts(self, sample_prompts: Any) -> None:
+        """Validate the (optional) sample_prompts shape at parse time, the
+        same way `descriptions` is validated above. Without this, a
+        malformed entry only surfaces as an uncaught pydantic
+        ValidationError deep inside the TemplateInfo response model,
+        which would take down GET /api/templates/ - and therefore the
+        whole template list - for every user, not just break this one
+        template.
+        """
+        if not sample_prompts:
+            return
+        if not isinstance(sample_prompts, dict):
+            raise ValueError(
+                "'sample_prompts' must be a dict keyed by locale (e.g. "
+                "{'en': [...], 'zh': [...]}), not a flat list - a flat list "
+                "would silently bypass per-locale resolution"
+            )
+        for locale, prompts in sample_prompts.items():
+            if not isinstance(prompts, list):
+                raise ValueError(f"'sample_prompts.{locale}' must be a list")
+            for index, prompt in enumerate(prompts):
+                if not isinstance(prompt, dict):
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}]' must be a mapping"
+                    )
+                title = prompt.get("title")
+                if not isinstance(title, str) or not title:
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}].title' must be a non-empty string"
+                    )
+                prompt_text = prompt.get("prompt")
+                if not isinstance(prompt_text, str) or not prompt_text:
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}].prompt' must be a non-empty string"
+                    )
+                highlights = prompt.get("highlights", [])
+                if not isinstance(highlights, list) or not all(
+                    isinstance(h, str) for h in highlights
+                ):
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}].highlights' must be a list of strings"
+                    )
 
     def _enrich_template(self, template: Dict[str, Any]) -> Dict[str, Any]:
         """Merge connections into agent_config.tool_categories"""
@@ -158,11 +206,11 @@ class TemplateManager:
             "category": template.get("category", ""),
             "featured": template.get("featured", False),
             "descriptions": template.get("descriptions", {}),
-            "features": template.get("features", []),
+            "features": template.get("features", {}),
             "sample_prompts": template.get("sample_prompts", {}),
             "connections": connections,
             "setup_time": template.get("setup_time", "5 min setup"),
-            "tags": template.get("tags", []),
+            "tags": template.get("tags", {}),
             "author": template.get("author", ""),
             "version": template.get("version", ""),
             "agent_config": agent_config_dict,

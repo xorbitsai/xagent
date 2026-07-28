@@ -11,19 +11,11 @@ import { getBrandingFromEnv } from "@/lib/branding";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { findRunnableAgentById } from "@/lib/agent-ui-access";
+import { resolveAgentForTemplate, toAgentId } from "@/lib/template-agent-resolution";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import type { Template, SamplePrompt } from "@/types/template";
 import { FEATURED_CATEGORY_ID } from "@/lib/template-categories";
-
-// Deep-link presets for "?starter=" (e.g. the Welcome modal's Presentation Builder
-// card). Kept separate from the template quick-access system below.
-const STARTER_PROMPTS: Record<string, { prompt: string; highlights: string[] }> = {
-  presentation: {
-    prompt: "Build a N-slide presentation on topic for audience.",
-    highlights: ["N", "topic", "audience"],
-  },
-};
 
 function TaskHomePageContent() {
   const { t, locale } = useI18n();
@@ -105,6 +97,8 @@ function TaskHomePageContent() {
     }
 
     setSelectedAgents([selectedAgent]);
+    setSelectedTemplate(null);
+    setSelectedPromptKey(null);
     appliedAgentFromQueryRef.current = agentFromQuery;
   }, [agentFromQuery, agents]);
 
@@ -154,13 +148,15 @@ function TaskHomePageContent() {
     };
   }, [selectedAgents]);
 
+  // Deep-link preset for "?starter=presentation" (the Welcome modal's
+  // Presentation Builder card). Only this one key is ever populated or read,
+  // so a plain check is clearer here than a one-entry lookup map.
   const starterPreset = useMemo(() => {
-    const found = starter ? STARTER_PROMPTS[starter] : null;
-    if (!found) return null;
+    if (starter !== "presentation") return null;
 
     return {
-      prompt: found.prompt,
-      highlights: found.highlights,
+      prompt: "Build a N-slide presentation on topic for audience.",
+      highlights: ["N", "topic", "audience"],
     };
   }, [starter]);
 
@@ -178,136 +174,64 @@ function TaskHomePageContent() {
     setPromptHighlightTerms(queryPromptHighlightTerms);
   }, [queryInputValue, queryPromptHighlightTerms]);
 
-  // The backend has no dedicated "created from template X" link on an Agent
-  // record, so we correlate by name: a template-created agent is always
-  // named exactly `template.name` on first creation (see
-  // create_agent_from_template in agent_management.py). Renaming that agent
-  // later breaks this correlation - a known tradeoff of not having a
-  // persisted template_id column.
-  const findExistingAgentIdForTemplate = (templateName: string, agentList: AgentCard[]) => {
-    const match = agentList.find((agent) => agent.name === templateName);
-    const matchId = Number(match?.id);
-    return Number.isNaN(matchId) ? null : matchId;
-  };
-
-  // Reuse an already-created agent for this template if one exists; only
-  // create + publish a new one the first time a template is used.
-  const resolveAgentForTemplate = async (
-    templateId: string,
-    templateName: string
-  ): Promise<{ agentId: number; created: boolean }> => {
-    const knownExistingId = findExistingAgentIdForTemplate(templateName, agents);
-    if (knownExistingId !== null) {
-      return { agentId: knownExistingId, created: false };
-    }
-
-    const createResponse = await apiRequest(`${getApiUrl()}/api/agents/from-template`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ template_id: templateId }),
-    });
-
-    if (createResponse.status === 400) {
-      // Name collision our local (published-only) list didn't know about -
-      // e.g. a draft agent, or one created in another tab/session since we
-      // last fetched. Look it up and reuse it rather than minting a
-      // duplicate under a disambiguated name.
-      const listResponse = await apiRequest(`${getApiUrl()}/api/agents`);
-      if (listResponse.ok) {
-        const allAgents = await listResponse.json();
-        const match = Array.isArray(allAgents)
-          ? allAgents.find((agent) => agent && agent.name === templateName)
-          : undefined;
-        const matchId = Number(match?.id);
-        if (match && !Number.isNaN(matchId)) {
-          if (match.status !== "published") {
-            const publishResponse = await apiRequest(
-              `${getApiUrl()}/api/agents/${matchId}/publish`,
-              { method: "POST" }
-            );
-            if (!publishResponse.ok) {
-              throw new Error(`Failed to publish agent (${publishResponse.status})`);
-            }
-          }
-          return { agentId: matchId, created: false };
-        }
-      }
-      throw new Error(`Failed to create agent from template (${createResponse.status})`);
-    }
-
-    if (!createResponse.ok) {
-      throw new Error(`Failed to create agent from template (${createResponse.status})`);
-    }
-    const createdAgent = await createResponse.json();
-
-    const publishResponse = await apiRequest(
-      `${getApiUrl()}/api/agents/${createdAgent.id}/publish`,
-      { method: "POST" }
-    );
-    if (!publishResponse.ok) {
-      throw new Error(`Failed to publish agent (${publishResponse.status})`);
-    }
-
-    return { agentId: createdAgent.id, created: true };
-  };
-
   const handleSend = async (message: string, filesToSend: File[], config?: any) => {
     if (state.isProcessing) return;
 
-    let agentId = Number(selectedAgents[0]?.id);
+    let agentId = toAgentId(selectedAgents[0]);
 
-    if (Number.isNaN(agentId) && selectedTemplate) {
+    if (agentId === null && selectedTemplate) {
+      let result: { agent: AgentCard; created: boolean };
       try {
-        const result = await resolveAgentForTemplate(selectedTemplate.id, selectedTemplate.name);
-        agentId = result.agentId;
-        if (result.created) {
-          const templateName = selectedTemplate.name;
-          toast.custom((toastId) => (
-            <div className="flex w-full flex-col gap-3 rounded-xl border border-green-600 bg-background p-4 shadow-lg">
-              <div className="flex items-start gap-2">
-                <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-green-600" />
-                <span className="text-sm font-medium text-green-600">
-                  {t("chatPage.templateQuickAccess.agentCreatedToast", { name: templateName })}
-                </span>
-              </div>
-              <Button
-                size="sm"
-                className="self-end"
-                onClick={() => {
-                  toast.dismiss(toastId);
-                  router.push("/build");
-                }}
-              >
-                {t("chatPage.templateQuickAccess.viewInAgents")}
-              </Button>
-            </div>
-          ));
-        }
-        // Keep local state in sync so sending from this template again in the
-        // same session (without a page reload) resolves instantly instead of
-        // re-querying the backend - this also covers the case where the
-        // agent was resolved via the 400-retry lookup (created === false)
-        // rather than freshly created, which the local list wouldn't know
-        // about otherwise.
-        setAgents((prev) => {
-          if (prev.some((agent) => Number(agent.id) === result.agentId)) {
-            return prev;
-          }
-          return [
-            ...prev,
-            { id: result.agentId, name: selectedTemplate.name, status: "published" },
-          ];
-        });
+        result = await resolveAgentForTemplate(selectedTemplate.id, selectedTemplate.name, agents);
       } catch (error) {
         console.error("Failed to create agent from template:", error);
-        toast.error(t("chatPage.templateQuickAccess.createAgentError"));
-        return;
+        // Rethrow (translated) rather than swallowing: ChatInput's own
+        // catch around onSend shows this as a toast, and - critically -
+        // only clears the typed message/chip when onSend actually
+        // resolves, so a failed creation no longer silently wipes the
+        // user's draft.
+        throw new Error(t("chatPage.templateQuickAccess.createAgentError"));
+      }
+
+      agentId = toAgentId(result.agent);
+      // Keep local state in sync so sending from this template again in the
+      // same session (without a page reload) resolves instantly instead of
+      // re-querying the backend - this also covers the case where the
+      // agent was resolved via the 400-retry lookup (created === false)
+      // rather than freshly created, which the local list wouldn't know
+      // about otherwise.
+      setAgents((prev) =>
+        prev.some((agent) => agent.id === result.agent.id) ? prev : [...prev, result.agent]
+      );
+
+      if (result.created) {
+        const templateName = selectedTemplate.name;
+        toast.custom((toastId) => (
+          <div className="flex w-full flex-col gap-3 rounded-xl border border-green-600 bg-background p-4 shadow-lg">
+            <div className="flex items-start gap-2">
+              <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-green-600" />
+              <span className="text-sm font-medium text-green-600">
+                {t("chatPage.templateQuickAccess.agentCreatedToast", { name: templateName })}
+              </span>
+            </div>
+            <Button
+              size="sm"
+              className="self-end"
+              onClick={() => {
+                toast.dismiss(toastId);
+                router.push("/build");
+              }}
+            >
+              {t("chatPage.templateQuickAccess.viewInAgents")}
+            </Button>
+          </div>
+        ));
       }
     }
 
     const nextConfig = {
       ...config,
-      agentId: Number.isNaN(agentId) ? undefined : agentId,
+      agentId: agentId ?? undefined,
     };
 
     try {
@@ -335,18 +259,6 @@ function TaskHomePageContent() {
     setInputValue(value);
   };
 
-  const handleAgentClick = (agent: AgentCard) => {
-    setSelectedAgents((prev) => {
-      const currentSelected = prev[0];
-      if (currentSelected?.id === agent.id) {
-        return [];
-      }
-      return [agent];
-    });
-    setSelectedTemplate(null);
-    setSelectedPromptKey(null);
-  };
-
   const handleRemoveSelectedAgent = (agentId: number | string) => {
     setSelectedAgents((prev) => prev.filter((agent) => agent.id !== agentId));
   };
@@ -368,12 +280,16 @@ function TaskHomePageContent() {
     <div className="h-full bg-background flex flex-col overflow-hidden">
       <div className="flex-1 overflow-y-auto">
         <main className="container max-w-4xl mx-auto px-4 py-8">
+          {/* No `agents`/`onAgentClick` props here: the template quick-access
+              grid (passed via `templates` below) replaces the old "Chat with
+              Agents" avatar picker on this page, matching the redesigned
+              Task page. `agents` state itself is still fetched and used -
+              for the `?agent=` deep link above and for template-reuse
+              matching - just not rendered as a picker here. */}
           <ChatStartScreen
             title={t("chatPage.page.emptyTitle", { appName: branding.appName })}
             description={t("chatPage.page.emptyDescription")}
             icon={<Bot className="w-10 h-10 text-[hsl(var(--gradient-from))]" />}
-            agents={agents}
-            onAgentClick={handleAgentClick}
             selectedAgents={selectedAgents}
             onRemoveSelectedAgent={handleRemoveSelectedAgent}
             onSend={handleSend}

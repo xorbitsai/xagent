@@ -234,6 +234,7 @@ const en = {
     input: {
       placeholder: "Describe your task...",
       processing: "Processing",
+      usingAgentLabel: "Using",
       actions: {
         config: "Configure Model",
         upload: "Upload",

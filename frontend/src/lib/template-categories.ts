@@ -10,6 +10,35 @@ export interface CategoryTab {
 }
 
 /**
+ * Shared by every page that renders a category filter (this quick-access
+ * pill row and the /templates library page): a known-first subset in
+ * caller-supplied preferred order, then any remaining categories in
+ * first-seen order. Each caller keeps its own preferred order (the two
+ * pages intentionally differ here - Featured/Marketing/Sales/Support for
+ * this compact panel vs Sales/Marketing/Support for the full library) while
+ * sharing the actual ordering algorithm instead of each reimplementing it.
+ */
+export function orderCategoriesWithPreferred(
+  dynamicCategories: string[],
+  preferredOrder: string[]
+): string[] {
+  return [
+    ...preferredOrder.filter((category) => dynamicCategories.includes(category)),
+    ...dynamicCategories.filter((category) => !preferredOrder.includes(category)),
+  ];
+}
+
+/**
+ * Normalizes a category name into a lookup/section-id key: lowercase,
+ * "&"-joined words collapsed to a single underscore, remaining whitespace
+ * underscored. Shared so a category like "Healthcare & Fitness" resolves to
+ * the same key ("healthcare_fitness") everywhere it's looked up.
+ */
+export function normalizeCategoryKey(category: string): string {
+  return category.toLowerCase().replace(/\s*&\s*/g, "_").replace(/\s+/g, "_");
+}
+
+/**
  * Ordered category tabs with counts: Featured first (when any template is
  * featured), then known categories in PREFERRED_ORDER, then any remaining
  * categories in first-seen order.
@@ -19,10 +48,7 @@ export function getOrderedCategoriesWithCounts(templates: Template[]): CategoryT
   const dynamicCategories = Array.from(
     new Set(templates.map((template) => template.category).filter(Boolean))
   );
-  const orderedCategories = [
-    ...PREFERRED_ORDER.filter((category) => dynamicCategories.includes(category)),
-    ...dynamicCategories.filter((category) => !PREFERRED_ORDER.includes(category)),
-  ];
+  const orderedCategories = orderCategoriesWithPreferred(dynamicCategories, PREFERRED_ORDER);
 
   const tabs: CategoryTab[] = [];
   if (featuredCount > 0) {

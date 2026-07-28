@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import React, { useMemo } from "react";
 import Link from "next/link";
 import type { ComponentType, SVGProps } from "react";
 import {
@@ -49,6 +49,16 @@ const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   support: "templates.categoryTitles.support",
 };
 
+// Shared indigo accent used throughout this component for the active/hover/
+// selected states (category tab, count badge, "All templates" link, card
+// hover border, card title hover, selected sample-prompt row).
+const ACCENT_TEXT_CLASS = "text-[#3040cf]";
+const ACCENT_ACTIVE_PILL_CLASSES = "border-[#3040cf] bg-[#eef1ff] text-[#3040cf]";
+const ACCENT_ACTIVE_BADGE_CLASSES = "bg-[#3040cf]/10 text-[#3040cf]";
+const ACCENT_SELECTED_PROMPT_CLASSES = "bg-[#eef1ff] font-medium text-[#3040cf]";
+const ACCENT_HOVER_BORDER_CLASS = "hover:border-[#3040cf]";
+const ACCENT_HOVER_TITLE_CLASS = "group-hover/text:text-[#3040cf]";
+
 function getTemplateIcon(template: Template): IconComponent {
   return (
     TEMPLATE_ICON_BY_ID[template.id] ||
@@ -74,16 +84,22 @@ export function TemplateQuickAccess({
 }: TemplateQuickAccessProps) {
   const { t } = useI18n();
 
-  // Only surface tabs this quick-access panel has a dedicated icon/label for
-  // (Featured/Marketing/Sales/Support); other categories remain reachable via
-  // "All templates" without cluttering this compact pill row.
   const categoryTabs = useMemo(
-    () => getOrderedCategoriesWithCounts(templates).filter((tab) => !!CATEGORY_ICONS[tab.id]),
+    () => getOrderedCategoriesWithCounts(templates),
     [templates]
   );
+
+  // The parent may hand us a selectedCategory (e.g. the "Featured" default)
+  // that no longer has a matching tab - a deployment with no featured
+  // templates, for instance. Fall back to the first available tab instead of
+  // rendering an empty, unlabeled panel.
+  const activeCategory = categoryTabs.some((tab) => tab.id === selectedCategory)
+    ? selectedCategory
+    : categoryTabs[0]?.id ?? selectedCategory;
+
   const cards = useMemo(
-    () => getTemplatesForCategory(templates, selectedCategory, 4),
-    [templates, selectedCategory]
+    () => getTemplatesForCategory(templates, activeCategory, 4),
+    [templates, activeCategory]
   );
 
   const categoryLabel = (categoryId: string) => {
@@ -100,16 +116,17 @@ export function TemplateQuickAccess({
       <div className="flex flex-wrap items-center justify-center gap-2">
         {categoryTabs.map((tab) => {
           const Icon = CATEGORY_ICONS[tab.id] || Layers;
-          const isActive = tab.id === selectedCategory;
+          const isActive = tab.id === activeCategory;
           return (
             <button
               key={tab.id}
               type="button"
+              aria-pressed={isActive}
               onClick={() => onCategoryChange(tab.id)}
               className={cn(
                 "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[13px] font-medium transition-colors",
                 isActive
-                  ? "border-[#3040cf] bg-[#eef1ff] text-[#3040cf]"
+                  ? ACCENT_ACTIVE_PILL_CLASSES
                   : "border-border text-muted-foreground hover:bg-muted/50 hover:text-foreground"
               )}
             >
@@ -118,7 +135,7 @@ export function TemplateQuickAccess({
               <span
                 className={cn(
                   "rounded-full px-1.5 py-0.5 text-[11px] font-semibold",
-                  isActive ? "bg-[#3040cf]/10 text-[#3040cf]" : "bg-muted text-muted-foreground"
+                  isActive ? ACCENT_ACTIVE_BADGE_CLASSES : "bg-muted text-muted-foreground"
                 )}
               >
                 {tab.count}
@@ -133,12 +150,12 @@ export function TemplateQuickAccess({
           <div className="flex items-baseline justify-between px-1">
             <h3 className="text-[14px] font-semibold text-foreground">
               {t("chatPage.templateQuickAccess.categoryHeading", {
-                category: categoryLabel(selectedCategory),
+                category: categoryLabel(activeCategory),
               })}
             </h3>
             <Link
               href="/templates"
-              className="text-[13px] font-medium text-[#3040cf] hover:underline"
+              className={cn("text-[13px] font-medium hover:underline", ACCENT_TEXT_CLASS)}
             >
               {t("chatPage.templateQuickAccess.allTemplates")}
             </Link>
@@ -152,17 +169,25 @@ export function TemplateQuickAccess({
               return (
                 <div
                   key={template.id}
-                  className="space-y-3 rounded-xl border border-border bg-card p-4 text-left transition-colors hover:border-[#3040cf]"
+                  className={cn(
+                    "space-y-3 rounded-xl border border-border bg-card p-4 text-left transition-colors",
+                    ACCENT_HOVER_BORDER_CLASS
+                  )}
                 >
                   <Link
                     href={`/build/new?template=${encodeURIComponent(template.id)}`}
-                    className="flex items-start gap-3"
+                    className="group/text flex items-start gap-3"
                   >
                     <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-600 dark:bg-blue-900/20 dark:text-blue-300">
                       <Icon className="h-5 w-5" />
                     </div>
-                    <div className="group/text min-w-0">
-                      <h4 className="truncate text-[14px] font-semibold text-foreground transition-colors group-hover/text:text-[#3040cf]">
+                    <div className="min-w-0">
+                      <h4
+                        className={cn(
+                          "truncate text-[14px] font-semibold text-foreground transition-colors",
+                          ACCENT_HOVER_TITLE_CLASS
+                        )}
+                      >
                         {template.name}
                       </h4>
                       <p className="line-clamp-2 text-[12.5px] text-muted-foreground">
@@ -180,11 +205,12 @@ export function TemplateQuickAccess({
                           <button
                             key={key}
                             type="button"
+                            title={prompt.title}
                             onClick={() => onPromptSelect(template, prompt, index)}
                             className={cn(
                               "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] transition-colors",
                               isSelected
-                                ? "bg-[#eef1ff] font-medium text-[#3040cf]"
+                                ? ACCENT_SELECTED_PROMPT_CLASSES
                                 : "text-foreground/80 hover:bg-muted/60"
                             )}
                           >

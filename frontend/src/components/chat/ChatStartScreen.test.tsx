@@ -8,10 +8,6 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-vi.mock("@/lib/utils", () => ({
-  getApiUrl: () => "http://api.local",
-}))
-
 vi.mock("@/components/chat/ChatInput", () => ({
   ChatInput: () => <div data-testid="chat-input" />,
 }))
@@ -26,6 +22,10 @@ vi.mock("@/components/ui/tooltip", () => ({
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 
 const AGENTS_SECTION = "chatPage.sections.chatWithAgents"
+// t() is mocked as identity, so the deleted demo cards would surface as their
+// literal keys — assert on those directly rather than only on the header they
+// happened to share a branch with.
+const MOCKED_AGENT_KEYS = /chatPage\.agents\./
 
 // The agents block only renders inside the prompts branch, so every case needs
 // a non-empty prompts list to reach it at all.
@@ -48,12 +48,14 @@ describe("ChatStartScreen agents section", () => {
     renderScreen(undefined)
 
     expect(screen.queryByText(AGENTS_SECTION)).toBeNull()
+    expect(screen.queryByText(MOCKED_AGENT_KEYS)).toBeNull()
   })
 
   it("renders nothing for an empty agent list", () => {
     renderScreen([])
 
     expect(screen.queryByText(AGENTS_SECTION)).toBeNull()
+    expect(screen.queryByText(MOCKED_AGENT_KEYS)).toBeNull()
   })
 
   it("renders the agents that were passed", () => {

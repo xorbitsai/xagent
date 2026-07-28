@@ -167,7 +167,7 @@ export function ChatStartScreen({
             </div>
 
             {/* Chat with Agents section */}
-            {agents && agents.length > 0 ? (
+            {agents && agents.length > 0 && (
               <>
                 <div className="flex items-center gap-2 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] mt-6 px-1">
                   <Bot className="w-3.5 h-3.5" />
@@ -212,7 +212,7 @@ export function ChatStartScreen({
                   </div>
                 </TooltipProvider>
               </>
-            ) : null}
+            )}
           </div>
         )}
       </div>

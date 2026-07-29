@@ -52,6 +52,7 @@ from ..services.workforce_lifecycle import (
     discard_draft_workforce,
 )
 from ..services.workforce_names import workforce_name_exists
+from ..services.workforce_runs import create_preview_workforce_run
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
 from ..services.workforce_runtime import (
     cancel_active_workforce_runs,
@@ -116,6 +117,16 @@ class WorkforceRunRequest(BaseModel):
     execution_mode: str | None = None
     is_preview: bool = False
     is_visible: bool = True
+
+
+class WorkforcePreviewRunRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    manager_agent_id: int
+    workers: list[WorkforceWorkerInput] = Field(default_factory=list)
+    message: str = Field(..., min_length=1)
+    files: list[str] = Field(default_factory=list)
+    execution_mode: str | None = None
 
 
 def _field_supplied(model: BaseModel, field_name: str) -> bool:
@@ -614,6 +625,35 @@ async def list_workforce_agent_options(
             purpose="workforce_select",
         )
     ]
+
+
+@router.post("/preview/runs")
+async def create_workforce_preview_run(
+    request: WorkforcePreviewRunRequest,
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Test-run an unsaved workforce draft (builder "test before save").
+
+    Takes the manager/workers inline instead of a workforce_id: nothing is
+    persisted as a Workforce, only a hidden preview Task + WorkforceRun
+    (``workforce_id`` NULL), mirroring the single-agent builder's preview.
+    """
+    result = await create_preview_workforce_run(
+        user_id=int(user.id),
+        name=request.name,
+        description=request.description,
+        manager_agent_id=request.manager_agent_id,
+        workers=[worker.model_dump() for worker in request.workers],
+        message=request.message,
+        selected_file_ids=request.files,
+        execution_mode=request.execution_mode,
+    )
+    return {
+        "workforce_run_id": result.workforce_run.id,
+        "task_id": result.task.id,
+        "status": result.workforce_run.status,
+        "redirect_url": f"/task/{result.task.id}",
+    }
 
 
 @router.get("/{workforce_id}")

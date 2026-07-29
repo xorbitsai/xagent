@@ -16,7 +16,11 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce, WorkforceAgent
-from .workforce_access import ensure_workforce_access, ensure_workforce_agent_run_access
+from .workforce_access import (
+    ensure_agent_access,
+    ensure_workforce_access,
+    ensure_workforce_agent_run_access,
+)
 from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
 
 WORKFORCE_STATUSES = {"draft", "active", "archived"}
@@ -354,6 +358,120 @@ def build_workforce_snapshot(
     snapshot["config_fingerprint"] = compute_workforce_config_fingerprint(
         workforce, manager_agent, enabled_workers
     )
+    snapshot["config_fingerprint_version"] = WORKFORCE_CONFIG_FINGERPRINT_VERSION
+    return snapshot
+
+
+def build_preview_workforce_snapshot(
+    db: Session,
+    user: User,
+    *,
+    name: str | None,
+    description: str | None,
+    manager_agent_id: int,
+    workers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a run snapshot for an unsaved (never-persisted) workforce draft.
+
+    Mirrors ``build_workforce_snapshot`` but reads the manager/workers by id
+    from the request instead of a ``Workforce`` row's relationships, so the
+    builder can test-run a draft without saving it first. Access is checked
+    per-agent (same rule as picking agents into a workforce), not via
+    ``ensure_workforce_agent_run_access`` which requires a real Workforce.
+    """
+    manager_agent = ensure_agent_access(
+        db.get(Agent, manager_agent_id),
+        user,
+        db,
+        purpose="workforce_select",
+        require_published=True,
+    )
+
+    if not workers:
+        raise HTTPException(
+            status_code=400, detail="Workforce requires at least one enabled worker"
+        )
+
+    snapshot_workers: list[dict[str, Any]] = []
+    seen_worker_agent_ids: set[int] = set()
+    for worker in workers:
+        agent_id = worker.get("agent_id")
+        if not isinstance(agent_id, int):
+            raise HTTPException(
+                status_code=400, detail="agent_id is required for each worker"
+            )
+        if int(agent_id) == int(manager_agent.id):
+            raise HTTPException(
+                status_code=400, detail="Manager agent cannot also be a worker"
+            )
+        if int(agent_id) in seen_worker_agent_ids:
+            raise HTTPException(
+                status_code=400, detail="Each agent can only be added once"
+            )
+        seen_worker_agent_ids.add(int(agent_id))
+        agent = ensure_agent_access(
+            db.get(Agent, agent_id),
+            user,
+            db,
+            purpose="workforce_select",
+            require_published=True,
+        )
+        assignment_instructions = normalize_text(
+            cast(str | None, worker.get("assignment_instructions")),
+            "assignment_instructions",
+            required=True,
+        )
+        if assignment_instructions is None:
+            raise HTTPException(
+                status_code=400, detail="assignment_instructions is required"
+            )
+        alias = (
+            normalize_text(cast(str | None, worker.get("alias")), "alias")
+            or cast(str, agent.name)
+        )
+
+        snapshot_workers.append(
+            {
+                "member_id": None,
+                "agent_id": agent.id,
+                "name": agent.name,
+                "alias": alias,
+                "description": agent.description,
+                "assignment_instructions": assignment_instructions,
+                "execution_mode": agent.execution_mode,
+                "tool_name": build_worker_tool_name(int(agent.id), alias),
+                "enabled": True,
+            }
+        )
+
+    workforce_name = normalize_text(name, "name") or "Workforce preview"
+    snapshot: dict[str, Any] = {
+        "version": 1,
+        "workforce": {
+            "id": None,
+            "name": workforce_name,
+            "description": description,
+            "status": "draft",
+            "scope_type": "user",
+            "scope_id": str(user.id),
+            "owner_user_id": user.id,
+        },
+        "manager": {
+            "agent_id": manager_agent.id,
+            "name": manager_agent.name,
+            "description": manager_agent.description,
+            "instructions": manager_agent.instructions,
+            "execution_mode": manager_agent.execution_mode,
+            "models": manager_agent.models or {},
+        },
+        "workers": snapshot_workers,
+    }
+    snapshot["manager"]["runtime_prompt"] = build_manager_system_prompt(snapshot)
+    # No live Workforce row exists to re-check a fingerprint against on
+    # later turns; ``ensure_workforce_turn_allowed`` already skips the
+    # comparison whenever the run's workforce_id is None (see
+    # workforce_runtime.py), so leaving this unset is safe.
+    snapshot["config_fingerprint"] = None
     snapshot["config_fingerprint_version"] = WORKFORCE_CONFIG_FINGERPRINT_VERSION
     return snapshot
 

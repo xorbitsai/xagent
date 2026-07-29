@@ -119,10 +119,13 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    # Nullable: ephemeral preview runs (test-before-save in the workforce
+    # builder) have a manager + inline worker configs but no persisted
+    # Workforce row to point at.
     workforce_id = Column(
         Integer,
         ForeignKey("workforces.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     task_id = Column(

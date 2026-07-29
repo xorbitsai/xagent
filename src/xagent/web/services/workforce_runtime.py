@@ -227,6 +227,12 @@ def ensure_workforce_turn_allowed(
     if run is None:
         raise WorkforceTurnRejectedError("workforce_run_not_found")
 
+    # Ephemeral preview runs (test-before-save in the builder) have no
+    # persisted Workforce to check archive/drift against -- the snapshot on
+    # the run row is the only source of truth for their whole lifetime.
+    if run.workforce_id is None:
+        return
+
     workforce = _load_workforce_for_fingerprint(db, int(run.workforce_id))
     if workforce is None or workforce.status == "archived":
         raise WorkforceTurnRejectedError("workforce_archived")

@@ -32,10 +32,14 @@ from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services import workforce_runs as workforce_runs_module
 from xagent.web.services.task_lease_service import acquire_task_lease
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
-from xagent.web.services.workforce_runs import create_workforce_run
+from xagent.web.services.workforce_runs import (
+    create_preview_workforce_run,
+    create_workforce_run,
+)
 from xagent.web.services.workforce_runtime import (
     WorkforceTaskRuntime,
     _map_task_status,
+    ensure_workforce_turn_allowed,
     release_current_runner_task_lease_with_workforce_sync,
     release_task_lease_with_workforce_sync,
     resolve_workforce_task_runtime,
@@ -282,6 +286,156 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         .count()
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_never_persists_a_workforce(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Builder "test before save": manager + inline workers, no Workforce row."""
+
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "draft-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        user_id=user.id,
+        name="Launch Team",
+        description="Coordinates the launch",
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Collect evidence and cite sources.",
+            }
+        ],
+        message="Draft a launch brief",
+    )
+    await result.background_task
+
+    assert db_session.query(Workforce).count() == 0
+
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    workforce_run = (
+        db_session.query(WorkforceRun)
+        .filter(WorkforceRun.id == int(result.workforce_run.id))
+        .one()
+    )
+
+    assert workforce_run.workforce_id is None
+    assert workforce_run.is_preview is True
+    assert task.is_visible is False
+    assert task.status == TaskStatus.RUNNING
+    assert task.agent_id == manager.id
+    assert task.agent_config["workforce_id"] is None
+    assert task.agent_config["workforce_run_id"] == workforce_run.id
+    snapshot = task.agent_config["workforce_snapshot"]
+    assert snapshot["workforce"]["id"] is None
+    assert snapshot["workforce"]["name"] == "Launch Team"
+    assert snapshot["manager"]["agent_id"] == manager.id
+    assert snapshot["workers"][0]["agent_id"] == worker_agent.id
+    assert snapshot["workers"][0]["alias"] == "Analyst"
+    assert scheduled["task_id"] == task.id
+
+    # The manager can actually delegate: tool-override resolution works from
+    # the run's own snapshot even though workforce_id is None.
+    runtime = resolve_workforce_task_runtime(db_session, task)
+    assert runtime is not None
+    assert runtime.allowed_agent_ids == [worker_agent.id]
+
+    # Turn-gating on a later message must not try to load a nonexistent
+    # Workforce by a None id.
+    ensure_workforce_turn_allowed(
+        db_session,
+        task_id=int(task.id),
+        task_owner_user_id=int(user.id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_requires_at_least_one_worker(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "no-worker-owner")
+    manager = _create_agent(db_session, user, "Solo Manager")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            user_id=user.id,
+            name="Solo Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_unpublished_manager(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "unpublished-owner")
+    manager = _create_agent(
+        db_session, user, "Draft Manager", status=AgentStatus.DRAFT
+    )
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_duplicate_worker_agent(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "duplicate-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": "First",
+                    "assignment_instructions": "Do the work.",
+                },
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": "Second",
+                    "assignment_instructions": "Do it again.",
+                },
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
 
 
 @pytest.mark.asyncio

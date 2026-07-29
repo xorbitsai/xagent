@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
@@ -68,25 +69,13 @@ async def prepare_llm_for_context(
         metadata = getattr(context, "metadata", None)
         preferred_modalities = normalize_input_modalities(
             ()
-            if not metadata or not isinstance(metadata, dict)
+            if not metadata or not isinstance(metadata, Mapping)
             else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
         )
-        supports_preferences = False
-        try:
-            parameters = inspect.signature(prepare).parameters
-            supports_preferences = "preferred_input_modalities" in parameters or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            )
-        except (TypeError, ValueError):
-            pass
-        if preferred_modalities and supports_preferences:
-            prepared = prepare(
-                messages,
-                preferred_input_modalities=preferred_modalities,
-            )
-        else:
-            prepared = prepare(messages)
+        prepared = prepare(
+            messages,
+            preferred_input_modalities=preferred_modalities,
+        )
         if inspect.isawaitable(prepared):
             prepared = await prepared
 

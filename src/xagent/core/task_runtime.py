@@ -12,16 +12,38 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 PREFERRED_INPUT_MODALITIES_METADATA_KEY = "preferred_input_modalities"
+MAX_TASK_RUNTIME_EXTENSIONS = 16
+MAX_TASK_RUNTIME_JSON_BYTES = 64 * 1024
+
+
+class TaskRuntimeClientError(Exception):
+    """Provider-approved error detail that may be returned to a client.
+
+    Provider implementations should raise this only for expected request or
+    authorization failures. Unexpected provider exceptions remain private and
+    are mapped to generic server errors by the web layer.
+    """
+
+    def __init__(self, detail: str, *, status_code: int = 400) -> None:
+        normalized_detail = detail.strip()
+        if not normalized_detail:
+            raise ValueError("Task runtime client error detail must not be empty")
+        if status_code not in (400, 403):
+            raise ValueError("Task runtime client error status must be 400 or 403")
+        super().__init__(normalized_detail)
+        self.detail = normalized_detail
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
 class TaskRuntimeContext:
     """Detached inputs shared with one task runtime extension.
 
-    ``session_factory`` is intentionally a factory instead of a checked-out
-    SQLAlchemy ``Session``.  Providers must open short, operation-local
-    sessions so a task-bound runtime never retains a request session across
-    tool calls or async boundaries.
+    ``user_id`` is always the task owner's stable identity, never the acting
+    admin or runtime caller. ``session_factory`` is intentionally a factory
+    instead of a checked-out SQLAlchemy ``Session``. Providers own every
+    session they open and must close it within the current hook; the framework
+    deliberately does not retain or instrument provider sessions.
     """
 
     task_id: int
@@ -48,13 +70,20 @@ class TaskRuntimeContribution:
     tools: tuple[Any, ...] = ()
     environment: str | None = None
     preferred_input_modalities: tuple[str, ...] = ()
+    # Populated by the registry merge for filtering diagnostics. Providers do
+    # not need to set this field themselves.
+    tool_origins: tuple[tuple[str, str], ...] = ()
 
 
 EMPTY_TASK_RUNTIME_CONTRIBUTION = TaskRuntimeContribution()
 
 
 class TaskRuntimeExtensionProvider(Protocol):
-    """Lifecycle contract implemented by an out-of-tree task extension."""
+    """Lifecycle contract implemented by an out-of-tree task extension.
+
+    ``on_task_deleted`` must be idempotent: core deletion can fail after
+    provider cleanup, and a retry will dispatch the hook again.
+    """
 
     def on_task_created(
         self,
@@ -81,19 +110,27 @@ class TaskRuntimeExtensionProvider(Protocol):
 def normalize_input_modalities(values: Any) -> tuple[str, ...]:
     """Normalize a provider or execution metadata modality sequence."""
 
-    if isinstance(values, (str, bytes)) or values is None:
-        values = (values,) if values else ()
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        values = (values,)
+    elif isinstance(values, (bytes, bytearray, Mapping)):
+        raise TypeError("Input modalities must be a string sequence")
     try:
         candidates = tuple(values)
-    except TypeError:
-        candidates = (values,)
-    return tuple(
-        dict.fromkeys(
-            normalized
-            for item in candidates
-            if item is not None and (normalized := str(item).strip().lower())
-        )
-    )
+    except TypeError as exc:
+        raise TypeError("Input modalities must be a string sequence") from exc
+
+    normalized_values: list[str] = []
+    for item in candidates:
+        if item is None:
+            continue
+        if not isinstance(item, str):
+            raise TypeError("Input modality items must be strings")
+        normalized = item.strip().lower()
+        if normalized:
+            normalized_values.append(normalized)
+    return tuple(dict.fromkeys(normalized_values))
 
 
 def normalize_task_runtime_contribution(
@@ -116,20 +153,27 @@ def normalize_task_runtime_contribution(
         tools=tuple(value.tools),
         environment=environment,
         preferred_input_modalities=modalities,
+        tool_origins=tuple(value.tool_origins),
     )
 
 
 def merge_task_runtime_contributions(
-    contributions: Mapping[str, TaskRuntimeContribution],
+    contributions: Mapping[str, TaskRuntimeContribution | None],
 ) -> TaskRuntimeContribution:
     """Merge provider contributions in registry order."""
 
     tools: list[Any] = []
     environments: list[str] = []
     modalities: list[str] = []
-    for contribution in contributions.values():
+    tool_origins: list[tuple[str, str]] = []
+    for provider_name, contribution in contributions.items():
         normalized = normalize_task_runtime_contribution(contribution)
         tools.extend(normalized.tools)
+        tool_origins.extend(
+            (name.strip(), provider_name)
+            for tool in normalized.tools
+            if isinstance((name := getattr(tool, "name", None)), str) and name.strip()
+        )
         if normalized.environment:
             environments.append(normalized.environment)
         modalities.extend(normalized.preferred_input_modalities)
@@ -138,4 +182,5 @@ def merge_task_runtime_contributions(
         tools=tuple(tools),
         environment="\n\n".join(environments) or None,
         preferred_input_modalities=tuple(dict.fromkeys(modalities)),
+        tool_origins=tuple(tool_origins),
     )

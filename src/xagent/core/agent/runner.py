@@ -85,6 +85,7 @@ class AgentRunner:
             )
         if checkpoint and isinstance(checkpoint.get("context"), dict):
             context = ExecutionContext.from_dict(checkpoint["context"])
+            self._merge_context_metadata(context, metadata)
             self.context_manager.set_context(context)
             execution_id = context.execution_id
             workspace = None
@@ -601,15 +602,9 @@ class AgentRunner:
         # is restored verbatim from the checkpoint, so a context-window or ratio
         # change made after checkpointing only affects newly started tasks.
         context.compact_config.threshold = self._resolve_compact_threshold()
-        if metadata:
-            context.metadata.update(metadata)
+        self._merge_context_metadata(context, metadata)
         if task:
             context.metadata.setdefault("task", task)
-        request_context = (
-            metadata.get("request_context") if isinstance(metadata, dict) else None
-        )
-        if isinstance(request_context, dict):
-            self._apply_request_context(context, request_context)
 
         memory_session = await self._resolve_memory_session(
             execution_id=execution_id,
@@ -621,6 +616,20 @@ class AgentRunner:
             context.attach_memory_session(memory_id, snapshot)
 
         return context, workspace
+
+    def _merge_context_metadata(
+        self,
+        context: ExecutionContext,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        """Overlay current-run metadata on new or checkpoint-restored context."""
+
+        if not metadata:
+            return
+        context.metadata.update(metadata)
+        request_context = metadata.get("request_context")
+        if isinstance(request_context, dict):
+            self._apply_request_context(context, request_context)
 
     def _resolve_compact_threshold(self) -> int:
         """Derive the context-compaction threshold from the model's context window.

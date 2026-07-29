@@ -15,6 +15,7 @@ from xagent.core.agent import (
 )
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -523,6 +524,7 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
 ) -> None:
     checkpoint_context = ExecutionContext(execution_id="exec-resume")
     checkpoint_context.add_user_message("Original task")
+    checkpoint_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["text"]
     checkpoint = {
         "context": checkpoint_context.to_dict(),
         "pattern": "StatefulPattern",
@@ -539,12 +541,16 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
         task="Should not be appended",
         execution_id="exec-resume",
         checkpoint=checkpoint,
+        metadata={PREFERRED_INPUT_MODALITIES_METADATA_KEY: ["image"]},
     )
 
     assert result["success"] is True
     assert result["output"] == "restored"
     assert result["message_count"] == 1
     assert pattern.state == {"output": "restored"}
+    assert result["context"].metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] == [
+        "image"
+    ]
     assert [message.content for message in result["context"].messages] == [
         "Original task",
         "restored",

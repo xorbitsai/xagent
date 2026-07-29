@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 
 from xagent.core.task_runtime import (
+    MAX_TASK_RUNTIME_EXTENSIONS,
+    MAX_TASK_RUNTIME_JSON_BYTES,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     normalize_input_modalities,
@@ -103,6 +105,19 @@ def test_normalize_input_modalities_ignores_none() -> None:
     assert normalize_input_modalities((None, " IMAGE ", None, "image")) == ("image",)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        b"image",
+        {"image": True},
+        ("image", 7),
+    ],
+)
+def test_normalize_input_modalities_rejects_malformed_values(value: Any) -> None:
+    with pytest.raises(TypeError, match="must be"):
+        normalize_input_modalities(value)
+
+
 @pytest.mark.asyncio
 async def test_provider_lifecycle_merges_detached_runtime_contributions(
     registered_names: list[str],
@@ -146,6 +161,10 @@ async def test_provider_lifecycle_merges_detached_runtime_contributions(
     assert contribution.tools == (tool_a, tool_b)
     assert contribution.environment == "First environment\n\nSecond environment"
     assert contribution.preferred_input_modalities == ("image", "audio")
+    assert contribution.tool_origins == (
+        ("tool_a", "first_runtime"),
+        ("tool_b", "second_runtime"),
+    )
     assert metadata == {"first_runtime": {"target": "one"}}
     assert events[-2:] == ["delete:second", "delete:first"]
 
@@ -228,6 +247,94 @@ async def test_create_failure_cleanup_does_not_swallow_process_control_exception
         )
 
 
+@pytest.mark.asyncio
+async def test_create_wraps_registry_change_during_validation(
+    registered_names: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xagent.web.services.task_runtime as task_runtime
+
+    provider = _Provider("racy")
+    _register("racy_runtime", provider, registered_names)
+    original_validate = task_runtime.validate_task_extension_requests
+
+    def validate_and_unregister(value: Any) -> dict[str, dict[str, Any]]:
+        result = original_validate(value)
+        unregister_task_extension("racy_runtime")
+        return result
+
+    monkeypatch.setattr(
+        task_runtime,
+        "validate_task_extension_requests",
+        validate_and_unregister,
+    )
+
+    with pytest.raises(TaskRuntimeExtensionError) as exc_info:
+        await create_task_extensions(_context(), {"racy_runtime": {}})
+
+    assert exc_info.value.extension == "registry"
+    assert exc_info.value.operation == "validate_requests"
+
+
+@pytest.mark.asyncio
+async def test_build_dispatch_uses_registry_snapshot_across_await(
+    registered_names: list[str],
+) -> None:
+    events: list[str] = []
+    second = _Provider(
+        "second",
+        contribution=TaskRuntimeContribution(environment="second"),
+        events=events,
+    )
+
+    class _UnregisteringProvider(_Provider):
+        async def build_runtime(
+            self,
+            context: TaskRuntimeContext,
+        ) -> TaskRuntimeContribution:
+            events.append("build:first")
+            unregister_task_extension("second_runtime")
+            return TaskRuntimeContribution(environment="first")
+
+    first = _UnregisteringProvider("first", events=events)
+    _register("first_runtime", first, registered_names)
+    _register("second_runtime", second, registered_names)
+
+    contribution = await build_task_runtime(_context())
+
+    assert contribution.environment == "first\n\nsecond"
+    assert events == ["build:first", "build:second"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_dispatch_uses_registry_snapshot_across_await(
+    registered_names: list[str],
+) -> None:
+    events: list[str] = []
+    second = _Provider("second", metadata={"second": True}, events=events)
+
+    class _UnregisteringProvider(_Provider):
+        def public_metadata(
+            self,
+            context: TaskRuntimeContext,
+        ) -> dict[str, Any]:
+            events.append("metadata:first")
+            unregister_task_extension("second_metadata")
+            return {"first": True}
+
+    first = _UnregisteringProvider("first", events=events)
+    _register("first_metadata", first, registered_names)
+    _register("second_metadata", second, registered_names)
+
+    metadata = await get_task_runtime_public_metadata(_context())
+
+    assert metadata == {
+        "first_metadata": {"first": True},
+        "second_metadata": {"second": True},
+    }
+    assert events == ["metadata:first", "metadata:second"]
+
+
 def test_registry_rejects_unknown_invalid_and_incomplete_providers(
     registered_names: list[str],
 ) -> None:
@@ -243,6 +350,24 @@ def test_registry_rejects_unknown_invalid_and_incomplete_providers(
     assert "valid_runtime" in registered_task_extensions()
     with pytest.raises(ValueError, match="already registered"):
         register_task_extension("valid_runtime", provider)
+
+
+def test_runtime_extension_requests_are_size_bounded(
+    registered_names: list[str],
+) -> None:
+    provider = _Provider("bounded")
+    _register("bounded_runtime", provider, registered_names)
+
+    with pytest.raises(TypeError, match="JSON-compatible"):
+        validate_task_extension_requests({"bounded_runtime": {"value": float("nan")}})
+    with pytest.raises(ValueError, match="byte limit"):
+        validate_task_extension_requests(
+            {"bounded_runtime": {"value": "x" * MAX_TASK_RUNTIME_JSON_BYTES}}
+        )
+    with pytest.raises(ValueError, match="at most"):
+        validate_task_extension_requests(
+            {f"runtime_{index}": {} for index in range(MAX_TASK_RUNTIME_EXTENSIONS + 1)}
+        )
 
 
 @pytest.mark.asyncio

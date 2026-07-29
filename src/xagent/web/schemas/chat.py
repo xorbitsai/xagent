@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from ...core.task_runtime import MAX_TASK_RUNTIME_EXTENSIONS
+
 
 class ChatMessage(BaseModel):
     """Chat message model"""
@@ -60,7 +62,12 @@ class TaskCreateRequest(BaseModel):
     )
     agent_type: Optional[str] = "standard"
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
-    runtime_extensions: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    # Transport-shape violations intentionally remain Pydantic 422 responses;
+    # registry/semantic validation happens in the service layer as HTTP 400.
+    runtime_extensions: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        max_length=MAX_TASK_RUNTIME_EXTENSIONS,
+    )
     is_preview: bool = False  # Backward-compatible alias for is_visible=False.
     is_visible: bool = True
 

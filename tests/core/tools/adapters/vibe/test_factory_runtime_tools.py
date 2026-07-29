@@ -40,6 +40,35 @@ async def test_runtime_tools_enter_normal_selection_pipeline(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_runtime_tools_filtered_by_policy_log_provider(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base_tool = _tool("base_tool")
+    runtime_tool = _tool("runtime_tool")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    config = ToolConfig({"allowed_tools": ["base_tool"]})
+    config.get_task_runtime_contribution = lambda: TaskRuntimeContribution(
+        tools=(runtime_tool,),
+        tool_origins=(("runtime_tool", "browser_runtime"),),
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    assert tools == [base_tool]
+    assert "browser_runtime=[runtime_tool]" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_runtime_tools_are_restored_from_config_on_rebuild(monkeypatch) -> None:
     base_tool = _tool("base_tool")
     runtime_tool = _tool("runtime_tool")

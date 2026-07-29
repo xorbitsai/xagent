@@ -458,7 +458,7 @@ class RouterLLM(BaseLLM):
         routing a second time, and carries the selected model's context window
         from xrouter's model profile catalog.
         """
-        preferred_input_modalities = tuple(
+        route_input_modalities = tuple(
             dict.fromkeys(
                 (
                     *normalize_input_modalities(preferred_input_modalities),
@@ -468,7 +468,7 @@ class RouterLLM(BaseLLM):
         )
         model_id, downstream = await self._resolve_route(
             messages,
-            preferred_input_modalities=preferred_input_modalities,
+            preferred_input_modalities=route_input_modalities,
         )
         context_window = getattr(self, "context_window", None)
         if not context_window:
@@ -478,9 +478,7 @@ class RouterLLM(BaseLLM):
         if not context_window:
             context_window = getattr(downstream, "context_window", None)
         input_modalities = (
-            self._profile_input_modalities(model_id)
-            if preferred_input_modalities
-            else ()
+            self._profile_input_modalities(model_id) if route_input_modalities else ()
         )
         return _ResolvedRouterLLM(
             router=self,

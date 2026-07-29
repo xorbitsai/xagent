@@ -15,7 +15,11 @@ from ..models.task import Task
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
-from ..services.task_runtime import TaskRuntimeExtensionError, delete_task_extensions
+from ..services.task_runtime import (
+    TaskRuntimeExtensionError,
+    delete_task_extensions,
+    registered_task_extensions,
+)
 from ..services.user_admin_scope import hidden_user_ids
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
@@ -98,34 +102,39 @@ async def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    session_factory = get_session_local()
-    task_runtime_contexts = [
-        TaskRuntimeContext(
-            task_id=int(task_id),
-            user_id=int(task_user_id),
-            source=str(source) if source is not None else None,
-            session_factory=session_factory,
-        )
-        for task_id, task_user_id, source in db.query(
-            Task.id,
-            Task.user_id,
-            Task.source,
-        )
-        .filter(Task.user_id == user_id)
-        .all()
-    ]
-    release_db_connection_if_clean(db)
-
-    for context in task_runtime_contexts:
-        try:
-            await delete_task_extensions(context)
-        except TaskRuntimeExtensionError:
-            logger.warning(
-                "User %s was deleted but runtime extension cleanup failed for task %s",
-                user_id,
-                context.task_id,
-                exc_info=True,
+    if registered_task_extensions():
+        session_factory = get_session_local()
+        task_runtime_contexts = [
+            TaskRuntimeContext(
+                task_id=int(task_id),
+                user_id=int(task_user_id),
+                source=str(source) if source is not None else None,
+                session_factory=session_factory,
             )
+            for task_id, task_user_id, source in db.query(
+                Task.id,
+                Task.user_id,
+                Task.source,
+            )
+            .filter(Task.user_id == user_id)
+            .all()
+        ]
+        release_db_connection_if_clean(db)
+
+        # Keep provider cleanup sequential: hooks may target the same external
+        # account, and bounded ordering avoids a deletion request creating an
+        # unbounded burst for users with many tasks.
+        for context in task_runtime_contexts:
+            try:
+                await delete_task_extensions(context)
+            except TaskRuntimeExtensionError:
+                logger.warning(
+                    "User %s was deleted but runtime extension cleanup failed "
+                    "for task %s",
+                    user_id,
+                    context.task_id,
+                    exc_info=True,
+                )
 
     # Re-read after the await: releasing the clean read transaction above may
     # expire ORM state, and extension hooks use their own short sessions.

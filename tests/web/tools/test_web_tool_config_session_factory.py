@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.task_runtime import TaskRuntimeContext
 from xagent.core.tools.adapters.vibe.config import (
     MCPConfigLoadError,
     ToolFactoryRuntimeSessionBoundaryError,
@@ -386,6 +387,51 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     assert tools == ["prepared-tool"]
     assert captured["db"] is None
     assert captured["db_factory"] is session_factory
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_skips_runtime_workspace_without_providers(
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.api.chat import create_default_tools
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            self.runtime_contribution = None
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+    async def create_tools(config):
+        return []
+
+    def unexpected_workspace(_config):
+        raise AssertionError("workspace must not be created without providers")
+
+    async def unexpected_runtime(_context):
+        raise AssertionError("runtime build must not run without providers")
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+    monkeypatch.setattr(ToolFactory, "create_workspace", unexpected_workspace)
+    monkeypatch.setattr(chat_module, "build_task_runtime", unexpected_runtime)
+    monkeypatch.setattr(chat_module, "registered_task_extensions", lambda: ())
+
+    tools, config = await create_default_tools(
+        None,
+        user=SimpleNamespace(id=7, is_admin=False),
+        task_id="web_task_11",
+        task_runtime_context=TaskRuntimeContext(
+            task_id=11,
+            user_id=7,
+            source="internal",
+            session_factory=lambda: object(),
+        ),
+    )
+
+    assert tools == []
+    assert config.runtime_contribution.tools == ()
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    TaskRuntimeClientError,
     TaskRuntimeContext,
     TaskRuntimeContribution,
 )
@@ -114,6 +115,7 @@ from ..services.task_runtime import (
     create_task_extensions,
     delete_task_extensions,
     get_task_runtime_public_metadata,
+    registered_task_extensions,
     validate_task_extension_requests,
 )
 from ..services.task_setup_snapshot import (
@@ -660,8 +662,8 @@ async def create_default_tools(
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
     runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
-    if task_runtime_context is not None:
-        workspace = ToolFactory._create_workspace(tool_config.get_workspace_config())
+    if task_runtime_context is not None and registered_task_extensions():
+        workspace = ToolFactory.create_workspace(tool_config.get_workspace_config())
         runtime_contribution = await build_task_runtime(
             task_runtime_context.with_workspace(workspace)
         )
@@ -719,18 +721,100 @@ def _compensate_failed_task_extension_create(
 ) -> None:
     """Remove a just-created task after provider binding setup failed."""
 
+    db.rollback()
+    deleted = _purge_task_rows(
+        db,
+        task_id=task_id,
+        preserve_uploaded_files=True,
+    )
+    db.commit()
+    if deleted:
+        invalidate_task_cache(task_id)
+
+
+def _purge_task_rows(
+    db: Session,
+    *,
+    task_id: int,
+    preserve_uploaded_files: bool,
+) -> bool:
+    """Delete one task and its non-cascading rows in a caller-owned transaction."""
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        return False
+
+    from ..models.task import (
+        DAGExecution,
+        TraceCheckpointBlob,
+        TraceMessageBlob,
+    )
     from ..models.uploaded_file import UploadedFile
 
-    db.rollback()
-    db.query(UploadedFile).filter(UploadedFile.task_id == task_id).update(
-        {UploadedFile.task_id: None},
-        synchronize_session=False,
+    db.query(TraceCheckpointBlob).filter(TraceCheckpointBlob.task_id == task_id).delete(
+        synchronize_session=False
     )
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if task is not None:
-        db.delete(task)
-    db.commit()
-    invalidate_task_cache(task_id)
+    db.query(TraceMessageBlob).filter(TraceMessageBlob.task_id == task_id).delete(
+        synchronize_session=False
+    )
+    db.query(TraceEvent).filter(TraceEvent.task_id == task_id).delete(
+        synchronize_session=False
+    )
+    db.query(DAGExecution).filter(DAGExecution.task_id == task_id).delete(
+        synchronize_session=False
+    )
+    if preserve_uploaded_files:
+        db.query(UploadedFile).filter(UploadedFile.task_id == task_id).update(
+            {UploadedFile.task_id: None},
+            synchronize_session=False,
+        )
+    db.delete(task)
+    return True
+
+
+def _load_task_delete_snapshot_sync(
+    *,
+    task_id: int,
+    requester_user_id: int,
+    is_admin: bool,
+) -> tuple[str, int, Any] | None:
+    """Load detached delete inputs without sharing the request session."""
+
+    session_factory = get_session_local()
+    delete_db = session_factory()
+    try:
+        query = delete_db.query(Task).filter(Task.id == task_id)
+        if not is_admin:
+            query = query.filter(Task.user_id == requester_user_id)
+        task = query.first()
+        if task is None:
+            return None
+        return str(task.title), int(task.user_id), task.source
+    finally:
+        delete_db.close()
+
+
+def _delete_task_sync(*, task_id: int) -> bool:
+    """Delete one task in an operation-local session."""
+
+    session_factory = get_session_local()
+    delete_db = session_factory()
+    try:
+        deleted = _purge_task_rows(
+            delete_db,
+            task_id=task_id,
+            preserve_uploaded_files=False,
+        )
+        if not deleted:
+            delete_db.rollback()
+            return False
+        delete_db.commit()
+        return True
+    except Exception:
+        delete_db.rollback()
+        raise
+    finally:
+        delete_db.close()
 
 
 def _selected_file_ids_from_agent_config(
@@ -2347,11 +2431,12 @@ class AgentServiceManager:
                     if db is not None and task is not None
                     else None
                 )
-                workspace_owner_id = (
-                    int(task.user_id)
-                    if task and task.user_id is not None
-                    else int(runtime_user.id)
-                )
+                # ``runtime_user_id`` is resolved from the persisted task owner
+                # above and remains authoritative even when this path uses a
+                # detached snapshot rather than a live ``Task`` ORM object.
+                if runtime_user_id is None:
+                    raise ValueError(f"Task {task_id} has no resolved owner")
+                workspace_owner_id = int(runtime_user_id)
                 scope_segments = scope.workspace_segments if scope is not None else ()
                 # Sandbox mount covers the scope's mount prefix (full
                 # workspace_segments when no prefix is declared); the deeper
@@ -2406,7 +2491,13 @@ class AgentServiceManager:
                     task_runtime_context=_task_runtime_context(
                         task_id=task_id,
                         user_id=workspace_owner_id,
-                        source=getattr(task, "source", None),
+                        source=getattr(
+                            task
+                            if task is not None
+                            else getattr(snapshot, "task", None),
+                            "source",
+                            None,
+                        ),
                     ),
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
@@ -3734,14 +3825,18 @@ async def create_task(
             )
         except TaskRuntimeExtensionError as exc:
             task_id = int(task.id)
-            _compensate_failed_task_extension_create(db, task_id=task_id)
+            try:
+                _compensate_failed_task_extension_create(db, task_id=task_id)
+            except Exception:
+                logger.exception(
+                    "Failed to compensate task %s after runtime extension "
+                    "creation failure",
+                    task_id,
+                )
             get_agent_manager(request).remove_agent(task_id, int(user.id))
-            if isinstance(exc.cause, PermissionError):
-                status_code = 403
-                detail = str(exc)
-            elif isinstance(exc.cause, (TypeError, ValueError)):
-                status_code = 400
-                detail = str(exc)
+            if isinstance(exc.cause, TaskRuntimeClientError):
+                status_code = exc.cause.status_code
+                detail = exc.cause.detail
             else:
                 status_code = 503
                 detail = "Service unavailable"
@@ -3751,6 +3846,10 @@ async def create_task(
                 )
             raise HTTPException(status_code=status_code, detail=detail) from exc
 
+        # Public metadata is optional decoration on the create response. The
+        # binding has already been persisted successfully, so creation degrades
+        # to an empty mapping here; the dedicated GET endpoint remains
+        # fail-closed because metadata is its primary response.
         try:
             runtime_extensions = await get_task_runtime_public_metadata(runtime_context)
         except TaskRuntimeExtensionError:
@@ -4315,12 +4414,9 @@ async def get_task_runtime_extensions(
     try:
         extensions = await get_task_runtime_public_metadata(context)
     except TaskRuntimeExtensionError as exc:
-        if isinstance(exc.cause, PermissionError):
-            status_code = 403
-            detail = str(exc)
-        elif isinstance(exc.cause, (TypeError, ValueError, AttributeError)):
-            status_code = 400
-            detail = str(exc)
+        if isinstance(exc.cause, TaskRuntimeClientError):
+            status_code = exc.cause.status_code
+            detail = exc.cause.detail
         else:
             status_code = 500
             detail = "Internal server error"
@@ -4342,26 +4438,21 @@ async def delete_task(
     """Delete a task and all related data"""
     try:
         requester_user_id = int(user.id)
-        # Load detached task details on the request thread before awaiting
-        # provider cleanup. Providers may need their task-bound rows to release
-        # external resources, so the hook must run before the core DELETE.
-        if user.is_admin:
-            task = db.query(Task).filter(Task.id == task_id).first()
-        else:
-            task = (
-                db.query(Task)
-                .filter(Task.id == task_id, Task.user_id == user.id)
-                .first()
-            )
-        if not task:
-            raise HTTPException(status_code=404, detail="Task not found")
-        task_title = str(task.title)
-        runtime_context = _task_runtime_context(
-            task_id=int(task.id),
-            user_id=int(task.user_id),
-            source=task.source,
-        )
         release_db_connection_if_clean(db)
+        task_snapshot = await asyncio.to_thread(
+            _load_task_delete_snapshot_sync,
+            task_id=task_id,
+            requester_user_id=requester_user_id,
+            is_admin=bool(user.is_admin),
+        )
+        if task_snapshot is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        task_title, task_user_id, task_source = task_snapshot
+        runtime_context = _task_runtime_context(
+            task_id=task_id,
+            user_id=task_user_id,
+            source=task_source,
+        )
 
         try:
             await delete_task_extensions(runtime_context)
@@ -4372,54 +4463,9 @@ async def delete_task(
                 exc_info=True,
             )
 
-        # Use an operation-local session inside the worker. SQLAlchemy sessions
-        # are not thread-safe, so the request session must never cross this
-        # boundary.
-        def _delete_task_sync() -> None:
-            session_factory = get_session_local()
-            delete_db = session_factory()
-            try:
-                task_to_delete = (
-                    delete_db.query(Task).filter(Task.id == task_id).first()
-                )
-                if task_to_delete is None:
-                    return
-                # Delete related data in the correct foreign-key order.
-                logger.info(f"Deleting task {task_id} and all related data")
-
-                # Delete task-owned rows that do not all have DB-level cascades.
-                from ..models.task import (
-                    DAGExecution,
-                    TraceCheckpointBlob,
-                    TraceEvent,
-                    TraceMessageBlob,
-                )
-
-                delete_db.query(TraceCheckpointBlob).filter(
-                    TraceCheckpointBlob.task_id == task_id
-                ).delete(synchronize_session=False)
-                delete_db.query(TraceMessageBlob).filter(
-                    TraceMessageBlob.task_id == task_id
-                ).delete(synchronize_session=False)
-                delete_db.query(TraceEvent).filter(
-                    TraceEvent.task_id == task_id
-                ).delete(synchronize_session=False)
-                delete_db.query(DAGExecution).filter(
-                    DAGExecution.task_id == task_id
-                ).delete(synchronize_session=False)
-
-                # Note: tool_usages, agents, and agent_tools tables have been removed
-
-                # Delete the task itself
-                delete_db.delete(task_to_delete)
-                delete_db.commit()
-            except Exception:
-                delete_db.rollback()
-                raise
-            finally:
-                delete_db.close()
-
-        await asyncio.to_thread(_delete_task_sync)
+        deleted = await asyncio.to_thread(_delete_task_sync, task_id=task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Task no longer exists")
         invalidate_task_cache(task_id)
 
         # Remove agent from manager if it exists
@@ -4452,7 +4498,7 @@ async def delete_task(
     except Exception as e:
         logger.error(f"Delete task failed: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @chat_router.get("/workspace/{task_id}/files")

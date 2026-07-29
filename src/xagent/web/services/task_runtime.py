@@ -12,15 +12,17 @@ import json
 import logging
 import re
 from collections.abc import Mapping
+from threading import RLock
 from typing import Any
 
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    MAX_TASK_RUNTIME_EXTENSIONS,
+    MAX_TASK_RUNTIME_JSON_BYTES,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     TaskRuntimeExtensionProvider,
     merge_task_runtime_contributions,
-    normalize_task_runtime_contribution,
 )
 
 _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -31,6 +33,7 @@ _PROVIDER_METHODS = (
     "on_task_deleted",
 )
 _task_runtime_extensions: dict[str, TaskRuntimeExtensionProvider] = {}
+_task_runtime_extensions_lock = RLock()
 logger = logging.getLogger(__name__)
 
 
@@ -65,21 +68,30 @@ def register_task_extension(
             "Task runtime extension provider is missing callable method(s): "
             + ", ".join(missing)
         )
-    if normalized in _task_runtime_extensions and not replace:
-        raise ValueError(f"Task runtime extension '{normalized}' is already registered")
-    _task_runtime_extensions[normalized] = provider
+    with _task_runtime_extensions_lock:
+        if normalized in _task_runtime_extensions and not replace:
+            raise ValueError(
+                f"Task runtime extension '{normalized}' is already registered"
+            )
+        _task_runtime_extensions[normalized] = provider
 
 
 def unregister_task_extension(name: str) -> TaskRuntimeExtensionProvider | None:
-    """Remove and return one provider, if registered."""
+    """Remove and return one provider, if registered.
 
-    return _task_runtime_extensions.pop(_normalize_extension_name(name), None)
+    Raises:
+        ValueError: If ``name`` is not a valid extension name.
+    """
+
+    normalized = _normalize_extension_name(name)
+    with _task_runtime_extensions_lock:
+        return _task_runtime_extensions.pop(normalized, None)
 
 
 def registered_task_extensions() -> tuple[str, ...]:
     """Return registered names in deterministic dispatch order."""
 
-    return tuple(_task_runtime_extensions)
+    return tuple(name for name, _provider in _registered_extension_items())
 
 
 def validate_task_extension_requests(value: Any) -> dict[str, dict[str, Any]]:
@@ -89,11 +101,16 @@ def validate_task_extension_requests(value: Any) -> dict[str, dict[str, Any]]:
         return {}
     if not isinstance(value, Mapping):
         raise TypeError("runtime_extensions must be an object")
+    if len(value) > MAX_TASK_RUNTIME_EXTENSIONS:
+        raise ValueError(
+            f"runtime_extensions supports at most {MAX_TASK_RUNTIME_EXTENSIONS} entries"
+        )
 
+    registered_names = {name for name, _provider in _registered_extension_items()}
     normalized: dict[str, dict[str, Any]] = {}
     for raw_name, raw_configuration in value.items():
         name = _normalize_extension_name(str(raw_name))
-        if name not in _task_runtime_extensions:
+        if name not in registered_names:
             raise ValueError(f"Task runtime extension '{name}' is not registered")
         if not isinstance(raw_configuration, Mapping):
             raise TypeError(
@@ -116,19 +133,31 @@ async def create_task_extensions(
     responsible for compensating the newly committed core ``Task`` row.
     """
 
-    normalized = validate_task_extension_requests(requests)
-    completed: list[str] = []
-    for name, configuration in normalized.items():
-        provider = _task_runtime_extensions[name]
+    try:
+        normalized = validate_task_extension_requests(requests)
+        with _task_runtime_extensions_lock:
+            providers = tuple(
+                (name, _task_runtime_extensions[name], configuration)
+                for name, configuration in normalized.items()
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TaskRuntimeExtensionError(
+            "registry",
+            "validate_requests",
+            exc,
+        ) from exc
+
+    completed: list[tuple[str, TaskRuntimeExtensionProvider]] = []
+    for name, provider, configuration in providers:
         try:
             await _maybe_await(provider.on_task_created(context, configuration))
         except Exception as exc:
             await _cleanup_after_create_failure(
                 context,
-                names=(*completed, name),
+                providers=(*completed, (name, provider)),
             )
             raise TaskRuntimeExtensionError(name, "on_task_created", exc) from exc
-        completed.append(name)
+        completed.append((name, provider))
 
 
 async def build_task_runtime(
@@ -136,11 +165,11 @@ async def build_task_runtime(
 ) -> TaskRuntimeContribution:
     """Build and merge every registered provider's contribution for one task."""
 
-    contributions: dict[str, TaskRuntimeContribution] = {}
-    for name, provider in _task_runtime_extensions.items():
+    contributions: dict[str, TaskRuntimeContribution | None] = {}
+    for name, provider in _registered_extension_items():
         try:
             contribution = await _maybe_await(provider.build_runtime(context))
-            contributions[name] = normalize_task_runtime_contribution(contribution)
+            contributions[name] = contribution
         except Exception as exc:
             raise TaskRuntimeExtensionError(name, "build_runtime", exc) from exc
     if not contributions:
@@ -154,7 +183,7 @@ async def get_task_runtime_public_metadata(
     """Return provider-selected, JSON-safe metadata suitable for clients."""
 
     result: dict[str, dict[str, Any]] = {}
-    for name, provider in _task_runtime_extensions.items():
+    for name, provider in _registered_extension_items():
         try:
             metadata = await _maybe_await(provider.public_metadata(context))
             if metadata is None:
@@ -179,7 +208,7 @@ async def delete_task_extensions(context: TaskRuntimeContext) -> None:
     """
 
     failures: list[tuple[str, BaseException]] = []
-    for name, provider in reversed(tuple(_task_runtime_extensions.items())):
+    for name, provider in reversed(_registered_extension_items()):
         try:
             await _maybe_await(provider.on_task_deleted(context))
         except Exception as exc:
@@ -201,12 +230,9 @@ async def delete_task_extensions(context: TaskRuntimeContext) -> None:
 async def _cleanup_after_create_failure(
     context: TaskRuntimeContext,
     *,
-    names: tuple[str, ...],
+    providers: tuple[tuple[str, TaskRuntimeExtensionProvider], ...],
 ) -> None:
-    for name in reversed(names):
-        provider = _task_runtime_extensions.get(name)
-        if provider is None:
-            continue
+    for name, provider in reversed(providers):
         try:
             await _maybe_await(provider.on_task_deleted(context))
         except Exception:
@@ -239,6 +265,23 @@ def _normalize_extension_name(name: str) -> str:
 
 def _ensure_json_compatible(value: Any, *, label: str) -> None:
     try:
-        json.dumps(value)
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise TypeError(f"{label} must be JSON-compatible") from exc
+    if len(encoded) > MAX_TASK_RUNTIME_JSON_BYTES:
+        raise ValueError(
+            f"{label} exceeds the {MAX_TASK_RUNTIME_JSON_BYTES}-byte limit"
+        )
+
+
+def _registered_extension_items() -> tuple[
+    tuple[str, TaskRuntimeExtensionProvider], ...
+]:
+    """Snapshot the registry so no dispatch iterates a live dict across await."""
+
+    with _task_runtime_extensions_lock:
+        return tuple(_task_runtime_extensions.items())

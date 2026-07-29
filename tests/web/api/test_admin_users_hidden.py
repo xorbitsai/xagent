@@ -107,3 +107,48 @@ async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
     finally:
         unregister_task_extension("delete_observer")
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_delete_skips_task_runtime_scan_without_providers(
+    monkeypatch,
+):
+    import xagent.web.api.admin_users as admin_users_module
+
+    _admin_headers()
+    _register_second_user("no-runtime-user", "runtimepass1")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "no-runtime-user").one()
+        db.add(
+            Task(
+                user_id=int(target.id),
+                title="ordinary task",
+                description="ordinary task",
+            )
+        )
+        db.commit()
+        target_id = int(target.id)
+
+        monkeypatch.setattr(
+            admin_users_module,
+            "registered_task_extensions",
+            lambda: (),
+        )
+
+        async def unexpected_cleanup(context):
+            raise AssertionError("runtime cleanup must be skipped")
+
+        monkeypatch.setattr(
+            admin_users_module,
+            "delete_task_extensions",
+            unexpected_cleanup,
+        )
+
+        response = await delete_user(target_id, admin, db)
+
+        assert response == {"message": "User deleted successfully"}
+        assert db.query(User).filter(User.id == target_id).count() == 0
+    finally:
+        db.close()

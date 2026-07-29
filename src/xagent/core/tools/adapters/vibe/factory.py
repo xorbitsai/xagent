@@ -8,7 +8,7 @@ and configuration management.
 # mypy: ignore-errors
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -309,12 +309,20 @@ class ToolFactory:
                         else None
                     )
                     resolved_additional_tools = getattr(contribution, "tools", ())
+                    additional_tool_origins = dict(
+                        getattr(contribution, "tool_origins", ())
+                    )
+                else:
+                    additional_tool_origins = {}
                 resolved_additional_tools = tuple(resolved_additional_tools or ())
                 prepared_kwargs: dict[str, Any] = {
                     "apply_user_override_filter": apply_user_override_filter
                 }
                 if resolved_additional_tools:
                     prepared_kwargs["additional_tools"] = resolved_additional_tools
+                    prepared_kwargs["additional_tool_origins"] = (
+                        additional_tool_origins
+                    )
                 return await ToolFactory._create_all_tools_prepared(
                     config,
                     **prepared_kwargs,
@@ -347,6 +355,7 @@ class ToolFactory:
         config: BaseToolConfig,
         apply_user_override_filter: bool = True,
         additional_tools: Iterable[Tool] = (),
+        additional_tool_origins: Mapping[str, str] | None = None,
     ) -> list[Tool]:
         """
         Create all tools based on configuration.
@@ -367,9 +376,9 @@ class ToolFactory:
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
         extension_tools = list(additional_tools)
+        extension_names: set[str] = set()
         if extension_tools:
             existing_names = {tool.name for tool in tools}
-            extension_names: set[str] = set()
             for tool in extension_tools:
                 name = getattr(tool, "name", None)
                 if not isinstance(name, str) or not name.strip():
@@ -473,6 +482,21 @@ class ToolFactory:
                 allowed_by_hook = set(allowlist)
                 tools = [tool for tool in tools if tool.name in allowed_by_hook]
 
+        dropped_extension_names = extension_names - {tool.name for tool in tools}
+        if dropped_extension_names:
+            origins = additional_tool_origins or {}
+            dropped_by_provider: dict[str, list[str]] = {}
+            for name in sorted(dropped_extension_names):
+                provider = origins.get(name, "unknown")
+                dropped_by_provider.setdefault(provider, []).append(name)
+            logger.warning(
+                "Task runtime extension tools were filtered by task tool policy: %s",
+                "; ".join(
+                    f"{provider}=[{', '.join(names)}]"
+                    for provider, names in sorted(dropped_by_provider.items())
+                ),
+            )
+
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:
@@ -574,10 +598,10 @@ class ToolFactory:
 
     # New unified tool creation methods
     @staticmethod
-    def _create_workspace(
+    def create_workspace(
         workspace_config: dict[str, Any] | None,
     ) -> TaskWorkspace | None:
-        """Create workspace from configuration.
+        """Create a workspace from a tool configuration.
 
         Uses MockWorkspace for tool listing scenarios to avoid creating
         unnecessary directories on disk.
@@ -621,6 +645,14 @@ class ToolFactory:
         except Exception as e:
             logger.warning(f"Failed to create workspace: {e}")
             return None
+
+    @staticmethod
+    def _create_workspace(
+        workspace_config: dict[str, Any] | None,
+    ) -> TaskWorkspace | None:
+        """Backward-compatible internal alias for existing tool creators."""
+
+        return ToolFactory.create_workspace(workspace_config)
 
     @staticmethod
     def _create_unavailable_mcp_tool(

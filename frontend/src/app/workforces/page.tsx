@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import React, { useCallback, useEffect, useState } from "react"
-import { ChevronLeft, ChevronRight, Play, Plus, Users, Zap, GitBranch, ShieldCheck, Pencil } from "lucide-react"
+import { ChevronLeft, ChevronRight, Play, Plus, Users, Zap, GitBranch, ShieldCheck, Pencil, Rocket } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { SearchInput } from "@/components/ui/search-input"
@@ -16,7 +16,16 @@ import { getRunDisabledReason } from "./workforce-ui-state"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { toast } from "sonner"
 import { WorkforceCreateView } from "@/components/workforce/workforce-create-view"
-import { WorkforceStatusBadge } from "@/components/workforce"
+import {
+  WorkforceStatusBadge,
+  WorkforceDeployDialog,
+  DeployWorkforceDialog,
+  WorkforceShareDialog,
+  WorkforceWidgetDialog,
+} from "@/components/workforce"
+import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
+
+type DeployView = "options" | "embed" | "api" | "share"
 
 export default function WorkforcesPage() {
   const { t } = useI18n()
@@ -31,6 +40,15 @@ export default function WorkforcesPage() {
   const pageSize = 10
   const [view, setView] = useState<"list" | "create">("list")
   const hasActiveSearch = search.trim().length > 0
+
+  const [deployItem, setDeployItem] = useState<WorkforceListItem | null>(null)
+  const [deployView, setDeployView] = useState<DeployView | null>(null)
+  const [triggersItem, setTriggersItem] = useState<WorkforceListItem | null>(null)
+
+  const closeDeploy = () => {
+    setDeployItem(null)
+    setDeployView(null)
+  }
 
   const load = useCallback(async (nextPage: number, nextSearch: string) => {
     try {
@@ -60,7 +78,7 @@ export default function WorkforcesPage() {
         <WorkforceCreateView
           onBack={() => setView("list")}
           onCreated={(workforce) => {
-            router.push(`/workforces/${workforce.id}`)
+            router.push(`/workforces/${workforce.id}?view=canvas`)
           }}
         />
       </div>
@@ -209,6 +227,18 @@ export default function WorkforcesPage() {
                                 </Link>
                               </Button>
                             )}
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-8 w-8 rounded-md p-0"
+                              title={t("workforces.actions.deploy")}
+                              onClick={() => {
+                                setDeployItem(item)
+                                setDeployView("options")
+                              }}
+                            >
+                              <Rocket className="h-3.5 w-3.5" />
+                            </Button>
                             <Button size="sm" variant="outline" className="h-8 rounded-md px-3" asChild>
                               <Link href={`/workforces/${item.id}`}>
                                 <Pencil className="mr-1.5 h-3.5 w-3.5" />
@@ -262,6 +292,43 @@ export default function WorkforcesPage() {
         ) : null}
       </div>
 
+      <WorkforceDeployDialog
+        open={!!deployItem && deployView === "options"}
+        onClose={closeDeploy}
+        workforceName={deployItem?.name ?? ""}
+        onSelectEmbed={() => setDeployView("embed")}
+        onSelectApi={() => setDeployView("api")}
+        onSelectShare={() => setDeployView("share")}
+        onSelectWebhook={() => {
+          setTriggersItem(deployItem)
+          closeDeploy()
+        }}
+      />
+      {deployItem && (
+        <DeployWorkforceDialog
+          open={deployView === "api"}
+          workforceId={deployItem.id}
+          workforceName={deployItem.name}
+          onClose={() => setDeployView(null)}
+        />
+      )}
+      <WorkforceWidgetDialog
+        workforce={deployView === "embed" ? deployItem : null}
+        open={deployView === "embed"}
+        onClose={() => setDeployView(null)}
+      />
+      <WorkforceShareDialog
+        workforce={deployView === "share" ? deployItem : null}
+        open={deployView === "share"}
+        onClose={() => setDeployView(null)}
+      />
+      <AgentTriggersDialog
+        agentId={null}
+        owner={triggersItem ? { kind: "workforce", id: triggersItem.id } : null}
+        agentName={triggersItem?.name}
+        open={!!triggersItem}
+        onOpenChange={(open) => { if (!open) setTriggersItem(null) }}
+      />
     </div>
   )
 }

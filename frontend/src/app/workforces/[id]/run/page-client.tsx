@@ -15,9 +15,8 @@ import {
   type Edge,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
-import { AlertCircle, ArrowLeft, Bot, Crown, FileText, GitBranch, History, Loader2, MessageSquare, Pencil, Users, X } from "lucide-react"
+import { AlertCircle, ArrowLeft, Bot, Crown, FileText, GitBranch, History, Loader2, MessageSquare, Pencil, Plus, Users, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
@@ -446,12 +445,29 @@ function WorkforceRunPageInner() {
   const agentExecutionRequestIdRef = useRef(0)
   const taskStatus = state.currentTask?.status ?? null
 
+  const resetRunState = useCallback(() => {
+    openedRunParamRef.current = null
+    previewTaskIdRef.current = null
+    activeWorkerTaskIdRef.current = null
+    agentExecutionRequestIdRef.current += 1
+    setSelectedTaskId(null)
+    setTaskStarted(false)
+    setInspectorMode(null)
+    closeFilePreview()
+    dispatch({ type: "CLEAR_MESSAGES" })
+    dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
+    dispatch({ type: "SET_STEPS", payload: [] })
+    dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+    dispatch({ type: "SET_CURRENT_TASK", payload: null })
+    dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+    setTaskId(null, { navigate: false })
+  }, [closeFilePreview, dispatch, setTaskId])
+
   const openRun = useCallback((run: WorkforceRunHistoryItem) => {
     if (!run.task_id) {
       toast.error(t("workforces.runs.taskDeleted"))
       return
     }
-    setHistoryOpen(false)
     if (previewTaskIdRef.current === run.task_id) return
     // Keep ?run= authoritative no matter which path opened the run, and mark
     // it as opened so the deep-link effect doesn't refetch it.
@@ -580,21 +596,7 @@ function WorkforceRunPageInner() {
     if (!id) return
     if (!runParam) {
       if (openedRunParamRef.current !== null) {
-        openedRunParamRef.current = null
-        previewTaskIdRef.current = null
-        activeWorkerTaskIdRef.current = null
-        agentExecutionRequestIdRef.current += 1
-        setSelectedTaskId(null)
-        setTaskStarted(false)
-        setInspectorMode(null)
-        closeFilePreview()
-        dispatch({ type: "CLEAR_MESSAGES" })
-        dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-        dispatch({ type: "SET_STEPS", payload: [] })
-        dispatch({ type: "SET_DAG_EXECUTION", payload: null })
-        dispatch({ type: "SET_CURRENT_TASK", payload: null })
-        dispatch({ type: "SET_HISTORY_LOADING", payload: false })
-        setTaskId(null, { navigate: false })
+        resetRunState()
       }
       return
     }
@@ -623,7 +625,7 @@ function WorkforceRunPageInner() {
         openedRunParamRef.current = null
       }
     }
-  }, [closeFilePreview, dispatch, id, openRun, runParam, setTaskId, t])
+  }, [id, openRun, resetRunState, runParam, t])
 
   const cleanupRef = useRef({ closeFilePreview, dispatch, setTaskId })
   cleanupRef.current = { closeFilePreview, dispatch, setTaskId }
@@ -687,6 +689,13 @@ function WorkforceRunPageInner() {
     }
   }, [id, closeFilePreview, setTaskId, dispatch, sendMessage, t])
 
+  const handleNewRun = useCallback(() => {
+    resetRunState()
+    if (runParam) {
+      router.push(`/workforces/${id}/run`)
+    }
+  }, [resetRunState, runParam, router, id])
+
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -719,19 +728,15 @@ function WorkforceRunPageInner() {
 
         <div className="flex-1" />
 
-        <Popover open={historyOpen} onOpenChange={setHistoryOpen}>
-          <PopoverTrigger asChild>
-            <Button variant="outline" size="sm" className="gap-1.5">
-              <History className="h-3.5 w-3.5" />
-              {t("workforces.runs.title")}
-            </Button>
-          </PopoverTrigger>
-          <PopoverContent align="end" className="max-h-[70vh] w-96 overflow-y-auto p-3">
-            {historyOpen && id ? (
-              <WorkforceRunsList workforceId={id} compact onSelectRun={openRun} />
-            ) : null}
-          </PopoverContent>
-        </Popover>
+        <Button
+          variant={historyOpen ? "secondary" : "outline"}
+          size="sm"
+          className="gap-1.5"
+          onClick={() => setHistoryOpen((open) => !open)}
+        >
+          <History className="h-3.5 w-3.5" />
+          {t("workforces.runs.title")}
+        </Button>
         <Button
           variant={inspectorMode === "flow" ? "secondary" : "outline"}
           size="sm"
@@ -758,8 +763,24 @@ function WorkforceRunPageInner() {
 
       {/* Body */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
+        {historyOpen && id ? (
+          <WorkforceRunHistoryPanel
+            workforceId={id}
+            onSelectRun={openRun}
+            onNewRun={handleNewRun}
+            onClose={() => setHistoryOpen(false)}
+            t={t}
+          />
+        ) : null}
         <div className="flex min-w-0 flex-1">
           <ResizableSplitLayout
+            // Remount (instead of relying on ResizableSplitLayout's own
+            // initialLeftWidth reactivity) when crossing the file/non-file
+            // boundary so the split snaps to the file-preview preset even if
+            // the user had manually dragged it in flow/agent mode -- switching
+            // between flow and agent alone keeps the same key and preserves
+            // any manual resize, matching ResizableSplitLayout's contract.
+            key={inspectorMode === "file" ? "file" : "graph"}
             initialLeftWidth={inspectorMode === "file" ? 50 : 65}
             minLeftWidth={35}
             maxLeftWidth={80}
@@ -801,6 +822,45 @@ function WorkforceRunPageInner() {
 }
 
 // ─── Run history ──────────────────────────────────────────────────────────────
+
+function WorkforceRunHistoryPanel({
+  workforceId,
+  onSelectRun,
+  onNewRun,
+  onClose,
+  t,
+}: {
+  workforceId: string
+  onSelectRun: (run: WorkforceRunHistoryItem) => void
+  onNewRun: () => void
+  onClose: () => void
+  t: Translate
+}) {
+  return (
+    <div className="flex h-full w-72 shrink-0 flex-col border-r bg-card/30">
+      <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b px-4">
+        <span className="text-sm font-semibold">{t("workforces.run.historyTitle")}</span>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label={t("workforces.run.closeHistory")}
+          className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="shrink-0 px-3 pt-3">
+        <Button variant="outline" size="sm" className="w-full gap-1.5" onClick={onNewRun}>
+          <Plus className="h-3.5 w-3.5" />
+          {t("workforces.run.newRun")}
+        </Button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <WorkforceRunsList workforceId={workforceId} onSelectRun={onSelectRun} />
+      </div>
+    </div>
+  )
+}
 
 const WORKFORCE_STATUS_TRANSLATION_KEYS: Record<string, Parameters<Translate>[0]> = {
   completed: "workforces.status.completed",

@@ -16,6 +16,20 @@ class ResizeObserverMock {
 
 globalThis.ResizeObserver = ResizeObserverMock
 
+// jsdom does not implement DOMMatrixReadOnly; @xyflow/react reads the scale
+// off it when recomputing node internals (e.g. after a node's type changes).
+class DOMMatrixReadOnlyMock {
+  m22: number
+
+  constructor(transform: string) {
+    const scale = transform?.match(/scale\(([0-9.]+)\)/)?.[1]
+    this.m22 = scale !== undefined ? Number(scale) : 1
+  }
+}
+
+// @ts-expect-error partial DOMMatrixReadOnly polyfill, sufficient for @xyflow/react in tests
+globalThis.DOMMatrixReadOnly = DOMMatrixReadOnlyMock
+
 class LocalStorageMock implements Storage {
   private store = new Map<string, string>()
 

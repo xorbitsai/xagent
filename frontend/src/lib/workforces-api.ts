@@ -15,6 +15,7 @@ import type {
   WorkforceCreatePayload,
   WorkforceDetail,
   WorkforceListResponse,
+  WorkforcePreviewRunPayload,
   WorkforcePromptCreatePayload,
   WorkforceRunHistoryItem,
   WorkforceRunHistoryResponse,
@@ -285,6 +286,20 @@ export async function runWorkforce(
   })
   if (!response.ok) {
     throw await parseApiError(response, "Failed to run workforce")
+  }
+  return response.json()
+}
+
+export async function runWorkforcePreview(
+  payload: WorkforcePreviewRunPayload,
+): Promise<WorkforceRunResponse> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/preview/runs`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to run workforce preview")
   }
   return response.json()
 }

@@ -18,10 +18,10 @@ import {
   rotateWorkforceWidgetKey,
   updateWorkforceWidgetConfig,
 } from "@/lib/workforces-api"
-import type { WorkforceDetail, WorkforceWidgetConfig } from "@/types/workforce"
+import type { WorkforceSummary, WorkforceWidgetConfig } from "@/types/workforce"
 
 interface WorkforceWidgetDialogProps {
-  workforce: WorkforceDetail | null
+  workforce: WorkforceSummary | null
   open: boolean
   onClose: () => void
 }

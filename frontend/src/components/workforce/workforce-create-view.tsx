@@ -1,14 +1,14 @@
 "use client"
 
 import React, { useState } from "react"
+import { useRouter } from "next/navigation"
 import { ArrowLeft, Sparkles, SlidersHorizontal } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { WorkforcePromptCreator } from "./workforce-prompt-creator"
-import { WorkforceWizard } from "./workforce-wizard"
 import { useI18n } from "@/contexts/i18n-context"
 import type { WorkforceDetail } from "@/types/workforce"
 
-type CreateMode = "select" | "ai" | "manual"
+type CreateMode = "select" | "ai"
 
 interface WorkforceCreateViewProps {
   onBack: () => void
@@ -17,6 +17,7 @@ interface WorkforceCreateViewProps {
 
 export function WorkforceCreateView({ onBack, onCreated }: WorkforceCreateViewProps) {
   const { t } = useI18n()
+  const router = useRouter()
   const [mode, setMode] = useState<CreateMode>("select")
 
   return (
@@ -61,7 +62,7 @@ export function WorkforceCreateView({ onBack, onCreated }: WorkforceCreateViewPr
             </button>
 
             <button
-              onClick={() => setMode("manual")}
+              onClick={() => router.push("/workforces/new")}
               className="flex flex-col gap-4 rounded-xl border-2 border-border bg-card p-6 text-left transition-colors hover:border-muted-foreground/30 hover:bg-muted/20"
             >
               <div className="flex items-center justify-between">
@@ -102,11 +103,6 @@ export function WorkforceCreateView({ onBack, onCreated }: WorkforceCreateViewPr
           </div>
           <WorkforcePromptCreator onCreated={onCreated} onCancel={() => setMode("select")} />
         </>
-      )}
-
-      {/* Mode: manual wizard — wizard has its own Back button that calls onBack */}
-      {mode === "manual" && (
-        <WorkforceWizard onCreated={onCreated} onBack={() => setMode("select")} />
       )}
     </div>
   )

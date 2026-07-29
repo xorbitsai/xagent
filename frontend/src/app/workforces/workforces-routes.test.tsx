@@ -571,38 +571,6 @@ describe("workforce route entry points", () => {
     expect(screen.getByRole("button", { name: /workforces.actions.run/ })).toBeDisabled()
   })
 
-  it("uses the shared Runs list on the workforce detail page", async () => {
-    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
-    listWorkforceRunsMock.mockResolvedValueOnce({
-      items: [
-        {
-          id: 9,
-          task_id: 99,
-          status: "completed",
-          is_preview: false,
-          task_title: "Launch Workforce: draft plan",
-          message: "draft plan",
-          created_at: "2026-07-19T10:00:00Z",
-          completed_at: "2026-07-19T10:03:00Z",
-        },
-      ],
-      total: 1,
-      page: 1,
-      size: 20,
-      pages: 1,
-    })
-
-    render(<WorkforceDetailPage />)
-
-    fireEvent.click(
-      await screen.findByRole("button", { name: /workforces.runs.title/ }),
-    )
-    fireEvent.click(await screen.findByText("Launch Workforce: draft plan"))
-
-    expect(listWorkforceRunsMock).toHaveBeenCalledWith("42", { page: 1, size: 20 })
-    expect(routerPushMock).toHaveBeenCalledWith("/workforces/42/run?run=9")
-  })
-
   it("runs an active workforce and opens the created task", async () => {
     getWorkforceMock.mockResolvedValueOnce(workforceDetail)
     runWorkforceMock.mockResolvedValueOnce({
@@ -648,6 +616,36 @@ describe("workforce route entry points", () => {
       "data-show-task-files",
       "true",
     )
+  })
+
+  it("resets to the empty composer when New run is clicked without a run query param", async () => {
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
+    runWorkforceMock.mockResolvedValueOnce({
+      workforce_run_id: 5,
+      task_id: 99,
+      status: "running",
+      redirect_url: "/task/99",
+    })
+
+    const { container } = render(<WorkforceRunPage />)
+
+    const textarea = await screen.findByPlaceholderText("workforces.run.placeholder")
+    fireEvent.change(textarea, { target: { value: "Draft launch plan" } })
+
+    await waitFor(() => {
+      const submitBtn = container.querySelector("textarea + button:not([disabled])")
+      expect(submitBtn).not.toBeNull()
+    })
+    fireEvent.click(container.querySelector("textarea + button:not([disabled])")!)
+
+    expect(await screen.findByTestId("task-conversation-panel")).toBeInTheDocument()
+
+    fireEvent.click(await screen.findByRole("button", { name: "workforces.runs.title" }))
+    fireEvent.click(await screen.findByRole("button", { name: "workforces.run.newRun" }))
+
+    expect(routerPushMock).not.toHaveBeenCalled()
+    expect(screen.queryByTestId("task-conversation-panel")).not.toBeInTheDocument()
+    expect(await screen.findByText("workforces.run.readyTitle")).toBeInTheDocument()
   })
 
   it("opens a historical run from the shared Runs popover", async () => {
@@ -861,38 +859,6 @@ describe("workforce route entry points", () => {
         message: "test message",
       })
     })
-  })
-
-  it("shows run history in the detail page runs tab and opens a run", async () => {
-    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
-    listWorkforceRunsMock.mockResolvedValue({
-      items: [
-        {
-          id: 9,
-          task_id: 99,
-          status: "completed",
-          is_preview: false,
-          task_title: "Launch Workforce: draft plan",
-          message: "draft plan",
-          created_at: "2026-07-19T10:00:00Z",
-          completed_at: "2026-07-19T10:03:00Z",
-        },
-      ],
-      total: 1,
-      page: 1,
-      size: 20,
-      pages: 1,
-    })
-
-    render(<WorkforceDetailPage />)
-
-    fireEvent.click(await screen.findByRole("button", { name: /workforces.runs.title/ }))
-
-    const runRow = await screen.findByText("Launch Workforce: draft plan")
-    expect(listWorkforceRunsMock).toHaveBeenCalledWith("42", { page: 1, size: 20 })
-
-    fireEvent.click(runRow)
-    expect(routerPushMock).toHaveBeenCalledWith("/workforces/42/run?run=9")
   })
 
   it("opens a past run on the run page via the run query param", async () => {

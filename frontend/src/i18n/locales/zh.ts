@@ -3962,6 +3962,31 @@ const zh = {
         copied: "已复制到剪贴板",
       },
     },
+    deployHub: {
+      title: "部署 Workforce",
+      options: {
+        embed: {
+          title: "嵌入组件",
+          desc: "通过一段脚本代码，把聊天组件添加到任意网站",
+          action: "获取代码",
+        },
+        api: {
+          title: "REST API",
+          desc: "从你的后端或应用程序中以编程方式调用该 Workforce",
+          action: "查看接口",
+        },
+        share: {
+          title: "分享链接",
+          desc: "生成一个公开链接，任何人都可以打开并与该 Workforce 对话",
+          action: "生成链接",
+        },
+        webhook: {
+          title: "Webhook",
+          desc: "通过外部系统的 Webhook 事件触发 Workforce 运行",
+          action: "配置",
+        },
+      },
+    },
     fields: {
       name: "名称",
       description: "描述",
@@ -4021,7 +4046,19 @@ const zh = {
       page: "第 {page} 页，共 {pages} 页",
       next: "下一页"
     },
+    getStarted: {
+      title: "快速上手",
+      steps: {
+        name: "填写 Workforce 名称",
+        lead: "选择 Workforce Lead",
+        agents: "为团队添加 agent",
+        delegation: "为每个 agent 设置委派规则",
+        test: "发送一条测试消息",
+        publish: "发布你的 Workforce",
+      },
+    },
     create: {
+      unsavedBadge: "未保存",
       backToWorkforces: "返回 Workforces",
       backToCreate: "返回创建",
       title: "创建 Workforce",
@@ -4149,12 +4186,11 @@ const zh = {
       readyTitle: "随时准备就绪",
       readyDesc: "发送消息，{manager} 将协调团队完成你的请求。",
       inactiveDisabled: "请先发布这个 Workforce 再运行。",
-      archivedDisabled: "已归档的 Workforce 不能运行。"
+      archivedDisabled: "已归档的 Workforce 不能运行。",
+      createToTest: "先选择 Manager 并添加至少一个 Worker 才能测试。"
     },
     runs: {
       title: "运行记录",
-      historyTitle: "历史运行",
-      historyHint: "这个 Workforce 的历史运行记录。点击某次运行可重新打开对应会话。",
       loading: "正在加载运行记录...",
       loadError: "加载运行记录失败",
       retry: "重试",
@@ -4178,6 +4214,7 @@ const zh = {
     },
     canvas: {
       title: "Workforce 流程",
+      configure: "配置",
       backToDetails: "返回详情",
       connections: "连接",
       noConnections: "暂未配置连接。",
@@ -4190,6 +4227,14 @@ const zh = {
         reportsTo: "汇报给",
         activeDelegation: "活跃委派",
         completed: "已完成",
+      },
+      chooseLead: {
+        title: "选择 Workforce Lead",
+        hint: "Lead 会接收你的请求，并把任务委派给下方的 agent。",
+      },
+      addFirstAgent: {
+        title: "添加第一个 agent",
+        hint: "Lead 可以委派任务的子 agent",
       },
     },
     detail: {

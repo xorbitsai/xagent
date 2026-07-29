@@ -66,6 +66,13 @@ export interface WorkforceRunHistoryResponse {
   pages: number
 }
 
+/** Minimal shape needed by dialogs (Deploy/Share/Embed) that only read id/name/status. */
+export interface WorkforceSummary {
+  id: number
+  name: string
+  status: WorkforceStatus
+}
+
 export interface WorkforceListItem {
   id: number
   name: string
@@ -199,6 +206,20 @@ export interface WorkforceRunResponse {
   task_id: number
   status: string
   redirect_url: string
+}
+
+export interface WorkforcePreviewRunPayload {
+  name?: string | null
+  description?: string | null
+  manager_agent_id: number
+  workers: Array<{
+    agent_id: number
+    alias?: string | null
+    assignment_instructions: string
+  }>
+  message: string
+  files?: string[]
+  execution_mode?: string | null
 }
 
 export interface WorkforceShareLink {

@@ -36,8 +36,9 @@ const FIELD_LABEL_CLASS = "text-xs font-semibold text-muted-foreground"
 const WEEKDAY_KEYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] as const
 export const RECURRENCE_TYPES: ScheduleRecurrence[] = ["hourly", "daily", "weekly", "monthly", "custom"]
 
-function ordinalDay(day: number, locale: string): string {
-  if (locale.startsWith("zh")) return `${day}日`
+function ordinalDay(day: number, locale?: string): string {
+  const loc = locale || "en"
+  if (loc.startsWith("zh")) return `${day}日`
   const remainder100 = day % 100
   if (remainder100 >= 11 && remainder100 <= 13) return `${day}th`
   switch (day % 10) {

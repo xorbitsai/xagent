@@ -257,13 +257,14 @@ def _normalize_trigger_name(name: str | None, *, default: str | None = None) -> 
 
 
 def _parse_time_of_day(value: Any) -> time:
-    """Parse a "HH:MM" string into a time, defaulting to midnight."""
+    """Parse a "HH:MM" (or "HH:MM:SS") string into a time, defaulting to
+    midnight."""
     if not value:
         return time(0, 0)
     try:
-        hour_str, minute_str = str(value).split(":", 1)
-        return time(int(hour_str), int(minute_str))
-    except (TypeError, ValueError) as exc:
+        parts = str(value).split(":")
+        return time(int(parts[0]), int(parts[1]))
+    except (TypeError, ValueError, IndexError) as exc:
         raise TriggerServiceError("Invalid time_of_day") from exc
 
 

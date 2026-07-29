@@ -107,8 +107,15 @@ class BaseTriggerConfig(BaseModel):
 # layer (triggers.py) when recomputing schedules from stored configs — the
 # same rules, one implementation, two error-wrapping styles.
 
+
 def normalize_weekdays(value: Any) -> set[int]:
     """Validate and coerce a weekdays list (0=Mon..6=Sun) to a set."""
+    if isinstance(value, (str, int, bool)):
+        # A bare scalar (e.g. weekdays=3) means a single day, not a sequence
+        # to iterate — coerce it to a one-element list first so it isn't
+        # split character-by-character (str) or rejected as non-iterable
+        # (int/bool).
+        value = [str(value)]
     try:
         weekday_set = {int(day) for day in (value or [])}
     except (TypeError, ValueError) as exc:
@@ -116,9 +123,7 @@ def normalize_weekdays(value: Any) -> set[int]:
             "weekdays must be a non-empty list of integers 0-6 (Mon-Sun)"
         ) from exc
     if not weekday_set or not weekday_set.issubset(range(7)):
-        raise ValueError(
-            "weekdays must be a non-empty list of integers 0-6 (Mon-Sun)"
-        )
+        raise ValueError("weekdays must be a non-empty list of integers 0-6 (Mon-Sun)")
     return weekday_set
 
 

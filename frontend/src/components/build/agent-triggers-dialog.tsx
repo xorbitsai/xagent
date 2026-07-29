@@ -1333,7 +1333,7 @@ export function AgentTriggersDialog({
       </div>
       <Switch
         checked={trigger.enabled}
-        disabled={busy || !canOperate}
+        disabled={busy || busyTypes.has(trigger.type) || !canOperate}
         onCheckedChange={(checked) => void handleItemToggle(trigger, checked)}
       />
       <button

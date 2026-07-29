@@ -13,6 +13,17 @@ from sqlalchemy.orm import Session
 from .builtin_mcp_registry import get_builtin_execution_fields
 from .models.public_mcp import PublicMCPApp
 
+# Apps that must not be satisfied by a bare provider-level OAuth grant (one
+# created via the app_id-less connect flow, e.g. UserOAuth.provider == "meta").
+# That flow requests only the provider's default scopes (see
+# generic_oauth_login's app_scopes=None branch when app_id is absent), never
+# an app's own oauth_scopes, so it can't carry a permission such as
+# pages_read_user_content that was added after the bare flow already existed.
+# Only an app-scoped grant (UserOAuth.provider == the app_id) counts for these
+# apps; Instagram is deliberately excluded so its existing bare "meta" grants
+# keep working, since its required scopes haven't changed.
+APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook"})
+
 
 def classify_app_auth(transport: Any, launch_config: Any) -> str:
     """Single source of truth for how a catalog app is connected.

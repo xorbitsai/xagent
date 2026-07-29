@@ -2853,12 +2853,21 @@ class WebToolConfig(BaseToolConfig):
         app_id: object,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one legacy OAuth account in an isolated transaction."""
+        from ...web.mcp_apps import APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
         from ...web.models.user_oauth import UserOAuth
 
         oauth_db = self._new_legacy_oauth_session()
         try:
             if app_id:
-                providers_to_check = [provider_name, app_id]
+                if app_id in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
+                    # A bare provider-level grant (e.g. UserOAuth.provider ==
+                    # "meta") never requested this app's own oauth_scopes, so
+                    # it can't be trusted to carry a permission added after
+                    # that flow already existed. Only an app-scoped grant
+                    # counts here; see APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
+                    providers_to_check = [app_id]
+                else:
+                    providers_to_check = [provider_name, app_id]
                 oauth_account = (
                     oauth_db.query(UserOAuth)
                     .filter(

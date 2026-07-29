@@ -33,7 +33,11 @@ from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
-from ..mcp_apps import get_all_mcp_apps, get_app_by_name
+from ..mcp_apps import (
+    APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT,
+    get_all_mcp_apps,
+    get_app_by_name,
+)
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
@@ -1586,7 +1590,11 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:
-    return _app_lookup_keys(app.get("id"), app.get("provider"))
+    app_id = _normalize_app_key(app.get("id"))
+    keys = _app_lookup_keys(app.get("id"), app.get("provider"))
+    if app_id in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
+        keys = [key for key in keys if key == app_id]
+    return keys
 
 
 def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:

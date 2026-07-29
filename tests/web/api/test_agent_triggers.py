@@ -44,6 +44,7 @@ from xagent.web.services.task_orchestrator import (
 )
 from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
+    _coerce_utc,
     _compute_next_run_at,
     _start_prepared_trigger_run_id,
     dispatch_pending_trigger_runs,
@@ -1432,10 +1433,12 @@ def test_scheduled_weekly_skips_missed_occurrences_after_downtime() -> None:
     assert next_run_at == datetime(2026, 2, 2, 9, 0, tzinfo=timezone.utc)
 
 
-def test_scheduled_past_explicit_anchor_rolls_forward_on_cadence() -> None:
-    # A "today at 09:00" anchor saved in the afternoon must not fire
-    # immediately; it keeps the 09:00 cadence and lands on the next step
-    # after now. Re-saving the same config later stays in the future too.
+def test_scheduled_explicit_anchor_is_honored_verbatim_past_or_future() -> None:
+    # An explicit next_run_at is authoritative either way: a future anchor
+    # is a genuine start time, and a past one means the trigger is already
+    # due — the same semantics as enabling a cron job whose scheduled time
+    # already passed. scan_due_scheduled_triggers (not this function) is
+    # what decides whether "due" means "fire now".
     now = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc)
     config = {
         "recurrence": "daily",
@@ -1443,10 +1446,9 @@ def test_scheduled_past_explicit_anchor_rolls_forward_on_cadence() -> None:
         "time_of_day": "09:00",
         "next_run_at": "2026-01-01T09:00:00+00:00",
     }
-    next_run_at = _compute_next_run_at(config, from_time=now)
-    assert next_run_at == datetime(2026, 1, 2, 9, 0, tzinfo=timezone.utc)
+    past = _compute_next_run_at(config, from_time=now)
+    assert past == datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
 
-    # A future anchor is honored verbatim.
     future = _compute_next_run_at(
         {**config, "next_run_at": "2026-01-03T09:00:00+00:00"}, from_time=now
     )
@@ -1597,6 +1599,63 @@ def test_scheduled_scan_fires_due_trigger_and_advances_next_run(
         db.close()
 
     assert mock_bg_scheduler.call_count == 1
+
+
+def test_scheduled_unrelated_update_does_not_reset_advanced_next_run(
+    mock_bg_scheduler,
+) -> None:
+    # Regression: PATCHing a field that has nothing to do with the schedule
+    # (name/prompt/secret) must not re-derive next_run_at from the trigger's
+    # stored config. The config's own "next_run_at" string is never advanced
+    # by a scan (only the next_run_at column is) — recomputing from it on
+    # every unrelated edit would re-arm an already-progressed schedule back
+    # to its original, long-stale anchor.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Every minute",
+            "config": {
+                "interval_seconds": 60,
+                "next_run_at": "2020-01-01T00:00:00+00:00",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        # The explicit past anchor is honored verbatim at create time.
+        assert _coerce_utc(trigger.next_run_at) == datetime(
+            2020, 1, 1, tzinfo=timezone.utc
+        )
+
+        runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+        assert len(runs) == 1
+        db.refresh(trigger)
+        advanced_next_run_at = _coerce_utc(trigger.next_run_at)
+        assert advanced_next_run_at is not None
+        assert advanced_next_run_at > datetime(2020, 1, 1, tzinfo=timezone.utc)
+    finally:
+        db.close()
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={"name": "Every minute (renamed)"},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["name"] == "Every minute (renamed)"
+    # The stored config's stale anchor is untouched, but the schedule's
+    # advanced next_run_at must survive the unrelated rename.
+    assert _coerce_utc(datetime.fromisoformat(patched.json()["next_run_at"])) == (
+        advanced_next_run_at
+    )
 
 
 def test_trigger_dispatcher_loop_scans_due_scheduled_trigger(mock_bg_scheduler) -> None:

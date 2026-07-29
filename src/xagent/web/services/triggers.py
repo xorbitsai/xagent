@@ -383,13 +383,15 @@ def _compute_next_run_at(
             except ValueError as exc:
                 raise TriggerServiceError("Invalid next_run_at") from exc
             if explicit is not None:
-                if explicit > now or config.get("interval_seconds") is None:
-                    return explicit
-                # A stale anchor (e.g. "today at 09:00" saved in the
-                # afternoon, or any later re-save of the same config) keeps
-                # the anchor's cadence but rolls forward past `now` via the
-                # interval math below, instead of firing immediately.
-                base = explicit
+                # Honored verbatim, whether in the future (a genuine start
+                # anchor) or the past (the trigger is already due and the
+                # next scan should catch it up once — the same semantics as
+                # enabling a cron job whose scheduled time already passed).
+                # Callers that must not re-arm an already-advanced schedule
+                # from a stale stored anchor (e.g. re-saving unrelated
+                # fields) should simply not recompute at all rather than
+                # pass include_explicit=True here.
+                return explicit
 
     interval = config.get("interval_seconds")
     if interval is None:
@@ -824,14 +826,29 @@ def _apply_trigger_updates(
         setattr(trigger, "secret_encrypted", encrypt_value(plain_secret))
 
     if trigger.type == TriggerType.SCHEDULED.value:
-        if trigger.enabled:
+        if not trigger.enabled:
+            setattr(trigger, "next_run_at", None)
+        elif "config" in updates and updates["config"] is not None:
+            # The schedule itself was intentionally resubmitted — recompute
+            # from the new config.
             setattr(
                 trigger,
                 "next_run_at",
                 _compute_next_run_at(dict(trigger.config or {})),
             )
-        else:
-            setattr(trigger, "next_run_at", None)
+        elif not old_enabled:
+            # Just re-enabled (next_run_at was cleared to None above on the
+            # disabling update) — needs a fresh value from its own config.
+            setattr(
+                trigger,
+                "next_run_at",
+                _compute_next_run_at(dict(trigger.config or {})),
+            )
+        # else: already enabled, schedule fields untouched — leave
+        # next_run_at as its current, possibly scan-advanced value. Blindly
+        # recomputing here on every unrelated edit (rename, prompt tweak,
+        # secret rotation) would re-read the same stored explicit anchor and
+        # re-arm an already-progressed schedule back to a stale due time.
 
     db.add(trigger)
     db.commit()

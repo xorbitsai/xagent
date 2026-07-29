@@ -422,13 +422,23 @@ def _oauth_token_expires_after_cache_window(expires_at: datetime) -> bool:
 
 
 def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
-    return list(
+    from ...web.mcp_apps import APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
+
+    candidates = list(
         dict.fromkeys(
             value
             for value in (app_info.get("provider"), app_info.get("id"))
             if isinstance(value, str) and value
         )
     )
+    app_id = app_info.get("id")
+    if isinstance(app_id, str) and app_id in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
+        # A resolver-hook token keyed to the bare provider (e.g. "meta") is
+        # exactly as unscoped as a legacy UserOAuth row under that provider;
+        # see APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT and
+        # _resolve_legacy_oauth_access_token's identical filter.
+        candidates = [value for value in candidates if value == app_id]
+    return candidates
 
 
 def _oauth_token_configured_resource(app_info: Mapping[str, Any]) -> str | None:

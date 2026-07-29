@@ -1354,6 +1354,7 @@ def test_task_runtime_metadata_maps_provider_error_status(
         )
         assert response.status_code == 200, response.text
         task_id = response.json()["task_id"]
+        assert response.json()["runtime_extensions_partial"] is True
 
         metadata = client.get(
             f"/api/chat/task/{task_id}/runtime-extensions",

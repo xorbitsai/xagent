@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -24,6 +25,7 @@ from ..services.user_admin_scope import hidden_user_ids
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
 logger = logging.getLogger(__name__)
+_TASK_RUNTIME_DELETE_CONCURRENCY = 4
 
 
 def _delete_legacy_text2sql_rows(db: Session, user_id: int) -> None:
@@ -104,29 +106,13 @@ async def delete_user(
 
     if registered_task_extensions():
         session_factory = get_session_local()
-        task_runtime_contexts = [
-            TaskRuntimeContext(
-                task_id=int(task_id),
-                user_id=int(task_user_id),
-                source=str(source) if source is not None else None,
-                session_factory=session_factory,
-            )
-            for task_id, task_user_id, source in db.query(
-                Task.id,
-                Task.user_id,
-                Task.source,
-            )
-            .filter(Task.user_id == user_id)
-            .all()
-        ]
-        release_db_connection_if_clean(db)
+        cleaned_task_ids: set[int] = set()
+        cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
 
-        # Keep provider cleanup sequential: hooks may target the same external
-        # account, and bounded ordering avoids a deletion request creating an
-        # unbounded burst for users with many tasks.
-        for context in task_runtime_contexts:
+        async def _cleanup_context(context: TaskRuntimeContext) -> None:
             try:
-                await delete_task_extensions(context)
+                async with cleanup_semaphore:
+                    await delete_task_extensions(context)
             except TaskRuntimeExtensionError:
                 logger.warning(
                     "User %s was deleted but runtime extension cleanup failed "
@@ -135,6 +121,34 @@ async def delete_user(
                     context.task_id,
                     exc_info=True,
                 )
+
+        # Re-query after each bounded batch. This covers tasks created while
+        # provider cleanup was awaiting external systems before the bulk delete.
+        while True:
+            task_query = db.query(Task.id, Task.user_id, Task.source).filter(
+                Task.user_id == user_id
+            )
+            if cleaned_task_ids:
+                task_query = task_query.filter(Task.id.notin_(cleaned_task_ids))
+            task_rows = task_query.all()
+            if not task_rows:
+                break
+            task_runtime_contexts = [
+                TaskRuntimeContext(
+                    task_id=int(task_id),
+                    user_id=int(task_user_id),
+                    source=str(source) if source is not None else None,
+                    session_factory=session_factory,
+                )
+                for task_id, task_user_id, source in task_rows
+            ]
+            cleaned_task_ids.update(
+                context.task_id for context in task_runtime_contexts
+            )
+            release_db_connection_if_clean(db)
+            await asyncio.gather(
+                *(_cleanup_context(context) for context in task_runtime_contexts)
+            )
 
     # Re-read after the await: releasing the clean read transaction above may
     # expire ORM state, and extension hooks use their own short sessions.

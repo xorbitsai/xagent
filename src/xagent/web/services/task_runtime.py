@@ -7,6 +7,7 @@ which runtime kinds, binding tables, or transports those providers implement.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -23,6 +24,7 @@ from ...core.task_runtime import (
     TaskRuntimeContribution,
     TaskRuntimeExtensionProvider,
     merge_task_runtime_contributions,
+    normalize_task_runtime_contribution,
 )
 
 _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -34,7 +36,20 @@ _PROVIDER_METHODS = (
 )
 _task_runtime_extensions: dict[str, TaskRuntimeExtensionProvider] = {}
 _task_runtime_extensions_lock = RLock()
+_TASK_RUNTIME_HOOK_TIMEOUT_SECONDS = {
+    "on_task_created": 30.0,
+    "build_runtime": 10.0,
+    "public_metadata": 10.0,
+    "on_task_deleted": 30.0,
+}
 logger = logging.getLogger(__name__)
+
+
+class _ProviderHookRaised:
+    """Carry a provider BaseException through the wait_for task boundary."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
 
 
 class TaskRuntimeExtensionError(RuntimeError):
@@ -99,6 +114,9 @@ def validate_task_extension_requests(value: Any) -> dict[str, dict[str, Any]]:
 
     if value is None:
         return {}
+    # Pydantic rejects these two shape limits on the HTTP path. Keep the checks
+    # here as defense-in-depth for SDK and internal callers that invoke the
+    # service directly.
     if not isinstance(value, Mapping):
         raise TypeError("runtime_extensions must be an object")
     if len(value) > MAX_TASK_RUNTIME_EXTENSIONS:
@@ -150,7 +168,12 @@ async def create_task_extensions(
     completed: list[tuple[str, TaskRuntimeExtensionProvider]] = []
     for name, provider, configuration in providers:
         try:
-            await _maybe_await(provider.on_task_created(context, configuration))
+            await _invoke_provider_hook(
+                provider,
+                "on_task_created",
+                context,
+                configuration,
+            )
         except Exception as exc:
             await _cleanup_after_create_failure(
                 context,
@@ -168,13 +191,24 @@ async def build_task_runtime(
     contributions: dict[str, TaskRuntimeContribution | None] = {}
     for name, provider in _registered_extension_items():
         try:
-            contribution = await _maybe_await(provider.build_runtime(context))
-            contributions[name] = contribution
+            contribution = await _invoke_provider_hook(
+                provider,
+                "build_runtime",
+                context,
+            )
+            contributions[name] = normalize_task_runtime_contribution(contribution)
         except Exception as exc:
             raise TaskRuntimeExtensionError(name, "build_runtime", exc) from exc
     if not contributions:
         return EMPTY_TASK_RUNTIME_CONTRIBUTION
-    return merge_task_runtime_contributions(contributions)
+    try:
+        return merge_task_runtime_contributions(contributions)
+    except Exception as exc:
+        raise TaskRuntimeExtensionError(
+            "registry",
+            "merge_contributions",
+            exc,
+        ) from exc
 
 
 async def get_task_runtime_public_metadata(
@@ -185,7 +219,11 @@ async def get_task_runtime_public_metadata(
     result: dict[str, dict[str, Any]] = {}
     for name, provider in _registered_extension_items():
         try:
-            metadata = await _maybe_await(provider.public_metadata(context))
+            metadata = await _invoke_provider_hook(
+                provider,
+                "public_metadata",
+                context,
+            )
             if metadata is None:
                 continue
             if not isinstance(metadata, Mapping):
@@ -210,7 +248,11 @@ async def delete_task_extensions(context: TaskRuntimeContext) -> None:
     failures: list[tuple[str, BaseException]] = []
     for name, provider in reversed(_registered_extension_items()):
         try:
-            await _maybe_await(provider.on_task_deleted(context))
+            await _invoke_provider_hook(
+                provider,
+                "on_task_deleted",
+                context,
+            )
         except Exception as exc:
             failures.append((name, exc))
     if failures:
@@ -234,7 +276,11 @@ async def _cleanup_after_create_failure(
 ) -> None:
     for name, provider in reversed(providers):
         try:
-            await _maybe_await(provider.on_task_deleted(context))
+            await _invoke_provider_hook(
+                provider,
+                "on_task_deleted",
+                context,
+            )
         except Exception:
             # The original create failure remains primary. Providers should make
             # deletion idempotent so operators can retry cleanup safely.
@@ -251,6 +297,45 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def _invoke_provider_hook(
+    provider: TaskRuntimeExtensionProvider,
+    operation: str,
+    *args: Any,
+) -> Any:
+    """Invoke one untrusted provider hook without blocking the event loop forever.
+
+    The initial call runs in a worker so a synchronous provider cannot block the
+    event loop. Cancelling a timed-out worker cannot stop Python code already
+    running in that thread, but it does bound the request path and async hooks
+    receive normal cancellation.
+    """
+
+    hook = getattr(provider, operation)
+    timeout = _TASK_RUNTIME_HOOK_TIMEOUT_SECONDS[operation]
+
+    async def _invoke() -> Any:
+        try:
+            value = await asyncio.to_thread(hook, *args)
+            return await _maybe_await(value)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            # ``SystemExit``/``KeyboardInterrupt`` raised inside a child Task can
+            # otherwise terminate the event loop before the awaiting caller can
+            # observe them. Carry then re-raise them outside ``wait_for``.
+            return _ProviderHookRaised(exc)
+
+    try:
+        result = await asyncio.wait_for(_invoke(), timeout=timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Provider hook exceeded the {timeout:g}-second timeout"
+        ) from exc
+    if isinstance(result, _ProviderHookRaised):
+        raise result.error
+    return result
 
 
 def _normalize_extension_name(name: str) -> str:

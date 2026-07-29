@@ -14,6 +14,8 @@ from typing import Any, Protocol
 PREFERRED_INPUT_MODALITIES_METADATA_KEY = "preferred_input_modalities"
 MAX_TASK_RUNTIME_EXTENSIONS = 16
 MAX_TASK_RUNTIME_JSON_BYTES = 64 * 1024
+MAX_TASK_RUNTIME_ENVIRONMENT_BYTES = 64 * 1024
+MAX_TASK_RUNTIME_TOOLS = 64
 
 
 class TaskRuntimeClientError(Exception):
@@ -82,7 +84,10 @@ class TaskRuntimeExtensionProvider(Protocol):
     """Lifecycle contract implemented by an out-of-tree task extension.
 
     ``on_task_deleted`` must be idempotent: core deletion can fail after
-    provider cleanup, and a retry will dispatch the hook again.
+    provider cleanup, and a retry will dispatch the hook again. Providers that
+    release an external lease or sandbox should persist a provider-side
+    "release requested" state and reconcile it safely on repeated calls instead
+    of treating the first release attempt as an irreversible one-shot action.
     """
 
     def on_task_created(
@@ -148,9 +153,21 @@ def normalize_task_runtime_contribution(
         if isinstance(value.environment, str) and value.environment.strip()
         else None
     )
+    if environment is not None:
+        environment_bytes = len(environment.encode("utf-8"))
+        if environment_bytes > MAX_TASK_RUNTIME_ENVIRONMENT_BYTES:
+            raise ValueError(
+                "Task runtime environment exceeds the "
+                f"{MAX_TASK_RUNTIME_ENVIRONMENT_BYTES}-byte limit"
+            )
+    tools = tuple(value.tools)
+    if len(tools) > MAX_TASK_RUNTIME_TOOLS:
+        raise ValueError(
+            f"Task runtime contribution exceeds the {MAX_TASK_RUNTIME_TOOLS}-tool limit"
+        )
     modalities = normalize_input_modalities(value.preferred_input_modalities)
     return TaskRuntimeContribution(
-        tools=tuple(value.tools),
+        tools=tools,
         environment=environment,
         preferred_input_modalities=modalities,
         tool_origins=tuple(value.tool_origins),
@@ -169,6 +186,11 @@ def merge_task_runtime_contributions(
     for provider_name, contribution in contributions.items():
         normalized = normalize_task_runtime_contribution(contribution)
         tools.extend(normalized.tools)
+        if len(tools) > MAX_TASK_RUNTIME_TOOLS:
+            raise ValueError(
+                "Merged task runtime contributions exceed the "
+                f"{MAX_TASK_RUNTIME_TOOLS}-tool limit"
+            )
         tool_origins.extend(
             (name.strip(), provider_name)
             for tool in normalized.tools
@@ -178,9 +200,19 @@ def merge_task_runtime_contributions(
             environments.append(normalized.environment)
         modalities.extend(normalized.preferred_input_modalities)
 
+    environment = "\n\n".join(environments) or None
+    if (
+        environment is not None
+        and len(environment.encode("utf-8")) > MAX_TASK_RUNTIME_ENVIRONMENT_BYTES
+    ):
+        raise ValueError(
+            "Merged task runtime environments exceed the "
+            f"{MAX_TASK_RUNTIME_ENVIRONMENT_BYTES}-byte limit"
+        )
+
     return TaskRuntimeContribution(
         tools=tuple(tools),
-        environment="\n\n".join(environments) or None,
+        environment=environment,
         preferred_input_modalities=tuple(dict.fromkeys(modalities)),
         tool_origins=tuple(tool_origins),
     )

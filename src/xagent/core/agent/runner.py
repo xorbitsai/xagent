@@ -11,6 +11,10 @@ from ...config import get_compact_threshold_default, get_compact_threshold_ratio
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY
 from ..model.intent import enter_goal, exit_goal
+from ..task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
 from ..workspace import WorkspaceManager
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
@@ -624,9 +628,19 @@ class AgentRunner:
     ) -> None:
         """Overlay current-run metadata on new or checkpoint-restored context."""
 
-        if not metadata:
+        if metadata is None:
             return
-        context.metadata.update(metadata)
+        current_metadata = dict(metadata)
+        preferred_modalities = normalize_input_modalities(
+            current_metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
+        )
+        if preferred_modalities:
+            context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
+        else:
+            context.metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, None)
+        context.metadata.update(current_metadata)
         request_context = metadata.get("request_context")
         if isinstance(request_context, dict):
             self._apply_request_context(context, request_context)

@@ -94,7 +94,10 @@ async def test_runtime_tools_are_restored_from_config_on_rebuild(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_runtime_tools_cannot_shadow_existing_tool(monkeypatch) -> None:
+async def test_runtime_tools_cannot_shadow_existing_tool(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     async def create_registered_tools(config: Any) -> list[Any]:
         return [_tool("computer")]
 
@@ -104,11 +107,40 @@ async def test_runtime_tools_cannot_shadow_existing_tool(monkeypatch) -> None:
         create_registered_tools,
     )
 
-    with pytest.raises(ValueError, match="duplicate tool 'computer'"):
-        await ToolFactory.create_all_tools(
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(
             ToolConfig({}),
             additional_tools=(_tool("computer"),),
+            additional_tool_origins={"computer": "desktop_runtime"},
         )
+
+    assert [tool.name for tool in tools] == ["computer"]
+    assert "desktop_runtime" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_explicit_runtime_tools_preserve_provider_origin(
+    monkeypatch, caplog
+) -> None:
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    config = ToolConfig({"allowed_tools": []})
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(
+            config,
+            additional_tools=(_tool("runtime_tool"),),
+            additional_tool_origins={"runtime_tool": "browser_runtime"},
+        )
+
+    assert tools == []
+    assert "browser_runtime=[runtime_tool]" in caplog.text
 
 
 @pytest.mark.asyncio

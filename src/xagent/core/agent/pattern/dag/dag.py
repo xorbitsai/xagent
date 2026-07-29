@@ -18,7 +18,12 @@ from ...language import (
     output_language_policy,
 )
 from ...result import unwrap_final_answer_content
-from ...runtime import ExecutionInterrupted, LLMCallInterrupted, PatternRuntime
+from ...runtime import (
+    ExecutionInterrupted,
+    LLMCallInterrupted,
+    PatternRuntime,
+    prepare_llm_for_context,
+)
 from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
 from ..react import ReActPattern, ReActReasoningMode
@@ -295,9 +300,16 @@ class _DAGStepRuntime:
 class _RuntimeLLMProxy:
     runtime: PatternRuntime
     llm: Any
+    context: Any
 
     async def chat(self, **kwargs: Any) -> Any:
-        return await self.runtime.run_llm_call(self.llm, **kwargs)
+        messages = list(kwargs.get("messages") or [])
+        call_llm = await prepare_llm_for_context(
+            llm=self.llm,
+            messages=messages,
+            context=self.context,
+        )
+        return await self.runtime.run_llm_call(call_llm, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.llm, name)
@@ -1308,8 +1320,13 @@ class DAGPattern(AgentPattern):
             emitter=final_answer_stream,
         )
         try:
+            call_llm = await prepare_llm_for_context(
+                llm=llm,
+                messages=messages,
+                context=context,
+            )
             response = await runtime.run_streaming_llm_call(
-                llm,
+                call_llm,
                 messages=messages,
                 tools=tools,
                 tool_choice="required",
@@ -1622,7 +1639,7 @@ class DAGPattern(AgentPattern):
         )
         self.plan = await self.plan_generator.generate_plan(
             request=request,
-            llm=_RuntimeLLMProxy(runtime=runtime, llm=llm),
+            llm=_RuntimeLLMProxy(runtime=runtime, llm=llm, context=context),
         )
         self.plan.validate()
         self._apply_completed_results_to_plan()

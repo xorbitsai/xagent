@@ -279,6 +279,7 @@ class ToolFactory:
         config: BaseToolConfig,
         apply_user_override_filter: bool = True,
         additional_tools: Iterable[Tool] | None = None,
+        additional_tool_origins: Mapping[str, str] | None = None,
     ) -> list[Tool]:
         """Create tools within the config's optional prepared-runtime boundary.
 
@@ -304,16 +305,18 @@ class ToolFactory:
                         config, "get_task_runtime_contribution", None
                     )
                     contribution = (
-                        contribution_getter()
-                        if callable(contribution_getter)
-                        else None
+                        contribution_getter() if callable(contribution_getter) else None
                     )
                     resolved_additional_tools = getattr(contribution, "tools", ())
-                    additional_tool_origins = dict(
-                        getattr(contribution, "tool_origins", ())
+                    resolved_additional_tool_origins = (
+                        dict(getattr(contribution, "tool_origins", ()))
+                        if additional_tool_origins is None
+                        else dict(additional_tool_origins)
                     )
                 else:
-                    additional_tool_origins = {}
+                    resolved_additional_tool_origins = dict(
+                        additional_tool_origins or {}
+                    )
                 resolved_additional_tools = tuple(resolved_additional_tools or ())
                 prepared_kwargs: dict[str, Any] = {
                     "apply_user_override_filter": apply_user_override_filter
@@ -321,7 +324,7 @@ class ToolFactory:
                 if resolved_additional_tools:
                     prepared_kwargs["additional_tools"] = resolved_additional_tools
                     prepared_kwargs["additional_tool_origins"] = (
-                        additional_tool_origins
+                        resolved_additional_tool_origins
                     )
                 return await ToolFactory._create_all_tools_prepared(
                     config,
@@ -379,6 +382,7 @@ class ToolFactory:
         extension_names: set[str] = set()
         if extension_tools:
             existing_names = {tool.name for tool in tools}
+            accepted_extension_tools: list[Tool] = []
             for tool in extension_tools:
                 name = getattr(tool, "name", None)
                 if not isinstance(name, str) or not name.strip():
@@ -387,11 +391,15 @@ class ToolFactory:
                         "non-empty string 'name' attribute"
                     )
                 if name in existing_names or name in extension_names:
-                    raise ValueError(
-                        f"Task runtime extension contributed duplicate tool '{name}'"
+                    logger.warning(
+                        "Skipping duplicate task runtime tool '%s' from extension '%s'",
+                        name,
+                        (additional_tool_origins or {}).get(name, "unknown"),
                     )
+                    continue
                 extension_names.add(name)
-            tools.extend(extension_tools)
+                accepted_extension_tools.append(tool)
+            tools.extend(accepted_extension_tools)
             tools = ToolRegistry._sort_tools_by_category(tools)
 
         # Name-level filter via the spec's ``compute_allowed_names``

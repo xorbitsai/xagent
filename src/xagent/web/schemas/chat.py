@@ -117,6 +117,7 @@ class TaskCreateResponse(BaseModel):
     state_version: int = 0
     control_state: str = "idle"
     runtime_extensions: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    runtime_extensions_partial: bool = False
 
 
 class ExecutionStatus(BaseModel):

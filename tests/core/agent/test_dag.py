@@ -27,6 +27,7 @@ from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
@@ -1789,6 +1790,55 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
     assert "response_format" not in llm.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_dag_plan_generation_forwards_runtime_modality_preference() -> None:
+    prepared_llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "inspect",
+                    "task": "Inspect the authorized page",
+                    "dependencies": [],
+                    "termination_condition": "Stop after inspection.",
+                    "completion_evidence": "The page was inspected.",
+                    "tool_names": [],
+                }
+            ]
+        )
+    )
+
+    class _RouterLikeLLM:
+        def __init__(self) -> None:
+            self.preferred_modalities: list[tuple[str, ...]] = []
+
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert messages
+            self.preferred_modalities.append(preferred_input_modalities)
+            return prepared_llm
+
+    context = ExecutionContext(execution_id="dag-runtime-modality")
+    context.add_user_message("Inspect the page")
+    context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["image"]
+    router_llm = _RouterLikeLLM()
+    pattern = DAGPattern(LLMPlanGenerator())
+
+    await pattern._generate_plan(
+        context=context,
+        tools=[],
+        llm=router_llm,
+        runtime=PatternRuntime(execution_id=context.execution_id),
+        replan=False,
+    )
+
+    assert router_llm.preferred_modalities == [("image",)]
+    assert prepared_llm.calls
 
 
 @pytest.mark.asyncio

@@ -152,3 +152,58 @@ async def test_admin_user_delete_skips_task_runtime_scan_without_providers(
         assert db.query(User).filter(User.id == target_id).count() == 0
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_delete_cleans_task_created_during_runtime_cleanup():
+    _admin_headers()
+    _register_second_user("racy-runtime-user", "runtimepass1")
+
+    class _CreateTaskDuringCleanupProvider(_DeleteObserverProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.created_replacement = False
+            self.cleaned_task_ids: list[int] = []
+
+        async def on_task_deleted(self, context) -> None:
+            self.cleaned_task_ids.append(context.task_id)
+            if not self.created_replacement:
+                self.created_replacement = True
+                replacement_db = context.session_factory()
+                try:
+                    replacement_db.add(
+                        Task(
+                            user_id=context.user_id,
+                            title="replacement during cleanup",
+                            description="",
+                        )
+                    )
+                    replacement_db.commit()
+                finally:
+                    replacement_db.close()
+
+    provider = _CreateTaskDuringCleanupProvider()
+    register_task_extension("racy_delete_observer", provider)
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "racy-runtime-user").one()
+        task = Task(
+            user_id=int(target.id),
+            title="initial runtime task",
+            description="",
+        )
+        db.add(task)
+        db.commit()
+        initial_task_id = int(task.id)
+        target_id = int(target.id)
+
+        response = await delete_user(target_id, admin, db)
+
+        assert response == {"message": "User deleted successfully"}
+        assert initial_task_id in provider.cleaned_task_ids
+        assert len(provider.cleaned_task_ids) == 2
+        assert db.query(Task).filter(Task.user_id == target_id).count() == 0
+    finally:
+        unregister_task_extension("racy_delete_observer")
+        db.close()

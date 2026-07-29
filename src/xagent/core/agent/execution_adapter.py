@@ -155,12 +155,10 @@ class AgentExecutionAdapter:
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
         )
-        if preferred_modalities:
-            resume_metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
-                preferred_modalities
-            )
-        if resume_metadata:
-            kwargs["metadata"] = resume_metadata
+        resume_metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+            preferred_modalities
+        )
+        kwargs["metadata"] = resume_metadata
         handle = self.registry.get(execution_id)
         if handle is None:
             runner, execution_type = self._build_runner()
@@ -245,10 +243,7 @@ class AgentExecutionAdapter:
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
         )
-        if preferred_modalities:
-            metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
-                preferred_modalities
-            )
+        metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(preferred_modalities)
         return metadata
 
     def _build_runner(self) -> tuple[AgentRunner, str]:

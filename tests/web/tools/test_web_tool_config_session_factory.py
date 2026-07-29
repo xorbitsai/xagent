@@ -413,6 +413,10 @@ async def test_create_default_tools_skips_runtime_workspace_without_providers(
         raise AssertionError("runtime build must not run without providers")
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
     monkeypatch.setattr(ToolFactory, "create_workspace", unexpected_workspace)
     monkeypatch.setattr(chat_module, "build_task_runtime", unexpected_runtime)
@@ -432,6 +436,71 @@ async def test_create_default_tools_skips_runtime_workspace_without_providers(
 
     assert tools == []
     assert config.runtime_contribution.tools == ()
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
+    monkeypatch,
+    caplog,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.task_runtime import TaskRuntimeExtensionError
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            self.runtime_contribution = None
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+    async def create_tools(config):
+        return ["core-tool"]
+
+    async def fail_runtime(_context):
+        raise TaskRuntimeExtensionError(
+            "broken_runtime",
+            "build_runtime",
+            RuntimeError("provider unavailable"),
+        )
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        lambda _config: SimpleNamespace(id="workspace"),
+    )
+    monkeypatch.setattr(chat_module, "build_task_runtime", fail_runtime)
+    monkeypatch.setattr(
+        chat_module,
+        "registered_task_extensions",
+        lambda: ("broken_runtime",),
+    )
+
+    with caplog.at_level("ERROR"):
+        tools, config = await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+            task_runtime_context=TaskRuntimeContext(
+                task_id=11,
+                user_id=7,
+                source="internal",
+                session_factory=lambda: object(),
+            ),
+        )
+
+    assert tools == ["core-tool"]
+    assert config.runtime_contribution.tools == ()
+    assert "broken_runtime" in caplog.text
 
 
 @pytest.mark.asyncio

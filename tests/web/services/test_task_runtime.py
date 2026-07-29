@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -8,8 +9,10 @@ from typing import Any
 import pytest
 
 from xagent.core.task_runtime import (
+    MAX_TASK_RUNTIME_ENVIRONMENT_BYTES,
     MAX_TASK_RUNTIME_EXTENSIONS,
     MAX_TASK_RUNTIME_JSON_BYTES,
+    MAX_TASK_RUNTIME_TOOLS,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     normalize_input_modalities,
@@ -382,3 +385,103 @@ async def test_public_metadata_must_be_json_compatible(
 
     assert exc_info.value.extension == "invalid_metadata"
     assert exc_info.value.operation == "public_metadata"
+
+
+@pytest.mark.asyncio
+async def test_provider_hook_timeout_is_attributed_and_bounded(
+    registered_names: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xagent.web.services.task_runtime as task_runtime
+
+    class _HangingProvider(_Provider):
+        async def build_runtime(
+            self,
+            context: TaskRuntimeContext,
+        ) -> TaskRuntimeContribution:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    _register("hanging_runtime", _HangingProvider("hanging"), registered_names)
+    monkeypatch.setitem(
+        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
+        "build_runtime",
+        0.01,
+    )
+
+    with pytest.raises(TaskRuntimeExtensionError) as exc_info:
+        await build_task_runtime(_context())
+
+    assert exc_info.value.extension == "hanging_runtime"
+    assert exc_info.value.operation == "build_runtime"
+    assert isinstance(exc_info.value.cause, TimeoutError)
+    assert "0.01-second timeout" in str(exc_info.value.cause)
+
+
+@pytest.mark.asyncio
+async def test_runtime_contribution_environment_and_tools_are_bounded(
+    registered_names: list[str],
+) -> None:
+    oversized_environment = _Provider(
+        "environment",
+        contribution=TaskRuntimeContribution(
+            environment="x" * (MAX_TASK_RUNTIME_ENVIRONMENT_BYTES + 1)
+        ),
+    )
+    _register("environment_runtime", oversized_environment, registered_names)
+
+    with pytest.raises(TaskRuntimeExtensionError) as environment_error:
+        await build_task_runtime(_context())
+
+    assert environment_error.value.extension == "environment_runtime"
+    unregister_task_extension("environment_runtime")
+    registered_names.remove("environment_runtime")
+
+    oversized_tools = _Provider(
+        "tools",
+        contribution=TaskRuntimeContribution(
+            tools=tuple(
+                SimpleNamespace(name=f"tool_{index}")
+                for index in range(MAX_TASK_RUNTIME_TOOLS + 1)
+            )
+        ),
+    )
+    _register("tools_runtime", oversized_tools, registered_names)
+
+    with pytest.raises(TaskRuntimeExtensionError) as tools_error:
+        await build_task_runtime(_context())
+
+    assert tools_error.value.extension == "tools_runtime"
+
+
+@pytest.mark.asyncio
+async def test_delete_dispatch_aggregates_multiple_provider_failures(
+    registered_names: list[str],
+) -> None:
+    events: list[str] = []
+    _register(
+        "first_failure",
+        _Provider(
+            "first",
+            fail_delete=RuntimeError("first failed"),
+            events=events,
+        ),
+        registered_names,
+    )
+    _register(
+        "second_failure",
+        _Provider(
+            "second",
+            fail_delete=ValueError("second failed"),
+            events=events,
+        ),
+        registered_names,
+    )
+
+    with pytest.raises(TaskRuntimeExtensionError) as exc_info:
+        await delete_task_extensions(_context())
+
+    assert events == ["delete:second", "delete:first"]
+    assert exc_info.value.extension == "second_failure"
+    assert "second_failure: second failed" in str(exc_info.value.cause)
+    assert "first_failure: first failed" in str(exc_info.value.cause)

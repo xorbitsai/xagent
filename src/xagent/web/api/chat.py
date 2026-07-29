@@ -664,9 +664,21 @@ async def create_default_tools(
     runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
     if task_runtime_context is not None and registered_task_extensions():
         workspace = ToolFactory.create_workspace(tool_config.get_workspace_config())
-        runtime_contribution = await build_task_runtime(
-            task_runtime_context.with_workspace(workspace)
-        )
+        try:
+            runtime_contribution = await build_task_runtime(
+                task_runtime_context.with_workspace(workspace)
+            )
+        except TaskRuntimeExtensionError as exc:
+            # Runtime tools are optional enrichment. A broken out-of-tree
+            # provider must not prevent every task from constructing its core
+            # tool set; lifecycle and metadata endpoints remain fail-closed.
+            logger.error(
+                "Ignoring failed task runtime contribution from extension '%s' "
+                "while building tools for task %s",
+                exc.extension,
+                task_id,
+                exc_info=True,
+            )
     tool_config.set_task_runtime_contribution(runtime_contribution)
 
     # Use ToolFactory to create proper xagent tools
@@ -687,6 +699,23 @@ def _task_runtime_context(
         user_id=user_id,
         source=str(source) if source is not None else None,
         session_factory=get_session_local(),
+    )
+
+
+def _task_runtime_context_for_tool_build(
+    *,
+    task_id: int,
+    user_id: int,
+    source: Any,
+) -> TaskRuntimeContext | None:
+    """Avoid constructing a DB session factory on the no-provider hot path."""
+
+    if not registered_task_extensions():
+        return None
+    return _task_runtime_context(
+        task_id=task_id,
+        user_id=user_id,
+        source=source,
     )
 
 
@@ -1811,7 +1840,7 @@ class AgentServiceManager:
             task_id=f"web_task_{task_id}",
             workspace_owner_id=int(task.user_id),
             scope=scope,
-            task_runtime_context=_task_runtime_context(
+            task_runtime_context=_task_runtime_context_for_tool_build(
                 task_id=task_id,
                 user_id=int(task.user_id),
                 source=getattr(task, "source", None),
@@ -2488,7 +2517,7 @@ class AgentServiceManager:
                     task_id=f"web_task_{task_id}",
                     workspace_owner_id=workspace_owner_id,
                     scope=scope,
-                    task_runtime_context=_task_runtime_context(
+                    task_runtime_context=_task_runtime_context_for_tool_build(
                         task_id=task_id,
                         user_id=workspace_owner_id,
                         source=getattr(
@@ -3850,6 +3879,7 @@ async def create_task(
         # binding has already been persisted successfully, so creation degrades
         # to an empty mapping here; the dedicated GET endpoint remains
         # fail-closed because metadata is its primary response.
+        runtime_extensions_partial = False
         try:
             runtime_extensions = await get_task_runtime_public_metadata(runtime_context)
         except TaskRuntimeExtensionError:
@@ -3859,6 +3889,7 @@ async def create_task(
                 exc_info=True,
             )
             runtime_extensions = {}
+            runtime_extensions_partial = True
 
         return TaskCreateResponse(
             task_id=task.id,
@@ -3885,6 +3916,7 @@ async def create_task(
             state_version=int(task.state_version or 0),
             control_state=str(task.control_state or "idle"),
             runtime_extensions=runtime_extensions,
+            runtime_extensions_partial=runtime_extensions_partial,
         )
 
     except HTTPException:

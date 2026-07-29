@@ -36,7 +36,26 @@ export interface AgentCard {
   template_id?: string | null;
 }
 
-interface ChatStartScreenProps {
+// When `templates` is supplied, TemplateQuickAccess is rendered and needs a
+// real handler for both callbacks - a `|| (() => {})` fallback would silently
+// swallow category switches/prompt picks instead of surfacing the missing
+// wiring at compile time. Omitting `templates` falls back to the plain
+// prompt-card grid, which doesn't use either handler.
+type TemplateQuickAccessSlotProps =
+  | {
+      templates?: undefined;
+      selectedCategory?: string;
+      onCategoryChange?: (category: string) => void;
+      onTemplatePromptSelect?: (template: Template, prompt: SamplePrompt, index: number) => void;
+    }
+  | {
+      templates: Template[];
+      selectedCategory?: string;
+      onCategoryChange: (category: string) => void;
+      onTemplatePromptSelect: (template: Template, prompt: SamplePrompt, index: number) => void;
+    };
+
+type ChatStartScreenProps = {
   title: string;
   description?: string;
   icon?: React.ReactNode | string; // URL string or ReactNode
@@ -63,14 +82,10 @@ interface ChatStartScreenProps {
   taskConfig?: any;
   autoFocus?: boolean;
   inputMinHeightClass?: string;
-  templates?: Template[];
-  selectedCategory?: string;
-  onCategoryChange?: (category: string) => void;
   selectedTemplate?: { id: string; name: string } | null;
   onRemoveSelectedTemplate?: () => void;
   selectedPromptKey?: string | null;
-  onTemplatePromptSelect?: (template: Template, prompt: SamplePrompt, index: number) => void;
-}
+} & TemplateQuickAccessSlotProps;
 
 export function ChatStartScreen({
   title,
@@ -163,9 +178,9 @@ export function ChatStartScreen({
           <TemplateQuickAccess
             templates={templates}
             selectedCategory={selectedCategory || ""}
-            onCategoryChange={onCategoryChange || (() => {})}
+            onCategoryChange={onCategoryChange}
             selectedPromptKey={selectedPromptKey ?? null}
-            onPromptSelect={onTemplatePromptSelect || (() => {})}
+            onPromptSelect={onTemplatePromptSelect}
           />
         ) : prompts && prompts.length > 0 && (
           <div className="space-y-3">

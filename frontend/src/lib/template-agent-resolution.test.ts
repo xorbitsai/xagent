@@ -169,4 +169,30 @@ describe("resolveAgentForTemplate", () => {
       expect.objectContaining({ method: "DELETE" })
     );
   });
+
+  it("does not delete an agent reused via the 400 lookup when its publish fails", async () => {
+    // Regression test for F1: an agent found via the template_id lookup was
+    // not created by this call - it may belong to a teammate (default
+    // visibility is "team") - so a failed publish must never delete it.
+    apiRequestMock
+      .mockResolvedValueOnce(
+        jsonResponse({ detail: DUPLICATE_AGENT_NAME_DETAIL }, { status: 400 })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse([{ id: 15, name: "Inbox Manager", template_id: "support-inbox-manager", status: "draft" }])
+      )
+      .mockResolvedValueOnce(jsonResponse({ detail: "publish failed" }, { status: 500 }));
+
+    await expect(resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", [])).rejects.toThrow(
+      "Failed to publish agent"
+    );
+
+    expect(apiRequestMock).toHaveBeenCalledTimes(3);
+    expect(apiRequestMock).not.toHaveBeenNthCalledWith(
+      4,
+      "http://api.local/api/agents/15",
+      expect.objectContaining({ method: "DELETE" })
+    );
+    expect(apiRequestMock.mock.calls.some(([, opts]) => opts?.method === "DELETE")).toBe(false);
+  });
 });

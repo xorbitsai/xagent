@@ -18,6 +18,25 @@ features:
   - 若两者均未连接，或该会议在其中不可用，也可接受您粘贴/上传的会议记录（.txt、.docx 或 .pdf）
   - 按需从记录中提取决策、负责人和截止日期
   - 在 Gmail 中起草跟进邮件，并在您批准后于 HubSpot 中记录 CRM 备注
+sample_prompts:
+  en:
+  - title: Summarize this meeting
+    prompt: Read this meeting transcript and give me a summary, the decisions made, and action items with owners and due dates.
+    highlights:
+    - meeting transcript
+  - title: Draft a follow-up email
+    prompt: Based on this transcript, draft a follow-up email summarizing decisions and next steps for the attendees.
+    highlights:
+    - this transcript
+  zh:
+  - title: 总结这次会议
+    prompt: 请阅读这份会议记录，给我摘要、决策以及带负责人和截止日期的行动项。
+    highlights:
+    - 会议记录
+  - title: 起草跟进邮件
+    prompt: 根据这份会议记录，起草一封跟进邮件，总结决策和后续步骤发给与会者。
+    highlights:
+    - 会议记录
 connections:
 - name: Zoom
   logo: https://www.google.com/s2/favicons?domain=zoom.us&sz=64

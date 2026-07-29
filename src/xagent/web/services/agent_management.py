@@ -21,7 +21,7 @@ from ...core.utils.api_key import (
     generate_api_key,
 )
 from ...templates.manager import TemplateManager
-from ..models.agent import Agent
+from ..models.agent import AGENT_NAME_UNIQUE_INDEX, Agent
 from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.model import Model as DBModel
@@ -603,11 +603,19 @@ class AgentManagementService:
 
         Conflict contract: ``agent_name_exists`` is a fast-path pre-check,
         not the source of truth -- the ``uq_agents_user_id_name_active``
-        partial unique index (excludes workforce-generated-manager agents,
-        matching ``agent_name_exists``) is what actually prevents a
-        concurrent-request race, so the agent insert's flush can itself
-        raise IntegrityError and is translated to ``DuplicateAgentNameError``
-        below. The only other IntegrityError source is the runtime key's
+        partial unique index (excludes workforce-generated-manager agents)
+        is what actually prevents a same-user concurrent-request race, so
+        the agent insert's flush can itself raise IntegrityError and is
+        translated to ``DuplicateAgentNameError`` below. The index is keyed
+        on ``(user_id, name)`` only, so it matches ``agent_name_exists``
+        exactly in standalone xagent (no team-scope hook, where the check is
+        also purely per-user). When a team-scope hook is installed,
+        ``agent_name_exists`` widens to a team-wide check (any teammate's
+        ``visibility="team"`` agent, or all of them for an admin) that this
+        per-user index does not mirror -- two different users on the same
+        team can still race past it with identical names; only a single
+        user's own double-submit is guaranteed to be caught here. The only
+        other IntegrityError source is the runtime key's
         ``key_prefix`` unique constraint (the ``uq_agent_api_keys_agent_active``
         partial index that used to also live here was dropped for multi-key
         support -- an agent may hold more than one active key now), handled
@@ -640,6 +648,8 @@ class AgentManagementService:
             )
         except IntegrityError as exc:
             self.db.rollback()
+            if not is_agent_name_unique_violation(exc):
+                raise
             raise DuplicateAgentNameError(name) from exc
 
         # The agent-name race is handled above via the add_agent flush; the
@@ -891,6 +901,33 @@ def _is_runtime_key_prefix_collision(error: BaseException) -> bool:
         message = str(current).lower()
         if "key_prefix" in message and (
             "agent_api_keys" in message or "unique" in message or "duplicate" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_agent_name_unique_violation(error: BaseException) -> bool:
+    """Recognize the authoritative (user_id, name) unique index failure.
+
+    Postgres includes the index name (``uq_agents_user_id_name_active``) in
+    its error message; sqlite instead names the columns
+    (``agents.user_id, agents.name``). Matching either keeps this from
+    misclassifying an unrelated IntegrityError (e.g. a ``widget_key``
+    collision or a foreign-key violation) as a duplicate-name conflict.
+    """
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if AGENT_NAME_UNIQUE_INDEX.lower() in message:
+            return True
+        if (
+            "agents.user_id" in message
+            and "agents.name" in message
+            and ("unique" in message or "duplicate" in message)
         ):
             return True
         current = current.__cause__ or current.__context__

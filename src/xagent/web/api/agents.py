@@ -38,6 +38,7 @@ from ..services.agent_management import (
     AgentWorkforceConflictError,
     DuplicateAgentNameError,
     TemplateNotFoundError,
+    is_agent_name_unique_violation,
 )
 from ..services.agent_store import (
     AgentStore,
@@ -597,11 +598,13 @@ async def create_agent(
                 suggested_prompts=agent_data.suggested_prompts,
                 visibility=agent_data.visibility,
             )
-        except IntegrityError:
+        except IntegrityError as exc:
             db.rollback()
+            if not is_agent_name_unique_violation(exc):
+                raise
             raise HTTPException(
                 status_code=400, detail="Agent with this name already exists"
-            )
+            ) from exc
 
         # Save logo if provided
         if agent_data.logo_base64:

@@ -14,6 +14,25 @@ features:
   - 读取您粘贴或上传的日志、命令输出或监控导出——无需连接到实时服务器
   - 将排查结果关联为根因假设与修复建议
   - 直接在对话中汇报——无需外部监控或消息集成
+sample_prompts:
+  en:
+  - title: Triage this incident
+    prompt: Here are the logs and command output from the incident — give me a root-cause hypothesis, a recommended fix, and a severity assessment.
+    highlights:
+    - logs and command output
+  - title: Correlate monitoring exports
+    prompt: I'm pasting a monitoring export below — correlate it with the error logs and tell me what's actually causing this.
+    highlights:
+    - monitoring export
+  zh:
+  - title: 排查这次故障
+    prompt: 这是故障相关的日志和命令输出——请给我根因假设、修复建议和严重程度评估。
+    highlights:
+    - 日志和命令输出
+  - title: 关联监控导出数据
+    prompt: 我粘贴了一份监控导出数据——请将其与错误日志关联，告诉我究竟是什么导致了这个问题。
+    highlights:
+    - 监控导出数据
 connections: []
 setup_time:
   en: 5 min setup

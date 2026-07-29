@@ -2,13 +2,28 @@
 
 ``template_id`` lets the create-or-reuse-from-template flow key off a
 stable id instead of the user-editable display name. The unique index on
-(user_id, name) backs the existing app-level ``agent_name_exists`` check at
-the database layer, closing the check-then-insert race; it excludes
+(user_id, name) backs the app-level ``agent_name_exists`` check at the
+database layer for a single user's own check-then-insert race; it excludes
 ``workforce_generated_manager`` agents to match ``agent_name_exists``,
-which already deliberately allows those to share names.
+which already deliberately allows those to share names. Note this index is
+strictly per-``user_id`` - when a SaaS team-scope hook is installed,
+``agent_name_exists`` becomes a team-wide check that this index does not
+mirror (see the docstring on ``agent_team_scope.owned_agent_clause`` and
+the comment on ``Agent.__table_args__``).
 
 Existing duplicate (user_id, name) rows (if any) are renamed before the
 index is created so this migration cannot fail on already-messy data.
+Renaming is a one-way, best-effort disambiguation: ``downgrade()`` drops the
+column/indexes but does not attempt to restore the original colliding
+names, since which row "owned" the pre-migration name is no longer
+recoverable once other rows have shifted around it.
+
+The dedupe pass and index creation both run inside this migration's single
+transaction, so any lock the database takes for either (e.g. a table-level
+lock while building the partial index, on backends that need one) is held
+for the combined duration of both steps, not just the index build. Expected
+to be negligible for typical agent-table sizes; revisit if this ever runs
+against a very large, highly-contended ``agents`` table in production.
 
 Revision ID: 20260728_add_agent_template_id_and_name_uniqueness
 Revises: 20260724_add_upload_source_to_uploaded_files
@@ -57,7 +72,11 @@ def _dedupe_agent_names() -> None:
     Only considers non-workforce-manager agents, matching the partial index's
     scope. The lowest ``id`` in each group keeps its name; later rows are
     suffixed with their own id, mirroring the disambiguation the frontend
-    already applies on a name collision.
+    already applies on a name collision. If that suffixed name happens to
+    already belong to another row for the same user (e.g. an existing agent
+    literally named ``"Foo (123)"``), an incrementing counter is appended
+    until a genuinely free name is found, so the rename itself can never
+    introduce a *new* collision for the unique index we're about to build.
     """
     bind = op.get_bind()
     agents = sa.table(
@@ -87,10 +106,24 @@ def _dedupe_agent_names() -> None:
         ).fetchall()
 
         for (agent_id,) in rows[1:]:
+            candidate = f"{name} ({agent_id})"
+            suffix = 2
+            while (
+                bind.execute(
+                    sa.select(agents.c.id).where(
+                        agents.c.user_id == user_id,
+                        agents.c.name == candidate,
+                        agents.c.origin != WORKFORCE_MANAGER_ORIGIN,
+                        agents.c.id != agent_id,
+                    )
+                ).first()
+                is not None
+            ):
+                candidate = f"{name} ({agent_id}-{suffix})"
+                suffix += 1
+
             bind.execute(
-                sa.update(agents)
-                .where(agents.c.id == agent_id)
-                .values(name=f"{name} ({agent_id})")
+                sa.update(agents).where(agents.c.id == agent_id).values(name=candidate)
             )
 
 

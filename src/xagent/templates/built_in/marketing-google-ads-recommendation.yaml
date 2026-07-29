@@ -14,6 +14,25 @@ features:
   - 从 Google Ads 拉取花费、点击率、单次转化成本、转化数和搜索词数据
   - 通过广告系列 / UTM 匹配，结合 Google Analytics Analyzer agent 输出的网站端「广告信号」
   - 按收入影响排序，推荐预算、关键词、否定关键词与文案调整，等待您审批
+sample_prompts:
+  en:
+  - title: Prioritize this week's fixes
+    prompt: Pull my Google Ads performance and rank the top budget, keyword and copy fixes by estimated revenue impact.
+    highlights:
+    - Google Ads performance
+  - title: Join with GA signals
+    prompt: Here's a Signals for Ads table from my Analytics agent — join it with Google Ads data and recommend changes, ranked by impact.
+    highlights:
+    - Signals for Ads table
+  zh:
+  - title: 排出本周优化优先级
+    prompt: 拉取我的 Google Ads 投放表现，按预估收入影响对预算、关键词和文案优化方案进行排序。
+    highlights:
+    - Google Ads 投放表现
+  - title: 结合 GA 广告信号
+    prompt: 这是我的 Analytics agent 输出的广告信号表格——将其与 Google Ads 数据结合，按影响排序推荐优化方案。
+    highlights:
+    - 广告信号表格
 connections:
 - name: Google Ads
   logo: https://www.google.com/s2/favicons?domain=ads.google.com&sz=64

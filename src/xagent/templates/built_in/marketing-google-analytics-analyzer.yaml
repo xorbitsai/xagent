@@ -14,6 +14,25 @@ features:
   - 读取您上传的 GA4 导出文件（CSV）或粘贴的表格——无需接入实时 GA4 连接
   - 与上一周期对比，按渠道、广告系列、落地页和细分维度标记异常
   - 输出供 Ads agent 使用的「广告信号」表格，并可按需将报告保存到 Google Docs 或 Slides
+sample_prompts:
+  en:
+  - title: Analyze this GA4 export
+    prompt: Analyze this GA4 export against the prior period and tell me what changed in traffic and conversions, and why.
+    highlights:
+    - GA4 export
+  - title: Generate Signals for Ads
+    prompt: Break down performance by channel, campaign and landing page, then emit a Signals for Ads table I can hand to my ads agent.
+    highlights:
+    - Signals for Ads table
+  zh:
+  - title: 分析这份 GA4 导出数据
+    prompt: 分析这份 GA4 导出数据 与上一周期的对比，告诉我流量和转化发生了什么变化，以及原因。
+    highlights:
+    - GA4 导出数据
+  - title: 生成广告信号表格
+    prompt: 按渠道、广告系列和落地页拆解表现，然后输出一份可以交给我的广告 agent 使用的广告信号表格。
+    highlights:
+    - 广告信号表格
 connections:
 - name: Google Docs
   logo: https://www.google.com/s2/favicons?domain=docs.google.com&sz=64

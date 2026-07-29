@@ -16,7 +16,18 @@ from .database import Base
 # databases get the same index from the
 # 20260728_add_agent_template_id_and_name_uniqueness migration, which also
 # dedupes any pre-existing collisions first.
+#
+# This is keyed on (user_id, name) only, so it mirrors agent_name_exists
+# exactly in standalone xagent. When a SaaS team-scope hook is installed,
+# agent_name_exists becomes a team-wide check (see agent_team_scope.py) that
+# this per-user index does not enforce - it only guarantees a single user
+# can't race a duplicate name past themselves, not across teammates.
 _NON_WORKFORCE_MANAGER_CLAUSE = text("origin != 'workforce_generated_manager'")
+
+# Shared with agent_management.py, which inspects a raised IntegrityError's
+# message for this name to distinguish this specific violation from any other
+# IntegrityError (e.g. a widget_key collision or an unrelated FK failure).
+AGENT_NAME_UNIQUE_INDEX = "uq_agents_user_id_name_active"
 
 
 class AgentStatus(enum.Enum):
@@ -119,7 +130,7 @@ class Agent(Base):  # type: ignore
 
     __table_args__ = (
         Index(
-            "uq_agents_user_id_name_active",
+            AGENT_NAME_UNIQUE_INDEX,
             "user_id",
             "name",
             unique=True,

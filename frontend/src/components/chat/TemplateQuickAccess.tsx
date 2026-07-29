@@ -21,6 +21,7 @@ import {
   FEATURED_CATEGORY_ID,
   getOrderedCategoriesWithCounts,
   getTemplatesForCategory,
+  normalizeCategoryKey,
 } from "@/lib/template-categories";
 
 type IconComponent = ComponentType<SVGProps<SVGSVGElement>>;
@@ -103,7 +104,7 @@ export function TemplateQuickAccess({
   );
 
   const categoryLabel = (categoryId: string) => {
-    const key = CATEGORY_LABEL_KEYS[categoryId.toLowerCase()];
+    const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(categoryId)];
     return key ? t(key) : categoryId;
   };
 

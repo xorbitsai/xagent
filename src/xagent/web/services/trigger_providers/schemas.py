@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Union
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -101,6 +102,45 @@ class BaseTriggerConfig(BaseModel):
     """Opt-in to encrypted full-payload snapshots on trigger runs."""
 
 
+# Shared normalization for schedule fields. Single source of truth used both
+# by the pydantic validators below (API-time validation) and by the service
+# layer (triggers.py) when recomputing schedules from stored configs — the
+# same rules, one implementation, two error-wrapping styles.
+
+def normalize_weekdays(value: Any) -> set[int]:
+    """Validate and coerce a weekdays list (0=Mon..6=Sun) to a set."""
+    try:
+        weekday_set = {int(day) for day in (value or [])}
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "weekdays must be a non-empty list of integers 0-6 (Mon-Sun)"
+        ) from exc
+    if not weekday_set or not weekday_set.issubset(range(7)):
+        raise ValueError(
+            "weekdays must be a non-empty list of integers 0-6 (Mon-Sun)"
+        )
+    return weekday_set
+
+
+def normalize_day_of_month(value: Any) -> int:
+    """Validate and coerce day_of_month (1-31)."""
+    try:
+        day = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("day_of_month must be between 1 and 31") from exc
+    if not (1 <= day <= 31):
+        raise ValueError("day_of_month must be between 1 and 31")
+    return day
+
+
+def normalize_schedule_timezone(value: Any) -> ZoneInfo:
+    """Validate an IANA timezone name and return its ZoneInfo."""
+    try:
+        return ZoneInfo(str(value))
+    except (ZoneInfoNotFoundError, ValueError, TypeError, KeyError) as exc:
+        raise ValueError(f"unknown timezone: {value!r}") from exc
+
+
 class WebhookTriggerConfig(BaseTriggerConfig):
     type: Literal["webhook"] = "webhook"
 
@@ -109,6 +149,21 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
     type: Literal["scheduled"] = "scheduled"
     interval_seconds: int | None = None
     next_run_at: str | None = None
+    recurrence: Literal["hourly", "daily", "weekly", "monthly", "custom"] | None = None
+    """Recurrence family driving the schedule UI. Hourly/daily/custom keep the
+    flat interval_seconds/next_run_at mechanism below (interval_seconds is
+    still what the scheduler advances by); weekly/monthly require real
+    calendar math and are computed from weekdays/day_of_month instead."""
+    time_of_day: str | None = None
+    """"HH:MM" (24h), the time-of-day component for daily/weekly/monthly."""
+    weekdays: list[int] | None = None
+    """0=Monday..6=Sunday. Required when recurrence == "weekly"."""
+    day_of_month: int | None = None
+    """1-31, clamped to the last day of short months. Required when
+    recurrence == "monthly"."""
+    start_at: str | None = None
+    """ISO date/datetime; optional anchor before which weekly/monthly won't
+    fire their first run."""
 
     @field_validator("interval_seconds")
     @classmethod
@@ -117,8 +172,42 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
             raise ValueError("interval_seconds must be positive")
         return value
 
+    timezone: str | None = None
+    """IANA timezone name (e.g. "Asia/Shanghai") that time_of_day and
+    weekdays/day_of_month are expressed in. Defaults to UTC when absent
+    (legacy configs)."""
+
+    @field_validator("weekdays")
+    @classmethod
+    def _valid_weekdays(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None:
+            normalize_weekdays(value)
+        return value
+
+    @field_validator("day_of_month")
+    @classmethod
+    def _valid_day_of_month(cls, value: int | None) -> int | None:
+        if value is not None:
+            normalize_day_of_month(value)
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_timezone(cls, value: str | None) -> str | None:
+        if value is not None:
+            normalize_schedule_timezone(value)
+        return value
+
     @model_validator(mode="after")
     def _require_schedule(self) -> "ScheduledTriggerConfig":
+        if self.recurrence == "weekly":
+            if not self.weekdays:
+                raise ValueError("weekly schedule requires weekdays")
+            return self
+        if self.recurrence == "monthly":
+            if self.day_of_month is None:
+                raise ValueError("monthly schedule requires day_of_month")
+            return self
         if self.interval_seconds is None and not (self.next_run_at or "").strip():
             raise ValueError(
                 "scheduled trigger requires interval_seconds or next_run_at"

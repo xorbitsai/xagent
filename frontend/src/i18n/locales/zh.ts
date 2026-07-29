@@ -3648,21 +3648,34 @@ const zh = {
       scheduledName: "Schedule",
       gmailName: "Gmail"
     },
-    overview: {
-      info: "Triggers 定义此 Agent 什么时候运行。启用一个或多个触发方式，让外部事件或定时计划自动启动 Agent。"
-    },
     cards: {
       webhook: {
         title: "API / Webhook",
-        description: "通过 REST API 调用或 incoming webhook 触发"
+        description: "通过 REST API 调用或 incoming webhook 触发",
+        empty: {
+          title: "还没有 Webhook",
+          description: "创建一个 webhook，让其他应用可以启动此 Agent —— 例如表单提交或收到新线索时。",
+          cta: "创建 webhook"
+        }
       },
       scheduled: {
         title: "Schedule",
-        description: "按固定时间间隔自动运行 Agent"
+        description: "按固定时间间隔自动运行 Agent",
+        empty: {
+          title: "还没有定时计划",
+          description: "创建一个定时计划，让此 Agent 自动运行 —— 例如每日摘要或每周报告。",
+          cta: "添加定时计划"
+        }
       },
       gmail: {
         title: "Gmail",
-        description: "当 Gmail 收到新邮件时运行 Agent"
+        description: "当 Gmail 收到新邮件时运行 Agent",
+        addTrigger: "添加 Gmail 触发器",
+        empty: {
+          title: "尚未连接 Gmail 账号",
+          description: "连接一个 Gmail 账号并选择哪些邮件应触发此 Agent。每个账号有独立的设置。",
+          cta: "使用 Google 登录"
+        }
       },
       activeCount: "{count} Active"
     },
@@ -3674,7 +3687,6 @@ const zh = {
       configure: "配置 Trigger"
     },
     staging: {
-      info: "此处配置的 Triggers 会随草稿一起保存，创建 Agent 时自动生效。",
       webhookPending: "Webhook 地址和签名 secret 将在 Agent 创建后生成。",
       failedTitle: "部分 Trigger 创建失败，配置已保留，可重试或丢弃。"
     },
@@ -3705,34 +3717,91 @@ const zh = {
       name: "名称",
       namePlaceholder: "日报、CRM webhook...",
       type: "类型",
-      intervalSeconds: "每多少秒重复",
-      nextRunAt: "首次运行时间",
       secret: "Webhook Secret",
       secretPlaceholder: "留空则自动生成",
       secretEditPlaceholder: "留空则保留当前 secret",
-      watchLabel: "监听标签 / 文件夹",
-      watchLabelPlaceholder: "INBOX",
+      watchLabel: "监听标签或文件夹（可选）",
+      watchLabelPlaceholder: "例如 Support —— 留空则监听所有收到的邮件",
       watchLabelHelp: "使用 * 或 all 可匹配任意标签。该值不区分大小写。",
       gmailAccount: "Gmail 账号",
       gmailAccountPlaceholder: "选择要监听的 Gmail 账号",
       gmailAccountHelp: "此触发器只会响应所选邮箱中的邮件。",
+      webhookNamePlaceholder: "例如：网站新线索",
+      scheduleNamePlaceholder: "例如：晨间摘要报告",
+      webhookPrompt: "提示词模板 —— 此 webhook 被调用时 Agent 应该做什么？",
+      webhookPromptPlaceholder: "例如：来了一个新线索 —— 调研该公司并起草一封介绍邮件",
+      schedulePrompt: "每次运行时 Agent 应该做什么？",
+      schedulePromptPlaceholder: "例如：生成今天的日报并邮件发送给团队",
+      gmailPrompt: "收到邮件时 Agent 应该做什么？",
+      gmailPromptPlaceholder: "例如：阅读邮件并起草一封友好的回复供我审核",
+      gmailPromptHelp: "每次运行时，邮件的发件人、主题和正文会自动提供给 Agent。",
+      generateSecret: "生成 secret",
+      secretGeneratedHint: "该 secret 保存后仅显示这一次 —— 请立即复制并妥善保存。",
       senderFilter: "按发件人过滤（可选）",
       senderFilterPlaceholder: "例如 @acme.com 或 boss@company.com",
       subjectKeyword: "按主题关键词过滤（可选）",
-      subjectKeywordPlaceholder: "例如 [SUPPORT]，留空则全部触发",
-      promptTemplate: "提示词模板",
-      promptPlaceholder: "可使用 {{payload}}、{{trigger_type}}、{{source_event_id}} 和 {{test}}。"
+      subjectKeywordPlaceholder: "例如 [SUPPORT]，留空则全部触发"
     },
     actions: {
       new: "新建",
+      edit: "编辑",
       delete: "删除",
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
       test: "测试触发",
-      addAnother: "新增",
+      addAnotherWebhook: "添加另一个 webhook",
+      addAnotherSchedule: "添加另一个定时计划",
+      addAnotherGmail: "添加另一个 Gmail 触发器",
       retry: "重试",
       discard: "丢弃",
-      confirmDiscard: "确认丢弃"
+      confirmDiscard: "确认丢弃",
+      saveWebhook: "保存 webhook",
+      saveSchedule: "保存定时计划",
+      saveSettings: "保存设置"
+    },
+    editor: {
+      webhookNew: "新建 webhook",
+      webhookEdit: "编辑 webhook",
+      scheduledNew: "新建定时计划",
+      scheduledEdit: "编辑定时计划",
+      gmailNew: "新建 Gmail 触发器",
+      gmailEdit: "编辑 Gmail 触发器"
+    },
+    item: {
+      gmailAllEmails: "所有收到的邮件"
+    },
+    schedule: {
+      nameLabel: "定时计划名称",
+      recurrenceLabel: "多久运行一次？",
+      hourly: "每小时",
+      daily: "每天",
+      weekly: "每周",
+      monthly: "每月",
+      custom: "自定义",
+      atWhatTime: "在什么时间？",
+      onWhichDays: "在哪几天？",
+      onWhichDayOfMonth: "每月的哪一天？",
+      runEvery: "每隔",
+      customHelp: "例如每 30 分钟一次，或每 3 天一次。",
+      customUnitMinutes: "分钟",
+      customUnitHours: "小时",
+      customUnitDays: "天",
+      startCheckbox: "此定时计划何时开始？",
+      startFrom: "从",
+      weekdayMon: "周一",
+      weekdayTue: "周二",
+      weekdayWed: "周三",
+      weekdayThu: "周四",
+      weekdayFri: "周五",
+      weekdaySat: "周六",
+      weekdaySun: "周日",
+      summaryHourly: "每小时运行一次",
+      summaryDaily: "每天 {time} 运行",
+      summaryWeekly: "每周 {days} 的 {time} 运行",
+      summaryMonthly: "每月 {day} 的 {time} 运行",
+      summaryCustom: "每 {amount} {unit}运行一次",
+      summaryStartsOnly: "{base}，从 {date} 开始",
+      summaryStartsWithTime: "{base}，从 {date} {time} 开始"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。",
@@ -3740,22 +3809,22 @@ const zh = {
     },
     webhook: {
       title: "Webhook 地址",
-      secretHeader: "每次请求需用 HMAC-SHA256 签名：以 secret 为密钥对 `{timestamp}.{原始请求体}` 计算十六进制摘要放入 x-xagent-signature header，并在 x-xagent-timestamp header 传入 Unix 时间戳。"
+      secretHeader: "每次请求需用 HMAC-SHA256 签名：以 secret 为密钥对 `{timestamp}.{原始请求体}` 计算十六进制摘要放入 x-xagent-signature header，并在 x-xagent-timestamp header 传入 Unix 时间戳。",
+      pendingSave: "Webhook 地址和签名 secret 将在保存后生成。"
     },
     gmail: {
-      connected: "Gmail 已连接",
-      connectedDescription: "当前工作区已有可用的 Gmail 账号连接。",
       notConnected: "连接 Gmail 后才能启用此触发器",
       notConnectedDescription: "依赖新邮件事件前，请先连接官方 Gmail Connector。",
       connect: "连接 Gmail",
       noAccounts: "尚未连接 Gmail 账号",
-      accountMissing: "之前选择的 Gmail 账号已断开连接，请重新选择。"
+      accountMissing: "之前选择的 Gmail 账号已断开连接，请重新选择。",
+      changeAccount: "更换账号",
+      optionalFilters: "可选过滤条件 —— 只响应特定发件人或主题"
     },
     test: {
-      title: "测试运行",
-      subtitle: "使用示例 payload 启动一次 trigger run。",
-      sourceEventId: "Source event ID",
-      sourceEventPlaceholder: "可选事件 ID"
+      running: "测试运行中…",
+      stagedPreviewNote: "Agent 尚未创建，此为本地试运行 —— 以下即该触发器实际会发送给 Agent 的内容。",
+      stagedPromptLabel: "渲染后的提示词"
     },
     runs: {
       title: "最近运行",
@@ -3772,10 +3841,9 @@ const zh = {
       nameLength: "Trigger 名称最多 200 个字符",
       interval: "重复间隔必须是正整数",
       nextRunAt: "首次运行时间无效",
-      scheduleRequired: "定时 Trigger 需要重复间隔或首次运行时间",
-      watchLabel: "Gmail Trigger 需要监听的标签或文件夹",
-      gmailAccount: "请选择此 Trigger 要监听的 Gmail 账号",
-      testPayload: "测试 payload 必须是 JSON object"
+      scheduleRequired: "每周计划需至少选择一个星期几",
+      startDate: "请选择定时计划的开始日期",
+      gmailAccount: "请选择此 Trigger 要监听的 Gmail 账号"
     },
     messages: {
       loadFailed: "加载 Triggers 失败",

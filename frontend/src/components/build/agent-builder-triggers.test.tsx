@@ -368,14 +368,13 @@ describe("AgentBuilder trigger summary cards (agent not created yet)", () => {
     // Stage an enabled webhook trigger via the dialog (no agentId yet, so
     // creation only touches the parent-owned staged list, no API call).
     fireEvent.click(await screen.findByText("triggers.builder.open"))
-    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    await screen.findByText("triggers.cards.webhook.title")
+    const [webhookCardSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(webhookCardSwitch)
+    // Toggle-on opens a draft editor; Save is what stages it (enabled).
     await screen.findByLabelText("triggers.form.name")
-    const [detailSwitch] = screen.getAllByRole("switch")
-    fireEvent.click(detailSwitch)
-    await waitFor(() => {
-      expect(detailSwitch).toHaveAttribute("aria-checked", "true")
-    })
-    fireEvent.click(screen.getByRole("button", { name: "common.done" }))
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveWebhook" }))
+    fireEvent.click(await screen.findByRole("button", { name: "common.done" }))
 
     // The summary card appears once the staged trigger is enabled.
     expect(await screen.findByText("triggers.cards.webhook.title")).toBeInTheDocument()

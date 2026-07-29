@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import hashlib
 import json
 import logging
@@ -8,7 +9,7 @@ import secrets
 from collections.abc import Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any
 
 from pydantic import ValidationError
@@ -46,7 +47,12 @@ from .task_orchestrator import (
 )
 from .trigger_providers.base import TriggerConfigError
 from .trigger_providers.registry import maybe_get_trigger_provider
-from .trigger_providers.schemas import parse_trigger_config
+from .trigger_providers.schemas import (
+    normalize_day_of_month,
+    normalize_schedule_timezone,
+    normalize_weekdays,
+    parse_trigger_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +256,86 @@ def _normalize_trigger_name(name: str | None, *, default: str | None = None) -> 
     return value
 
 
+def _parse_time_of_day(value: Any) -> time:
+    """Parse a "HH:MM" string into a time, defaulting to midnight."""
+    if not value:
+        return time(0, 0)
+    try:
+        hour_str, minute_str = str(value).split(":", 1)
+        return time(int(hour_str), int(minute_str))
+    except (TypeError, ValueError) as exc:
+        raise TriggerServiceError("Invalid time_of_day") from exc
+
+
+def _weekday_set(config: dict[str, Any]) -> set[int]:
+    try:
+        return normalize_weekdays(config.get("weekdays"))
+    except ValueError as exc:
+        raise TriggerServiceError(str(exc)) from exc
+
+
+def _day_of_month(config: dict[str, Any]) -> int:
+    try:
+        return normalize_day_of_month(config.get("day_of_month"))
+    except ValueError as exc:
+        raise TriggerServiceError(str(exc)) from exc
+
+
+def _schedule_tzinfo(config: dict[str, Any]) -> tzinfo:
+    """The timezone that time_of_day/weekdays/day_of_month are expressed in.
+
+    Configs written before timezone support (or by API clients that omit it)
+    keep the historical UTC interpretation.
+    """
+    name = config.get("timezone")
+    if not name:
+        return timezone.utc
+    try:
+        return normalize_schedule_timezone(name)
+    except ValueError as exc:
+        raise TriggerServiceError(str(exc)) from exc
+
+
+def _next_weekly_occurrence(
+    base: datetime, weekdays: set[int], time_of_day: time, tz: tzinfo
+) -> datetime:
+    """Earliest datetime strictly after `base` combining a weekday in
+    `weekdays` (0=Mon..6=Sun) with `time_of_day`, both interpreted in `tz`
+    (the user's schedule timezone). Returned as UTC."""
+    local_base = base.astimezone(tz)
+    for offset in range(8):
+        candidate_date = local_base.date() + timedelta(days=offset)
+        if candidate_date.weekday() not in weekdays:
+            continue
+        candidate = datetime.combine(candidate_date, time_of_day, tzinfo=tz)
+        if candidate > base:
+            return candidate.astimezone(timezone.utc)
+    # Unreachable: a full week (7 days) always contains every weekday at
+    # least once, so offset 0..7 always yields a match strictly after base.
+    raise TriggerServiceError("Unable to compute next weekly occurrence")
+
+
+def _next_monthly_occurrence(
+    base: datetime, day_of_month: int, time_of_day: time, tz: tzinfo
+) -> datetime:
+    """Earliest datetime strictly after `base` on `day_of_month` (clamped to
+    the last day of short months) at `time_of_day`, both interpreted in `tz`.
+    Returned as UTC."""
+    local_base = base.astimezone(tz)
+    year, month = local_base.year, local_base.month
+    for _ in range(24):  # 24 months is far more than enough headroom
+        last_day = calendar.monthrange(year, month)[1]
+        day = min(day_of_month, last_day)
+        candidate = datetime.combine(date(year, month, day), time_of_day, tzinfo=tz)
+        if candidate > base:
+            return candidate.astimezone(timezone.utc)
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    raise TriggerServiceError("Unable to compute next monthly occurrence")
+
+
 def _compute_next_run_at(
     config: dict[str, Any],
     *,
@@ -260,14 +346,49 @@ def _compute_next_run_at(
     """Compute the next scheduled fire time for the supported MVP config."""
     base = _coerce_utc(previous_due_at) or from_time or _now()
     base = _coerce_utc(base) or _now()
+    now = _coerce_utc(from_time) or _now()
+
+    recurrence = config.get("recurrence")
+    if recurrence in ("weekly", "monthly"):
+        time_of_day = _parse_time_of_day(config.get("time_of_day"))
+        tz = _schedule_tzinfo(config)
+        # Only the first computation (no previous fire yet) may be pushed out
+        # by an explicit start_at; subsequent recomputations always advance
+        # from the last fire time.
+        if previous_due_at is None:
+            explicit_start = config.get("start_at")
+            if isinstance(explicit_start, str) and explicit_start.strip():
+                try:
+                    start = _coerce_utc(datetime.fromisoformat(explicit_start))
+                except ValueError as exc:
+                    raise TriggerServiceError("Invalid start_at") from exc
+                if start and start > base:
+                    # Subtract a second so a start date that itself matches
+                    # the recurrence still qualifies as its own first fire.
+                    base = start - timedelta(seconds=1)
+        # Like the interval path below, never schedule in the past: a stale
+        # previous_due_at (downtime, long-disabled trigger) skips the missed
+        # occurrences instead of firing a catch-up burst.
+        base = max(base, now)
+        if recurrence == "weekly":
+            return _next_weekly_occurrence(base, _weekday_set(config), time_of_day, tz)
+        return _next_monthly_occurrence(base, _day_of_month(config), time_of_day, tz)
 
     if include_explicit:
         explicit_next = config.get("next_run_at")
         if isinstance(explicit_next, str) and explicit_next.strip():
             try:
-                return _coerce_utc(datetime.fromisoformat(explicit_next))
+                explicit = _coerce_utc(datetime.fromisoformat(explicit_next))
             except ValueError as exc:
                 raise TriggerServiceError("Invalid next_run_at") from exc
+            if explicit is not None:
+                if explicit > now or config.get("interval_seconds") is None:
+                    return explicit
+                # A stale anchor (e.g. "today at 09:00" saved in the
+                # afternoon, or any later re-save of the same config) keeps
+                # the anchor's cadence but rolls forward past `now` via the
+                # interval math below, instead of firing immediately.
+                base = explicit
 
     interval = config.get("interval_seconds")
     if interval is None:
@@ -280,8 +401,6 @@ def _compute_next_run_at(
         raise TriggerServiceError("interval_seconds must be positive")
 
     candidate = base + timedelta(seconds=interval_seconds)
-    now = from_time or _now()
-    now = _coerce_utc(now) or _now()
     if candidate <= now:
         elapsed_seconds = (now - base).total_seconds()
         steps = int(elapsed_seconds // interval_seconds) + 1

@@ -1348,6 +1348,203 @@ def test_scheduled_next_run_skips_stale_intervals_without_iteration() -> None:
     assert next_run_at == now + timedelta(seconds=1)
 
 
+def test_scheduled_weekly_picks_earliest_selected_weekday() -> None:
+    # 2026-01-01 is a Thursday (weekday()==3).
+    base = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+    # Mon=0, Wed=2, Fri=4 selected; the next one after Thursday 09:00 is
+    # Friday 08:00 (same day, earlier time) -> still counts as after base? No:
+    # candidate must be strictly after base, so Friday 08:00 on 2026-01-02 at
+    # 08:00 is BEFORE 09:00 on the same day only if same date; here it's the
+    # next calendar day so it is after base regardless of time-of-day.
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "weekly", "weekdays": [0, 2, 4], "time_of_day": "08:00"},
+        from_time=base,
+        previous_due_at=base,
+        include_explicit=False,
+    )
+    assert next_run_at == datetime(2026, 1, 2, 8, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_weekly_skips_same_day_earlier_time() -> None:
+    # 2026-01-05 is a Monday. A weekly schedule for Monday at 08:00, when the
+    # last fire was also a Monday at 08:00, must advance a full week, not
+    # repeat the same day.
+    due_at = datetime(2026, 1, 5, 8, 0, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "weekly", "weekdays": [0], "time_of_day": "08:00"},
+        from_time=due_at,
+        previous_due_at=due_at,
+        include_explicit=False,
+    )
+    assert next_run_at == datetime(2026, 1, 12, 8, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_weekly_honors_start_at_on_first_computation() -> None:
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)  # Thursday
+    next_run_at = _compute_next_run_at(
+        {
+            "recurrence": "weekly",
+            "weekdays": [3],  # Thursday
+            "time_of_day": "09:00",
+            "start_at": "2026-01-15T00:00:00+00:00",
+        },
+        from_time=base,
+    )
+    # Without start_at this would be 2026-01-01 09:00 (same-day Thursday);
+    # the explicit start pushes it to the next Thursday on/after 2026-01-15.
+    assert next_run_at == datetime(2026, 1, 15, 9, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_monthly_clamps_short_months() -> None:
+    # day_of_month=31 in February clamps to the 28th (2026 is not a leap year).
+    base = datetime(2026, 1, 31, 10, 0, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "monthly", "day_of_month": 31, "time_of_day": "09:00"},
+        from_time=base,
+        previous_due_at=base,
+        include_explicit=False,
+    )
+    assert next_run_at == datetime(2026, 2, 28, 9, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_monthly_advances_a_full_month() -> None:
+    due_at = datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "monthly", "day_of_month": 15, "time_of_day": "09:00"},
+        from_time=due_at,
+        previous_due_at=due_at,
+        include_explicit=False,
+    )
+    assert next_run_at == datetime(2026, 4, 15, 9, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_weekly_skips_missed_occurrences_after_downtime() -> None:
+    # Last fire three weeks ago (server downtime): the next run must land
+    # after `now` in one computation — no catch-up burst of stale Mondays.
+    now = datetime(2026, 1, 28, 12, 0, tzinfo=timezone.utc)  # Wednesday
+    stale_due = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)  # Monday, 3w ago
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "weekly", "weekdays": [0], "time_of_day": "09:00"},
+        from_time=now,
+        previous_due_at=stale_due,
+        include_explicit=False,
+    )
+    assert next_run_at == datetime(2026, 2, 2, 9, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_past_explicit_anchor_rolls_forward_on_cadence() -> None:
+    # A "today at 09:00" anchor saved in the afternoon must not fire
+    # immediately; it keeps the 09:00 cadence and lands on the next step
+    # after now. Re-saving the same config later stays in the future too.
+    now = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc)
+    config = {
+        "recurrence": "daily",
+        "interval_seconds": 86400,
+        "time_of_day": "09:00",
+        "next_run_at": "2026-01-01T09:00:00+00:00",
+    }
+    next_run_at = _compute_next_run_at(config, from_time=now)
+    assert next_run_at == datetime(2026, 1, 2, 9, 0, tzinfo=timezone.utc)
+
+    # A future anchor is honored verbatim.
+    future = _compute_next_run_at(
+        {**config, "next_run_at": "2026-01-03T09:00:00+00:00"}, from_time=now
+    )
+    assert future == datetime(2026, 1, 3, 9, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_weekly_respects_schedule_timezone() -> None:
+    # Monday 09:00 in Asia/Shanghai (UTC+8) is Monday 01:00 UTC.
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)  # Thursday
+    next_run_at = _compute_next_run_at(
+        {
+            "recurrence": "weekly",
+            "weekdays": [0],
+            "time_of_day": "09:00",
+            "timezone": "Asia/Shanghai",
+        },
+        from_time=base,
+    )
+    assert next_run_at == datetime(2026, 1, 5, 1, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_weekly_timezone_decides_the_weekday() -> None:
+    # Monday 20:00 in Honolulu (UTC-10) is Tuesday 06:00 UTC — the weekday
+    # must be evaluated in the schedule's timezone, not UTC.
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {
+            "recurrence": "weekly",
+            "weekdays": [0],
+            "time_of_day": "20:00",
+            "timezone": "Pacific/Honolulu",
+        },
+        from_time=base,
+    )
+    # Next local Monday is 2026-01-05; 20:00 local = 06:00 UTC on the 6th.
+    assert next_run_at == datetime(2026, 1, 6, 6, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_rejects_unknown_timezone() -> None:
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+    from xagent.web.services.triggers import TriggerServiceError
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {
+                "recurrence": "weekly",
+                "weekdays": [0],
+                "time_of_day": "09:00",
+                "timezone": "Not/AZone",
+            },
+        )
+
+    with pytest.raises(TriggerServiceError):
+        _compute_next_run_at(
+            {
+                "recurrence": "weekly",
+                "weekdays": [0],
+                "time_of_day": "09:00",
+                "timezone": "Not/AZone",
+            },
+            from_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+
+def test_scheduled_config_validation_accepts_weekly_and_monthly() -> None:
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    weekly = parse_trigger_config(
+        "scheduled",
+        {"recurrence": "weekly", "weekdays": [0, 2, 4], "time_of_day": "09:00"},
+    )
+    assert weekly.weekdays == [0, 2, 4]
+
+    monthly = parse_trigger_config(
+        "scheduled",
+        {"recurrence": "monthly", "day_of_month": 31, "time_of_day": "09:00"},
+    )
+    assert monthly.day_of_month == 31
+
+
+def test_scheduled_config_validation_rejects_incomplete_weekly_and_monthly() -> None:
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"recurrence": "weekly"})
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"recurrence": "monthly"})
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"recurrence": "weekly", "weekdays": [0, 7]})
+
+
 def test_scheduled_scan_fires_due_trigger_and_advances_next_run(
     mock_bg_scheduler,
 ) -> None:

@@ -3648,21 +3648,34 @@ Build when you need.`,
       scheduledName: "Schedule",
       gmailName: "Gmail"
     },
-    overview: {
-      info: "Triggers define when this agent runs. Enable one or more ways to automatically activate the agent in response to external events or schedules."
-    },
     cards: {
       webhook: {
         title: "API / Webhook",
-        description: "Trigger via REST API call or incoming webhook"
+        description: "Trigger via REST API call or incoming webhook",
+        empty: {
+          title: "No webhooks yet",
+          description: "Create a webhook so other apps can start this agent — for example when a form is submitted or a new lead comes in.",
+          cta: "Create a webhook"
+        }
       },
       scheduled: {
         title: "Schedule",
-        description: "Run the agent automatically on a recurring interval"
+        description: "Run the agent automatically on a recurring interval",
+        empty: {
+          title: "No schedules yet",
+          description: "Create a schedule so this agent can run automatically — for example a daily summary or weekly report.",
+          cta: "Add schedule"
+        }
       },
       gmail: {
         title: "Gmail",
-        description: "Run the agent when a new email arrives in Gmail"
+        description: "Run the agent when a new email arrives in Gmail",
+        addTrigger: "Add Gmail trigger",
+        empty: {
+          title: "No Gmail accounts connected",
+          description: "Connect a Gmail account and choose which emails should start this agent. Each account gets its own settings.",
+          cta: "Sign in with Google"
+        }
       },
       activeCount: "{count} Active"
     },
@@ -3674,7 +3687,6 @@ Build when you need.`,
       configure: "Configure trigger"
     },
     staging: {
-      info: "Triggers configured here are saved with the draft and created automatically together with the agent.",
       webhookPending: "The webhook URL and signing secret will be generated after the agent is created.",
       failedTitle: "Some triggers could not be created. Their configuration is kept — retry or discard."
     },
@@ -3705,34 +3717,91 @@ Build when you need.`,
       name: "Name",
       namePlaceholder: "Daily report, CRM webhook...",
       type: "Type",
-      intervalSeconds: "Repeat every seconds",
-      nextRunAt: "First run at",
       secret: "Webhook secret",
       secretPlaceholder: "Leave blank to generate one",
       secretEditPlaceholder: "Leave blank to keep the current secret",
-      watchLabel: "Watch label / folder",
-      watchLabelPlaceholder: "INBOX",
+      watchLabel: "Watched label or folder (optional)",
+      watchLabelPlaceholder: "e.g. Support — leave blank to watch all incoming emails",
       watchLabelHelp: "Use * or all to match any label. Value is case-insensitive.",
       gmailAccount: "Gmail account",
       gmailAccountPlaceholder: "Select a Gmail account",
       gmailAccountHelp: "This trigger only fires for email in the selected mailbox.",
+      webhookNamePlaceholder: "e.g. New lead from website",
+      scheduleNamePlaceholder: "e.g. Morning summary report",
+      webhookPrompt: "Prompt template — what should the agent do when this webhook is called?",
+      webhookPromptPlaceholder: "e.g. A new lead just came in — research the company and draft an intro email",
+      schedulePrompt: "What should the agent do on each run?",
+      schedulePromptPlaceholder: "e.g. Generate today's daily summary report and email it to the team",
+      gmailPrompt: "What should the agent do with each email?",
+      gmailPromptPlaceholder: "e.g. Read the email and draft a friendly reply for my review",
+      gmailPromptHelp: "The email's sender, subject, and message are automatically shared with the agent on each run.",
+      generateSecret: "Generate secret",
+      secretGeneratedHint: "This secret is shown only once after saving — copy it now and keep it somewhere safe.",
       senderFilter: "Filter by sender (optional)",
       senderFilterPlaceholder: "e.g. @acme.com or boss@company.com",
       subjectKeyword: "Filter by subject keyword (optional)",
-      subjectKeywordPlaceholder: "e.g. [SUPPORT] or leave blank for all",
-      promptTemplate: "Prompt template",
-      promptPlaceholder: "Use {{payload}}, {{trigger_type}}, {{source_event_id}}, and {{test}}."
+      subjectKeywordPlaceholder: "e.g. [SUPPORT] or leave blank for all"
     },
     actions: {
       new: "New",
+      edit: "Edit",
       delete: "Delete",
       confirmDelete: "Confirm delete",
       rotateSecret: "Rotate secret",
       test: "Test trigger",
-      addAnother: "Add",
+      addAnotherWebhook: "Add another webhook",
+      addAnotherSchedule: "Add another schedule",
+      addAnotherGmail: "Add another Gmail trigger",
       retry: "Retry",
       discard: "Discard",
-      confirmDiscard: "Confirm discard"
+      confirmDiscard: "Confirm discard",
+      saveWebhook: "Save webhook",
+      saveSchedule: "Save schedule",
+      saveSettings: "Save settings"
+    },
+    editor: {
+      webhookNew: "New webhook",
+      webhookEdit: "Edit webhook",
+      scheduledNew: "New schedule",
+      scheduledEdit: "Edit schedule",
+      gmailNew: "New Gmail trigger",
+      gmailEdit: "Edit Gmail trigger"
+    },
+    item: {
+      gmailAllEmails: "All incoming emails"
+    },
+    schedule: {
+      nameLabel: "Schedule name",
+      recurrenceLabel: "How often should it run?",
+      hourly: "Hourly",
+      daily: "Daily",
+      weekly: "Weekly",
+      monthly: "Monthly",
+      custom: "Custom",
+      atWhatTime: "At what time?",
+      onWhichDays: "On which days?",
+      onWhichDayOfMonth: "On which day of the month?",
+      runEvery: "Run every",
+      customHelp: "For example every 30 minutes, or every 3 days.",
+      customUnitMinutes: "minutes",
+      customUnitHours: "hours",
+      customUnitDays: "days",
+      startCheckbox: "When should this schedule start?",
+      startFrom: "from",
+      weekdayMon: "Mon",
+      weekdayTue: "Tue",
+      weekdayWed: "Wed",
+      weekdayThu: "Thu",
+      weekdayFri: "Fri",
+      weekdaySat: "Sat",
+      weekdaySun: "Sun",
+      summaryHourly: "Runs every hour",
+      summaryDaily: "Runs every day at {time}",
+      summaryWeekly: "Runs weekly on {days} at {time}",
+      summaryMonthly: "Runs on the {day} of every month at {time}",
+      summaryCustom: "Runs every {amount} {unit}",
+      summaryStartsOnly: "{base} - starts {date}",
+      summaryStartsWithTime: "{base} - starts {date} at {time}"
     },
     secret: {
       title: "Copy this secret now. It is shown only once.",
@@ -3740,22 +3809,22 @@ Build when you need.`,
     },
     webhook: {
       title: "Webhook endpoint",
-      secretHeader: "Sign each request with HMAC-SHA256: put the hex digest of `{timestamp}.{raw body}` keyed by the secret in the x-xagent-signature header, and the unix timestamp in x-xagent-timestamp."
+      secretHeader: "Sign each request with HMAC-SHA256: put the hex digest of `{timestamp}.{raw body}` keyed by the secret in the x-xagent-signature header, and the unix timestamp in x-xagent-timestamp.",
+      pendingSave: "The webhook URL and signing secret are generated when you save."
     },
     gmail: {
-      connected: "Gmail connected",
-      connectedDescription: "A Gmail account is connected for this workspace.",
       notConnected: "Connect Gmail to activate this trigger",
       notConnectedDescription: "Connect the official Gmail connector before relying on incoming email events.",
       connect: "Connect Gmail",
       noAccounts: "No Gmail accounts connected",
-      accountMissing: "The selected Gmail account is no longer connected. Choose another account."
+      accountMissing: "The selected Gmail account is no longer connected. Choose another account.",
+      changeAccount: "Change account",
+      optionalFilters: "Optional filters — only react to certain senders or subjects"
     },
     test: {
-      title: "Test run",
-      subtitle: "Start a trigger run with a sample payload.",
-      sourceEventId: "Source event ID",
-      sourceEventPlaceholder: "optional-event-id"
+      running: "Running test…",
+      stagedPreviewNote: "The agent isn't created yet, so this is a local dry run — below is exactly what this trigger will send to the agent.",
+      stagedPromptLabel: "Rendered prompt"
     },
     runs: {
       title: "Recent runs",
@@ -3772,10 +3841,9 @@ Build when you need.`,
       nameLength: "Trigger name must be at most 200 characters",
       interval: "Interval must be a positive integer",
       nextRunAt: "First run time is invalid",
-      scheduleRequired: "Scheduled triggers need an interval or a first run time",
-      watchLabel: "Gmail triggers need a label or folder to watch",
-      gmailAccount: "Select the Gmail account this trigger should watch",
-      testPayload: "Test payload must be a JSON object"
+      scheduleRequired: "Weekly schedules need at least one weekday selected",
+      startDate: "Pick a start date for the schedule",
+      gmailAccount: "Select the Gmail account this trigger should watch"
     },
     messages: {
       loadFailed: "Failed to load triggers",

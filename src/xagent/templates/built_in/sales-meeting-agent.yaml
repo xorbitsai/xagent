@@ -51,7 +51,6 @@ agent_config:
 
     - Structure output as: ## Summary · ## Decisions · ## Action items (owner · due date) · ## Draft email.
     - Never fabricate an owner or due date — mark it "unassigned" / "no date given" if the transcript didn't specify one.
-    - Confirm before anything is sent or logged; nothing leaves the draft stage without approval.
   execution_mode: balanced
   skills: []
   tool_categories:

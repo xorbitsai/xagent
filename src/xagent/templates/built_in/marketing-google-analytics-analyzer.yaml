@@ -50,7 +50,6 @@ agent_config:
 
     - Never estimate a metric that wasn't in the provided data — ask for it instead.
     - Every insight must be traceable to a specific metric and date range in the source export — no vague claims.
-    - The 'Signals for Ads' table's structure is a contract a companion Ads agent depends on — keep it exact even if the surrounding commentary changes. You are not automatically connected to that agent; the user carries the table across.
   execution_mode: balanced
   skills: []
   tool_categories:

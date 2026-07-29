@@ -11,7 +11,7 @@ Existing duplicate (user_id, name) rows (if any) are renamed before the
 index is created so this migration cannot fail on already-messy data.
 
 Revision ID: 20260728_add_agent_template_id_and_name_uniqueness
-Revises: 20260725_add_uploaded_file_recovery_index
+Revises: 20260724_add_upload_source_to_uploaded_files
 Create Date: 2026-07-28
 """
 
@@ -22,7 +22,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260728_add_agent_template_id_and_name_uniqueness"
-down_revision: Union[str, None] = "20260725_add_uploaded_file_recovery_index"
+down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

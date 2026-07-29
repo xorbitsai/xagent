@@ -396,7 +396,7 @@ def build_preview_workforce_snapshot(
     seen_worker_agent_ids: set[int] = set()
     for worker in workers:
         agent_id = worker.get("agent_id")
-        if not isinstance(agent_id, int):
+        if not isinstance(agent_id, int) or isinstance(agent_id, bool):
             raise HTTPException(
                 status_code=400, detail="agent_id is required for each worker"
             )

@@ -437,6 +437,33 @@ async def test_create_preview_workforce_run_rejects_duplicate_worker_agent(
 
 
 @pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_boolean_worker_agent_id(
+    db_session: Session,
+) -> None:
+    """bool is an int subclass in Python; a worker's agent_id must reject it."""
+    user = _create_user(db_session, "boolean-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": True,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_create_workforce_run_releases_connection_before_worker_transaction(
     single_connection_workforce_db,
     monkeypatch: pytest.MonkeyPatch,

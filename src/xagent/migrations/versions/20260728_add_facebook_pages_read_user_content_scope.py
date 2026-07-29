@@ -23,6 +23,12 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("oauth_scopes", sa.JSON),
 )
 
+USER_OAUTH_TABLE = sa.table(
+    "user_oauth",
+    sa.column("provider", sa.String),
+    sa.column("access_token", sa.String),
+)
+
 APP_ID = "facebook"
 NEW_SCOPE = "pages_read_user_content"
 PREVIOUS_SCOPES = ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]
@@ -45,9 +51,40 @@ def _set_scopes(bind: sa.engine.Connection, scopes: list[str]) -> None:
     )
 
 
+def _invalidate_existing_facebook_grants(bind: sa.engine.Connection) -> None:
+    """Force reconnection for Facebook grants issued under the old scope set.
+
+    Meta never returns a ``scope`` field from its token endpoint, so a stored
+    grant's actual permissions can't be inspected after the fact — there is no
+    way to tell whether a given row already has ``pages_read_user_content``.
+    Every row was necessarily authorized before this scope existed, so the
+    access token is cleared; ``_oauth_account_can_connect`` treats a falsy
+    token as disconnected, and the connector UI prompts the user to
+    reconnect and grant the new permission.
+    """
+
+    inspector = sa.inspect(bind)
+    if "user_oauth" not in set(inspector.get_table_names()):
+        return
+
+    columns = {c["name"] for c in inspector.get_columns("user_oauth")}
+    if not {"provider", "access_token"}.issubset(columns):
+        return
+
+    bind.execute(
+        sa.update(USER_OAUTH_TABLE)
+        .where(USER_OAUTH_TABLE.c.provider == APP_ID)
+        .values(access_token="")
+    )
+
+
 def upgrade() -> None:
-    _set_scopes(op.get_bind(), CURRENT_SCOPES)
+    bind = op.get_bind()
+    _set_scopes(bind, CURRENT_SCOPES)
+    _invalidate_existing_facebook_grants(bind)
 
 
 def downgrade() -> None:
+    # The cleared access tokens are gone for good (that's the point — force a
+    # reconnect); there is nothing meaningful to restore for user_oauth here.
     _set_scopes(op.get_bind(), PREVIOUS_SCOPES)

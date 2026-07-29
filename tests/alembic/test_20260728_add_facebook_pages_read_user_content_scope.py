@@ -58,6 +58,34 @@ def _scopes(connection):
     return json.loads(value) if isinstance(value, str) else value
 
 
+def _create_user_oauth_table(connection):
+    connection.execute(
+        text(
+            """
+            CREATE TABLE user_oauth (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                provider VARCHAR(50) NOT NULL,
+                access_token VARCHAR NOT NULL
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO user_oauth (user_id, provider, access_token) VALUES "
+            "(1, 'facebook', 'old-facebook-token'), "
+            "(1, 'instagram', 'old-instagram-token')"
+        )
+    )
+
+
+def _access_tokens(connection):
+    return dict(
+        connection.execute(text("SELECT provider, access_token FROM user_oauth")).all()
+    )
+
+
 def test_upgrade_adds_pages_read_user_content(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -102,6 +130,28 @@ def test_downgrade_removes_pages_read_user_content(tmp_path):
             "pages_read_engagement",
             "pages_manage_posts",
         ]
+
+
+def test_upgrade_invalidates_existing_facebook_grant_only(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _create_user_oauth_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        tokens = _access_tokens(connection)
+        assert tokens["facebook"] == ""
+        assert tokens["instagram"] == "old-instagram-token"
+
+
+def test_upgrade_without_user_oauth_table_is_a_noop(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise when user_oauth doesn't exist
 
 
 def test_migration_scopes_match_registry():

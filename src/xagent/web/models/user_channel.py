@@ -21,7 +21,7 @@ def _get_cipher() -> Fernet:
 
 
 class UserChannel(Base):  # type: ignore[no-any-unimported]
-    """User Channels configurations (e.g. Telegram Bot, Feishu)"""
+    """User Channels configurations (e.g. Telegram, Feishu, Slack)."""
 
     __tablename__ = "user_channels"
 
@@ -49,18 +49,12 @@ class UserChannel(Base):  # type: ignore[no-any-unimported]
         config_copy = copy.deepcopy(raw_config)
 
         # Decrypt sensitive fields
-        if config_copy.get("bot_token"):
+        for field in ("bot_token", "app_secret", "app_token"):
+            if not config_copy.get(field):
+                continue
             try:
-                config_copy["bot_token"] = cipher.decrypt(
-                    config_copy["bot_token"].encode()
-                ).decode()
-            except Exception:
-                pass  # Fallback to plaintext if not encrypted
-
-        if config_copy.get("app_secret"):
-            try:
-                config_copy["app_secret"] = cipher.decrypt(
-                    config_copy["app_secret"].encode()
+                config_copy[field] = cipher.decrypt(
+                    config_copy[field].encode()
                 ).decode()
             except Exception:
                 pass  # Fallback to plaintext if not encrypted
@@ -76,20 +70,14 @@ class UserChannel(Base):  # type: ignore[no-any-unimported]
         config_copy = copy.deepcopy(value)
 
         # Encrypt sensitive fields
-        if config_copy.get("bot_token"):
+        for field in ("bot_token", "app_secret", "app_token"):
+            if not config_copy.get(field):
+                continue
             try:
-                cipher.decrypt(config_copy["bot_token"].encode())
+                cipher.decrypt(config_copy[field].encode())
             except Exception:
-                config_copy["bot_token"] = cipher.encrypt(
-                    config_copy["bot_token"].encode()
-                ).decode()
-
-        if config_copy.get("app_secret"):
-            try:
-                cipher.decrypt(config_copy["app_secret"].encode())
-            except Exception:
-                config_copy["app_secret"] = cipher.encrypt(
-                    config_copy["app_secret"].encode()
+                config_copy[field] = cipher.encrypt(
+                    config_copy[field].encode()
                 ).decode()
 
         self._config = config_copy  # type: ignore[assignment]

@@ -60,6 +60,7 @@ repos:
           - python-pptx
           - cloudpickle
           - exa-py
+          - slack-sdk==3.43.0
           - limits
           - google-genai==1.66.0
           - elevenlabs==2.56.0

@@ -1254,9 +1254,10 @@ async def startup_event() -> None:
     app.state.task_command_dispatcher_task = _task_command_dispatcher_task
     logger.info("Started durable task command dispatcher")
 
-    # Start Telegram and FeiShu channels if enabled
+    # Start configured chat channels.
     try:
         from .channels.feishu.bot import get_feishu_channel
+        from .channels.slack.bot import get_slack_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
@@ -1270,8 +1271,14 @@ async def startup_event() -> None:
             logger.info("Initializing Feishu channel manager...")
             app.state.feishu_task = asyncio.create_task(feishu_channel.start())
             logger.info("Feishu channel background task created successfully")
+
+        slack_channel = get_slack_channel()
+        if slack_channel.enabled:
+            logger.info("Initializing Slack channel manager...")
+            app.state.slack_task = asyncio.create_task(slack_channel.start())
+            logger.info("Slack channel background task created successfully")
     except Exception as e:
-        logger.error(f"Failed to start Telegram channel manager: {e}", exc_info=True)
+        logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
 
 
 @app.on_event("shutdown")
@@ -1330,13 +1337,17 @@ async def shutdown_event() -> None:
             with suppress(asyncio.CancelledError):
                 await task
 
-    # Shutdown Telegram channel if enabled
+    # Shutdown chat channels before draining task finalizers.
     try:
         if hasattr(app.state, "telegram_task"):
             app.state.telegram_task.cancel()
             logger.info("Cancelled Telegram polling task")
+        if hasattr(app.state, "slack_task"):
+            app.state.slack_task.cancel()
+            logger.info("Cancelled Slack manager task")
 
         from .channels.feishu.bot import get_feishu_channel
+        from .channels.slack.bot import get_slack_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
@@ -1346,8 +1357,11 @@ async def shutdown_event() -> None:
 
         feishu_channel = get_feishu_channel()
         await feishu_channel.stop()
+
+        slack_channel = get_slack_channel()
+        await slack_channel.stop()
     except Exception as e:
-        logger.error("Failed to stop Telegram channel: %s", e, exc_info=True)
+        logger.error("Failed to stop chat channels: %s", e, exc_info=True)
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.

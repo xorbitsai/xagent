@@ -172,6 +172,8 @@ async def test_application_shutdown_stops_task_lease_recovery(
     fake_telegram_bot.get_telegram_channel = lambda: _FakeChannel()
     fake_feishu_bot = ModuleType("xagent.web.channels.feishu.bot")
     fake_feishu_bot.get_feishu_channel = lambda: _FakeChannel()
+    fake_slack_bot = ModuleType("xagent.web.channels.slack.bot")
+    fake_slack_bot.get_slack_channel = lambda: _FakeChannel()
     monkeypatch.setitem(
         sys.modules,
         "xagent.web.channels.telegram.bot",
@@ -181,6 +183,11 @@ async def test_application_shutdown_stops_task_lease_recovery(
         sys.modules,
         "xagent.web.channels.feishu.bot",
         fake_feishu_bot,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "xagent.web.channels.slack.bot",
+        fake_slack_bot,
     )
     monkeypatch.setattr(app_module, "flush_langfuse", lambda: None)
     monkeypatch.setattr(app_module, "stop_task_lease_recovery_task", fake_stop)
@@ -209,6 +216,8 @@ async def test_application_shutdown_stops_task_lease_recovery(
     app_module.app.state.metadata_rebuild_task = None
     if hasattr(app_module.app.state, "telegram_task"):
         delattr(app_module.app.state, "telegram_task")
+    if hasattr(app_module.app.state, "slack_task"):
+        delattr(app_module.app.state, "slack_task")
 
     await app_module.shutdown_event()
 

@@ -31,10 +31,9 @@ from xagent.providers.vector_store.lancedb import get_connection_from_env
 
 
 def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Avoid Telegram/Feishu startup errors when optional deps are missing.
+    """Avoid chat-channel startup work in migration tests.
 
-    ``startup_event`` optionally starts the Telegram and Feishu channel managers.
-    These managers pull optional dependencies (aiogram, feishu) that CI may omit.
+    ``startup_event`` optionally starts the Telegram, Feishu, and Slack managers.
 
     We inject lightweight stub modules into ``sys.modules`` instead of
     ``monkeypatch.setattr("...telegram.bot...", ...)``, because importing the real
@@ -70,6 +69,10 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_feishu_bot = ModuleType("xagent.web.channels.feishu.bot")
     fake_feishu_bot.get_feishu_channel = lambda: _FakeFeishuChannel()
     monkeypatch.setitem(sys.modules, "xagent.web.channels.feishu.bot", fake_feishu_bot)
+
+    fake_slack_bot = ModuleType("xagent.web.channels.slack.bot")
+    fake_slack_bot.get_slack_channel = lambda: _FakeFeishuChannel()
+    monkeypatch.setitem(sys.modules, "xagent.web.channels.slack.bot", fake_slack_bot)
 
 
 def _patch_task_command_dispatcher_disabled(

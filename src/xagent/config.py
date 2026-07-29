@@ -131,6 +131,10 @@ GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECO
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
+SLACK_CLIENT_ID = "XAGENT_SLACK_CLIENT_ID"
+SLACK_CLIENT_SECRET = "XAGENT_SLACK_CLIENT_SECRET"
+SLACK_APP_TOKEN = "XAGENT_SLACK_APP_TOKEN"
+SLACK_REDIRECT_URI = "XAGENT_SLACK_REDIRECT_URI"
 SMTP_HOST = "XAGENT_SMTP_HOST"
 SMTP_PORT = "XAGENT_SMTP_PORT"
 SMTP_USERNAME = "XAGENT_SMTP_USERNAME"
@@ -356,6 +360,40 @@ def get_password_reset_expire_minutes() -> int:
 def get_app_base_url() -> str | None:
     """Return the trusted frontend base URL used in email links."""
     return _normalized_env_url(APP_BASE_URL)
+
+
+def get_slack_client_id() -> str | None:
+    """Return the Slack app client ID used by the workspace OAuth flow."""
+    value = (os.getenv(SLACK_CLIENT_ID) or "").strip()
+    return value or None
+
+
+def get_slack_client_secret() -> str | None:
+    """Return the Slack app client secret used to exchange OAuth codes."""
+    value = (os.getenv(SLACK_CLIENT_SECRET) or "").strip()
+    return value or None
+
+
+def get_slack_app_token() -> str | None:
+    """Return the shared Slack Socket Mode app-level token."""
+    value = (os.getenv(SLACK_APP_TOKEN) or "").strip()
+    return value or None
+
+
+def get_slack_oauth_redirect_uri() -> str | None:
+    """Return the externally reachable Slack OAuth callback URL.
+
+    An explicit redirect URI wins. Otherwise derive the callback from the
+    public backend base URL so all advertised provider callbacks share the
+    same deployment-level source of truth.
+    """
+    explicit = _normalized_env_url(SLACK_REDIRECT_URI)
+    if explicit is not None:
+        return explicit
+    public_base_url = get_public_api_base_url()
+    if public_base_url is None:
+        return None
+    return f"{public_base_url}/api/channels/slack/oauth/callback"
 
 
 def get_smtp_host() -> str:

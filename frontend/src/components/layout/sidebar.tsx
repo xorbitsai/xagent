@@ -43,6 +43,7 @@ import {
   Search,
   Radio,
   Send,
+  Hash,
   ChevronsUpDown,
 } from "lucide-react"
 import {
@@ -97,6 +98,9 @@ function ChannelTypeIcon({ channelType }: { channelType?: string }) {
 
   if (normalizedType === "telegram") {
     return <Send className="h-3 w-3 flex-shrink-0 text-[#229ED9]" aria-hidden="true" />
+  }
+  if (normalizedType === "slack") {
+    return <Hash className="h-3 w-3 flex-shrink-0 text-[#4A154B]" aria-hidden="true" />
   }
 
   const iconPath = CHANNEL_ICON_PATHS[normalizedType]

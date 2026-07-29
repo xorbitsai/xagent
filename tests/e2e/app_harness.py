@@ -61,6 +61,16 @@ class _DisabledFeishuChannel:
         return None
 
 
+class _DisabledSlackChannel:
+    enabled = False
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
 def build_access_token(
     *,
     username: str,
@@ -228,3 +238,7 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     feishu_module = ModuleType("xagent.web.channels.feishu.bot")
     feishu_module.get_feishu_channel = lambda: _DisabledFeishuChannel()
     monkeypatch.setitem(sys.modules, "xagent.web.channels.feishu.bot", feishu_module)
+
+    slack_module = ModuleType("xagent.web.channels.slack.bot")
+    slack_module.get_slack_channel = lambda: _DisabledSlackChannel()
+    monkeypatch.setitem(sys.modules, "xagent.web.channels.slack.bot", slack_module)

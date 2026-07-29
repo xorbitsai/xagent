@@ -37,6 +37,14 @@ describe("channel display", () => {
     expect(getCompactChannelName("生产环境飞书", "feishu")).toBe("生产环境")
   })
 
+  it("supports Slack channels", () => {
+    expect(getCompactChannelName("Xagent Slack", "slack")).toBe("Xagent")
+    expect(getCompactChannelName("Slack Support", "SLACK")).toBe("Support")
+    expect(getChannelTooltip("Xagent Slack", "slack")).toBe(
+      "Slack · Xagent Slack",
+    )
+  })
+
   it("does not strip a CJK alias from the middle of a larger token", () => {
     expect(getCompactChannelName("超级飞书商店", "feishu")).toBe("超级飞书商店")
   })

@@ -63,6 +63,10 @@ from xagent.config import (
     SANDBOX_MEMORY,
     SANDBOX_SWEEP_INTERVAL,
     SANDBOX_VOLUMES,
+    SLACK_APP_TOKEN,
+    SLACK_CLIENT_ID,
+    SLACK_CLIENT_SECRET,
+    SLACK_REDIRECT_URI,
     SMTP_FROM_EMAIL,
     SMTP_FROM_NAME,
     SMTP_HOST,
@@ -147,6 +151,10 @@ from xagent.config import (
     get_sandbox_memory,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_slack_app_token,
+    get_slack_client_id,
+    get_slack_client_secret,
+    get_slack_oauth_redirect_uri,
     get_smtp_from_email,
     get_smtp_from_name,
     get_smtp_host,
@@ -325,6 +333,12 @@ class TestEnvironmentVariableConstants:
         assert SMTP_FROM_EMAIL == "XAGENT_SMTP_FROM_EMAIL"
         assert SMTP_FROM_NAME == "XAGENT_SMTP_FROM_NAME"
 
+    def test_slack_oauth_config_constants(self):
+        assert SLACK_CLIENT_ID == "XAGENT_SLACK_CLIENT_ID"
+        assert SLACK_CLIENT_SECRET == "XAGENT_SLACK_CLIENT_SECRET"
+        assert SLACK_APP_TOKEN == "XAGENT_SLACK_APP_TOKEN"
+        assert SLACK_REDIRECT_URI == "XAGENT_SLACK_REDIRECT_URI"
+
 
 class TestAuthEmailConfig:
     def test_password_reset_expire_minutes_defaults_to_30(self, monkeypatch):
@@ -348,6 +362,47 @@ class TestAuthEmailConfig:
     def test_app_base_url_strips_and_removes_trailing_slash(self, monkeypatch):
         monkeypatch.setenv(APP_BASE_URL, " https://app.example.com/base/ ")
         assert get_app_base_url() == "https://app.example.com/base"
+
+    def test_slack_oauth_config_defaults_to_unconfigured(self, monkeypatch):
+        for env_name in (
+            SLACK_CLIENT_ID,
+            SLACK_CLIENT_SECRET,
+            SLACK_APP_TOKEN,
+            SLACK_REDIRECT_URI,
+            PUBLIC_API_BASE_URL,
+        ):
+            monkeypatch.delenv(env_name, raising=False)
+
+        assert get_slack_client_id() is None
+        assert get_slack_client_secret() is None
+        assert get_slack_app_token() is None
+        assert get_slack_oauth_redirect_uri() is None
+
+    def test_slack_oauth_config_uses_explicit_values(self, monkeypatch):
+        monkeypatch.setenv(SLACK_CLIENT_ID, " client-id ")
+        monkeypatch.setenv(SLACK_CLIENT_SECRET, " client-secret ")
+        monkeypatch.setenv(SLACK_APP_TOKEN, " xapp-test ")
+        monkeypatch.setenv(
+            SLACK_REDIRECT_URI,
+            " https://api.example.com/api/channels/slack/oauth/callback/ ",
+        )
+
+        assert get_slack_client_id() == "client-id"
+        assert get_slack_client_secret() == "client-secret"
+        assert get_slack_app_token() == "xapp-test"
+        assert (
+            get_slack_oauth_redirect_uri()
+            == "https://api.example.com/api/channels/slack/oauth/callback"
+        )
+
+    def test_slack_redirect_uri_falls_back_to_public_api_base(self, monkeypatch):
+        monkeypatch.delenv(SLACK_REDIRECT_URI, raising=False)
+        monkeypatch.setenv(PUBLIC_API_BASE_URL, " https://api.example.com/ ")
+
+        assert (
+            get_slack_oauth_redirect_uri()
+            == "https://api.example.com/api/channels/slack/oauth/callback"
+        )
 
     def test_smtp_host_and_credentials_strip_expected_values(self, monkeypatch):
         monkeypatch.setenv(SMTP_HOST, " smtp.example.com ")

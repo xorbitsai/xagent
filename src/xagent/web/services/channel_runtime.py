@@ -1,10 +1,10 @@
 """Detached database boundaries shared by asynchronous chat transports.
 
-Telegram and Feishu spend most of a turn awaiting network, file, sandbox, and
-agent work.  A transport must therefore never retain a SQLAlchemy ``Session``
-or an attached ORM row for the lifetime of that turn.  This module owns the
-short worker-side transactions required by both transports and returns only
-frozen primitive snapshots.
+Telegram, Feishu, and Slack spend most of a turn awaiting network, file,
+sandbox, and agent work. A transport must therefore never retain a SQLAlchemy
+``Session`` or an attached ORM row for the lifetime of that turn. This module
+owns the short worker-side transactions required by these transports and
+returns only frozen primitive snapshots.
 """
 
 from __future__ import annotations

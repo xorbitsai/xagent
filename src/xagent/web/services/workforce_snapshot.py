@@ -425,9 +425,8 @@ def build_preview_workforce_snapshot(
             raise HTTPException(
                 status_code=400, detail="assignment_instructions is required"
             )
-        alias = (
-            normalize_text(cast(str | None, worker.get("alias")), "alias")
-            or cast(str, agent.name)
+        alias = normalize_text(cast(str | None, worker.get("alias")), "alias") or cast(
+            str, agent.name
         )
 
         snapshot_workers.append(

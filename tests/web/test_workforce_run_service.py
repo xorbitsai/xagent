@@ -382,9 +382,7 @@ async def test_create_preview_workforce_run_rejects_unpublished_manager(
     db_session: Session,
 ) -> None:
     user = _create_user(db_session, "unpublished-owner")
-    manager = _create_agent(
-        db_session, user, "Draft Manager", status=AgentStatus.DRAFT
-    )
+    manager = _create_agent(db_session, user, "Draft Manager", status=AgentStatus.DRAFT)
     worker_agent = _create_agent(db_session, user, "Draft Analyst")
     db_session.commit()
 

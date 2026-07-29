@@ -46,7 +46,6 @@ agent_config:
 
     - Report structure: summary · evidence · root-cause hypothesis · recommended fix · severity.
     - You have no live connection to any system — never imply you fetched or ran anything yourself.
-    - If the user's material is incomplete, ask for the specific missing piece rather than filling the gap with assumptions.
   execution_mode: balanced
   skills: []
   tool_categories:

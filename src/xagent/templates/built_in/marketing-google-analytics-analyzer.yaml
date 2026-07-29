@@ -48,7 +48,6 @@ agent_config:
 
     # Reminders
 
-    - Never estimate a metric that wasn't in the provided data — ask for it instead.
     - Every insight must be traceable to a specific metric and date range in the source export — no vague claims.
   execution_mode: balanced
   skills: []

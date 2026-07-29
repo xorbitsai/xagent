@@ -207,3 +207,48 @@ async def test_admin_user_delete_cleans_task_created_during_runtime_cleanup():
     finally:
         unregister_task_extension("racy_delete_observer")
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_delete_pages_runtime_cleanup(monkeypatch):
+    import xagent.web.api.admin_users as admin_users_module
+
+    _admin_headers()
+    _register_second_user("paged-runtime-user", "runtimepass1")
+
+    class _PagedDeleteObserver(_DeleteObserverProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleaned_task_ids: list[int] = []
+
+        async def on_task_deleted(self, context) -> None:
+            self.cleaned_task_ids.append(context.task_id)
+
+    provider = _PagedDeleteObserver()
+    register_task_extension("paged_delete_observer", provider)
+    monkeypatch.setattr(admin_users_module, "_TASK_RUNTIME_DELETE_PAGE_SIZE", 2)
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "paged-runtime-user").one()
+        tasks = [
+            Task(
+                user_id=int(target.id),
+                title=f"runtime task {index}",
+                description="",
+            )
+            for index in range(5)
+        ]
+        db.add_all(tasks)
+        db.commit()
+        task_ids = {int(task.id) for task in tasks}
+        target_id = int(target.id)
+
+        response = await delete_user(target_id, admin, db)
+
+        assert response == {"message": "User deleted successfully"}
+        assert set(provider.cleaned_task_ids) == task_ids
+        assert db.query(Task).filter(Task.user_id == target_id).count() == 0
+    finally:
+        unregister_task_extension("paged_delete_observer")
+        db.close()

@@ -212,6 +212,8 @@ def _get_service() -> Any:
 
 
 class RouterLLM(BaseLLM):
+    supports_preferred_input_modalities = True
+
     def __init__(
         self,
         model_name: str = "auto",

@@ -243,7 +243,10 @@ class AgentExecutionAdapter:
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
         )
-        metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(preferred_modalities)
+        if preferred_modalities:
+            metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
         return metadata
 
     def _build_runner(self) -> tuple[AgentRunner, str]:

@@ -13,6 +13,8 @@ import json
 import logging
 import re
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from threading import RLock
 from typing import Any
 
@@ -20,6 +22,8 @@ from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     MAX_TASK_RUNTIME_EXTENSIONS,
     MAX_TASK_RUNTIME_JSON_BYTES,
+    MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
+    TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     TaskRuntimeExtensionProvider,
@@ -42,6 +46,11 @@ _TASK_RUNTIME_HOOK_TIMEOUT_SECONDS = {
     "public_metadata": 10.0,
     "on_task_deleted": 30.0,
 }
+_TASK_RUNTIME_HOOK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="xagent-task-runtime",
+)
+_PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -174,7 +183,8 @@ async def create_task_extensions(
                 context,
                 configuration,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            _propagate_control_flow_exception(exc)
             await _cleanup_after_create_failure(
                 context,
                 providers=(*completed, (name, provider)),
@@ -186,9 +196,10 @@ async def create_task_extensions(
 async def build_task_runtime(
     context: TaskRuntimeContext,
 ) -> TaskRuntimeContribution:
-    """Build and merge every registered provider's contribution for one task."""
+    """Build providers independently and merge every successful contribution."""
 
     contributions: dict[str, TaskRuntimeContribution | None] = {}
+    merged = EMPTY_TASK_RUNTIME_CONTRIBUTION
     for name, provider in _registered_extension_items():
         try:
             contribution = await _invoke_provider_hook(
@@ -196,19 +207,19 @@ async def build_task_runtime(
                 "build_runtime",
                 context,
             )
-            contributions[name] = normalize_task_runtime_contribution(contribution)
-        except Exception as exc:
-            raise TaskRuntimeExtensionError(name, "build_runtime", exc) from exc
-    if not contributions:
-        return EMPTY_TASK_RUNTIME_CONTRIBUTION
-    try:
-        return merge_task_runtime_contributions(contributions)
-    except Exception as exc:
-        raise TaskRuntimeExtensionError(
-            "registry",
-            "merge_contributions",
-            exc,
-        ) from exc
+            normalized = normalize_task_runtime_contribution(contribution)
+            candidate = {**contributions, name: normalized}
+            merged = merge_task_runtime_contributions(candidate)
+        except BaseException as exc:
+            _propagate_control_flow_exception(exc)
+            logger.error(
+                "Ignoring failed task runtime contribution from extension '%s'",
+                name,
+                exc_info=True,
+            )
+            continue
+        contributions[name] = normalized
+    return merged
 
 
 async def get_task_runtime_public_metadata(
@@ -217,6 +228,7 @@ async def get_task_runtime_public_metadata(
     """Return provider-selected, JSON-safe metadata suitable for clients."""
 
     result: dict[str, dict[str, Any]] = {}
+    omitted_extensions: list[str] = []
     for name, provider in _registered_extension_items():
         try:
             metadata = await _invoke_provider_hook(
@@ -231,9 +243,29 @@ async def get_task_runtime_public_metadata(
             detached = dict(metadata)
             _ensure_json_compatible(detached, label=f"'{name}' public metadata")
             if detached:
-                result[name] = detached
-        except Exception as exc:
+                candidate = {**result, name: detached}
+                if _json_encoded_size(candidate) > (
+                    MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES
+                    - _PUBLIC_METADATA_STATUS_RESERVE_BYTES
+                ):
+                    omitted_extensions.append(name)
+                    logger.warning(
+                        "Omitting public metadata from task runtime extension "
+                        "'%s' because the aggregate response reached %d bytes",
+                        name,
+                        MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
+                    )
+                else:
+                    result[name] = detached
+        except BaseException as exc:
+            _propagate_control_flow_exception(exc)
             raise TaskRuntimeExtensionError(name, "public_metadata", exc) from exc
+    if omitted_extensions:
+        result[TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY] = {
+            "partial": True,
+            "omitted_extensions": omitted_extensions,
+            "limit_bytes": MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
+        }
     return result
 
 
@@ -253,7 +285,8 @@ async def delete_task_extensions(context: TaskRuntimeContext) -> None:
                 "on_task_deleted",
                 context,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            _propagate_control_flow_exception(exc)
             failures.append((name, exc))
     if failures:
         failure_name, first_cause = failures[0]
@@ -281,7 +314,8 @@ async def _cleanup_after_create_failure(
                 "on_task_deleted",
                 context,
             )
-        except Exception:
+        except BaseException as exc:
+            _propagate_control_flow_exception(exc)
             # The original create failure remains primary. Providers should make
             # deletion idempotent so operators can retry cleanup safely.
             logger.warning(
@@ -314,13 +348,20 @@ async def _invoke_provider_hook(
 
     hook = getattr(provider, operation)
     timeout = _TASK_RUNTIME_HOOK_TIMEOUT_SECONDS[operation]
+    loop = asyncio.get_running_loop()
 
     async def _invoke() -> Any:
         try:
-            value = await asyncio.to_thread(hook, *args)
+            value = await loop.run_in_executor(
+                _TASK_RUNTIME_HOOK_EXECUTOR,
+                partial(hook, *args),
+            )
             return await _maybe_await(value)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as exc:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            return _ProviderHookRaised(exc)
         except BaseException as exc:
             # ``SystemExit``/``KeyboardInterrupt`` raised inside a child Task can
             # otherwise terminate the event loop before the awaiting caller can
@@ -338,6 +379,17 @@ async def _invoke_provider_hook(
     return result
 
 
+def _propagate_control_flow_exception(error: BaseException) -> None:
+    """Preserve process control and cancellation of the surrounding task."""
+
+    if isinstance(error, (SystemExit, KeyboardInterrupt)):
+        raise error
+    if isinstance(error, asyncio.CancelledError):
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise error
+
+
 def _normalize_extension_name(name: str) -> str:
     normalized = name.strip()
     if not _EXTENSION_NAME_RE.fullmatch(normalized):
@@ -350,17 +402,23 @@ def _normalize_extension_name(name: str) -> str:
 
 def _ensure_json_compatible(value: Any, *, label: str) -> None:
     try:
-        encoded = json.dumps(
+        encoded_size = _json_encoded_size(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{label} must be JSON-compatible") from exc
+    if encoded_size > MAX_TASK_RUNTIME_JSON_BYTES:
+        raise ValueError(
+            f"{label} exceeds the {MAX_TASK_RUNTIME_JSON_BYTES}-byte limit"
+        )
+
+
+def _json_encoded_size(value: Any) -> int:
+    return len(
+        json.dumps(
             value,
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{label} must be JSON-compatible") from exc
-    if len(encoded) > MAX_TASK_RUNTIME_JSON_BYTES:
-        raise ValueError(
-            f"{label} exceeds the {MAX_TASK_RUNTIME_JSON_BYTES}-byte limit"
-        )
+    )
 
 
 def _registered_extension_items() -> tuple[

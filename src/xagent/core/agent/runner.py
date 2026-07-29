@@ -89,7 +89,7 @@ class AgentRunner:
             )
         if checkpoint and isinstance(checkpoint.get("context"), dict):
             context = ExecutionContext.from_dict(checkpoint["context"])
-            self._merge_context_metadata(context, metadata)
+            self._merge_context_metadata(context, metadata, restored=True)
             self.context_manager.set_context(context)
             execution_id = context.execution_id
             workspace = None
@@ -625,11 +625,30 @@ class AgentRunner:
         self,
         context: ExecutionContext,
         metadata: dict[str, Any] | None,
+        *,
+        restored: bool = False,
     ) -> None:
         """Overlay current-run metadata on new or checkpoint-restored context."""
 
         if metadata is None:
             return
+        if restored:
+            if PREFERRED_INPUT_MODALITIES_METADATA_KEY not in metadata:
+                return
+            preferred_modalities = normalize_input_modalities(
+                metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY]
+            )
+            if preferred_modalities:
+                context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                    preferred_modalities
+                )
+            else:
+                context.metadata.pop(
+                    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+                    None,
+                )
+            return
+
         current_metadata = dict(metadata)
         preferred_modalities = normalize_input_modalities(
             current_metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())

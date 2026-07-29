@@ -169,22 +169,6 @@ class BaseLLM(ABC):
             # Return as-is for other types
             return content
 
-    async def prepare_for_call(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        preferred_input_modalities: tuple[str, ...] = (),
-    ) -> "BaseLLM":
-        """Resolve any per-call model selection before invoking an LLM method.
-
-        Fixed-model implementations reuse themselves. Virtual model routers
-        override this method and may use modality preferences to return a
-        concrete one-call model wrapper.
-        """
-
-        del messages, preferred_input_modalities
-        return self
-
     @abstractmethod
     async def chat(
         self,

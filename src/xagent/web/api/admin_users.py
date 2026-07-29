@@ -26,6 +26,7 @@ from ..services.user_admin_scope import hidden_user_ids
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
 logger = logging.getLogger(__name__)
 _TASK_RUNTIME_DELETE_CONCURRENCY = 4
+_TASK_RUNTIME_DELETE_PAGE_SIZE = 100
 
 
 def _delete_legacy_text2sql_rows(db: Session, user_id: int) -> None:
@@ -106,7 +107,6 @@ async def delete_user(
 
     if registered_task_extensions():
         session_factory = get_session_local()
-        cleaned_task_ids: set[int] = set()
         cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
 
         async def _cleanup_context(context: TaskRuntimeContext) -> None:
@@ -122,17 +122,26 @@ async def delete_user(
                     exc_info=True,
                 )
 
-        # Re-query after each bounded batch. This covers tasks created while
-        # provider cleanup was awaiting external systems before the bulk delete.
+        # Keyset pages bound memory and gather fan-out without growing a NOT IN
+        # parameter list. New tasks receive higher ids and are picked up by the
+        # next page after provider cleanup awaits external systems.
+        last_seen_task_id = 0
         while True:
-            task_query = db.query(Task.id, Task.user_id, Task.source).filter(
-                Task.user_id == user_id
+            task_rows = (
+                db.query(Task.id, Task.user_id, Task.source)
+                .filter(
+                    Task.user_id == user_id,
+                    Task.id > last_seen_task_id,
+                )
+                .order_by(Task.id)
+                .limit(_TASK_RUNTIME_DELETE_PAGE_SIZE)
+                .all()
             )
-            if cleaned_task_ids:
-                task_query = task_query.filter(Task.id.notin_(cleaned_task_ids))
-            task_rows = task_query.all()
             if not task_rows:
                 break
+            last_seen_task_id = max(
+                int(task_id) for task_id, _user_id, _source in task_rows
+            )
             task_runtime_contexts = [
                 TaskRuntimeContext(
                     task_id=int(task_id),
@@ -142,9 +151,6 @@ async def delete_user(
                 )
                 for task_id, task_user_id, source in task_rows
             ]
-            cleaned_task_ids.update(
-                context.task_id for context in task_runtime_contexts
-            )
             release_db_connection_if_clean(db)
             await asyncio.gather(
                 *(_cleanup_context(context) for context in task_runtime_contexts)

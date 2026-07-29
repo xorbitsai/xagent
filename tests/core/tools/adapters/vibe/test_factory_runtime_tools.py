@@ -3,7 +3,10 @@ from typing import Any
 
 import pytest
 
-from xagent.core.task_runtime import TaskRuntimeContribution
+from xagent.core.task_runtime import (
+    TaskRuntimeContribution,
+    merge_task_runtime_contributions,
+)
 from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
@@ -96,7 +99,6 @@ async def test_runtime_tools_are_restored_from_config_on_rebuild(monkeypatch) ->
 @pytest.mark.asyncio
 async def test_runtime_tools_cannot_shadow_existing_tool(
     monkeypatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def create_registered_tools(config: Any) -> list[Any]:
         return [_tool("computer")]
@@ -107,15 +109,15 @@ async def test_runtime_tools_cannot_shadow_existing_tool(
         create_registered_tools,
     )
 
-    with caplog.at_level("WARNING"):
-        tools = await ToolFactory.create_all_tools(
+    with pytest.raises(
+        ValueError,
+        match="desktop_runtime.*duplicate tool 'computer'",
+    ):
+        await ToolFactory.create_all_tools(
             ToolConfig({}),
             additional_tools=(_tool("computer"),),
             additional_tool_origins={"computer": "desktop_runtime"},
         )
-
-    assert [tool.name for tool in tools] == ["computer"]
-    assert "desktop_runtime" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -141,6 +143,43 @@ async def test_explicit_runtime_tools_preserve_provider_origin(
 
     assert tools == []
     assert "browser_runtime=[runtime_tool]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_filtered_runtime_tools_remove_provider_environment(monkeypatch) -> None:
+    base_tool = _tool("base_tool")
+    runtime_tool = _tool("runtime_tool")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "browser_runtime": TaskRuntimeContribution(
+                    tools=(runtime_tool,),
+                    environment="Use the leased browser.",
+                    preferred_input_modalities=("image",),
+                )
+            }
+        )
+    }
+    config = ToolConfig({"allowed_tools": ["base_tool"]})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    tools = await ToolFactory.create_all_tools(config)
+
+    assert tools == [base_tool]
+    assert contribution_holder["value"].environment is None
+    assert contribution_holder["value"].preferred_input_modalities == ()
 
 
 @pytest.mark.asyncio

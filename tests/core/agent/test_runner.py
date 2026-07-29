@@ -586,6 +586,41 @@ async def test_runner_clears_checkpointed_modality_preference(
 
 
 @pytest.mark.asyncio
+async def test_runner_empty_resume_metadata_preserves_checkpoint_metadata(
+    tmp_path: Path,
+) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-preserve-metadata")
+    checkpoint_context.add_user_message("Original task")
+    checkpoint_context.metadata.update(
+        {
+            PREFERRED_INPUT_MODALITIES_METADATA_KEY: ["image"],
+            "execution_type": "checkpointed",
+        }
+    )
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {"output": "restored"},
+    }
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task="Should not be appended",
+        execution_id="exec-preserve-metadata",
+        checkpoint=checkpoint,
+        metadata={},
+    )
+
+    assert result["context"].metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] == [
+        "image"
+    ]
+    assert result["context"].metadata["execution_type"] == "checkpointed"
+
+
+@pytest.mark.asyncio
 async def test_runner_registers_restored_context_for_live_message_injection(
     tmp_path: Path,
 ) -> None:

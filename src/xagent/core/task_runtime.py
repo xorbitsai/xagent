@@ -16,6 +16,8 @@ MAX_TASK_RUNTIME_EXTENSIONS = 16
 MAX_TASK_RUNTIME_JSON_BYTES = 64 * 1024
 MAX_TASK_RUNTIME_ENVIRONMENT_BYTES = 64 * 1024
 MAX_TASK_RUNTIME_TOOLS = 64
+MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES = 256 * 1024
+TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY = "_runtime"
 
 
 class TaskRuntimeClientError(Exception):
@@ -75,6 +77,10 @@ class TaskRuntimeContribution:
     # Populated by the registry merge for filtering diagnostics. Providers do
     # not need to set this field themselves.
     tool_origins: tuple[tuple[str, str], ...] = ()
+    # Detached per-provider contributions retained by the registry merge so
+    # policy filtering can remove a provider's prompt context when none of its
+    # tools survive. Providers do not set this field themselves.
+    provider_contributions: tuple[tuple[str, "TaskRuntimeContribution"], ...] = ()
 
 
 EMPTY_TASK_RUNTIME_CONTRIBUTION = TaskRuntimeContribution()
@@ -183,8 +189,10 @@ def merge_task_runtime_contributions(
     environments: list[str] = []
     modalities: list[str] = []
     tool_origins: list[tuple[str, str]] = []
+    provider_contributions: list[tuple[str, TaskRuntimeContribution]] = []
     for provider_name, contribution in contributions.items():
         normalized = normalize_task_runtime_contribution(contribution)
+        provider_contributions.append((provider_name, normalized))
         tools.extend(normalized.tools)
         if len(tools) > MAX_TASK_RUNTIME_TOOLS:
             raise ValueError(
@@ -215,4 +223,47 @@ def merge_task_runtime_contributions(
         environment=environment,
         preferred_input_modalities=tuple(dict.fromkeys(modalities)),
         tool_origins=tuple(tool_origins),
+        provider_contributions=tuple(provider_contributions),
+    )
+
+
+def filter_task_runtime_contribution_tools(
+    contribution: TaskRuntimeContribution,
+    available_tool_names: set[str],
+) -> TaskRuntimeContribution:
+    """Reconcile provider context with runtime tools that survived policy.
+
+    Providers that contribute no tools retain their environment and modality
+    preferences. When a provider does contribute tools, its entire contribution
+    is removed only if none survive; otherwise its prompt context is retained
+    and its tool list is narrowed to the surviving names.
+    """
+
+    if not contribution.provider_contributions:
+        return contribution
+
+    retained: dict[str, TaskRuntimeContribution] = {}
+    for provider_name, provider_contribution in contribution.provider_contributions:
+        provider_tools = tuple(provider_contribution.tools)
+        if not provider_tools:
+            retained[provider_name] = provider_contribution
+            continue
+        surviving_tools = tuple(
+            tool
+            for tool in provider_tools
+            if isinstance((name := getattr(tool, "name", None)), str)
+            and name in available_tool_names
+        )
+        if surviving_tools:
+            retained[provider_name] = replace(
+                provider_contribution,
+                tools=surviving_tools,
+                tool_origins=(),
+                provider_contributions=(),
+            )
+
+    return (
+        merge_task_runtime_contributions(retained)
+        if retained
+        else EMPTY_TASK_RUNTIME_CONTRIBUTION
     )

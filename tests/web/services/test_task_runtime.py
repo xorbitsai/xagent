@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -12,7 +13,9 @@ from xagent.core.task_runtime import (
     MAX_TASK_RUNTIME_ENVIRONMENT_BYTES,
     MAX_TASK_RUNTIME_EXTENSIONS,
     MAX_TASK_RUNTIME_JSON_BYTES,
+    MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
     MAX_TASK_RUNTIME_TOOLS,
+    TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     normalize_input_modalities,
@@ -391,6 +394,7 @@ async def test_public_metadata_must_be_json_compatible(
 async def test_provider_hook_timeout_is_attributed_and_bounded(
     registered_names: list[str],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import xagent.web.services.task_runtime as task_runtime
 
@@ -409,18 +413,98 @@ async def test_provider_hook_timeout_is_attributed_and_bounded(
         0.01,
     )
 
-    with pytest.raises(TaskRuntimeExtensionError) as exc_info:
-        await build_task_runtime(_context())
+    with caplog.at_level(logging.ERROR):
+        contribution = await build_task_runtime(_context())
 
-    assert exc_info.value.extension == "hanging_runtime"
-    assert exc_info.value.operation == "build_runtime"
-    assert isinstance(exc_info.value.cause, TimeoutError)
-    assert "0.01-second timeout" in str(exc_info.value.cause)
+    assert contribution == TaskRuntimeContribution()
+    assert "hanging_runtime" in caplog.text
+    assert "0.01-second timeout" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_blocking_provider_timeout_does_not_consume_default_executor(
+    registered_names: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xagent.web.services.task_runtime as task_runtime
+
+    release_hook = threading.Event()
+
+    class _BlockingProvider(_Provider):
+        def build_runtime(
+            self,
+            context: TaskRuntimeContext,
+        ) -> TaskRuntimeContribution:
+            release_hook.wait()
+            return TaskRuntimeContribution(environment="released")
+
+    _register(
+        "blocking_runtime",
+        _BlockingProvider("blocking"),
+        registered_names,
+    )
+    monkeypatch.setitem(
+        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
+        "build_runtime",
+        0.01,
+    )
+
+    try:
+        contribution = await build_task_runtime(_context())
+        default_executor_result = await asyncio.wait_for(
+            asyncio.to_thread(lambda: "available"),
+            timeout=0.5,
+        )
+    finally:
+        release_hook.set()
+
+    assert contribution == TaskRuntimeContribution()
+    assert default_executor_result == "available"
+
+
+@pytest.mark.asyncio
+async def test_build_runtime_keeps_successful_provider_when_another_fails(
+    registered_names: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    good_tool = SimpleNamespace(name="good_tool")
+
+    class _FailingProvider(_Provider):
+        async def build_runtime(
+            self,
+            context: TaskRuntimeContext,
+        ) -> TaskRuntimeContribution:
+            raise RuntimeError("provider unavailable")
+
+    _register(
+        "good_runtime",
+        _Provider(
+            "good",
+            contribution=TaskRuntimeContribution(
+                tools=(good_tool,),
+                environment="Good environment",
+            ),
+        ),
+        registered_names,
+    )
+    _register(
+        "failing_runtime",
+        _FailingProvider("failing"),
+        registered_names,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        contribution = await build_task_runtime(_context())
+
+    assert contribution.tools == (good_tool,)
+    assert contribution.environment == "Good environment"
+    assert "failing_runtime" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_runtime_contribution_environment_and_tools_are_bounded(
     registered_names: list[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     oversized_environment = _Provider(
         "environment",
@@ -430,10 +514,9 @@ async def test_runtime_contribution_environment_and_tools_are_bounded(
     )
     _register("environment_runtime", oversized_environment, registered_names)
 
-    with pytest.raises(TaskRuntimeExtensionError) as environment_error:
-        await build_task_runtime(_context())
-
-    assert environment_error.value.extension == "environment_runtime"
+    with caplog.at_level(logging.ERROR):
+        assert await build_task_runtime(_context()) == TaskRuntimeContribution()
+    assert "environment_runtime" in caplog.text
     unregister_task_extension("environment_runtime")
     registered_names.remove("environment_runtime")
 
@@ -448,10 +531,88 @@ async def test_runtime_contribution_environment_and_tools_are_bounded(
     )
     _register("tools_runtime", oversized_tools, registered_names)
 
-    with pytest.raises(TaskRuntimeExtensionError) as tools_error:
-        await build_task_runtime(_context())
+    with caplog.at_level(logging.ERROR):
+        assert await build_task_runtime(_context()) == TaskRuntimeContribution()
+    assert "tools_runtime" in caplog.text
 
-    assert tools_error.value.extension == "tools_runtime"
+
+@pytest.mark.asyncio
+async def test_public_metadata_aggregate_is_bounded_with_partial_marker(
+    registered_names: list[str],
+) -> None:
+    for index in range(5):
+        _register(
+            f"metadata_{index}",
+            _Provider(
+                f"metadata-{index}",
+                metadata={"payload": "x" * (60 * 1024)},
+            ),
+            registered_names,
+        )
+
+    metadata = await get_task_runtime_public_metadata(_context())
+
+    status = metadata[TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY]
+    assert status["partial"] is True
+    assert status["omitted_extensions"]
+    assert status["limit_bytes"] == MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES
+
+
+@pytest.mark.asyncio
+async def test_delete_dispatch_treats_provider_cancel_as_one_failure(
+    registered_names: list[str],
+) -> None:
+    events: list[str] = []
+    _register(
+        "healthy_runtime",
+        _Provider("healthy", events=events),
+        registered_names,
+    )
+    _register(
+        "cancelled_runtime",
+        _Provider(
+            "cancelled",
+            fail_delete=asyncio.CancelledError("provider cancelled itself"),
+            events=events,
+        ),
+        registered_names,
+    )
+
+    with pytest.raises(TaskRuntimeExtensionError) as exc_info:
+        await delete_task_extensions(_context())
+
+    assert events == ["delete:cancelled", "delete:healthy"]
+    assert exc_info.value.extension == "cancelled_runtime"
+    assert isinstance(exc_info.value.cause, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_build_dispatch_propagates_surrounding_task_cancellation(
+    registered_names: list[str],
+) -> None:
+    started = asyncio.Event()
+
+    class _WaitingProvider(_Provider):
+        async def build_runtime(
+            self,
+            context: TaskRuntimeContext,
+        ) -> TaskRuntimeContribution:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    _register(
+        "waiting_runtime",
+        _WaitingProvider("waiting"),
+        registered_names,
+    )
+
+    build_task = asyncio.create_task(build_task_runtime(_context()))
+    await started.wait()
+    build_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await build_task
 
 
 @pytest.mark.asyncio

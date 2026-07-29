@@ -140,6 +140,20 @@ def test_execution_metadata_carries_runtime_modality_preferences() -> None:
     assert metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] == ["image"]
 
 
+def test_execution_metadata_omits_empty_runtime_modality_preferences() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="test",
+            pattern="react",
+            llm=FakeLLM([]),
+        )
+    )
+
+    metadata = adapter._execution_metadata(execution_type="react")
+
+    assert PREFERRED_INPUT_MODALITIES_METADATA_KEY not in metadata
+
+
 def auto_decision(
     action: str, *, answer: str = "", reason: str = "test"
 ) -> dict[str, Any]:

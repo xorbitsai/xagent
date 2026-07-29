@@ -59,9 +59,11 @@ async def prepare_llm_for_context(
 ) -> Any:
     """Resolve virtual models before compaction and apply their context window.
 
-    Normal models are returned unchanged. RouterLLM exposes ``prepare_for_call``
-    and returns a one-call wrapper for the concrete xrouter selection, ensuring
-    the selected model is reused after compaction instead of routing twice.
+    Models without a per-call preparation hook are returned unchanged.
+    RouterLLM advertises modality-aware preparation and returns a one-call
+    wrapper for the concrete xrouter selection, ensuring the selected model is
+    reused after compaction instead of routing twice. Legacy virtual models
+    keep their original one-argument ``prepare_for_call(messages)`` contract.
     """
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
@@ -72,10 +74,13 @@ async def prepare_llm_for_context(
             if not metadata or not isinstance(metadata, Mapping)
             else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
         )
-        prepared = prepare(
-            messages,
-            preferred_input_modalities=preferred_modalities,
-        )
+        if getattr(llm, "supports_preferred_input_modalities", False):
+            prepared = prepare(
+                messages,
+                preferred_input_modalities=preferred_modalities,
+            )
+        else:
+            prepared = prepare(messages)
         if inspect.isawaitable(prepared):
             prepared = await prepared
 

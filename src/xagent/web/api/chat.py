@@ -37,6 +37,7 @@ from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY,
     TaskRuntimeClientError,
     TaskRuntimeContext,
     TaskRuntimeContribution,
@@ -663,8 +664,14 @@ async def create_default_tools(
 
     runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
     if task_runtime_context is not None and registered_task_extensions():
-        workspace = ToolFactory.create_workspace(tool_config.get_workspace_config())
         try:
+            workspace = await asyncio.to_thread(
+                ToolFactory.create_workspace,
+                tool_config.get_workspace_config(),
+            )
+            workspace_setter = getattr(tool_config, "set_task_runtime_workspace", None)
+            if callable(workspace_setter):
+                workspace_setter(workspace)
             runtime_contribution = await build_task_runtime(
                 task_runtime_context.with_workspace(workspace)
             )
@@ -678,6 +685,12 @@ async def create_default_tools(
                 exc.extension,
                 task_id,
                 exc_info=True,
+            )
+        except Exception:
+            logger.exception(
+                "Ignoring unexpected task runtime setup failure while building "
+                "tools for task %s",
+                task_id,
             )
     tool_config.set_task_runtime_contribution(runtime_contribution)
 
@@ -3882,6 +3895,11 @@ async def create_task(
         runtime_extensions_partial = False
         try:
             runtime_extensions = await get_task_runtime_public_metadata(runtime_context)
+            runtime_extensions_partial = bool(
+                runtime_extensions.get(TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY, {}).get(
+                    "partial"
+                )
+            )
         except TaskRuntimeExtensionError:
             logger.warning(
                 "Failed to load public runtime metadata for task %s",

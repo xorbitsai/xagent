@@ -391,12 +391,11 @@ class ToolFactory:
                         "non-empty string 'name' attribute"
                     )
                 if name in existing_names or name in extension_names:
-                    logger.warning(
-                        "Skipping duplicate task runtime tool '%s' from extension '%s'",
-                        name,
-                        (additional_tool_origins or {}).get(name, "unknown"),
+                    provider = (additional_tool_origins or {}).get(name, "unknown")
+                    raise ValueError(
+                        f"Task runtime extension '{provider}' contributed duplicate "
+                        f"tool '{name}'"
                     )
-                    continue
                 extension_names.add(name)
                 accepted_extension_tools.append(tool)
             tools.extend(accepted_extension_tools)
@@ -505,6 +504,27 @@ class ToolFactory:
                 ),
             )
 
+        if extension_names:
+            contribution_getter = getattr(config, "get_task_runtime_contribution", None)
+            contribution_setter = getattr(config, "set_task_runtime_contribution", None)
+            if callable(contribution_getter) and callable(contribution_setter):
+                from ....task_runtime import (
+                    TaskRuntimeContribution,
+                    filter_task_runtime_contribution_tools,
+                )
+
+                contribution = contribution_getter()
+                if isinstance(contribution, TaskRuntimeContribution):
+                    surviving_names = {
+                        tool.name for tool in tools if tool.name in extension_names
+                    }
+                    contribution_setter(
+                        filter_task_runtime_contribution_tools(
+                            contribution,
+                            surviving_names,
+                        )
+                    )
+
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:
@@ -516,7 +536,16 @@ class ToolFactory:
             release = getattr(config, "release_db_connection", None)
             if callable(release):
                 release()
-            workspace = ToolFactory._create_workspace(config.get_workspace_config())
+            runtime_workspace_getter = getattr(
+                config, "get_task_runtime_workspace", None
+            )
+            workspace = (
+                runtime_workspace_getter()
+                if callable(runtime_workspace_getter)
+                else None
+            )
+            if workspace is None:
+                workspace = ToolFactory._create_workspace(config.get_workspace_config())
             if workspace is not None:
                 from .sandboxed_tool.sandboxed_tool_wrapper import (
                     create_workspace_in_sandbox,

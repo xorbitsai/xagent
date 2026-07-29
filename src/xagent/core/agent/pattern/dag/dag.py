@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from ....model.intent import goal_scope
+from ....task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
 from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
@@ -820,6 +824,10 @@ class DAGPattern(AgentPattern):
         output_language = self._output_language(root_context)
         if active_context is not None:
             child_context = type(root_context).from_dict(active_context)
+            self._refresh_restored_step_runtime_metadata(
+                child_context,
+                root_context,
+            )
             if output_language and not child_context.metadata.get(
                 OUTPUT_LANGUAGE_METADATA_KEY
             ):
@@ -1722,6 +1730,7 @@ class DAGPattern(AgentPattern):
             return False
 
         child_context = type(root_context).from_dict(active_context)
+        self._refresh_restored_step_runtime_metadata(child_context, root_context)
         for message in root_user_messages[self.planned_user_message_count :]:
             child_context.add_user_message(
                 message.content,
@@ -1737,6 +1746,29 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = len(root_user_messages)
         self.status = "running"
         return True
+
+    @staticmethod
+    def _refresh_restored_step_runtime_metadata(
+        child_context: Any,
+        root_context: Any,
+    ) -> None:
+        """Refresh volatile routing metadata on a checkpoint-restored DAG step."""
+
+        root_metadata = getattr(root_context, "metadata", {})
+        preferred_modalities = normalize_input_modalities(
+            root_metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
+            if isinstance(root_metadata, dict)
+            else ()
+        )
+        if preferred_modalities:
+            child_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
+        else:
+            child_context.metadata.pop(
+                PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+                None,
+            )
 
     def _waiting_step_id(self) -> str | None:
         for step_id in self.active_step_ids:

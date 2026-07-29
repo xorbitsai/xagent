@@ -1810,6 +1810,8 @@ async def test_dag_plan_generation_forwards_runtime_modality_preference() -> Non
     )
 
     class _RouterLikeLLM:
+        supports_preferred_input_modalities = True
+
         def __init__(self) -> None:
             self.preferred_modalities: list[tuple[str, ...]] = []
 
@@ -2568,6 +2570,7 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     )
     first_context = ExecutionContext(execution_id="dag-resume-pending-tool")
     first_context.add_user_message("Root task")
+    first_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["image"]
 
     interrupted = await first_pattern.run(
         context=first_context,
@@ -2605,18 +2608,36 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     )
     restored_pattern.load_state(checkpoint["pattern_state"])
     restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["audio"]
     restored_tool = FakeTool()
+    resumed_modalities: list[tuple[str, ...]] = []
+    resumed_llm = SequenceLLM([{"content": "The answer is 42.", "done": True}])
+
+    class _TrackingRouter:
+        supports_preferred_input_modalities = True
+
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert messages
+            resumed_modalities.append(preferred_input_modalities)
+            return resumed_llm
 
     resumed = await restored_pattern.run(
         context=restored_context,
         tools=[restored_tool],
-        llm=SequenceLLM([{"content": "The answer is 42.", "done": True}]),
+        llm=_TrackingRouter(),
     )
 
     assert resumed["success"] is True
     assert resumed["status"] == "completed"
     assert resumed["step_results"]["calc"] == "The answer is 42."
     assert restored_tool.calls == [{"expression": "6*7"}]
+    assert resumed_modalities
+    assert all(modalities == ("audio",) for modalities in resumed_modalities)
 
 
 @pytest.mark.asyncio

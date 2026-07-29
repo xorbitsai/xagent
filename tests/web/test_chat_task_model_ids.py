@@ -1217,6 +1217,30 @@ def test_delete_task_keeps_cross_user_access_denied(
         db.close()
 
 
+def test_filtered_runtime_provider_environment_is_not_added_to_system_prompt():
+    from xagent.core.task_runtime import (
+        TaskRuntimeContribution,
+        filter_task_runtime_contribution_tools,
+        merge_task_runtime_contributions,
+    )
+    from xagent.web.api.chat import _append_runtime_environment
+
+    runtime_tool = MagicMock()
+    runtime_tool.name = "leased_browser"
+    contribution = merge_task_runtime_contributions(
+        {
+            "browser_runtime": TaskRuntimeContribution(
+                tools=(runtime_tool,),
+                environment="Use the leased browser.",
+            )
+        }
+    )
+
+    filtered = filter_task_runtime_contribution_tools(contribution, set())
+
+    assert _append_runtime_environment("Base prompt.", filtered) == "Base prompt."
+
+
 class _TaskRuntimeProvider:
     def __init__(
         self,

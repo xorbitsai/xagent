@@ -1138,6 +1138,7 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_load_summary_tracer = mcp_load_summary_tracer
         self._mcp_load_summary_trace_task_id = mcp_load_summary_trace_task_id
         self._task_runtime_contribution: Any = None
+        self._task_runtime_workspace: Any = None
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -1718,6 +1719,16 @@ class WebToolConfig(BaseToolConfig):
         """Return the contribution consumed while building ``AgentService``."""
 
         return self._task_runtime_contribution
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain the workspace already prepared for runtime providers."""
+
+        self._task_runtime_workspace = workspace
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return the workspace shared by providers and sandbox setup."""
+
+        return self._task_runtime_workspace
 
     def get_task_id(self) -> Optional[str]:
         """Get task ID for session tracking."""

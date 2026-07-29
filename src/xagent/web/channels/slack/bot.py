@@ -223,7 +223,17 @@ class SlackBotInstance:
                     self.event_queues.pop(conversation_key, None)
                     return
                 payload, event = queue.pop(0)
-                await self._process_event(conversation_key, payload, event)
+                try:
+                    await self._process_event(conversation_key, payload, event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A failure notifying Slack about one event must not strand
+                    # the rest of this conversation's queued events.
+                    logger.exception(
+                        "Error processing queued Slack event for %s",
+                        conversation_key,
+                    )
         finally:
             current = asyncio.current_task()
             if self.event_tasks.get(conversation_key) is current:

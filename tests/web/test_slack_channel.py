@@ -179,6 +179,36 @@ async def test_socket_listener_acks_immediately_and_deduplicates_events() -> Non
 
 
 @pytest.mark.asyncio
+async def test_event_queue_survives_a_failing_event() -> None:
+    bot = make_bot()
+    processed: list[str] = []
+
+    async def process_event(
+        _conversation_key: str,
+        _payload: dict[str, Any],
+        event: dict[str, Any],
+    ) -> None:
+        text = str(event["text"])
+        if text == "boom":
+            raise RuntimeError("slack api failed")
+        processed.append(text)
+
+    bot._process_event = process_event  # type: ignore[method-assign]
+
+    conversation_key = "T1:D1:U1:direct"
+    bot.event_queues[conversation_key] = [
+        ({}, {"text": "boom"}),
+        ({}, {"text": "still delivered"}),
+    ]
+
+    await bot._process_event_queue(conversation_key)
+
+    assert processed == ["still delivered"]
+    assert conversation_key not in bot.event_queues
+    assert conversation_key not in bot.event_tasks
+
+
+@pytest.mark.asyncio
 async def test_slack_manager_starts_active_configured_bots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

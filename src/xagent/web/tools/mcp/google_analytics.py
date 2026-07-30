@@ -117,9 +117,18 @@ def _require_dict_result(result: Any) -> dict[str, Any]:
 
 
 def _date_range_body(date_range: dict[str, Any]) -> dict[str, Any]:
+    # FastMCP's signature validation guarantees a dict, but not its keys — an
+    # empty dict or misnamed keys (e.g. camelCase "startDate") would otherwise
+    # sail through and reach the API as two nulls. Fail here with a message
+    # the LLM can self-correct from.
+    if not date_range.get("start_date") or not date_range.get("end_date"):
+        raise ValueError(
+            'Each date range needs "start_date" and "end_date" (YYYY-MM-DD or '
+            'GA4 relative terms like "7daysAgo"/"today")'
+        )
     body = {
-        "startDate": date_range.get("start_date"),
-        "endDate": date_range.get("end_date"),
+        "startDate": date_range["start_date"],
+        "endDate": date_range["end_date"],
     }
     if date_range.get("name"):
         body["name"] = date_range["name"]

@@ -365,6 +365,24 @@ def test_run_report_passes_through_filter_and_order(monkeypatch):
     assert body["dateRanges"] == [{"startDate": "7daysAgo", "endDate": "today"}]
 
 
+def test_run_report_rejects_date_range_missing_required_keys(monkeypatch):
+    """An empty dict or misnamed keys (e.g. camelCase "startDate") pass the
+    tool-signature validation but must fail here with an actionable message
+    instead of sending nulls to the API."""
+    mock_request = Mock()
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    for bad_range in [{}, {"startDate": "7daysAgo", "endDate": "today"}]:
+        result = json.loads(
+            google_analytics.google_analytics_run_report(
+                "42", metrics=["sessions"], date_ranges=[bad_range]
+            )
+        )
+        assert result["status"] == "error"
+        assert "start_date" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_run_report_rejects_invalid_property_id(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(google_analytics.requests, "request", mock_request)

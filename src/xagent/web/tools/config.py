@@ -603,9 +603,16 @@ async def refresh_oauth_token_if_needed(
         data = {
             "grant_type": "refresh_token",
             "refresh_token": oauth_account.refresh_token,
-            "client_id": client_id,
-            "client_secret": client_secret,
         }
+        post_kwargs: dict[str, Any] = {}
+        if provider_name == "zoom":
+            # Zoom's token endpoint rejects client_secret in the body; it
+            # requires HTTP Basic Auth (client_id:client_secret, base64) on
+            # every refresh, same as the initial code exchange.
+            post_kwargs["auth"] = httpx.BasicAuth(client_id, client_secret)
+        else:
+            data["client_id"] = client_id
+            data["client_secret"] = client_secret
 
         headers = {}
         if provider_name == "linkedin":
@@ -613,7 +620,11 @@ async def refresh_oauth_token_if_needed(
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                provider_config.token_url, data=data, headers=headers, timeout=10.0
+                provider_config.token_url,
+                data=data,
+                headers=headers,
+                timeout=10.0,
+                **post_kwargs,
             )
 
         if response.status_code == 200:

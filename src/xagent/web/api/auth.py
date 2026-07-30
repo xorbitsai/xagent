@@ -1320,14 +1320,20 @@ def generic_oauth_callback(
         data = {
             "grant_type": "authorization_code",
             "code": code,
-            "client_id": client_id,
-            "client_secret": client_secret,
             "redirect_uri": redirect_uri,
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        auth: tuple[str, str] | None = None
+        if provider.lower() == "zoom":
+            # Zoom's token endpoint rejects client_secret in the body; it
+            # requires HTTP Basic Auth (client_id:client_secret, base64).
+            auth = (client_id, client_secret)
+        else:
+            data["client_id"] = client_id
+            data["client_secret"] = client_secret
 
         token_response = requests.post(
-            token_url, data=data, headers=headers, timeout=10.0
+            token_url, data=data, headers=headers, timeout=10.0, auth=auth
         )
         token_data = token_response.json()
 

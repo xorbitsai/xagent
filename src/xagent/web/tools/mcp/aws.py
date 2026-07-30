@@ -91,7 +91,7 @@ def _client(
 
 def _aws_error_message(exc: Exception) -> str:
     if isinstance(exc, ClientError):
-        error = exc.response.get("Error", {})
+        error = exc.response.get("Error") or {}
         code = error.get("Code", "")
         message = error.get("Message", "")
         if code or message:
@@ -151,7 +151,7 @@ def aws_cloudwatch_describe_alarms(
                 "threshold": alarm.get("Threshold"),
                 "comparison": alarm.get("ComparisonOperator"),
             }
-            for alarm in result.get("MetricAlarms", [])
+            for alarm in (result.get("MetricAlarms") or [])
         ]
         return _success(alarms=alarms)
     except (ClientError, BotoCoreError, ValueError) as e:
@@ -202,8 +202,8 @@ def aws_cloudwatch_get_metric_data(
             StartTime=start_time,
             EndTime=end_time,
         )
-        series = result.get("MetricDataResults", [])
-        first = series[0] if series else {}
+        series = result.get("MetricDataResults") or []
+        first = (series[0] or {}) if series else {}
         return _success(
             timestamps=first.get("Timestamps", []),
             values=first.get("Values", []),
@@ -235,7 +235,7 @@ def aws_cloudwatch_describe_log_groups(
                 "stored_bytes": group.get("storedBytes"),
                 "retention_days": group.get("retentionInDays"),
             }
-            for group in result.get("logGroups", [])
+            for group in (result.get("logGroups") or [])
         ]
         return _success(log_groups=groups)
     except (ClientError, BotoCoreError, ValueError) as e:
@@ -278,7 +278,7 @@ def aws_cloudwatch_filter_log_events(
                 "log_stream": event.get("logStreamName"),
                 "message": event.get("message"),
             }
-            for event in result.get("events", [])
+            for event in (result.get("events") or [])
         ]
         return _success(events=events, truncated="nextToken" in result)
     except (ClientError, BotoCoreError, ValueError) as e:
@@ -295,7 +295,7 @@ def aws_dynamodb_list_tables(
     """
     try:
         result = _client("dynamodb", region, role_arn).list_tables(Limit=100)
-        return _success(tables=result.get("TableNames", []))
+        return _success(tables=result.get("TableNames") or [])
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing DynamoDB tables: {e}")
         return _error(_aws_error_message(e))
@@ -313,7 +313,7 @@ def aws_dynamodb_describe_table(
         result = _client("dynamodb", region, role_arn).describe_table(
             TableName=table_name
         )
-        table = result.get("Table", {})
+        table = result.get("Table") or {}
         return _success(
             table={
                 "name": table.get("TableName"),
@@ -329,7 +329,7 @@ def aws_dynamodb_describe_table(
                         "name": index.get("IndexName"),
                         "status": index.get("IndexStatus"),
                     }
-                    for index in table.get("GlobalSecondaryIndexes", [])
+                    for index in (table.get("GlobalSecondaryIndexes") or [])
                 ],
             }
         )
@@ -352,7 +352,7 @@ def aws_sqs_list_queues(
         if name_prefix:
             kwargs["QueueNamePrefix"] = name_prefix
         result = _client("sqs", region, role_arn).list_queues(**kwargs)
-        return _success(queue_urls=result.get("QueueUrls", []))
+        return _success(queue_urls=result.get("QueueUrls") or [])
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing SQS queues: {e}")
         return _error(_aws_error_message(e))
@@ -371,7 +371,7 @@ def aws_sqs_get_queue_attributes(
         result = _client("sqs", region, role_arn).get_queue_attributes(
             QueueUrl=queue_url, AttributeNames=["All"]
         )
-        return _success(attributes=result.get("Attributes", {}))
+        return _success(attributes=result.get("Attributes") or {})
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error getting SQS queue attributes for {queue_url}: {e}")
         return _error(_aws_error_message(e))

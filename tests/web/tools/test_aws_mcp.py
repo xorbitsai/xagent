@@ -150,6 +150,34 @@ def test_get_metric_data_handles_empty_series(monkeypatch):
     assert result["values"] == []
 
 
+def test_tools_tolerate_explicit_none_values_in_responses(monkeypatch):
+    """Keys present with an explicit None value (as opposed to absent) must
+    not crash list/dict handling — the `or []` / `or {}` fallbacks apply."""
+    client = Mock()
+    client.describe_alarms.return_value = {"MetricAlarms": None}
+    client.get_metric_data.return_value = {"MetricDataResults": None}
+    client.list_tables.return_value = {"TableNames": None}
+    client.describe_table.return_value = {"Table": None}
+    client.list_queues.return_value = {"QueueUrls": None}
+    client.get_queue_attributes.return_value = {"Attributes": None}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=client))
+
+    assert json.loads(aws.aws_cloudwatch_describe_alarms())["alarms"] == []
+    metric = json.loads(
+        aws.aws_cloudwatch_get_metric_data(
+            namespace="AWS/EC2",
+            metric_name="CPUUtilization",
+            start_time="2026-07-30T00:00:00Z",
+            end_time="2026-07-30T01:00:00Z",
+        )
+    )
+    assert metric["status"] == "success" and metric["values"] == []
+    assert json.loads(aws.aws_dynamodb_list_tables())["tables"] == []
+    assert json.loads(aws.aws_dynamodb_describe_table("orders"))["status"] == "success"
+    assert json.loads(aws.aws_sqs_list_queues())["queue_urls"] == []
+    assert json.loads(aws.aws_sqs_get_queue_attributes("https://q"))["attributes"] == {}
+
+
 def test_filter_log_events_caps_limit_and_passes_window(monkeypatch):
     logs = Mock()
     logs.filter_log_events.return_value = {

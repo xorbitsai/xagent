@@ -491,7 +491,8 @@ async def slack_oauth_callback(
         )
 
     nonce = str(state_payload.get("nonce") or "")
-    state_user_id = state_payload.get("user_id")
+    raw_state_user_id = state_payload.get("user_id")
+    state_user_id = int(raw_state_user_id) if raw_state_user_id is not None else None
     # The browser that completes this callback is NOT verified to be the one
     # that called /oauth/start: an attacker can send their own fresh
     # authorize_url to a victim, and the victim's consent then binds their
@@ -580,8 +581,12 @@ async def slack_oauth_callback(
                 str(token_data.get("error") or "Slack token exchange failed")
             )
 
-        # Already validated against the claimed flow row above.
-        user_id = int(state_user_id)
+        # Unreachable: the claim above only succeeds for a non-None user_id
+        # matching a live flow row. Kept as an explicit guard rather than an
+        # assert, which -O would strip.
+        if state_user_id is None:
+            raise ValueError("Slack OAuth state is missing the Xagent user")
+        user_id = state_user_id
         if db.query(User.id).filter(User.id == user_id).first() is None:
             raise ValueError(
                 "The Xagent user who started authorization no longer exists"

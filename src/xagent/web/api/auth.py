@@ -1325,8 +1325,8 @@ def generic_oauth_callback(
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         auth: tuple[str, str] | None = None
         if provider.lower() == "zoom":
-            # Zoom's token endpoint rejects client_secret in the body; it
-            # requires HTTP Basic Auth (client_id:client_secret, base64).
+            # Zoom's token endpoint requires HTTP Basic Auth for client
+            # credentials (client_id:client_secret, base64).
             auth = (client_id, client_secret)
         else:
             data["client_id"] = client_id

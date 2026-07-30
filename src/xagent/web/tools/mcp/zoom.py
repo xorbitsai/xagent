@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import urllib.parse
 from typing import Any
 
@@ -19,6 +20,28 @@ mcp = FastMCP("zoom-mcp")
 
 ZOOM_BASE_URL = "https://api.zoom.us/v2"
 DEFAULT_TIMEOUT_SECONDS = 30
+
+# Documented `type` values for GET /users/{userId}/meetings. "previous_meetings"
+# matters most here: past meetings are the only ones that can have a transcript.
+MEETING_LIST_TYPES = (
+    "scheduled",
+    "live",
+    "upcoming",
+    "upcoming_meetings",
+    "previous_meetings",
+)
+
+_VTT_TIMESTAMP_LINE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:")
+
+
+class _ZoomApiError(RuntimeError):
+    """A Zoom API error carrying the HTTP status code, so callers can branch
+    on 404 precisely instead of substring-matching the message (which could
+    false-positive on an error body that merely mentions "404")."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _success(**payload: Any) -> str:
@@ -92,11 +115,15 @@ def _request(
             detail = response.text.strip()
         if detail:
             message = f"{message} - {detail}"
-        raise RuntimeError(message) from exc
+        raise _ZoomApiError(message, status_code=response.status_code) from exc
 
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _is_not_found(exc: Exception) -> bool:
+    return isinstance(exc, _ZoomApiError) and exc.status_code == 404
 
 
 def _download_text(download_url: str) -> str:
@@ -105,8 +132,35 @@ def _download_text(download_url: str) -> str:
         headers=_headers(),
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
-    response.raise_for_status()
-    return response.text
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        # Never let the raw HTTPError escape: str(HTTPError) embeds the full
+        # request URL including its query string, and Zoom download URLs can
+        # carry access tokens as query params — keep them out of logs and the
+        # LLM-visible tool response.
+        raise RuntimeError(
+            f"Transcript download failed with HTTP {response.status_code}"
+        ) from exc
+    # Decode explicitly as UTF-8: for a text/* content type without a charset
+    # (a plausible header for a VTT download), requests falls back to
+    # ISO-8859-1, which corrupts non-ASCII (e.g. Chinese) transcripts.
+    return response.content.decode("utf-8", errors="replace")
+
+
+def _vtt_to_text(vtt_text: str) -> str:
+    """Strip WebVTT scaffolding (header, cue numbers, timestamp lines) and
+    return only the spoken lines. Cue timing rarely matters for summarization
+    and roughly doubles the token count of the payload handed to the LLM."""
+    lines: list[str] = []
+    for raw_line in vtt_text.splitlines():
+        line = raw_line.strip()
+        if not line or line == "WEBVTT" or line.isdigit():
+            continue
+        if _VTT_TIMESTAMP_LINE.match(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _find_transcript_file(recording_files: list[Any]) -> dict[str, Any] | None:
@@ -117,20 +171,31 @@ def _find_transcript_file(recording_files: list[Any]) -> dict[str, Any] | None:
 
 
 @mcp.tool()
-def zoom_list_meetings(meeting_type: str = "scheduled") -> str:
+def zoom_list_meetings(meeting_type: str = "scheduled", page_token: str = "") -> str:
     """
     List meetings for the connected Zoom user.
-    meeting_type: one of "scheduled" (default, upcoming + recurring), "live", or "upcoming".
-    Use this to find a meeting_id when the user refers to a meeting by name or "latest".
+    meeting_type: one of "scheduled" (default, unexpired previous + upcoming),
+    "live", "upcoming", "upcoming_meetings", or "previous_meetings".
+    Use "previous_meetings" when looking for a meeting that already happened —
+    e.g. to fetch its transcript ("summarize my latest call").
+    page_token: pass the next_page_token from a previous response to fetch the
+    next page when the result was truncated.
     """
-    try:
-        result = _request(
-            "GET",
-            "/users/me/meetings",
-            params={"type": meeting_type, "page_size": 100},
+    if meeting_type not in MEETING_LIST_TYPES:
+        return _error(
+            f"Invalid meeting_type {meeting_type!r}; expected one of "
+            f"{', '.join(MEETING_LIST_TYPES)}"
         )
-        meetings = result.get("meetings", []) if isinstance(result, dict) else []
-        return _success(meetings=meetings)
+    try:
+        params: dict[str, Any] = {"type": meeting_type, "page_size": 100}
+        if page_token:
+            params["next_page_token"] = page_token
+        result = _request("GET", "/users/me/meetings", params=params)
+        meetings = result.get("meetings") or [] if isinstance(result, dict) else []
+        next_page_token = (
+            result.get("next_page_token", "") if isinstance(result, dict) else ""
+        )
+        return _success(meetings=meetings, next_page_token=next_page_token)
     except Exception as e:
         logger.error(f"Error listing Zoom meetings: {e}")
         return _error(str(e))
@@ -146,10 +211,21 @@ def zoom_get_meeting(meeting_id: str) -> str:
     try:
         try:
             result = _request("GET", f"/meetings/{encoded_id}")
-        except RuntimeError as exc:
-            if "404" not in str(exc):
+        except Exception as exc:
+            if not _is_not_found(exc):
                 raise
-            result = _request("GET", f"/past_meetings/{encoded_id}")
+            try:
+                result = _request("GET", f"/past_meetings/{encoded_id}")
+            except Exception as past_exc:
+                if _is_not_found(past_exc):
+                    # Surface the real situation (unknown id) instead of the
+                    # misleading "past_meetings lookup failed" from the second
+                    # leg alone — the common case here is a typo'd meeting_id.
+                    return _error(
+                        f"Meeting {meeting_id} not found (checked both upcoming "
+                        "and past meetings)"
+                    )
+                raise
         return _success(meeting=result)
     except Exception as e:
         logger.error(f"Error getting Zoom meeting {meeting_id}: {e}")
@@ -167,7 +243,7 @@ def zoom_list_recordings(meeting_id: str) -> str:
     try:
         result = _request("GET", f"/meetings/{encoded_id}/recordings")
         recording_files = (
-            result.get("recording_files", []) if isinstance(result, dict) else []
+            result.get("recording_files") or [] if isinstance(result, dict) else []
         )
         return _success(recording_files=recording_files)
     except Exception as e:
@@ -178,24 +254,40 @@ def zoom_list_recordings(meeting_id: str) -> str:
 @mcp.tool()
 def zoom_get_meeting_transcript(meeting_id: str) -> str:
     """
-    Get the full text of a meeting's cloud-recording transcript (VTT captions), if one exists.
+    Get the spoken text of a meeting's cloud-recording transcript, if one exists
+    (WebVTT scaffolding such as timestamps and cue numbers is stripped).
     """
     encoded_id = _encode_meeting_id(meeting_id)
     try:
+        restriction_reason: str | None = None
         try:
             transcript = _request("GET", f"/meetings/{encoded_id}/transcript")
-            download_url = (
-                transcript.get("download_url") if isinstance(transcript, dict) else None
-            )
-        except RuntimeError as exc:
-            if "404" not in str(exc):
+            if isinstance(transcript, dict):
+                download_url = transcript.get("download_url")
+                restriction_reason = transcript.get("download_restriction_reason")
+            else:
+                download_url = None
+        except Exception as exc:
+            if not _is_not_found(exc):
                 raise
             download_url = None
 
+        if not download_url and restriction_reason:
+            return _error(f"Transcript download is restricted: {restriction_reason}")
+
         if not download_url:
-            recordings = _request("GET", f"/meetings/{encoded_id}/recordings")
+            try:
+                recordings = _request("GET", f"/meetings/{encoded_id}/recordings")
+            except Exception as rec_exc:
+                if _is_not_found(rec_exc):
+                    return _error(
+                        f"Meeting {meeting_id} not found or has no cloud "
+                        "recording (checked both the transcript and recordings "
+                        "endpoints)"
+                    )
+                raise
             recording_files = (
-                recordings.get("recording_files", [])
+                recordings.get("recording_files") or []
                 if isinstance(recordings, dict)
                 else []
             )
@@ -207,7 +299,7 @@ def zoom_get_meeting_transcript(meeting_id: str) -> str:
         if not download_url:
             return _error("Transcript file has no download_url")
 
-        transcript_text = _download_text(download_url)
+        transcript_text = _vtt_to_text(_download_text(download_url))
         return _success(transcript=transcript_text)
     except Exception as e:
         logger.error(f"Error getting Zoom transcript for meeting {meeting_id}: {e}")

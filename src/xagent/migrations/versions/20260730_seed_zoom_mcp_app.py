@@ -57,7 +57,7 @@ APP_ID = "zoom"
 ZOOM_SCOPES = [
     "meeting:read:meeting",
     "meeting:read:list_meetings",
-    "cloud_recording:read:recording",
+    "cloud_recording:read:list_recording_files",
     "cloud_recording:read:meeting_transcript",
     "user:read:user",
 ]
@@ -164,17 +164,14 @@ def downgrade() -> None:
     # Only delete the provider row when it still matches the static shape this
     # migration seeded, so an admin-created "zoom" provider (via
     # POST /admin/mcp/providers) is preserved. client_id/client_secret are
-    # env-dependent and intentionally not part of the guard.
-    provider_columns = {
-        column["name"] for column in inspector.get_columns("oauth_providers")
-    }
+    # env-dependent and intentionally not part of the guard. name/auth_url/
+    # token_url are NOT NULL core columns present since the table's creation,
+    # so they can be matched unconditionally.
     seeded_provider = _zoom_provider_row()
-    delete_stmt = sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
-        FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "zoom"
+    bind.execute(
+        sa.delete(FULL_OAUTH_PROVIDERS_TABLE)
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "zoom")
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.name == seeded_provider["name"])
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.auth_url == seeded_provider["auth_url"])
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.token_url == seeded_provider["token_url"])
     )
-    for column in ("name", "auth_url", "token_url"):
-        if column in provider_columns:
-            delete_stmt = delete_stmt.where(
-                FULL_OAUTH_PROVIDERS_TABLE.c[column] == seeded_provider[column]
-            )
-    bind.execute(delete_stmt)

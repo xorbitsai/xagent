@@ -144,7 +144,7 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": [
                 "meeting:read:meeting",
                 "meeting:read:list_meetings",
-                "cloud_recording:read:recording",
+                "cloud_recording:read:list_recording_files",
                 "cloud_recording:read:meeting_transcript",
                 "user:read:user",
             ],
@@ -426,7 +426,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": [
                 "meeting:read:meeting",
                 "meeting:read:list_meetings",
-                "cloud_recording:read:recording",
+                "cloud_recording:read:list_recording_files",
                 "cloud_recording:read:meeting_transcript",
                 "user:read:user",
             ],

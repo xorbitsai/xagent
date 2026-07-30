@@ -605,10 +605,13 @@ async def refresh_oauth_token_if_needed(
             "refresh_token": oauth_account.refresh_token,
         }
         post_kwargs: dict[str, Any] = {}
-        if provider_name == "zoom":
-            # Zoom's token endpoint rejects client_secret in the body; it
-            # requires HTTP Basic Auth (client_id:client_secret, base64) on
-            # every refresh, same as the initial code exchange.
+        # .lower() matches the code-exchange branch in api/auth.py: an
+        # admin-created provider named "Zoom" would otherwise connect fine
+        # but silently fail every refresh an hour later.
+        if provider_name.lower() == "zoom":
+            # Zoom's token endpoint requires HTTP Basic Auth for client
+            # credentials (client_id:client_secret, base64) on every refresh,
+            # same as the initial code exchange.
             post_kwargs["auth"] = httpx.BasicAuth(client_id, client_secret)
         else:
             data["client_id"] = client_id

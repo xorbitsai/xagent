@@ -212,8 +212,6 @@ def _get_service() -> Any:
 
 
 class RouterLLM(BaseLLM):
-    supports_preferred_input_modalities = True
-
     def __init__(
         self,
         model_name: str = "auto",
@@ -324,9 +322,13 @@ class RouterLLM(BaseLLM):
         response_format: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
         output_config: dict[str, Any] | None = None,
+        preferred_input_modalities: tuple[str, ...] = (),
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        prepared = await self.prepare_for_call(messages)
+        prepared = await self.prepare_for_call(
+            messages,
+            preferred_input_modalities=preferred_input_modalities,
+        )
         return await prepared.chat(
             messages,
             temperature=temperature,
@@ -349,9 +351,13 @@ class RouterLLM(BaseLLM):
         response_format: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
         output_config: dict[str, Any] | None = None,
+        preferred_input_modalities: tuple[str, ...] = (),
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        prepared = await self.prepare_for_call(messages)
+        prepared = await self.prepare_for_call(
+            messages,
+            preferred_input_modalities=preferred_input_modalities,
+        )
         return await prepared.vision_chat(
             messages,
             temperature=temperature,
@@ -374,9 +380,13 @@ class RouterLLM(BaseLLM):
         response_format: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
         output_config: dict[str, Any] | None = None,
+        preferred_input_modalities: tuple[str, ...] = (),
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        prepared = await self.prepare_for_call(messages)
+        prepared = await self.prepare_for_call(
+            messages,
+            preferred_input_modalities=preferred_input_modalities,
+        )
         async for chunk in prepared.stream_chat(
             messages,
             temperature=temperature,
@@ -448,6 +458,19 @@ class RouterLLM(BaseLLM):
                 current_thinking = next_thinking
 
     # ---- Routing ------------------------------------------------------------
+    async def prepare_for_call_with_modalities(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> BaseLLM:
+        """Explicit modality-aware preparation contract for agent runtimes."""
+
+        return await self.prepare_for_call(
+            messages,
+            preferred_input_modalities=preferred_input_modalities,
+        )
+
     async def prepare_for_call(
         self,
         messages: list[dict[str, Any]],

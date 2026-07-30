@@ -39,9 +39,7 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
         context_window = 1_048_576
 
     class VirtualLLM:
-        supports_preferred_input_modalities = True
-
-        async def prepare_for_call(
+        async def prepare_for_call_with_modalities(
             self,
             messages: list[dict[str, Any]],
             *,
@@ -74,9 +72,7 @@ async def test_prepare_llm_for_context_passes_runtime_modality_preferences() -> 
         context_window = 128_000
 
     class VirtualLLM:
-        supports_preferred_input_modalities = True
-
-        async def prepare_for_call(
+        async def prepare_for_call_with_modalities(
             self,
             messages: list[dict[str, Any]],
             *,
@@ -107,9 +103,7 @@ async def test_prepare_llm_for_context_reads_runtime_metadata_once() -> None:
         pass
 
     class VirtualLLM:
-        supports_preferred_input_modalities = True
-
-        async def prepare_for_call(
+        async def prepare_for_call_with_modalities(
             self,
             messages: list[dict[str, Any]],
             *,
@@ -140,7 +134,9 @@ async def test_prepare_llm_for_context_reads_runtime_metadata_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prepare_llm_for_context_preserves_legacy_prepare_signature() -> None:
+async def test_prepare_llm_for_context_preserves_legacy_prepare_signature(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class PreparedLLM:
         pass
 
@@ -152,13 +148,15 @@ async def test_prepare_llm_for_context_preserves_legacy_prepare_signature() -> N
     context = ExecutionContext()
     context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["image"]
 
-    prepared = await prepare_llm_for_context(
-        llm=LegacyVirtualLLM(),
-        messages=[{"role": "user", "content": "inspect"}],
-        context=context,
-    )
+    with caplog.at_level("DEBUG"):
+        prepared = await prepare_llm_for_context(
+            llm=LegacyVirtualLLM(),
+            messages=[{"role": "user", "content": "inspect"}],
+            context=context,
+        )
 
     assert isinstance(prepared, PreparedLLM)
+    assert "ignoring preferred input modalities" in caplog.text
 
 
 @pytest.mark.asyncio

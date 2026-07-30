@@ -17,7 +17,6 @@ MAX_TASK_RUNTIME_JSON_BYTES = 64 * 1024
 MAX_TASK_RUNTIME_ENVIRONMENT_BYTES = 64 * 1024
 MAX_TASK_RUNTIME_TOOLS = 64
 MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES = 256 * 1024
-TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY = "_runtime"
 
 
 class TaskRuntimeClientError(Exception):
@@ -84,6 +83,14 @@ class TaskRuntimeContribution:
 
 
 EMPTY_TASK_RUNTIME_CONTRIBUTION = TaskRuntimeContribution()
+
+
+@dataclass(frozen=True)
+class TaskRuntimeToolConflict:
+    """One provider dropped because its surviving tools collide by name."""
+
+    provider: str
+    tool_names: tuple[str, ...]
 
 
 class TaskRuntimeExtensionProvider(Protocol):
@@ -239,10 +246,35 @@ def filter_task_runtime_contribution_tools(
     and its tool list is narrowed to the surviving names.
     """
 
+    reconciled, _conflicts = reconcile_task_runtime_contribution_tools(
+        contribution,
+        available_tool_names=available_tool_names,
+    )
+    return reconciled
+
+
+def reconcile_task_runtime_contribution_tools(
+    contribution: TaskRuntimeContribution,
+    *,
+    available_tool_names: set[str],
+    reserved_tool_names: set[str] | None = None,
+) -> tuple[TaskRuntimeContribution, tuple[TaskRuntimeToolConflict, ...]]:
+    """Apply tool policy and isolate providers whose surviving names collide.
+
+    ``available_tool_names`` contains extension tool names that survived the
+    task's selection and user policy. ``reserved_tool_names`` contains core
+    tool names that survived the same policy. Providers are considered in
+    registry order; a provider with any collision is removed as one unit so
+    its prompt environment and modality preference cannot describe tools that
+    were discarded.
+    """
+
     if not contribution.provider_contributions:
-        return contribution
+        return contribution, ()
 
     retained: dict[str, TaskRuntimeContribution] = {}
+    conflicts: list[TaskRuntimeToolConflict] = []
+    claimed_names = set(reserved_tool_names or ())
     for provider_name, provider_contribution in contribution.provider_contributions:
         provider_tools = tuple(provider_contribution.tools)
         if not provider_tools:
@@ -254,16 +286,37 @@ def filter_task_runtime_contribution_tools(
             if isinstance((name := getattr(tool, "name", None)), str)
             and name in available_tool_names
         )
-        if surviving_tools:
-            retained[provider_name] = replace(
-                provider_contribution,
-                tools=surviving_tools,
-                tool_origins=(),
-                provider_contributions=(),
-            )
+        if not surviving_tools:
+            continue
 
-    return (
+        surviving_names = tuple(str(tool.name).strip() for tool in surviving_tools)
+        seen_names: set[str] = set()
+        duplicate_names: set[str] = set()
+        for name in surviving_names:
+            if name in seen_names:
+                duplicate_names.add(name)
+            seen_names.add(name)
+        conflicting_names = duplicate_names | (set(surviving_names) & claimed_names)
+        if conflicting_names:
+            conflicts.append(
+                TaskRuntimeToolConflict(
+                    provider=provider_name,
+                    tool_names=tuple(sorted(conflicting_names)),
+                )
+            )
+            continue
+
+        retained[provider_name] = replace(
+            provider_contribution,
+            tools=surviving_tools,
+            tool_origins=(),
+            provider_contributions=(),
+        )
+        claimed_names.update(surviving_names)
+
+    reconciled = (
         merge_task_runtime_contributions(retained)
         if retained
         else EMPTY_TASK_RUNTIME_CONTRIBUTION
     )
+    return reconciled, tuple(conflicts)

@@ -15,7 +15,6 @@ from xagent.core.task_runtime import (
     MAX_TASK_RUNTIME_JSON_BYTES,
     MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
     MAX_TASK_RUNTIME_TOOLS,
-    TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     normalize_input_modalities,
@@ -28,6 +27,7 @@ from xagent.web.services.task_runtime import (
     get_task_runtime_public_metadata,
     register_task_extension,
     registered_task_extensions,
+    shutdown_task_runtime_hook_executor,
     unregister_task_extension,
     validate_task_extension_requests,
 )
@@ -49,6 +49,24 @@ def _context(*, workspace: Any = None) -> TaskRuntimeContext:
         session_factory=lambda: object(),
         workspace=workspace,
     )
+
+
+def test_task_runtime_executor_shutdown_allows_lazy_recreation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xagent.web.services.task_runtime as task_runtime
+
+    shutdown_task_runtime_hook_executor()
+    monkeypatch.setattr(task_runtime, "get_task_runtime_hook_max_workers", lambda: 2)
+
+    first = task_runtime._get_task_runtime_hook_executor()
+    shutdown_task_runtime_hook_executor()
+    second = task_runtime._get_task_runtime_hook_executor()
+    shutdown_task_runtime_hook_executor()
+
+    assert first is not second
+    assert first._shutdown is True
+    assert second._shutdown is True
 
 
 class _Provider:
@@ -171,7 +189,8 @@ async def test_provider_lifecycle_merges_detached_runtime_contributions(
         ("tool_a", "first_runtime"),
         ("tool_b", "second_runtime"),
     )
-    assert metadata == {"first_runtime": {"target": "one"}}
+    assert metadata.extensions == {"first_runtime": {"target": "one"}}
+    assert metadata.status == "complete"
     assert events[-2:] == ["delete:second", "delete:first"]
 
 
@@ -334,7 +353,7 @@ async def test_metadata_dispatch_uses_registry_snapshot_across_await(
 
     metadata = await get_task_runtime_public_metadata(_context())
 
-    assert metadata == {
+    assert metadata.extensions == {
         "first_metadata": {"first": True},
         "second_metadata": {"second": True},
     }
@@ -463,6 +482,59 @@ async def test_blocking_provider_timeout_does_not_consume_default_executor(
 
 
 @pytest.mark.asyncio
+async def test_provider_execution_timeout_excludes_executor_queue_wait(
+    registered_names: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import xagent.web.services.task_runtime as task_runtime
+
+    release_blocker = threading.Event()
+
+    class _BlockingProvider(_Provider):
+        def build_runtime(
+            self,
+            context: TaskRuntimeContext,
+        ) -> TaskRuntimeContribution:
+            release_blocker.wait()
+            return TaskRuntimeContribution(environment="too late")
+
+    shutdown_task_runtime_hook_executor()
+    monkeypatch.setattr(task_runtime, "get_task_runtime_hook_max_workers", lambda: 1)
+    monkeypatch.setattr(
+        task_runtime,
+        "get_task_runtime_hook_queue_timeout_seconds",
+        lambda: 1,
+    )
+    monkeypatch.setitem(
+        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
+        "build_runtime",
+        0.05,
+    )
+    _register(
+        "blocking_runtime",
+        _BlockingProvider("blocking"),
+        registered_names,
+    )
+    _register(
+        "healthy_runtime",
+        _Provider(
+            "healthy",
+            contribution=TaskRuntimeContribution(environment="healthy"),
+        ),
+        registered_names,
+    )
+    asyncio.get_running_loop().call_later(0.15, release_blocker.set)
+
+    try:
+        contribution = await build_task_runtime(_context())
+    finally:
+        release_blocker.set()
+        shutdown_task_runtime_hook_executor()
+
+    assert contribution.environment == "healthy"
+
+
+@pytest.mark.asyncio
 async def test_build_runtime_keeps_successful_provider_when_another_fails(
     registered_names: list[str],
     caplog: pytest.LogCaptureFixture,
@@ -537,7 +609,45 @@ async def test_runtime_contribution_environment_and_tools_are_bounded(
 
 
 @pytest.mark.asyncio
-async def test_public_metadata_aggregate_is_bounded_with_partial_marker(
+async def test_aggregate_tool_limit_logs_dropped_provider_and_reason(
+    registered_names: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _register(
+        "large_runtime",
+        _Provider(
+            "large",
+            contribution=TaskRuntimeContribution(
+                tools=tuple(
+                    SimpleNamespace(name=f"large_{index}") for index in range(60)
+                )
+            ),
+        ),
+        registered_names,
+    )
+    _register(
+        "small_runtime",
+        _Provider(
+            "small",
+            contribution=TaskRuntimeContribution(
+                tools=tuple(
+                    SimpleNamespace(name=f"small_{index}") for index in range(5)
+                )
+            ),
+        ),
+        registered_names,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        contribution = await build_task_runtime(_context())
+
+    assert len(contribution.tools) == 60
+    assert "small_runtime" in caplog.text
+    assert f"{MAX_TASK_RUNTIME_TOOLS}-tool limit" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_public_metadata_aggregate_is_bounded_with_top_level_status(
     registered_names: list[str],
 ) -> None:
     for index in range(5):
@@ -552,10 +662,13 @@ async def test_public_metadata_aggregate_is_bounded_with_partial_marker(
 
     metadata = await get_task_runtime_public_metadata(_context())
 
-    status = metadata[TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY]
-    assert status["partial"] is True
-    assert status["omitted_extensions"]
-    assert status["limit_bytes"] == MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES
+    assert metadata.status == "truncated"
+    assert metadata.omitted_extensions
+    assert "_runtime" not in metadata.extensions
+    assert (
+        len(str(metadata.extensions).encode("utf-8"))
+        < MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES
+    )
 
 
 @pytest.mark.asyncio

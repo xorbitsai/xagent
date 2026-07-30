@@ -1810,12 +1810,10 @@ async def test_dag_plan_generation_forwards_runtime_modality_preference() -> Non
     )
 
     class _RouterLikeLLM:
-        supports_preferred_input_modalities = True
-
         def __init__(self) -> None:
             self.preferred_modalities: list[tuple[str, ...]] = []
 
-        async def prepare_for_call(
+        async def prepare_for_call_with_modalities(
             self,
             messages: list[dict[str, Any]],
             *,
@@ -2614,9 +2612,7 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     resumed_llm = SequenceLLM([{"content": "The answer is 42.", "done": True}])
 
     class _TrackingRouter:
-        supports_preferred_input_modalities = True
-
-        async def prepare_for_call(
+        async def prepare_for_call_with_modalities(
             self,
             messages: list[dict[str, Any]],
             *,

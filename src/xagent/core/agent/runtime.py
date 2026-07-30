@@ -60,26 +60,38 @@ async def prepare_llm_for_context(
     """Resolve virtual models before compaction and apply their context window.
 
     Models without a per-call preparation hook are returned unchanged.
-    RouterLLM advertises modality-aware preparation and returns a one-call
+    RouterLLM exposes an explicit modality-aware hook and returns a one-call
     wrapper for the concrete xrouter selection, ensuring the selected model is
-    reused after compaction instead of routing twice. Legacy virtual models
-    keep their original one-argument ``prepare_for_call(messages)`` contract.
+    reused after compaction instead of routing twice. Legacy virtual models keep
+    their original one-argument ``prepare_for_call(messages)`` contract.
     """
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
-    if callable(prepare):
+    prepare_with_modalities = getattr(
+        llm,
+        "prepare_for_call_with_modalities",
+        None,
+    )
+    if callable(prepare) or callable(prepare_with_modalities):
         metadata = getattr(context, "metadata", None)
         preferred_modalities = normalize_input_modalities(
             ()
             if not metadata or not isinstance(metadata, Mapping)
             else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
         )
-        if getattr(llm, "supports_preferred_input_modalities", False):
-            prepared = prepare(
+        if callable(prepare_with_modalities):
+            prepared = prepare_with_modalities(
                 messages,
                 preferred_input_modalities=preferred_modalities,
             )
-        else:
+        elif callable(prepare):
+            if preferred_modalities:
+                logger.debug(
+                    "LLM %s exposes only legacy prepare_for_call; ignoring "
+                    "preferred input modalities %s",
+                    type(llm).__name__,
+                    preferred_modalities,
+                )
             prepared = prepare(messages)
         if inspect.isawaitable(prepared):
             prepared = await prepared

@@ -37,7 +37,6 @@ from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
-    TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY,
     TaskRuntimeClientError,
     TaskRuntimeContext,
     TaskRuntimeContribution,
@@ -3860,6 +3859,7 @@ async def create_task(
             user_id=int(task.user_id),
             source=task.source,
         )
+        release_db_connection_if_clean(db)
         try:
             await create_task_extensions(
                 runtime_context,
@@ -3892,14 +3892,13 @@ async def create_task(
         # binding has already been persisted successfully, so creation degrades
         # to an empty mapping here; the dedicated GET endpoint remains
         # fail-closed because metadata is its primary response.
-        runtime_extensions_partial = False
+        runtime_extensions_status = "complete"
+        runtime_extensions_omitted: list[str] = []
         try:
-            runtime_extensions = await get_task_runtime_public_metadata(runtime_context)
-            runtime_extensions_partial = bool(
-                runtime_extensions.get(TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY, {}).get(
-                    "partial"
-                )
-            )
+            metadata_result = await get_task_runtime_public_metadata(runtime_context)
+            runtime_extensions = metadata_result.extensions
+            runtime_extensions_status = metadata_result.status
+            runtime_extensions_omitted = list(metadata_result.omitted_extensions)
         except TaskRuntimeExtensionError:
             logger.warning(
                 "Failed to load public runtime metadata for task %s",
@@ -3907,7 +3906,7 @@ async def create_task(
                 exc_info=True,
             )
             runtime_extensions = {}
-            runtime_extensions_partial = True
+            runtime_extensions_status = "failed"
 
         return TaskCreateResponse(
             task_id=task.id,
@@ -3934,7 +3933,8 @@ async def create_task(
             state_version=int(task.state_version or 0),
             control_state=str(task.control_state or "idle"),
             runtime_extensions=runtime_extensions,
-            runtime_extensions_partial=runtime_extensions_partial,
+            runtime_extensions_status=runtime_extensions_status,
+            runtime_extensions_omitted=runtime_extensions_omitted,
         )
 
     except HTTPException:
@@ -4461,8 +4461,9 @@ async def get_task_runtime_extensions(
         user_id=int(task.user_id),
         source=task.source,
     )
+    release_db_connection_if_clean(db)
     try:
-        extensions = await get_task_runtime_public_metadata(context)
+        metadata_result = await get_task_runtime_public_metadata(context)
     except TaskRuntimeExtensionError as exc:
         if isinstance(exc.cause, TaskRuntimeClientError):
             status_code = exc.cause.status_code
@@ -4475,7 +4476,12 @@ async def get_task_runtime_extensions(
                 task_id,
             )
         raise HTTPException(status_code=status_code, detail=detail) from exc
-    return {"task_id": task_id, "runtime_extensions": extensions}
+    return {
+        "task_id": task_id,
+        "runtime_extensions": metadata_result.extensions,
+        "runtime_extensions_status": metadata_result.status,
+        "runtime_extensions_omitted": list(metadata_result.omitted_extensions),
+    }
 
 
 @chat_router.delete("/task/{task_id}")

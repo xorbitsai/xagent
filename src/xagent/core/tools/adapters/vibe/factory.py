@@ -378,11 +378,11 @@ class ToolFactory:
         """
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
+        core_tool_ids = {id(tool) for tool in tools}
         extension_tools = list(additional_tools)
+        extension_tool_ids: set[int] = set()
         extension_names: set[str] = set()
         if extension_tools:
-            existing_names = {tool.name for tool in tools}
-            accepted_extension_tools: list[Tool] = []
             for tool in extension_tools:
                 name = getattr(tool, "name", None)
                 if not isinstance(name, str) or not name.strip():
@@ -390,15 +390,11 @@ class ToolFactory:
                         "Task runtime extension contributed a tool without a "
                         "non-empty string 'name' attribute"
                     )
-                if name in existing_names or name in extension_names:
-                    provider = (additional_tool_origins or {}).get(name, "unknown")
-                    raise ValueError(
-                        f"Task runtime extension '{provider}' contributed duplicate "
-                        f"tool '{name}'"
-                    )
-                extension_names.add(name)
-                accepted_extension_tools.append(tool)
-            tools.extend(accepted_extension_tools)
+                extension_names.add(name.strip())
+                extension_tool_ids.add(id(tool))
+            # Keep colliding candidates through the name-policy stages. A tool
+            # filtered by task/user policy cannot collide at execution time.
+            tools.extend(extension_tools)
             tools = ToolRegistry._sort_tools_by_category(tools)
 
         # Name-level filter via the spec's ``compute_allowed_names``
@@ -489,7 +485,13 @@ class ToolFactory:
                 allowed_by_hook = set(allowlist)
                 tools = [tool for tool in tools if tool.name in allowed_by_hook]
 
-        dropped_extension_names = extension_names - {tool.name for tool in tools}
+        policy_surviving_extension_tools = [
+            tool for tool in tools if id(tool) in extension_tool_ids
+        ]
+        policy_surviving_extension_names = {
+            tool.name for tool in policy_surviving_extension_tools
+        }
+        dropped_extension_names = extension_names - policy_surviving_extension_names
         if dropped_extension_names:
             origins = additional_tool_origins or {}
             dropped_by_provider: dict[str, list[str]] = {}
@@ -507,23 +509,63 @@ class ToolFactory:
         if extension_names:
             contribution_getter = getattr(config, "get_task_runtime_contribution", None)
             contribution_setter = getattr(config, "set_task_runtime_contribution", None)
+            contribution_reconciled = False
             if callable(contribution_getter) and callable(contribution_setter):
                 from ....task_runtime import (
                     TaskRuntimeContribution,
-                    filter_task_runtime_contribution_tools,
+                    reconcile_task_runtime_contribution_tools,
                 )
 
                 contribution = contribution_getter()
-                if isinstance(contribution, TaskRuntimeContribution):
-                    surviving_names = {
-                        tool.name for tool in tools if tool.name in extension_names
-                    }
-                    contribution_setter(
-                        filter_task_runtime_contribution_tools(
-                            contribution,
-                            surviving_names,
-                        )
+                if (
+                    isinstance(contribution, TaskRuntimeContribution)
+                    and contribution.provider_contributions
+                    and {id(tool) for tool in contribution.tools} == extension_tool_ids
+                ):
+                    reconciled, conflicts = reconcile_task_runtime_contribution_tools(
+                        contribution,
+                        available_tool_names=policy_surviving_extension_names,
+                        reserved_tool_names={
+                            tool.name for tool in tools if id(tool) in core_tool_ids
+                        },
                     )
+                    contribution_setter(reconciled)
+                    accepted_extension_ids = {id(tool) for tool in reconciled.tools}
+                    tools = [
+                        tool
+                        for tool in tools
+                        if id(tool) not in extension_tool_ids
+                        or id(tool) in accepted_extension_ids
+                    ]
+                    contribution_reconciled = True
+                    for conflict in conflicts:
+                        logger.warning(
+                            "Dropping task runtime extension '%s' because its "
+                            "post-policy tool names collide: %s",
+                            conflict.provider,
+                            ", ".join(conflict.tool_names),
+                        )
+                elif isinstance(contribution, TaskRuntimeContribution):
+                    contribution_setter(
+                        reconcile_task_runtime_contribution_tools(
+                            contribution,
+                            available_tool_names=policy_surviving_extension_names,
+                        )[0]
+                    )
+
+            if not contribution_reconciled:
+                claimed_names = {
+                    tool.name for tool in tools if id(tool) in core_tool_ids
+                }
+                for tool in policy_surviving_extension_tools:
+                    name = tool.name
+                    if name in claimed_names:
+                        provider = (additional_tool_origins or {}).get(name, "unknown")
+                        raise ValueError(
+                            f"Task runtime extension '{provider}' contributed "
+                            f"duplicate tool '{name}'"
+                        )
+                    claimed_names.add(name)
 
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()

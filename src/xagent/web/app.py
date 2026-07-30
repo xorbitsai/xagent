@@ -1365,6 +1365,10 @@ async def shutdown_event() -> None:
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
 
+    from .services.task_runtime import shutdown_task_runtime_hook_executor
+
+    shutdown_task_runtime_hook_executor()
+
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager
 

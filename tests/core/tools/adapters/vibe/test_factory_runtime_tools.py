@@ -121,6 +121,68 @@ async def test_runtime_tools_cannot_shadow_existing_tool(
 
 
 @pytest.mark.asyncio
+async def test_policy_filtered_runtime_collision_does_not_fail(monkeypatch) -> None:
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [_tool("computer")]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+
+    tools = await ToolFactory.create_all_tools(
+        ToolConfig({"allowed_tools": []}),
+        additional_tools=(_tool("computer"),),
+        additional_tool_origins={"computer": "desktop_runtime"},
+    )
+
+    assert tools == []
+
+
+@pytest.mark.asyncio
+async def test_structured_runtime_collision_drops_only_provider(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    core_tool = _tool("computer")
+    runtime_tool = _tool("computer")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [core_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "desktop_runtime": TaskRuntimeContribution(
+                    tools=(runtime_tool,),
+                    environment="Control the desktop.",
+                    preferred_input_modalities=("image",),
+                )
+            }
+        )
+    }
+    config = ToolConfig({})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    assert tools == [core_tool]
+    assert contribution_holder["value"] == TaskRuntimeContribution()
+    assert "Dropping task runtime extension 'desktop_runtime'" in caplog.text
+    assert "computer" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_explicit_runtime_tools_preserve_provider_origin(
     monkeypatch, caplog
 ) -> None:

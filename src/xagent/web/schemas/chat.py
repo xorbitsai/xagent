@@ -1,7 +1,7 @@
 """Chat API request and response models"""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -117,7 +117,8 @@ class TaskCreateResponse(BaseModel):
     state_version: int = 0
     control_state: str = "idle"
     runtime_extensions: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
-    runtime_extensions_partial: bool = False
+    runtime_extensions_status: Literal["complete", "truncated", "failed"] = "complete"
+    runtime_extensions_omitted: List[str] = Field(default_factory=list)
 
 
 class ExecutionStatus(BaseModel):

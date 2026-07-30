@@ -13,17 +13,20 @@ import json
 import logging
 import re
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from threading import RLock
-from typing import Any
+from typing import Any, Literal
 
+from ...config import (
+    get_task_runtime_hook_max_workers,
+    get_task_runtime_hook_queue_timeout_seconds,
+)
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     MAX_TASK_RUNTIME_EXTENSIONS,
     MAX_TASK_RUNTIME_JSON_BYTES,
     MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
-    TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     TaskRuntimeExtensionProvider,
@@ -46,10 +49,8 @@ _TASK_RUNTIME_HOOK_TIMEOUT_SECONDS = {
     "public_metadata": 10.0,
     "on_task_deleted": 30.0,
 }
-_TASK_RUNTIME_HOOK_EXECUTOR = ThreadPoolExecutor(
-    max_workers=8,
-    thread_name_prefix="xagent-task-runtime",
-)
+_task_runtime_hook_executor: ThreadPoolExecutor | None = None
+_task_runtime_hook_executor_lock = RLock()
 _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,37 @@ class TaskRuntimeExtensionError(RuntimeError):
         self.extension = extension
         self.operation = operation
         self.cause = cause
+
+
+@dataclass(frozen=True)
+class TaskRuntimePublicMetadata:
+    """Provider metadata plus aggregate delivery status for API callers."""
+
+    extensions: dict[str, dict[str, Any]]
+    status: Literal["complete", "truncated"] = "complete"
+    omitted_extensions: tuple[str, ...] = ()
+
+
+def shutdown_task_runtime_hook_executor() -> None:
+    """Stop accepting provider hooks and cancel work that has not started."""
+
+    global _task_runtime_hook_executor
+    with _task_runtime_hook_executor_lock:
+        executor = _task_runtime_hook_executor
+        _task_runtime_hook_executor = None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _get_task_runtime_hook_executor() -> ThreadPoolExecutor:
+    global _task_runtime_hook_executor
+    with _task_runtime_hook_executor_lock:
+        if _task_runtime_hook_executor is None:
+            _task_runtime_hook_executor = ThreadPoolExecutor(
+                max_workers=get_task_runtime_hook_max_workers(),
+                thread_name_prefix="xagent-task-runtime",
+            )
+        return _task_runtime_hook_executor
 
 
 def register_task_extension(
@@ -213,8 +245,9 @@ async def build_task_runtime(
         except BaseException as exc:
             _propagate_control_flow_exception(exc)
             logger.error(
-                "Ignoring failed task runtime contribution from extension '%s'",
+                "Dropping task runtime contribution from extension '%s': %s",
                 name,
+                exc,
                 exc_info=True,
             )
             continue
@@ -224,7 +257,7 @@ async def build_task_runtime(
 
 async def get_task_runtime_public_metadata(
     context: TaskRuntimeContext,
-) -> dict[str, dict[str, Any]]:
+) -> TaskRuntimePublicMetadata:
     """Return provider-selected, JSON-safe metadata suitable for clients."""
 
     result: dict[str, dict[str, Any]] = {}
@@ -260,13 +293,11 @@ async def get_task_runtime_public_metadata(
         except BaseException as exc:
             _propagate_control_flow_exception(exc)
             raise TaskRuntimeExtensionError(name, "public_metadata", exc) from exc
-    if omitted_extensions:
-        result[TASK_RUNTIME_PUBLIC_METADATA_STATUS_KEY] = {
-            "partial": True,
-            "omitted_extensions": omitted_extensions,
-            "limit_bytes": MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
-        }
-    return result
+    return TaskRuntimePublicMetadata(
+        extensions=result,
+        status="truncated" if omitted_extensions else "complete",
+        omitted_extensions=tuple(omitted_extensions),
+    )
 
 
 async def delete_task_extensions(context: TaskRuntimeContext) -> None:
@@ -349,13 +380,15 @@ async def _invoke_provider_hook(
     hook = getattr(provider, operation)
     timeout = _TASK_RUNTIME_HOOK_TIMEOUT_SECONDS[operation]
     loop = asyncio.get_running_loop()
+    started: Future[None] = Future()
+
+    def _call_hook() -> Any:
+        started.set_result(None)
+        return hook(*args)
 
     async def _invoke() -> Any:
         try:
-            value = await loop.run_in_executor(
-                _TASK_RUNTIME_HOOK_EXECUTOR,
-                partial(hook, *args),
-            )
+            value = await execution_future
             return await _maybe_await(value)
         except asyncio.CancelledError as exc:
             task = asyncio.current_task()
@@ -368,11 +401,34 @@ async def _invoke_provider_hook(
             # observe them. Carry then re-raise them outside ``wait_for``.
             return _ProviderHookRaised(exc)
 
+    execution_future = loop.run_in_executor(
+        _get_task_runtime_hook_executor(),
+        _call_hook,
+    )
+    started_future = asyncio.wrap_future(started)
+    queue_timeout = get_task_runtime_hook_queue_timeout_seconds()
     try:
-        result = await asyncio.wait_for(_invoke(), timeout=timeout)
+        await asyncio.wait_for(
+            asyncio.shield(started_future),
+            timeout=queue_timeout,
+        )
+    except TimeoutError as exc:
+        execution_future.cancel()
+        raise TimeoutError(
+            f"Provider hook queue wait exceeded the {queue_timeout:g}-second timeout"
+        ) from exc
+    except asyncio.CancelledError:
+        execution_future.cancel()
+        raise
+
+    try:
+        result = await asyncio.wait_for(
+            _invoke(),
+            timeout=timeout,
+        )
     except TimeoutError as exc:
         raise TimeoutError(
-            f"Provider hook exceeded the {timeout:g}-second timeout"
+            f"Provider hook execution exceeded the {timeout:g}-second timeout"
         ) from exc
     if isinstance(result, _ProviderHookRaised):
         raise result.error

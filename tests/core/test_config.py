@@ -75,6 +75,8 @@ from xagent.config import (
     TASK_LEASE_RECOVERY_BATCH_SIZE,
     TASK_LEASE_RECOVERY_INTERVAL_SECONDS,
     TASK_LEASE_TTL_SECONDS,
+    TASK_RUNTIME_HOOK_MAX_WORKERS,
+    TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
     TRIGGER_CALLBACK_BASE_URL,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
@@ -158,6 +160,8 @@ from xagent.config import (
     get_storage_root,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
+    get_task_runtime_hook_max_workers,
+    get_task_runtime_hook_queue_timeout_seconds,
     get_trigger_callback_base_url,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
@@ -1504,6 +1508,29 @@ class TestToolConcurrencyConfig:
         assert get_tool_max_concurrency() == 3
         monkeypatch.setenv("XAGENT_TOOL_MAX_CONCURRENCY", "0")
         assert get_tool_max_concurrency() == 3
+
+
+class TestTaskRuntimeHookConfig:
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv(TASK_RUNTIME_HOOK_MAX_WORKERS, raising=False)
+        monkeypatch.delenv(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, raising=False)
+
+        assert get_task_runtime_hook_max_workers() == 8
+        assert get_task_runtime_hook_queue_timeout_seconds() == 30
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_MAX_WORKERS, "12")
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, "45")
+
+        assert get_task_runtime_hook_max_workers() == 12
+        assert get_task_runtime_hook_queue_timeout_seconds() == 45
+
+    def test_invalid_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_MAX_WORKERS, "0")
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, "invalid")
+
+        assert get_task_runtime_hook_max_workers() == 8
+        assert get_task_runtime_hook_queue_timeout_seconds() == 30
 
 
 class TestCheckpointStorageConfig:

@@ -252,6 +252,32 @@ async def test_prepare_for_call_merges_runtime_and_message_modalities(monkeypatc
     assert prepared.has_ability("vision")
 
 
+@pytest.mark.asyncio
+async def test_direct_chat_forwards_explicit_modality_preference(monkeypatch):
+    downstream = _ScriptedChatLLM([])
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    captured: list[tuple[str, ...]] = []
+
+    async def prepare(
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> BaseLLM:
+        assert messages
+        captured.append(preferred_input_modalities)
+        return downstream
+
+    monkeypatch.setattr(router, "prepare_for_call", prepare)
+
+    result = await router.chat(
+        [{"role": "user", "content": "inspect"}],
+        preferred_input_modalities=("image",),
+    )
+
+    assert result == "ok"
+    assert captured == [("image",)]
+
+
 def test_router_detects_modalities_from_refs_and_content_parts() -> None:
     reference = ContextReference(
         file_ref={

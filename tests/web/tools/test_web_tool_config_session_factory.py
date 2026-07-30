@@ -504,6 +504,105 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
 
 
 @pytest.mark.asyncio
+async def test_create_default_tools_isolates_runtime_tool_name_collision(
+    monkeypatch,
+    caplog,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.core.task_runtime import (
+        TaskRuntimeContribution,
+        merge_task_runtime_contributions,
+    )
+    from xagent.core.tools.adapters.vibe.config import (
+        ToolConfig as StandaloneToolConfig,
+    )
+    from xagent.web.api.chat import create_default_tools
+
+    core_tool = SimpleNamespace(
+        name="computer",
+        metadata=SimpleNamespace(category="other"),
+    )
+    runtime_tool = SimpleNamespace(
+        name="computer",
+        metadata=SimpleNamespace(category="other"),
+    )
+
+    class _FakeToolConfig(StandaloneToolConfig):
+        def __init__(self, **kwargs):
+            super().__init__({})
+            self.runtime_contribution = TaskRuntimeContribution()
+            self.runtime_workspace = None
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+        def get_task_runtime_contribution(self):
+            return self.runtime_contribution
+
+        def set_task_runtime_workspace(self, workspace) -> None:
+            self.runtime_workspace = workspace
+
+        def get_task_runtime_workspace(self):
+            return self.runtime_workspace
+
+    async def create_registered_tools(config):
+        return [core_tool]
+
+    async def build_runtime(_context):
+        return merge_task_runtime_contributions(
+            {
+                "desktop_runtime": TaskRuntimeContribution(
+                    tools=(runtime_tool,),
+                    environment="Control the desktop.",
+                    preferred_input_modalities=("image",),
+                )
+            }
+        )
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        lambda _config: SimpleNamespace(id="workspace"),
+    )
+    monkeypatch.setattr(chat_module, "build_task_runtime", build_runtime)
+    monkeypatch.setattr(
+        chat_module,
+        "registered_task_extensions",
+        lambda: ("desktop_runtime",),
+    )
+
+    with caplog.at_level("WARNING"):
+        tools, config = await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+            task_runtime_context=TaskRuntimeContext(
+                task_id=11,
+                user_id=7,
+                source="internal",
+                session_factory=lambda: object(),
+            ),
+        )
+
+    assert tools == [core_tool]
+    assert config.runtime_contribution == TaskRuntimeContribution()
+    assert "Dropping task runtime extension 'desktop_runtime'" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_create_default_tools_prefetches_excluded_agent_policy_once(monkeypatch):
     """The prefetched agent policy must include the excluded agent ID."""
     from xagent.web.api.chat import create_default_tools

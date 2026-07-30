@@ -1287,13 +1287,40 @@ def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
     test_db,
     user1_headers,
     user2_headers,
+    monkeypatch,
 ):
+    import xagent.web.api.chat as chat_module
     from xagent.web.services.task_runtime import (
         register_task_extension,
         unregister_task_extension,
     )
 
-    provider = _TaskRuntimeProvider()
+    release_count = 0
+    original_release = chat_module.release_db_connection_if_clean
+
+    def record_release(db):
+        nonlocal release_count
+        release_count += 1
+        return original_release(db)
+
+    monkeypatch.setattr(
+        chat_module,
+        "release_db_connection_if_clean",
+        record_release,
+    )
+
+    class _ReleaseAwareProvider(_TaskRuntimeProvider):
+        minimum_release_count = 1
+
+        async def on_task_created(self, context, configuration):
+            assert release_count >= self.minimum_release_count
+            await super().on_task_created(context, configuration)
+
+        async def public_metadata(self, context):
+            assert release_count >= self.minimum_release_count
+            return await super().public_metadata(context)
+
+    provider = _ReleaseAwareProvider()
     register_task_extension("test_runtime", provider)
     try:
         response = client.post(
@@ -1311,6 +1338,9 @@ def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
         assert response.json()["runtime_extensions"] == {
             "test_runtime": {"target": "approved_browser"}
         }
+        assert response.json()["runtime_extensions_status"] == "complete"
+        assert response.json()["runtime_extensions_omitted"] == []
+        provider.minimum_release_count = release_count + 1
         metadata = client.get(
             f"/api/chat/task/{task_id}/runtime-extensions",
             headers=user1_headers,
@@ -1319,6 +1349,8 @@ def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
         assert metadata.json()["runtime_extensions"] == {
             "test_runtime": {"target": "approved_browser"}
         }
+        assert metadata.json()["runtime_extensions_status"] == "complete"
+        assert metadata.json()["runtime_extensions_omitted"] == []
         denied = client.get(
             f"/api/chat/task/{task_id}/runtime-extensions",
             headers=user2_headers,
@@ -1378,7 +1410,8 @@ def test_task_runtime_metadata_maps_provider_error_status(
         )
         assert response.status_code == 200, response.text
         task_id = response.json()["task_id"]
-        assert response.json()["runtime_extensions_partial"] is True
+        assert response.json()["runtime_extensions_status"] == "failed"
+        assert response.json()["runtime_extensions_omitted"] == []
 
         metadata = client.get(
             f"/api/chat/task/{task_id}/runtime-extensions",

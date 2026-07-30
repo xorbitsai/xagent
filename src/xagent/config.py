@@ -83,6 +83,10 @@ WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
 TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
+TASK_RUNTIME_HOOK_MAX_WORKERS = "XAGENT_TASK_RUNTIME_HOOK_MAX_WORKERS"
+TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS = (
+    "XAGENT_TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS"
+)
 CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
 CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
@@ -504,6 +508,18 @@ def get_tool_max_concurrency() -> int:
         The per-batch concurrency cap (>= 1).
     """
     return _get_positive_int_env(TOOL_MAX_CONCURRENCY, 3)
+
+
+def get_task_runtime_hook_max_workers() -> int:
+    """Maximum process-wide worker threads for task runtime provider hooks."""
+
+    return _get_positive_int_env(TASK_RUNTIME_HOOK_MAX_WORKERS, 8)
+
+
+def get_task_runtime_hook_queue_timeout_seconds() -> int:
+    """Seconds a provider hook may wait for a runtime worker before starting."""
+
+    return _get_positive_int_env(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, 30)
 
 
 def get_checkpoint_encoding_v2_enabled() -> bool:

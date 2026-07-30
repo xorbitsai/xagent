@@ -71,6 +71,11 @@ def _slack_provider_row() -> dict[str, object]:
         "token_url": "https://slack.com/api/oauth.v2.access",
         "redirect_uri": os.environ.get("SLACK_REDIRECT_URI", ""),
         "userinfo_url": "https://slack.com/api/auth.test",
+        # auth.test never returns an email for a bot token; the workspace
+        # name ("team") is deliberately stored in the email slot because
+        # UserOAuth.email is only consumed as the "connected account" display
+        # label for non-gmail providers — without it the Slack connection
+        # would show up unlabeled in the connector UI.
         "user_id_path": "team_id",
         "email_path": "team",
         "default_scopes": SLACK_SCOPES,

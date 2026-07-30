@@ -20,10 +20,10 @@ from xagent.web.models.agent import (
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce, WorkforceAgent
-from .agent_team_scope import get_agent_team_scope, owns_agent
 from .workforce_access import (
     ensure_workforce_access,
     ensure_workforce_agent_run_access,
+    get_workforce_policy,
 )
 from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
 
@@ -369,15 +369,17 @@ def build_workforce_snapshot(
 def _ensure_preview_agent_run_access(
     agent: Agent | None, user: User, db: Session
 ) -> Agent:
-    """Strict, non-bypassable ownership check for a preview run's agents.
+    """Run-scope access check for a preview run's agents, with no persisted
+    Workforce to check against.
 
     Unlike ``ensure_agent_access`` (used for *selecting* agents into a
     workforce, purpose="workforce_select"), a preview run actually executes
-    the manager/worker agents. It must match the persisted run path's
-    ``ensure_workforce_agent_run_access`` / ``is_agent_in_workforce_run_scope``
-    semantics -- strict ownership, with no ``user.is_admin`` bypass and no
-    broader team-visibility grant -- or an admin could use the preview
-    endpoint to execute another user's private published agent.
+    the manager/worker agents, so it must go through the same pluggable
+    ``WorkforcePolicy.is_agent_in_workforce_run_scope`` hook as the persisted
+    path's ``ensure_workforce_agent_run_access`` -- passing ``workforce=None``
+    -- rather than hardcoding the default policy's ownership rule here. A
+    custom policy (e.g. team-shared execution) must apply identically to
+    preview and saved runs.
     """
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -387,8 +389,9 @@ def _ensure_preview_agent_run_access(
         raise HTTPException(
             status_code=400, detail="Workforce agents must be published"
         )
-    scope = get_agent_team_scope(db, int(user.id))
-    if not owns_agent(agent, int(user.id), scope):
+    if not get_workforce_policy().is_agent_in_workforce_run_scope(
+        db, user, None, agent
+    ):
         raise HTTPException(status_code=403, detail="Access denied to agent")
     return agent
 

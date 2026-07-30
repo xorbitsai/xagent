@@ -70,14 +70,17 @@ class WorkforcePolicy:
         self,
         db: Session,
         user: User,
-        workforce: Workforce,
+        workforce: Workforce | None,
         agent: Agent,
     ) -> bool:
+        """``workforce`` is ``None`` for an unsaved draft's preview run --
+        there is no persisted owner to check, so the draft is scoped to the
+        requesting user by construction and only agent ownership applies.
+        """
+        if workforce is not None and int(workforce.owner_user_id) != int(user.id):
+            return False
         scope = get_agent_team_scope(db, int(user.id))
-        return bool(
-            int(workforce.owner_user_id) == int(user.id)
-            and owns_agent(agent, int(user.id), scope)
-        )
+        return owns_agent(agent, int(user.id), scope)
 
     def after_workforce_run_created(
         self,

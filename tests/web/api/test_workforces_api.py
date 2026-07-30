@@ -1352,6 +1352,99 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
     }
 
 
+def test_preview_run_endpoint_delegates_to_run_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercises the actual route + FastAPI dependency injection (the request
+    body, ``db: Session = Depends(get_db)``, ``user: User = Depends(get_current_user)``)
+    for the preview endpoint -- the existing preview coverage is all at the
+    service-function level."""
+    headers = _admin_headers()
+    owner_id = _user_id()
+    manager_id = _create_published_agent(owner_id, "Preview Manager")
+    worker_id = _create_published_agent(owner_id, "Preview Worker")
+    captured: dict[str, Any] = {}
+
+    async def fake_create_preview_workforce_run(
+        db: Any,
+        *,
+        user_id: int,
+        name: str | None,
+        description: str | None,
+        manager_agent_id: int,
+        workers: list[dict[str, Any]],
+        message: str,
+        selected_file_ids: list[str] | None = None,
+        execution_mode: str | None = None,
+    ) -> Any:
+        captured.update(
+            {
+                "user_id": user_id,
+                "name": name,
+                "description": description,
+                "manager_agent_id": manager_agent_id,
+                "workers": workers,
+                "message": message,
+                "selected_file_ids": selected_file_ids,
+                "execution_mode": execution_mode,
+            }
+        )
+        return SimpleNamespace(
+            workforce_run=SimpleNamespace(id=77, status="pending"),
+            task=SimpleNamespace(id=321),
+        )
+
+    monkeypatch.setattr(
+        workforces_api,
+        "create_preview_workforce_run",
+        fake_create_preview_workforce_run,
+    )
+
+    response = client.post(
+        "/api/workforces/preview/runs",
+        headers=headers,
+        json={
+            "name": "Draft Team",
+            "manager_agent_id": manager_id,
+            "workers": [
+                {
+                    "agent_id": worker_id,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            "message": "go",
+            "files": ["file-1"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "workforce_run_id": 77,
+        "task_id": 321,
+        "status": "pending",
+        "redirect_url": "/task/321",
+    }
+    assert captured == {
+        "user_id": owner_id,
+        "name": "Draft Team",
+        "description": None,
+        "manager_agent_id": manager_id,
+        "workers": [
+            {
+                "source_type": "existing",
+                "agent_id": worker_id,
+                "alias": None,
+                "assignment_instructions": "Do the work.",
+                "enabled": True,
+                "sort_order": None,
+                "canvas_position": None,
+            }
+        ],
+        "message": "go",
+        "selected_file_ids": ["file-1"],
+        "execution_mode": None,
+    }
+
+
 def test_list_workforce_runs_orders_paginates_and_excludes_previews() -> None:
     headers = _admin_headers()
     owner_id = _user_id()

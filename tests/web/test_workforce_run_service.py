@@ -617,6 +617,56 @@ async def test_create_preview_workforce_run_rejects_admin_using_anothers_private
 
 
 @pytest.mark.asyncio
+async def test_create_preview_workforce_run_honors_custom_run_scope_policy(
+    db_session: Session,
+) -> None:
+    """A custom ``WorkforcePolicy`` (e.g. team-shared execution) must apply
+    identically to preview and saved runs. The preview path checks agent
+    access through the same ``is_agent_in_workforce_run_scope`` hook as the
+    persisted path -- passing ``workforce=None`` -- instead of hardcoding the
+    default ownership rule, so a policy that widens (or narrows) run scope
+    isn't silently bypassed for one path but not the other."""
+
+    class TeamScopePolicy(WorkforcePolicy):
+        def is_agent_in_workforce_run_scope(
+            self,
+            db: Session,
+            user: User,
+            workforce: Workforce | None,
+            agent: Agent,
+        ) -> bool:
+            del db, user, workforce, agent
+            return True
+
+    set_workforce_policy(TeamScopePolicy())
+
+    owner = _create_user(db_session, "team-scope-owner")
+    runner = _create_user(db_session, "team-scope-runner")
+    manager = _create_agent(db_session, owner, "Owner's Manager")
+    worker_agent = _create_agent(db_session, owner, "Owner's Analyst")
+    db_session.commit()
+
+    # `runner` doesn't own either agent, but the installed policy grants
+    # cross-user run scope -- must not 403 like the default policy would.
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=runner.id,
+        name="Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": None,
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="Hello",
+    )
+    await result.background_task
+
+
+@pytest.mark.asyncio
 async def test_create_workforce_run_releases_connection_before_worker_transaction(
     single_connection_workforce_db,
     monkeypatch: pytest.MonkeyPatch,
@@ -1320,7 +1370,7 @@ async def test_verified_workforce_run_scope_loads_manager_config(
             self,
             db: Session,
             user: User,
-            workforce: Workforce,
+            workforce: Workforce | None,
             agent: Agent,
         ) -> bool:
             del db, user, workforce, agent

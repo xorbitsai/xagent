@@ -106,6 +106,10 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const [draftWorkers, setDraftWorkers] = useState<WorkforceWorkerDraft[]>([])
 
     const previewTaskIdRef = useRef<number | null>(null)
+    // Bumped whenever handleCreate resets the preview state, so an in-flight
+    // handleTestSendMessage call started before Create doesn't clobber the
+    // reset with its now-orphaned (pre-save) result once its await resolves.
+    const previewGenerationRef = useRef(0)
     const isArchived = workforce?.status === "archived"
 
     const load = useCallback(async (options: LoadOptions = {}) => {
@@ -392,6 +396,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             // against the just-saved workforce instead of continuing to chat
             // into the stale draft's conversation, which would silently
             // ignore any config changes made after saving.
+            previewGenerationRef.current += 1
             previewTaskIdRef.current = null
             closeFilePreview()
             dispatch({ type: "CLEAR_MESSAGES" })
@@ -419,6 +424,8 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         let taskId = previewTaskIdRef.current
         if (taskId === -1) return
 
+        const generationAtStart = previewGenerationRef.current
+
         try {
             if (!taskId) {
                 previewTaskIdRef.current = -1
@@ -444,6 +451,14 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                     })
                 taskId = result.task_id
                 if (!taskId) throw new Error("Invalid run response: missing task_id")
+
+                if (previewGenerationRef.current !== generationAtStart) {
+                    // Create succeeded while this request was in flight: the
+                    // run it started targets the now-discarded pre-save
+                    // draft snapshot. Drop it instead of resurrecting it as
+                    // the active conversation over handleCreate's reset.
+                    return
+                }
                 previewTaskIdRef.current = taskId
                 closeFilePreview()
                 setTaskId(taskId, { navigate: false })

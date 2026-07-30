@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const createWorkforceMock = vi.hoisted(() => vi.fn())
@@ -297,6 +297,117 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
       )
     })
     expect(runWorkforcePreviewMock).toHaveBeenCalledOnce()
+  })
+
+  it("does not let a preview response that resolves after Create clobber the reset with the stale task", async () => {
+    let resolvePreview: (value: unknown) => void = () => {}
+    runWorkforcePreviewMock.mockImplementationOnce(
+      () => new Promise((resolve) => { resolvePreview = resolve }),
+    )
+
+    const created = { id: 55, name: "Launch Team", status: "draft" }
+    createWorkforceMock.mockResolvedValueOnce(created)
+    getWorkforceMock.mockResolvedValue({
+      id: 55,
+      name: "Launch Team",
+      description: null,
+      status: "draft",
+      manager: {
+        id: 7,
+        name: "Project Coordinator",
+        description: "Coordinates the workforce",
+        logo_url: null,
+        status: "published",
+      },
+      workers: [
+        {
+          id: 1,
+          agent: {
+            id: 8,
+            name: "Web Researcher",
+            description: "Gathers the web",
+            logo_url: null,
+            status: "published",
+          },
+          alias: null,
+          assignment_instructions: "Gathers the web",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          sort_order: 1,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+      canvas_layout: null,
+      scope_type: "user",
+      scope_id: "1",
+      owner_user_id: 1,
+      created_at: null,
+      updated_at: null,
+    })
+    runWorkforceMock.mockResolvedValueOnce({
+      workforce_run_id: 2,
+      task_id: 99,
+      status: "running",
+      redirect_url: "/task/99",
+    })
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    // Start a test send whose network call won't resolve until we say so.
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => expect(runWorkforcePreviewMock).toHaveBeenCalledOnce())
+
+    // While it's in flight, fill the name and save -- this resets the
+    // preview state synchronously, before the pending call above resolves.
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Launch Team" } })
+    fireEvent.click(screen.getByText("common.save"))
+
+    const createButton = screen.getByText("workforces.actions.createTeam")
+    await waitFor(() => expect(createButton).not.toBeDisabled())
+    fireEvent.click(createButton)
+    await waitFor(() => expect(getWorkforceMock).toHaveBeenCalledWith("55"))
+
+    // Now let the stale in-flight preview call resolve, and flush its
+    // continuation to completion before checking what state it left behind
+    // -- otherwise the click below could race the continuation instead of
+    // strictly following it.
+    await act(async () => {
+      resolvePreview({
+        workforce_run_id: 1,
+        task_id: 42,
+        status: "running",
+        redirect_url: "/task/42",
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // A subsequent test message must still start a fresh run against the
+    // saved workforce -- proving the stale resolution above didn't
+    // resurrect task 42 as the active preview task.
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => {
+      expect(runWorkforceMock).toHaveBeenCalledWith(
+        "55",
+        expect.objectContaining({ message: "test message" }),
+      )
+    })
   })
 
   it("does not count a worker's auto-filled name/id placeholder as a written delegation rule in Get Started", async () => {

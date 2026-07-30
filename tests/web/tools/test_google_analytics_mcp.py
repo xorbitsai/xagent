@@ -197,6 +197,39 @@ def test_list_properties_handles_account_without_properties(monkeypatch):
     assert result["properties"] == []
 
 
+def test_list_properties_tolerates_null_values_in_response(monkeypatch):
+    """Keys present with an explicit null (accountSummaries, property) must not
+    crash iteration/rsplit; entries without a usable property resource name are
+    skipped rather than emitted with an empty property_id."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"accountSummaries": None}),
+            MockResponse(
+                json_data={
+                    "accountSummaries": [
+                        {
+                            "displayName": "Acme Inc",
+                            "propertySummaries": [
+                                {"property": None, "displayName": "broken"},
+                                {"property": "properties/111", "displayName": "ok"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    first = json.loads(google_analytics.google_analytics_list_properties())
+    second = json.loads(google_analytics.google_analytics_list_properties())
+
+    assert first["status"] == "success"
+    assert first["properties"] == []
+    assert second["status"] == "success"
+    assert [p["property_id"] for p in second["properties"]] == ["111"]
+
+
 def test_list_properties_returns_error_payload_on_failure(monkeypatch):
     monkeypatch.setattr(
         google_analytics.requests,

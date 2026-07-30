@@ -147,14 +147,18 @@ def google_analytics_list_properties() -> str:
                     params=params,
                 )
             )
-            for account in result.get("accountSummaries", []):
+            for account in result.get("accountSummaries") or []:
                 if not isinstance(account, dict):
                     continue
                 account_name = account.get("displayName")
-                for prop in account.get("propertySummaries", []) or []:
+                for prop in account.get("propertySummaries") or []:
                     if not isinstance(prop, dict):
                         continue
-                    resource_name = prop.get("property", "")
+                    resource_name = prop.get("property")
+                    if not isinstance(resource_name, str) or not resource_name:
+                        # No usable resource name -> no property_id to offer;
+                        # skip rather than emitting a garbage empty id.
+                        continue
                     properties.append(
                         {
                             "account_name": account_name,
@@ -187,8 +191,8 @@ def google_analytics_get_metadata(property_id: str) -> str:
             )
         )
         return _success(
-            dimensions=result.get("dimensions", []),
-            metrics=result.get("metrics", []),
+            dimensions=result.get("dimensions") or [],
+            metrics=result.get("metrics") or [],
         )
     except Exception as e:
         logger.error(f"Error getting Google Analytics metadata for {property_id}: {e}")
@@ -247,10 +251,10 @@ def google_analytics_run_report(
             )
         )
         return _success(
-            dimension_headers=result.get("dimensionHeaders", []),
-            metric_headers=result.get("metricHeaders", []),
-            rows=result.get("rows", []),
-            row_count=result.get("rowCount", 0),
+            dimension_headers=result.get("dimensionHeaders") or [],
+            metric_headers=result.get("metricHeaders") or [],
+            rows=result.get("rows") or [],
+            row_count=result.get("rowCount") or 0,
         )
     except Exception as e:
         logger.error(f"Error running Google Analytics report for {property_id}: {e}")

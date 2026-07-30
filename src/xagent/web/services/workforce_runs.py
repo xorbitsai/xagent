@@ -812,6 +812,7 @@ async def create_workforce_run(
 
 
 async def create_preview_workforce_run(
+    db: Session,
     *,
     user_id: int,
     name: str | None,
@@ -829,7 +830,15 @@ async def create_preview_workforce_run(
     Always ``is_preview`` and never visible in task lists, mirroring the
     single-agent builder's preview task. No idempotency key: previews are
     interactive, one-shot builder actions, not externally retried calls.
+
+    ``db`` is the request-scoped Session from the endpoint's ``get_current_user``
+    dependency; it is unused past this point but must have its pooled
+    connection released before the isolated worker transaction below, or it
+    pins a pool slot idle-in-transaction for the whole request (issue #889),
+    mirroring ``create_workforce_run``'s ``release_db_connection_if_clean`` call.
     """
+    if not release_db_connection_if_clean(db):
+        raise RuntimeError("request DB transaction is not clean at turn boundary")
 
     request = _normalize_workforce_run_request(
         message=message,

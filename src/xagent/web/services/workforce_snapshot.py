@@ -12,12 +12,16 @@ from xagent.core.execution_scope import (
 from xagent.core.tools.adapters.vibe.agent_tool_names import (
     gen_workforce_agent_tool_name,
 )
-from xagent.web.models.agent import Agent
+from xagent.web.models.agent import (
+    Agent,
+    AgentStatus,
+    is_workforce_generated_manager_agent,
+)
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce, WorkforceAgent
+from .agent_team_scope import get_agent_team_scope, owns_agent
 from .workforce_access import (
-    ensure_agent_access,
     ensure_workforce_access,
     ensure_workforce_agent_run_access,
 )
@@ -362,6 +366,33 @@ def build_workforce_snapshot(
     return snapshot
 
 
+def _ensure_preview_agent_run_access(
+    agent: Agent | None, user: User, db: Session
+) -> Agent:
+    """Strict, non-bypassable ownership check for a preview run's agents.
+
+    Unlike ``ensure_agent_access`` (used for *selecting* agents into a
+    workforce, purpose="workforce_select"), a preview run actually executes
+    the manager/worker agents. It must match the persisted run path's
+    ``ensure_workforce_agent_run_access`` / ``is_agent_in_workforce_run_scope``
+    semantics -- strict ownership, with no ``user.is_admin`` bypass and no
+    broader team-visibility grant -- or an admin could use the preview
+    endpoint to execute another user's private published agent.
+    """
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if is_workforce_generated_manager_agent(agent):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status != AgentStatus.PUBLISHED:
+        raise HTTPException(
+            status_code=400, detail="Workforce agents must be published"
+        )
+    scope = get_agent_team_scope(db, int(user.id))
+    if not owns_agent(agent, int(user.id), scope):
+        raise HTTPException(status_code=403, detail="Access denied to agent")
+    return agent
+
+
 def build_preview_workforce_snapshot(
     db: Session,
     user: User,
@@ -376,25 +407,37 @@ def build_preview_workforce_snapshot(
     Mirrors ``build_workforce_snapshot`` but reads the manager/workers by id
     from the request instead of a ``Workforce`` row's relationships, so the
     builder can test-run a draft without saving it first. Access is checked
-    per-agent (same rule as picking agents into a workforce), not via
-    ``ensure_workforce_agent_run_access`` which requires a real Workforce.
+    per-agent via ``_ensure_preview_agent_run_access`` (strict ownership,
+    matching the persisted run path), not via ``ensure_workforce_agent_run_access``
+    which requires a real Workforce, and not via the looser
+    ``ensure_agent_access`` used for agent *selection*.
     """
-    manager_agent = ensure_agent_access(
-        db.get(Agent, manager_agent_id),
-        user,
-        db,
-        purpose="workforce_select",
-        require_published=True,
+    manager_agent = _ensure_preview_agent_run_access(
+        db.get(Agent, manager_agent_id), user, db
     )
 
-    if not workers:
+    # Sort like the persisted path's ``_sorted_workers`` (sort_order, then a
+    # stable tiebreaker -- request order stands in for row id, since these
+    # are draft dicts with no id yet), then drop disabled workers like
+    # ``validate_workforce_for_run``'s ``enabled_workers`` -- a preview must
+    # actually execute the same worker set the saved run would.
+    enabled_workers = [
+        worker
+        for _, worker in sorted(
+            enumerate(workers),
+            key=lambda pair: (pair[1].get("sort_order") or 0, pair[0]),
+        )
+        if worker.get("enabled", True)
+    ]
+
+    if not enabled_workers:
         raise HTTPException(
             status_code=400, detail="Workforce requires at least one enabled worker"
         )
 
     snapshot_workers: list[dict[str, Any]] = []
     seen_worker_agent_ids: set[int] = set()
-    for worker in workers:
+    for worker in enabled_workers:
         agent_id = worker.get("agent_id")
         if not isinstance(agent_id, int) or isinstance(agent_id, bool):
             raise HTTPException(
@@ -409,13 +452,7 @@ def build_preview_workforce_snapshot(
                 status_code=400, detail="Each agent can only be added once"
             )
         seen_worker_agent_ids.add(int(agent_id))
-        agent = ensure_agent_access(
-            db.get(Agent, agent_id),
-            user,
-            db,
-            purpose="workforce_select",
-            require_published=True,
-        )
+        agent = _ensure_preview_agent_run_access(db.get(Agent, agent_id), user, db)
         assignment_instructions = normalize_text(
             cast(str | None, worker.get("assignment_instructions")),
             "assignment_instructions",

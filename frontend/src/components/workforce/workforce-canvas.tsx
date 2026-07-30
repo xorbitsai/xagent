@@ -242,6 +242,12 @@ export function WorkforceCanvas({
         type: "manager",
         position: { x: 0, y: MANAGER_Y },
         origin: [0.5, 0],
+        // Layout is fully recomputed from array index/constants on every
+        // render (no onNodesChange wired up to persist a drag, and
+        // canvas_position isn't read here) -- dragging would just silently
+        // snap back on the next unrelated re-render, so disable it rather
+        // than ship a broken affordance.
+        draggable: false,
         width: MANAGER_WIDTH,
         data: {
           name: manager.name,
@@ -256,6 +262,7 @@ export function WorkforceCanvas({
         type: "choose-lead",
         position: { x: 0, y: MANAGER_Y },
         origin: [0.5, 0],
+        draggable: false,
         width: MANAGER_WIDTH,
         data: {
           label: t("workforces.canvas.chooseLead.title"),
@@ -278,6 +285,7 @@ export function WorkforceCanvas({
         type: "worker",
         position: { x: startX + index * (workerWidth + gap), y: WORKER_Y },
         origin: [0.5, 0],
+        draggable: false,
         width: WORKER_WIDTH_PX,
         data: {
           name: worker.alias || worker.agent?.name || t("workforces.canvas.nodeTypes.worker"),
@@ -309,6 +317,7 @@ export function WorkforceCanvas({
         type: "add",
         position: { x: startX + workers.length * (workerWidth + gap), y: WORKER_Y },
         origin: [0.5, 0],
+        draggable: false,
         width: WORKER_WIDTH_PX,
         data:
           workers.length === 0

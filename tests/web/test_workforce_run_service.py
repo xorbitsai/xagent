@@ -303,6 +303,7 @@ async def test_create_preview_workforce_run_never_persists_a_workforce(
     db_session.commit()
 
     result = await create_preview_workforce_run(
+        db_session,
         user_id=user.id,
         name="Launch Team",
         description="Coordinates the launch",
@@ -367,6 +368,7 @@ async def test_create_preview_workforce_run_requires_at_least_one_worker(
 
     with pytest.raises(HTTPException) as excinfo:
         await create_preview_workforce_run(
+            db_session,
             user_id=user.id,
             name="Solo Team",
             description=None,
@@ -388,6 +390,7 @@ async def test_create_preview_workforce_run_rejects_unpublished_manager(
 
     with pytest.raises(HTTPException) as excinfo:
         await create_preview_workforce_run(
+            db_session,
             user_id=user.id,
             name="Team",
             description=None,
@@ -415,6 +418,7 @@ async def test_create_preview_workforce_run_rejects_duplicate_worker_agent(
 
     with pytest.raises(HTTPException) as excinfo:
         await create_preview_workforce_run(
+            db_session,
             user_id=user.id,
             name="Team",
             description=None,
@@ -437,6 +441,121 @@ async def test_create_preview_workforce_run_rejects_duplicate_worker_agent(
 
 
 @pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_manager_as_worker(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "manager-also-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": manager.id,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_excludes_disabled_workers(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker unchecked in the builder must not actually run in the preview,
+    matching ``validate_workforce_for_run``'s ``enabled_workers`` filtering."""
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db_session, "disabled-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    active_worker = _create_agent(db_session, user, "Active Analyst")
+    disabled_worker = _create_agent(db_session, user, "Disabled Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": disabled_worker.id,
+                "enabled": False,
+                "assignment_instructions": "Should never run.",
+            },
+            {
+                "agent_id": active_worker.id,
+                "assignment_instructions": "Collect evidence and cite sources.",
+            },
+        ],
+        message="Draft a launch brief",
+    )
+    await result.background_task
+
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    snapshot = task.agent_config["workforce_snapshot"]
+    snapshot_agent_ids = [worker["agent_id"] for worker in snapshot["workers"]]
+    assert snapshot_agent_ids == [active_worker.id]
+
+    runtime = resolve_workforce_task_runtime(db_session, task)
+    assert runtime is not None
+    assert runtime.allowed_agent_ids == [active_worker.id]
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_sorts_workers_by_sort_order(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker order in the snapshot/manager prompt must match sort_order, not
+    request-array order, matching the persisted path's ``_sorted_workers``."""
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db_session, "sort-order-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    second_worker = _create_agent(db_session, user, "Second Analyst")
+    first_worker = _create_agent(db_session, user, "First Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        # Requested in reverse of the intended sort_order.
+        workers=[
+            {
+                "agent_id": second_worker.id,
+                "sort_order": 2,
+                "assignment_instructions": "Runs second.",
+            },
+            {
+                "agent_id": first_worker.id,
+                "sort_order": 1,
+                "assignment_instructions": "Runs first.",
+            },
+        ],
+        message="Draft a launch brief",
+    )
+    await result.background_task
+
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    snapshot = task.agent_config["workforce_snapshot"]
+    snapshot_agent_ids = [worker["agent_id"] for worker in snapshot["workers"]]
+    assert snapshot_agent_ids == [first_worker.id, second_worker.id]
+
+
+@pytest.mark.asyncio
 async def test_create_preview_workforce_run_rejects_boolean_worker_agent_id(
     db_session: Session,
 ) -> None:
@@ -447,6 +566,7 @@ async def test_create_preview_workforce_run_rejects_boolean_worker_agent_id(
 
     with pytest.raises(HTTPException) as excinfo:
         await create_preview_workforce_run(
+            db_session,
             user_id=user.id,
             name="Team",
             description=None,
@@ -461,6 +581,39 @@ async def test_create_preview_workforce_run_rejects_boolean_worker_agent_id(
             message="Hello",
         )
     assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_admin_using_anothers_private_agent(
+    db_session: Session,
+) -> None:
+    """An admin must not be able to preview-run (i.e. actually execute) an
+    agent they don't own, even though ``ensure_agent_access`` (used for
+    agent *selection*) grants admins a bypass. The preview run path must
+    enforce the persisted run path's strict ownership instead."""
+    owner = _create_user(db_session, "private-agent-owner")
+    admin = _create_user(db_session, "unrelated-admin", is_admin=True)
+    manager = _create_agent(db_session, admin, "Admin Manager")
+    private_worker = _create_agent(db_session, owner, "Owner's Private Analyst")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=admin.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": private_worker.id,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -517,6 +670,70 @@ async def test_create_workforce_run_releases_connection_before_worker_transactio
     assert result.workforce_run.status == "running"
     assert checked_out == [0]
     assert ticks >= 3, "workforce turn startup blocked the asyncio event loop"
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_releases_connection_before_worker_transaction(
+    single_connection_workforce_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same pool-exhaustion guard as the persisted path (issue #889), for preview."""
+    engine, db = single_connection_workforce_db
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db, "single-pool-preview-owner")
+    manager = _create_agent(db, user, "Draft Manager")
+    worker_agent = _create_agent(db, user, "Draft Analyst")
+    db.commit()
+
+    checked_out: list[int] = []
+    original = workforce_runs_module._create_claimed_preview_run_isolated
+
+    def observed(*args: Any, **kwargs: Any):
+        checked_out.append(engine.pool.checkedout())
+        time.sleep(0.05)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        workforce_runs_module,
+        "_create_claimed_preview_run_isolated",
+        observed,
+    )
+
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await create_preview_workforce_run(
+            db,
+            user_id=user.id,
+            name="Launch Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": None,
+                    "assignment_instructions": "Collect evidence and cite sources.",
+                }
+            ],
+            message="Draft a launch brief",
+        )
+        await result.background_task
+    finally:
+        ticker_stop.set()
+        await ticker_task
+
+    assert result.task.status == TaskStatus.RUNNING
+    assert result.workforce_run.status == "running"
+    assert checked_out == [0]
+    assert ticks >= 3, "preview workforce turn startup blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio

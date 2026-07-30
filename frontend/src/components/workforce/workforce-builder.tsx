@@ -171,7 +171,10 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         setError(null)
     }
 
-    const handleSaveDetails = async (data: { name: string; description: string }) => {
+    // useCallback: workforce-canvas.tsx's node-layout memo depends on this
+    // reference, and a fresh one on every unrelated re-render (e.g. opening a
+    // dialog) would otherwise rebuild the whole nodes array from scratch.
+    const handleSaveDetails = useCallback(async (data: { name: string; description: string }) => {
         if (!isEditMode) {
             setDraftName(data.name)
             setDraftDescription(data.description)
@@ -194,7 +197,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         } finally {
             setSaving(false)
         }
-    }
+    }, [isEditMode, localId, t])
 
     const handleChangeLead = async (agentId: number) => {
         if (!isEditMode) {
@@ -384,6 +387,20 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                 manager_agent_id: Number(draftManagerAgentId),
                 workers: draftWorkers,
             })
+            // Clear the ephemeral pre-save preview run (workforce_id IS NULL,
+            // frozen snapshot) so the next test message starts a fresh run
+            // against the just-saved workforce instead of continuing to chat
+            // into the stale draft's conversation, which would silently
+            // ignore any config changes made after saving.
+            previewTaskIdRef.current = null
+            closeFilePreview()
+            dispatch({ type: "CLEAR_MESSAGES" })
+            dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
+            dispatch({ type: "SET_STEPS", payload: [] })
+            dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+            dispatch({ type: "SET_CURRENT_TASK", payload: null })
+            dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+            setTaskId(null, { navigate: false })
             setWorkforce(created)
             setLocalId(String(created.id))
             router.replace(`/workforces/${created.id}`)
@@ -468,7 +485,17 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         {
             key: "delegation",
             label: t("workforces.getStarted.steps.delegation"),
-            done: workers.length > 0 && workers.every((worker) => !!worker.assignment_instructions?.trim()),
+            // A worker added via one click auto-fills assignment_instructions
+            // with the agent's own name (or id, as a last resort) when it has
+            // no description to seed from -- that's a placeholder, not a
+            // delegation rule the user actually wrote, so it shouldn't count.
+            done:
+                workers.length > 0 &&
+                workers.every((worker) => {
+                    const text = worker.assignment_instructions?.trim()
+                    if (!text) return false
+                    return text !== worker.agent.name && text !== String(worker.agent.id)
+                }),
         },
         { key: "test", label: t("workforces.getStarted.steps.test"), done: hasSentTestMessage },
         {

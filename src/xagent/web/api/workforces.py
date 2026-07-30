@@ -630,6 +630,7 @@ async def list_workforce_agent_options(
 @router.post("/preview/runs")
 async def create_workforce_preview_run(
     request: WorkforcePreviewRunRequest,
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Test-run an unsaved workforce draft (builder "test before save").
@@ -639,6 +640,7 @@ async def create_workforce_preview_run(
     (``workforce_id`` NULL), mirroring the single-agent builder's preview.
     """
     result = await create_preview_workforce_run(
+        db,
         user_id=int(user.id),
         name=request.name,
         description=request.description,

@@ -427,7 +427,12 @@ _NON_INCOMING_LABELS = {"sent", "draft", "spam", "trash"}
 def _trigger_matches_message(trigger: AgentTrigger, payload: dict[str, Any]) -> bool:
     config = dict(trigger.config or {})
     label_ids = {str(label_id).lower() for label_id in payload.get("label_ids", [])}
-    watch_label = str(config.get("watch_label") or "INBOX").strip().lower()
+    # Strip BEFORE falling back to the default: a whitespace-only stored
+    # value (e.g. " ") is truthy pre-strip, so `... or "inbox"` alone would
+    # skip the default and strip down to "", which matches neither the
+    # wildcard branch below nor a real label — silently disabling all
+    # filtering instead of falling back to INBOX.
+    watch_label = str(config.get("watch_label") or "").strip().lower() or "inbox"
     if watch_label in {"*", "all"}:
         if label_ids & _NON_INCOMING_LABELS:
             return False

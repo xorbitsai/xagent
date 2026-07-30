@@ -297,28 +297,24 @@ def _localize(naive_local: datetime, tz: tzinfo) -> datetime:
     """Attach `tz` to a naive local datetime, normalizing a nonexistent local
     time (a DST spring-forward gap — e.g. 2:30 AM on the day a zone jumps
     from 2:00 to 3:00) by shifting forward past the gap instead of silently
-    resolving to whichever UTC instant `fold=0` happens to pick."""
+    resolving to whichever UTC instant `fold=0` happens to pick.
+
+    A fall-back-ambiguous local time (repeated once when a zone jumps back,
+    e.g. 1:30 AM occurring twice) is NOT specially handled: `roundtrip ==
+    naive_local` holds trivially for both occurrences, so the correction
+    branch never fires and Python's default `fold=0` — the first, pre-DST
+    occurrence — wins. That's a real, if arbitrary, choice, not just an
+    unhandled case; see the pinning test for the exact instant it picks.
+    """
     aware = naive_local.replace(tzinfo=tz)
     roundtrip = aware.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None)
     if roundtrip != naive_local:
-        # `naive_local` doesn't exist in `tz`. The round-trip reveals how far
-        # off the nearest realizable instant is; shifting by that same delta
-        # lands on it directly (verified: the shifted time round-trips to
-        # itself, since it no longer falls inside the gap).
-        aware = (naive_local + (roundtrip - naive_local)).replace(tzinfo=tz)
+        # `naive_local` doesn't exist in `tz`. `roundtrip` (what `fold=0`
+        # actually resolved to) IS the nearest realizable instant — the
+        # shift-by-delta arithmetic this replaced (`naive_local + (roundtrip
+        # - naive_local)`) reduces to exactly `roundtrip`.
+        aware = roundtrip.replace(tzinfo=tz)
     return aware
-
-
-def _next_daily_occurrence(base: datetime, time_of_day: time, tz: tzinfo) -> datetime:
-    """Earliest datetime strictly after `base` at `time_of_day`, interpreted
-    in `tz` (the user's schedule timezone). Returned as UTC."""
-    local_base = base.astimezone(tz)
-    for offset in range(3):  # today, tomorrow, plus headroom for a DST shift
-        candidate_date = local_base.date() + timedelta(days=offset)
-        candidate = _localize(datetime.combine(candidate_date, time_of_day), tz)
-        if candidate > base:
-            return candidate.astimezone(timezone.utc)
-    raise TriggerServiceError("Unable to compute next daily occurrence")
 
 
 def _next_weekly_occurrence(
@@ -367,6 +363,7 @@ def _compute_next_run_at(
     from_time: datetime | None = None,
     previous_due_at: datetime | None = None,
     include_explicit: bool = True,
+    allow_past_explicit: bool = True,
 ) -> datetime | None:
     """Compute the next scheduled fire time for the supported MVP config."""
     base = _coerce_utc(previous_due_at) or from_time or _now()
@@ -403,7 +400,10 @@ def _compute_next_run_at(
             return _next_monthly_occurrence(
                 base, _day_of_month(config), time_of_day, tz
             )
-        return _next_daily_occurrence(base, time_of_day, tz)
+        # "daily" is "weekly on every day" — _next_weekly_occurrence with the
+        # full weekday set produces byte-identical results (including every
+        # DST edge case) with no separate implementation to keep in sync.
+        return _next_weekly_occurrence(base, set(range(7)), time_of_day, tz)
 
     if include_explicit:
         explicit_next = config.get("next_run_at")
@@ -413,15 +413,23 @@ def _compute_next_run_at(
             except ValueError as exc:
                 raise TriggerServiceError("Invalid next_run_at") from exc
             if explicit is not None:
-                # Honored verbatim, whether in the future (a genuine start
-                # anchor) or the past (the trigger is already due and the
-                # next scan should catch it up once — the same semantics as
-                # enabling a cron job whose scheduled time already passed).
-                # Callers that must not re-arm an already-advanced schedule
-                # from a stale stored anchor (e.g. re-saving unrelated
-                # fields) should simply not recompute at all rather than
-                # pass include_explicit=True here.
-                return explicit
+                if allow_past_explicit:
+                    # Honored verbatim, whether in the future (a genuine
+                    # start anchor) or the past (the trigger is already due
+                    # and the next scan should catch it up once — the same
+                    # semantics as enabling a cron job whose scheduled time
+                    # already passed). Only true at creation, or when
+                    # re-enabling a trigger that had no prior armed
+                    # schedule — see _apply_trigger_updates.
+                    return explicit
+                # A recompute triggered by an intentional schedule EDIT on an
+                # already-armed trigger: the resubmitted config still carries
+                # the ORIGINAL creation-time next_run_at (it's never advanced
+                # by scans, only the DB column is), so honoring it verbatim
+                # here would re-arm the trigger to that stale instant on
+                # every such edit. Clamp to `now` instead — same "catch up
+                # once, don't burst" semantics as an interval recompute.
+                return max(explicit, now)
 
     interval = config.get("interval_seconds")
     if interval is None:
@@ -439,6 +447,31 @@ def _compute_next_run_at(
         steps = int(elapsed_seconds // interval_seconds) + 1
         candidate = base + timedelta(seconds=steps * interval_seconds)
     return candidate
+
+
+_SCHEDULE_RELEVANT_CONFIG_FIELDS = (
+    "recurrence",
+    "time_of_day",
+    "weekdays",
+    "day_of_month",
+    "timezone",
+    "interval_seconds",
+    "next_run_at",
+    "start_at",
+)
+
+
+def _schedule_signature(config: dict[str, Any]) -> tuple[Any, ...]:
+    """The subset of a scheduled trigger's config that actually determines
+    its fire times. Used to decide whether an update genuinely changed the
+    schedule (and must recompute next_run_at) versus resending an unrelated
+    field alongside an unchanged schedule (and must not) — comparing the
+    whole config dict is too coarse, since incidental, non-schedule churn in
+    it (e.g. a resubmitted `timezone` that only differs because the browser
+    saving it changed zones — see agent-triggers-dialog.tsx's buildConfig)
+    would otherwise be indistinguishable from an intentional schedule edit.
+    """
+    return tuple(config.get(field) for field in _SCHEDULE_RELEVANT_CONFIG_FIELDS)
 
 
 def _typed_config_error(trigger_type: str, exc: ValidationError) -> TriggerServiceError:
@@ -857,27 +890,42 @@ def _apply_trigger_updates(
 
     if trigger.type == TriggerType.SCHEDULED.value:
         # Keyed on whether the SCHEDULE ITSELF actually changed (comparing
-        # the resulting config, not whether the request payload happened to
-        # include a `config` key) rather than on `"config" in updates`: the
+        # the schedule-relevant subset of the config, not whether the
+        # request payload happened to include a `config` key, and not the
+        # whole config dict) rather than on `"config" in updates`: the
         # editor's full-form Save always resends the complete config,
         # including hourly/custom's flat next_run_at/interval_seconds anchor
         # — which was computed once at creation and never advances (only the
-        # DB column does, via scans). Gating on payload shape alone made this
-        # branch effectively dead for the real Save flow, since `config` is
-        # present on essentially every edit.
+        # DB column does, via scans) — plus incidental fields like
+        # `timezone` that can legitimately differ between saves without the
+        # schedule itself changing. Gating on payload shape or whole-config
+        # equality both made this branch fire on saves that touch nothing
+        # schedule-related.
         new_config = dict(trigger.config or {})
         if not trigger.enabled:
             setattr(trigger, "next_run_at", None)
-        elif not old_enabled or new_config != old_config:
-            # Re-enabled, or the schedule was intentionally changed —
-            # recompute from the (possibly new) config.
+        elif not old_enabled:
+            # Re-enabled — needs a fresh value from its own config, exactly
+            # like a fresh creation (no prior armed schedule to protect from
+            # rewinding, so a past explicit anchor is fine to honor).
             setattr(trigger, "next_run_at", _compute_next_run_at(new_config))
-        # else: already enabled, config byte-identical to before — leave
+        elif _schedule_signature(new_config) != _schedule_signature(old_config):
+            # The schedule was intentionally changed. Recompute, but don't
+            # let a still-past explicit next_run_at — unchanged from a much
+            # earlier creation, now stale — rewind an already-armed
+            # schedule; only a trigger's first-ever computation gets that
+            # benefit of the doubt.
+            setattr(
+                trigger,
+                "next_run_at",
+                _compute_next_run_at(new_config, allow_past_explicit=False),
+            )
+        # else: already enabled, schedule fields unchanged — leave
         # next_run_at as its current, possibly scan-advanced value. Blindly
-        # recomputing here on every edit that resends an unchanged config
-        # (rename, prompt tweak, secret rotation) would re-read the same
-        # stored explicit anchor and re-arm an already-progressed schedule
-        # back to a stale due time.
+        # recomputing here on every edit that resends an unchanged schedule
+        # (rename, prompt tweak, secret rotation, or an incidental timezone
+        # re-derivation) would re-read the same stored explicit anchor and
+        # re-arm an already-progressed schedule back to a stale due time.
 
     db.add(trigger)
     db.commit()

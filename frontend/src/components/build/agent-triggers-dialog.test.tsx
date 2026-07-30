@@ -8,6 +8,7 @@ const routerPushMock = vi.hoisted(() => vi.fn())
 const translateMock = vi.hoisted(() => {
   return (key: string, vars?: Record<string, string | number>) => {
     if (vars?.count) return `${key}:${vars.count}`
+    if (vars?.timezone) return `${key}:${vars.timezone}`
     return key
   }
 })
@@ -44,6 +45,7 @@ vi.mock("@/lib/clipboard", () => ({
 }))
 
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
+import { localIsoDate, localTimeOfDay } from "./agent-triggers-schedule-fields"
 import type { AgentTrigger, StagedTrigger } from "@/lib/agent-triggers-api"
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
@@ -314,6 +316,42 @@ describe("AgentTriggersDialog", () => {
     expect(await screen.findByText("triggers.gmail.accountMissing")).toBeInTheDocument()
   })
 
+  it("shows a legacy trigger missing watch_label as INBOX, not blank", async () => {
+    // PR #1051 review: a config with the `watch_label` key entirely absent
+    // predates the field and has always meant INBOX server-side
+    // (gmail_triggers.py's `... or "inbox"` fallback) — the editor must not
+    // render that identically to an explicit blank/wildcard, or opening and
+    // saving it (without touching the field) silently widens it to match
+    // every incoming email.
+    const legacyTrigger = makeTrigger({
+      id: 10,
+      type: "gmail",
+      name: "Legacy inbox watcher",
+      config: { oauth_account_id: 7 },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([legacyTrigger]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+
+    expect(await screen.findByLabelText("triggers.form.watchLabel")).toHaveValue("INBOX")
+  })
+
   it("persists the detail header switch immediately without pressing save", async () => {
     render(
       <AgentTriggersDialog
@@ -440,6 +478,35 @@ describe("AgentTriggersDialog", () => {
         expect.objectContaining({ method: "POST" }),
       )
     })
+  })
+
+  it("fills the secret field with a client-generated whsec_ value on Generate secret", async () => {
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    await screen.findByText("triggers.cards.webhook.title")
+    const [webhookSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(webhookSwitch)
+
+    const secretInput = (await screen.findByLabelText(
+      "triggers.form.secret",
+    )) as HTMLInputElement
+    expect(secretInput).toHaveValue("")
+
+    fireEvent.click(screen.getByRole("button", { name: "triggers.form.generateSecret" }))
+
+    expect(secretInput.value).toMatch(/^whsec_[A-Za-z0-9_-]+$/)
+    expect(screen.getByText("triggers.form.secretGeneratedHint")).toBeInTheDocument()
+
+    // Typing a value of one's own discards the generated one and its hint.
+    fireEvent.change(secretInput, { target: { value: "my-own-secret" } })
+    expect(screen.queryByText("triggers.form.secretGeneratedHint")).not.toBeInTheDocument()
   })
 
   it("calls onChanged exactly once for a Save (Done afterward does not refetch again)", async () => {
@@ -1922,6 +1989,135 @@ describe("AgentTriggersDialog schedule recurrence", () => {
   // "00:00" for the time. The guard is unreachable through the actual
   // editor UI; only a caller constructing a form value directly could hit
   // it, and buildConfig is a component-scoped closure, not an exported unit.
+
+  it("preserves an existing trigger's stored timezone instead of re-deriving the browser's", async () => {
+    // PR #1051 review: buildConfig used to call Intl.DateTimeFormat()
+    // .resolvedOptions().timeZone fresh on every Save. Editing a schedule
+    // from a machine in a different zone than it was created in — without
+    // touching the schedule at all — would silently relocate it, since the
+    // backend's recompute gate couldn't tell that apart from a real edit.
+    const trigger = makeTrigger({
+      id: 91,
+      type: "scheduled",
+      config: {
+        recurrence: "daily",
+        time_of_day: "09:00",
+        timezone: "Asia/Shanghai",
+        start_at: "2026-01-01T01:00:00+00:00",
+      },
+    })
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string; body?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([trigger]))
+      }
+      if (url === `${TRIGGERS_URL}/91/runs`) return Promise.resolve(jsonResponse([]))
+      if (url === `${TRIGGERS_URL}/91` && init?.method === "PATCH") {
+        return Promise.resolve(jsonResponse(trigger))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    // Simulate editing from a browser in a DIFFERENT zone than the stored
+    // one — only the no-arg "what's my current zone" call is faked;
+    // locale-formatting calls (new Intl.DateTimeFormat(locale, options)) in
+    // schedule-fields.tsx's own summary/label rendering still delegate to
+    // the real implementation.
+    const RealDateTimeFormat = Intl.DateTimeFormat
+    const dtfSpy = vi
+      .spyOn(Intl, "DateTimeFormat")
+      .mockImplementation((...args: ConstructorParameters<typeof Intl.DateTimeFormat>) => {
+        if (args.length === 0) {
+          return { resolvedOptions: () => ({ timeZone: "America/New_York" }) } as Intl.DateTimeFormat
+        }
+        return new RealDateTimeFormat(...args)
+      })
+    try {
+      render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+      fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+      fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+      await screen.findByText("triggers.schedule.recurrenceLabel")
+
+      // The displayed label reflects the STORED zone, not the browser's.
+      expect(await screen.findByText("triggers.schedule.timezoneLabel:Asia/Shanghai")).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+      await waitFor(() => {
+        expect(apiRequestMock).toHaveBeenCalledWith(
+          `${TRIGGERS_URL}/91`,
+          expect.objectContaining({ method: "PATCH" }),
+        )
+      })
+      const patchCall = apiRequestMock.mock.calls.find(
+        ([url, init]) => url === `${TRIGGERS_URL}/91` && init?.method === "PATCH",
+      )
+      const body = JSON.parse((patchCall![1] as { body: string }).body)
+      expect(body.config.timezone).toBe("Asia/Shanghai")
+    } finally {
+      dtfSpy.mockRestore()
+    }
+  })
+
+  it("reconstructs timeOfDay/startDate when reopening an existing trigger, including a legacy config with only an anchor", async () => {
+    // PR #1051 review: the timeOfDay-derivation fix (anchor-derived, not a
+    // hardcoded "09:00") was previously only exercised via the create path.
+    const withTimeOfDayAnchor = new Date("2026-03-15T14:30:00+00:00")
+    const withTimeOfDay = makeTrigger({
+      id: 92,
+      type: "scheduled",
+      config: {
+        recurrence: "daily",
+        time_of_day: "14:30",
+        timezone: "UTC",
+        start_at: withTimeOfDayAnchor.toISOString(),
+      },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL) return Promise.resolve(jsonResponse([withTimeOfDay]))
+      if (url === `${TRIGGERS_URL}/92/runs`) return Promise.resolve(jsonResponse([]))
+      return Promise.resolve(jsonResponse([]))
+    })
+    render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    // The stored time_of_day ("14:30") is authoritative regardless of the
+    // machine's local timezone — it's used verbatim, not derived from the
+    // anchor's local calendar time.
+    expect(await screen.findByLabelText("triggers.schedule.atWhatTime")).toHaveValue("14:30")
+    // startDate always comes from the anchor's LOCAL calendar date.
+    expect(document.getElementById("schedule-start-date")).toHaveValue(
+      localIsoDate(withTimeOfDayAnchor),
+    )
+    cleanup()
+
+    // Legacy config: no `recurrence`/`time_of_day` at all, only the flat
+    // interval mechanism's anchor — timeOfDay must come from the anchor
+    // timestamp itself, converted to the LOCAL calendar date/time (hence
+    // computing the expected values the same way the component does,
+    // rather than hardcoding UTC-relative ones — the conversion legitimately
+    // depends on the machine's own timezone).
+    const anchorIso = "2026-04-01T16:45:00+00:00"
+    const anchorDate = new Date(anchorIso)
+    const legacy = makeTrigger({
+      id: 93,
+      type: "scheduled",
+      config: { interval_seconds: 86400, next_run_at: anchorIso },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL) return Promise.resolve(jsonResponse([legacy]))
+      if (url === `${TRIGGERS_URL}/93/runs`) return Promise.resolve(jsonResponse([]))
+      return Promise.resolve(jsonResponse([]))
+    })
+    render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    expect(await screen.findByLabelText("triggers.schedule.atWhatTime")).toHaveValue(
+      localTimeOfDay(anchorDate),
+    )
+    expect(document.getElementById("schedule-start-date")).toHaveValue(localIsoDate(anchorDate))
+  })
 })
 
 describe("AgentTriggersDialog owner routing", () => {

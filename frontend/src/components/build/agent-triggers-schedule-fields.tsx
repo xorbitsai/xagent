@@ -23,6 +23,12 @@ export interface ScheduleFieldsValue {
   customAmount: string
   customUnit: ScheduleCustomUnit
   startDate: string
+  // IANA name (e.g. "Asia/Shanghai"). Only daily/weekly/monthly are actually
+  // computed in this zone server-side (hourly/custom are a flat interval
+  // with no civil time-of-day for a zone to apply to) — shown regardless of
+  // recurrence so switching into a tz-aware one doesn't silently start from
+  // an unset zone.
+  timezone: string
 }
 
 interface ScheduleFieldsProps {
@@ -108,12 +114,19 @@ export function summarizeSchedule(
     base = t("triggers.schedule.summaryHourly")
   }
 
-  if (!form.startDate) return base
-  const date = formatDateLabel(form.startDate, locale)
-  if (form.recurrence === "hourly" || form.recurrence === "custom") {
-    return t("triggers.schedule.summaryStartsWithTime", { base, date, time })
+  if (form.startDate) {
+    const date = formatDateLabel(form.startDate, locale)
+    base =
+      form.recurrence === "hourly" || form.recurrence === "custom"
+        ? t("triggers.schedule.summaryStartsWithTime", { base, date, time })
+        : t("triggers.schedule.summaryStartsOnly", { base, date })
   }
-  return t("triggers.schedule.summaryStartsOnly", { base, date })
+
+  // Only daily/weekly/monthly are actually computed in this zone
+  // server-side; appending it to hourly/custom would imply a dependency
+  // that doesn't exist.
+  if (form.recurrence === "hourly" || form.recurrence === "custom") return base
+  return t("triggers.schedule.summaryWithTimezone", { base, timezone: form.timezone })
 }
 
 /** A Date's LOCAL calendar date as YYYY-MM-DD (what <input type="date"> expects). */
@@ -139,6 +152,13 @@ export function scheduleFieldsDefaults(): ScheduleFieldsValue {
     customUnit: "minutes",
     // The start date is always shown (reference design), defaulting to today.
     startDate: iso,
+    // A brand-new schedule has nothing stored yet — default to the editing
+    // browser's own zone. An EXISTING trigger's stored timezone must be
+    // preserved instead of re-derived here on every edit (see
+    // formFromTrigger in agent-triggers-dialog.tsx): re-deriving it would
+    // silently relocate the schedule when edited from a different zone than
+    // it was created in.
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
   }
 }
 
@@ -256,6 +276,12 @@ export function ScheduleFields({ value, onChange, t, locale }: ScheduleFieldsPro
             onChange={(event) => onChange("timeOfDay", event.target.value)}
             className="w-40"
           />
+          {/* Read-only: this is the zone the schedule was created in (or the
+              browser's own, for a new one) — not a picker, since changing it
+              would silently relocate an already-armed schedule. */}
+          <p className="text-xs text-muted-foreground" data-testid="schedule-timezone-label">
+            {t("triggers.schedule.timezoneLabel", { timezone: value.timezone })}
+          </p>
         </div>
       ) : null}
 

@@ -178,6 +178,19 @@ function displayWatchLabel(raw: string): string {
   return value === "*" || value.toLowerCase() === "all" ? "" : value
 }
 
+// A config with the `watch_label` key entirely absent is a legacy row from
+// before this field existed — gmail_triggers.py's `... or "inbox"` fallback
+// means the backend has always interpreted (and still interprets) that as
+// INBOX-only. A config that explicitly stores "" / "*" / "all" is a later,
+// deliberate choice to watch everything. These must render differently:
+// otherwise the editor shows both as an identical blank field, and simply
+// opening + saving a legacy INBOX-only trigger silently widens it to the
+// wildcard the blank state actually means for every OTHER trigger.
+function gmailFormWatchLabel(config: Record<string, unknown>): string {
+  if (!("watch_label" in config)) return "INBOX"
+  return displayWatchLabel(configString(config, "watch_label"))
+}
+
 function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
   return {
     type,
@@ -268,6 +281,12 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
       customAmount,
       customUnit,
       startDate,
+      // The zone this config is ACTUALLY interpreted in server-side (see
+      // _schedule_tzinfo: absent means UTC) — not the editing browser's
+      // current zone. Preserving this (rather than re-deriving it fresh on
+      // every Save) is what stops an incidental machine/zone difference
+      // from silently relocating an already-armed schedule.
+      timezone: configString(config, "timezone") || "UTC",
     }
   }
 
@@ -324,9 +343,10 @@ function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
     secret: "",
     promptTemplate: trigger.prompt_template ?? "",
     // The "*"/"all" match-anything sentinels render as a blank field, whose
-    // placeholder explains that blank watches every incoming email.
-    watchLabel:
-      trigger.type === "gmail" ? displayWatchLabel(configString(trigger.config, "watch_label")) : "",
+    // placeholder explains that blank watches every incoming email — but a
+    // config missing the key entirely (legacy) renders as "INBOX", matching
+    // what the backend actually still does with it (see gmailFormWatchLabel).
+    watchLabel: trigger.type === "gmail" ? gmailFormWatchLabel(trigger.config) : "",
     senderFilter: trigger.type === "gmail" ? configString(trigger.config, "sender_filter") : "",
     subjectKeyword: trigger.type === "gmail" ? configString(trigger.config, "subject_keyword") : "",
     oauthAccountId:
@@ -702,8 +722,14 @@ export function AgentTriggersDialog({
       recurrence: sourceForm.recurrence,
       time_of_day: sourceForm.timeOfDay || "00:00",
       // time_of_day/weekdays/day_of_month are the user's local wall-clock —
-      // the backend needs the zone to compute occurrences correctly.
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      // the backend needs the zone to compute occurrences correctly. Sent
+      // from form state (populated once, from the trigger's stored zone or
+      // the browser's own for a new trigger — see scheduleFieldsFromConfig
+      // / scheduleFieldsDefaults), NOT re-derived here on every Save: doing
+      // that would silently relocate an already-armed schedule if the user
+      // happens to edit it from a different machine/zone than it was
+      // created in.
+      timezone: sourceForm.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
     }
     // The start date is required: for hourly/daily/custom the picked time
     // only reaches the backend through this anchor, so a missing date would
@@ -1320,9 +1346,11 @@ export function AgentTriggersDialog({
     }
     const accountId = configId(trigger.config, "oauth_account_id")
     const email = gmailAccounts?.find((account) => String(account.id) === accountId)?.email
-    // "*"/"all" (or a missing label) are the backend's match-anything
-    // sentinels; anything else — including INBOX — is a real label filter.
-    const watchLabel = displayWatchLabel(configString(trigger.config, "watch_label"))
+    // "*"/"all" are the backend's match-anything sentinels; a MISSING label
+    // is INBOX (a legacy default the backend still applies), not wildcard —
+    // see gmailFormWatchLabel. Anything else, including an explicit INBOX,
+    // is a real label filter.
+    const watchLabel = gmailFormWatchLabel(trigger.config)
     const labelPart = watchLabel || t("triggers.item.gmailAllEmails")
     return [email, labelPart].filter(Boolean).join(" · ")
   }

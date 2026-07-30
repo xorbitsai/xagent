@@ -3801,7 +3801,9 @@ Build when you need.`,
       summaryMonthly: "Runs on the {day} of every month at {time}",
       summaryCustom: "Runs every {amount} {unit}",
       summaryStartsOnly: "{base} - starts {date}",
-      summaryStartsWithTime: "{base} - starts {date} at {time}"
+      summaryStartsWithTime: "{base} - starts {date} at {time}",
+      summaryWithTimezone: "{base} ({timezone})",
+      timezoneLabel: "Timezone: {timezone}"
     },
     secret: {
       title: "Copy this secret now. It is shown only once.",

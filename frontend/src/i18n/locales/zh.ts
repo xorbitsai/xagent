@@ -3801,7 +3801,9 @@ const zh = {
       summaryMonthly: "每月 {day} 的 {time} 运行",
       summaryCustom: "每 {amount} {unit}运行一次",
       summaryStartsOnly: "{base}，从 {date} 开始",
-      summaryStartsWithTime: "{base}，从 {date} {time} 开始"
+      summaryStartsWithTime: "{base}，从 {date} {time} 开始",
+      summaryWithTimezone: "{base}（{timezone}）",
+      timezoneLabel: "时区：{timezone}"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。",

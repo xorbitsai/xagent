@@ -1487,6 +1487,23 @@ def test_scheduled_dst_spring_forward_gap_shifts_forward_instead_of_drifting() -
     assert ordinary == datetime(2026, 3, 8, 13, 0, tzinfo=timezone.utc)
 
 
+def test_scheduled_dst_fall_back_ambiguous_time_pins_the_first_occurrence() -> None:
+    # 2026-11-01 is when America/New_York falls back (2:00 AM -> 1:00 AM);
+    # 1:30 AM occurs twice that day. _localize's docstring documents that
+    # the ambiguity-correction branch never fires here (round-tripping a
+    # `fold=0` instant always equals itself), so Python's default fold=0 —
+    # the first, still-daylight-saving occurrence — silently wins. This
+    # pins that choice against zoneinfo's real 2026 transition so a future
+    # change to the resolution policy is a deliberate, visible diff here.
+    base = datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc)  # ~1:00 AM EDT
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "daily", "time_of_day": "01:30", "timezone": "America/New_York"},
+        from_time=base,
+        previous_due_at=base,
+    )
+    assert next_run_at == datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc)
+
+
 def test_scheduled_explicit_anchor_is_honored_verbatim_past_or_future() -> None:
     # An explicit next_run_at is authoritative either way: a future anchor
     # is a genuine start time, and a past one means the trigger is already
@@ -1508,6 +1525,33 @@ def test_scheduled_explicit_anchor_is_honored_verbatim_past_or_future() -> None:
         {**config, "next_run_at": "2026-01-03T09:00:00+00:00"}, from_time=now
     )
     assert future == datetime(2026, 1, 3, 9, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_explicit_anchor_clamps_to_now_when_past_explicit_disallowed() -> (
+    None
+):
+    # PR #1051 review: allow_past_explicit=True (the default) is only
+    # correct for a trigger's first-ever computation (create, or
+    # re-enabling one with no prior armed schedule). _apply_trigger_updates
+    # passes allow_past_explicit=False when recomputing because the
+    # schedule was intentionally edited on an ALREADY-armed trigger, since
+    # the resubmitted config still carries the untouched creation-time
+    # anchor — honoring it verbatim would rewind next_run_at into the past
+    # on every such edit, not just the first one.
+    now = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc)
+    config = {"interval_seconds": 120, "next_run_at": "2020-01-01T00:00:00+00:00"}
+
+    verbatim = _compute_next_run_at(config, from_time=now)
+    assert verbatim == datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    clamped = _compute_next_run_at(config, from_time=now, allow_past_explicit=False)
+    assert clamped == now
+
+    # A future explicit anchor is unaffected either way — nothing to clamp.
+    future_config = {**config, "next_run_at": "2026-02-01T00:00:00+00:00"}
+    assert _compute_next_run_at(
+        future_config, from_time=now, allow_past_explicit=False
+    ) == datetime(2026, 2, 1, tzinfo=timezone.utc)
 
 
 def test_scheduled_weekly_respects_schedule_timezone() -> None:
@@ -1616,11 +1660,12 @@ def test_scheduled_config_validation_requires_time_of_day_for_calendar_recurrenc
     with pytest.raises(ValidationError):
         parse_trigger_config("scheduled", {"recurrence": "monthly", "day_of_month": 1})
 
-    # Present, it's accepted (daily has no other required field).
+    # Present, it's accepted (daily has no other required field) — and
+    # canonicalized to zero-padded "HH:MM".
     daily = parse_trigger_config(
         "scheduled", {"recurrence": "daily", "time_of_day": "09:00:00"}
     )
-    assert daily.time_of_day == "09:00:00"
+    assert daily.time_of_day == "09:00"
 
 
 def test_scheduled_config_validation_rejects_interval_seconds_for_calendar_recurrences() -> (
@@ -1659,6 +1704,33 @@ def test_normalize_weekdays_coerces_a_bare_scalar_to_a_single_day() -> None:
     # (str) or rejected as non-iterable (int/bool).
     assert normalize_weekdays(3) == {3}
     assert normalize_weekdays("3") == {3}
+
+
+def test_normalize_time_of_day_rejects_non_string_non_none_values() -> None:
+    from datetime import time as time_cls
+
+    from xagent.web.services.trigger_providers.schemas import normalize_time_of_day
+
+    # None (truly absent) and blank both legitimately default to midnight.
+    assert normalize_time_of_day(None) == time_cls(0, 0)
+    assert normalize_time_of_day("") == time_cls(0, 0)
+    assert normalize_time_of_day("   ") == time_cls(0, 0)
+
+    # 0/False/[] are type errors, not "absent" — must not silently become
+    # midnight (a config bug that stores the wrong type should surface, not
+    # be masked as a valid "00:00" schedule).
+    for bad_value in (0, False, [], {}):
+        with pytest.raises(ValueError):
+            normalize_time_of_day(bad_value)
+
+
+def test_scheduled_config_validation_canonicalizes_time_of_day() -> None:
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    parsed = parse_trigger_config(
+        "scheduled", {"recurrence": "daily", "time_of_day": "9:5"}
+    )
+    assert parsed.time_of_day == "09:05"
 
 
 def test_scheduled_scan_fires_due_trigger_and_advances_next_run(
@@ -1825,15 +1897,22 @@ def test_scheduled_full_form_save_with_unchanged_config_does_not_reset_next_run_
 
     # A genuinely changed config (the user actually edits the schedule) must
     # still recompute.
+    before_repatch = datetime.now(timezone.utc)
     repatched = client.patch(
         f"/api/agents/{agent_id}/triggers/{trigger_id}",
         headers=headers,
         json={"config": {**original_config, "interval_seconds": 120}},
     )
     assert repatched.status_code == 200, repatched.text
-    assert _coerce_utc(datetime.fromisoformat(repatched.json()["next_run_at"])) != (
-        advanced_next_run_at
-    )
+    recomputed = _coerce_utc(datetime.fromisoformat(repatched.json()["next_run_at"]))
+    # PR #1051 review: asserting only `!= advanced_next_run_at` is satisfied
+    # by the bug this test exists to catch — the un-clamped recompute
+    # returns the config's stale 2020 anchor verbatim, which trivially
+    # differs from `advanced_next_run_at` too. Assert it's actually no
+    # earlier than the request itself, which fails without the
+    # allow_past_explicit=False clamp in _apply_trigger_updates.
+    assert recomputed is not None
+    assert recomputed >= before_repatch
 
 
 def test_trigger_dispatcher_loop_scans_due_scheduled_trigger(mock_bg_scheduler) -> None:

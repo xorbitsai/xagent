@@ -140,11 +140,17 @@ def normalize_day_of_month(value: Any) -> int:
 
 def normalize_time_of_day(value: Any) -> time:
     """Validate and coerce a "HH:MM" (or "HH:MM:SS") time-of-day string,
-    defaulting to midnight when absent."""
-    if not value:
+    defaulting to midnight when absent (None or blank). Any other non-string
+    value (0, False, [], ...) is a type error, not "absent", and must not
+    silently become midnight."""
+    if value is None:
+        return time(0, 0)
+    if not isinstance(value, str):
+        raise ValueError('time_of_day must be a "HH:MM" (24h) string')
+    if not value.strip():
         return time(0, 0)
     try:
-        parts = str(value).split(":")
+        parts = value.split(":")
         return time(int(parts[0]), int(parts[1]))
     except (TypeError, ValueError, IndexError) as exc:
         raise ValueError('time_of_day must be "HH:MM" (24h)') from exc
@@ -214,9 +220,14 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
     @field_validator("time_of_day")
     @classmethod
     def _valid_time_of_day(cls, value: str | None) -> str | None:
-        if value is not None:
-            normalize_time_of_day(value)
-        return value
+        if value is None:
+            return value
+        # Canonicalize to zero-padded "HH:MM" ("9:5" -> "09:05") so a value
+        # that round-trips through validation is normalized, not just
+        # accepted. Note: the trigger service persists the caller-provided
+        # config verbatim (see _validate_config's docstring), so this only
+        # canonicalizes the typed model — it does not rewrite stored JSON.
+        return normalize_time_of_day(value).strftime("%H:%M")
 
     @field_validator("timezone")
     @classmethod

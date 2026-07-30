@@ -3748,7 +3748,7 @@ const zh = {
       delete: "删除",
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
-      test: "测试触发",
+      test: "保存并测试",
       addAnotherWebhook: "添加另一个 webhook",
       addAnotherSchedule: "添加另一个定时计划",
       addAnotherGmail: "添加另一个 Gmail 触发器",

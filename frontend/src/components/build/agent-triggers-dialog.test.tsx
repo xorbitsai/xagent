@@ -45,7 +45,7 @@ vi.mock("@/lib/clipboard", () => ({
 }))
 
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
-import { localIsoDate, localTimeOfDay } from "./agent-triggers-schedule-fields"
+import { localIsoDate, localTimeOfDay, zonedIsoDate } from "./agent-triggers-schedule-fields"
 import type { AgentTrigger, StagedTrigger } from "@/lib/agent-triggers-api"
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
@@ -328,6 +328,43 @@ describe("AgentTriggersDialog", () => {
       type: "gmail",
       name: "Legacy inbox watcher",
       config: { oauth_account_id: 7 },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([legacyTrigger]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+
+    expect(await screen.findByLabelText("triggers.form.watchLabel")).toHaveValue("INBOX")
+  })
+
+  it("shows a legacy trigger with a present-but-empty watch_label as INBOX, not blank", async () => {
+    // PR #1051 review: gmailFormWatchLabel only special-cased an ABSENT key;
+    // a present `watch_label: ""` fell through to displayWatchLabel("") and
+    // rendered blank, indistinguishable from an explicit wildcard — even
+    // though gmail_triggers.py resolves an empty string exactly the same
+    // way it resolves a missing key: `config.get("watch_label") or ""`,
+    // stripped, `or "inbox"`. Saving that blank field would widen an
+    // INBOX-only trigger to match every incoming email.
+    const legacyTrigger = makeTrigger({
+      id: 10,
+      type: "gmail",
+      name: "Legacy inbox watcher",
+      config: { watch_label: "", oauth_account_id: 7 },
     })
     apiRequestMock.mockImplementation((url: string) => {
       if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
@@ -1230,6 +1267,116 @@ describe("AgentTriggersDialog", () => {
     expect(screen.getByText("triggers.form.gmailAccountPlaceholder")).toBeInTheDocument()
   })
 
+  it("propagates a rebound Gmail account to an auto-derived name, but not a customized one", async () => {
+    // PR #1051 review: the editor hides gmail's name field entirely (the
+    // bound account IS the identity), so re-binding must keep the trigger's
+    // NAME in sync with its config, not just the config itself — otherwise
+    // the card keeps showing whichever account it used to watch.
+    gmailAccounts = [
+      { id: 7, provider: "gmail", email: "gerard.santos@gmail.com" },
+      { id: 8, provider: "gmail", email: "work@company.com" },
+    ]
+    // An auto-derived trigger: its persisted name is exactly the bound
+    // account's email (as buildPayload would have produced on first save).
+    const autoNamed = makeTrigger({
+      id: 11,
+      type: "gmail",
+      name: "gerard.santos@gmail.com",
+      config: { watch_label: "INBOX", oauth_account_id: 7 },
+    })
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string; body?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers" && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([autoNamed]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/11" && init?.method === "PATCH") {
+        const patch = init.body ? JSON.parse(init.body) : {}
+        return Promise.resolve(jsonResponse({ ...autoNamed, ...patch }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.gmail.changeAccount" }),
+    )
+    // The account picker is a custom button+dropdown, not a native <select>:
+    // click the (placeholder, nothing chosen yet post-rebind) trigger text
+    // to open it — clicking the aria-labelledby wrapper itself wouldn't
+    // reach the actual onClick handler, which lives on an inner div — then
+    // click the target account's option button.
+    fireEvent.click(await screen.findByText("triggers.form.gmailAccountPlaceholder"))
+    fireEvent.click(await screen.findByRole("button", { name: "work@company.com" }))
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSettings" }))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/agents/42/triggers/11",
+        expect.objectContaining({ body: expect.stringContaining('"name":"work@company.com"') }),
+      )
+    })
+  })
+
+  it("keeps a deliberately customized Gmail trigger name across a rebind", async () => {
+    gmailAccounts = [
+      { id: 7, provider: "gmail", email: "gerard.santos@gmail.com" },
+      { id: 8, provider: "gmail", email: "work@company.com" },
+    ]
+    // baseTrigger9 (id 9, bound to account 7) has the custom name "Support
+    // inbox" — nothing to do with the bound account's email.
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string; body?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers" && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9" && init?.method === "PATCH") {
+        const patch = init.body ? JSON.parse(init.body) : {}
+        return Promise.resolve(jsonResponse({ ...baseTrigger9, ...patch }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.gmail.changeAccount" }),
+    )
+    // The account picker is a custom button+dropdown, not a native <select>:
+    // click the (placeholder, nothing chosen yet post-rebind) trigger text
+    // to open it — clicking the aria-labelledby wrapper itself wouldn't
+    // reach the actual onClick handler, which lives on an inner div — then
+    // click the target account's option button.
+    fireEvent.click(await screen.findByText("triggers.form.gmailAccountPlaceholder"))
+    fireEvent.click(await screen.findByRole("button", { name: "work@company.com" }))
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSettings" }))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/agents/42/triggers/9",
+        expect.objectContaining({ body: expect.stringContaining('"name":"Support inbox"') }),
+      )
+    })
+  })
+
   it("keeps unsaved field edits when the header switch is toggled while editing", async () => {
     render(
       <AgentTriggersDialog
@@ -1849,13 +1996,12 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     const config = await saveAndGetConfig(getBody)
 
     // Hourly is a flat repeat interval with no fixed civil time to honor, so
-    // it (like custom) keeps the interval_seconds/next_run_at mechanism —
-    // time_of_day/timezone still ride along (harmless, unused server-side)
-    // in case a future "anchor to the hour" feature wants them.
+    // it (like custom) keeps the interval_seconds/next_run_at mechanism and
+    // omits time_of_day/timezone entirely — the backend schema now rejects
+    // them outright for hourly/custom (see _require_schedule) so the two
+    // mechanisms stay enforceably disjoint, not just conventionally so.
     expect(config).toEqual({
       recurrence: "hourly",
-      time_of_day: "09:00",
-      timezone: expect.any(String),
       interval_seconds: 3600,
       next_run_at: expect.any(String),
     })
@@ -1871,11 +2017,15 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     // Daily has a fixed civil time to honor every day, so — unlike
     // hourly/custom — it's routed through the timezone-aware occurrence
     // mechanism (start_at), not a flat interval that would drift across DST.
+    // start_at is a bare "YYYY-MM-DD" date, not a full ISO instant — sending
+    // an instant here would materialize it in the BROWSER's zone while the
+    // backend combines it with the trigger's own `timezone`, silently
+    // disagreeing whenever they differ (PR #1051 review).
     expect(config).toEqual({
       recurrence: "daily",
       time_of_day: "09:00",
       timezone: expect.any(String),
-      start_at: expect.any(String),
+      start_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
     })
   })
 
@@ -1893,7 +2043,7 @@ describe("AgentTriggersDialog schedule recurrence", () => {
       time_of_day: "09:00",
       timezone: expect.any(String),
       weekdays: [0, 2],
-      start_at: expect.any(String),
+      start_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
     })
   })
 
@@ -1909,7 +2059,7 @@ describe("AgentTriggersDialog schedule recurrence", () => {
       time_of_day: "09:00",
       timezone: expect.any(String),
       day_of_month: 1,
-      start_at: expect.any(String),
+      start_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
     })
   })
 
@@ -1925,8 +2075,6 @@ describe("AgentTriggersDialog schedule recurrence", () => {
 
     expect(config).toEqual({
       recurrence: "custom",
-      time_of_day: "09:00",
-      timezone: expect.any(String),
       interval_seconds: 120,
       next_run_at: expect.any(String),
     })
@@ -2061,14 +2209,20 @@ describe("AgentTriggersDialog schedule recurrence", () => {
   it("reconstructs timeOfDay/startDate when reopening an existing trigger, including a legacy config with only an anchor", async () => {
     // PR #1051 review: the timeOfDay-derivation fix (anchor-derived, not a
     // hardcoded "09:00") was previously only exercised via the create path.
-    const withTimeOfDayAnchor = new Date("2026-03-15T14:30:00+00:00")
+    // 20:30 UTC on 2026-03-15 is 2026-03-16 04:30 in Asia/Shanghai (UTC+8) —
+    // deliberately crossing a calendar-day boundary, so a test-runner
+    // machine that happens to sit in a zone matching the trigger's OWN
+    // configured zone can't mask a regression back to reading the machine's
+    // zone instead (see zonedIsoDate/zonedTimeOfDay in buildConfig's sibling
+    // read path, scheduleFieldsFromConfig).
+    const withTimeOfDayAnchor = new Date("2026-03-15T20:30:00+00:00")
     const withTimeOfDay = makeTrigger({
       id: 92,
       type: "scheduled",
       config: {
         recurrence: "daily",
         time_of_day: "14:30",
-        timezone: "UTC",
+        timezone: "Asia/Shanghai",
         start_at: withTimeOfDayAnchor.toISOString(),
       },
     })
@@ -2081,14 +2235,17 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
     fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
     fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
-    // The stored time_of_day ("14:30") is authoritative regardless of the
-    // machine's local timezone — it's used verbatim, not derived from the
-    // anchor's local calendar time.
+    // The stored time_of_day ("14:30") is authoritative regardless of any
+    // zone — it's used verbatim, not derived from the anchor.
     expect(await screen.findByLabelText("triggers.schedule.atWhatTime")).toHaveValue("14:30")
-    // startDate always comes from the anchor's LOCAL calendar date.
+    // startDate for a calendar recurrence's legacy (full-ISO) anchor comes
+    // from the anchor's date in the TRIGGER's OWN configured zone — Mar 16
+    // in Shanghai, not Mar 15 (which is what the raw UTC instant, or the
+    // machine's own unrelated local zone, would show).
     expect(document.getElementById("schedule-start-date")).toHaveValue(
-      localIsoDate(withTimeOfDayAnchor),
+      zonedIsoDate(withTimeOfDayAnchor, "Asia/Shanghai"),
     )
+    expect(document.getElementById("schedule-start-date")).toHaveValue("2026-03-16")
     cleanup()
 
     // Legacy config: no `recurrence`/`time_of_day` at all, only the flat
@@ -2117,6 +2274,35 @@ describe("AgentTriggersDialog schedule recurrence", () => {
       localTimeOfDay(anchorDate),
     )
     expect(document.getElementById("schedule-start-date")).toHaveValue(localIsoDate(anchorDate))
+  })
+
+  it("shows a legacy one-shot config (next_run_at only, no interval_seconds) as custom, not hourly", async () => {
+    // PR #1051 review: `Number(configNumber(config, "interval_seconds")) ||
+    // 3600` treated a MISSING interval_seconds the same as an explicit
+    // 3600 — defaulting the pill to "Hourly" for what is actually a
+    // deliberate one-shot (the backend fires it once, then disables it; see
+    // test_scheduled_scan_disables_one_shot_trigger). A no-op Save on that
+    // pill would have written interval_seconds: 3600, silently and
+    // irreversibly turning it into a perpetual hourly job.
+    const oneShot = makeTrigger({
+      id: 94,
+      type: "scheduled",
+      config: { next_run_at: "2026-05-01T09:00:00+00:00" },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL) return Promise.resolve(jsonResponse([oneShot]))
+      if (url === `${TRIGGERS_URL}/94/runs`) return Promise.resolve(jsonResponse([]))
+      return Promise.resolve(jsonResponse([]))
+    })
+    render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+
+    expect(await screen.findByText("triggers.schedule.custom")).toHaveClass(
+      "border-primary",
+    )
+    expect(screen.queryByText("triggers.schedule.hourly")).not.toHaveClass("border-primary")
   })
 })
 

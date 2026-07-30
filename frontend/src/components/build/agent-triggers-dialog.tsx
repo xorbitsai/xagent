@@ -65,6 +65,8 @@ import {
   localTimeOfDay,
   scheduleFieldsDefaults,
   summarizeSchedule,
+  zonedIsoDate,
+  zonedTimeOfDay,
   type ScheduleCustomUnit,
   type ScheduleFieldsValue,
   type ScheduleRecurrence,
@@ -178,17 +180,20 @@ function displayWatchLabel(raw: string): string {
   return value === "*" || value.toLowerCase() === "all" ? "" : value
 }
 
-// A config with the `watch_label` key entirely absent is a legacy row from
-// before this field existed — gmail_triggers.py's `... or "inbox"` fallback
-// means the backend has always interpreted (and still interprets) that as
-// INBOX-only. A config that explicitly stores "" / "*" / "all" is a later,
-// deliberate choice to watch everything. These must render differently:
-// otherwise the editor shows both as an identical blank field, and simply
-// opening + saving a legacy INBOX-only trigger silently widens it to the
-// wildcard the blank state actually means for every OTHER trigger.
+// gmail_triggers.py resolves BOTH an absent `watch_label` key AND a
+// present-but-empty string to "inbox" (`config.get("watch_label") or ""`,
+// then `... or "inbox"` once stripped) — an empty string is exactly as
+// falsy as a missing key. "*" / "all" are the only real wildcard sentinels.
+// A config missing the key entirely is a legacy row from before this field
+// existed; a present "" is presumably from the same era via some other
+// write path. Either way the backend treats it as INBOX-only, so the editor
+// must too — showing it as an indistinguishable blank field (this UI's
+// wildcard display) would silently widen it to match everything the moment
+// the user opens and saves it.
 function gmailFormWatchLabel(config: Record<string, unknown>): string {
-  if (!("watch_label" in config)) return "INBOX"
-  return displayWatchLabel(configString(config, "watch_label"))
+  const raw = configString(config, "watch_label")
+  if (!("watch_label" in config) || !raw.trim()) return "INBOX"
+  return displayWatchLabel(raw)
 }
 
 function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
@@ -232,17 +237,34 @@ function inferCustomAmountUnit(intervalSeconds: number): { amount: string; unit:
 function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFieldsValue {
   const defaults = scheduleFieldsDefaults()
   const recurrenceRaw = configString(config, "recurrence")
-  // The stored anchor is UTC; render it back as the user's LOCAL calendar
-  // date and time (slicing the ISO string would show the UTC values and
-  // make every edit round-trip drift the anchor for non-UTC users).
+  const isCalendarRecurrence =
+    recurrenceRaw === "daily" || recurrenceRaw === "weekly" || recurrenceRaw === "monthly"
+  const configuredTimezone = configString(config, "timezone") || "UTC"
+
   const startAtRaw = configString(config, "start_at") || configString(config, "next_run_at")
   let startDate = ""
   let anchorTimeOfDay: string | null = null
-  if (startAtRaw) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(startAtRaw)) {
+    // The plain "YYYY-MM-DD" shape buildConfig now sends for daily/weekly/
+    // monthly (see buildConfig) — already zone-agnostic, nothing to convert.
+    startDate = startAtRaw
+  } else if (startAtRaw) {
+    // A full ISO instant: either the flat hourly/custom `next_run_at` (no
+    // zone-bound civil time — rendering it in the CURRENT browser's zone is
+    // self-consistent, since buildConfig reconstructs it the same way), or
+    // legacy daily/weekly/monthly data predating the plain-date format
+    // above. The latter must render in the trigger's OWN stored zone, not
+    // the editing browser's — otherwise the displayed date can be off by a
+    // day from whichever zone the schedule actually runs in.
     const anchorDate = new Date(startAtRaw)
     if (!Number.isNaN(anchorDate.getTime())) {
-      startDate = localIsoDate(anchorDate)
-      anchorTimeOfDay = localTimeOfDay(anchorDate)
+      if (isCalendarRecurrence) {
+        startDate = zonedIsoDate(anchorDate, configuredTimezone)
+        anchorTimeOfDay = zonedTimeOfDay(anchorDate, configuredTimezone)
+      } else {
+        startDate = localIsoDate(anchorDate)
+        anchorTimeOfDay = localTimeOfDay(anchorDate)
+      }
     }
   }
   // A stored time_of_day is authoritative when present; otherwise fall back
@@ -293,7 +315,21 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
   // Legacy config saved before `recurrence` existed: only interval_seconds /
   // next_run_at are present. `timeOfDay` still carries the anchor-derived
   // real time (not defaults.timeOfDay's hardcoded "09:00") from above.
-  const interval = Number(configNumber(config, "interval_seconds")) || 3600
+  const rawInterval = configNumber(config, "interval_seconds")
+  if (!rawInterval) {
+    // No interval_seconds at all (only next_run_at) is a deliberate
+    // backend-supported one-shot: it fires once and the scan loop disables
+    // it (see test_scheduled_scan_disables_one_shot_trigger) — there was
+    // never a "recurrence" to infer. Defaulting this to "hourly" would
+    // claim a recurring cadence the config doesn't have, and a no-op Save
+    // would then write interval_seconds: 3600, silently and irreversibly
+    // turning a one-time job into a perpetual one. "custom" at least makes
+    // no false claim about the cadence; it does NOT by itself preserve the
+    // one-shot semantics on Save (this UI has no representation for "no
+    // interval" — a real fix needs a dedicated one-time recurrence option).
+    return { ...defaults, recurrence: "custom", timeOfDay, startDate }
+  }
+  const interval = Number(rawInterval) || 3600
   if (interval === 3600) {
     return { ...defaults, recurrence: "hourly", timeOfDay, startDate }
   }
@@ -426,6 +462,11 @@ export function AgentTriggersDialog({
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null)
   const [gmailFiltersOpen, setGmailFiltersOpen] = useState(false)
   const [gmailAccounts, setGmailAccounts] = useState<GmailAccount[] | null>(null)
+  // Set by "Change account" (clearing oauthAccountId is an explicit user
+  // choice); makes the auto-bind effect below not overwrite it should
+  // gmailAccounts ever become reactive to something other than the current
+  // one-shot per-open fetch. Reset alongside the other per-view state.
+  const gmailAccountClearedByUserRef = useRef(false)
   const [gmailAccountsLoading, setGmailAccountsLoading] = useState(false)
   const selectedTriggerIdRef = useRef<number | null>(null)
   const activeTypeRef = useRef<AgentTriggerType | null>(null)
@@ -585,6 +626,7 @@ export function AgentTriggersDialog({
     setStagedTestRun(null)
     setSecretGenerated(false)
     setGmailFiltersOpen(false)
+    gmailAccountClearedByUserRef.current = false
     setRuns([])
     if (initialType) setForm(emptyForm(initialType))
     void loadTriggers(null)
@@ -615,6 +657,7 @@ export function AgentTriggersDialog({
   // never chosen silently.
   useEffect(() => {
     if (!open || !editing || activeType !== "gmail" || selectedTrigger) return
+    if (gmailAccountClearedByUserRef.current) return
     if (gmailAccounts?.length === 1) {
       const onlyAccountId = String(gmailAccounts[0].id)
       setForm((current) =>
@@ -663,6 +706,7 @@ export function AgentTriggersDialog({
     setStagedTestRun(null)
     setSecretGenerated(false)
     setGmailFiltersOpen(false)
+    gmailAccountClearedByUserRef.current = false
     setForm(options.form)
     if (trigger) {
       void loadRunsFor(trigger)
@@ -718,55 +762,62 @@ export function AgentTriggersDialog({
       return config
     }
 
-    const config: Record<string, unknown> = {
-      recurrence: sourceForm.recurrence,
-      time_of_day: sourceForm.timeOfDay || "00:00",
-      // time_of_day/weekdays/day_of_month are the user's local wall-clock —
-      // the backend needs the zone to compute occurrences correctly. Sent
-      // from form state (populated once, from the trigger's stored zone or
-      // the browser's own for a new trigger — see scheduleFieldsFromConfig
-      // / scheduleFieldsDefaults), NOT re-derived here on every Save: doing
-      // that would silently relocate an already-armed schedule if the user
-      // happens to edit it from a different machine/zone than it was
-      // created in.
-      timezone: sourceForm.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
-    }
-    // The start date is required: for hourly/daily/custom the picked time
-    // only reaches the backend through this anchor, so a missing date would
+    // The start date is required: for every recurrence the picked time only
+    // reaches the backend through this anchor, so a missing date would
     // silently ignore the chosen time.
     if (!sourceForm.startDate) {
       throw new Error(t("triggers.validation.startDate"))
     }
+
+    if (
+      sourceForm.recurrence === "weekly" ||
+      sourceForm.recurrence === "monthly" ||
+      sourceForm.recurrence === "daily"
+    ) {
+      // Sent as a bare "YYYY-MM-DD" date — zone-agnostic on purpose. The
+      // backend combines it with time_of_day/timezone itself (the same
+      // _localize the actual occurrence math uses); materializing a UTC
+      // instant here via `new Date(...)` would parse the wall-clock fields
+      // in THIS BROWSER's zone, which silently disagrees with the trigger's
+      // stored `timezone` whenever they differ (e.g. editing from a
+      // different machine than the trigger was created on) — the date
+      // shifts by up to a day, or the schedule starts a full cycle late.
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(sourceForm.startDate)) {
+        throw new Error(t("triggers.validation.nextRunAt"))
+      }
+      const config: Record<string, unknown> = {
+        recurrence: sourceForm.recurrence,
+        time_of_day: sourceForm.timeOfDay || "00:00",
+        // The user's local wall-clock — the backend needs the zone to
+        // compute occurrences correctly. Sent from form state (populated
+        // once, from the trigger's stored zone or the browser's own for a
+        // new trigger — see scheduleFieldsFromConfig / scheduleFieldsDefaults),
+        // NOT re-derived here on every Save: doing that would silently
+        // relocate an already-armed schedule if the user happens to edit it
+        // from a different machine/zone than it was created in.
+        timezone: sourceForm.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+        start_at: sourceForm.startDate,
+      }
+      if (sourceForm.recurrence === "weekly") {
+        if (!sourceForm.weekdays.length) {
+          throw new Error(t("triggers.validation.scheduleRequired"))
+        }
+        config.weekdays = sourceForm.weekdays
+      } else if (sourceForm.recurrence === "monthly") {
+        config.day_of_month = sourceForm.dayOfMonth
+      }
+      return config
+    }
+
+    // hourly/custom: no civil time-of-day for a zone to apply to (see the
+    // `recurrence` field's docstring in schemas.py) — the anchor really is
+    // just an absolute instant, so browser-local parsing is fine, and
+    // self-consistent on every re-save since the editor always displays
+    // this anchor back in the CURRENT browser's zone too (scheduleFieldsFromConfig).
     const anchor = new Date(`${sourceForm.startDate}T${sourceForm.timeOfDay || "00:00"}:00`)
     if (Number.isNaN(anchor.getTime())) {
       throw new Error(t("triggers.validation.nextRunAt"))
     }
-
-    if (sourceForm.recurrence === "weekly") {
-      if (!sourceForm.weekdays.length) {
-        throw new Error(t("triggers.validation.scheduleRequired"))
-      }
-      config.weekdays = sourceForm.weekdays
-      config.start_at = anchor.toISOString()
-      return config
-    }
-
-    if (sourceForm.recurrence === "monthly") {
-      config.day_of_month = sourceForm.dayOfMonth
-      config.start_at = anchor.toISOString()
-      return config
-    }
-
-    if (sourceForm.recurrence === "daily") {
-      // Routed through the same timezone-aware occurrence math as
-      // weekly/monthly (start_at, no interval_seconds) instead of flat
-      // interval arithmetic — a fixed wall-clock time needs real calendar
-      // math to survive DST and to land on the picked time in the picked
-      // zone at all.
-      config.start_at = anchor.toISOString()
-      return config
-    }
-
     let intervalSeconds = 3600
     if (sourceForm.recurrence === "custom") {
       const amount = Number(sourceForm.customAmount)
@@ -775,21 +826,47 @@ export function AgentTriggersDialog({
       }
       intervalSeconds = amount * unitSecondsFor(sourceForm.customUnit)
     }
-    config.interval_seconds = intervalSeconds
-    config.next_run_at = anchor.toISOString()
-    return config
+    return {
+      recurrence: sourceForm.recurrence,
+      interval_seconds: intervalSeconds,
+      next_run_at: anchor.toISOString(),
+    }
   }
 
   const buildPayload = (sourceForm: TriggerFormState = form) => {
     // Gmail triggers have no name field in the editor (the bound account IS
-    // the identity, like the reference design), so default to its email.
+    // the identity, like the reference design), so a fresh/never-customized
+    // trigger's name always tracks the bound account's email — including
+    // across a rebind, so the card doesn't keep showing an account it no
+    // longer watches. Only names that are STILL exactly the account the
+    // trigger was previously bound to count as "never customized" — a
+    // deliberately renamed trigger (e.g. "Support inbox") keeps its name
+    // when rebound, same as it would for any other unrelated edit.
     const boundEmail =
       sourceForm.type === "gmail"
         ? ((gmailAccounts ?? []).find(
             (account) => String(account.id) === sourceForm.oauthAccountId,
           )?.email ?? null)
         : null
-    const name = sourceForm.name.trim() || boundEmail || defaultNameForType(sourceForm.type)
+    const previouslyBoundEmail =
+      sourceForm.type === "gmail" && selectedTrigger?.type === "gmail"
+        ? ((gmailAccounts ?? []).find(
+            (account) =>
+              String(account.id) === configId(selectedTrigger.config, "oauth_account_id"),
+          )?.email ?? null)
+        : null
+    const wasAutoNamed =
+      sourceForm.type === "gmail" &&
+      // A brand-new gmail draft has nothing to preserve — always derive.
+      (!selectedTrigger ||
+        // An existing trigger's old account is no longer resolvable (e.g.
+        // disconnected) — can't tell whether the current name was ever
+        // auto-derived, so the safer default is to leave a possible
+        // customization alone rather than risk clobbering it.
+        (previouslyBoundEmail !== null && sourceForm.name.trim() === previouslyBoundEmail))
+    const name = wasAutoNamed
+      ? boundEmail || defaultNameForType(sourceForm.type)
+      : sourceForm.name.trim() || boundEmail || defaultNameForType(sourceForm.type)
     if (name.length > 200) {
       throw new Error(t("triggers.validation.nameLength"))
     }
@@ -1650,7 +1727,10 @@ export function AgentTriggersDialog({
               variant="ghost"
               size="sm"
               className="h-7 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground"
-              onClick={() => setFormValue("oauthAccountId", "")}
+              onClick={() => {
+                gmailAccountClearedByUserRef.current = true
+                setFormValue("oauthAccountId", "")
+              }}
             >
               {t("triggers.gmail.changeAccount")}
             </Button>

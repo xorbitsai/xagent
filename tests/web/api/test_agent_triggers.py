@@ -1504,6 +1504,45 @@ def test_scheduled_dst_fall_back_ambiguous_time_pins_the_first_occurrence() -> N
     assert next_run_at == datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc)
 
 
+def test_scheduled_start_at_is_a_date_combined_via_the_configured_zone() -> None:
+    # PR #1051 review: start_at must carry only a calendar DATE, never a
+    # baked-in clock time — the actual first-occurrence clock time is always
+    # time_of_day localized in `timezone`. A client (the frontend included)
+    # has no reliable way to express "9am in Asia/Shanghai" as a bare ISO
+    # instant without knowing which zone the RECEIVING process will read it
+    # back in; sending just the date sidesteps that entirely.
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {
+            "recurrence": "daily",
+            "time_of_day": "09:00",
+            "timezone": "Asia/Shanghai",
+            "start_at": "2026-08-01",
+        },
+        from_time=now,
+    )
+    # 09:00 Asia/Shanghai (UTC+8) on 2026-08-01 is 01:00 UTC.
+    assert next_run_at == datetime(2026, 8, 1, 1, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_start_at_ignores_a_legacy_time_component() -> None:
+    # Backward compatibility: a full ISO datetime (the pre-fix shape, or a
+    # direct API client sending one anyway) still works — only its DATE
+    # portion is read; a non-midnight time component is simply discarded
+    # rather than corrupting the computed anchor.
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {
+            "recurrence": "daily",
+            "time_of_day": "09:00",
+            "timezone": "Asia/Shanghai",
+            "start_at": "2026-08-01T17:00:00+00:00",  # any time; only the date matters
+        },
+        from_time=base,
+    )
+    assert next_run_at == datetime(2026, 8, 1, 1, 0, tzinfo=timezone.utc)
+
+
 def test_scheduled_explicit_anchor_is_honored_verbatim_past_or_future() -> None:
     # An explicit next_run_at is authoritative either way: a future anchor
     # is a genuine start time, and a past one means the trigger is already
@@ -1693,6 +1732,103 @@ def test_scheduled_config_validation_rejects_malformed_time_of_day() -> None:
     with pytest.raises(ValidationError):
         parse_trigger_config(
             "scheduled", {"recurrence": "daily", "time_of_day": "not-a-time"}
+        )
+
+
+def test_scheduled_config_validation_rejects_malformed_start_at() -> None:
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    # A dedicated field validator, not just an incidental failure surfaced
+    # later at recompute time as an unstructured TriggerServiceError — a
+    # malformed start_at is now a clean, attributable 422 at write time.
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {"recurrence": "daily", "time_of_day": "09:00", "start_at": "not-a-date"},
+        )
+    # A bare date and a full ISO datetime are both valid.
+    parse_trigger_config(
+        "scheduled",
+        {"recurrence": "daily", "time_of_day": "09:00", "start_at": "2026-08-01"},
+    )
+    parse_trigger_config(
+        "scheduled",
+        {
+            "recurrence": "daily",
+            "time_of_day": "09:00",
+            "start_at": "2026-08-01T00:00:00+00:00",
+        },
+    )
+
+
+def test_scheduled_config_validation_rejects_calendar_only_fields_on_flat_recurrences() -> (
+    None
+):
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    # hourly/custom (and a bare next_run_at with no recurrence — the
+    # deliberate one-shot shape) never read time_of_day/weekdays/
+    # day_of_month/start_at/timezone; a client setting them got a 2xx and
+    # silently nothing happened. Reject outright instead, symmetric with how
+    # a calendar recurrence already rejects a stray interval_seconds.
+    base_hourly = {"recurrence": "hourly", "interval_seconds": 3600}
+    for stray_field, stray_value in (
+        ("time_of_day", "09:00"),
+        ("weekdays", [0]),
+        ("day_of_month", 1),
+        ("start_at", "2026-08-01"),
+        ("timezone", "Asia/Shanghai"),
+    ):
+        with pytest.raises(ValidationError):
+            parse_trigger_config("scheduled", {**base_hourly, stray_field: stray_value})
+    # Without any of them, hourly is still valid.
+    parse_trigger_config("scheduled", base_hourly)
+
+
+def test_scheduled_config_validation_requires_interval_seconds_for_custom() -> None:
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    # "custom" (unlike a bare, recurrence-less next_run_at — the one-shot
+    # shape) explicitly implies a user-picked interval; omitting it is a
+    # caller error, not a valid degraded one-shot.
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {"recurrence": "custom", "next_run_at": "2026-08-01T09:00:00+00:00"},
+        )
+    parse_trigger_config(
+        "scheduled",
+        {
+            "recurrence": "custom",
+            "interval_seconds": 120,
+            "next_run_at": "2026-08-01T09:00:00+00:00",
+        },
+    )
+    # The one-shot shape itself (no recurrence at all) remains valid.
+    parse_trigger_config("scheduled", {"next_run_at": "2026-08-01T09:00:00+00:00"})
+
+
+def test_scheduled_config_validation_rejects_stray_next_run_at_on_calendar_recurrences() -> (
+    None
+):
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {
+                "recurrence": "daily",
+                "time_of_day": "09:00",
+                "next_run_at": "2026-08-01T09:00:00+00:00",
+            },
         )
 
 
@@ -1913,6 +2049,88 @@ def test_scheduled_full_form_save_with_unchanged_config_does_not_reset_next_run_
     # allow_past_explicit=False clamp in _apply_trigger_updates.
     assert recomputed is not None
     assert recomputed >= before_repatch
+
+
+def test_scheduled_re_enable_clamps_a_stale_anchor_instead_of_rewinding(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review: the re-enable branch used to call _compute_next_run_at
+    # with the default allow_past_explicit=True — same bug as a schedule
+    # edit, reached via disable -> enable instead. Re-enabling isn't "like a
+    # fresh creation": the stored config's anchor may be from long before
+    # the trigger was ever disabled.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Every minute",
+            "enabled": False,
+            "config": {
+                "interval_seconds": 60,
+                "next_run_at": "2020-01-01T00:00:00+00:00",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+    assert created.json()["next_run_at"] is None
+
+    before_enable = datetime.now(timezone.utc)
+    enabled = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={"enabled": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    next_run_at = _coerce_utc(datetime.fromisoformat(enabled.json()["next_run_at"]))
+    assert next_run_at is not None
+    assert next_run_at >= before_enable
+
+
+def test_scheduled_signature_ignores_unpadded_time_of_day_and_weekday_order(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review: _validate_config persists the caller-provided config
+    # verbatim (never rewrites stored JSON), so a stored "9:5" or an
+    # out-of-order weekdays list is compared RAW by _schedule_signature — an
+    # equivalent, differently-formatted resend must still count as "the
+    # schedule didn't change".
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Weekly",
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "9:5",
+                "weekdays": [2, 0],
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+    original_next_run_at = created.json()["next_run_at"]
+    assert original_next_run_at is not None
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:05",  # zero-padded, same time
+                "weekdays": [0, 2],  # sorted, same set
+            },
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["next_run_at"] == original_next_run_at
 
 
 def test_trigger_dispatcher_loop_scans_due_scheduled_trigger(mock_bg_scheduler) -> None:

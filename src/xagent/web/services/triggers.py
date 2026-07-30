@@ -381,10 +381,21 @@ def _compute_next_run_at(
             explicit_start = config.get("start_at")
             if isinstance(explicit_start, str) and explicit_start.strip():
                 try:
-                    start = _coerce_utc(datetime.fromisoformat(explicit_start))
+                    start_date = datetime.fromisoformat(explicit_start).date()
                 except ValueError as exc:
                     raise TriggerServiceError("Invalid start_at") from exc
-                if start and start > base:
+                # Only the calendar DATE is authoritative — the clock time of
+                # the first occurrence is always time_of_day in `tz`, never
+                # whatever time component `start_at` happens to carry. A
+                # client (the schedule editor included) has no reliable way
+                # to express "this wall-clock time, in this zone" as a bare
+                # ISO instant without knowing which zone the RECEIVING
+                # process will interpret it in — sending just a date sidesteps
+                # that entirely.
+                start = _localize(
+                    datetime.combine(start_date, time_of_day), tz
+                ).astimezone(timezone.utc)
+                if start > base:
                     # Subtract a second so a start date that itself matches
                     # the recurrence still qualifies as its own first fire.
                     base = start - timedelta(seconds=1)
@@ -463,15 +474,38 @@ _SCHEDULE_RELEVANT_CONFIG_FIELDS = (
 
 def _schedule_signature(config: dict[str, Any]) -> tuple[Any, ...]:
     """The subset of a scheduled trigger's config that actually determines
-    its fire times. Used to decide whether an update genuinely changed the
-    schedule (and must recompute next_run_at) versus resending an unrelated
-    field alongside an unchanged schedule (and must not) — comparing the
-    whole config dict is too coarse, since incidental, non-schedule churn in
-    it (e.g. a resubmitted `timezone` that only differs because the browser
-    saving it changed zones — see agent-triggers-dialog.tsx's buildConfig)
-    would otherwise be indistinguishable from an intentional schedule edit.
+    its fire times, normalized so two configs that mean the same schedule
+    compare equal even if their raw JSON doesn't byte-match. Used to decide
+    whether an update genuinely changed the schedule (and must recompute
+    next_run_at) versus resending an unrelated field alongside an unchanged
+    schedule (and must not) — comparing raw, unnormalized values is too
+    literal: a stored trigger genuinely irrelevant to scheduling (name,
+    prompt_template, event_types, ...) never differs here, so only a real
+    schedule edit trips the recompute path.
+
+    Two normalizations matter in practice: `_validate_config` persists the
+    caller-provided config verbatim (never rewrites stored JSON — see its
+    docstring), so an un-padded `time_of_day` ("9:5") is never canonicalized
+    at rest; and `weekdays` is a set of days with no meaningful order, so
+    `[0, 2]` and `[2, 0]` must compare equal. Both would otherwise register
+    as a schedule "change" for reasons that have nothing to do with the
+    schedule actually differing.
     """
-    return tuple(config.get(field) for field in _SCHEDULE_RELEVANT_CONFIG_FIELDS)
+    normalized: list[Any] = []
+    for field in _SCHEDULE_RELEVANT_CONFIG_FIELDS:
+        value = config.get(field)
+        if field == "time_of_day" and value is not None:
+            try:
+                value = normalize_time_of_day(value).strftime("%H:%M")
+            except ValueError:
+                pass  # Malformed values still compare (in)equal on the raw input.
+        elif field == "weekdays" and isinstance(value, list):
+            try:
+                value = sorted(normalize_weekdays(value))
+            except ValueError:
+                pass
+        normalized.append(value)
+    return tuple(normalized)
 
 
 def _typed_config_error(trigger_type: str, exc: ValidationError) -> TriggerServiceError:
@@ -896,19 +930,31 @@ def _apply_trigger_updates(
         # editor's full-form Save always resends the complete config,
         # including hourly/custom's flat next_run_at/interval_seconds anchor
         # — which was computed once at creation and never advances (only the
-        # DB column does, via scans) — plus incidental fields like
-        # `timezone` that can legitimately differ between saves without the
-        # schedule itself changing. Gating on payload shape or whole-config
-        # equality both made this branch fire on saves that touch nothing
-        # schedule-related.
+        # DB column does, via scans) — alongside fields genuinely irrelevant
+        # to scheduling, like `name` or `prompt_template` (not part of
+        # `config` at all — see below) or a trigger's `event_types`. Gating
+        # on payload shape or whole-config equality both made this branch
+        # fire on saves that touch nothing schedule-related. A resubmitted
+        # `timezone` that DOES differ is a genuine schedule edit — see
+        # _schedule_signature — and correctly forces a recompute.
         new_config = dict(trigger.config or {})
         if not trigger.enabled:
             setattr(trigger, "next_run_at", None)
         elif not old_enabled:
-            # Re-enabled — needs a fresh value from its own config, exactly
-            # like a fresh creation (no prior armed schedule to protect from
-            # rewinding, so a past explicit anchor is fine to honor).
-            setattr(trigger, "next_run_at", _compute_next_run_at(new_config))
+            # Re-enabled. NOT treated like a fresh creation: the stored
+            # config's `next_run_at`/`start_at` is whatever was last
+            # intentionally set, possibly from long before this trigger was
+            # ever disabled — honoring it verbatim here would either fire
+            # immediately (if never consumed) or, worse, silently no-op (if
+            # the disable happened after it already fired once, since the
+            # scan's idempotency key is derived from the due instant and
+            # would collide with the already-consumed run). Clamp the same
+            # way an intentional schedule edit does.
+            setattr(
+                trigger,
+                "next_run_at",
+                _compute_next_run_at(new_config, allow_past_explicit=False),
+            )
         elif _schedule_signature(new_config) != _schedule_signature(old_config):
             # The schedule was intentionally changed. Recompute, but don't
             # let a still-past explicit next_run_at — unchanged from a much

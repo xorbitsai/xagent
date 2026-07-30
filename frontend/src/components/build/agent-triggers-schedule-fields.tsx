@@ -141,6 +141,31 @@ export function localTimeOfDay(date: Date): string {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`
 }
 
+function datePartsInZone(date: Date, timeZone: string, options: Intl.DateTimeFormatOptions) {
+  const parts = new Intl.DateTimeFormat("en-US", { ...options, timeZone }).formatToParts(date)
+  return (type: string) => parts.find((part) => part.type === type)?.value ?? "00"
+}
+
+/** A Date's calendar date in an ARBITRARY IANA zone, as YYYY-MM-DD. Unlike
+ * `localIsoDate`, this doesn't depend on the browser's own zone — needed to
+ * show a daily/weekly/monthly trigger's stored legacy anchor (a full ISO
+ * instant predating the plain-date `start_at` format) on the calendar date
+ * it actually starts on, not whatever date that instant happens to fall on
+ * in the zone of whoever is currently editing it. */
+export function zonedIsoDate(date: Date, timeZone: string): string {
+  const part = datePartsInZone(date, timeZone, { year: "numeric", month: "2-digit", day: "2-digit" })
+  return `${part("year")}-${part("month")}-${part("day")}`
+}
+
+/** A Date's wall-clock time in an ARBITRARY IANA zone, as HH:MM. See
+ * `zonedIsoDate`. */
+export function zonedTimeOfDay(date: Date, timeZone: string): string {
+  const part = datePartsInZone(date, timeZone, { hour: "2-digit", minute: "2-digit", hour12: false })
+  // hour12: false can still render midnight as "24" in some locales/engines.
+  const hour = part("hour") === "24" ? "00" : part("hour")
+  return `${hour}:${part("minute")}`
+}
+
 export function scheduleFieldsDefaults(): ScheduleFieldsValue {
   const iso = localIsoDate(new Date())
   return {

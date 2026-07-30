@@ -236,8 +236,30 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
             normalize_schedule_timezone(value)
         return value
 
+    @field_validator("start_at")
+    @classmethod
+    def _valid_start_at(cls, value: str | None) -> str | None:
+        if value is not None and value.strip():
+            try:
+                datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(
+                    'start_at must be an ISO date ("YYYY-MM-DD") or datetime string'
+                ) from exc
+        return value
+
     @model_validator(mode="after")
     def _require_schedule(self) -> "ScheduledTriggerConfig":
+        # Two disjoint mechanisms behind one `recurrence` enum:
+        # daily/weekly/monthly are real, timezone-aware calendar math off
+        # time_of_day (+ weekdays/day_of_month); hourly/custom (and a bare
+        # `next_run_at` with no recurrence at all — the deliberate one-shot
+        # shape a trigger settles into after its one scheduled fire, see
+        # test_scheduled_scan_disables_one_shot_trigger) are the flat
+        # interval_seconds/next_run_at mechanism. Each rejects the other's
+        # fields outright rather than silently ignoring them, so a
+        # contradictory config is a 422 at write time, not a same-shape
+        # config that quietly does nothing.
         if self.recurrence in ("daily", "weekly", "monthly"):
             if not (self.time_of_day or "").strip():
                 raise ValueError(f"{self.recurrence} schedule requires time_of_day")
@@ -245,11 +267,25 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
                 raise ValueError(
                     f"{self.recurrence} schedule must not set interval_seconds"
                 )
+            if (self.next_run_at or "").strip():
+                raise ValueError(f"{self.recurrence} schedule must not set next_run_at")
             if self.recurrence == "weekly" and not self.weekdays:
                 raise ValueError("weekly schedule requires weekdays")
             if self.recurrence == "monthly" and self.day_of_month is None:
                 raise ValueError("monthly schedule requires day_of_month")
             return self
+        for field_name in (
+            "time_of_day",
+            "weekdays",
+            "day_of_month",
+            "start_at",
+            "timezone",
+        ):
+            if getattr(self, field_name) is not None:
+                label = self.recurrence or "a plain next_run_at"
+                raise ValueError(f"{field_name} is not used by {label} schedule")
+        if self.recurrence == "custom" and self.interval_seconds is None:
+            raise ValueError("custom schedule requires interval_seconds")
         if self.interval_seconds is None and not (self.next_run_at or "").strip():
             raise ValueError(
                 "scheduled trigger requires interval_seconds or next_run_at"

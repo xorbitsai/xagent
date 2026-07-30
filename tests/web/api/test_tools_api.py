@@ -5,15 +5,21 @@ This module tests the /api/tools endpoints, including the /available endpoint
 which lists all tools that can be used by agents.
 """
 
+import logging
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from xagent.core.tools.adapters.vibe.config import (
+    ToolFactoryRuntimeSessionBoundaryError,
+)
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import _create_tool_info, tools_router
 from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.tool_config import ToolConfig, ToolUsage
 
 
 def override_get_db():
@@ -75,6 +81,210 @@ def test_music_tool_requires_music_model() -> None:
     assert available["status"] == "available"
 
 
+class _AvailableToolsRouteHarness:
+    def __init__(
+        self,
+        *,
+        cleanup_error: BaseException,
+        primary_error: BaseException | None = None,
+    ) -> None:
+        self.cleanup_error = cleanup_error
+        self.primary_error = primary_error
+        self.events: list[str] = []
+        self.close_calls = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> object:
+        harness = self
+
+        class Config:
+            def __init__(self, **_kwargs) -> None:
+                pass
+
+            def get_vision_model(self):
+                harness.events.append("vision")
+                return None
+
+            def get_image_models(self):
+                harness.events.append("image")
+                return {}
+
+            def get_video_models(self):
+                harness.events.append("video")
+                return {}
+
+            def get_asr_models(self):
+                harness.events.append("asr")
+                return {}
+
+            def get_tts_models(self):
+                harness.events.append("tts")
+                return {}
+
+            def get_sound_effect_models(self):
+                harness.events.append("sound_effect")
+                return {}
+
+            def get_music_models(self):
+                harness.events.append("music")
+                return {}
+
+            def get_user_tool_overrides(self):
+                harness.events.append("user_overrides")
+                return {}
+
+            def close(self) -> None:
+                harness.events.append("close")
+                harness.close_calls += 1
+                raise harness.cleanup_error
+
+        class Query:
+            def __init__(self, model: object) -> None:
+                self.model = model
+
+            def all(self) -> list[object]:
+                model_name = getattr(self.model, "__name__", str(self.model))
+                harness.events.append(model_name)
+                if self.model is ToolConfig and harness.primary_error is not None:
+                    raise harness.primary_error
+                return []
+
+        class Database:
+            def query(self, model: object) -> Query:
+                return Query(model)
+
+        class SandboxManager:
+            async def get_or_create_lease_provider(
+                self, _scope: str, _user_id: str
+            ) -> object:
+                harness.events.append("sandbox_get")
+                return object()
+
+            async def attach(self, _scope: str, _user_id: str) -> bool:
+                harness.events.append("sandbox_attach")
+                return True
+
+            async def release(self, _scope: str, _user_id: str) -> None:
+                harness.events.append("sandbox_release")
+
+        category = SimpleNamespace(value="basic")
+        tool = SimpleNamespace(
+            name="test_tool",
+            description="",
+            metadata=SimpleNamespace(category=category),
+        )
+
+        async def create_all_tools(
+            _config, apply_user_override_filter: bool = True
+        ) -> list[object]:
+            assert apply_user_override_filter is False
+            harness.events.append("factory")
+            return [tool]
+
+        def create_tool_info(*_args, **_kwargs) -> dict[str, object]:
+            harness.events.append("response_shape")
+            return {
+                "name": "test_tool",
+                "category": "basic",
+                "enabled": True,
+                "status": "available",
+            }
+
+        monkeypatch.setattr("xagent.web.api.tools.WebToolConfig", Config)
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            create_all_tools,
+        )
+        monkeypatch.setattr(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            lambda: SandboxManager(),
+        )
+        monkeypatch.setattr("xagent.web.api.tools._create_tool_info", create_tool_info)
+        monkeypatch.setattr(
+            "xagent.web.api.tools.get_default_tool_configs",
+            lambda: [],
+        )
+        return Database()
+
+
+@pytest.mark.asyncio
+async def test_available_tools_cleanup_failure_follows_complete_route_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    cleanup_error = RuntimeError("close failed")
+    harness = _AvailableToolsRouteHarness(cleanup_error=cleanup_error)
+    db = harness.install(monkeypatch)
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError) as exc_info:
+        await get_available_tools(
+            current_user=SimpleNamespace(id=7, is_admin=False),
+            db=db,
+        )
+
+    assert exc_info.value.__cause__ is cleanup_error
+    assert str(exc_info.value) == "Tool runtime cleanup could not be completed."
+    assert harness.close_calls == 1
+    assert harness.events == [
+        "sandbox_get",
+        "sandbox_attach",
+        "factory",
+        "sandbox_release",
+        "vision",
+        "image",
+        "video",
+        "asr",
+        "tts",
+        "sound_effect",
+        "music",
+        "response_shape",
+        ToolUsage.__name__,
+        ToolConfig.__name__,
+        "user_overrides",
+        "close",
+    ]
+
+
+class _RoutePrimaryFailure(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_available_tools_primary_failure_wins_over_terminal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    primary_error = _RoutePrimaryFailure("route failed")
+    cleanup_error = RuntimeError("close failed")
+    harness = _AvailableToolsRouteHarness(
+        cleanup_error=cleanup_error,
+        primary_error=primary_error,
+    )
+    db = harness.install(monkeypatch)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="xagent.web.api.tools"),
+        pytest.raises(_RoutePrimaryFailure) as exc_info,
+    ):
+        await get_available_tools(
+            current_user=SimpleNamespace(id=7, is_admin=False),
+            db=db,
+        )
+
+    assert exc_info.value is primary_error
+    assert harness.close_calls == 1
+    cleanup_records = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "Failed to close tool listing runtime after route failure"
+    ]
+    assert len(cleanup_records) == 1
+    assert cleanup_records[0].exc_info is not None
+
+
 def ensure_system_initialized() -> None:
     status_response = client.get("/api/auth/setup-status")
     assert status_response.status_code == 200
@@ -122,12 +332,32 @@ class TestToolsAvailableAPI:
         ensure_system_initialized()
         yield
 
-    def test_get_available_tools_without_workspace(self):
+    def test_get_available_tools_without_workspace(self, monkeypatch):
         """Test that /api/tools/available works without a real workspace.
 
         This endpoint is used to list available tools for the UI.
         It should work even when there's no active task/workspace.
         """
+        from xagent.web.api import tools as tools_api
+
+        real_config_type = tools_api.WebToolConfig
+        created_configs = []
+        closed_configs = []
+
+        def capture_config(*args, **kwargs):
+            config = real_config_type(*args, **kwargs)
+            real_close = config.close
+
+            def close() -> None:
+                closed_configs.append(config)
+                real_close()
+
+            config.close = close
+            created_configs.append(config)
+            return config
+
+        monkeypatch.setattr(tools_api, "WebToolConfig", capture_config)
+
         # Login to get token
         login_response = client.post(
             "/api/auth/login", json={"username": "admin", "password": "admin123"}
@@ -187,6 +417,7 @@ class TestToolsAvailableAPI:
         assert "read_skill_doc" in tool_names, "Should have read_skill_doc tool"
         assert "list_skill_docs" in tool_names, "Should have list_skill_docs tool"
         assert "fetch_skill_file" in tool_names, "Should have fetch_skill_file tool"
+        assert closed_configs == created_configs
 
     def test_skill_category_in_available_tools(self):
         """Test that skill tools appear with correct category."""

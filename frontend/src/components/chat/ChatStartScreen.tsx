@@ -39,7 +39,7 @@ interface ChatStartScreenProps {
   onAgentClick?: (agent: AgentCard) => void;
   selectedAgents?: AgentCard[];
   onRemoveSelectedAgent?: (agentId: number | string) => void;
-  onSend: (message: string, files: File[], config?: any) => void;
+  onSend: (message: string, files: File[], config?: any) => void | Promise<void>;
   isSending?: boolean;
   inputValue?: string;
   onInputChange?: (value: string) => void;
@@ -52,6 +52,8 @@ interface ChatStartScreenProps {
   hideConfig?: boolean;
   compactInput?: boolean;
   deferFileUpload?: boolean;
+  filesDisabled?: boolean;
+  voiceInputEnabled?: boolean;
   taskConfig?: any;
   autoFocus?: boolean;
   inputMinHeightClass?: string;
@@ -79,11 +81,14 @@ export function ChatStartScreen({
   hideConfig = false,
   compactInput = false,
   deferFileUpload = false,
+  filesDisabled = false,
+  voiceInputEnabled = true,
   taskConfig,
   autoFocus = false,
   inputMinHeightClass
 }: ChatStartScreenProps) {
   const { t } = useI18n();
+  const enabledFiles = filesDisabled ? [] : files;
 
   const handlePromptClick = (prompt: string, promptHighlights?: string[]) => {
     if (onPromptSelect) {
@@ -107,10 +112,12 @@ export function ChatStartScreen({
       <div className="w-full max-w-[680px] mx-auto space-y-6">
         <div>
           <ChatInput
-            onSend={(msg, config) => onSend(msg, files, config)}
+            onSend={(msg, config) => onSend(msg, enabledFiles, config)}
             isLoading={isSending}
-            files={files}
-            onFilesChange={onFilesChange || (() => { })}
+            files={enabledFiles}
+            onFilesChange={
+              filesDisabled ? undefined : (onFilesChange || (() => { }))
+            }
             showModeToggle={showModeToggle}
             inputValue={inputValue}
             onInputChange={onInputChange}
@@ -119,6 +126,9 @@ export function ChatStartScreen({
             hideConfig={hideConfig}
             compact={compactInput}
             deferFileUpload={deferFileUpload}
+            filesDisabled={filesDisabled}
+            voiceInputEnabled={voiceInputEnabled}
+            hideFileUpload={filesDisabled}
             taskConfig={taskConfig}
             autoFocus={autoFocus}
             minHeightClass={inputMinHeightClass}

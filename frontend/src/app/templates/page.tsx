@@ -30,6 +30,7 @@ const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   customer_service: "templates.categoryTitles.customer_service",
   finance_lms_ops: "templates.categoryTitles.finance_lms_ops",
   security: "templates.categoryTitles.security",
+  operations: "templates.categoryTitles.operations",
 };
 
 const normalizeCategoryKey = (category: string) =>

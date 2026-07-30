@@ -1,11 +1,13 @@
-import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import React, { Suspense, startTransition } from "react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { createRoot } from "react-dom/client"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const resetMentionMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -67,7 +69,7 @@ vi.mock("@/hooks/use-file-mention", () => ({
 
 vi.mock("sonner", () => ({
   toast: {
-    error: vi.fn(),
+    error: toastErrorMock,
     success: vi.fn(),
   },
 }))
@@ -87,10 +89,13 @@ describe("ChatInput", () => {
     openFilePreviewMock.mockReset()
     routerPushMock.mockReset()
     resetMentionMock.mockReset()
+    toastErrorMock.mockReset()
   })
 
   afterEach(() => {
     cleanup()
+    Reflect.deleteProperty(document, "execCommand")
+    vi.unstubAllGlobals()
   })
 
   it("requires a model when submitting generic chat", async () => {
@@ -110,6 +115,130 @@ describe("ChatInput", () => {
       expect(screen.getByText("chatPage.input.noModelAlert")).toBeInTheDocument()
     })
     expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("suppresses preseeded files and restored file previews when files are disabled", () => {
+    const onSend = vi.fn()
+    const onFilesChange = vi.fn()
+    const uploadFile = vi.fn()
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn(),
+    })
+    const { container } = render(
+      <ChatInput
+        files={[file]}
+        filesDisabled
+        hideConfig
+        inputValue="[secret.txt](file:file-secret)"
+        onFilesChange={onFilesChange}
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+        uploadFile={uploadFile}
+      />
+    )
+
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+    expect(container.querySelector(".file-chip-preview")).toBeNull()
+    const editor = screen.getByRole("textbox")
+    expect(editor).toHaveTextContent("secret.txt")
+    expect(editor).not.toHaveTextContent("file-secret")
+    expect(editor.innerHTML).not.toContain("file-secret")
+
+    editor.innerHTML = '<span class="file-chip-preview" data-file-path="file-secret">secret</span>'
+    fireEvent.click(editor.querySelector(".file-chip-preview") as HTMLElement)
+
+    fireEvent.drop(container.querySelector("form") as HTMLFormElement, {
+      dataTransfer: { types: ["Files"] },
+    })
+    fireEvent.paste(editor, {
+      clipboardData: {
+        items: [{
+          kind: "file",
+          type: "text/plain",
+          getAsFile: () => file,
+        }],
+        getData: () => "",
+      },
+    })
+
+    expect(openFilePreviewMock).not.toHaveBeenCalled()
+    expect(onFilesChange).not.toHaveBeenCalled()
+    expect(uploadFile).not.toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
+    expect(
+      apiRequestMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/api/files/"),
+      )
+    ).toBe(false)
+  })
+
+  it("keeps restored file preview semantics when only upload UI is hidden", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="[report.txt](file:file-report)"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        readOnlyConfig
+      />
+    )
+
+    const chip = container.querySelector(".file-chip-preview")
+    expect(chip).not.toBeNull()
+    fireEvent.click(chip as HTMLElement)
+    expect(openFilePreviewMock).toHaveBeenCalledWith(
+      "file-report",
+      "file-report",
+      [{ fileName: "file-report", fileId: "file-report" }],
+    )
+  })
+
+  it("restores a draft file chip without displaying its canonical id and preserves that id on send", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="[report.txt](file:canonical-file-id)"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    expect(screen.getByText("report.txt")).toBeInTheDocument()
+    expect(screen.queryByText("canonical-file-id")).not.toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "[report.txt](file:canonical-file-id)",
+        expect.any(Object),
+      )
+    })
+  })
+
+  it("keeps a controlled first-message draft after an async send rejection", async () => {
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("delivery failed"))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="retry this"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />,
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalled())
+    expect(onInputChange).not.toHaveBeenCalledWith("")
   })
 
   it("allows selected agent submissions without a local model", async () => {
@@ -180,6 +309,495 @@ describe("ChatInput", () => {
     )
 
     expect(await screen.findByLabelText("voiceInput.start")).toBeInTheDocument()
+  })
+
+  it("does not load or render voice controls when voice input is disabled", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+
+    await Promise.resolve()
+
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText("voiceInput.start")).not.toBeInTheDocument()
+  })
+
+  it("stops active recording without transcribing when voice input is disabled", async () => {
+    const trackStop = vi.fn()
+    const getUserMedia = vi.fn().mockResolvedValue({
+      getTracks: () => [{ stop: trackStop }],
+    })
+    const recorders: Array<{
+      state: "inactive" | "recording"
+      stop: ReturnType<typeof vi.fn>
+    }> = []
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+      ondataavailable: ((event: { data: Blob }) => void) | null = null
+      onstop: (() => void) | null = null
+      onerror: (() => void) | null = null
+      stop = vi.fn(() => {
+        this.state = "inactive"
+        this.ondataavailable?.({ data: new Blob(["audio"], { type: this.mimeType }) })
+        this.onstop?.()
+      })
+
+      constructor() {
+        recorders.push(this)
+      }
+
+      start() {
+        this.state = "recording"
+      }
+    }
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+    expect(recorders).toHaveLength(1)
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+
+    await waitFor(() => expect(recorders[0].stop).toHaveBeenCalledTimes(1))
+    expect(trackStop).toHaveBeenCalledTimes(1)
+    expect(
+      apiRequestMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/api/models/speech/transcribe"),
+      ),
+    ).toBe(false)
+  })
+
+  it("does not invalidate a committed recorder for an abandoned disabled render", async () => {
+    const trackStop = vi.fn()
+    const getUserMedia = vi.fn().mockResolvedValue({
+      getTracks: () => [{ stop: trackStop }],
+    })
+    const recorders: Array<{
+      state: "inactive" | "recording"
+      stop: ReturnType<typeof vi.fn>
+    }> = []
+    let suspendedRenderStarted = false
+    const neverResolves = new Promise<never>(() => undefined)
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+      ondataavailable: ((event: { data: Blob }) => void) | null = null
+      onstop: (() => void) | null = null
+      onerror: (() => void) | null = null
+      stop = vi.fn(() => {
+        this.state = "inactive"
+        this.ondataavailable?.({ data: new Blob(["audio"], { type: this.mimeType }) })
+        this.onstop?.()
+      })
+
+      constructor() {
+        recorders.push(this)
+      }
+
+      start() {
+        this.state = "recording"
+      }
+    }
+
+    const NeverSettles = () => {
+      suspendedRenderStarted = true
+      throw neverResolves
+    }
+    const VoiceInputHarness = ({
+      enabled,
+      suspend,
+    }: {
+      enabled: boolean
+      suspend: boolean
+    }) => (
+      <Suspense fallback={null}>
+        <ChatInput
+          hideConfig
+          hideFileUpload
+          inputValue=""
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          voiceInputEnabled={enabled}
+        />
+        {suspend && <NeverSettles />}
+      </Suspense>
+    )
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const container = document.createElement("div")
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    try {
+      await act(async () => {
+        root.render(<VoiceInputHarness enabled suspend={false} />)
+      })
+
+      fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+      await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+      expect(recorders).toHaveLength(1)
+
+      await act(async () => {
+        startTransition(() => {
+          root.render(<VoiceInputHarness enabled={false} suspend />)
+        })
+        await Promise.resolve()
+      })
+      expect(suspendedRenderStarted).toBe(true)
+
+      await act(async () => {
+        root.render(<VoiceInputHarness enabled suspend={false} />)
+      })
+
+      expect(
+        apiRequestMock.mock.calls.some(
+          ([url]) => typeof url === "string" && url.includes("/api/models/speech/transcribe"),
+        ),
+      ).toBe(false)
+      fireEvent.click(screen.getByLabelText("voiceInput.stop"))
+
+      await waitFor(() => expect(trackStop).toHaveBeenCalledTimes(1))
+    } finally {
+      await act(async () => {
+        root.unmount()
+      })
+      container.remove()
+    }
+  })
+
+  it("stops a stale media stream when voice capability is restored before getUserMedia resolves", async () => {
+    let resolveStream!: (stream: { getTracks: () => Array<{ stop: ReturnType<typeof vi.fn> }> }) => void
+    const staleTrackStop = vi.fn()
+    const staleStream = {
+      getTracks: () => [{ stop: staleTrackStop }],
+    }
+    const getUserMedia = vi.fn(() => new Promise<typeof staleStream>((resolve) => {
+      resolveStream = resolve
+    }))
+    const recorders: unknown[] = []
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+
+      constructor() {
+        recorders.push(this)
+      }
+
+      start() {
+        this.state = "recording"
+      }
+
+      stop() {
+        this.state = "inactive"
+      }
+    }
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    resolveStream(staleStream)
+
+    await waitFor(() => expect(staleTrackStop).toHaveBeenCalledTimes(1))
+    expect(recorders).toHaveLength(0)
+    expect(
+      apiRequestMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/api/models/speech/transcribe"),
+      ),
+    ).toBe(false)
+  })
+
+  it("does not apply a stale transcription after voice capability is restored", async () => {
+    let resolveTranscription!: (response: Response) => void
+    const transcription = new Promise<Response>((resolve) => {
+      resolveTranscription = resolve
+    })
+    const getUserMedia = vi.fn().mockResolvedValue({
+      getTracks: () => [{ stop: vi.fn() }],
+    })
+    const onInputChange = vi.fn()
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+      ondataavailable: ((event: { data: Blob }) => void) | null = null
+      onstop: (() => void) | null = null
+      onerror: (() => void) | null = null
+
+      start() {
+        this.state = "recording"
+      }
+
+      stop() {
+        this.state = "inactive"
+        this.ondataavailable?.({ data: new Blob(["audio"], { type: this.mimeType }) })
+        this.onstop?.()
+      }
+    }
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      if (url === "http://upload.local/api/models/speech/transcribe") {
+        return transcription
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+    const editor = screen.getByRole("textbox")
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn((_command: string, _showUi: boolean, value: string) => {
+        editor.appendChild(document.createTextNode(value))
+        return true
+      }),
+    })
+
+    fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+    fireEvent.click(screen.getByLabelText("voiceInput.stop"))
+    await waitFor(() => {
+      expect(
+        apiRequestMock.mock.calls.some(
+          ([url]) => url === "http://upload.local/api/models/speech/transcribe",
+        ),
+      ).toBe(true)
+    })
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    resolveTranscription(
+      new Response(JSON.stringify({ text: "stale transcription" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(editor).not.toHaveTextContent("stale transcription")
+    expect(onInputChange).not.toHaveBeenCalledWith("stale transcription")
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("does not restore stale ASR availability after voice input is disabled", async () => {
+    let resolveInitialModels!: (models: Array<{ abilities: string[] }>) => void
+    const initialModels = new Promise<Array<{ abilities: string[] }>>((resolve) => {
+      resolveInitialModels = resolve
+    })
+    let availabilityRequests = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url !== "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(emptyJsonResponse())
+      }
+      availabilityRequests += 1
+      return availabilityRequests === 1
+        ? { ok: true, json: () => initialModels }
+        : new Promise<Response>(() => undefined)
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+    await waitFor(() => expect(availabilityRequests).toBe(1))
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+    resolveInitialModels([{ abilities: ["asr"] }])
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    expect(screen.queryByLabelText("voiceInput.start")).not.toBeInTheDocument()
   })
 
   it("allows live guidance while a task is running", async () => {

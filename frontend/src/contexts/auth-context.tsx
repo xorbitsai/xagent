@@ -1,365 +1,198 @@
 "use client"
 
-import React, { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react"
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
+import { toast } from "@/components/ui/sonner"
+import { useI18n } from "@/contexts/i18n-context"
+import { authMutationUnavailableTranslationKey } from "@/lib/auth-pages"
 import {
-  AUTH_CACHE_DURATION_MS,
-  AUTH_CACHE_KEY,
-  AUTH_TOKEN_UPDATED_EVENT,
-  AuthCache,
-  AuthCacheUser,
-  clearStoredAuth,
-  LEGACY_AUTH_TOKEN_KEY,
-  LEGACY_AUTH_USER_KEY,
-  readAuthCache,
-  writeAuthCache,
+  AUTH_CACHE_DURATION_MS, AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT,
+  type AuthCacheUser, type AuthSessionProjection, type AuthSessionSnapshot,
+  clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
+  claimAuthLoginIntent, createAuthSession, inspectAuthSession, migrateLegacyAuthSession,
 } from "@/lib/auth-cache"
 
-type User = AuthCacheUser
-
 type TeamRole = "admin" | "member" | null
-
-function isAuthCacheEventPayload(value: unknown): value is AuthCache {
-  if (typeof value !== "object" || value === null) return false
-
-  const candidate = value as Partial<AuthCache>
-  return (
-    typeof candidate.user === "object" &&
-    candidate.user !== null &&
-    typeof candidate.token === "string"
-  )
-}
-
 interface AuthContextType {
-  user: User | null
-  isAuthenticated: boolean
-  token: string | null
-  refreshToken: string | null
-  isLoading: boolean
-  // SaaS team context; on standard xagent (no teams / my-team 404) inTeam=false, teamRole=null.
-  inTeam: boolean
-  teamRole: TeamRole
+  user: AuthCacheUser | null; isAuthenticated: boolean; token: string | null; refreshToken: string | null
+  session: AuthSessionSnapshot; isLoading: boolean; inTeam: boolean; teamRole: TeamRole
   login: (username: string, password: string) => Promise<boolean>
-  logout: () => void
+  logout: () => Promise<boolean>
   checkAuth: () => Promise<boolean>
-  refreshAccessToken: () => Promise<boolean>
+  refreshAccessToken: (expectedSession?: AuthSessionSnapshot) => Promise<boolean>
 }
-
+const EMPTY_SESSION: AuthSessionSnapshot = { sessionId: null, credentialRevision: null, profileRevision: null, userId: null, accessToken: null, refreshToken: null, profileFingerprint: null }
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
+const ANONYMOUS_AUTH_CONTEXT: AuthContextType = {
+  user: null, isAuthenticated: false, token: null, refreshToken: null, session: EMPTY_SESSION,
+  isLoading: false, inTeam: false, teamRole: null,
+  login: async () => false, logout: async () => false, checkAuth: async () => false, refreshAccessToken: async () => false,
+}
+const AUTH_REFRESH_UNAVAILABLE_TOAST_ID = "auth-refresh-unavailable"
+function currentProjection(): AuthSessionProjection | null {
+  const inspection = inspectAuthSession()
+  return inspection.status === "valid" ? inspection.projection : null
+}
+function isCurrentCredentialLineage(current: AuthSessionProjection | null, captured: AuthSessionSnapshot): boolean {
+  return current?.snapshot.sessionId === captured.sessionId
+    && current.snapshot.credentialRevision === captured.credentialRevision
+    && current.snapshot.accessToken === captured.accessToken
+    && current.snapshot.refreshToken === captured.refreshToken
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null)
-  const [token, setToken] = useState<string | null>(null)
-  const [refreshToken, setRefreshToken] = useState<string | null>(null)
+  const { t } = useI18n()
+  const [projection, setProjection] = useState<AuthSessionProjection | null>(() => currentProjection())
   const [isLoading, setIsLoading] = useState(true)
-  const [lastCheckTime, setLastCheckTime] = useState(0)
+  const [lastCheck, setLastCheck] = useState<{ key: string | null; at: number }>({ key: null, at: 0 })
   const [inTeam, setInTeam] = useState(false)
   const [teamRole, setTeamRole] = useState<TeamRole>(null)
-  const refreshAccessTokenRef = useRef<(
-    expectedAccessToken?: string | null,
-    expectedUserId?: string | null
-  ) => Promise<boolean>>(
-    async () => false
-  )
+  const mountedRef = useRef(true)
+  const initializationRef = useRef(0)
+  const operationRef = useRef(0)
+  const refreshRef = useRef<(session?: AuthSessionSnapshot) => Promise<boolean>>(async () => false)
+  const sync = useCallback(() => { if (mountedRef.current) setProjection(currentProjection()) }, [])
+  const session = projection?.snapshot ?? EMPTY_SESSION
+  const user = projection?.cache.user ?? null
+  const token = session.accessToken
+  const refreshToken = session.refreshToken
 
-  // Timer for active token refresh
   useEffect(() => {
-    if (!token || !refreshToken) return
-
-    const refreshInterval = setInterval(async () => {
-      const cache = readAuthCache()
-      if (!cache) return
-
-      if (cache.expiresAt) {
-        const now = Date.now()
-        const timeUntilExpiry = cache.expiresAt - now
-        const shouldRefresh = timeUntilExpiry < 5 * 60 * 1000 // Refresh 5 minutes in advance
-
-        if (shouldRefresh) {
-          console.log("Token is about to expire, refreshing actively...")
-          await refreshAccessTokenRef.current(cache.token, cache.user?.id || null)
-        }
-      } else {
-        const timeSinceCreation = Date.now() - cache.timestamp
-        const shouldRefreshAccess = timeSinceCreation > (AUTH_CACHE_DURATION_MS - 5 * 60 * 1000)
-        const timeUntilRefreshExpiry = cache.refreshExpiresAt
-          ? cache.refreshExpiresAt - Date.now()
-          : Number.POSITIVE_INFINITY
-        const shouldRefreshToken = timeUntilRefreshExpiry < 5 * 60 * 1000
-        const shouldRefresh = shouldRefreshAccess || shouldRefreshToken
-
-        if (shouldRefresh) {
-          console.log("Token cache is missing access expiry info, refreshing actively...")
-          await refreshAccessTokenRef.current(cache.token, cache.user?.id || null)
-        }
-      }
-    }, 60000) // Check every minute
-
-    return () => clearInterval(refreshInterval)
-  }, [token, refreshToken])
-
-  // Check cache on initialization
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      // Try new cache format first
-      const cache = readAuthCache()
-      if (cache && cache.user && cache.token) {
-        setUser(cache.user)
-        setToken(cache.token)
-        setRefreshToken(cache.refreshToken)
-      } else {
-        // Fall back to old format for backward compatibility
-        const savedToken = localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)
-        const savedUser = localStorage.getItem(LEGACY_AUTH_USER_KEY)
-
-        if (savedToken && savedUser) {
-          try {
-            const userData = JSON.parse(savedUser)
-            setToken(savedToken)
-            setUser(userData)
-
-            // Migrate to new cache format
-            writeAuthCache(userData, savedToken)
-          } catch (error) {
-            console.error("Failed to parse saved user data:", error)
-            clearStoredAuth()
-          }
-        }
-      }
-      setIsLoading(false)
-    }, 100)
-
-    return () => clearTimeout(timer)
-  }, [])
-
-  // Listen for same-tab refresh events and native cross-tab storage events.
-  useEffect(() => {
-    const handleTokenUpdate = (event: Event) => {
-      const storageEvent = event as StorageEvent
-      if (storageEvent.key !== AUTH_CACHE_KEY) return
-
-      if (!storageEvent.newValue) {
-        setUser(null)
-        setToken(null)
-        setRefreshToken(null)
-        return
-      }
-
-      if (storageEvent.newValue) {
-        try {
-          const cache: unknown = JSON.parse(storageEvent.newValue)
-          if (isAuthCacheEventPayload(cache)) {
-            setUser(cache.user)
-            setToken(cache.token)
-            setRefreshToken(cache.refreshToken)
-          }
-        } catch (error) {
-          console.error("Failed to parse updated auth cache:", error)
-        }
-      }
-    }
-
-    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
-    window.addEventListener("storage", handleTokenUpdate)
-    return () => {
-      window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, handleTokenUpdate)
-      window.removeEventListener("storage", handleTokenUpdate)
-    }
-  }, [])
-
-  // Resolve SaaS team role once we have a session. my-team 404 / any failure =>
-  // standard xagent with no team concept; keep inTeam=false, teamRole=null.
-  useEffect(() => {
-    // Reset first so a token change / failed or non-team response never leaves
-    // a previous user's team context behind.
-    setInTeam(false)
-    setTeamRole(null)
-    if (!token) {
-      return
-    }
-    let active = true
-    ;(async () => {
-      try {
-        const res = await apiRequest(`${getApiUrl()}/api/teams/my-team`)
-        if (!active || !res.ok) return
-        const team = await res.json()
-        if (!active) return
-        setInTeam(true)
-        setTeamRole(team?.team_role === "admin" ? "admin" : "member")
-      } catch {
-        // no team context; keep defaults
+    mountedRef.current = true
+    const initialization = ++initializationRef.current
+    void (async () => {
+      await migrateLegacyAuthSession()
+      if (mountedRef.current && initialization === initializationRef.current) {
+        sync(); setIsLoading(false)
       }
     })()
-    return () => {
-      active = false
+    return () => { mountedRef.current = false; initializationRef.current += 1 }
+  }, [sync])
+  useEffect(() => {
+    const handler = (event: Event) => {
+      if (event.type === AUTH_TOKEN_UPDATED_EVENT || (event as StorageEvent).key === AUTH_CACHE_KEY) sync()
     }
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, handler); window.addEventListener("storage", handler)
+    return () => { window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, handler); window.removeEventListener("storage", handler) }
+  }, [sync])
+  useEffect(() => {
+    setInTeam(false); setTeamRole(null)
+    if (!token) return
+    let active = true
+    void (async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/teams/my-team`)
+        if (!active || !response.ok) return
+        const team = await response.json()
+        if (active) { setInTeam(true); setTeamRole(team?.team_role === "admin" ? "admin" : "member") }
+      } catch { /* no team context */ }
+    })()
+    return () => { active = false }
   }, [token])
+  useEffect(() => {
+    if (!projection || !session.refreshToken) return
+    const interval = setInterval(() => {
+      const current = currentProjection()
+      if (!current || current.snapshot.sessionId !== session.sessionId) return
+      const cache = current.cache
+      const deadline = Math.min(cache.expiresAt ?? cache.timestamp + AUTH_CACHE_DURATION_MS, cache.refreshExpiresAt ?? Number.POSITIVE_INFINITY)
+      if (deadline - Date.now() < 5 * 60 * 1000) void refreshRef.current(current.snapshot)
+    }, 60_000)
+    return () => clearInterval(interval)
+  }, [projection, session.sessionId, session.refreshToken])
 
-  const login = async (username: string, password: string): Promise<boolean> => {
+  const login = useCallback(async (username: string, password: string) => {
+    const operation = ++operationRef.current
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/auth/login`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ username, password }),
-      })
-
-      if (response.ok) {
-        const data = await response.json()
-        const userData = {
-          id: data.user.id,
-          username: data.user.username,
-          email: data.user.email,
-          is_admin: data.user.is_admin
-        }
-
-        setToken(data.access_token)
-        setRefreshToken(data.refresh_token)
-        setUser(userData)
-
-        // Update cache
-        writeAuthCache(
-          userData,
-          data.access_token,
-          data.refresh_token,
-          data.expires_in ? data.expires_in : undefined,
-          data.refresh_expires_in ? data.refresh_expires_in : undefined
-        )
-
-        return true
-      }
-      return false
-    } catch (error) {
-      console.error("Login error:", error)
-      return false
-    }
-  }
-
-  const logout = () => {
-    setUser(null)
-    setToken(null)
-    setRefreshToken(null)
-    clearStoredAuth()
-    window.location.href = "/login"
-  }
-
-  const checkAuth = async (): Promise<boolean> => {
-    if (!token || !user) return false
-
-    // Debounce: if interval since last check is too short, return true directly
-    const now = Date.now()
-    if (now - lastCheckTime < 15000) { // Do not check repeatedly within 15 seconds to reduce server load
+      const claimed = await claimAuthLoginIntent()
+      if (claimed.status !== "claimed") return false
+      const response = await apiRequest(`${getApiUrl()}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) })
+      if (!response.ok) return false
+      const payload = await response.json()
+      if (!mountedRef.current || operation !== operationRef.current) return false
+      const created = await createAuthSession(payload, claimed.intent)
+      if (created.status !== "created") return false
+      if (mountedRef.current && operation === operationRef.current) setProjection(created.projection)
       return true
+    } catch (error) { console.error("Login error:", error); return false }
+  }, [])
+  const logout = useCallback(async () => {
+    ++operationRef.current
+    const result = await clearStoredAuth()
+    if (result.credentialsCleared && mountedRef.current) setProjection(null)
+    if (result.status !== "cleared") return false
+    window.location.href = "/login"
+    return true
+  }, [])
+  const checkAuth = useCallback(async () => {
+    const captured = projection?.snapshot
+    const beforeInspection = inspectAuthSession()
+    const before = beforeInspection.status === "valid" ? beforeInspection.projection : null
+    sync()
+    const comparison = captured ? compareAuthSession(captured, beforeInspection) : null
+    if (!captured || !before || !comparison || (comparison.status !== "exact" && comparison.status !== "profile_advanced")) {
+      return Boolean(before?.snapshot.accessToken)
     }
-
+    const key = `${before.snapshot.sessionId}:${before.snapshot.credentialRevision}`
+    const now = Date.now()
+    if (lastCheck.key === key && now - lastCheck.at < 15_000) return true
+    const operation = ++operationRef.current
     try {
-      // Use new verify endpoint to check token validity
-      const response = await apiRequest(`${getApiUrl()}/api/auth/verify`, {
-        headers: {
-          "X-Username": user.username,
-        },
-      })
-
-      setLastCheckTime(now)
-
-      if (!response.ok) {
-        // apiRequest has automatically handled token refresh, if it still fails, it means there is an authentication problem
-        if (response.status === 401) {
-          // Check if it is explicitly an invalid token (not expired)
-          const errorType = response.headers.get("Error-Type")
-          const isInvalid = errorType === "InvalidToken"
-
-          if (isInvalid) {
-            // Explicitly invalid token, clear state
-            logout()
-            return false
-          }
-
-          // A rejected refresh clears the shared cache in apiRequest. A
-          // temporary refresh outage leaves it intact so the next check can
-          // retry without ejecting the user from the app.
-          if (!readAuthCache()) {
-            setUser(null)
-            setToken(null)
-            setRefreshToken(null)
-            return false
-          }
-          return true
-        }
-        // Network or server errors must not turn a temporary outage into logout.
-        return true
+      const response = await apiRequest(`${getApiUrl()}/api/auth/verify`, { headers: { "X-Username": before.cache.user.username } })
+      const current = currentProjection()
+      if (mountedRef.current && operation === operationRef.current) { setProjection(current); setLastCheck({ key, at: now }) }
+      if (!current) return false
+      if (current.snapshot.sessionId !== captured.sessionId) return Boolean(current.snapshot.accessToken)
+      if (!response.ok && response.status === 401 && response.headers.get("Error-Type") === "InvalidToken") {
+        const cleared = await clearAuthSessionIfCurrent(captured)
+        const after = currentProjection()
+        if (mountedRef.current && operation === operationRef.current) setProjection(after)
+        return cleared.status !== "cleared" && Boolean(after?.snapshot.accessToken)
       }
-
-      const data = await response.json()
-      if (data.success === true) {
-        // Auth success, sync update state (because apiRequest may have updated cache)
-        const updatedCache = readAuthCache()
-        if (updatedCache && updatedCache.token && updatedCache.user) {
-          setToken(updatedCache.token)
-          setUser(updatedCache.user)
-          setRefreshToken(updatedCache.refreshToken)
-        }
-        return true
-      }
-
-      return false
+      return Boolean(current.snapshot.accessToken)
     } catch (error) {
       console.error("Auth check error:", error)
-      // Network error, keep current state
-      return true
+      const current = currentProjection()
+      if (mountedRef.current && operation === operationRef.current) setProjection(current)
+      return Boolean(current?.snapshot.accessToken)
     }
-  }
-
-  const refreshAccessToken = async (
-    expectedAccessToken?: string | null,
-    expectedUserId?: string | null
-  ): Promise<boolean> => {
-    const cache = readAuthCache()
-    const result = await refreshStoredAccessToken(
-      expectedAccessToken === undefined ? cache?.token || null : expectedAccessToken,
-      expectedUserId === undefined ? cache?.user?.id || null : expectedUserId
-    )
-    if (result.accessToken !== null) {
-      const updatedCache = readAuthCache()
-      if (updatedCache?.user && updatedCache.token) {
-        setUser(updatedCache.user)
-        setToken(updatedCache.token)
-        setRefreshToken(updatedCache.refreshToken)
-      }
-      return true
+  }, [lastCheck, projection, sync])
+  const refreshAccessToken = useCallback(async (expected = projection?.snapshot ?? EMPTY_SESSION) => {
+    const operation = ++operationRef.current
+    const result = await refreshStoredAccessToken(expected)
+    const current = currentProjection()
+    if (mountedRef.current && operation === operationRef.current) setProjection(current)
+    switch (result.status) {
+      case "refreshed":
+      case "advanced":
+        return Boolean(current && current.snapshot.sessionId === expected.sessionId && current.snapshot.accessToken === result.accessToken)
+      case "rejected":
+        await clearAuthSessionIfCurrent(expected)
+        break
+      case "unavailable":
+        if (mountedRef.current && operation === operationRef.current && isCurrentCredentialLineage(current, expected)) {
+          toast.error(t(authMutationUnavailableTranslationKey(result.reason)), { id: AUTH_REFRESH_UNAVAILABLE_TOAST_ID })
+        }
+        break
+      case "not_current":
+      case "invalid_response":
+      case "transport_failed":
+        break
     }
-
-    if (result.rejected) {
-      logout()
-    }
+    const after = currentProjection()
+    if (mountedRef.current && operation === operationRef.current) setProjection(after)
     return false
-  }
-
-  refreshAccessTokenRef.current = refreshAccessToken
-
-  const value: AuthContextType = {
-    user,
-    isAuthenticated: !!user && !!token,
-    token,
-    refreshToken,
-    isLoading,
-    inTeam,
-    teamRole,
-    login,
-    logout,
-    checkAuth,
-    refreshAccessToken,
-  }
-
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
+  }, [projection, t])
+  refreshRef.current = refreshAccessToken
+  return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}</AuthContext.Provider>
 }
-
+/** Provides a stable anonymous projection for public routes without reading browser auth state. */
+export function AnonymousAuthProvider({ children }: { children: ReactNode }) {
+  return <AuthContext.Provider value={ANONYMOUS_AUTH_CONTEXT}>{children}</AuthContext.Provider>
+}
 export function useAuth() {
   const context = useContext(AuthContext)
-  if (context === undefined) {
-    throw new Error("useAuth must be used within an AuthProvider")
-  }
+  if (!context) throw new Error("useAuth must be used within an AuthProvider")
   return context
 }

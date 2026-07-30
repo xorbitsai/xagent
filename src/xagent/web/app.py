@@ -18,9 +18,11 @@ from ..config import (
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
+    get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
+    get_taskless_upload_ttl_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -67,6 +69,11 @@ from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.orphan_upload_gc import run_orphan_upload_gc_loop
+from .services.skill_runtime import (
+    SkillRuntimeSessionBoundaryError,
+    skill_runtime_session_boundary_error_handler,
+)
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
@@ -455,6 +462,76 @@ async def stop_uploaded_file_recovery_task(app_instance: FastAPI) -> None:
             )
 
 
+def start_orphan_upload_gc_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the orphan task-less-upload GC loop for this process (#973).
+
+    Runs in-app (like the uploaded-file recovery loop) so every supported
+    deployment reaps abandoned task-less public uploads — the GC must not
+    depend on an optional Celery worker while Gunicorn-only deployments keep
+    accepting task-less uploads.
+    """
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "orphan_upload_gc_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error(
+                "Previous orphan upload GC loop failed",
+                exc_info=failure,
+            )
+        app_instance.state.orphan_upload_gc_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping orphan upload GC loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_orphan_upload_sweep_interval_seconds()
+    ttl_seconds = get_taskless_upload_ttl_seconds()
+    task = asyncio.create_task(
+        run_orphan_upload_gc_loop(
+            poll_interval_seconds=poll_interval_seconds,
+            ttl_seconds=ttl_seconds,
+        )
+    )
+    app_instance.state.orphan_upload_gc_task = task
+    logger.info(
+        "Started orphan upload GC loop (interval=%ss, ttl=%ss)",
+        poll_interval_seconds,
+        ttl_seconds,
+    )
+    return task
+
+
+async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's orphan upload GC loop."""
+
+    task = getattr(app_instance.state, "orphan_upload_gc_task", None)
+    app_instance.state.orphan_upload_gc_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling orphan upload GC loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Orphan upload GC loop stopped after failure",
+                exc_info=exc,
+            )
+
+
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
     """Wait until durable file storage startup sync has completed successfully."""
     while True:
@@ -731,6 +808,10 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
 # See web/api/v1/errors.py for the contract.
 app.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 app.add_exception_handler(A2AApiError, a2a_api_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(
+    SkillRuntimeSessionBoundaryError,
+    cast(Any, skill_runtime_session_boundary_error_handler),
+)
 
 
 # Add CORS middleware
@@ -812,6 +893,7 @@ async def startup_event() -> None:
     start_trigger_dispatcher_task(app)
     start_task_lease_recovery_task(app)
     start_uploaded_file_recovery_task(app)
+    start_orphan_upload_gc_task(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) are preferred
     # over the embedder's resolver during per-task scope resolution.
@@ -1298,6 +1380,7 @@ async def shutdown_event() -> None:
         await stop_task_command_dispatcher()
     _task_command_dispatcher_task = None
 
+    await stop_orphan_upload_gc_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -72,14 +73,33 @@ class SnapshotRefreshingToolConfig(AllowedToolsConfig):
     def __init__(self) -> None:
         super().__init__()
         self.snapshot_prepared = False
-        self.release_count = 0
+        self.handoff_count = 0
 
     async def refresh_runtime_policy(self) -> None:
         self.snapshot_prepared = True
 
-    def release_prepared_factory_runtime(self) -> None:
+    def handoff_factory_runtime(self) -> None:
         self.snapshot_prepared = False
-        self.release_count += 1
+        self.handoff_count += 1
+
+
+class PrebuiltHandoffConfig(AllowedToolsConfig):
+    def __init__(self) -> None:
+        super().__init__()
+        self.handed_off = False
+        self.handoff_count = 0
+
+    def handoff_factory_runtime(self) -> None:
+        self.handed_off = True
+        self.handoff_count += 1
+
+    def get_allowed_skills(self) -> list[str] | None:
+        assert self.handed_off, "prebuilt config getter ran before verified handoff"
+        return None
+
+    def get_skill_scope_context(self) -> None:
+        assert self.handed_off, "prebuilt config getter ran before verified handoff"
+        return None
 
 
 class DelegationRuntimeConfig:
@@ -183,7 +203,7 @@ async def test_agent_service_awaits_async_runtime_policy_refresh(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_unchanged_policy_releases_prepared_factory_snapshot(
+async def test_unchanged_policy_handoffs_prepared_factory_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool_config = SnapshotRefreshingToolConfig()
@@ -202,12 +222,187 @@ async def test_unchanged_policy_releases_prepared_factory_snapshot(
         tool_config=tool_config,
         enable_workspace=False,
     )
+    tool_config.handoff_count = 0
 
     await service._ensure_tools_initialized()
 
-    assert tool_config.release_count == 1
+    assert tool_config.handoff_count == 1
     assert not tool_config.snapshot_prepared
     assert [tool.name for tool in service.tools] == ["existing"]
+
+
+def test_prebuilt_config_handoffs_before_agent_service_getters() -> None:
+    tool_config = PrebuiltHandoffConfig()
+
+    AgentService(
+        name="prebuilt-handoff-test",
+        id="prebuilt-handoff-test",
+        tools=[NamedTool("existing")],
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    assert tool_config.handoff_count == 1
+
+
+@pytest.mark.asyncio
+async def test_real_web_config_prebuilt_and_cache_hit_detach_resources(
+    monkeypatch, tmp_path
+) -> None:
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import QueuePool
+
+    from xagent.web.models.tool_config import ToolConfig
+    from xagent.web.tools.config import WebToolConfig
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'agent-prebuilt-handoff.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    live_db = factory()
+    request = SimpleNamespace(user=object())
+    config = WebToolConfig(
+        db=live_db,
+        db_factory=factory,
+        request=request,
+        user=request.user,
+        user_id=1,
+    )
+    handoff_calls = 0
+    real_handoff = WebToolConfig.handoff_factory_runtime
+
+    def count_handoff(self):
+        nonlocal handoff_calls
+        handoff_calls += 1
+        real_handoff(self)
+
+    monkeypatch.setattr(WebToolConfig, "handoff_factory_runtime", count_handoff)
+    try:
+        live_db.query(ToolConfig).all()
+        assert engine.pool.checkedout() == 1
+
+        service = AgentService(
+            name="real-prebuilt-handoff-test",
+            id="real-prebuilt-handoff-test",
+            tools=[NamedTool("existing")],
+            tool_config=config,
+            enable_workspace=False,
+        )
+        assert handoff_calls == 1
+        assert engine.pool.checkedout() == 0
+        assert config._live_db is None
+        assert config.request is None
+        assert config._user is None
+
+        handoff_calls = 0
+        await service._ensure_tools_initialized()
+
+        assert handoff_calls == 1
+        assert engine.pool.checkedout() == 0
+        assert config._live_db is None
+        assert config._lazy_db is None
+        assert config.request is None
+        assert config._user is None
+    finally:
+        live_db.close()
+        config.close()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_lazy", [False, True])
+async def test_real_web_config_cache_hit_handoffs_reacquired_lazy_session(
+    monkeypatch, tmp_path, pending_lazy
+) -> None:
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import QueuePool
+
+    from xagent.core.tools.adapters.vibe.config import (
+        ToolFactoryRuntimeSessionBoundaryError,
+    )
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+    from xagent.web.models.tool_config import ToolConfig
+    from xagent.web.models.user import User
+    from xagent.web.tools.config import WebToolConfig
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / f'cache-hit-lazy-{pending_lazy}.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    User.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    config = WebToolConfig(db=None, db_factory=factory, request=None, user_id=1)
+
+    async def refresh_with_lazy_checkout():
+        config.db.query(ToolConfig).all()
+        assert engine.pool.checkedout() == 1
+        if pending_lazy:
+            config.db.add(
+                User(username="cache-hit-pending", password_hash="hash", is_admin=False)
+            )
+
+    async def unexpected_rebuild(_config):
+        raise AssertionError("cache hit must not rebuild tools")
+
+    config.refresh_runtime_policy = refresh_with_lazy_checkout
+    monkeypatch.setattr(ToolFactory, "create_all_tools", unexpected_rebuild)
+    service = AgentService(
+        name="real-cache-hit-lazy-test",
+        id=f"real-cache-hit-lazy-{pending_lazy}",
+        tools=[NamedTool("existing")],
+        tool_config=config,
+        enable_workspace=False,
+    )
+    try:
+        if pending_lazy:
+            with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+                await service._ensure_tools_initialized()
+        else:
+            await service._ensure_tools_initialized()
+
+        assert config._lazy_db is None
+        assert engine.pool.checkedout() == 0
+    finally:
+        config.close()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_uses_legacy_snapshot_release_fallback() -> None:
+    class LegacyOnlyConfig(AllowedToolsConfig):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_count = 0
+
+        async def refresh_runtime_policy(self) -> None:
+            return None
+
+        def release_prepared_factory_runtime(self) -> None:
+            self.release_count += 1
+
+    config = LegacyOnlyConfig()
+    service = AgentService(
+        name="legacy-cache-hit-test",
+        id="legacy-cache-hit-test",
+        tools=[NamedTool("existing")],
+        tool_config=config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+
+    assert config.release_count == 1
 
 
 @pytest.mark.asyncio

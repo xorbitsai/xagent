@@ -600,15 +600,23 @@ jobs:
       - name: Verify Docker
         run: docker version
 
-      - name: Pull MinIO image
-        # Use Docker Hub (minio/minio) — more reliable than quay.io which
-        # intermittently returns 504. Retry up to 3 times; fail the step if
-        # all attempts fail so the image-not-found error surfaces here rather
-        # than as a confusing Docker daemon error inside the e2e fixture.
+      - name: Pull e2e service images
+        # Retry service images before pytest so registry failures surface here
+        # instead of as confusing Docker daemon errors inside e2e fixtures.
         run: |
-          for i in 1 2 3; do
-            docker pull minio/minio && break
-            [ "$i" -lt 3 ] && echo "Attempt $i failed, retrying in 15s..." && sleep 15 || exit 1
+          for image in minio/minio postgres:16-bookworm; do
+            pulled=false
+            for i in 1 2 3; do
+              if docker pull "$image"; then
+                pulled=true
+                break
+              fi
+              if [ "$i" -lt 3 ]; then
+                echo "Pull attempt $i for $image failed; retrying in 15s..."
+                sleep 15
+              fi
+            done
+            [ "$pulled" = true ] || exit 1
           done
 
       - name: Run e2e tests
@@ -647,11 +655,9 @@ jobs:
         working-directory: ./frontend
         run: npm run test:widget:coverage
 
-      # The widget step above runs a hardcoded two-file list, so page-level
-      # component tests (e.g. src/components/pages/knowledge-base.test.tsx)
-      # never executed in CI and could break silently. This step uses the
-      # default vitest config scoped to the pages directory, so new test files
-      # added there are picked up automatically.
+      # The widget lane above is an explicit regression suite for the widget,
+      # Session, and browser-auth contracts. Keep this broader page-directory
+      # suite so unrelated page components are still discovered automatically.
       # TODO: widen this to the full `npm run test:run` suite once the known
       # failures in src/components/kb/knowledge-base-creation-dialog.test.tsx,
       # src/components/kb/knowledge-base-detail.component.test.tsx and

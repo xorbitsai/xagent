@@ -7,12 +7,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRef,
+    ConnectorRuntimeError,
+)
 from xagent.web.models import Agent, Base, MCPServer, Task, User, UserMCPServer
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import connector_runtime as connector_runtime_service
+from xagent.web.services import connector_team_scope
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     bind_connector_runtime_selection_snapshot,
@@ -252,6 +256,326 @@ def test_selection_snapshot_scopes_custom_api_by_source_server_name(
         "connector_type": "custom_api",
         "connector_id": int(unselected_api.id),
     } not in (task.connector_runtime_selected_refs or [])
+
+
+def test_selected_connector_resolver_returns_selected_mcp_without_runtime_declaration(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="OAuth Connector Agent",
+        description="shared",
+        instructions="Use the selected connector.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    server = _create_runtime_mcp(db_session, user, "oauth-only")
+    server.runtime_input_schema = None
+    server.runtime_bindings = None
+    db_session.flush()
+
+    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    ref = ConnectorRef("mcp", int(server.id))
+    assert list(resolved) == [ref]
+    assert resolved[ref] is server
+
+
+@pytest.mark.parametrize(
+    ("tool_categories", "selects_all"),
+    [
+        (None, True),
+        ([], False),
+    ],
+)
+def test_selected_connector_resolver_honors_all_and_none_sentinels(
+    db_session: Session,
+    tool_categories: list[str] | None,
+    selects_all: bool,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Sentinel Connector Agent",
+        description="shared",
+        instructions="Use selected connectors.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=tool_categories,
+    )
+    db_session.add(agent)
+    db_session.flush()
+    mcp_server = _create_runtime_mcp(db_session, user, "Records")
+    custom_api = _create_runtime_custom_api(db_session, user, "Records")
+
+    db_session.expire(agent, ["tool_categories"])
+    assert agent.tool_categories == tool_categories
+
+    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    expected = (
+        [
+            ConnectorRef("custom_api", int(custom_api.id)),
+            ConnectorRef("mcp", int(mcp_server.id)),
+        ]
+        if selects_all
+        else []
+    )
+    assert list(resolved) == expected
+
+
+def test_selected_connector_resolver_includes_owner_and_team_visible_connectors_only(
+    db_session: Session,
+) -> None:
+    viewer = _create_user(db_session, "viewer")
+    other_user = _create_user(db_session, "other-user")
+    hidden_user = _create_user(db_session, "hidden-user")
+    agent = Agent(
+        user_id=viewer.id,
+        name="Scoped Connector Agent",
+        description="shared",
+        instructions="Use selected tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp: Team Records"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    team_server = _create_runtime_mcp(db_session, other_user, "Team Records")
+    owner_server = _create_runtime_mcp(db_session, viewer, "team-records")
+    hidden_server = _create_runtime_mcp(db_session, hidden_user, "TEAM_records")
+    unselected_server = _create_runtime_mcp(db_session, viewer, "Billing")
+
+    connector_team_scope.set_connector_team_hooks(
+        visibility=lambda db, user_id: {
+            "mcp": {int(team_server.id)} if user_id == int(viewer.id) else set(),
+            "custom_api": set(),
+        }
+    )
+    try:
+        resolved = connector_runtime_service.resolve_agent_selected_connectors(
+            db=db_session,
+            agent=agent,
+            connector_user_id=int(viewer.id),
+        )
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+    owner_ref = ConnectorRef("mcp", int(owner_server.id))
+    team_ref = ConnectorRef("mcp", int(team_server.id))
+    assert list(resolved) == [team_ref, owner_ref]
+    assert ConnectorRef("mcp", int(hidden_server.id)) not in resolved
+    assert ConnectorRef("mcp", int(unselected_server.id)) not in resolved
+
+
+def test_selected_connector_resolver_skips_name_normalization_without_server_scope(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Unscoped Connector Agent",
+        description="shared",
+        instructions="Use MCP tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    selected_mcp = _create_runtime_mcp(db_session, user, "Records")
+    _create_runtime_custom_api(db_session, user, "Billing")
+
+    normalization_calls: list[str] = []
+    normalize_name = connector_runtime_service.normalize_mcp_server_name
+
+    def record_normalization(name: str) -> str:
+        normalization_calls.append(name)
+        return normalize_name(name)
+
+    monkeypatch.setattr(
+        connector_runtime_service,
+        "normalize_mcp_server_name",
+        record_normalization,
+    )
+
+    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    assert list(resolved) == [ConnectorRef("mcp", int(selected_mcp.id))]
+    assert normalization_calls == []
+
+
+def test_selected_connector_resolver_normalizes_names_and_orders_refs(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Normalized Connector Agent",
+        description="shared",
+        instructions="Use selected tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp: Google Drive"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    mcp_server = _create_runtime_mcp(db_session, user, "Google-Drive")
+    custom_api = _create_runtime_custom_api(db_session, user, "google drive")
+
+    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    assert list(resolved) == [
+        ConnectorRef("custom_api", int(custom_api.id)),
+        ConnectorRef("mcp", int(mcp_server.id)),
+    ]
+
+
+def test_create_plan_preserves_canonical_cross_type_connector_order(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Ordered Connector Agent",
+        description="shared",
+        instructions="Use selected tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp: Records"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    selected_mcp = _create_runtime_mcp(db_session, user, "Records")
+    selected_api = _create_runtime_custom_api(db_session, user, "records")
+    unselected_mcp = _create_runtime_mcp(db_session, user, "Billing")
+
+    plan = prepare_create_connector_runtime(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+        task_source="sdk",
+        payload_items=None,
+    )
+
+    assert plan.selected_refs == (
+        ConnectorRef("custom_api", int(selected_api.id)),
+        ConnectorRef("mcp", int(selected_mcp.id)),
+    )
+    assert ConnectorRef("mcp", int(unselected_mcp.id)) not in plan.selected_refs
+
+
+def test_selection_snapshot_uses_public_resolver_and_filters_runtime_declarations(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Snapshot Connector Agent",
+        description="shared",
+        instructions="Use selected tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    declared = _create_runtime_mcp(db_session, user, "declared")
+    undeclared = _create_runtime_mcp(db_session, user, "undeclared")
+    undeclared.runtime_input_schema = None
+    undeclared.runtime_bindings = None
+    db_session.flush()
+    calls = []
+
+    def resolve_selected(**kwargs):
+        calls.append(kwargs)
+        return {
+            ConnectorRef("mcp", int(declared.id)): declared,
+            ConnectorRef("mcp", int(undeclared.id)): undeclared,
+        }
+
+    monkeypatch.setattr(
+        connector_runtime_service,
+        "resolve_agent_selected_connectors",
+        resolve_selected,
+    )
+
+    selected_refs = prepare_connector_runtime_selection_snapshot(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    assert selected_refs == (ConnectorRef("mcp", int(declared.id)),)
+    assert calls == [
+        {
+            "db": db_session,
+            "agent": agent,
+            "connector_user_id": int(user.id),
+        }
+    ]
+
+
+def test_create_plan_rejects_undeclared_selected_connector_payload(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Runtime Declaration Agent",
+        description="shared",
+        instructions="Use selected tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    server = _create_runtime_mcp(db_session, user, "oauth-only")
+    server.runtime_input_schema = None
+    server.runtime_bindings = None
+    db_session.flush()
+
+    with pytest.raises(ConnectorRuntimeError) as exc_info:
+        prepare_create_connector_runtime(
+            db=db_session,
+            agent=agent,
+            task_source="sdk",
+            connector_user_id=int(user.id),
+            payload_items=[
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": int(server.id),
+                    }
+                }
+            ],
+        )
+
+    assert exc_info.value.code == "invalid_runtime_context"
+    assert exc_info.value.details["reason"] == "connector_not_selected"
 
 
 def test_scoped_resolver_applies_consistently_to_create_and_binding(

@@ -105,6 +105,17 @@ describe("translations", () => {
     }))
   })
 
+  it("provides localized Widget Session lifecycle copy", () => {
+    assertTranslationLeavesNonEmpty(
+      translations.en.widgetSession,
+      "translations.en.widgetSession",
+    )
+    assertTranslationLeavesNonEmpty(
+      translations.zh.widgetSession,
+      "translations.zh.widgetSession",
+    )
+  })
+
   it("reports a missing dynamic key and uses its explicit fallback", () => {
     const onMissing = vi.fn()
 

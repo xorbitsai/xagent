@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -58,12 +59,18 @@ from sqlalchemy.orm import Session
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ..models.task import Task, TaskStatus
-from .chat_history_service import mark_user_message_delivery_sync
+from .chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
+    DELIVERY_PENDING,
+    mark_user_message_delivery_sync,
+)
 from .db_runtime import (
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from .file_turn import bind_turn_files_no_commit
 from .hot_path_cache import invalidate_task_cache
 from .task_execution_controller import (
     TaskControlState,
@@ -130,6 +137,10 @@ class TaskTurnPayload:
     # name, size, type) — already path-stripped by the websocket layer
     # before reaching here.
     attachments: Optional[List[Dict[str, Any]]] = None
+    # Authorized uploads are bound by the acceptance transaction, never by
+    # WebSocket preparation. Keeping only IDs here prevents a second
+    # authorization path from drifting from the transcript owner.
+    file_ids: tuple[str, ...] = ()
     # Stable identity shared by the transcript row and the user_message trace
     # event for this user turn. Historical replay uses it to merge persisted
     # transcript rows with trace rows without collapsing repeated text.
@@ -190,6 +201,27 @@ class TaskTurnNotFoundError(Exception):
     def __init__(self, task_id: int):
         super().__init__(f"task {task_id} not found or not owned by the task owner")
         self.task_id = task_id
+
+
+class TaskTurnCommitOutcomeUnknown(Exception):
+    """A turn COMMIT may have succeeded but cannot yet be reconciled."""
+
+    def __init__(self, task_id: int, turn_id: str):
+        super().__init__(
+            f"turn {turn_id} for task {task_id} has an unknown commit outcome"
+        )
+        self.task_id = task_id
+        self.turn_id = turn_id
+
+
+class TaskTurnFileBindingError(ValueError):
+    """The acceptance transaction could not bind every requested upload."""
+
+    def __init__(self, missing_file_ids: list[str]):
+        self.missing_file_ids = tuple(missing_file_ids)
+        super().__init__(
+            "Files are no longer bindable: " + ", ".join(self.missing_file_ids)
+        )
 
 
 @dataclass(frozen=True)
@@ -729,7 +761,7 @@ def _persist_claimed_turn_no_commit(
 ) -> _ClaimedTurn:
     """Persist the first message and snapshot one already-claimed turn."""
 
-    from .chat_history_service import DELIVERY_PENDING, persist_user_message_no_commit
+    from .chat_history_service import persist_user_message_no_commit
 
     persisted_message = persist_user_message_no_commit(
         db=db,
@@ -860,6 +892,14 @@ def _claim_turn_no_commit(
         payload=payload,
         task_lease=task_lease,
     )
+    missing_bindings = bind_turn_files_no_commit(
+        file_ids=list(payload.file_ids),
+        task_id=task_id,
+        owner_user_id=task_owner_user_id,
+        db=db,
+    )
+    if missing_bindings:
+        raise TaskTurnFileBindingError(missing_bindings)
     agent_config = result.agent_config
     if isinstance(agent_config, dict) and isinstance(
         agent_config.get("workforce_run_id"), int
@@ -922,35 +962,187 @@ def _begin_turn_atomic_sync(
         :class:`TaskTurnNotFoundError`
       - row exists + owned but wrong status → ``TaskTurnError("busy")``
 
-    Invariant relied on by ``begin_turn``: this function only raises BEFORE
-    ``commit``. The committed-row snapshot is SELECTed pre-commit
-    (read-your-writes within the transaction; a bulk
-    ``.update(synchronize_session=False)`` leaves no ORM object to refresh),
-    and the only post-commit work — ``invalidate_task_cache`` — is
-    best-effort. So a successful return always means the row is committed
-    RUNNING, and any exception means it is not.
+    The committed-row snapshot is SELECTed pre-commit (read-your-writes within
+    the transaction; a bulk ``.update(synchronize_session=False)`` leaves no
+    ORM object to refresh). A lost COMMIT acknowledgement is reconciled from
+    fresh Sessions after the failed Session has released its connection.
     """
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
     db = SessionLocal()
+    result: _ClaimedTurn | None = None
+    session_retired = False
     try:
-        result = _claim_turn_no_commit(
-            db,
-            task_id,
-            task_owner_user_id,
-            payload=payload,
-            kind=kind,
+        try:
+            result = _claim_turn_no_commit(
+                db,
+                task_id,
+                task_owner_user_id,
+                payload=payload,
+                kind=kind,
+            )
+            db.flush()
+        except Exception:
+            db.rollback()
+            raise
+        try:
+            db.commit()
+        except Exception as commit_error:
+            # A driver can lose the acknowledgement after the server applied
+            # COMMIT. Do not roll that durable graph back or report a false
+            # rejection; inspect it through a fresh Session instead.
+            _retire_turn_session_best_effort(db, task_id=task_id)
+            session_retired = True
+            if _reconcile_claimed_turn_after_commit_ack_failure(
+                task_id=task_id,
+                task_owner_user_id=task_owner_user_id,
+                payload=payload,
+                claimed=result,
+            ):
+                invalidate_task_cache_best_effort(task_id)
+                return result
+            raise TaskTurnCommitOutcomeUnknown(
+                task_id, payload.turn_id
+            ) from commit_error
+    finally:
+        if not session_retired:
+            _retire_turn_session_best_effort(db, task_id=task_id)
+
+    invalidate_task_cache_best_effort(task_id)
+    assert result is not None
+    return result
+
+
+def _reconcile_claimed_turn_after_commit_ack_failure(
+    *,
+    task_id: int,
+    task_owner_user_id: int,
+    payload: TaskTurnPayload,
+    claimed: _ClaimedTurn,
+) -> bool:
+    """Check the complete accepted turn graph in a fresh owned Session."""
+
+    from ..models.chat_message import TaskChatMessage
+    from ..models.database import get_session_local
+    from ..models.uploaded_file import UploadedFile
+
+    SessionLocal = get_session_local()
+    for attempt in range(3):
+        reconcile_db: Session | None = None
+        try:
+            reconcile_db = SessionLocal()
+            task = (
+                reconcile_db.query(Task)
+                .filter(
+                    Task.id == task_id,
+                    Task.user_id == task_owner_user_id,
+                    Task.status == TaskStatus.RUNNING,
+                    Task.run_id == claimed.run_id,
+                    Task.runner_id == claimed.task_lease.runner_id,
+                )
+                .first()
+            )
+            if task is not None:
+                message = (
+                    reconcile_db.query(TaskChatMessage)
+                    .filter(
+                        TaskChatMessage.task_id == task_id,
+                        TaskChatMessage.role == "user",
+                        TaskChatMessage.turn_id == payload.turn_id,
+                        TaskChatMessage.content == payload.transcript_message.strip(),
+                        TaskChatMessage.delivery_status.in_(
+                            (
+                                DELIVERY_PENDING,
+                                DELIVERY_DISPATCHED,
+                                DELIVERY_COMPLETED,
+                            )
+                        ),
+                    )
+                    .first()
+                )
+                if message is not None:
+                    if not payload.file_ids:
+                        return True
+                    bound_count = (
+                        reconcile_db.query(UploadedFile.file_id)
+                        .filter(
+                            UploadedFile.file_id.in_(payload.file_ids),
+                            UploadedFile.user_id == task_owner_user_id,
+                            UploadedFile.task_id == task_id,
+                        )
+                        .count()
+                    )
+                    if bound_count == len(set(payload.file_ids)):
+                        return True
+        except Exception:
+            logger.warning(
+                "turn commit reconciliation attempt %s failed for task %s",
+                attempt + 1,
+                task_id,
+                exc_info=True,
+            )
+        finally:
+            if reconcile_db is not None:
+                _retire_turn_session_best_effort(reconcile_db, task_id=task_id)
+        if attempt < 2:
+            time.sleep(0.01)
+    return False
+
+
+def _retire_turn_session_best_effort(db: Session, *, task_id: int) -> None:
+    """Release an owned Session without replacing the transaction error."""
+
+    try:
+        db.close()
+        return
+    except Exception:
+        logger.warning(
+            "failed to close turn session for task %s", task_id, exc_info=True
         )
-        db.commit()
+    try:
+        db.invalidate()
+    except Exception:
+        logger.warning(
+            "failed to invalidate turn session for task %s",
+            task_id,
+            exc_info=True,
+        )
+
+
+def commit_claimed_turn_or_reconcile(
+    db: Session,
+    *,
+    task_id: int,
+    task_owner_user_id: int,
+    payload: TaskTurnPayload,
+    claimed: _ClaimedTurn,
+) -> None:
+    """Commit a complete turn graph or prove an ambiguous COMMIT succeeded.
+
+    On an acknowledgement failure the caller-owned Session is retired before
+    any fresh read, which prevents a retained connection from starving a
+    one-slot pool. The caller may safely schedule only after this returns.
+    """
+
+    try:
+        db.flush()
     except Exception:
         db.rollback()
         raise
-    finally:
-        db.close()
-
-    invalidate_task_cache_best_effort(task_id)
-    return result
+    try:
+        db.commit()
+        return
+    except Exception as commit_error:
+        _retire_turn_session_best_effort(db, task_id=task_id)
+        if _reconcile_claimed_turn_after_commit_ack_failure(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+            claimed=claimed,
+        ):
+            return
+        raise TaskTurnCommitOutcomeUnknown(task_id, payload.turn_id) from commit_error
 
 
 def _refuse_if_bg_inflight(task_id: int) -> None:

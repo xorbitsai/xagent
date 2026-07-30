@@ -90,6 +90,41 @@ def test_ws_turn_and_upload_are_per_guest(monkeypatch: pytest.MonkeyPatch) -> No
     assert limiter.allow_upload("g") is False
 
 
+def test_widget_upload_per_ip_bucket_trips_across_entities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-IP is the tight abuser bucket: rotating the target entity (or the
+    client-supplied widget guest_id, which is deliberately NOT a key) must
+    not escape it."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_UPLOAD_RATE_LIMIT="100/minute",
+        XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT="2/minute",
+    )
+    assert limiter.allow_widget_upload("agent:1", "9.9.9.9") is True
+    assert limiter.allow_widget_upload("workforce:2", "9.9.9.9") is True
+    assert limiter.allow_widget_upload("agent:3", "9.9.9.9") is False
+    # A different caller is unaffected.
+    assert limiter.allow_widget_upload("agent:1", "8.8.8.8") is True
+
+
+def test_widget_upload_entity_ceiling_trips_across_ips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-entity is the loose backstop bounding total production through one
+    widget, across many callers."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_UPLOAD_RATE_LIMIT="2/minute",
+        XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_widget_upload("workforce:7", "1.1.1.1") is True
+    assert limiter.allow_widget_upload("workforce:7", "2.2.2.2") is True
+    assert limiter.allow_widget_upload("workforce:7", "3.3.3.3") is False
+    # A different widget entity has its own bucket.
+    assert limiter.allow_widget_upload("workforce:8", "4.4.4.4") is True
+
+
 def test_ws_connect_is_per_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     """The pre-auth handshake budget is keyed per caller IP (#993 F5)."""
     limiter = _limiter_with(
@@ -170,4 +205,5 @@ def test_all_gates_fail_open_on_backend_error(
     assert limiter.allow_ws_turn("g") is True
     assert limiter.allow_ws_connect("1.1.1.1") is True
     assert limiter.allow_upload("g") is True
+    assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is True
     assert limiter.allow_run("agent:1", "g") is True

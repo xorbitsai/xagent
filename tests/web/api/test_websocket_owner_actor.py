@@ -18,8 +18,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from xagent.core.execution_scope import (
@@ -39,6 +40,7 @@ from xagent.web.api.websocket import (
     handle_chat_message,
     handle_pause_task,
     handle_resume_task,
+    send_message_delivery,
 )
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -46,11 +48,8 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
-from xagent.web.services.chat_history_service import (
-    DELIVERY_DISPATCHED,
-    DELIVERY_FAILED,
-    DELIVERY_PENDING,
-)
+from xagent.web.services import task_orchestrator
+from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
 from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
@@ -95,6 +94,31 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
     db.commit()
     db.refresh(t)
     return t
+
+
+@pytest.mark.asyncio
+async def test_rejected_delivery_serializes_an_explicit_outcome() -> None:
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await send_message_delivery(
+            MagicMock(),
+            client_message_id="rejected-turn",
+            turn_id="rejected-turn",
+            accepted=False,
+            rejection_outcome="not_accepted",
+        )
+
+    payload = ws_manager.send_personal_message.await_args.args[0]
+    assert payload["type"] == "message_rejected"
+    assert payload["rejection_outcome"] == "not_accepted"
+
+    with pytest.raises(ValueError, match="requires an explicit rejection outcome"):
+        await send_message_delivery(
+            MagicMock(),
+            client_message_id="missing-outcome-turn",
+            turn_id="missing-outcome-turn",
+            accepted=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -720,7 +744,7 @@ async def test_missing_task_file_bind_race_rolls_back_the_whole_create(
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
-        websocket_api,
+        task_orchestrator,
         "bind_turn_files_no_commit",
         MagicMock(return_value=["missing-bind-race-file"]),
     )
@@ -1367,7 +1391,7 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
 
 
 @pytest.mark.asyncio
-async def test_resume_registration_failure_preserves_dispatched_delivery(
+async def test_resume_registration_failure_keeps_injected_delivery_pending(
     db_session,
 ) -> None:
     owner = _user(db_session, "owner")
@@ -1393,7 +1417,7 @@ async def test_resume_registration_failure_preserves_dispatched_delivery(
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
         patch("xagent.web.api.websocket.manager", ws_manager),
-        patch("xagent.web.api.websocket.execute_resume_background", MagicMock()),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
         patch(
             "xagent.web.api.websocket.asyncio.create_task",
             return_value=bg_handle,
@@ -1424,13 +1448,449 @@ async def test_resume_registration_failure_preserves_dispatched_delivery(
         .filter(TaskChatMessage.turn_id == "registration-failure-turn")
         .one()
     )
-    assert stored.delivery_status == DELIVERY_DISPATCHED
+    assert stored.delivery_status == DELIVERY_PENDING
     accepted = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_marker_failure_after_registered_handoff_is_still_accepted(
+    db_session,
+) -> None:
+    owner = _user(db_session, "marker-failure-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "marker-failure-runner"
+    task.run_id = "marker-failure-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            side_effect=RuntimeError("marker unavailable"),
+        ),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Apply this once",
+                "client_message_id": "marker-failure-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    bg_mgr.register_reserved_resume.assert_called_once()
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+
+
+def test_live_claim_unique_loser_returns_the_committed_winner(
+    db_session,
+) -> None:
+    owner = _user(db_session, "live-unique-loser-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Apply exactly once",
+            message_type="user_message",
+            turn_id="live-unique-loser-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+
+    with patch(
+        "xagent.web.api.websocket.claim_user_message_delivery_no_commit",
+        side_effect=IntegrityError(
+            "INSERT task_chat_messages",
+            {},
+            RuntimeError("unique constraint"),
+        ),
+    ):
+        claim = _claim_user_message_delivery_isolated(
+            task_id=int(task.id),
+            task_owner_user_id=int(owner.id),
+            content="Apply exactly once",
+            attachments=None,
+            file_ids=[],
+            turn_id="live-unique-loser-turn",
+            expected_run_id=None,
+            expected_status=TaskStatus.RUNNING,
+        )
+
+    assert claim.claimed is False
+    assert claim.payload_matches is True
+    assert claim.pending is True
+    assert claim.failed is False
+
+
+def test_live_claim_unique_loser_returns_conflicting_winner_with_files(
+    db_session,
+) -> None:
+    owner = _user(db_session, "live-conflicting-unique-loser-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Winner payload",
+            message_type="user_message",
+            turn_id="live-conflicting-unique-loser-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+
+    with patch(
+        "xagent.web.api.websocket.claim_user_message_delivery_no_commit",
+        side_effect=IntegrityError(
+            "INSERT task_chat_messages",
+            {},
+            RuntimeError("unique constraint"),
+        ),
+    ):
+        claim = _claim_user_message_delivery_isolated(
+            task_id=int(task.id),
+            task_owner_user_id=int(owner.id),
+            content="Conflicting loser payload",
+            attachments=[{"file_id": "loser-file"}],
+            file_ids=["loser-file"],
+            turn_id="live-conflicting-unique-loser-turn",
+            expected_run_id=None,
+            expected_status=TaskStatus.RUNNING,
+        )
+
+    assert claim.claimed is False
+    assert claim.payload_matches is False
+    assert claim.pending is True
+    assert claim.failed is False
+
+
+@pytest.mark.asyncio
+async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
+    db_session,
+) -> None:
+    owner = _user(db_session, "marker-cancellation-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "marker-cancellation-runner"
+    task.run_id = "marker-cancellation-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+    marker_started = threading.Event()
+    marker_release = threading.Event()
+    registered_tasks: list[asyncio.Task] = []
+    background_cancelled = asyncio.Event()
+
+    def mark_delivery(*_args, **_kwargs) -> None:
+        marker_started.set()
+        assert marker_release.wait(timeout=5)
+
+    async def resume_forever(*_args, **_kwargs) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            background_cancelled.set()
+            raise
+
+    def register_resume(_task_id: int, task_handle: asyncio.Task) -> None:
+        registered_tasks.append(task_handle)
+
+    bg_mgr.register_reserved_resume.side_effect = register_resume
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.execute_resume_background",
+            side_effect=resume_forever,
+        ),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            side_effect=mark_delivery,
+        ),
+    ):
+        handling = asyncio.get_running_loop().create_task(
+            _handle_chat_message_unserialized(
+                MagicMock(),
+                int(task.id),
+                {
+                    "message": "Apply despite disconnect",
+                    "client_message_id": "marker-cancellation-turn",
+                    "user": owner,
+                    "files": [],
+                },
+            )
+        )
+        assert await asyncio.to_thread(marker_started.wait, 5)
+        handling.cancel()
+        marker_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await handling
+
+    assert len(registered_tasks) == 1
+    assert registered_tasks[0].cancelled() is False
+    assert background_cancelled.is_set() is False
+    bg_mgr.release_resume_reservation.assert_not_called()
+    registered_tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await registered_tasks[0]
+
+
+def test_live_claim_reconciles_a_commit_acknowledgement_failure(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _user(db_session, "live-ack-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    original_commit = Session.commit
+    commit_raised = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal commit_raised
+        original_commit(session)
+        if session is not db_session and not commit_raised:
+            commit_raised = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    claim = _claim_user_message_delivery_isolated(
+        task_id=int(task.id),
+        task_owner_user_id=int(owner.id),
+        content="Apply safely",
+        attachments=None,
+        file_ids=[],
+        turn_id="live-ack-turn",
+        expected_run_id=None,
+        expected_status=TaskStatus.RUNNING,
+    )
+
+    assert commit_raised is True
+    assert claim.claimed is True
+    db_session.expire_all()
+    assert (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "live-ack-turn")
+        .one()
+        .delivery_status
+        == DELIVERY_PENDING
+    )
+
+
+def test_waiting_for_user_claim_reconciles_a_commit_acknowledgement_failure(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _user(db_session, "waiting-ack-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.run_id = "waiting-ack-run"
+    db_session.commit()
+    original_commit = Session.commit
+    commit_raised = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal commit_raised
+        original_commit(session)
+        if session is not db_session and not commit_raised:
+            commit_raised = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    claim = _claim_user_message_delivery_isolated(
+        task_id=int(task.id),
+        task_owner_user_id=int(owner.id),
+        content="Answer the pending question",
+        attachments=None,
+        file_ids=[],
+        turn_id="waiting-ack-turn",
+        expected_run_id="waiting-ack-run",
+        expected_status=TaskStatus.WAITING_FOR_USER,
+    )
+
+    assert commit_raised is True
+    assert claim.claimed is True
+    db_session.expire_all()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "waiting-ack-turn")
+        .one()
+    )
+    assert stored.delivery_status == DELIVERY_PENDING
+
+
+def test_websocket_commit_reconciliation_read_failure_stays_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = MagicMock()
+    session.query.side_effect = RuntimeError("reconciliation database unavailable")
+    monkeypatch.setattr(
+        websocket_api,
+        "get_session_local",
+        lambda: lambda: session,
+    )
+    monkeypatch.setattr(websocket_api.time, "sleep", MagicMock())
+
+    assert (
+        websocket_api._reconcile_websocket_acceptance_graph(
+            task_id=123,
+            task_owner_user_id=456,
+            turn_id="read-failure-turn",
+            content="Accepted",
+            file_ids=[],
+            expected_run_id="run",
+            expected_status=TaskStatus.RUNNING,
+        )
+        is False
+    )
+    assert session.query.call_count == 3
+
+
+def test_websocket_commit_reconciliation_rejects_failed_delivery(
+    db_session,
+) -> None:
+    owner = _user(db_session, "failed-reconciliation-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.run_id = "failed-reconciliation-run"
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Accepted",
+            message_type="user_message",
+            turn_id="failed-reconciliation-turn",
+            delivery_status=DELIVERY_FAILED,
+        )
+    )
+    db_session.commit()
+
+    assert (
+        websocket_api._reconcile_websocket_acceptance_graph(
+            task_id=int(task.id),
+            task_owner_user_id=int(owner.id),
+            turn_id="failed-reconciliation-turn",
+            content="Accepted",
+            file_ids=[],
+            expected_run_id="failed-reconciliation-run",
+            expected_status=TaskStatus.RUNNING,
+        )
+        is False
+    )
+
+
+def test_missing_task_prepare_reconciles_a_commit_acknowledgement_failure(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _user(db_session, "missing-ack-owner")
+    original_commit = Session.commit
+    commit_raised = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal commit_raised
+        original_commit(session)
+        if session is not db_session and not commit_raised:
+            commit_raised = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    preparation = websocket_api._prepare_websocket_turn_sync(
+        requested_task_id=987654,
+        actor_user_id=int(owner.id),
+        actor_is_admin=False,
+        user_message="start after acknowledgement loss",
+        raw_context={},
+        raw_files=[],
+        client_message_id="missing-ack-turn",
+        turn_id="missing-ack-turn",
+        durable_attempt_count=1,
+        durable_target_run_id=None,
+        pause_accepted=False,
+    )
+
+    assert commit_raised is True
+    assert preparation.task_created is True
+    db_session.expire_all()
+    assert (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == "missing-ack-turn")
+        .one()
+        .delivery_status
+        == DELIVERY_PENDING
+    )
+
+
+def test_missing_task_prepare_keeps_an_absent_commit_outcome_unknown(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _user(db_session, "missing-unknown-owner")
+
+    def lose_commit_before_acknowledgement(_session: Session) -> None:
+        raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", lose_commit_before_acknowledgement)
+
+    with pytest.raises(websocket_api._WebSocketCommitOutcomeUnknown):
+        websocket_api._prepare_websocket_turn_sync(
+            requested_task_id=987655,
+            actor_user_id=int(owner.id),
+            actor_is_admin=False,
+            user_message="unknown acceptance",
+            raw_context={},
+            raw_files=[],
+            client_message_id="missing-unknown-turn",
+            turn_id="missing-unknown-turn",
+            durable_attempt_count=1,
+            durable_target_run_id=None,
+            pause_accepted=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -1495,6 +1955,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "live-control-pool-timeout"
     assert "inject failed" in rejected[0]["message"]
+    assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
 @pytest.mark.asyncio
@@ -1667,6 +2128,7 @@ async def test_reusing_client_id_with_different_content_is_rejected(
     ]
     assert len(rejected) == 1
     assert rejected[0]["retry_with_new_id"] is True
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
 
 
 @pytest.mark.asyncio
@@ -1717,6 +2179,50 @@ async def test_failed_durable_delivery_is_not_silently_accepted(db_session) -> N
     ]
     assert len(rejected) == 1
     assert rejected[0]["retry_with_new_id"] is True
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
+
+
+@pytest.mark.asyncio
+async def test_pending_same_id_delivery_reports_unknown_outcome(db_session) -> None:
+    owner = _user(db_session, "pending-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Pending guidance",
+            message_type="user_message",
+            turn_id="pending-turn-1",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Pending guidance",
+                "client_message_id": "pending-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["client_message_id"] == "pending-turn-1"
+    assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
 @pytest.mark.asyncio
@@ -2282,6 +2788,164 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
         .one()
     )
     assert delivery.delivery_status == DELIVERY_FAILED
+
+
+@pytest.mark.asyncio
+async def test_deferred_injection_marker_failure_does_not_abort_resume(
+    db_session,
+) -> None:
+    owner = _user(db_session, "deferred-marker-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-marker-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                metadata={"turn_id": "deferred-marker-turn"},
+            )
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(return_value=True),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    def mark_delivery(_task_id: int, _turn_id: str, status: str):
+        if status == websocket_api.DELIVERY_DISPATCHED:
+            raise RuntimeError("delivery marker unavailable")
+        return None
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            side_effect=mark_delivery,
+        ),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-marker-turn",
+            },
+            delivery_turn_id="deferred-marker-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-marker-turn",
+        )
+
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_injection_marker_cancellation_does_not_abort_resume(
+    db_session,
+) -> None:
+    owner = _user(db_session, "deferred-marker-cancel-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Deferred guidance",
+            message_type="user_message",
+            turn_id="deferred-marker-cancel-turn",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                metadata={"turn_id": "deferred-marker-cancel-turn"},
+            )
+        ]
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(return_value=True),
+        resume_execution_by_id=AsyncMock(
+            return_value={
+                "status": "completed",
+                "success": True,
+                "output": "Applied",
+                "agent_result": {"context": context},
+            }
+        ),
+    )
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    def mark_delivery(_task_id: int, _turn_id: str, status: str):
+        if status == websocket_api.DELIVERY_DISPATCHED:
+            raise asyncio.CancelledError
+        return None
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            side_effect=mark_delivery,
+        ),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-marker-cancel-turn",
+            },
+            delivery_turn_id="deferred-marker-cancel-turn",
+            delivery_websocket=MagicMock(),
+            delivery_client_message_id="deferred-marker-cancel-turn",
+        )
+
+    agent.resume_execution_by_id.assert_awaited_once_with(str(task.id))
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
 
 
 @pytest.mark.asyncio

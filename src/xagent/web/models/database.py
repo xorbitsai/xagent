@@ -118,6 +118,11 @@ def get_session_local() -> sessionmaker[Session]:
     return _SessionLocal
 
 
+def get_optional_session_local() -> sessionmaker[Session] | None:
+    """Return the installed session factory without requiring database setup."""
+    return _SessionLocal
+
+
 def get_engine() -> Engine:
     if _engine is None:
         raise RuntimeError("Engine is not initialized. Call init_db() first.")

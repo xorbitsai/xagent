@@ -396,6 +396,7 @@ async def store_uploaded_files(
     folder: str | None,
     user_id: int,
     single_file_mode: bool,
+    upload_source: str | None = None,
 ) -> Dict[str, Any]:
     """Store request bytes without retaining a database connection across I/O."""
 
@@ -484,6 +485,7 @@ async def store_uploaded_files(
                     task_id=parsed_task_id,
                     filename=Path(uploaded.filename).name,
                     mime_type=uploaded.content_type,
+                    upload_source=upload_source,
                     execution_scope=upload_execution_scope,
                 )
             )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -271,6 +272,38 @@ class TracerCheckpointStore:
     async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
         payload = self.by_execution_id.get(execution_id)
         return dict(payload) if payload is not None else None
+
+
+class EmptyCanonicalCheckpointStore:
+    def __init__(self) -> None:
+        self.legacy_reads = 0
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        return None
+
+    def get_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        self.legacy_reads += 1
+        raise AssertionError("canonical empty result must end checkpoint lookup")
+
+
+@pytest.mark.asyncio
+async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
+    checkpoint_store = EmptyCanonicalCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=checkpoint_store,
+    )
+
+    context = await runner.inject_user_message(
+        "missing-execution",
+        "Continue",
+        request_interrupt=False,
+    )
+
+    assert context is None
+    assert checkpoint_store.legacy_reads == 0
 
 
 @pytest.mark.asyncio
@@ -803,14 +836,20 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         callbacks=[FailingUserMessageCallback()],
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
+    failing_runner.pause = MagicMock(return_value=True)
 
-    with pytest.raises(RuntimeError, match="trace callback failed"):
-        await failing_runner.post_user_message(
-            execution_id,
-            "Choose B",
-            turn_id="a2a:42:msg-1",
-            request_interrupt=False,
-        )
+    accepted = await failing_runner.post_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="a2a:42:msg-1",
+        request_interrupt=True,
+    )
+
+    assert accepted is not None
+    failing_runner.pause.assert_called_once_with(
+        execution_id,
+        reason="new user message",
+    )
 
     failing_runner.context_manager.remove_context(execution_id)
     retry_runner = AgentRunner(

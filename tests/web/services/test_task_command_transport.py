@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime, timedelta
 from threading import Barrier, Event, get_ident
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -793,10 +793,35 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
     db_session.commit()
 
-    assert await dispatch_one_task_command(
-        execute_durable_task_command,
-        command_db_id=enqueued.command_id,
+    runtime_agent = MagicMock()
+    runtime_agent.supports_live_control.return_value = True
+    runtime_agent.post_user_message = AsyncMock(return_value=True)
+    runtime_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=runtime_agent)
     )
+    resume = AsyncMock()
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=runtime_manager,
+        ),
+        patch.object(websocket_api, "execute_resume_background", new=resume),
+    ):
+        assert await dispatch_one_task_command(
+            execute_durable_task_command,
+            command_db_id=enqueued.command_id,
+        )
+        resume_task = websocket_api.background_task_manager.resume_tasks.get(
+            int(task.id)
+        )
+        assert resume_task is not None
+        await resume_task
+        websocket_api.background_task_manager.cleanup_task(
+            int(task.id),
+            expected_task=resume_task,
+        )
+
     db_session.expire_all()
     messages = (
         db_session.query(TaskChatMessage)
@@ -809,6 +834,12 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     assert command is not None
     assert command.status == COMMAND_COMPLETED
     assert task.run_id == "run-2"
+    runtime_agent.post_user_message.assert_awaited_once()
+    assert runtime_agent.post_user_message.await_args.kwargs["turn_id"] == (
+        "committed-turn"
+    )
+    resume.assert_awaited_once()
+    assert resume.await_args.kwargs["expected_run_id"] == "run-2"
 
 
 @pytest.mark.asyncio

@@ -81,6 +81,30 @@ XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS="~/skills,$HOME/custom_skills,./local_skills
 
 Skills with the same name are loaded in order, with later directories overriding earlier ones.
 
+## Provider extension contract
+
+Applications may register a read provider with `set_skill_library_provider()` or
+a write provider with `set_skill_write_provider()`. Both provider protocols and
+their registration functions are exported from `xagent.skills`.
+
+Read providers receive `SkillScopeContext`; write providers receive
+`SkillWriteContext`. These contexts contain only a `user_id` and copied scalar
+metadata. They never contain an ORM entity, request, database session, or
+session factory, and should not be serialized as a transport contract. Metadata
+is non-authoritative: a provider must resolve current authorization from
+`user_id` inside its own short-lived dependency scope.
+
+A database-backed provider owns its complete operation: open a session,
+authorize, materialize its result, commit on success or roll back on failure,
+and close before returning. It must not commit or roll back the caller's
+request transaction.
+
+Expected public write failures must raise `SkillWriteProviderError` with an
+allowlisted `SkillWriteProviderErrorReason` and a deliberately public-safe
+message. `FORBIDDEN` maps to HTTP 403 and `INVALID_REQUEST` to HTTP 400.
+Unexpected provider exceptions are logged and exposed as a stable sanitized
+HTTP 500 response.
+
 ### Path Expansion Support
 
 - **Home Directory**: `~` is expanded to the user's home directory

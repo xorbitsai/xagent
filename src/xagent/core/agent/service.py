@@ -14,6 +14,7 @@ from ..model.chat.basic.base import BaseLLM
 from ..tools.adapters.vibe import Tool
 from ..tools.adapters.vibe.config import (
     RequiredMCPUnavailableError,
+    ToolFactoryRuntimeSessionBoundaryError,
     normalize_tool_allowlist,
 )
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
@@ -70,6 +71,12 @@ class AgentService:
         self.system_prompt = system_prompt
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
+        if tools is not None and tool_config is not None:
+            handoff_factory_runtime = getattr(
+                tool_config, "handoff_factory_runtime", None
+            )
+            if callable(handoff_factory_runtime):
+                handoff_factory_runtime()
         self.tool_config = tool_config
         self.tracer = tracer or Tracer()
         # Default infer: if the caller passed ``tools`` (even ``[]``) the
@@ -658,13 +665,21 @@ class AgentService:
                     self._tools_initialized
                     and policy_signature == self._tool_policy_signature
                 ):
-                    release_factory_runtime = getattr(
+                    handoff_factory_runtime = getattr(
                         self.tool_config,
-                        "release_prepared_factory_runtime",
+                        "handoff_factory_runtime",
                         None,
                     )
-                    if callable(release_factory_runtime):
-                        release_factory_runtime()
+                    if callable(handoff_factory_runtime):
+                        handoff_factory_runtime()
+                    else:
+                        release_factory_runtime = getattr(
+                            self.tool_config,
+                            "release_prepared_factory_runtime",
+                            None,
+                        )
+                        if callable(release_factory_runtime):
+                            release_factory_runtime()
                     return
 
                 # Rebuild the tool list so disabled tools disappear from reused agents.
@@ -689,6 +704,8 @@ class AgentService:
             except ConnectorRuntimeError:
                 raise
             except RequiredMCPUnavailableError:
+                raise
+            except ToolFactoryRuntimeSessionBoundaryError:
                 raise
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)

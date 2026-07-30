@@ -60,6 +60,7 @@ from xagent.web.services.task_lease_service import (
     get_runner_id,
 )
 from xagent.web.services.task_orchestrator import (
+    TaskTurnCommitOutcomeUnknown,
     TaskTurnError,
     TaskTurnNotFoundError,
     TaskTurnOrchestrator,
@@ -510,6 +511,270 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
         .one()
     )
     assert persisted.turn_id == payload.turn_id
+
+
+def test_begin_turn_reconciles_a_commit_acknowledgement_failure(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+    payload = TaskTurnPayload("acknowledged after disconnect")
+    original_commit = Session.commit
+    commit_raised = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal commit_raised
+        original_commit(session)
+        if session is not db_session and not commit_raised:
+            commit_raised = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    claimed = _begin_turn_atomic_sync(
+        int(task.id),
+        int(user.id),
+        payload=payload,
+        kind=TurnKind.CREATE,
+    )
+
+    assert commit_raised is True
+    assert claimed.run_id
+    db_session.expire_all()
+    stored = db_session.query(TaskChatMessage).filter_by(turn_id=payload.turn_id).one()
+    assert stored.content == "acknowledged after disconnect"
+
+
+def test_begin_turn_retires_failed_session_before_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    commit_error = ConnectionError("commit acknowledgement lost")
+    lease = MagicMock(runner_id="runner", run_id="run")
+    claimed = _ClaimedTurn(
+        task_lease=lease,
+        status=TaskStatus.RUNNING,
+        updated_at=None,
+        before_message_id=None,
+        task_source="sdk",
+        run_id="run",
+    )
+
+    class FailedSession:
+        def flush(self) -> None:
+            events.append("flush")
+
+        def commit(self) -> None:
+            events.append("commit")
+            raise commit_error
+
+        def rollback(self) -> None:
+            events.append("rollback")
+
+        def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(
+        database_module,
+        "get_session_local",
+        lambda: lambda: FailedSession(),
+    )
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_claim_turn_no_commit",
+        MagicMock(return_value=claimed),
+    )
+
+    def reconcile(**_kwargs) -> bool:
+        events.append("reconcile")
+        assert events.index("close") < events.index("reconcile")
+        return True
+
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_reconcile_claimed_turn_after_commit_ack_failure",
+        reconcile,
+    )
+
+    result = _begin_turn_atomic_sync(
+        123,
+        456,
+        payload=TaskTurnPayload("accepted", turn_id="retire-before-reconcile"),
+        kind=TurnKind.CREATE,
+    )
+
+    assert result is claimed
+    assert events[:4] == ["flush", "commit", "close", "reconcile"]
+
+
+def test_commit_reconciliation_accepts_a_late_visible_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = MagicMock(runner_id="runner", run_id="run")
+    claimed = _ClaimedTurn(
+        task_lease=lease,
+        status=TaskStatus.RUNNING,
+        updated_at=None,
+        before_message_id=None,
+        task_source="sdk",
+        run_id="run",
+    )
+    payload = TaskTurnPayload("accepted", turn_id="late-visible-turn")
+    sessions = [MagicMock(), MagicMock(), MagicMock()]
+    sessions[0].query.return_value.filter.return_value.first.return_value = None
+    sessions[1].query.return_value.filter.return_value.first.return_value = None
+    task_query = MagicMock()
+    task_query.filter.return_value.first.return_value = MagicMock()
+    message_query = MagicMock()
+    message_query.filter.return_value.first.return_value = MagicMock()
+    third_queries = [task_query, message_query]
+    sessions[2].query.side_effect = third_queries
+    created_sessions: list[MagicMock] = []
+
+    def session_factory() -> MagicMock:
+        session = sessions[len(created_sessions)]
+        created_sessions.append(session)
+        return session
+
+    monkeypatch.setattr(
+        database_module,
+        "get_session_local",
+        lambda: session_factory,
+    )
+    monkeypatch.setattr(task_orchestrator_module.time, "sleep", MagicMock())
+
+    assert (
+        task_orchestrator_module._reconcile_claimed_turn_after_commit_ack_failure(
+            task_id=123,
+            task_owner_user_id=456,
+            payload=payload,
+            claimed=claimed,
+        )
+        is True
+    )
+    assert len(created_sessions) == 3
+    assert all(session.close.called for session in created_sessions)
+
+
+def test_successful_commit_is_not_rejected_when_session_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    claimed = _ClaimedTurn(
+        task_lease=MagicMock(runner_id="runner", run_id="run"),
+        status=TaskStatus.RUNNING,
+        updated_at=None,
+        before_message_id=None,
+        task_source="sdk",
+        run_id="run",
+    )
+
+    class CloseFailingSession:
+        def flush(self) -> None:
+            events.append("flush")
+
+        def commit(self) -> None:
+            events.append("commit")
+
+        def rollback(self) -> None:
+            events.append("rollback")
+
+        def close(self) -> None:
+            events.append("close")
+            raise RuntimeError("close failed")
+
+        def invalidate(self) -> None:
+            events.append("invalidate")
+
+    monkeypatch.setattr(
+        database_module,
+        "get_session_local",
+        lambda: lambda: CloseFailingSession(),
+    )
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_claim_turn_no_commit",
+        MagicMock(return_value=claimed),
+    )
+    invalidate_cache = MagicMock()
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "invalidate_task_cache_best_effort",
+        invalidate_cache,
+    )
+
+    result = _begin_turn_atomic_sync(
+        123,
+        456,
+        payload=TaskTurnPayload("accepted", turn_id="close-failure-turn"),
+        kind=TurnKind.CREATE,
+    )
+
+    assert result is claimed
+    assert events == ["flush", "commit", "close", "invalidate"]
+    invalidate_cache.assert_called_once_with(123)
+
+
+def test_reconciliation_read_failure_remains_commit_outcome_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit_error = ConnectionError("commit acknowledgement lost")
+    claimed = _ClaimedTurn(
+        task_lease=MagicMock(runner_id="runner", run_id="run"),
+        status=TaskStatus.RUNNING,
+        updated_at=None,
+        before_message_id=None,
+        task_source="sdk",
+        run_id="run",
+    )
+    factory_calls = 0
+
+    class FailedCommitSession:
+        def flush(self) -> None:
+            return None
+
+        def commit(self) -> None:
+            raise commit_error
+
+        def rollback(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def session_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            return FailedCommitSession()
+        raise RuntimeError("reconciliation database unavailable")
+
+    monkeypatch.setattr(
+        database_module,
+        "get_session_local",
+        lambda: session_factory,
+    )
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_claim_turn_no_commit",
+        MagicMock(return_value=claimed),
+    )
+    monkeypatch.setattr(task_orchestrator_module.time, "sleep", MagicMock())
+
+    with pytest.raises(TaskTurnCommitOutcomeUnknown) as exc_info:
+        _begin_turn_atomic_sync(
+            123,
+            456,
+            payload=TaskTurnPayload(
+                "accepted",
+                turn_id="reconciliation-read-failure",
+            ),
+            kind=TurnKind.CREATE,
+        )
+
+    assert exc_info.value.__cause__ is commit_error
+    assert factory_calls == 4
 
 
 @pytest.mark.asyncio

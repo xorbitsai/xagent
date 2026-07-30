@@ -18,19 +18,50 @@ interface ClarificationFormProps {
   interactions: Interaction[]
   messageId?: string
   active?: boolean
+  filesDisabled?: boolean
   onSend?: (message: string, files?: File[], metadata?: any) => Promise<void> | void
 }
 
-export function ClarificationForm({ interactions, messageId, active = true, onSend }: ClarificationFormProps) {
+const FILE_ACTION_VALUE_RE = /(^|[-_\s])(upload|file)(?=$|[-_\s])/i
+
+const isFileActionValue = (value: unknown): boolean =>
+  typeof value === "string" && FILE_ACTION_VALUE_RE.test(value)
+
+const isFileActionOption = (
+  option: { value?: string; action_type?: string } | undefined,
+): boolean => {
+  const actionType = option?.action_type?.toLowerCase()
+  if (actionType !== undefined) {
+    return actionType === "upload"
+  }
+  return isFileActionValue(option?.value)
+}
+
+const isFileActionSelection = (
+  option: { value?: string; action_type?: string } | undefined,
+  value: unknown,
+): boolean => option
+  ? isFileActionOption(option)
+  : isFileActionValue(value)
+
+export function ClarificationForm({
+  interactions,
+  messageId,
+  active = true,
+  filesDisabled: filesDisabledOverride,
+  onSend,
+}: ClarificationFormProps) {
   // If onSend is provided, use it (e.g., from builder chat), otherwise use useApp
-  let sendMessage: any, dispatch: any;
+  let sendMessage: any, dispatch: any, contextFilesDisabled: boolean | undefined;
   try {
     const appCtx = useApp();
     sendMessage = appCtx.sendMessage;
     dispatch = appCtx.dispatch;
+    contextFilesDisabled = appCtx.filesDisabled;
   } catch {
     // We might not be in the app context (e.g., agent builder chat)
   }
+  const filesDisabled = filesDisabledOverride ?? contextFilesDisabled ?? true
 
   const { t } = useI18n()
   const [formState, setFormState] = useState<Record<string, any>>({})
@@ -68,12 +99,14 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
         : Array.isArray(interaction.actions)
           ? interaction.actions
           : undefined
-      const options = rawOptions?.map((opt: any) => ({
-        value: typeof opt?.value === "string" ? opt.value : String(opt?.label || ""),
-        label: typeof opt?.label === "string" ? opt.label : String(opt?.value || ""),
-        description: typeof opt?.description === "string" ? opt.description : undefined,
-        action_type: typeof opt?.action_type === "string" ? opt.action_type : undefined,
-      })).filter((opt: { value: string; label: string }) => opt.value && opt.label)
+      const options = rawOptions
+        ?.map((opt: any) => ({
+          value: typeof opt?.value === "string" ? opt.value : String(opt?.label || ""),
+          label: typeof opt?.label === "string" ? opt.label : String(opt?.value || ""),
+          description: typeof opt?.description === "string" ? opt.description : undefined,
+          action_type: typeof opt?.action_type === "string" ? opt.action_type : undefined,
+        }))
+        .filter((opt: { value: string; label: string }) => opt.value && opt.label)
       return {
         ...interaction,
         type,
@@ -82,6 +115,42 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
       }
     }) as Interaction[]
   }, [interactions])
+
+  useEffect(() => {
+    if (!filesDisabled) return
+
+    setFormState((previous) => {
+      const next = { ...previous }
+      let changed = false
+
+      for (const interaction of normalizedInteractions) {
+        if (interaction.type === "file_upload" && interaction.field in next) {
+          delete next[interaction.field]
+          changed = true
+        }
+
+        if (interaction.type === "action_cards") {
+          const fileField = `${interaction.field}_files`
+          if (fileField in next) {
+            delete next[fileField]
+            changed = true
+          }
+          const selectedOption = interaction.options?.find(
+            (option) => option.value === next[interaction.field],
+          )
+          if (isFileActionSelection(
+            selectedOption,
+            next[interaction.field],
+          )) {
+            delete next[interaction.field]
+            changed = true
+          }
+        }
+      }
+
+      return changed ? next : previous
+    })
+  }, [filesDisabled, normalizedInteractions])
 
   const handleInputChange = (field: string, value: any) => {
     setFormState((prev) => ({ ...prev, [field]: value }))
@@ -92,6 +161,20 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
     const metadata: any = {}
     const lines = normalizedInteractions.flatMap(interaction => {
       const value = formState[interaction.field]
+
+      if (filesDisabled && interaction.type === "file_upload") {
+        return []
+      }
+      if (
+        filesDisabled
+        && interaction.type === "action_cards"
+        && isFileActionSelection(
+          interaction.options?.find((option) => option.value === value),
+          value,
+        )
+      ) {
+        return []
+      }
 
       // Skip empty values unless it's a boolean (confirm) which might be false
       if (value === undefined || value === null || (typeof value === "string" && value.trim() === "") || (Array.isArray(value) && value.length === 0)) {
@@ -120,7 +203,7 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
       const results = [{ field: interaction.field, label: interaction.label || interaction.field, value: isFile ? value : displayValue, isFile }]
 
       // For action_cards, if files were uploaded alongside it, add them too
-      if (interaction.type === "action_cards") {
+      if (interaction.type === "action_cards" && !filesDisabled) {
         const fileValue = formState[`${interaction.field}_files`]
         if (fileValue && ((fileValue instanceof FileList && fileValue.length > 0) || (Array.isArray(fileValue) && fileValue.length > 0))) {
           results.push({ field: `${interaction.field}_files`, label: t("chatPage.clarification.uploadedFiles"), value: fileValue, isFile: true })
@@ -164,12 +247,13 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
     try {
       setIsSubmitting(true)
       // If textMessage is empty but we have files, send a generic message?
-      const finalMessage = textMessage || (files.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
+      const outboundFiles = filesDisabled ? [] : files
+      const finalMessage = textMessage || (outboundFiles.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
 
       if (onSend) {
-        await onSend(finalMessage, files, metadata);
+        await onSend(finalMessage, outboundFiles, metadata);
       } else if (sendMessage) {
-        await sendMessage(finalMessage, { force: true, metadata }, files)
+        await sendMessage(finalMessage, { force: true, metadata }, outboundFiles)
       }
 
       setIsSubmitted(true)
@@ -237,6 +321,8 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
         )
 
       case "file_upload":
+        if (filesDisabled) return null
+
         const fileValue = formState[interaction.field]
         const files: File[] = []
         if (fileValue instanceof FileList) {
@@ -318,14 +404,19 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
 
       case "action_cards":
         const selectedOption = interaction.options?.find((opt) => opt.value === value)
+        const visibleOptions = filesDisabled
+          ? interaction.options?.filter((option) => !isFileActionOption(option))
+          : interaction.options
         const selectedActionType = selectedOption?.action_type?.toLowerCase()
-        const isUploadSelected = selectedActionType === 'upload' || (typeof value === 'string' && (value.toLowerCase().includes('upload') || value.toLowerCase().includes('file')));
+        const isUploadSelected = !filesDisabled && (
+          selectedActionType === 'upload' || isFileActionValue(value)
+        );
         const isWebsiteSelected = selectedActionType === 'input_url' || (typeof value === 'string' && (value.toLowerCase().includes('website') || value.toLowerCase().includes('url') || value.toLowerCase().includes('import')));
 
         return (
           <div className="flex flex-col gap-4 w-full">
             <div className="grid w-full grid-cols-1 sm:grid-cols-2 gap-4">
-              {interaction.options?.map((opt) => (
+              {visibleOptions?.map((opt) => (
                 <div
                   key={opt.value}
                   className={`flex flex-col items-center justify-center gap-2 rounded-lg border p-6 cursor-pointer transition-all ${value === opt.value ? 'border-primary bg-primary/5 shadow-sm ring-1 ring-primary' : 'bg-card hover:bg-muted/50 hover:border-muted-foreground/30'
@@ -395,6 +486,7 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
       <CollapsibleContent className="space-y-4 p-4">
         <div className="space-y-4">
           {normalizedInteractions.map((interaction, index) => (
+            filesDisabled && interaction.type === "file_upload" ? null : (
             <div key={`${interaction.field}-${index}`} className="space-y-2">
               <Label className="text-sm font-medium">
                 {interaction.label || interaction.field}
@@ -403,6 +495,7 @@ export function ClarificationForm({ interactions, messageId, active = true, onSe
 
               {renderField(interaction)}
             </div>
+            )
           ))}
         </div>
 

@@ -145,9 +145,13 @@ The frontend handles the following WebSocket events:
 ## Browser Support
 
 - Chrome 90+
-- Firefox 88+
-- Safari 14+
+- Firefox 96+
+- Safari 15.4+
 - Edge 90+
+
+Browser sign-in also requires local storage, the Web Locks API, and a secure
+context. Use HTTPS outside local development; loopback hosts such as
+`localhost`, `127.0.0.1`, and `::1` are suitable for local development.
 
 ## Contributing
 

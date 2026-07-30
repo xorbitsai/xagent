@@ -4,8 +4,8 @@ import { FileText, Loader2, Volume2 } from 'lucide-react'
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
 import { ExcelPreviewRenderer } from '@/components/file/excel-preview-renderer'
 import { PptxPreviewRenderer } from '@/components/file/pptx-preview-renderer'
-import { apiRequest } from '@/lib/api-wrapper'
 import { cn, getApiUrl } from '@/lib/utils'
+import { useFileAccess, type FileAccessPolicy } from '@/contexts/file-access-context'
 import {
   arrayBufferToBase64,
   getInlineFileDownloadUrl,
@@ -38,14 +38,15 @@ function InlineImagePreview({
   filename,
   imageClassName,
   onFileClick,
+  fileAccess,
 }: {
   source: InlineFilePreviewSource
   previewUrl: string
   filename: string
   imageClassName?: string
   onFileClick?: (filePath: string, fileName: string) => void
+  fileAccess: FileAccessPolicy
 }) {
-  const apiUrl = getApiUrl()
   const shouldFallback = Boolean(source.fileId)
   const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
 
@@ -58,8 +59,8 @@ function InlineImagePreview({
     const runFallback = async () => {
       if (!shouldFallback) return
       try {
-        const response = await apiRequest(
-          `${apiUrl}/api/files/preview/${encodeURIComponent(source.fileId!)}`,
+        const response = await fileAccess.request(
+          fileAccess.previewUrl(source.fileId!),
           {
             cache: 'no-cache',
             headers: {
@@ -95,7 +96,7 @@ function InlineImagePreview({
       isCancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [apiUrl, previewUrl, shouldFallback, source.fileId])
+  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
 
   const handleClick = (event: React.MouseEvent<HTMLImageElement>) => {
     if (!onFileClick || !source.fileId) return
@@ -136,14 +137,15 @@ function InlineAudioPreview({
   filename,
   openLabel,
   className,
+  fileAccess,
 }: {
   source: InlineFilePreviewSource
   previewUrl: string
   filename: string
   openLabel: string
   className?: string
+  fileAccess: FileAccessPolicy
 }) {
-  const apiUrl = getApiUrl()
   const shouldFallback = Boolean(source.fileId)
   const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
 
@@ -156,8 +158,8 @@ function InlineAudioPreview({
     const loadAuthenticatedAudio = async () => {
       if (!shouldFallback || !source.fileId) return
       try {
-        const response = await apiRequest(
-          `${apiUrl}/api/files/preview/${encodeURIComponent(source.fileId)}`,
+        const response = await fileAccess.request(
+          fileAccess.previewUrl(source.fileId),
           {
             cache: 'no-cache',
             headers: {
@@ -188,7 +190,7 @@ function InlineAudioPreview({
       isCancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [apiUrl, previewUrl, shouldFallback, source.fileId])
+  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
 
   return (
     <div
@@ -237,12 +239,14 @@ function InlineOfficeContent({
   previewUrl,
   loadErrorText,
   fileId,
+  fileAccess,
 }: {
   kind: 'presentation' | 'document' | 'spreadsheet'
   previewUrl: string
   loadErrorText: string
   /** Optional fileId; when set, enables server-side PDF preview for .pptx. */
   fileId?: string
+  fileAccess: FileAccessPolicy
 }) {
   const [base64Content, setBase64Content] = useState('')
   const [error, setError] = useState(false)
@@ -258,7 +262,7 @@ function InlineOfficeContent({
 
     const loadPreview = async () => {
       try {
-        const response = await apiRequest(previewUrl, {
+        const response = await fileAccess.request(previewUrl, {
           cache: 'no-cache',
           headers: {
             'Cache-Control': 'no-cache',
@@ -286,7 +290,7 @@ function InlineOfficeContent({
     return () => {
       isCancelled = true
     }
-  }, [previewUrl])
+  }, [fileAccess, previewUrl])
 
   // Fast path: presentation with a managed fileId — skip the eager PPTX
   // download and mount the renderer immediately.  PptxPreviewRenderer will
@@ -363,12 +367,17 @@ export function InlineFilePreview({
   loadErrorText = DEFAULT_LOAD_ERROR_TEXT,
 }: InlineFilePreviewProps) {
   const apiUrl = getApiUrl()
+  const fileAccess = useFileAccess()
   const resolvedSource = source.fileId
     ? { ...source, fileId: resolveInlineFileId(source.fileId) }
     : source
   const kind = getInlineFilePreviewKind(resolvedSource)
-  const previewUrl = getInlineFilePreviewUrl(resolvedSource, apiUrl)
-  const downloadUrl = getInlineFileDownloadUrl(resolvedSource, apiUrl)
+  const previewUrl = resolvedSource.fileId
+    ? fileAccess.inlinePreviewUrl(resolvedSource.fileId)
+    : getInlineFilePreviewUrl(resolvedSource, apiUrl)
+  const downloadUrl = resolvedSource.fileId
+    ? fileAccess.inlineDownloadUrl(resolvedSource.fileId)
+    : getInlineFileDownloadUrl(resolvedSource, apiUrl)
   const previewUrlTrust = getPreviewUrlTrust(resolvedSource, apiUrl)
   const filename = fileNameFromSource(resolvedSource)
   const canOpenFilePreview = Boolean(onFileClick && resolvedSource.fileId)
@@ -401,6 +410,7 @@ export function InlineFilePreview({
         filename={filename}
         imageClassName={imageClassName}
         onFileClick={onFileClick}
+        fileAccess={fileAccess}
       />
     )
   }
@@ -413,6 +423,7 @@ export function InlineFilePreview({
         filename={filename}
         openLabel={openLabel}
         className={className}
+        fileAccess={fileAccess}
       />
     )
   }
@@ -459,6 +470,7 @@ export function InlineFilePreview({
           previewUrl={previewUrl}
           loadErrorText={loadErrorText}
           fileId={resolvedSource.fileId}
+          fileAccess={fileAccess}
         />
       </div>
     </div>

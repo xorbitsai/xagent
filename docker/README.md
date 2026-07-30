@@ -22,6 +22,13 @@ Compose overlays, including sandbox runtime options, live in this directory.
 
 ## Quick Start
 
+Browser sign-in requires local browser storage and the Web Locks API for safe
+cross-tab session coordination. Use HTTPS for non-local deployments. The
+`localhost`, `127.0.0.1`, and `::1` loopback forms are suitable secure contexts
+for local development. The bundled HTTP Compose endpoint is a local-development
+reference; production deployments must terminate TLS and use a browser that
+supports Web Locks.
+
 ### 1. Configure Environment
 
 Copy and edit the environment file:

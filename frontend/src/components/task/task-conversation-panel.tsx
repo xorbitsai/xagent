@@ -16,8 +16,8 @@ import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
 import { useApp } from "@/contexts/app-context-chat"
+import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest } from "@/lib/api-wrapper"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
@@ -190,7 +190,24 @@ export function TaskConversationPanel({
   onSend,
   onAgentExecutionClick,
 }: TaskConversationPanelProps) {
-  const { state, sendMessage, pauseTask, resumeTask, openFilePreview, closeFilePreview, requestStatus, dispatch, getFileDownloadUrl } = useApp()
+  const {
+    state,
+    sendMessage,
+    filesDisabled,
+    voiceInputEnabled,
+    taskControlsEnabled,
+    pauseTask,
+    resumeTask,
+    openFilePreview,
+    closeFilePreview,
+    requestStatus,
+    dispatch,
+    getFileDownloadUrl,
+    isConversationResetPending,
+    isMessageDeliveryPending,
+    isSessionInteractionLocked,
+  } = useApp()
+  const fileAccess = useFileAccess()
   const { t } = useI18n()
   const [files, setFiles] = useState<File[]>([])
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
@@ -199,7 +216,8 @@ export function TaskConversationPanel({
   const [isDragging, setIsDragging] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
-  const anyPreviewOpen = mode === "page" && (state.filePreview.isOpen || dagPreviewOpen)
+  const isFilePreviewOpen = !filesDisabled && state.filePreview.isOpen
+  const anyPreviewOpen = mode === "page" && (isFilePreviewOpen || dagPreviewOpen)
   const hideDelegatedChildTraces = Boolean(onAgentExecutionClick)
   const shouldHideWorkforceInternalTrace = useCallback(
     (event: unknown) =>
@@ -224,7 +242,8 @@ export function TaskConversationPanel({
   }, [closeFilePreview])
 
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
-    await (onSend ?? sendMessage)(message, config, filesToSend || files)
+    const outboundFiles = filesDisabled ? [] : (filesToSend || files)
+    await (onSend ?? sendMessage)(message, config, outboundFiles)
     setFiles([])
   }
 
@@ -456,12 +475,20 @@ export function TaskConversationPanel({
   }, [state.messages, state.steps])
 
   useEffect(() => {
-    if (state.filePreview.isOpen) {
+    if (isFilePreviewOpen) {
       setDagPreviewOpen(false)
     }
-  }, [state.filePreview.isOpen])
+  }, [isFilePreviewOpen])
 
   useEffect(() => {
+    if (filesDisabled) {
+      setFiles([])
+    }
+  }, [filesDisabled])
+
+  useEffect(() => {
+    if (filesDisabled) return
+
     const handleFilePreviewEvent = (event: Event) => {
       const { filePath, fileName, allFiles, currentIndex } = (event as CustomEvent<any>).detail || {}
       if (!filePath) return
@@ -474,12 +501,14 @@ export function TaskConversationPanel({
 
     window.addEventListener("openFilePreview", handleFilePreviewEvent as EventListener)
     return () => window.removeEventListener("openFilePreview", handleFilePreviewEvent as EventListener)
-  }, [openFilePreview])
+  }, [filesDisabled, openFilePreview])
 
   const handleDownload = async () => {
+    if (filesDisabled) return
+
     try {
       if (!state.filePreview.fileId) return
-      const response = await apiRequest(getFileDownloadUrl(state.filePreview.fileId))
+      const response = await fileAccess.request(getFileDownloadUrl(state.filePreview.fileId))
       if (!response.ok) {
         throw new Error(`Download failed: ${response.statusText}`)
       }
@@ -740,7 +769,7 @@ export function TaskConversationPanel({
             {showTaskActions && (
               <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  {showTaskFiles && (
+                  {showTaskFiles && !filesDisabled && (
                     <TaskFileManager taskId={state.taskId} onPreview={(fileId, fileName) => openFilePreview(fileId, fileName)}>
                       <Button type="button" variant="outline" className="h-auto rounded-xl bg-card/80 px-3 py-2 text-sm" title={t("files.header.title")}>
                         <FolderOpen className="w-3.5 h-3.5 mr-1" />
@@ -768,14 +797,19 @@ export function TaskConversationPanel({
 
             <ChatInput
               onSend={handleSend}
-              isLoading={state.isProcessing}
-              files={files}
-              onFilesChange={setFiles}
+              isLoading={
+                state.isProcessing
+                || isConversationResetPending
+                || isMessageDeliveryPending
+                || isSessionInteractionLocked
+              }
+              files={filesDisabled ? [] : files}
+              onFilesChange={filesDisabled ? undefined : setFiles}
               showModeToggle={false}
               hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
-              onPause={pauseTask}
-              onResume={resumeTask}
+              onPause={taskControlsEnabled ? pauseTask : undefined}
+              onResume={taskControlsEnabled ? resumeTask : undefined}
               taskConfig={state.currentTask ? {
                 model: state.currentTask.modelId || state.currentTask.modelName,
                 smallFastModel: state.currentTask.smallFastModelId,
@@ -784,7 +818,9 @@ export function TaskConversationPanel({
                 executionMode: state.currentTask.executionMode,
               } : undefined}
               readOnlyConfig={true}
-              hideFileUpload={hideFileUpload}
+              filesDisabled={filesDisabled}
+              voiceInputEnabled={voiceInputEnabled}
+              hideFileUpload={hideFileUpload || filesDisabled}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}
               autoFocus={autoFocusInput}
@@ -811,15 +847,15 @@ export function TaskConversationPanel({
           className="flex-shrink-0 px-2 py-6 overflow-hidden relative"
         >
           <PreviewSheet
-            open={state.filePreview.isOpen || dagPreviewOpen}
+            open={isFilePreviewOpen || dagPreviewOpen}
             onOpenChange={(open) => {
               if (!open) {
                 closeFilePreview()
                 setDagPreviewOpen(false)
               }
             }}
-            title={state.filePreview.isOpen ? <>{state.filePreview.fileName}</> : t("chatPage.executionPlan.title")}
-            actions={state.filePreview.isOpen ? (
+            title={isFilePreviewOpen ? <>{state.filePreview.fileName}</> : t("chatPage.executionPlan.title")}
+            actions={isFilePreviewOpen ? (
               <FilePreviewActionButtons
                 viewMode={state.filePreview.viewMode}
                 onViewModeChange={(mode) => dispatch({ type: "SET_FILE_PREVIEW_MODE", payload: mode })}
@@ -830,8 +866,8 @@ export function TaskConversationPanel({
             ) : null}
           >
             <div className="w-full h-full">
-              {state.filePreview.isOpen ? (
-                <FilePreviewContent open={state.filePreview.isOpen} />
+              {isFilePreviewOpen ? (
+                <FilePreviewContent open={isFilePreviewOpen} />
               ) : (
                 <CenterPanel
                   dagExecution={state.dagExecution}
@@ -843,7 +879,7 @@ export function TaskConversationPanel({
                   hasError={hasError}
                   currentTaskStatus={state.currentTask?.status}
                   onRefresh={() => requestStatus()}
-                  onFileClick={openFilePreview}
+                  onFileClick={filesDisabled ? undefined : openFilePreview}
                 />
               )}
             </div>

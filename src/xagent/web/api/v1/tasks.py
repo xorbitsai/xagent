@@ -60,7 +60,6 @@ from ...services.db_runtime import (
 )
 from ...services.file_turn import (
     append_uploaded_files_context,
-    bind_turn_files_no_commit,
     build_uploaded_files_context,
     normalize_attachments_for_persistence,
     resolve_turn_file_infos,
@@ -76,12 +75,15 @@ from ...services.hot_path_cache import (
 from ...services.managed_file_ref import DurableStorageOperationError
 from ...services.task_orchestrator import (
     TaskTurnError,
+    TaskTurnFileBindingError,
     TaskTurnNotFoundError,
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
     TurnStarted,
     _ClaimedTurn,
+    _retire_turn_session_best_effort,
+    commit_claimed_turn_or_reconcile,
 )
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
@@ -249,7 +251,18 @@ def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPay
         transcript_message=content,
         execution_message=append_uploaded_files_context(content, context),
         attachments=normalize_attachments_for_persistence(file_infos) or None,
+        file_ids=tuple(str(info["file_id"]) for info in file_infos),
     )
+
+
+def _raise_v1_file_binding_error(exc: TaskTurnFileBindingError) -> NoReturn:
+    raise V1ApiError(
+        V1ErrorCode.INVALID_INPUT,
+        400,
+        message=(
+            "These file ids are not accessible: " + ", ".join(exc.missing_file_ids)
+        ),
+    ) from exc
 
 
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
@@ -323,6 +336,7 @@ def _prepare_created_task_isolated(
     SessionLocal = get_session_local()
     db = SessionLocal()
     payload: TaskTurnPayload | None = None
+    owned_task_id = 0
     try:
         agent = db.get(Agent, agent_id)
         if agent is None:
@@ -359,30 +373,22 @@ def _prepare_created_task_isolated(
         db.add(task)
         db.flush()
         task_id = int(task.id)
+        owned_task_id = task_id
         persist_create_connector_runtime_context(
             db=db,
             task_id=task_id,
             plan=runtime_plan,
         )
         payload = _turn_payload(message, file_infos)
-        claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
-            db,
-            task_id=task_id,
-            task_owner_user_id=task_owner_user_id,
-            payload=payload,
-        )
-        missing = bind_turn_files_no_commit(
-            file_ids=[str(info["file_id"]) for info in file_infos],
-            task_id=task_id,
-            owner_user_id=task_owner_user_id,
-            db=db,
-        )
-        if missing:
-            raise V1ApiError(
-                V1ErrorCode.INVALID_INPUT,
-                400,
-                message="These file ids are not accessible: " + ", ".join(missing),
+        try:
+            claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
+                db,
+                task_id=task_id,
+                task_owner_user_id=task_owner_user_id,
+                payload=payload,
             )
+        except TaskTurnFileBindingError as exc:
+            _raise_v1_file_binding_error(exc)
         _store_connector_runtime_values_or_fail(
             task_id=task_id,
             turn_id=payload.turn_id,
@@ -391,7 +397,13 @@ def _prepare_created_task_isolated(
         created_at = db.query(Task.created_at).filter(Task.id == task_id).scalar()
         if created_at is None:
             raise RuntimeError("created task has no creation timestamp")
-        db.commit()
+        commit_claimed_turn_or_reconcile(
+            db,
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+            claimed=claimed_turn,
+        )
         return _PreparedCreateTaskStart(
             task_id=task_id,
             agent_id=agent_id,
@@ -406,7 +418,7 @@ def _prepare_created_task_isolated(
             pop_ephemeral_runtime_values(payload.turn_id)
         raise
     finally:
-        db.close()
+        _retire_turn_session_best_effort(db, task_id=owned_task_id)
 
 
 def _prepare_append_turn_isolated(
@@ -472,24 +484,15 @@ def _prepare_append_turn_isolated(
             task_id=int(task.id),
         )
         payload = _turn_payload(message, file_infos)
-        claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
-            db,
-            task_id=int(task.id),
-            task_owner_user_id=task_owner_user_id,
-            payload=payload,
-        )
-        missing = bind_turn_files_no_commit(
-            file_ids=[str(info["file_id"]) for info in file_infos],
-            task_id=int(task.id),
-            owner_user_id=task_owner_user_id,
-            db=db,
-        )
-        if missing:
-            raise V1ApiError(
-                V1ErrorCode.INVALID_INPUT,
-                400,
-                message="These file ids are not accessible: " + ", ".join(missing),
+        try:
+            claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
+                db,
+                task_id=int(task.id),
+                task_owner_user_id=task_owner_user_id,
+                payload=payload,
             )
+        except TaskTurnFileBindingError as exc:
+            _raise_v1_file_binding_error(exc)
         _store_connector_runtime_values_or_fail(
             task_id=int(task.id),
             turn_id=payload.turn_id,
@@ -502,7 +505,13 @@ def _prepare_append_turn_isolated(
             payload=payload,
             claimed_turn=claimed_turn,
         )
-        db.commit()
+        commit_claimed_turn_or_reconcile(
+            db,
+            task_id=int(task.id),
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+            claimed=claimed_turn,
+        )
         return prepared
     except Exception:
         db.rollback()
@@ -510,7 +519,7 @@ def _prepare_append_turn_isolated(
             pop_ephemeral_runtime_values(payload.turn_id)
         raise
     finally:
-        db.close()
+        _retire_turn_session_best_effort(db, task_id=task_id)
 
 
 @router.post(

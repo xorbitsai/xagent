@@ -37,6 +37,10 @@ vi.mock('@/components/file/pptx-preview-renderer', () => ({
 }))
 
 import { InlineFilePreview } from './inline-file-preview'
+import {
+  FileAccessProvider,
+  createPublicFileAccessPolicy,
+} from '@/contexts/file-access-context'
 
 describe('InlineFilePreview', () => {
   beforeEach(() => {
@@ -45,6 +49,7 @@ describe('InlineFilePreview', () => {
 
   afterEach(() => {
     cleanup()
+    vi.unstubAllGlobals()
   })
 
   it('falls back to authenticated preview for uuid image file ids', async () => {
@@ -75,6 +80,38 @@ describe('InlineFilePreview', () => {
     await waitFor(() => {
       expect(image.getAttribute('src')).toMatch(/^blob:/)
     })
+  })
+
+  it('uses the provider-scoped public credential for image and audio bytes', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['media'], { type: 'image/png' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(
+      <FileAccessProvider policy={createPublicFileAccessPolicy('guest-a')}>
+        <>
+          <InlineFilePreview
+            source={{ type: 'image', fileId: 'image-id', filename: 'image.png' }}
+          />
+          <InlineFilePreview
+            source={{ type: 'audio', fileId: 'audio-id', filename: 'audio.mp3' }}
+          />
+        </>
+      </FileAccessProvider>,
+    )
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/image-id?token=guest-a',
+      expect.objectContaining({ credentials: 'omit' }),
+    )
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/audio-id?token=guest-a',
+      expect.objectContaining({ credentials: 'omit' }),
+    )
+    expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
   it('extracts uuid from file paths that include a filename suffix', async () => {

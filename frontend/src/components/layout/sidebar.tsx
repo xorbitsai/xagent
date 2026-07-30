@@ -5,7 +5,7 @@ import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { SearchInput } from "@/components/ui/search-input"
-import { useState, useEffect, useCallback, useMemo, useRef } from "react"
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
@@ -1033,8 +1033,11 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
               <div className="h-px bg-border my-1 mx-2" />
               <button
                 onClick={() => {
-                  logout()
-                  setShowUserMenu(false)
+                  void (async () => {
+                    const loggedOut = await logout()
+                    if (loggedOut) setShowUserMenu(false)
+                    else toast.error(t("sidebar.user.logoutFailed"))
+                  })()
                 }}
                 className="flex w-full items-center px-4 py-2 text-sm hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors text-left"
               >

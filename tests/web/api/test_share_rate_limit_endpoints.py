@@ -235,6 +235,7 @@ async def test_ws_turn_rate_limited_rejects_without_dispatch(
     _, kwargs = delivery.await_args
     assert kwargs["accepted"] is False
     assert kwargs["client_message_id"] == "m2"
+    assert kwargs["rejection_outcome"] == "not_accepted"
 
 
 @pytest.mark.asyncio

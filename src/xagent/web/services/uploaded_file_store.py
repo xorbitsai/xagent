@@ -64,6 +64,7 @@ class LocalUploadRegistration:
     task_id: int | None
     filename: str
     mime_type: str | None
+    upload_source: str | None = None
     execution_scope: ExecutionScope | None = None
 
     @property
@@ -143,6 +144,7 @@ class StagedUploadedFile:
     workspace_category: str | None
     mime_type: str | None
     file_size: int
+    upload_source: str | None = None
 
     @classmethod
     def from_record(cls, file_record: UploadedFile) -> "StagedUploadedFile":
@@ -189,6 +191,11 @@ class StagedUploadedFile:
                 else None
             ),
             file_size=int(file_record.file_size or 0),
+            upload_source=(
+                str(file_record.upload_source)
+                if file_record.upload_source is not None
+                else None
+            ),
         )
 
     def to_record(self) -> UploadedFile:
@@ -210,6 +217,7 @@ class StagedUploadedFile:
             storage_status="available",
             mime_type=self.mime_type,
             file_size=self.file_size,
+            upload_source=self.upload_source,
         )
 
 
@@ -913,6 +921,7 @@ def create_unbound_uploaded_file_from_local_path(
     storage_key: str | None = None,
     workspace_relative_path: str | None = None,
     workspace_category: str | None = None,
+    upload_source: str | None = None,
     execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED,
 ) -> UploadedFile:
     file_record = build_uploaded_file_record(
@@ -924,6 +933,7 @@ def create_unbound_uploaded_file_from_local_path(
         mime_type=mime_type,
         workspace_relative_path=workspace_relative_path,
         workspace_category=workspace_category,
+        upload_source=upload_source,
     )
     ManagedFileRef(file_record, execution_scope=execution_scope).sync_to_durable(
         storage_key=storage_key,
@@ -943,6 +953,7 @@ def stage_uploaded_file_from_local_path(
     storage_key: str,
     workspace_relative_path: str | None = None,
     workspace_category: str | None = None,
+    upload_source: str | None = None,
     execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED,
 ) -> StagedUploadedFile:
     """Write one immutable object without retaining a Session.
@@ -971,6 +982,7 @@ def stage_uploaded_file_from_local_path(
                 storage_key=storage_key,
                 workspace_relative_path=workspace_relative_path,
                 workspace_category=workspace_category,
+                upload_source=upload_source,
                 execution_scope=execution_scope,
             )
         )
@@ -1080,6 +1092,7 @@ def register_local_uploads_sync(
                 filename=registration.filename,
                 mime_type=registration.mime_type,
                 storage_key=registration.compensation_claim.expected_storage_key,
+                upload_source=registration.upload_source,
                 execution_scope=registration.execution_scope,
             )
             staged_files.append(staged)
@@ -1263,6 +1276,7 @@ def build_uploaded_file_record(
     mime_type: str | None = None,
     workspace_relative_path: str | None = None,
     workspace_category: str | None = None,
+    upload_source: str | None = None,
 ) -> UploadedFile:
     resolved_filename = filename or local_path.name
     resolved_mime_type = mime_type or guess_media_type(resolved_filename)
@@ -1277,6 +1291,7 @@ def build_uploaded_file_record(
         storage_status="pending",
         workspace_relative_path=workspace_relative_path,
         workspace_category=workspace_category,
+        upload_source=upload_source,
     )
 
 
@@ -1298,6 +1313,7 @@ class UploadedFileStore:
         storage_key: str | None = None,
         workspace_relative_path: str | None = None,
         workspace_category: str | None = None,
+        upload_source: str | None = None,
     ) -> UploadedFile:
         file_record = build_uploaded_file_record(
             local_path=local_path,
@@ -1308,6 +1324,7 @@ class UploadedFileStore:
             mime_type=mime_type,
             workspace_relative_path=workspace_relative_path,
             workspace_category=workspace_category,
+            upload_source=upload_source,
         )
         self.db.add(file_record)
         self.db.flush()

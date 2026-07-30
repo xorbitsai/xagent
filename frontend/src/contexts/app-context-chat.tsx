@@ -1,6 +1,6 @@
 "use client"
 
-import React, { createContext, useContext, useReducer, useCallback, useEffect, useState, useRef, useMemo } from "react"
+import React, { createContext, useContext, useReducer, useCallback, useEffect, useLayoutEffect, useState, useRef, useMemo } from "react"
 import { useRouter } from "next/navigation"
 import { FileText, Target, Zap, CheckCircle, XCircle, Wrench, Activity, Search, Lightbulb, AlertTriangle, Info, Brain, Bot } from "lucide-react"
 import { JsonRenderer, MarkdownRenderer } from "../components/ui/markdown-renderer"
@@ -9,6 +9,14 @@ import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
+import {
+  AgentCardPresentationCapability,
+  resolveAgentCardPresentationCapability,
+} from "@/contexts/presentation-capabilities"
+import {
+  FileAccessProvider,
+  type FileAccessPolicy,
+} from "@/contexts/file-access-context"
 
 interface WebSocketMessage {
   type: string
@@ -56,6 +64,111 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
   "task_waiting_for_user",
 ])
 const MAX_TRACKED_TASK_STATE_VERSIONS = 500
+// A Session may reset repeatedly during its absolute lifetime. Retired ids are
+// retained only to reject late frames, so bound this lineage guard separately
+// from the unrelated task-state ordering cache.
+const MAX_RETIRED_SESSION_TASK_IDS = 500
+const SESSION_RESET_ACK_TIMEOUT_MS = 30_000
+const SESSION_TASK_ADOPTION_TIMEOUT_MS = 30_000
+const MAX_SESSION_PRE_ADOPTION_FRAMES = 64
+const MAX_SESSION_PRE_ADOPTION_BYTES = 256 * 1024
+
+type SessionConversationState =
+  | { phase: "unbound"; connectionIdentity: string | null; taskId: null }
+  | { phase: "bound"; connectionIdentity: string; taskId: number }
+  | { phase: "reset_requested"; connectionIdentity: string; taskId: number }
+  | { phase: "replacement_ready"; connectionIdentity: string; taskId: null }
+  | { phase: "replacement_sending"; connectionIdentity: string; taskId: null }
+  | { phase: "replacement_awaiting_task"; connectionIdentity: string; taskId: null }
+  | { phase: "reload_required"; connectionIdentity: string | null; taskId: null }
+
+type SessionConversationAction =
+  | { type: "SESSION_TASK_INFO"; connectionIdentity: string; taskId: number }
+  | { type: "SESSION_RESET_REQUESTED"; connectionIdentity: string; taskId: number }
+  | { type: "SESSION_RESET_NOT_SENT"; connectionIdentity: string }
+  | { type: "SESSION_RESET_ACKNOWLEDGED"; connectionIdentity: string }
+  | { type: "SESSION_REPLACEMENT_SENDING"; connectionIdentity: string }
+  | { type: "SESSION_REPLACEMENT_ACCEPTED"; connectionIdentity: string }
+  | { type: "SESSION_REPLACEMENT_REJECTED"; connectionIdentity: string }
+  | { type: "SESSION_BOUND_CONNECTION_REBOUND"; connectionIdentity: string }
+  | { type: "SESSION_RELOAD_REQUIRED"; connectionIdentity: string | null }
+
+const initialSessionConversationState: SessionConversationState = {
+  phase: "unbound",
+  connectionIdentity: null,
+  taskId: null,
+}
+
+const reduceSessionConversation = (
+  state: SessionConversationState,
+  action: SessionConversationAction,
+): SessionConversationState => {
+  if (state.phase === "reload_required") return state
+  switch (action.type) {
+    case "SESSION_TASK_INFO":
+      if (state.phase === "unbound") {
+        return { phase: "bound", connectionIdentity: action.connectionIdentity, taskId: action.taskId }
+      }
+      if (
+        state.phase === "replacement_awaiting_task"
+        && state.connectionIdentity === action.connectionIdentity
+      ) {
+        return { phase: "bound", connectionIdentity: action.connectionIdentity, taskId: action.taskId }
+      }
+      return state
+    case "SESSION_RESET_REQUESTED":
+      return state.phase === "bound" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "reset_requested", connectionIdentity: action.connectionIdentity, taskId: action.taskId }
+        : state
+    case "SESSION_RESET_NOT_SENT":
+      return state.phase === "reset_requested" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "bound", connectionIdentity: state.connectionIdentity, taskId: state.taskId }
+        : state
+    case "SESSION_RESET_ACKNOWLEDGED":
+      return state.phase === "reset_requested" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_ready", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_REPLACEMENT_SENDING":
+      return state.phase === "replacement_ready" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_sending", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_REPLACEMENT_ACCEPTED":
+      return state.phase === "replacement_sending" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_awaiting_task", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_REPLACEMENT_REJECTED":
+      return state.phase === "replacement_sending" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_ready", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_BOUND_CONNECTION_REBOUND":
+      return state.phase === "bound"
+        ? { ...state, connectionIdentity: action.connectionIdentity }
+        : state
+    case "SESSION_RELOAD_REQUIRED":
+      return { phase: "reload_required", connectionIdentity: action.connectionIdentity, taskId: null }
+  }
+}
+
+type SessionConversationTransition = {
+  accepted: boolean
+  changed: boolean
+  next: SessionConversationState
+}
+
+const transitionSessionConversation = (
+  current: SessionConversationState,
+  action: SessionConversationAction,
+): SessionConversationTransition => {
+  const next = reduceSessionConversation(current, action)
+  const changed = next !== current
+  const accepted = changed || (
+    action.type === "SESSION_TASK_INFO"
+    && current.phase === "bound"
+    && current.connectionIdentity === action.connectionIdentity
+    && current.taskId === action.taskId
+  )
+  return { accepted, changed, next }
+}
 
 const asMessageRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? value as Record<string, unknown> : {}
@@ -70,19 +183,30 @@ const parseInteger = (value: unknown): number | undefined => {
 export const extractTaskControlEnvelope = (message: WebSocketMessage): TaskControlEnvelope => {
   const root = message as unknown as Record<string, unknown>
   const data = asMessageRecord(root.data)
+  const nestedData = asMessageRecord(data.data)
   const task = asMessageRecord(root.task)
   const eventType = String(root.event_type || data.event_type || "")
   const isStateEvent = VERSIONED_TASK_EVENT_TYPES.has(message.type)
     || (message.type === "trace_event" && eventType === "task_info")
   if (!isStateEvent) return { isStateEvent: false }
 
-  const rawTaskId = root.task_id ?? task.id ?? data.id
+  const rawTaskId = root.task_id ?? task.id ?? data.id ?? nestedData.id
   const parsedTaskId = parseInteger(rawTaskId)
-  const rawVersion = root.state_version ?? task.state_version ?? data.state_version
+  const rawVersion =
+    root.state_version
+    ?? task.state_version
+    ?? data.state_version
+    ?? nestedData.state_version
   const parsedVersion = parseInteger(rawVersion)
-  const rawRunId = root.run_id ?? task.run_id ?? data.run_id
-  const rawControlState = root.control_state ?? task.control_state ?? data.control_state
-  const rawStatus = root.status ?? task.status ?? data.status
+  const rawRunId =
+    root.run_id ?? task.run_id ?? data.run_id ?? nestedData.run_id
+  const rawControlState =
+    root.control_state
+    ?? task.control_state
+    ?? data.control_state
+    ?? nestedData.control_state
+  const rawStatus =
+    root.status ?? task.status ?? data.status ?? nestedData.status
 
   return {
     isStateEvent: true,
@@ -109,6 +233,62 @@ const taskEventMatchesControlState = (
   const allowed = expected[message.type]
   return !allowed || !envelope.controlState || allowed.includes(envelope.controlState)
 }
+
+type TaskStateVersionEntry = {
+  version: number
+  runId?: string | null
+}
+
+const canAcceptTaskControlVersion = (
+  message: WebSocketMessage,
+  envelope: TaskControlEnvelope,
+  versions: Map<number, TaskStateVersionEntry>,
+): boolean => {
+  if (!envelope.isStateEvent || envelope.taskId === undefined) return true
+
+  const knownState = versions.get(envelope.taskId)
+  if (envelope.stateVersion === undefined) {
+    // Once the server establishes versioned state for a Task, an unversioned
+    // replay cannot roll it back. Error frames remain informational.
+    const isErrorEvent =
+      message.type === "error" || message.type === "agent_error"
+    return !knownState || isErrorEvent
+  }
+
+  const isOlderVersion =
+    knownState && envelope.stateVersion < knownState.version
+  const isDifferentRunAtSameVersion =
+    knownState
+    && envelope.stateVersion === knownState.version
+    && knownState.runId !== undefined
+    && envelope.runId !== undefined
+    && knownState.runId !== envelope.runId
+  if (isOlderVersion || isDifferentRunAtSameVersion) return false
+
+  return true
+}
+
+const acceptTaskControlVersion = (
+  message: WebSocketMessage,
+  envelope: TaskControlEnvelope,
+  versions: Map<number, TaskStateVersionEntry>,
+): boolean => {
+  if (!canAcceptTaskControlVersion(message, envelope, versions)) return false
+  if (!envelope.isStateEvent || envelope.taskId === undefined) return true
+  if (envelope.stateVersion === undefined) return true
+
+  versions.delete(envelope.taskId)
+  versions.set(envelope.taskId, {
+    version: envelope.stateVersion,
+    runId: envelope.runId,
+  })
+  if (versions.size > MAX_TRACKED_TASK_STATE_VERSIONS) {
+    const oldestTaskId = versions.keys().next().value
+    if (oldestTaskId !== undefined) versions.delete(oldestTaskId)
+  }
+  return true
+}
+
 export interface Interaction {
   type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards";
   field: string;
@@ -123,8 +303,11 @@ export interface Interaction {
   accept?: string[] | string;
   multiple?: boolean;
 }
-import { useWebSocket } from "@/hooks/use-websocket"
-import { useAuth } from "@/contexts/auth-context"
+import {
+  useWebSocket,
+  type WebSocketConnection,
+  type WebSocketConnectionFailure,
+} from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
@@ -150,8 +333,9 @@ const generateMessageId = (prefix: string) => {
   return `${prefix}-${++messageIdCounter}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
 }
 
-// Simple deduplication for all messages
-const recentMessages = new Set<string>()
+// Providers own their own dedupe cache. The window hook is retained solely for
+// legacy hot-reload callers and clears registered provider-local caches.
+const duplicateMessageCacheClearers = new Set<() => void>()
 
 // Helper function to compare arrays
 const arraysEqual = (a: string[], b: string[]): boolean => {
@@ -302,49 +486,12 @@ const findOptimisticUserMessageIndex = (
   return -1
 }
 
-// Function to clear duplicate message cache
-const clearDuplicateMessageCache = () => {
-  recentMessages.clear()
-}
-
-// Function to start delayed playback
-let startDelayedPlayback = () => {
-  // Will be initialized later
-}
-
 // Expose to window for global access
 if (typeof window !== 'undefined') {
-  ; (window as any).clearDuplicateMessageCache = clearDuplicateMessageCache
-}
-// Flag to track if we're loading historical data
-let isHistoricalDataLoading = false
-// Store pending task info for auto-execution after historical data loads
-let pendingTaskToExecute: { description: string } | null = null
-const isDuplicateMessage = (content: string | React.ReactNode, type: string = 'general', force: boolean = false, shouldCache: boolean = true) => {
-  const contentStr = normalizeMessageContent(content)
-
-  const key = `${type}:${contentStr}`
-  if (!force && recentMessages.has(key)) {
-    return true
+  ; (window as any).clearDuplicateMessageCache = () => {
+    duplicateMessageCacheClearers.forEach(clear => clear())
   }
-
-  if (shouldCache) {
-    recentMessages.add(key)
-    // Clean up old messages after 30 seconds
-    setTimeout(() => {
-      recentMessages.delete(key)
-    }, 30000)
-  }
-
-  return false
 }
-
-// Backward compatibility for result messages
-const isDuplicateResult = (content: string) => {
-  return isDuplicateMessage(content, 'result')
-}
-
-
 const normalizeInteractions = (value: unknown): Interaction[] => {
   if (!Array.isArray(value)) {
     return []
@@ -478,6 +625,60 @@ export interface Task {
   controlState?: TaskControlState
 }
 
+type SessionTaskBinding =
+  | { present: false }
+  | { present: true; valid: false }
+  | { present: true; valid: true; taskId: number }
+
+const hasOwn = (
+  record: Record<string, unknown>,
+  key: string,
+): boolean => Object.prototype.hasOwnProperty.call(record, key)
+
+const extractSessionTaskBinding = (
+  message: WebSocketMessage,
+): SessionTaskBinding => {
+  const root = asMessageRecord(message)
+  const data = asMessageRecord(root.data)
+  const nestedData = asMessageRecord(data.data)
+  const task = asMessageRecord(root.task)
+  const dataTask = asMessageRecord(data.task)
+  const nestedTask = asMessageRecord(nestedData.task)
+  const candidates: unknown[] = []
+
+  const collect = (record: Record<string, unknown>, key: string) => {
+    if (hasOwn(record, key) && record[key] !== undefined) {
+      candidates.push(record[key])
+    }
+  }
+  collect(root, "task_id")
+  collect(task, "id")
+  collect(data, "task_id")
+  collect(dataTask, "id")
+  collect(nestedData, "task_id")
+  collect(nestedTask, "id")
+
+  if (candidates.length === 0) return { present: false }
+  const parsed = candidates.map(parseInteger)
+  if (parsed.some(taskId => taskId === undefined || taskId <= 0)) {
+    return { present: true, valid: false }
+  }
+  const taskIds = new Set(parsed as number[])
+  if (taskIds.size !== 1) return { present: true, valid: false }
+  return { present: true, valid: true, taskId: parsed[0] as number }
+}
+
+const getSessionTaskInfoData = (
+  message: WebSocketMessage,
+): Record<string, unknown> | null => {
+  if (message.type !== "trace_event") return null
+  const data = asMessageRecord(message.data)
+  const eventType = message.event_type ?? data.event_type
+  if (eventType !== "task_info") return null
+  const nestedData = asMessageRecord(data.data)
+  return Object.keys(nestedData).length > 0 ? nestedData : data
+}
+
 interface StepExecution {
   id: string
   name: string
@@ -511,6 +712,36 @@ const normalizeStepStatus = (status: unknown): StepExecution["status"] => {
 
 const getString = (value: unknown, fallback = ""): string => typeof value === "string" ? value : fallback
 const getStringArray = (value: unknown): string[] => Array.isArray(value) ? value.map(item => String(item)) : []
+
+const taskFromTaskInfoData = (
+  taskData: Record<string, unknown>,
+  taskId: number,
+): Task => ({
+  id: String(taskId),
+  title: taskData.title as string,
+  description: taskData.description as string,
+  status: normalizeTaskStatus(taskData.status) || "pending",
+  createdAt: taskData.created_at as string | number,
+  updatedAt: taskData.updated_at as string | number,
+  modelId: taskData.model_id as string | undefined,
+  smallFastModelId: taskData.small_fast_model_id as string | undefined,
+  visualModelId: taskData.visual_model_id as string | undefined,
+  compactModelId: taskData.compact_model_id as string | undefined,
+  modelName: taskData.model_name as string | undefined,
+  smallFastModelName: taskData.small_fast_model_name as string | undefined,
+  visualModelName: taskData.visual_model_name as string | undefined,
+  compactModelName: taskData.compact_model_name as string | undefined,
+  executionMode: taskData.execution_mode as Task["executionMode"],
+  isDag: taskData.is_dag as boolean | undefined,
+  agentId: taskData.agent_id as number | undefined,
+  agentName: taskData.agent_name as string | undefined,
+  agentLogoUrl: taskData.agent_logo_url as string | undefined,
+  waitingQuestion: taskData.waiting_question as string | undefined,
+  waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
+  runId: taskData.run_id as string | null | undefined,
+  stateVersion: parseInteger(taskData.state_version),
+  controlState: taskData.control_state as TaskControlState | undefined,
+})
 
 const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
   const root = message as unknown as Record<string, unknown>
@@ -614,10 +845,14 @@ interface AppState {
   isHistoryLoading: boolean
   // Current context-window usage from the latest LLM call, for the usage gauge.
   contextUsage: { tokens: number; threshold: number } | null
+  sessionConversation: SessionConversationState
 }
 
 type AppAction =
+  | { type: "SESSION_CONVERSATION"; payload: SessionConversationAction }
   | { type: "SET_TASK_ID"; payload: number | null }
+  | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
+  | { type: "RESET_SESSION_CONVERSATION" }
   | { type: "ADD_MESSAGE"; payload: Message }
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
@@ -660,7 +895,7 @@ type AppAction =
   | { type: "SET_HISTORY_LOADING"; payload: boolean }
   | { type: "SYNC_PROCESSING_STATUS" }
 
-const initialState: AppState = {
+const createInitialState = (): AppState => ({
   messages: [],
   currentTask: null,
   dagExecution: null,
@@ -691,12 +926,21 @@ const initialState: AppState = {
   lastTaskUpdate: Date.now(),
   isHistoryLoading: false,
   contextUsage: null,
-}
+  sessionConversation: { ...initialSessionConversationState },
+})
 
-function appReducer(state: AppState, action: AppAction): AppState {
+function projectAppState(state: AppState, action: AppAction): AppState {
   console.log('🔍 Reducer called with action:', action.type, action)
 
   switch (action.type) {
+    case "SESSION_CONVERSATION":
+      return {
+        ...state,
+        sessionConversation: reduceSessionConversation(
+          state.sessionConversation,
+          action.payload,
+        ),
+      }
     case "SET_HISTORY_LOADING":
       return { ...state, isHistoryLoading: action.payload }
 
@@ -722,6 +966,20 @@ function appReducer(state: AppState, action: AppAction): AppState {
       const newState = { ...state, taskId: action.payload, messages, contextUsage }
       console.log('🔄 Reducer returning new state:', newState)
       return newState
+
+    case "ADOPT_SESSION_TASK":
+      return {
+        ...state,
+        taskId: action.payload.taskId,
+        currentTask: action.payload.task,
+      }
+
+    case "RESET_SESSION_CONVERSATION":
+      return {
+        ...createInitialState(),
+        lastTaskUpdate: Date.now(),
+        sessionConversation: state.sessionConversation,
+      }
 
     case "ADD_MESSAGE": {
       const newMessage = action.payload
@@ -1015,7 +1273,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: [] }
 
     case "RESET_STATE":
-      return initialState
+      return {
+        ...createInitialState(),
+        sessionConversation: state.sessionConversation,
+      }
 
     case "OPEN_FILE_PREVIEW":
       // Support passing single file or multiple file list
@@ -1188,6 +1449,13 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
+type AppStateCommit = { state: AppState }
+
+const commitProjectedAppState = (
+  _: AppState,
+  commit: AppStateCommit,
+): AppState => commit.state
+
 interface PendingMessage {
   message: string
   files?: File[]
@@ -1201,6 +1469,10 @@ interface PendingMessage {
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
+  filesDisabled: boolean
+  agentCardsEnabled: boolean
+  voiceInputEnabled: boolean
+  taskControlsEnabled: boolean
   sendMessage: (message: string, config?: any, files?: File[]) => Promise<void>
   executeTask: (description: string) => void
   pauseTask: () => void
@@ -1209,6 +1481,11 @@ interface AppContextType {
   clearMessages: () => void
   isConnected: boolean
   connectionError: Error | null
+  startNewConversation: () => Promise<void>
+  isConversationResetPending: boolean
+  isMessageDeliveryPending: boolean
+  isSessionInteractionLocked: boolean
+  sessionConversationState: SessionConversationState["phase"]
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
   getFilePreviewUrl: (fileId: string) => string
@@ -1226,15 +1503,83 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined)
 
-export interface AppProviderTransportConfig {
-  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
-  buildFilePreviewUrl?: (params: { baseUrl: string; fileId: string }) => string
-  buildFileDownloadUrl?: (params: { baseUrl: string; fileId: string }) => string
-  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+type TransportCapabilityState = "enabled" | "disabled"
+
+export interface AppProviderTransportCapabilities {
+  files?: TransportCapabilityState
+  agentCards?: TransportCapabilityState
+  voice?: TransportCapabilityState
+  taskControls?: TransportCapabilityState
 }
 
-// Global ref to track historical data requests per task ID
-const historicalDataRequestMap = new Map<number, boolean>()
+export interface AppProviderTransportConfig {
+  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
+  /**
+   * Owns every file URL and request made below this provider. Public
+   * transports use this to keep guest credentials instance-scoped.
+   */
+  fileAccess?: FileAccessPolicy
+  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+  capabilities?: AppProviderTransportCapabilities
+  session?: {
+    connection: WebSocketConnection | null
+    onConnectionClose: (
+      event: CloseEvent,
+      connectionIdentity?: string,
+    ) => "handled"
+    onConnectionFailure: (
+      failure: WebSocketConnectionFailure,
+      connectionIdentity?: string,
+    ) => void
+    onConnectionOpen?: (connectionIdentity: string) => void
+    allowTasklessChat: true
+    supportsConversationReset: true
+    history: "none"
+    files: "disabled"
+    agentCards: "disabled"
+    voice: "disabled"
+    taskControls: "disabled"
+  }
+}
+
+interface SessionResetFlight {
+  connectionIdentity: string
+  deliveryGeneration: number
+  promise: Promise<void>
+  resolve: () => void
+  reject: (error: Error) => void
+  timeout: ReturnType<typeof setTimeout>
+}
+
+interface SessionMessageOwner {
+  connectionIdentity: string
+}
+
+interface SessionPreAdoptionBuffer {
+  connectionIdentity: string
+  candidate: { message: WebSocketMessage; taskId: number } | null
+  frames: WebSocketMessage[]
+  bytes: number
+  timeout: ReturnType<typeof setTimeout> | null
+}
+
+const serializedWebSocketMessageBytes = (message: WebSocketMessage): number =>
+  new TextEncoder().encode(JSON.stringify(message)).byteLength
+
+function resolveTransportCapability(
+  sessionTransport: AppProviderTransportConfig["session"],
+  sessionState: TransportCapabilityState | undefined,
+  transportState: TransportCapabilityState | undefined,
+): boolean {
+  // Session transports are external credential domains and therefore default
+  // closed when a required runtime descriptor is malformed. Other transports
+  // preserve the existing enabled behavior unless they opt out explicitly.
+  return (
+    sessionTransport
+      ? sessionState ?? "disabled"
+      : transportState ?? "enabled"
+  ) === "enabled"
+}
 
 export function AppProvider({
   children,
@@ -1245,21 +1590,285 @@ export function AppProvider({
   token?: string
   transport?: AppProviderTransportConfig
 }) {
-  const [state, dispatch] = useReducer(appReducer, initialState)
+  const [state, privateCommit] = useReducer(
+    commitProjectedAppState,
+    undefined,
+    createInitialState,
+  )
+  const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
+  const startDelayedPlaybackRef = useRef<() => void>(() => {})
+  const isHistoricalDataLoadingRef = useRef(false)
+  const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
+  const recentMessagesRef = useRef(new Set<string>())
+  const isDuplicateMessage = useCallback((
+    content: string | React.ReactNode,
+    type = "general",
+    force = false,
+    shouldCache = true,
+  ) => {
+    const contentStr = normalizeMessageContent(content)
+    const key = `${type}:${contentStr}`
+    const cache = recentMessagesRef.current
+    if (!force && cache.has(key)) return true
+    if (shouldCache) {
+      cache.add(key)
+      setTimeout(() => cache.delete(key), 30_000)
+    }
+    return false
+  }, [])
+  const isDuplicateResult = useCallback(
+    (content: string) => isDuplicateMessage(content, "result"),
+    [isDuplicateMessage],
+  )
+  // All actions are projected synchronously so each action observes the state
+  // produced by the preceding action before React commits the batch.
+  const stateRef = useRef(state)
+  const dispatch = useCallback((action: AppAction) => {
+    const next = projectAppState(stateRef.current, action)
+    stateRef.current = next
+    privateCommit({ state: next })
+  }, [])
+  const sessionConversationRef = useRef<SessionConversationState>(initialSessionConversationState)
+  const dispatchSessionConversation = useCallback(
+    (action: SessionConversationAction) => {
+      const current = sessionConversationRef.current
+      const transition = transitionSessionConversation(current, action)
+      if (transition.changed) {
+        sessionConversationRef.current = transition.next
+        dispatch({ type: "SESSION_CONVERSATION", payload: action })
+      }
+      return transition
+    },
+    [dispatch],
+  )
+  useLayoutEffect(() => {
+    sessionConversationRef.current = state.sessionConversation
+  }, [state.sessionConversation])
   const [pendingMessage, setPendingMessage] = useState<PendingMessage | null>(null)
-  const { token: authToken } = useAuth() // Get auth token from context
+  const pendingMessageRef = useRef(pendingMessage)
+  pendingMessageRef.current = pendingMessage
+  useEffect(() => {
+    const clear = () => recentMessagesRef.current.clear()
+    duplicateMessageCacheClearers.add(clear)
+    return () => {
+      duplicateMessageCacheClearers.delete(clear)
+    }
+  }, [])
+  const sessionTransport = transport?.session
+  const filesDisabled = !resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.files,
+    transport?.capabilities?.files,
+  )
+  const rejectDisabledFileUpload = useCallback(async () => {
+    throw new Error("Files are disabled for this conversation.")
+  }, [])
+  const requestedAgentCardsEnabled = resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.agentCards,
+    transport?.capabilities?.agentCards,
+  )
+  const agentCardsEnabled = resolveAgentCardPresentationCapability(
+    filesDisabled,
+    requestedAgentCardsEnabled,
+  )
+  const voiceInputEnabled = resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.voice,
+    transport?.capabilities?.voice,
+  )
+  const taskControlsEnabled = resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.taskControls,
+    transport?.capabilities?.taskControls,
+  )
+  const sessionConnectionIdentity =
+    sessionTransport?.connection?.identity ?? null
+  const [deliveryGeneration, setDeliveryGeneration] = useState(0)
+  const deliveryGenerationRef = useRef(deliveryGeneration)
+  deliveryGenerationRef.current = deliveryGeneration
+  const [messageDeliveryCount, setMessageDeliveryCount] = useState(0)
+  const messageDeliveryCountRef = useRef(0)
+  const sessionConnectionIdentityRef = useRef(sessionConnectionIdentity)
+  sessionConnectionIdentityRef.current = sessionConnectionIdentity
+  const previousSessionConnectionIdentityRef = useRef(
+    sessionConnectionIdentity
+  )
+  const sessionResetFlightRef = useRef<SessionResetFlight | null>(null)
+  const sessionPreAdoptionBufferRef = useRef<SessionPreAdoptionBuffer | null>(null)
+  const flushingSessionPreAdoptionCandidateRef = useRef<WebSocketMessage | null>(null)
+  const retiredSessionTaskIdsRef = useRef(new Set<number>())
+  const sessionMessageHandlerRef = useRef<
+    (message: WebSocketMessage, owner: SessionMessageOwner) => void
+  >(() => {})
+  const mountedRef = useRef(false)
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
   const taskStateVersionsRef = useRef(
-    new Map<number, { version: number; runId?: string | null }>()
+    new Map<number, TaskStateVersionEntry>()
   )
 
-  // Ref to track current state for WebSocket message handler
-  const stateRef = useRef(state)
-  stateRef.current = state
+  // Session task ownership is established only by a current-socket task_info;
+  // never import a legacy route/storage Task id into this protocol state.
+  const sessionTaskIdRef = useRef<number | null>(null)
+
+  const rejectSessionResetFlight = useCallback(
+    (
+      resetFlight: SessionResetFlight | null,
+      error: Error,
+    ): boolean => {
+      if (
+        !resetFlight
+        || sessionResetFlightRef.current !== resetFlight
+      ) {
+        return false
+      }
+
+      sessionResetFlightRef.current = null
+      clearTimeout(resetFlight.timeout)
+      resetFlight.reject(error)
+      return true
+    },
+    [],
+  )
+
+  const discardSessionPreAdoptionBuffer = useCallback(() => {
+    const buffer = sessionPreAdoptionBufferRef.current
+    if (!buffer) return
+    if (buffer.timeout !== null) clearTimeout(buffer.timeout)
+    sessionPreAdoptionBufferRef.current = null
+  }, [])
+
+  const requireSessionReload = useCallback((error: Error) => {
+    discardSessionPreAdoptionBuffer()
+    rejectSessionResetFlight(sessionResetFlightRef.current, error)
+    dispatchSessionConversation({
+      type: "SESSION_RELOAD_REQUIRED",
+      connectionIdentity: sessionConnectionIdentityRef.current,
+    })
+  }, [discardSessionPreAdoptionBuffer, dispatchSessionConversation, rejectSessionResetFlight])
+
+  const beginSessionPreAdoptionBuffer = useCallback((connectionIdentity: string) => {
+    discardSessionPreAdoptionBuffer()
+    sessionPreAdoptionBufferRef.current = {
+      connectionIdentity,
+      candidate: null,
+      frames: [],
+      bytes: 0,
+      timeout: null,
+    }
+  }, [discardSessionPreAdoptionBuffer])
+
+  const activateSessionPreAdoptionBuffer = useCallback((connectionIdentity: string) => {
+    const buffer = sessionPreAdoptionBufferRef.current
+    if (!buffer || buffer.connectionIdentity !== connectionIdentity) {
+      requireSessionReload(
+        new Error("Replacement conversation transaction is missing; reload required.")
+      )
+      return
+    }
+    if (buffer.timeout !== null) return
+    buffer.timeout = setTimeout(() => {
+      const buffer = sessionPreAdoptionBufferRef.current
+      if (buffer?.connectionIdentity !== connectionIdentity) return
+      requireSessionReload(
+        new Error("Replacement conversation did not publish task_info before its deadline; reload required.")
+      )
+    }, SESSION_TASK_ADOPTION_TIMEOUT_MS)
+    if (buffer.candidate) {
+      flushingSessionPreAdoptionCandidateRef.current = buffer.candidate.message
+      try {
+        sessionMessageHandlerRef.current(buffer.candidate.message, { connectionIdentity })
+      } finally {
+        flushingSessionPreAdoptionCandidateRef.current = null
+      }
+    }
+  }, [requireSessionReload])
+
+  const bufferSessionPreAdoptionFrame = useCallback((
+    message: WebSocketMessage,
+    owner: SessionMessageOwner,
+    candidateTaskId?: number,
+  ): boolean => {
+    const buffer = sessionPreAdoptionBufferRef.current
+    if (!buffer || buffer.connectionIdentity !== owner.connectionIdentity) {
+      requireSessionReload(
+        new Error("Replacement frame ownership is unknown; reload required.")
+      )
+      return false
+    }
+    const bytes = serializedWebSocketMessageBytes(message)
+    if (candidateTaskId !== undefined && buffer.candidate) {
+      if (buffer.candidate.taskId === candidateTaskId) return true
+      requireSessionReload(
+        new Error("Replacement conversation published conflicting task_info; reload required.")
+      )
+      return false
+    }
+    if (
+      buffer.frames.length + (buffer.candidate ? 1 : 0) >= MAX_SESSION_PRE_ADOPTION_FRAMES
+      || buffer.bytes + bytes > MAX_SESSION_PRE_ADOPTION_BYTES
+    ) {
+      requireSessionReload(
+        new Error("Replacement frame buffer exceeded its safe bound; reload required.")
+      )
+      return false
+    }
+    if (candidateTaskId !== undefined) {
+      buffer.candidate = { message, taskId: candidateTaskId }
+    } else {
+      buffer.frames.push(message)
+    }
+    buffer.bytes += bytes
+    return true
+  }, [requireSessionReload])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      messageDeliveryCountRef.current = 0
+      discardSessionPreAdoptionBuffer()
+      rejectSessionResetFlight(
+        sessionResetFlightRef.current,
+        new Error("Conversation reset was cancelled because chat was closed.")
+      )
+    }
+  }, [discardSessionPreAdoptionBuffer, rejectSessionResetFlight])
+
+  useEffect(() => {
+    const previousIdentity = previousSessionConnectionIdentityRef.current
+    previousSessionConnectionIdentityRef.current = sessionConnectionIdentity
+    if (previousIdentity === sessionConnectionIdentity) return
+
+    if (sessionConversationRef.current.phase === "bound") {
+      if (sessionConnectionIdentity) {
+        dispatchSessionConversation({
+          type: "SESSION_BOUND_CONNECTION_REBOUND",
+          connectionIdentity: sessionConnectionIdentity,
+        })
+      }
+      return
+    }
+    if (sessionConversationRef.current.phase !== "unbound") {
+      requireSessionReload(
+        new Error("Conversation outcome is unknown after a connection refresh; reload required.")
+      )
+    }
+  }, [dispatchSessionConversation, requireSessionReload, sessionConnectionIdentity])
 
   const onConnect = useCallback(() => {
+    if (sessionTransport?.history === "none") {
+      const connectionIdentity = sessionConnectionIdentityRef.current
+      if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {
+        sessionTransport.onConnectionOpen?.(connectionIdentity)
+      }
+      isHistoricalDataLoadingRef.current = false
+      dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+      return
+    }
+
     // Fix: If we should be in replay mode but got disconnected, restore replay state
     if (stateRef.current.replayTaskId && stateRef.current.taskId === stateRef.current.replayTaskId && !stateRef.current.isReplaying) {
       dispatch({ type: "SET_REPLAY_PLAYING", payload: true })
@@ -1284,7 +1893,7 @@ export function AppProvider({
     }
 
     // Set history loading state
-    isHistoricalDataLoading = true
+    isHistoricalDataLoadingRef.current = true
     dispatch({ type: "SET_HISTORY_LOADING", payload: true })
 
     // Safety timeout: if no history arrives within 2 seconds, assume empty or done
@@ -1294,29 +1903,40 @@ export function AppProvider({
 
     // Auto-execute PENDING tasks from Agent Builder
     setTimeout(() => {
-      if (pendingTaskToExecute) {
+      if (pendingTaskToExecuteRef.current) {
         const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
         console.log('🔍 onConnect - checking auto-execute:', {
-          hasPendingTask: !!pendingTaskToExecute,
-          pendingDescription: pendingTaskToExecute.description,
+          hasPendingTask: !!pendingTaskToExecuteRef.current,
+          pendingDescription: pendingTaskToExecuteRef.current.description,
           hasUserMessages,
         })
 
         if (!hasUserMessages) {
-          console.log('🚀 Auto-executing PENDING task from Agent Builder (onConnect):', pendingTaskToExecute.description)
+          console.log('🚀 Auto-executing PENDING task from Agent Builder (onConnect):', pendingTaskToExecuteRef.current.description)
           // sendChatMessage(pendingTaskToExecute.description, []) // Cannot access sendChatMessage
-          pendingTaskToExecute = null
+          pendingTaskToExecuteRef.current = null
         } else {
           console.log('⏭️ Skipping auto-execute, already has user messages')
-          pendingTaskToExecute = null
+          pendingTaskToExecuteRef.current = null
         }
       }
     }, 1000)
-  }, [])
+  }, [
+    sessionConnectionIdentity,
+    sessionTransport?.history,
+    sessionTransport?.onConnectionOpen,
+  ])
+
+  const sessionMessageOwner = sessionConnectionIdentity
+    ? {
+      connectionIdentity: sessionConnectionIdentity,
+    }
+    : null
 
   const {
     isConnected,
     connectionError,
+    sendMessage: sendRawMessage,
     sendChatMessage,
     executeTask: wsExecuteTask,
     pauseTask: wsPauseTask,
@@ -1327,13 +1947,52 @@ export function AppProvider({
     taskId: state.taskId || undefined,
     token,
     buildWebSocketUrl: transport?.buildWebSocketUrl,
-    uploadFiles: transport?.uploadFiles,
+    uploadFiles: filesDisabled
+      ? rejectDisabledFileUpload
+      : transport?.uploadFiles,
+    connection:
+      sessionTransport === undefined
+        ? undefined
+        : sessionTransport.connection,
+    deliveryGeneration:
+      sessionTransport === undefined
+        ? undefined
+        : deliveryGeneration,
+    onSessionConnectionClose: sessionTransport?.onConnectionClose,
+    onSessionConnectionFailure: sessionTransport?.onConnectionFailure,
     onMessage: (message) => {
-      handleMessage(message, dispatch, stateRef.current)
+      if (sessionTransport) {
+        if (
+          !mountedRef.current
+          || !sessionMessageOwner
+          || sessionMessageOwner.connectionIdentity
+            !== sessionConnectionIdentityRef.current
+        ) {
+          return
+        }
+        sessionMessageHandlerRef.current(message, sessionMessageOwner)
+        return
+      }
+      handleMessage(message, dispatch, stateRef.current, { filesDisabled })
     },
     onConnect: onConnect, // Pass the callback
     autoConnect: true,
   })
+
+  useEffect(() => {
+    if (!sessionTransport || isConnected) return
+    if (
+      sessionConversationRef.current.phase !== "reset_requested"
+      && sessionConversationRef.current.phase !== "replacement_ready"
+      && sessionConversationRef.current.phase !== "replacement_sending"
+      && sessionConversationRef.current.phase !== "replacement_awaiting_task"
+    ) {
+      return
+    }
+    requireSessionReload(
+      new Error("Conversation outcome is unknown because the Session disconnected; reload required.")
+    )
+  }, [isConnected, requireSessionReload, sessionTransport])
 
   // Handle pending messages separately since we need sendChatMessage
   useEffect(() => {
@@ -1401,18 +2060,18 @@ export function AppProvider({
 
   // Handle auto-execute pending task separately
   useEffect(() => {
-    if (isConnected && pendingTaskToExecute) {
+    if (isConnected && pendingTaskToExecuteRef.current) {
       // Logic moved to effect
       // But wait, pendingTaskToExecute is not state, it's a let variable.
       // Effect won't run when it changes.
       // But it runs when isConnected changes.
 
       const timer = setTimeout(() => {
-        if (pendingTaskToExecute) {
+        if (pendingTaskToExecuteRef.current) {
           const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
           if (!hasUserMessages) {
-            sendChatMessage(pendingTaskToExecute.description, [])
-            pendingTaskToExecute = null
+            sendChatMessage(pendingTaskToExecuteRef.current.description, [])
+            pendingTaskToExecuteRef.current = null
           }
         }
       }, 1000)
@@ -1439,12 +2098,21 @@ export function AppProvider({
     })
   }, [isConnected, state.taskId, connectionError])
 
-  const handleMessage = useCallback((message: WebSocketMessage, dispatch: React.Dispatch<AppAction>, currentState: AppState) => {
+  const handleMessage = useCallback((
+    message: WebSocketMessage,
+    dispatch: React.Dispatch<AppAction>,
+    currentState: AppState,
+    options?: {
+      skipHistory?: boolean
+      filesDisabled?: boolean
+    },
+  ) => {
     // If we're in replay mode, don't process immediately - collect for delayed playback
     if (
-      shouldBufferMessageForHistoricalReplay({
+      !options?.skipHistory
+      && shouldBufferMessageForHistoricalReplay({
         isReplaying: currentState.isReplaying,
-        isHistoryLoading: currentState.isHistoryLoading || isHistoricalDataLoading,
+        isHistoryLoading: currentState.isHistoryLoading || isHistoricalDataLoadingRef.current,
         message,
       })
     ) {
@@ -1456,12 +2124,12 @@ export function AppProvider({
         getWebSocketEventType(message) === "historical_data_complete"
 
       if (isHistoricalComplete) {
-        isHistoricalDataLoading = false
+        isHistoricalDataLoadingRef.current = false
         dispatch({ type: "SET_HISTORY_LOADING", payload: false })
         dispatch({ type: "SYNC_PROCESSING_STATUS" })
         // Add a small delay to ensure all events are collected before starting playback
         setTimeout(() => {
-          startDelayedPlayback()
+          startDelayedPlaybackRef.current()
         }, 500) // 500ms delay to collect remaining events
       }
 
@@ -1470,37 +2138,13 @@ export function AppProvider({
 
     const controlEnvelope = extractTaskControlEnvelope(message)
     if (controlEnvelope.isStateEvent && controlEnvelope.taskId !== undefined) {
-      const knownState = taskStateVersionsRef.current.get(controlEnvelope.taskId)
-      if (controlEnvelope.stateVersion === undefined) {
-        // Once the server has established the versioned protocol for a task,
-        // legacy/unversioned replay events must not be allowed to roll it back.
-        // Error events carry information rather than a state transition, so a
-        // rare unversioned error must still reach the user.
-        const isErrorEvent = message.type === "error" || message.type === "agent_error"
-        if (knownState && !isErrorEvent) return
-      } else {
-        const isOlderVersion = knownState
-          && controlEnvelope.stateVersion < knownState.version
-        // Backend transitions currently advance the version whenever run_id
-        // changes. Keep this defensive guard for malformed or future emitters.
-        const isDifferentRunAtSameVersion = knownState
-          && controlEnvelope.stateVersion === knownState.version
-          && knownState.runId !== undefined
-          && controlEnvelope.runId !== undefined
-          && knownState.runId !== controlEnvelope.runId
-        if (isOlderVersion || isDifferentRunAtSameVersion) return
-        taskStateVersionsRef.current.delete(controlEnvelope.taskId)
-        taskStateVersionsRef.current.set(controlEnvelope.taskId, {
-          version: controlEnvelope.stateVersion,
-          runId: controlEnvelope.runId,
-        })
-        if (taskStateVersionsRef.current.size > MAX_TRACKED_TASK_STATE_VERSIONS) {
-          const oldestTaskId = taskStateVersionsRef.current.keys().next().value
-          if (oldestTaskId !== undefined) {
-            taskStateVersionsRef.current.delete(oldestTaskId)
-          }
-        }
-      }
+      if (
+        !acceptTaskControlVersion(
+          message,
+          controlEnvelope,
+          taskStateVersionsRef.current,
+        )
+      ) return
 
       // A late event may have an old semantic type (for example
       // ``task_paused``) after a newer run is already RUNNING. The backend
@@ -1586,8 +2230,11 @@ export function AppProvider({
 
           // Handle structured trace events
           if (eventType === "task_info") {
-            const taskData = eventData
-            const taskStatus = normalizeTaskStatus(taskData.status) || "pending"
+            const taskData = eventData as Record<string, unknown>
+            const taskId = parseInteger(taskData.id)
+            if (taskId === undefined || taskId <= 0) return
+            const task = taskFromTaskInfoData(taskData, taskId)
+            const taskStatus = task.status
             console.log('📥 Received task_info event:', {
               taskData,
               status: taskData.status,
@@ -1595,52 +2242,23 @@ export function AppProvider({
             })
 
             // Store pending task for auto-execution
-            if (taskStatus === 'pending' && taskData.description) {
-              pendingTaskToExecute = { description: taskData.description }
+            if (taskStatus === 'pending' && task.description) {
+              pendingTaskToExecuteRef.current = { description: task.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
 
             // Check if status changed and trigger update if so
-            if (currentState.currentTask?.id === taskData.id.toString() && currentState.currentTask?.status !== taskStatus) {
+            if (currentState.currentTask?.id === task.id && currentState.currentTask?.status !== taskStatus) {
               dispatch({ type: "TRIGGER_TASK_UPDATE" })
             }
 
             dispatch({
               type: "SET_CURRENT_TASK",
-              payload: {
-                id: taskData.id.toString(),
-                title: taskData.title,
-                description: taskData.description,
-                status: taskStatus,
-                createdAt: taskData.created_at,
-                updatedAt: taskData.updated_at,
-                modelId: taskData.model_id,
-                smallFastModelId: taskData.small_fast_model_id,
-                visualModelId: taskData.visual_model_id,
-                compactModelId: taskData.compact_model_id,
-                modelName: taskData.model_name,
-                smallFastModelName: taskData.small_fast_model_name,
-                visualModelName: taskData.visual_model_name,
-                compactModelName: taskData.compact_model_name,
-                executionMode: taskData.execution_mode,
-                isDag: taskData.is_dag,
-                agentId: taskData.agent_id,
-                agentName: taskData.agent_name,
-                agentLogoUrl: taskData.agent_logo_url,
-                waitingQuestion: taskData.waiting_question,
-                waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
-                runId: taskData.run_id,
-                stateVersion: taskData.state_version,
-                controlState: taskData.control_state,
-              }
+              payload: task,
             })
 
             // Check if this is a new task (created within last 5 seconds)
             // If so, we don't expect historical messages, so stop loading
-            const createdAt = typeof taskData.created_at === 'number'
-              ? (taskData.created_at > 10000000000 ? taskData.created_at : taskData.created_at * 1000) // Handle ms vs s
-              : new Date(taskData.created_at).getTime()
-
             // We do NOT stop loading here for new tasks anymore.
             // We wait for the user_message event or the timeout to handle it.
             // This prevents the empty state flash when task_info arrives before user_message.
@@ -1712,7 +2330,7 @@ export function AppProvider({
             console.log('🔍 Duplicate check:', {
               messageContent,
               isDuplicate,
-              recentMessages: Array.from(recentMessages)
+              recentMessages: Array.from(recentMessagesRef.current)
             })
 
             if (isDuplicate) {
@@ -1738,7 +2356,7 @@ export function AppProvider({
                 <UserMessageContent
                   message={messageContent}
                   files={files}
-                  onPreview={(file, previewFiles) => {
+                  onPreview={options?.filesDisabled ? undefined : (file, previewFiles) => {
                     const currentFileId = file.file_id || ""
                     const normalizedFiles = previewFiles.map((previewFile) => ({
                       fileId: previewFile.file_id || "",
@@ -1938,7 +2556,7 @@ export function AppProvider({
             )
 
             // Set DAG execution state to planning phase (only if not already executing or completed)
-            if (!state.dagExecution || state.dagExecution.phase === "planning") {
+            if (!currentState.dagExecution || currentState.dagExecution.phase === "planning") {
               const dagExecution: DAGExecution = {
                 phase: phase as "planning" | "executing" | "completed" | "failed",
                 current_plan: {},
@@ -1973,7 +2591,7 @@ export function AppProvider({
               <>
                 <CheckCircle className="h-4 w-4 inline mr-2 text-green-500" />
                 {t('agent.logs.event.messages.planEnd', { planId, stepsCount })}
-                {state.planMemoryInfo && (
+                {currentState.planMemoryInfo && (
                   <div className="mt-2">
                     <CollapsibleSection
                       title={t('agent.planDetails.memory.title')}
@@ -1983,26 +2601,26 @@ export function AppProvider({
                       <div className="grid grid-cols-2 gap-2 text-xs">
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Search className="h-3 w-3" />
-                          <span>{t('agent.planDetails.memory.stats.found', { count: state.planMemoryInfo.memoriesFound })}</span>
+                          <span>{t('agent.planDetails.memory.stats.found', { count: currentState.planMemoryInfo.memoriesFound })}</span>
                         </div>
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Target className="h-3 w-3" />
-                          <span>{t('agent.planDetails.memory.stats.used', { count: state.planMemoryInfo.memoriesUsed })}</span>
+                          <span>{t('agent.planDetails.memory.stats.used', { count: currentState.planMemoryInfo.memoriesUsed })}</span>
                         </div>
                       </div>
-                      {state.planMemoryInfo.enhancedGoal && (
+                      {currentState.planMemoryInfo.enhancedGoal && (
                         <div className="mt-2">
                           <div className="text-xs font-medium text-muted-foreground mb-1">{t('agent.planDetails.memory.enhancedGoalTitle')}</div>
                           <div className="text-xs bg-blue-500/10 p-2 rounded border border-blue-500/20">
-                            {state.planMemoryInfo.enhancedGoal}
+                            {currentState.planMemoryInfo.enhancedGoal}
                           </div>
                         </div>
                       )}
-                      {state.planMemoryInfo.memories && state.planMemoryInfo.memories.length > 0 && (
+                      {currentState.planMemoryInfo.memories && currentState.planMemoryInfo.memories.length > 0 && (
                         <div className="mt-2">
                           <div className="text-xs font-medium text-muted-foreground mb-1">{t('agent.planDetails.memory.relatedTitle')}</div>
                           <div className="space-y-1">
-                            {state.planMemoryInfo.memories.map((memory, index) => (
+                            {currentState.planMemoryInfo.memories.map((memory, index) => (
                               <div
                                 key={index}
                                 className="text-xs p-2 bg-muted/20 rounded border border-border/50"
@@ -2047,9 +2665,9 @@ export function AppProvider({
               })
 
               // Update DAG execution state to executing phase (only if not already completed or failed)
-              if (state.dagExecution && state.dagExecution.phase !== "completed" && state.dagExecution.phase !== "failed") {
+              if (currentState.dagExecution && currentState.dagExecution.phase !== "completed" && currentState.dagExecution.phase !== "failed") {
                 const updatedDAGExecution = {
-                  ...state.dagExecution,
+                  ...currentState.dagExecution,
                   phase: "executing" as const,
                   current_plan: planData,
                   updated_at: message.timestamp,
@@ -2069,9 +2687,9 @@ export function AppProvider({
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             // Update DAG execution state to executing phase
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "executing" as const,
                 updated_at: message.timestamp,
               }
@@ -2118,9 +2736,9 @@ export function AppProvider({
             dispatch({ type: "SET_PROCESSING", payload: false })
 
             // Update DAG execution state to completed phase
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "completed" as const,
                 updated_at: message.timestamp,
               }
@@ -2223,7 +2841,7 @@ export function AppProvider({
 
             // dag_step_start has step_id, should update the right-side step data, do not display message on the left
             // Find existing step first, preserve dependencies
-            const existingStep = state.steps.find(s => s.id === (message.step_id || eventData.step_id || stepName))
+            const existingStep = currentState.steps.find(s => s.id === (message.step_id || eventData.step_id || stepName))
             const step: StepExecution = {
               id: message.step_id || eventData.step_id || stepName,
               name: stepName,
@@ -2264,7 +2882,7 @@ export function AppProvider({
 
             // dag_step_end has step_id, should update right-side step data, do not display message on the left
             const stepId = message.step_id || eventData.step_id || stepName
-            const existingStep = state.steps.find(s => s.id === stepId)
+            const existingStep = currentState.steps.find(s => s.id === stepId)
             const step: StepExecution = {
               id: stepId,
               name: stepName,
@@ -2306,12 +2924,12 @@ export function AppProvider({
           } else if (eventType === "dag_step_failed") {
             const stepName = eventData.step_name || eventData.name || eventData.title || `${t('agent.logs.event.messages.execStepPrefix')}${eventData.step_id || t('common.errors.unknown')}`
             const stepId = message.step_id || eventData.step_id || stepName
-            const existingStep = state.steps.find(s => s.id === stepId)
+            const existingStep = currentState.steps.find(s => s.id === stepId)
 
             // Update DAG execution state to failed
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "failed" as const,
                 updated_at: message.timestamp,
               }
@@ -2812,7 +3430,11 @@ export function AppProvider({
                   id: msgId,
                   role: "assistant",
                   content: <div className="space-y-2">
-                    <MarkdownRenderer content={clarificationMessage} />
+                    <MarkdownRenderer
+                      content={clarificationMessage}
+                      filesDisabled={options?.filesDisabled}
+                      agentCardsEnabled={agentCardsEnabled}
+                    />
                     <ClarificationForm
                       interactions={clarification.interactions}
                       messageId={msgId}
@@ -2974,7 +3596,13 @@ export function AppProvider({
                     <span>{t('agent.logs.event.messages.metaTitle')}</span>
                   </div>
                   <div className="ml-6">
-                    <JsonRenderer data={metaInfo} onFileClick={openFilePreview} onAgentClick={(agentId) => router.push(`/agent/${agentId}`)} />
+                    <JsonRenderer
+                      data={metaInfo}
+                      filesDisabled={options?.filesDisabled}
+                      agentCardsEnabled={agentCardsEnabled}
+                      onFileClick={options?.filesDisabled ? undefined : openFilePreview}
+                      onAgentClick={(agentId) => router.push(`/agent/${agentId}`)}
+                    />
                   </div>
                 </div>
               )
@@ -3018,6 +3646,7 @@ export function AppProvider({
                           <span className="text-sm font-mono">{fileName}</span>
                           <button
                             onClick={() => {
+                              if (options?.filesDisabled) return
                               // Dispatch custom event to open file preview with all files
                               const allFiles = normalizeGeneratedPreviewFiles(fileOutputsData)
 
@@ -3034,7 +3663,7 @@ export function AppProvider({
                                 }
                               }))
                             }}
-                            disabled={!filePath}
+                            disabled={options?.filesDisabled || !filePath}
                             className="text-xs bg-primary/10 hover:bg-primary/20 text-primary px-2 py-1 rounded transition-colors"
                           >
                             {t('agent.logs.event.messages.previewLabel')}
@@ -3060,7 +3689,9 @@ export function AppProvider({
                 })
               }
 
-              dispatchAutoOpenPreview(fileOutputsData, dispatch)
+              if (!options?.filesDisabled) {
+                dispatchAutoOpenPreview(fileOutputsData, dispatch)
+              }
             }
 
             // Update task status and trigger sidebar update
@@ -3849,16 +4480,16 @@ export function AppProvider({
 
           // Historical Data Events - handled by the main message handler below
           else if (eventType === "historical_data_complete") {
-            isHistoricalDataLoading = false
+            isHistoricalDataLoadingRef.current = false
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
             // If we're in replay mode, initialize the replay scheduler
-            if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {
+            if (currentState.isReplaying && currentState.replayTaskId && currentState.replayEventCache.length > 0) {
               initializeReplayScheduler()
             } else {
               // Fix: If we have cache but replay mode is not set, force start replay
-              if (state.replayEventCache.length > 0 && state.replayTaskId && !state.isReplaying) {
+              if (currentState.replayEventCache.length > 0 && currentState.replayTaskId && !currentState.isReplaying) {
                 dispatch({ type: "SET_REPLAY_PLAYING", payload: true })
                 setTimeout(() => {
                   initializeReplayScheduler()
@@ -3910,7 +4541,7 @@ export function AppProvider({
           else if (traceEventData.goal) {
             // For now, create a basic task structure
             const task = {
-              id: state.taskId?.toString() || "unknown",
+              id: currentState.taskId?.toString() || "unknown",
               title: traceEventData.task_preview || traceEventData.goal,
               description: traceEventData.goal,
               status: "completed" as const,
@@ -4079,9 +4710,9 @@ export function AppProvider({
         }
 
         // Update DAG execution status to completed
-        if (state.dagExecution) {
+        if (currentState.dagExecution) {
           const updatedDAGExecution = {
-            ...state.dagExecution,
+            ...currentState.dagExecution,
             phase: taskData.status,
             updated_at: new Date().toISOString()
           }
@@ -4097,8 +4728,8 @@ export function AppProvider({
         }
 
         // Mark that historical data should not be requested again for completed/failed tasks
-        if (state.taskId) {
-          historicalDataRequestMap.set(state.taskId, true)
+        if (currentState.taskId) {
+          historicalDataRequestMapRef.current.set(currentState.taskId, true)
         }
 
         // Handle file outputs
@@ -4124,6 +4755,7 @@ export function AppProvider({
                       <span className="text-sm font-mono">{fileName}</span>
                       <button
                         onClick={() => {
+                          if (options?.filesDisabled) return
                           // Dispatch custom event to open file preview with all files
                           const allFiles = normalizeGeneratedPreviewFiles(taskData.fileOutputs)
 
@@ -4140,7 +4772,7 @@ export function AppProvider({
                             }
                           }))
                         }}
-                        disabled={!filePath}
+                        disabled={options?.filesDisabled || !filePath}
                         className="text-xs bg-primary/10 hover:bg-primary/20 text-primary px-2 py-1 rounded transition-colors"
                       >
                         {t('agent.logs.event.messages.previewLabel')}
@@ -4166,7 +4798,9 @@ export function AppProvider({
             })
           }
 
-          dispatchAutoOpenPreview(taskData.fileOutputs, dispatch)
+          if (!options?.filesDisabled) {
+            dispatchAutoOpenPreview(taskData.fileOutputs, dispatch)
+          }
         }
 
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -4204,15 +4838,15 @@ export function AppProvider({
 
         // Update DAG execution status
         // Update overall DAG status based on step status
-        if (state.dagExecution) {
-          const updatedDAGExecution = { ...state.dagExecution }
+        if (currentState.dagExecution) {
+          const updatedDAGExecution = { ...currentState.dagExecution }
 
           // Update DAG phase based on step status
           if (stepInfo.status === "running") {
             updatedDAGExecution.phase = "executing" as const
           } else if (stepInfo.status === "completed") {
             // Check if all steps are completed
-            const allStepsCompleted = state.steps.every(step =>
+            const allStepsCompleted = currentState.steps.every(step =>
               step.id === stepInfo.id ? stepInfo.status === "completed" : step.status === "completed"
             )
             if (allStepsCompleted) {
@@ -4232,7 +4866,7 @@ export function AppProvider({
         break
 
       case "dag_execution":
-        const dagSteps = stepsFromPlanData(message.data, state.steps)
+        const dagSteps = stepsFromPlanData(message.data, currentState.steps)
         if (dagSteps) {
           dispatch({ type: "SET_STEPS", payload: dagSteps })
         }
@@ -4337,9 +4971,9 @@ export function AppProvider({
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
 
-        if (agentErrorTaskStatus === "failed" && state.dagExecution) {
+        if (agentErrorTaskStatus === "failed" && currentState.dagExecution) {
           const updatedDAGExecution = {
-            ...state.dagExecution,
+            ...currentState.dagExecution,
             phase: "failed" as const,
             updated_at: message.timestamp,
           }
@@ -4398,17 +5032,227 @@ export function AppProvider({
 
       case "historical_data_complete":
         // Historical data loading complete
-        isHistoricalDataLoading = false
+        isHistoricalDataLoadingRef.current = false
         dispatch({ type: "SET_HISTORY_LOADING", payload: false })
         dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
         // If we're in replay mode, initialize the replay scheduler
-        if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {
+        if (currentState.isReplaying && currentState.replayTaskId && currentState.replayEventCache.length > 0) {
           initializeReplayScheduler()
         }
         break
     }
   }, [])
+
+  const handleSessionMessage = (
+    message: WebSocketMessage,
+    owner: SessionMessageOwner,
+  ) => {
+    if (!mountedRef.current) return
+    if (
+      owner.connectionIdentity !== sessionConnectionIdentityRef.current
+    ) {
+      return
+    }
+
+    if (message.type === "conversation_reset") {
+      const resetFlight = sessionResetFlightRef.current
+      if (
+        !resetFlight
+        || resetFlight.connectionIdentity !== owner.connectionIdentity
+        || resetFlight.deliveryGeneration !== deliveryGenerationRef.current
+      ) {
+        return
+      }
+
+      const transition = dispatchSessionConversation({
+        type: "SESSION_RESET_ACKNOWLEDGED",
+        connectionIdentity: owner.connectionIdentity,
+      })
+      if (!transition.accepted) return
+
+      const retiredTaskId = sessionTaskIdRef.current
+      if (retiredTaskId !== null) {
+        retiredSessionTaskIdsRef.current.add(retiredTaskId)
+        if (
+          retiredSessionTaskIdsRef.current.size
+          > MAX_RETIRED_SESSION_TASK_IDS
+        ) {
+          const oldestTaskId =
+            retiredSessionTaskIdsRef.current.values().next().value
+          if (oldestTaskId !== undefined) {
+            retiredSessionTaskIdsRef.current.delete(oldestTaskId)
+          }
+        }
+      }
+
+      sessionResetFlightRef.current = null
+      clearTimeout(resetFlight.timeout)
+      sessionTaskIdRef.current = null
+      taskStateVersionsRef.current.clear()
+      stateRef.current.replayScheduler?.stop()
+      pendingTaskToExecuteRef.current = null
+      lastConnectedTaskId.current = null
+      recentMessagesRef.current.clear()
+      const pending = pendingMessageRef.current
+      pendingMessageRef.current = null
+      setPendingMessage(null)
+      pending?.reject?.(
+        new Error("Message delivery was cancelled by conversation reset.")
+      )
+
+      const nextDeliveryGeneration = deliveryGenerationRef.current + 1
+      deliveryGenerationRef.current = nextDeliveryGeneration
+      setDeliveryGeneration(nextDeliveryGeneration)
+      dispatch({ type: "RESET_SESSION_CONVERSATION" })
+      resetFlight.resolve()
+      return
+    }
+
+    const binding = extractSessionTaskBinding(message)
+    if (binding.present && !binding.valid) return
+
+    const taskInfoData = getSessionTaskInfoData(message)
+    if (taskInfoData) {
+      const taskId = parseInteger(taskInfoData.id)
+      if (
+        taskId === undefined
+        || taskId <= 0
+        || retiredSessionTaskIdsRef.current.has(taskId)
+        || (
+          binding.present
+          && binding.valid
+          && binding.taskId !== taskId
+        )
+      ) {
+        return
+      }
+      const lifecycle = sessionConversationRef.current
+      const isFlushingCandidate =
+        flushingSessionPreAdoptionCandidateRef.current === message
+      if (
+        !isFlushingCandidate
+        && (
+          lifecycle.phase === "replacement_sending"
+          || lifecycle.phase === "replacement_awaiting_task"
+        )
+      ) {
+        if (!bufferSessionPreAdoptionFrame(message, owner, taskId)) return
+        const buffer = sessionPreAdoptionBufferRef.current
+        if (
+          lifecycle.phase === "replacement_awaiting_task"
+          && buffer?.timeout != null
+        ) {
+          flushingSessionPreAdoptionCandidateRef.current = message
+          try {
+            handleSessionMessage(message, owner)
+          } finally {
+            flushingSessionPreAdoptionCandidateRef.current = null
+          }
+        }
+        return
+      }
+      if (
+        lifecycle.phase === "reset_requested"
+        || lifecycle.phase === "replacement_ready"
+        || lifecycle.phase === "reload_required"
+      ) {
+        return
+      }
+
+      const currentTaskId = sessionTaskIdRef.current
+      if (
+        currentTaskId !== null
+        && currentTaskId !== taskId
+      ) {
+        requireSessionReload(
+          new Error("Session task lineage changed without a reset; reload required.")
+        )
+        return
+      }
+      const taskInfoEnvelope = extractTaskControlEnvelope(message)
+      if (
+        taskInfoEnvelope.taskId !== taskId
+        || !canAcceptTaskControlVersion(
+          message,
+          taskInfoEnvelope,
+          taskStateVersionsRef.current,
+        )
+      ) {
+        return
+      }
+
+      const bufferedFrames = lifecycle.phase === "replacement_awaiting_task"
+        ? sessionPreAdoptionBufferRef.current?.frames.slice() ?? []
+        : []
+      discardSessionPreAdoptionBuffer()
+      const transition = dispatchSessionConversation({
+        type: "SESSION_TASK_INFO",
+        connectionIdentity: owner.connectionIdentity,
+        taskId,
+      })
+      if (!transition.accepted || transition.next.phase !== "bound") return
+      if (!acceptTaskControlVersion(
+        message,
+        taskInfoEnvelope,
+        taskStateVersionsRef.current,
+      )) return
+      sessionTaskIdRef.current = taskId
+      dispatch({
+        type: "ADOPT_SESSION_TASK",
+        payload: {
+          taskId,
+          task: taskFromTaskInfoData(taskInfoData, taskId),
+        },
+      })
+      for (const bufferedFrame of bufferedFrames) {
+        handleSessionMessage(bufferedFrame, owner)
+      }
+      return
+    }
+
+    if (
+      binding.present
+      && binding.valid
+      && retiredSessionTaskIdsRef.current.has(binding.taskId)
+    ) {
+      return
+    }
+    if (
+      sessionConversationRef.current.phase === "replacement_sending"
+      || sessionConversationRef.current.phase === "replacement_awaiting_task"
+    ) {
+      bufferSessionPreAdoptionFrame(message, owner)
+      return
+    }
+    if (
+      sessionConversationRef.current.phase === "reset_requested"
+      || sessionConversationRef.current.phase === "replacement_ready"
+      || sessionConversationRef.current.phase === "reload_required"
+    ) return
+    if (binding.present && binding.valid) {
+      if (
+        sessionTaskIdRef.current === null
+      ) {
+        return
+      }
+      if (sessionTaskIdRef.current !== binding.taskId) {
+        requireSessionReload(
+          new Error("Session task lineage changed without a reset; reload required.")
+        )
+        return
+      }
+    }
+
+    handleMessage(message, dispatch, stateRef.current, {
+      skipHistory: true,
+      filesDisabled,
+    })
+  }
+
+  useLayoutEffect(() => {
+    sessionMessageHandlerRef.current = handleSessionMessage
+  }, [handleSessionMessage])
 
   const getLLMIdsFromConfig = (config?: any) => {
     if (!config || !config.model) {
@@ -4430,12 +5274,48 @@ export function AppProvider({
     return llmIds
   }
 
+  const beginSessionMessageDelivery = useCallback(() => {
+    if (!mountedRef.current) return
+    const nextCount = messageDeliveryCountRef.current + 1
+    messageDeliveryCountRef.current = nextCount
+    setMessageDeliveryCount(nextCount)
+  }, [])
+
+  const endSessionMessageDelivery = useCallback(() => {
+    const nextCount = Math.max(0, messageDeliveryCountRef.current - 1)
+    messageDeliveryCountRef.current = nextCount
+    if (mountedRef.current) setMessageDeliveryCount(nextCount)
+  }, [])
+
   const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
+
+    if (sessionTransport && !mountedRef.current) {
+      throw new Error("Message not sent: the Session chat is closed.")
+    }
+    if (
+      filesDisabled
+      && files
+      && files.length > 0
+    ) {
+      throw new Error("Files are disabled for this conversation.")
+    }
+    if (sessionTransport && sessionConversationRef.current.phase === "reset_requested") {
+      throw new Error(
+        "Message delivery is blocked while conversation reset is pending."
+      )
+    }
 
     const clientMessageId = typeof config?.clientMessageId === 'string'
       ? config.clientMessageId
       : generateClientMessageId()
+    const sessionDeliveryOwner =
+      sessionTransport && sessionConnectionIdentityRef.current
+        ? {
+          connectionIdentity: sessionConnectionIdentityRef.current,
+          deliveryGeneration: deliveryGenerationRef.current,
+        }
+        : null
 
     // Optimistic copy of the sender's own bubble, added once delivery is
     // acknowledged. The live user_message trace event only exists after the
@@ -4444,11 +5324,25 @@ export function AppProvider({
     // invisible until a reload replays the persisted transcript row. The
     // reducer reconciles by turn id / content, keeping the persisted event
     // when it already arrived and replacing this copy when it arrives later.
-    const addOptimisticUserMessage = (intendedTaskId: number) => {
+    const addOptimisticUserMessage = (intendedTaskId: number | null) => {
       // Delivery acknowledgement can arrive after the user has navigated to a
       // different task. Never append this turn to whichever task happens to be
       // active when the async send resumes.
-      if (stateRef.current.taskId !== intendedTaskId) {
+      if (sessionTransport) {
+        if (
+          !mountedRef.current
+          || !sessionDeliveryOwner
+          || sessionDeliveryOwner.connectionIdentity
+            !== sessionConnectionIdentityRef.current
+          || sessionDeliveryOwner.deliveryGeneration
+            !== deliveryGenerationRef.current
+        ) {
+          return
+        }
+      } else if (
+        intendedTaskId === null
+        || stateRef.current.taskId !== intendedTaskId
+      ) {
         return
       }
       let content: React.ReactNode = message
@@ -4477,6 +5371,113 @@ export function AppProvider({
     }
 
     const targetTaskId = typeof config?.targetTaskId === 'number' ? config.targetTaskId : null
+    if (
+      sessionTransport
+      && targetTaskId !== null
+      && state.taskId !== targetTaskId
+    ) {
+      throw new Error(
+        "The Session connection does not own the requested task."
+      )
+    }
+
+    if (sessionTransport?.allowTasklessChat) {
+      if (!sessionDeliveryOwner) {
+        throw new Error(
+          "Message not sent: the Session connection is not ready."
+        )
+      }
+
+      if (sessionConversationRef.current.phase === "reload_required") {
+        throw new Error("Conversation outcome is unknown; reload required.")
+      }
+      if (
+        sessionConversationRef.current.phase === "replacement_sending"
+        || sessionConversationRef.current.phase === "replacement_awaiting_task"
+      ) {
+        throw new Error("The replacement conversation is already starting.")
+      }
+
+      const startsReplacementConversation =
+        sessionConversationRef.current.phase === "replacement_ready"
+      const replacementSendStillOwned = () => {
+        const lifecycle: SessionConversationState = sessionConversationRef.current
+        return (
+          mountedRef.current
+          && sessionConnectionIdentityRef.current === sessionDeliveryOwner.connectionIdentity
+          && deliveryGenerationRef.current === sessionDeliveryOwner.deliveryGeneration
+          && lifecycle.phase === "replacement_sending"
+        )
+      }
+      if (startsReplacementConversation) {
+        const transition = dispatchSessionConversation({
+          type: "SESSION_REPLACEMENT_SENDING",
+          connectionIdentity: sessionDeliveryOwner.connectionIdentity,
+        })
+        if (!transition.accepted) {
+          throw new Error("The replacement conversation is no longer available.")
+        }
+        beginSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
+      }
+      beginSessionMessageDelivery()
+      try {
+        await sendChatMessage(
+          message,
+          undefined,
+          config?.force,
+          clientMessageId,
+        )
+        if (startsReplacementConversation) {
+          if (!replacementSendStillOwned()) {
+            return
+          }
+          const transition = dispatchSessionConversation({
+            type: "SESSION_REPLACEMENT_ACCEPTED",
+            connectionIdentity: sessionDeliveryOwner.connectionIdentity,
+          })
+          if (!transition.accepted) return
+          activateSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
+        }
+        addOptimisticUserMessage(state.taskId)
+      } catch (error) {
+        if (startsReplacementConversation) {
+          if (!replacementSendStillOwned()) {
+            throw error
+          }
+          const candidatePresent = sessionPreAdoptionBufferRef.current?.candidate != null
+          const disposition = (
+            error
+            && typeof error === "object"
+            && "disposition" in error
+            && (
+              error.disposition === "not_sent"
+              || error.disposition === "rejected"
+              || error.disposition === "outcome_unknown"
+            )
+          )
+            ? error.disposition
+            : "outcome_unknown"
+          if (disposition === "outcome_unknown" || candidatePresent) {
+            requireSessionReload(
+              error instanceof Error
+                ? error
+                : new Error("Conversation outcome is unknown; reload required."),
+            )
+          } else {
+            discardSessionPreAdoptionBuffer()
+            dispatchSessionConversation({
+              type: "SESSION_REPLACEMENT_REJECTED",
+              connectionIdentity: sessionDeliveryOwner.connectionIdentity,
+            })
+          }
+        }
+        throw error
+      } finally {
+        endSessionMessageDelivery()
+      }
+      return
+    }
+
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
       await queuePendingMessage({
         message,
@@ -4684,7 +5685,126 @@ export function AppProvider({
 
       addOptimisticUserMessage(state.taskId)
     }
-  }, [state.taskId, sendChatMessage, wsExecuteTask, state.currentTask?.status, queuePendingMessage])
+  }, [
+    beginSessionMessageDelivery,
+    beginSessionPreAdoptionBuffer,
+    activateSessionPreAdoptionBuffer,
+    discardSessionPreAdoptionBuffer,
+    dispatchSessionConversation,
+    endSessionMessageDelivery,
+    filesDisabled,
+    queuePendingMessage,
+    sendChatMessage,
+    sessionTransport,
+    state.currentTask?.status,
+    state.taskId,
+  ])
+
+  const startNewConversation = useCallback((): Promise<void> => {
+    const existingReset = sessionResetFlightRef.current
+    if (existingReset) return existingReset.promise
+    if (sessionConversationRef.current.phase === "reload_required") {
+      return Promise.reject(
+        new Error("Conversation outcome is unknown; reload required.")
+      )
+    }
+    if (!sessionTransport?.supportsConversationReset) {
+      return Promise.reject(
+        new Error("Conversation reset is not supported by this transport.")
+      )
+    }
+    if (!mountedRef.current) {
+      return Promise.reject(
+        new Error("Conversation reset is unavailable after chat is closed.")
+      )
+    }
+    if (messageDeliveryCountRef.current > 0) {
+      return Promise.reject(
+        new Error(
+          "Conversation reset is blocked while message delivery is pending."
+        )
+      )
+    }
+    const establishedSessionTaskId = sessionTaskIdRef.current
+    if (establishedSessionTaskId === null) {
+      return Promise.reject(
+        new Error("Conversation reset requires an established Session task.")
+      )
+    }
+    if (sessionConversationRef.current.phase !== "bound") {
+      return Promise.reject(
+        new Error(
+          "Start the replacement conversation before resetting again."
+        )
+      )
+    }
+
+    const connectionIdentity = sessionConnectionIdentityRef.current
+    if (!connectionIdentity || !isConnected) {
+      return Promise.reject(
+        new Error("Conversation reset requires a connected Session.")
+      )
+    }
+
+    let resolveReset!: () => void
+    let rejectReset!: (error: Error) => void
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveReset = resolve
+      rejectReset = reject
+    })
+    const resetFlight: SessionResetFlight = {
+      connectionIdentity,
+      deliveryGeneration: deliveryGenerationRef.current,
+      promise,
+      resolve: resolveReset,
+      reject: rejectReset,
+      timeout: setTimeout(() => {
+        if (sessionResetFlightRef.current !== resetFlight) return
+        requireSessionReload(
+          new Error("Conversation reset acknowledgement timed out; reload required.")
+        )
+      }, SESSION_RESET_ACK_TIMEOUT_MS),
+    }
+    sessionResetFlightRef.current = resetFlight
+    const transition = dispatchSessionConversation({
+      type: "SESSION_RESET_REQUESTED",
+      connectionIdentity,
+      taskId: establishedSessionTaskId,
+    })
+    if (!transition.accepted) {
+      rejectSessionResetFlight(
+        resetFlight,
+        new Error("Conversation reset is no longer available."),
+      )
+      return promise
+    }
+
+    try {
+      const sent = sendRawMessage({ type: "new_conversation" })
+      if (sent !== "sent") {
+        dispatchSessionConversation({
+          type: "SESSION_RESET_NOT_SENT",
+          connectionIdentity,
+        })
+        rejectSessionResetFlight(
+          resetFlight,
+          new Error("Conversation reset was not sent; retry the request."),
+        )
+      }
+    } catch (error) {
+      const resetError =
+        error instanceof Error ? error : new Error(String(error))
+      requireSessionReload(resetError)
+    }
+    return promise
+  }, [
+    isConnected,
+    dispatchSessionConversation,
+    rejectSessionResetFlight,
+    requireSessionReload,
+    sendRawMessage,
+    sessionTransport?.supportsConversationReset,
+  ])
 
   // Initialize the replay scheduler function
   const initializeReplayScheduler = useCallback(() => {
@@ -4710,7 +5830,7 @@ export function AppProvider({
         // but with isReplaying: false to ensure it gets processed for display
         const message = event.data as WebSocketMessage
         const tempState = { ...stateRef.current, isReplaying: false }
-        handleMessage(message, dispatch, tempState)
+        handleMessage(message, dispatch, tempState, { filesDisabled })
       },
       () => {
         // Replay completed
@@ -4728,7 +5848,7 @@ export function AppProvider({
 
     // Always start the scheduler since this function is called when we want to replay
     scheduler.play()
-  }, [state.isReplaying, state.replayTaskId, state.replayEventCache, state.replaySpeed, dispatch])
+  }, [state.isReplaying, state.replayTaskId, state.replayEventCache, state.replaySpeed, dispatch, filesDisabled])
 
   const executeTask = useCallback((description: string) => {
     if (!state.taskId) return
@@ -4747,21 +5867,21 @@ export function AppProvider({
 
   const selectStep = useCallback((stepId: string | null) => {
     dispatch({ type: "SELECT_STEP", payload: stepId })
-  }, [])
+  }, [dispatch])
 
   const clearMessages = useCallback(() => {
     dispatch({ type: "CLEAR_MESSAGES" })
-  }, [])
+  }, [dispatch])
 
   const setTaskId = useCallback((taskId: number | null, options?: { navigate?: boolean }) => {
     // Only reset historical data request flag when changing to a different task
     if (taskId !== stateRef.current.taskId) {
       if (taskId) {
-        historicalDataRequestMap.set(taskId, false)
+        historicalDataRequestMapRef.current.set(taskId, false)
       }
       // Clear recentMessages cache when switching tasks to prevent false duplicates
-      recentMessages.clear()
-      isHistoricalDataLoading = false
+      recentMessagesRef.current.clear()
+      isHistoricalDataLoadingRef.current = false
 
       // Clear existing data immediately when switching tasks to prevent stale data display
       // This fixes the issue where messages from the previous task might be cleared
@@ -4783,12 +5903,13 @@ export function AppProvider({
     dispatch({ type: "SET_TASK_ID", payload: taskId })
     // Set history loading state immediately when switching tasks to prevent empty state flash
     if (taskId) {
-      isHistoricalDataLoading = true
+      isHistoricalDataLoadingRef.current = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
     }
-  }, [router])
+  }, [dispatch, router])
 
   const openFilePreview = useCallback((fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => {
+    if (filesDisabled) return
     console.log('🎯 openFilePreview called:', {
       fileId,
       fileName,
@@ -4797,67 +5918,78 @@ export function AppProvider({
       index
     })
     dispatch({ type: "OPEN_FILE_PREVIEW", payload: { fileId, fileName, files, index } })
-  }, [])
+  }, [dispatch, filesDisabled])
 
   const switchFilePreview = useCallback((index: number) => {
+    if (filesDisabled) return
     const { availableFiles } = state.filePreview
     if (index >= 0 && index < availableFiles.length) {
       const file = availableFiles[index]
       dispatch({ type: "SWITCH_FILE_PREVIEW", payload: { fileId: file.fileId, fileName: file.fileName, index } })
     }
-  }, [state.filePreview.availableFiles])
+  }, [filesDisabled, state.filePreview.availableFiles])
 
   const closeFilePreview = useCallback(() => {
     dispatch({ type: "CLOSE_FILE_PREVIEW" })
-  }, [])
+  }, [dispatch])
 
   const getFilePreviewUrl = useCallback((fileId: string) => {
-    const baseUrl = getApiUrl()
-    return transport?.buildFilePreviewUrl
-      ? transport.buildFilePreviewUrl({ baseUrl, fileId })
-      : `${baseUrl}/api/files/preview/${encodeURIComponent(fileId)}`
-  }, [transport])
+    if (filesDisabled) {
+      throw new Error("Files are disabled for this conversation.")
+    }
+    if (transport?.fileAccess) {
+      return transport.fileAccess.previewUrl(fileId)
+    }
+    return `${getApiUrl()}/api/files/preview/${encodeURIComponent(fileId)}`
+  }, [filesDisabled, transport])
 
   const getFileDownloadUrl = useCallback((fileId: string) => {
-    const baseUrl = getApiUrl()
-    return transport?.buildFileDownloadUrl
-      ? transport.buildFileDownloadUrl({ baseUrl, fileId })
-      : `${baseUrl}/api/files/download/${encodeURIComponent(fileId)}`
-  }, [transport])
+    if (filesDisabled) {
+      throw new Error("Files are disabled for this conversation.")
+    }
+    if (transport?.fileAccess) {
+      return transport.fileAccess.downloadUrl(fileId)
+    }
+    return `${getApiUrl()}/api/files/download/${encodeURIComponent(fileId)}`
+  }, [filesDisabled, transport])
 
 
   // Replay control methods
   const startReplay = useCallback((taskId: number, events: TraceEvent[]) => {
     dispatch({ type: "START_REPLAY", payload: { taskId, events } })
-  }, [])
+  }, [dispatch])
 
   const stopReplay = useCallback(() => {
     dispatch({ type: "STOP_REPLAY" })
-  }, [])
+  }, [dispatch])
 
   const setReplayPlaying = useCallback((isPlaying: boolean) => {
     dispatch({ type: "SET_REPLAY_PLAYING", payload: isPlaying })
-  }, [])
+  }, [dispatch])
 
   const setReplaySpeed = useCallback((speed: number) => {
     dispatch({ type: "SET_REPLAY_SPEED", payload: speed })
-  }, [])
+  }, [dispatch])
 
   const setReplayProgress = useCallback((progress: number) => {
     dispatch({ type: "SET_REPLAY_PROGRESS", payload: progress })
-  }, [])
+  }, [dispatch])
 
-  // Initialize the delayed playback function
-  startDelayedPlayback = useCallback(() => {
-    // Use the replay scheduler to play all events with proper time intervals
-    initializeReplayScheduler()
-  }, [state.replayEventCache, initializeReplayScheduler])
+  useLayoutEffect(() => {
+    startDelayedPlaybackRef.current = initializeReplayScheduler
+  }, [initializeReplayScheduler])
 
   return (
-    <AppContext.Provider
-      value={{
+    <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
+      <FileAccessProvider policy={transport?.fileAccess}>
+        <AppContext.Provider
+        value={{
         state,
         dispatch,
+        filesDisabled,
+        agentCardsEnabled,
+        voiceInputEnabled,
+        taskControlsEnabled,
         sendMessage,
         executeTask,
         pauseTask,
@@ -4866,6 +5998,13 @@ export function AppProvider({
         clearMessages,
         isConnected,
         connectionError,
+        startNewConversation,
+        isConversationResetPending:
+          state.sessionConversation.phase === "reset_requested",
+        isMessageDeliveryPending: messageDeliveryCount > 0,
+        isSessionInteractionLocked:
+          state.sessionConversation.phase === "reload_required",
+        sessionConversationState: state.sessionConversation.phase,
         setTaskId,
         requestStatus,
         getFilePreviewUrl,
@@ -4879,10 +6018,12 @@ export function AppProvider({
         setReplaySpeed,
         setReplayProgress,
         setPendingMessage,
-      }}
-    >
-      {children}
-    </AppContext.Provider>
+        }}
+      >
+        {children}
+        </AppContext.Provider>
+      </FileAccessProvider>
+    </AgentCardPresentationCapability.Provider>
   )
 }
 

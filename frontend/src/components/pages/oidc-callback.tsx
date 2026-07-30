@@ -1,8 +1,8 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import React, { useEffect, useRef, useState } from "react"
 import { getApiUrl } from "@/lib/utils"
-import { clearAuthTokenPayload, storeAuthTokenPayload } from "@/lib/auth-cache"
+import { createAuthSession, takeOidcAuthLoginIntent } from "@/lib/auth-cache"
 import { useI18n } from "@/contexts/i18n-context"
 
 export function OidcCallbackPage() {
@@ -18,9 +18,13 @@ export function OidcCallbackPage() {
       const params = new URLSearchParams(window.location.search)
       const provider = params.get("provider")
       const code = params.get("code")
+      const intentResult = takeOidcAuthLoginIntent()
 
-      if (provider !== "google" || !code) {
-        clearAuthTokenPayload()
+      if (intentResult.status === "unavailable") {
+        window.location.href = `/login?auth_unavailable=${intentResult.reason}`
+        return
+      }
+      if (provider !== "google" || !code || intentResult.status !== "present") {
         window.location.href = "/login?oidc_error=exchange_failed"
         return
       }
@@ -43,10 +47,18 @@ export function OidcCallbackPage() {
           throw new Error("OIDC exchange response was incomplete")
         }
 
-        storeAuthTokenPayload(data)
+        const created = await createAuthSession(data, intentResult.intent)
+        if (created.status !== "created") {
+          if (created.status === "unavailable") {
+            window.location.href = `/login?auth_unavailable=${created.reason}`
+            return
+          }
+          throw new Error("OIDC session storage failed")
+        }
         window.location.href = "/"
       } catch {
-        clearAuthTokenPayload()
+        // An OIDC callback can arrive after another login completed in this
+        // browser. A failed exchange must not clear that unrelated lineage.
         setMessage(t("login.alerts.google_failed"))
         window.location.href = "/login?oidc_error=exchange_failed"
       }

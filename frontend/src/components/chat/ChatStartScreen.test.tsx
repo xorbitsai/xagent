@@ -2,6 +2,15 @@ import React from "react"
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
+const chatInputProps = vi.hoisted(() => ({
+  current: null as null | {
+    files?: File[]
+    filesDisabled?: boolean
+    hideFileUpload?: boolean
+    onSend: (message: string, config?: unknown) => void
+  },
+}))
+
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string) => key,
@@ -13,7 +22,10 @@ vi.mock("@/lib/utils", () => ({
 }))
 
 vi.mock("@/components/chat/ChatInput", () => ({
-  ChatInput: () => <div data-testid="chat-input" />,
+  ChatInput: (props: NonNullable<typeof chatInputProps.current>) => {
+    chatInputProps.current = props
+    return <div data-testid="chat-input" />
+  },
 }))
 
 vi.mock("@/components/ui/tooltip", () => ({
@@ -41,6 +53,7 @@ const renderScreen = (agents?: React.ComponentProps<typeof ChatStartScreen>["age
 
 afterEach(() => {
   cleanup()
+  chatInputProps.current = null
 })
 
 describe("ChatStartScreen agents section", () => {
@@ -61,5 +74,45 @@ describe("ChatStartScreen agents section", () => {
 
     expect(screen.getByText(AGENTS_SECTION)).toBeTruthy()
     expect(screen.getByText("Billing Agent")).toBeTruthy()
+  })
+})
+
+describe("ChatStartScreen file capability", () => {
+  it("forwards the disabled file capability to ChatInput", () => {
+    const onSend = vi.fn()
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+    render(
+      <ChatStartScreen
+        files={[file]}
+        filesDisabled
+        onSend={onSend}
+        title="Session Agent"
+      />
+    )
+
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument()
+    expect(chatInputProps.current?.hideFileUpload).toBe(true)
+    expect(chatInputProps.current?.filesDisabled).toBe(true)
+    expect(chatInputProps.current?.files).toEqual([])
+    chatInputProps.current?.onSend("hello", { mode: "balanced" })
+    expect(onSend).toHaveBeenCalledWith("hello", [], { mode: "balanced" })
+  })
+
+  it("preserves file input by default", () => {
+    const onSend = vi.fn()
+    const file = new File(["legacy"], "legacy.txt", { type: "text/plain" })
+    render(
+      <ChatStartScreen
+        files={[file]}
+        onSend={onSend}
+        title="Legacy Agent"
+      />
+    )
+
+    expect(chatInputProps.current?.hideFileUpload).toBe(false)
+    expect(chatInputProps.current?.filesDisabled).toBe(false)
+    expect(chatInputProps.current?.files).toEqual([file])
+    chatInputProps.current?.onSend("hello", { mode: "balanced" })
+    expect(onSend).toHaveBeenCalledWith("hello", [file], { mode: "balanced" })
   })
 })

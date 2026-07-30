@@ -5,14 +5,12 @@ import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
+import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
-  getFilePublicDownloadUrl,
-  getFilePublicPreviewUrl,
-  setPublicAccessToken,
 } from "@/lib/utils"
 
 interface PublicAgentChatPageProps {
@@ -142,7 +140,14 @@ function PublicConversationContent({
   suggestedPrompts,
   onAuthInvalidated,
 }: PublicConversationContentProps) {
-  const { state, dispatch, sendMessage, setTaskId, connectionError } = useApp()
+  const {
+    state,
+    dispatch,
+    sendMessage,
+    setTaskId,
+    connectionError,
+    voiceInputEnabled,
+  } = useApp()
   const { t } = useI18n()
   const [createTaskError, setCreateTaskError] = useState<string | null>(null)
   const [draftMessage, setDraftMessage] = useState("")
@@ -388,6 +393,7 @@ function PublicConversationContent({
                 hideConfig={true}
                 compactInput={true}
                 deferFileUpload={true}
+                voiceInputEnabled={voiceInputEnabled}
                 autoFocus={true}
                 inputMinHeightClass="min-h-[44px]"
               />
@@ -441,7 +447,6 @@ export function PublicAgentChatPage({
       safeRemoveItem(shareAuthStorageKey)
     }
     setAuthResult(null)
-    setPublicAccessToken(null)
     setIsInitializing(true)
     setReauthNonce((n) => n + 1)
   }, [shareAuthStorageKey])
@@ -503,7 +508,6 @@ export function PublicAgentChatPage({
         const persisted = readPersistedShareAuth()
         if (persisted) {
           setAuthResult(persisted)
-          setPublicAccessToken(persisted.access_token ?? null)
           setErrorMessage(null)
           return
         }
@@ -534,30 +538,29 @@ export function PublicAgentChatPage({
         const authData = await authResponse.json()
         persistShareAuth(authData)
         setAuthResult(authData)
-        setPublicAccessToken(authData.access_token ?? null)
         setErrorMessage(null)
       } catch (error) {
         console.error(error)
         setErrorMessage((error as Error).message || t("widgetChat.messages.error_init"))
-        setPublicAccessToken(null)
       } finally {
         setIsInitializing(false)
       }
     }
 
     initPublicChat()
-    return () => setPublicAccessToken(null)
   }, [authMode, embedTicket, widgetKey, normalizedGuestId, routeToken, searchAgentId, shareAuthStorageKey, reauthNonce, t])
 
   const publicAccessToken = authResult?.access_token ?? ""
+  const fileAccess = usePublicFileAccessPolicy(publicAccessToken)
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    capabilities: {
+      agentCards: "disabled",
+      voice: "disabled",
+    },
     buildWebSocketUrl: ({ baseUrl, taskId, token }) =>
       `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,
-    buildFilePreviewUrl: ({ baseUrl, fileId }) =>
-      getFilePublicPreviewUrl(fileId, baseUrl),
-    buildFileDownloadUrl: ({ baseUrl, fileId }) =>
-      getFilePublicDownloadUrl(fileId, baseUrl),
+    fileAccess,
     uploadFiles: (files, params) =>
       Promise.all(files.map((file) =>
         uploadPublicChatFile({
@@ -569,7 +572,7 @@ export function PublicAgentChatPage({
           fallbackError: t("files.uploadFailed"),
         }),
       )),
-  }), [authMode, publicAccessToken, t])
+  }), [authMode, fileAccess, publicAccessToken, t])
 
   if (isInitializing) {
     return (

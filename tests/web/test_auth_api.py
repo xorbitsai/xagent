@@ -12,7 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import auth_router, hash_password
+from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
 
@@ -130,6 +130,115 @@ def test_admin_data():
 
 
 class TestAuthAPI:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {
+                "success": False,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 60,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": " ",
+                "refresh_token": "refresh",
+                "expires_in": 60,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": " ",
+                "expires_in": 60,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 1.5,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": True,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": "60",
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 0,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 60,
+                "refresh_expires_in": -1,
+            },
+        ],
+    )
+    def test_refresh_response_requires_complete_strict_rotation(self, payload):
+        with pytest.raises(Exception):
+            RefreshTokenResponse.model_validate(payload)
+
+    def test_refresh_response_serializes_literal_success(self):
+        response = RefreshTokenResponse(
+            success=True,
+            message="ok",
+            access_token=" access ",
+            refresh_token=" refresh ",
+            expires_in=60,
+            refresh_expires_in=120,
+        )
+        assert response.model_dump()["success"] is True
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "success",
+            "access_token",
+            "refresh_token",
+            "expires_in",
+            "refresh_expires_in",
+        ],
+    )
+    def test_refresh_response_rejects_each_missing_required_field(self, field):
+        payload = {
+            "success": True,
+            "message": "ok",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 60,
+            "refresh_expires_in": 120,
+        }
+        del payload[field]
+
+        with pytest.raises(Exception):
+            RefreshTokenResponse.model_validate(payload)
+
     """Test authentication API endpoints"""
 
     def test_login_success(self, test_db, test_user_data):

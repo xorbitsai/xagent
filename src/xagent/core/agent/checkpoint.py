@@ -11,6 +11,11 @@ CHECKPOINT_TYPE = "agent_execution_checkpoint"
 LEGACY_CHECKPOINT_TYPES = frozenset({"agent_v2_execution_checkpoint"})
 READABLE_CHECKPOINT_TYPES = frozenset({CHECKPOINT_TYPE, *LEGACY_CHECKPOINT_TYPES})
 CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_READER_METHODS = (
+    "load_latest_checkpoint",
+    "get_latest_checkpoint",
+    "latest_checkpoint",
+)
 
 
 CHECKPOINT_EVENT_TYPE = TraceEventType(
@@ -37,6 +42,30 @@ def checkpoint_execution_id(data: dict[str, Any]) -> str:
 
 class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
+
+
+async def read_latest_checkpoint_payload(
+    reader: Any,
+    execution_id: str,
+) -> Any:
+    """Read through the first checkpoint capability exposed by ``reader``.
+
+    Method names are compatibility aliases, not independent data sources. Once
+    a reader exposes the preferred available method, its result is
+    authoritative, including ``None`` for "no checkpoint". Falling through
+    after that valid empty result can invoke deprecated aliases or combine
+    inconsistent reader implementations.
+    """
+
+    for method_name in CHECKPOINT_READER_METHODS:
+        method = getattr(reader, method_name, None)
+        if not callable(method):
+            continue
+        payload = method(execution_id)
+        if inspect.isawaitable(payload):
+            payload = await payload
+        return payload
+    return None
 
 
 @dataclass
@@ -82,19 +111,8 @@ class TraceCheckpointStore:
         self,
         execution_id: str,
     ) -> dict[str, Any] | None:
-        for method_name in (
-            "load_latest_checkpoint",
-            "get_latest_checkpoint",
-            "latest_checkpoint",
-        ):
-            method = getattr(self.tracer, method_name, None)
-            if not callable(method):
-                continue
-            payload = method(execution_id)
-            if inspect.isawaitable(payload):
-                payload = await payload
-            return self._unwrap_checkpoint_payload(payload)
-        return None
+        payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
+        return self._unwrap_checkpoint_payload(payload)
 
     def get_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
         raise NotImplementedError("Use async load_latest_checkpoint().")

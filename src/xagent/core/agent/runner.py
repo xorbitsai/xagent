@@ -12,6 +12,7 @@ from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY
 from ..model.intent import enter_goal, exit_goal
 from ..workspace import WorkspaceManager
+from .checkpoint import read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
@@ -435,13 +436,24 @@ class AgentRunner:
         # change (see comment below) and persist it.
         watermark_before = self._read_trace_watermark(context)
         traced_turn_ids_before = self._read_traced_turn_ids(context)
-        await self._dispatch_callback(
-            "on_user_message_posted",
-            runner=self,
-            context=context,
-            message=added,
-            files=files,
-        )
+        try:
+            await self._dispatch_callback(
+                "on_user_message_posted",
+                runner=self,
+                context=context,
+                message=added,
+                files=files,
+            )
+        except Exception:
+            # The injected-context checkpoint above is the durable acceptance
+            # boundary. Trace projection can be replayed from its pending
+            # marker, so it must not turn an accepted user message into a
+            # rejected delivery.
+            logger.warning(
+                "user-message callback failed after injection checkpoint for %s",
+                execution_id,
+                exc_info=True,
+            )
         # Re-persist when the trace callback advanced the watermark —
         # without this a worker crash between trace emission and the next
         # checkpoint would let the resume path replay the same user_message
@@ -455,11 +467,20 @@ class AgentRunner:
             watermark_after and watermark_after != watermark_before
         ) or traced_turn_ids_after != traced_turn_ids_before:
             self._clear_pending_user_message_marker(context)
-            await self._persist_injected_context(
-                execution_id=execution_id,
-                context=context,
-                label="user_message_trace_watermark",
-            )
+            try:
+                await self._persist_injected_context(
+                    execution_id=execution_id,
+                    context=context,
+                    label="user_message_trace_watermark",
+                )
+            except Exception:
+                # Preserve the pending marker for resume catch-up when the
+                # trace watermark cannot be persisted after acceptance.
+                logger.warning(
+                    "user-message watermark checkpoint failed after injection for %s",
+                    execution_id,
+                    exc_info=True,
+                )
         if request_interrupt:
             self.pause(execution_id, reason=reason or "new user message")
         return context
@@ -894,20 +915,8 @@ class AgentRunner:
         if self.tracer is None:
             return None
 
-        for method_name in (
-            "load_latest_checkpoint",
-            "get_latest_checkpoint",
-            "latest_checkpoint",
-        ):
-            method = getattr(self.tracer, method_name, None)
-            if not callable(method):
-                continue
-            payload = method(execution_id)
-            if inspect.isawaitable(payload):
-                payload = await payload
-            if isinstance(payload, dict):
-                return payload
-        return None
+        payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
+        return payload if isinstance(payload, dict) else None
 
     async def _persist_injected_context(
         self,

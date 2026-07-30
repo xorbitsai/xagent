@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
@@ -8,6 +8,7 @@ import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
+import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
@@ -41,6 +42,8 @@ interface ChatInputProps {
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
   hideFileUpload?: boolean;
+  filesDisabled?: boolean;
+  voiceInputEnabled?: boolean;
   compact?: boolean;
   autoFocus?: boolean;
   minHeightClass?: string;
@@ -94,6 +97,8 @@ export function ChatInput({
   hideConfig = false,
   readOnlyConfig = false,
   hideFileUpload = false,
+  filesDisabled = false,
+  voiceInputEnabled = true,
   compact = false,
   autoFocus = false,
   minHeightClass = "min-h-[130px]",
@@ -117,7 +122,7 @@ export function ChatInput({
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { openFilePreview } = useApp();
-  const voiceInput = useVoiceInputControls();
+  const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
 
   useEffect(() => {
     if (!autoFocus || !editorRef.current) return;
@@ -201,15 +206,25 @@ export function ChatInput({
     fileMention.checkTrigger();
   };
 
-  const fileMention = useFileMention(editorRef, containerRef, handleInput, t);
+  const fileMention = useFileMention(
+    editorRef,
+    containerRef,
+    handleInput,
+    t,
+    filesDisabled,
+  );
+  const enabledFiles = useMemo(
+    () => filesDisabled ? [] : files,
+    [files, filesDisabled],
+  );
 
   // Track files for async operations
-  const filesRef = useRef(files);
+  const filesRef = useRef(enabledFiles);
   const uploadAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
 
   useEffect(() => {
-    filesRef.current = files;
-  }, [files]);
+    filesRef.current = enabledFiles;
+  }, [enabledFiles]);
 
   // Determine if controlled or uncontrolled
   const isControlled = inputValue !== undefined;
@@ -218,6 +233,8 @@ export function ChatInput({
 
   // Handle click on delete button and file chip preview
   useEffect(() => {
+    if (filesDisabled) return;
+
     const editor = editorRef.current;
     if (!editor) return;
 
@@ -259,7 +276,7 @@ export function ChatInput({
 
     editor.addEventListener('click', handleClick);
     return () => editor.removeEventListener('click', handleClick);
-  }, [fileMention.fileList, openFilePreview]);
+  }, [fileMention.fileList, filesDisabled, openFilePreview]);
   const [agentConfig, setAgentConfig] = useState<AgentConfig>({
     model: "",
     memorySimilarityThreshold: 1.5,
@@ -292,9 +309,21 @@ export function ChatInput({
     setIsDraggingFiles(false);
   };
 
+  useEffect(() => {
+    if (!filesDisabled) return;
+
+    uploadAbortControllersRef.current.forEach((controller) => {
+      controller.abort();
+    });
+    uploadAbortControllersRef.current.clear();
+    setUploadingFiles(new Set());
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+  }, [filesDisabled]);
+
   // Helper to upload files immediately
   const uploadFiles = async (newFiles: File[]) => {
-    if (newFiles.length === 0) return;
+    if (filesDisabled || newFiles.length === 0) return;
 
     // Mark as uploading (use name + lastModified as rough unique ID)
     const fileIds = newFiles.map(f => `${f.name}-${f.lastModified}`);
@@ -381,7 +410,12 @@ export function ChatInput({
   };
 
   const appendFiles = (newFiles: File[]) => {
-    if (newFiles.length === 0 || !onFilesChange || isInputBusy) return;
+    if (
+      filesDisabled
+      || newFiles.length === 0
+      || !onFilesChange
+      || isInputBusy
+    ) return;
     onFilesChange([...filesRef.current, ...newFiles]);
     if (!deferFileUpload) {
       uploadFiles(newFiles);
@@ -510,12 +544,12 @@ export function ChatInput({
       voiceInput.stopRecording();
       return;
     }
-    if (voiceInput.status === "idle") {
+    if (voiceInputEnabled && voiceInput.status === "idle") {
       voiceInput.startRecording(editorRef.current);
     }
   };
 
-  const hasDraft = message.trim().length > 0 || files.length > 0;
+  const hasDraft = message.trim().length > 0 || enabledFiles.length > 0;
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
     return hasDraft && !isInputBusy && !isUploadingFiles;
@@ -527,7 +561,12 @@ export function ChatInput({
   const shouldShowPauseButton = canPauseTask && !hasDraft;
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesDisabled
+    ) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current += 1;
@@ -535,7 +574,12 @@ export function ChatInput({
   };
 
   const handleDragOver = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesDisabled
+    ) return;
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = "copy";
@@ -555,7 +599,12 @@ export function ChatInput({
   };
 
   const handleDrop = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesDisabled
+    ) return;
     e.preventDefault();
     e.stopPropagation();
     const droppedFiles = extractDroppedFiles(e.dataTransfer);
@@ -582,7 +631,11 @@ export function ChatInput({
       const executionMode = taskConfig?.executionMode;
       const deliveryKey = JSON.stringify([
         messageToSend,
-        files.map((file) => [file.name, file.size, file.lastModified]),
+        enabledFiles.map((file) => [
+          file.name,
+          file.size,
+          file.lastModified,
+        ]),
       ]);
       const previousAttempt = deliveryAttemptRef.current;
       const clientMessageId = previousAttempt?.key === deliveryKey
@@ -651,7 +704,7 @@ export function ChatInput({
     const items = Array.from(e.clipboardData.items || []);
     const fileItems = items.filter(item => item.kind === 'file');
 
-    if (fileItems.length > 0 && !hideFileUpload) {
+    if (fileItems.length > 0 && !hideFileUpload && !filesDisabled) {
       e.preventDefault();
       const pastedFiles: File[] = [];
 
@@ -692,6 +745,8 @@ export function ChatInput({
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (filesDisabled) return;
+
     const selectedFiles = Array.from(e.target.files || []);
     appendFiles(selectedFiles);
     if (fileInputRef.current) {
@@ -700,7 +755,7 @@ export function ChatInput({
   };
 
   const removeFile = (index: number) => {
-    const fileToRemove = files[index];
+    const fileToRemove = enabledFiles[index];
     if (fileToRemove) {
       const fileId = `${fileToRemove.name}-${fileToRemove.lastModified}`;
       const controller = uploadAbortControllersRef.current.get(fileId);
@@ -709,7 +764,7 @@ export function ChatInput({
         uploadAbortControllersRef.current.delete(fileId);
       }
     }
-    onFilesChange?.(files.filter((_, i) => i !== index));
+    onFilesChange?.(enabledFiles.filter((_, i) => i !== index));
   };
 
   useEffect(() => {
@@ -721,6 +776,18 @@ export function ChatInput({
         editor.innerHTML = "";
       }
     } else if (document.activeElement !== editor) {
+      if (filesDisabled) {
+        let html = applyPromptHighlights(
+          escapeHtml(sanitizeFilesDisabledPresentationText(message)),
+          promptHighlightTerms,
+        );
+        html = html.replace(/\n/g, "<br>");
+        if (editor.innerHTML !== html) {
+          editor.innerHTML = html;
+        }
+        return;
+      }
+
       const currentText = serializeEditorContent(editor);
 
       if (message !== currentText) {
@@ -741,7 +808,7 @@ export function ChatInput({
         editor.innerHTML = html;
       }
     }
-  }, [message, promptHighlightTerms]);
+  }, [filesDisabled, message, promptHighlightTerms]);
 
   return (
     <div className="space-y-3">
@@ -750,15 +817,17 @@ export function ChatInput({
         className={cn("relative", selectedAgents.length > 0 && "pt-9")}
         ref={containerRef}
       >
-        <FileMentionDropdown
-          show={fileMention.showFilePicker}
-          isLoading={fileMention.isLoadingFiles}
-          filteredFiles={fileMention.filteredFiles}
-          selectedFileIndex={fileMention.selectedFileIndex}
-          onInsert={fileMention.insertFile}
-          t={t}
-          position={fileMention.dropdownPosition}
-        />
+        {fileMention.fileMentionsEnabled && (
+          <FileMentionDropdown
+            show={fileMention.showFilePicker}
+            isLoading={fileMention.isLoadingFiles}
+            filteredFiles={fileMention.filteredFiles}
+            selectedFileIndex={fileMention.selectedFileIndex}
+            onInsert={fileMention.insertFile}
+            t={t}
+            position={fileMention.dropdownPosition}
+          />
+        )}
         {selectedAgents.length > 0 && (
           <div className="absolute top-0 z-10 flex flex-wrap gap-2">
             {selectedAgents.map((agent) => (
@@ -817,9 +886,9 @@ export function ChatInput({
               </div>
             </div>
           )}
-          {files.length > 0 && (
+          {enabledFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
-              {files.map((file, index) => {
+              {enabledFiles.map((file, index) => {
                 const isUploading = uploadingFiles.has(`${file.name}-${file.lastModified}`);
                 return (
                   <div
@@ -879,7 +948,7 @@ export function ChatInput({
           {/* Bottom toolbar or inline button */}
           {compact ? (
             <div className="absolute right-2 bottom-2 flex items-center gap-2">
-              {!hideFileUpload && (
+              {!hideFileUpload && !filesDisabled && (
                 <>
                   <input
                     ref={fileInputRef}
@@ -902,7 +971,7 @@ export function ChatInput({
                   </Button>
                 </>
               )}
-              {voiceInput.hasAsrModel && (
+              {voiceInputEnabled && voiceInput.hasAsrModel && (
                 <Button
                   type="button"
                   variant="ghost"
@@ -989,7 +1058,7 @@ export function ChatInput({
                   </>
                 )}
                 {/* Upload button - adjacent to bottom toolbar */}
-                {!hideFileUpload && (
+                {!hideFileUpload && !filesDisabled && (
                   <>
                     <input
                       ref={fileInputRef}
@@ -1029,7 +1098,7 @@ export function ChatInput({
                 <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
-                {voiceInput.hasAsrModel && (
+                {voiceInputEnabled && voiceInput.hasAsrModel && (
                   <Button
                     type="button"
                     variant="ghost"

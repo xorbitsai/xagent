@@ -197,3 +197,94 @@ class TestCheckRegistrySecurityGate:
             )
         assert exc.value.status_code == 403
         assert "malicious" in exc.value.detail.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "expected_method"),
+    [
+        ("create", "create_skill"),
+        ("update", "update_skill_file"),
+        ("delete", "delete_skill"),
+        ("registry_install", "create_skill"),
+    ],
+)
+async def test_team_write_routes_adopt_the_central_provider_invoker(
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    expected_method: str,
+) -> None:
+    from dataclasses import fields
+    from types import SimpleNamespace
+
+    from xagent.skills.library import SkillScopeContext
+    from xagent.web.api import skill_hub
+
+    captured: list[tuple[str, object, dict]] = []
+    scope = SkillScopeContext(user_id=7, metadata={"source_id": 11})
+
+    class _Manager:
+        async def get_skill(self, name: str):
+            return {"name": name, "scope": "team", "path": ""}
+
+    async def _central_invoker(provider, method, context, **kwargs):
+        captured.append((method, context, kwargs))
+
+    registry = SimpleNamespace(
+        id="testhub",
+        display_name="TestHub",
+        get_skill=lambda slug: {},
+        extract_scan_status=lambda detail: None,
+        download_skill=lambda slug, version: (200, _make_zip({"SKILL.md": SKILL_MD})),
+    )
+    monkeypatch.setattr(skill_hub, "invoke_skill_write_provider", _central_invoker)
+    monkeypatch.setattr(
+        "xagent.skills.library.get_skill_write_provider", lambda: object()
+    )
+
+    async def _scoped_manager(*args):
+        return _Manager()
+
+    monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped_manager)
+    monkeypatch.setattr(skill_hub, "get_registry", lambda source: registry)
+
+    request = SimpleNamespace()
+    user = SimpleNamespace(id=7)
+    if route == "create":
+        await skill_hub.create_skill(
+            skill_hub.CreateSkillRequest(
+                name="writer", skill_md="# writer", scope="team"
+            ),
+            request,
+            scope,
+            object(),
+            user,
+        )
+    elif route == "update":
+        await skill_hub.edit_installed(
+            "writer",
+            skill_hub.EditSkillRequest(skill_md="# updated"),
+            request,
+            scope,
+            object(),
+            user,
+        )
+    elif route == "delete":
+        await skill_hub.delete_installed("writer", request, scope, object(), user)
+    else:
+        await skill_hub.install_skill(
+            "testhub",
+            skill_hub.InstallSkillRequest(slug="writer", scope="team"),
+            request,
+            scope,
+            object(),
+            user,
+        )
+
+    assert len(captured) == 1
+    method, context, kwargs = captured[0]
+    assert method == expected_method
+    assert {field.name for field in fields(context)} == {"user_id", "metadata"}
+    assert context.user_id == scope.user_id
+    assert context.metadata == scope.metadata
+    assert kwargs["scope"] == "team"

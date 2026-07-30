@@ -156,8 +156,9 @@ async def upload_share_file(
     share_info: ShareChatAccessContext = Depends(get_current_share_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
-    # Abuse control (#973): per-guest cap on public uploads. Storage-quota
-    # accounting and orphan GC are the separate hardening tracked for PR3.
+    # Abuse control (#973): per-guest cap on public uploads (guest_id is
+    # server-minted on the share path, so it is a trustworthy key). Storage
+    # quota + orphan GC are enforced inside upload_share_chat_files.
     if not get_share_rate_limiter().allow_upload(share_info.guest_id):
         raise HTTPException(status_code=429, detail="Too many requests")
     return await upload_share_chat_files(

@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
+from sqlalchemy.orm import Session
 
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
@@ -330,6 +331,37 @@ def test_create_task_happy_path(mock_start_task):
     assert kwargs["payload"].transcript_message == "first user message"
 
 
+def test_create_task_schedules_after_commit_acknowledgement_loss(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    original_commit = Session.commit
+    acknowledgement_lost = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal acknowledgement_lost
+        original_commit(session)
+        if not acknowledgement_lost:
+            acknowledgement_lost = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "commit then schedule"},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert acknowledgement_lost is True
+    assert mock_start_task.call_count == 1
+
+
 def test_create_task_uses_one_connection_at_a_time(
     mock_start_task,
     monkeypatch: pytest.MonkeyPatch,
@@ -471,6 +503,7 @@ def test_upload_and_attach_files_to_task(mock_start_task):
     assert "UPLOADED FILES" in payload.execution_message
     assert payload.attachments
     assert any(a.get("file_id") == file_id for a in payload.attachments)
+    assert payload.file_ids == (file_id,)
 
     # File is bound to the task after the turn is claimed (not before).
     from xagent.web.models.uploaded_file import UploadedFile
@@ -789,6 +822,7 @@ def test_append_message_with_files(mock_start_task):
     assert payload.transcript_message == "look at this too"
     assert file_id in payload.execution_message
     assert any(a.get("file_id") == file_id for a in payload.attachments)
+    assert payload.file_ids == (file_id,)
 
     from xagent.web.models.uploaded_file import UploadedFile
 
@@ -2763,6 +2797,40 @@ def test_append_message_claims_slot_atomically(mock_start_task):
     assert r2.status_code == 409
     assert r2.json()["error"]["code"] == "task_busy"
     # Only one bg kickoff total (from the winning first append).
+    assert mock_start_task.call_count == 1
+
+
+def test_append_message_schedules_after_commit_acknowledgement_loss(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first")
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+    original_commit = Session.commit
+    acknowledgement_lost = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal acknowledgement_lost
+        original_commit(session)
+        if not acknowledgement_lost:
+            acknowledgement_lost = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    response = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second after disconnect"},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert acknowledgement_lost is True
     assert mock_start_task.call_count == 1
 
 

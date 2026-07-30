@@ -6,11 +6,12 @@ This allows different contexts (web, standalone) to provide configuration
 to the ToolFactory in a unified way.
 """
 
+import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypeVar
 
 from ..... import config as _root_config
 
@@ -20,6 +21,46 @@ class MCPFailurePolicy(str, Enum):
 
     BEST_EFFORT = "best_effort"
     STRICT = "strict"
+
+
+class ToolFactoryRuntimeSessionBoundaryError(RuntimeError):
+    """Tool construction cannot safely detach its database resources."""
+
+    def __init__(
+        self, message: str = "Tool runtime cleanup could not be completed."
+    ) -> None:
+        super().__init__(message)
+
+
+_CleanupResultT = TypeVar("_CleanupResultT")
+
+
+async def run_with_tool_runtime_cleanup(
+    body: Callable[[], Awaitable[_CleanupResultT]],
+    cleanup: Callable[[], None],
+    *,
+    logger: logging.Logger,
+    cleanup_error_message: str = (
+        "Tool runtime cleanup failed after the primary operation failed"
+    ),
+) -> _CleanupResultT:
+    """Run cleanup without allowing it to replace an active primary failure."""
+    primary_error: BaseException | None = None
+    try:
+        return await body()
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            cleanup()
+        except BaseException as cleanup_error:
+            if primary_error is not None:
+                logger.error(cleanup_error_message, exc_info=True)
+            elif isinstance(cleanup_error, Exception):
+                raise ToolFactoryRuntimeSessionBoundaryError() from cleanup_error
+            else:
+                raise
 
 
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(

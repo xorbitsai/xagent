@@ -43,6 +43,8 @@ from ...config import (
     get_share_upload_rate_limit,
     get_share_ws_connect_ip_rate_limit,
     get_share_ws_turn_rate_limit,
+    get_widget_upload_ip_rate_limit,
+    get_widget_upload_rate_limit,
 )
 
 # remote_ip_from_request is stable, shared reverse-proxy-aware infra; import it
@@ -65,6 +67,8 @@ _TASK_CREATE_TOKEN_NAMESPACE = "share-task-create-token"
 _WS_TURN_NAMESPACE = "share-ws-turn"
 _WS_CONNECT_IP_NAMESPACE = "share-ws-connect-ip"
 _UPLOAD_NAMESPACE = "share-upload"
+_WIDGET_UPLOAD_ENTITY_NAMESPACE = "widget-upload"
+_WIDGET_UPLOAD_IP_NAMESPACE = "widget-upload-ip"
 _RUN_SHARE_NAMESPACE = "share-run"
 _RUN_GUEST_NAMESPACE = "share-run-guest"
 
@@ -143,6 +147,12 @@ class ShareRateLimiter:
         self._upload_limit = _parse_rate(
             get_share_upload_rate_limit(), fallback="60/minute"
         )
+        self._widget_upload_entity_limit = _parse_rate(
+            get_widget_upload_rate_limit(), fallback="240/minute"
+        )
+        self._widget_upload_ip_limit = _parse_rate(
+            get_widget_upload_ip_rate_limit(), fallback="60/minute"
+        )
         self._run_share_limit = _parse_rate(get_share_run_quota(), fallback="500/day")
         self._run_guest_limit = _parse_rate(
             get_share_run_guest_quota(), fallback="60/hour"
@@ -206,6 +216,28 @@ class ShareRateLimiter:
         """Count one share upload for a guest; False when exceeded."""
         return self._limiter.hit(
             self._upload_limit, _UPLOAD_NAMESPACE, guest_id or "unknown"
+        )
+
+    @_fail_open
+    def allow_widget_upload(self, entity_key: str, remote_ip: str | None) -> bool:
+        """Count one widget upload; False when a bucket is exceeded.
+
+        Keyed on the widget entity (``agent:<id>`` / ``workforce:<id>``) plus
+        the caller IP — NOT the widget ``guest_id``, which unlike the share
+        path is client-supplied and therefore rotatable at will. Per-IP is
+        the tighter bucket (bounds one abuser); per-entity is the loose
+        backstop bounding total orphan/storage production through one widget.
+        """
+        if not self._limiter.hit(
+            self._widget_upload_ip_limit,
+            _WIDGET_UPLOAD_IP_NAMESPACE,
+            remote_ip or "unknown",
+        ):
+            return False
+        return self._limiter.hit(
+            self._widget_upload_entity_limit,
+            _WIDGET_UPLOAD_ENTITY_NAMESPACE,
+            entity_key or "unknown",
         )
 
     @_fail_open

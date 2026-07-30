@@ -31,6 +31,7 @@ from .base import (
     ToolCategory,
     ToolVisibility,
 )
+from .config import run_with_tool_runtime_cleanup
 
 logger = logging.getLogger(__name__)
 MAX_AGENT_NAME_LENGTH = 200
@@ -2019,7 +2020,7 @@ class AgentTool(AbstractBaseTool):
                 execution_scope=self._execution_scope,
             )
 
-            try:
+            async def execute_delegated_runtime() -> tuple[dict[str, Any], Any]:
                 tracer = self._create_child_execution_tracer(
                     execution_task_id=execution_task_id,
                     agent_name=str(agent_name),
@@ -2077,8 +2078,16 @@ class AgentTool(AbstractBaseTool):
                         context=execution_context if execution_context else None,
                         task_id=execution_task_id,
                     )
-            finally:
-                tool_config.close()
+                return result, agent_service
+
+            result, agent_service = await run_with_tool_runtime_cleanup(
+                execute_delegated_runtime,
+                tool_config.close,
+                logger=logger,
+                cleanup_error_message=(
+                    "Failed to close delegated agent tool runtime after execution"
+                ),
+            )
 
             # ---- Phase 3: post-run file outputs in a fresh short-lived
             # session. Registering delegated outputs only flushes into the

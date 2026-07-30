@@ -484,6 +484,22 @@ const zh = {
       powered_by: "由 {appName} 提供"
     }
   },
+  widgetSession: {
+    startNewConversation: "开始新对话",
+    resetting: "正在开始...",
+    resetFailed: "无法开始新对话，请重试。",
+    startMessageFailed: "无法发送消息，请重试。",
+    reloadRequired: "此对话状态未知。请刷新页面后再继续。",
+    expiryWarning: "此聊天会话即将过期，请刷新页面以继续。",
+    expired: {
+      title: "聊天会话已过期",
+      description: "请刷新页面以开始新的聊天会话。",
+    },
+    unavailable: {
+      title: "聊天暂不可用",
+      description: "目前无法打开此聊天，请稍后重试。",
+    },
+  },
   channels: {
     page_title: "渠道管理",
     page_description: "管理您的沟通渠道和机器人。",
@@ -640,6 +656,9 @@ const zh = {
       auth_failed: "用户名/邮箱或密码错误",
       network_failed: "登录失败，请稍后重试",
       google_failed: "Google 登录失败，请重试",
+      storage_unavailable: "浏览器阻止了本地存储。请启用本地存储后重试。",
+      coordination_unavailable: "您的浏览器不支持此应用所需的安全登录功能。",
+      operation_failed: "无法更新您的登录会话，请重试。",
     },
     google: {
       continue: "使用 Google 继续",
@@ -1548,7 +1567,8 @@ const zh = {
       general_productivity: "通用与效率",
       customer_service: "客户服务",
       finance_lms_ops: "金融、LMS 与运营",
-      security: "安全"
+      security: "安全",
+      operations: "运维"
     },
     sections: {
       knowledge: "知识与研究",
@@ -1575,6 +1595,7 @@ const zh = {
       loggedIn: "已登录",
       notLoggedIn: "未登录",
       logoutTitle: "退出登录",
+      logoutFailed: "无法退出登录，请重试。",
       defaultName: "用户",
     },
   },
@@ -3324,7 +3345,6 @@ const zh = {
     previewFile: "预览文件",
     filePrefix: "文件:",
     queryPrefix: "查询:",
-    pathPrefix: "路径:",
     bashPrefix: "Bash命令:",
     searchPrefix: "搜索:",
     workforceDelegation: "Workforce 委派",

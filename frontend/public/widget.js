@@ -28,11 +28,6 @@
     identity_mismatch: true,
     rate_limited: true
   };
-  var TRANSIENT_SESSION_CODES = {
-    network_unavailable: true,
-    rate_limited: true
-  };
-
   function sessionAbortError() {
     return new DOMException('session request superseded', 'AbortError');
   }
@@ -81,54 +76,75 @@
       : Math.max(0, retryAt - Date.now());
   }
 
-  // Every request counts against the shared total-attempt and absolute-deadline
-  // budget. Transport failures and coded rate limits also have narrower
-  // per-class retry caps inside it.
-  function withRetry(makeRequest, policy, signal) {
-    var attempts = 0;
-    var transportRetries = 0;
-    var rateLimited = 0;
-    var startedAt = Date.now();
+  function createRetryLineage() {
+    return {
+      startedAt: Date.now(),
+      attempts: 0,
+      transportRetries: 0,
+      rateLimited: 0,
+      lastRetryCode: 'network_unavailable'
+    };
+  }
+
+  function exhaustedRetryResult(code) {
+    return {
+      ok: false,
+      status: 0,
+      data: null,
+      syntheticCode: code || 'network_unavailable'
+    };
+  }
+
+  // Every request counts against the supplied total-attempt and absolute-deadline
+  // lineage. Exchange owns its lineage at controller scope so bfcache can
+  // replace a network operation without minting a new grant budget.
+  function withRetry(makeRequest, policy, signal, onRetry, lineage) {
+    var retry = lineage || createRetryLineage();
 
     function remainingMs() {
-      return Math.max(0, policy.deadlineMs - (Date.now() - startedAt));
+      return Math.max(0, policy.deadlineMs - (Date.now() - retry.startedAt));
     }
 
-    function giveUp(result, error) {
+    function giveUp(result, error, code) {
       if (error) throw error;
-      return result;
+      return result || exhaustedRetryResult(code || retry.lastRetryCode);
     }
 
-    function retryAfter(wait, result, error) {
-      if (attempts >= policy.maxAttempts || wait >= remainingMs()) {
-        return giveUp(result, error);
+    function retryAfter(wait, result, error, code) {
+      retry.lastRetryCode = code;
+      if (retry.attempts >= policy.maxAttempts || wait >= remainingMs()) {
+        return giveUp(result, error, code);
       }
+      if (onRetry) onRetry(code);
       return sessionDelay(wait, signal).then(run);
     }
 
     function retryTransportOrGiveUp(result, error) {
-      if (transportRetries >= policy.retryDelays.length) {
-        return giveUp(result, error);
+      if (retry.transportRetries >= policy.retryDelays.length) {
+        return giveUp(result, error, 'network_unavailable');
       }
-      var wait = policy.retryDelays[transportRetries];
-      transportRetries += 1;
-      return retryAfter(wait, result, error);
+      var wait = policy.retryDelays[retry.transportRetries];
+      retry.transportRetries += 1;
+      return retryAfter(wait, result, error, 'network_unavailable');
     }
 
     function run() {
       if (signal.aborted) return Promise.reject(sessionAbortError());
+      if (retry.attempts >= policy.maxAttempts) {
+        return Promise.resolve(exhaustedRetryResult(retry.lastRetryCode));
+      }
       var requestTimeoutMs = Math.min(SESSION_TIMEOUT_MS, remainingMs());
       if (requestTimeoutMs <= 0) {
-        return Promise.reject(new DOMException('session request deadline exceeded', 'AbortError'));
+        return Promise.resolve(exhaustedRetryResult(retry.lastRetryCode));
       }
-      attempts += 1;
+      retry.attempts += 1;
       return makeRequest(requestTimeoutMs).then(function (result) {
         if (signal.aborted) throw sessionAbortError();
         var code = sessionErrorCode(result);
         if (code === 'rate_limited') {
-          if (rateLimited >= policy.maxRateLimitRetries) return result;
-          rateLimited += 1;
-          return retryAfter(retryAfterMs(result), result, null);
+          if (retry.rateLimited >= policy.maxRateLimitRetries) return result;
+          retry.rateLimited += 1;
+          return retryAfter(retryAfterMs(result), result, null, 'rate_limited');
         }
         if (!isKnownSessionErrorCode(code) && result.status >= 500) {
           return retryTransportOrGiveUp(result, null);
@@ -413,11 +429,21 @@
       reconnectToken: null,
       terminalCode: null,
       recoverableCode: null,
+      exchangeRetry: createRetryLineage(),
+      reconnectRetry: null,
       detached: false,
       observer: null,
       inflight: { exchange: null, reconnect: null },
+      recoveryFlight: null,
       restorePending: false,
-      frozenInflight: { exchange: null, reconnect: null }
+      frozenInflight: { exchange: null, reconnect: null },
+      frozenRecoveryFlight: null,
+      rapidRecoveries: 0,
+      deliverySequence: 0,
+      awaitedDeliveryId: null,
+      invalidatedDeliveryId: null,
+      stableDeliveryId: null,
+      stabilityTimer: null
     };
 
     function attach(iframe) {
@@ -427,7 +453,7 @@
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);
       state.observer = new MutationObserver(onDomMutation);
-      state.observer.observe(document.body, { childList: true });
+      state.observer.observe(document.body, { childList: true, subtree: true });
       runLoadFlow();
     }
 
@@ -435,8 +461,33 @@
       return exchange();
     }
 
-    function runRecoveryFlow() {
-      return state.reconnectToken ? reconnect() : exchange();
+    function runRecoveryFlow(isResume) {
+      if (state.terminalCode) {
+        flush();
+        return Promise.resolve();
+      }
+      // Join the existing parent owner before touching the rapid-recovery
+      // circuit: iframe close/error bursts do not consume logical attempts.
+      if (state.recoveryFlight) return state.recoveryFlight;
+      var initialExchange = !state.session && inflightPromise('exchange');
+      if (initialExchange) return initialExchange;
+      if (!isResume) {
+        invalidateStability();
+        if (state.rapidRecoveries >= 3) {
+          recordFailure('network_unavailable');
+          return Promise.resolve();
+        }
+        state.rapidRecoveries += 1;
+      }
+      var recovery = isNonBlankString(state.reconnectToken) ? reconnect() : exchange();
+      var recoveryFlight;
+      recoveryFlight = Promise.resolve(recovery).then(function () {
+        if (state.recoveryFlight === recoveryFlight) state.recoveryFlight = null;
+      }, function () {
+        if (state.recoveryFlight === recoveryFlight) state.recoveryFlight = null;
+      });
+      state.recoveryFlight = recoveryFlight;
+      return recoveryFlight;
     }
 
     function onDomMutation() {
@@ -446,6 +497,7 @@
     function detach() {
       if (state.detached) return;
       state.detached = true;
+      invalidateStability();
       cancelInflight('exchange');
       cancelInflight('reconnect');
       window.removeEventListener('message', onMessage);
@@ -462,9 +514,11 @@
     // earlier pageshow for the same navigation.
     function onPageHide(event) {
       if (!event.persisted || state.detached) return;
+      invalidateStability();
       state.restorePending = true;
       state.frozenInflight.exchange = state.inflight.exchange;
       state.frozenInflight.reconnect = state.inflight.reconnect;
+      state.frozenRecoveryFlight = state.recoveryFlight;
     }
 
     // Scripts do not re-run on a bfcache restore. Consume each persisted
@@ -478,18 +532,24 @@
       state.restorePending = false;
       var frozenExchange = state.frozenInflight.exchange;
       var frozenReconnect = state.frozenInflight.reconnect;
+      var frozenRecoveryFlight = state.frozenRecoveryFlight;
       state.frozenInflight.exchange = null;
       state.frozenInflight.reconnect = null;
+      state.frozenRecoveryFlight = null;
       if (state.terminalCode) return;
       cancelInflightIfCurrent('exchange', frozenExchange);
       cancelInflightIfCurrent('reconnect', frozenReconnect);
+      if (state.recoveryFlight === frozenRecoveryFlight) state.recoveryFlight = null;
       state.recoverableCode = null;
       if (state.session && !isStale(state.session.session_token_expires_at)) {
+        // A persisted restore reuses the token lineage but starts a new
+        // parent/iframe delivery epoch; the pagehide-invalidated ID cannot
+        // establish post-restore stability.
+        state.session.session_delivery_id = mintDeliveryId();
         flush();
         return;
       }
-      runRecoveryFlow();
-      flush();
+      runRecoveryFlow(Boolean(frozenRecoveryFlight));
     }
 
     function onMessage(event) {
@@ -502,7 +562,10 @@
         state.ready = true;
         flush();
       } else if (data.type === 'reconnect_request') {
-        reconnect();
+        runRecoveryFlow();
+      } else if (data.type === 'session_connection_open') {
+        if (!isNonBlankString(data.session_delivery_id)) return;
+        beginStability(data.session_delivery_id);
       }
     }
 
@@ -532,19 +595,23 @@
         send({ type: 'session_terminal', code: state.terminalCode });
         return;
       }
-      if (state.recoverableCode &&
-          (!state.session || isStale(state.session.session_token_expires_at))) {
+      if (state.recoverableCode) {
         send({ type: 'session_degraded', code: state.recoverableCode });
         return;
       }
       if (!state.session) return;
       // Rule 3: refresh before any use of the token, including handing it over.
       if (isStale(state.session.session_token_expires_at)) {
-        reconnect();
+        runRecoveryFlow();
         return;
+      }
+      var deliveryId = state.session.session_delivery_id;
+      if (deliveryId !== state.stableDeliveryId && deliveryId !== state.invalidatedDeliveryId) {
+        state.awaitedDeliveryId = deliveryId;
       }
       send({
         type: 'session_update',
+        session_delivery_id: deliveryId,
         session_token: state.session.session_token,
         session_token_expires_at: state.session.session_token_expires_at,
         absolute_expires_at: state.session.absolute_expires_at,
@@ -586,24 +653,73 @@
     }
 
     function applySession(payload) {
+      var reconnectTokenChanged = payload.reconnectToken !== state.reconnectToken;
       state.session = payload.session;
+      state.session.session_delivery_id = mintDeliveryId();
+      state.awaitedDeliveryId = null;
       state.reconnectToken = payload.reconnectToken;
+      if (reconnectTokenChanged) state.reconnectRetry = null;
       state.recoverableCode = null;
+    }
+
+    function mintDeliveryId() {
+      state.deliverySequence += 1;
+      return 'widget-delivery-' + Date.now().toString(36) + '-' + state.deliverySequence;
+    }
+
+    function invalidateStability() {
+      if (state.stabilityTimer) {
+        clearTimeout(state.stabilityTimer);
+        state.stabilityTimer = null;
+      }
+      if (state.awaitedDeliveryId) {
+        state.invalidatedDeliveryId = state.awaitedDeliveryId;
+        state.awaitedDeliveryId = null;
+      }
+    }
+
+    function beginStability(deliveryId) {
+      if (deliveryId !== state.awaitedDeliveryId || deliveryId === state.invalidatedDeliveryId) return;
+      if (state.stabilityTimer || state.stableDeliveryId === deliveryId) return;
+      var timer = setTimeout(function () {
+        if (state.stabilityTimer !== timer || state.awaitedDeliveryId !== deliveryId) return;
+        state.stabilityTimer = null;
+        state.awaitedDeliveryId = null;
+        state.stableDeliveryId = deliveryId;
+        state.rapidRecoveries = 0;
+      }, 15000);
+      state.stabilityTimer = timer;
+    }
+
+    function reconnectRetryLineage(reconnectToken) {
+      var current = state.reconnectRetry;
+      if (!current || current.reconnectToken !== reconnectToken) {
+        current = {
+          reconnectToken: reconnectToken,
+          lineage: createRetryLineage()
+        };
+        state.reconnectRetry = current;
+      }
+      return current.lineage;
+    }
+
+    function recordRetry(code) {
+      if (state.terminalCode) return;
+      state.recoverableCode = code;
+      logSession('warn', 'session recovery is retrying', code);
+      flush();
     }
 
     function recordFailure(code, status) {
       if (state.terminalCode) return;
-      if (Object.prototype.hasOwnProperty.call(TRANSIENT_SESSION_CODES, code)) {
-        state.recoverableCode = code;
-      } else {
-        state.terminalCode = code;
-        state.recoverableCode = null;
-      }
+      state.terminalCode = code;
+      state.recoverableCode = null;
       logSession('error', 'chat unavailable', code, status);
       flush();
     }
 
     function classifySessionFailure(result) {
+      if (result && result.syntheticCode) return result.syntheticCode;
       var code = sessionErrorCode(result);
       if (isKnownSessionErrorCode(code)) return code;
       if (result.status >= 500) return 'network_unavailable';
@@ -619,10 +735,6 @@
           return;
         }
         applySession(payload);
-        // A reconnect already in flight supersedes this response: it was
-        // queued while this exchange was still pending and will carry the
-        // freshest reconnect_token, so let it be the one that flushes.
-        if (phase === 'exchange' && state.inflight.reconnect) return;
         flush();
         return;
       }
@@ -730,16 +842,24 @@
       cancelInflight(key);
     }
 
+    // Exchange and reconnect differ only in endpoint/body/lineage; both keep
+    // retry publication fenced by the operation signal.
+    function requestSessionWithRetry(url, body, retryLineage, signal) {
+      return withRetry(function (timeoutMs) {
+        return postJson(url, body, timeoutMs, signal);
+      }, SESSION_RETRY_POLICY, signal, function (code) {
+        if (!signal.aborted) recordRetry(code);
+      }, retryLineage);
+    }
+
     function exchange() {
       return singleFlight('exchange', function (signal) {
-        return withRetry(function (timeoutMs) {
-          return postJson(
-            host + '/v1/external/chat/sessions',
-            { encrypted_context: state.grant },
-            timeoutMs,
-            signal
-          );
-        }, SESSION_RETRY_POLICY, signal).then(function (result) {
+        return requestSessionWithRetry(
+          host + '/v1/external/chat/sessions',
+          { encrypted_context: state.grant },
+          state.exchangeRetry,
+          signal
+        ).then(function (result) {
           handleResult(result, 'exchange');
         }, function () {
           if (!signal.aborted) recordFailure('network_unavailable');
@@ -748,36 +868,33 @@
     }
 
     function reconnect() {
-      if (state.terminalCode || state.recoverableCode) {
+      if (state.terminalCode) {
         flush();
         return Promise.resolve();
       }
+      if (state.recoverableCode) {
+        return inflightPromise('reconnect') || inflightPromise('exchange') || Promise.resolve();
+      }
+      var reconnectToken = state.reconnectToken;
+      // Defense in depth: every internal reconnect caller must revalidate the
+      // rotate-on-use credential immediately before constructing the request.
+      if (!isNonBlankString(reconnectToken)) {
+        recordFailure('reconnect_invalid');
+        return Promise.resolve();
+      }
       return singleFlight('reconnect', function (signal) {
-        // If an exchange is still in flight, wait for it: it will land the
-        // authoritative reconnect_token this reconnect needs to send, and
-        // its own flush is held back (see handleResult) so this call wins.
-        var wait = inflightPromise('exchange') || Promise.resolve();
-        return wait.then(function () {
-          if (signal.aborted) return;
-          // Re-check: the exchange we waited on may have just published a
-          // failure. Its transition already flushed the authoritative state;
-          // this parked continuation must neither issue a request nor flush a
-          // duplicate terminal message.
-          if (state.terminalCode || state.recoverableCode) return;
-          var body = { reconnect_token: state.reconnectToken };
-          body.encrypted_context = state.grant;
-          return withRetry(function (timeoutMs) {
-            return postJson(
-              host + '/v1/external/chat/sessions/reconnect',
-              body,
-              timeoutMs,
-              signal
-            );
-          }, SESSION_RETRY_POLICY, signal).then(function (result) {
-            handleResult(result, 'reconnect');
-          }, function () {
-            if (!signal.aborted) recordFailure('network_unavailable');
-          });
+        var body = { reconnect_token: reconnectToken };
+        body.encrypted_context = state.grant;
+        var retryLineage = reconnectRetryLineage(reconnectToken);
+        return requestSessionWithRetry(
+          host + '/v1/external/chat/sessions/reconnect',
+          body,
+          retryLineage,
+          signal
+        ).then(function (result) {
+          handleResult(result, 'reconnect');
+        }, function () {
+          if (!signal.aborted) recordFailure('network_unavailable');
         });
       });
     }

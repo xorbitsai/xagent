@@ -5,7 +5,9 @@ import json
 import logging
 import re
 import shutil
+import time
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -34,6 +37,7 @@ from fastapi import (
 )
 from fastapi.responses import RedirectResponse
 from sqlalchemy import case, func, or_, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -76,10 +80,9 @@ from ..services.chat_history_service import (
     DELIVERY_FAILED,
     DELIVERY_PENDING,
     UserMessageDeliveryClaim,
-    claim_user_message_delivery,
+    claim_user_message_delivery_no_commit,
     get_latest_waiting_question,
     inspect_user_message_delivery,
-    mark_user_message_delivery,
     mark_user_message_delivery_sync,
 )
 from ..services.db_runtime import (
@@ -292,9 +295,14 @@ async def send_message_delivery(
     accepted: bool,
     message: str | None = None,
     retry_with_new_id: bool = False,
+    rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
 ) -> None:
     if client_message_id is None:
         return
+    if not accepted and rejection_outcome is None:
+        raise ValueError("Rejected delivery requires an explicit rejection outcome")
+    if accepted and rejection_outcome is not None:
+        raise ValueError("Accepted delivery cannot include a rejection outcome")
     payload: dict[str, Any] = {
         "type": "message_accepted" if accepted else "message_rejected",
         "client_message_id": client_message_id,
@@ -305,6 +313,8 @@ async def send_message_delivery(
         payload["message"] = message
     if retry_with_new_id:
         payload["retry_with_new_id"] = True
+    if rejection_outcome is not None:
+        payload["rejection_outcome"] = rejection_outcome
     await manager.send_personal_message(payload, websocket)
 
 
@@ -2962,6 +2972,7 @@ async def execute_resume_background(
         message: str | None = None,
         *,
         retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
         if delivery_websocket is None or delivery_client_message_id is None:
             return
@@ -2973,6 +2984,7 @@ async def execute_resume_background(
                 accepted=accepted,
                 message=message,
                 retry_with_new_id=retry_with_new_id,
+                rejection_outcome=rejection_outcome,
             )
         except Exception:
             # Delivery state is durable; a disconnected client will retry the
@@ -3084,6 +3096,7 @@ async def execute_resume_background(
                         False,
                         "The deferred message could not be delivered. Please retry.",
                         retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
                     )
                 await manager.broadcast_to_task(
                     {
@@ -3136,13 +3149,34 @@ async def execute_resume_background(
                 )
             delivery_was_dispatched = True
             if delivery_turn_id is not None:
-                await run_db_io_cancellation_safe(
-                    lambda: mark_user_message_delivery_sync(
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_DISPATCHED,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "delivery marker failed after deferred message seal "
+                        "for task %s turn %s",
                         task_id,
                         delivery_turn_id,
-                        DELIVERY_DISPATCHED,
+                        exc_info=True,
                     )
-                )
+                except asyncio.CancelledError:
+                    # Once the checkpoint write has accepted this turn, task
+                    # cancellation must not turn that durable success into a
+                    # failed delivery. Continue the registered resume; the
+                    # marker is monotonic and can be reconciled from the
+                    # checkpoint on retry.
+                    logger.warning(
+                        "delivery marker was cancelled after deferred message "
+                        "seal for task %s turn %s; continuing resume",
+                        task_id,
+                        delivery_turn_id,
+                    )
             await notify_deferred_delivery(True)
 
         # Resume is now durable: lease acquisition committed RUNNING. Do not
@@ -3375,6 +3409,7 @@ async def execute_resume_background(
                     False,
                     "The deferred message was cancelled. Please retry.",
                     retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
                 )
         raise
     except Exception as e:
@@ -3417,6 +3452,7 @@ async def execute_resume_background(
                         False,
                         error_message,
                         retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
                     )
             current_snapshot = None
             if (
@@ -4365,6 +4401,10 @@ class _UserMessageDeliverySnapshot:
     pending: bool
 
 
+class _WebSocketCommitOutcomeUnknown(RuntimeError):
+    """A WebSocket acceptance COMMIT may still be visible to a later retry."""
+
+
 def _snapshot_user_message_delivery(
     claim: UserMessageDeliveryClaim,
 ) -> _UserMessageDeliverySnapshot:
@@ -4376,27 +4416,209 @@ def _snapshot_user_message_delivery(
     )
 
 
+def _retire_websocket_session_best_effort(
+    db: Session,
+    *,
+    task_id: int,
+) -> None:
+    """Release an owned Session without replacing its primary error."""
+
+    try:
+        db.close()
+        return
+    except Exception:
+        logger.warning(
+            "failed to close websocket turn session for task %s",
+            task_id,
+            exc_info=True,
+        )
+    try:
+        db.invalidate()
+    except Exception:
+        logger.warning(
+            "failed to invalidate websocket turn session for task %s",
+            task_id,
+            exc_info=True,
+        )
+
+
+@contextmanager
+def _owned_websocket_session(*, task_id: int) -> Iterator[Session]:
+    SessionLocal = get_session_local()
+    resource = SessionLocal()
+    enter = getattr(resource, "__enter__", None)
+    exit_context = getattr(resource, "__exit__", None)
+    db = enter() if callable(enter) else resource
+    try:
+        yield db
+    finally:
+        if callable(exit_context):
+            try:
+                exit_context(None, None, None)
+            except Exception:
+                _retire_websocket_session_best_effort(db, task_id=task_id)
+        else:
+            _retire_websocket_session_best_effort(db, task_id=task_id)
+
+
+def _reconcile_websocket_acceptance_graph(
+    *,
+    task_id: int,
+    task_owner_user_id: int,
+    turn_id: str,
+    content: str,
+    file_ids: list[str],
+    expected_run_id: str | None,
+    expected_status: TaskStatus,
+) -> bool:
+    """Boundedly inspect an ambiguous acceptance COMMIT via fresh Sessions."""
+
+    for attempt in range(3):
+        reconcile_db: Session | None = None
+        try:
+            SessionLocal = get_session_local()
+            reconcile_db = SessionLocal()
+            task_query = reconcile_db.query(Task).filter(
+                Task.id == task_id,
+                Task.user_id == task_owner_user_id,
+                Task.status == expected_status,
+                Task.run_id == expected_run_id,
+            )
+            if task_query.first() is None:
+                pass
+            else:
+                message = (
+                    reconcile_db.query(TaskChatMessage)
+                    .filter(
+                        TaskChatMessage.task_id == task_id,
+                        TaskChatMessage.role == "user",
+                        TaskChatMessage.turn_id == turn_id,
+                        TaskChatMessage.content == content.strip(),
+                        TaskChatMessage.delivery_status.in_(
+                            (
+                                DELIVERY_PENDING,
+                                DELIVERY_DISPATCHED,
+                                DELIVERY_COMPLETED,
+                            )
+                        ),
+                    )
+                    .first()
+                )
+                if message is not None:
+                    if not file_ids:
+                        return True
+                    bound = (
+                        reconcile_db.query(UploadedFile.file_id)
+                        .filter(
+                            UploadedFile.file_id.in_(file_ids),
+                            UploadedFile.user_id == task_owner_user_id,
+                            UploadedFile.task_id == task_id,
+                        )
+                        .count()
+                    )
+                    if bound == len(set(file_ids)):
+                        return True
+        except Exception:
+            logger.warning(
+                "websocket commit reconciliation attempt %s failed for task %s",
+                attempt + 1,
+                task_id,
+                exc_info=True,
+            )
+        finally:
+            if reconcile_db is not None:
+                _retire_websocket_session_best_effort(
+                    reconcile_db,
+                    task_id=task_id,
+                )
+        if attempt < 2:
+            time.sleep(0.01)
+    return False
+
+
 def _claim_user_message_delivery_isolated(
     *,
     task_id: int,
     task_owner_user_id: int,
     content: str,
     attachments: list[dict[str, Any]] | None,
+    file_ids: list[str],
     turn_id: str,
+    expected_run_id: str | None,
+    expected_status: TaskStatus,
 ) -> _UserMessageDeliverySnapshot:
     """Claim a live-control message in one worker-owned short Session."""
 
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        claim = claim_user_message_delivery(
-            db,
-            task_id=task_id,
-            user_id=task_owner_user_id,
-            content=content,
-            attachments=attachments,
-            turn_id=turn_id,
-        )
-        return _snapshot_user_message_delivery(claim)
+    with _owned_websocket_session(task_id=task_id) as db:
+        try:
+            try:
+                claim = claim_user_message_delivery_no_commit(
+                    db,
+                    task_id=task_id,
+                    user_id=task_owner_user_id,
+                    content=content,
+                    attachments=attachments,
+                    turn_id=turn_id,
+                )
+            except IntegrityError:
+                db.rollback()
+                _retire_websocket_session_best_effort(db, task_id=task_id)
+                with _owned_websocket_session(task_id=task_id) as winner_db:
+                    winner = inspect_user_message_delivery(
+                        winner_db,
+                        task_id,
+                        content,
+                        attachments=attachments,
+                        turn_id=turn_id,
+                    )
+                    if winner is None:
+                        raise
+                    if winner.payload_matches and file_ids:
+                        bound_count = (
+                            winner_db.query(UploadedFile.file_id)
+                            .filter(
+                                UploadedFile.file_id.in_(file_ids),
+                                UploadedFile.user_id == task_owner_user_id,
+                                UploadedFile.task_id == task_id,
+                            )
+                            .count()
+                        )
+                        if bound_count != len(set(file_ids)):
+                            raise
+                    return _snapshot_user_message_delivery(winner)
+            if claim.claimed:
+                missing = bind_turn_files_no_commit(
+                    file_ids=file_ids,
+                    task_id=task_id,
+                    owner_user_id=task_owner_user_id,
+                    db=db,
+                )
+                if missing:
+                    raise ValueError(
+                        "Files are no longer bindable: " + ", ".join(missing)
+                    )
+            claim_snapshot = _snapshot_user_message_delivery(claim)
+            try:
+                db.flush()
+                db.commit()
+            except Exception as commit_error:
+                _retire_websocket_session_best_effort(db, task_id=task_id)
+                if not _reconcile_websocket_acceptance_graph(
+                    task_id=task_id,
+                    task_owner_user_id=task_owner_user_id,
+                    turn_id=turn_id,
+                    content=content,
+                    file_ids=file_ids,
+                    expected_run_id=expected_run_id,
+                    expected_status=expected_status,
+                ):
+                    raise _WebSocketCommitOutcomeUnknown(
+                        f"live delivery {turn_id} has an unknown commit outcome"
+                    ) from commit_error
+            return claim_snapshot
+        except Exception:
+            db.rollback()
+            raise
 
 
 def _register_uploaded_files_for_agent(
@@ -4537,6 +4759,7 @@ async def handle_chat_message(
             turn_id=client_message_id or str(uuid.uuid4()),
             accepted=False,
             message=str(exc),
+            rejection_outcome="not_accepted",
         )
         await manager.send_personal_message(
             {"type": "error", "message": str(exc)}, websocket
@@ -4557,6 +4780,7 @@ async def handle_chat_message(
             accepted=False,
             message="Message id was already used for different content or files.",
             retry_with_new_id=True,
+            rejection_outcome="not_accepted",
         )
         return
     if enqueued.status == COMMAND_FAILED:
@@ -4567,6 +4791,7 @@ async def handle_chat_message(
             accepted=False,
             message="The previous delivery attempt failed. Please retry the draft.",
             retry_with_new_id=True,
+            rejection_outcome="not_accepted",
         )
         return
     await send_message_delivery(
@@ -4889,8 +5114,7 @@ def _prepare_websocket_turn_sync(
 ) -> _WebSocketTurnPreparation:
     """Authorize, normalize, and detach one WebSocket turn off the event loop."""
 
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
+    with _owned_websocket_session(task_id=requested_task_id) as db:
         files = deepcopy(raw_files)
         if not files:
             try:
@@ -4983,17 +5207,6 @@ def _prepare_websocket_turn_sync(
                     requested_task_id,
                     missing_id,
                 )
-            if not task_created:
-                assert routing is not None
-                bind_turn_files(
-                    file_ids=[
-                        str(file_info["file_id"]) for file_info in file_info_list
-                    ],
-                    task_id=routing.task_id,
-                    owner_user_id=routing.task_owner_user_id,
-                    db=db,
-                )
-
         if task_created:
             task_title = f"Chat: {user_message}"
             if len(task_title) > 50:
@@ -5078,6 +5291,7 @@ def _prepare_websocket_turn_sync(
             transcript_message=display_user_message,
             execution_message=user_message_for_llm,
             attachments=deepcopy(persisted_attachments) or None,
+            file_ids=tuple(str(file_info["file_id"]) for file_info in file_info_list),
             turn_id=turn_id,
         )
         claimed_created_turn = None
@@ -5093,16 +5307,6 @@ def _prepare_websocket_turn_sync(
                 task_owner_user_id=routing.task_owner_user_id,
                 payload=turn_payload,
             )
-            missing_bindings = bind_turn_files_no_commit(
-                file_ids=[str(file_info["file_id"]) for file_info in file_info_list],
-                task_id=routing.task_id,
-                owner_user_id=routing.task_owner_user_id,
-                db=db,
-            )
-            if missing_bindings:
-                raise ValueError(
-                    "Files are no longer bindable: " + ", ".join(missing_bindings)
-                )
             # The atomic claim uses a bulk UPDATE. Refresh the Task before
             # projecting the detached routing snapshot so the first
             # task_info event reflects the committed RUNNING lease.
@@ -5112,7 +5316,26 @@ def _prepare_websocket_turn_sync(
                 db,
                 task,
             )
-            db.commit()
+            try:
+                db.flush()
+                db.commit()
+            except Exception as commit_error:
+                _retire_websocket_session_best_effort(
+                    db,
+                    task_id=routing.task_id,
+                )
+                if not _reconcile_websocket_acceptance_graph(
+                    task_id=routing.task_id,
+                    task_owner_user_id=routing.task_owner_user_id,
+                    turn_id=turn_id,
+                    content=display_user_message,
+                    file_ids=list(turn_payload.file_ids),
+                    expected_run_id=routing.run_id,
+                    expected_status=TaskStatus.RUNNING,
+                ):
+                    raise _WebSocketCommitOutcomeUnknown(
+                        f"created task turn {turn_id} has an unknown commit outcome"
+                    ) from commit_error
             delivery_claimed = True
             logger.info(
                 "Created and claimed task %s, replacing old task_id %s",
@@ -5140,17 +5363,6 @@ def _prepare_websocket_turn_sync(
                         pending=True,
                     )
                     delivery_claimed = True
-                    if (
-                        routing.status == TaskStatus.RUNNING
-                        and routing.task_input.strip() == display_user_message.strip()
-                    ):
-                        mark_user_message_delivery(
-                            db,
-                            task_id=routing.task_id,
-                            turn_id=turn_id,
-                            status=DELIVERY_DISPATCHED,
-                        )
-                        delivery_dispatched = True
                 else:
                     existing_delivery_snapshot = _snapshot_user_message_delivery(
                         existing_delivery
@@ -5196,6 +5408,7 @@ async def _handle_chat_message_unserialized(
     suppress_delivery_ack = bool(message_data.get("_durable_ack_sent"))
     delivery_finished = False
     delivery_dispatched = False
+    delivery_injected = False
     delivery_claimed = False
     delivery_failure_persist_attempted = False
     delivery_failure_pool_timeout = False
@@ -5206,6 +5419,7 @@ async def _handle_chat_message_unserialized(
         message: str | None = None,
         *,
         retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
         nonlocal delivery_finished
         if delivery_finished:
@@ -5222,6 +5436,7 @@ async def _handle_chat_message_unserialized(
             accepted=accepted,
             message=message,
             retry_with_new_id=retry_with_new_id,
+            rejection_outcome=rejection_outcome,
         )
 
     async def finish_delivery_failure(message: str) -> bool:
@@ -5234,6 +5449,7 @@ async def _handle_chat_message_unserialized(
             delivery_claimed
             and not delivery_dispatched
             and not delivery_failure_persist_attempted
+            and not delivery_injected
         ):
             # Set before awaiting the worker. If its checkout times out and the
             # exception reaches another handler layer, that layer must not
@@ -5258,10 +5474,18 @@ async def _handle_chat_message_unserialized(
                     delivery_error,
                     exc_info=True,
                 )
-        await finish_delivery(
-            delivery_dispatched,
-            None if delivery_dispatched else message,
-        )
+        if delivery_dispatched:
+            await finish_delivery(True)
+        else:
+            await finish_delivery(
+                False,
+                message,
+                rejection_outcome=(
+                    "outcome_unknown"
+                    if delivery_failure_pool_timeout or delivery_injected
+                    else "not_accepted"
+                ),
+            )
         return not delivery_failure_pool_timeout
 
     async def finish_existing_delivery(
@@ -5272,17 +5496,20 @@ async def _handle_chat_message_unserialized(
                 False,
                 "Message id was already used for different content or files.",
                 retry_with_new_id=True,
+                rejection_outcome="not_accepted",
             )
         elif claim.failed:
             await finish_delivery(
                 False,
                 "The previous delivery attempt failed. Please retry the draft.",
                 retry_with_new_id=True,
+                rejection_outcome="not_accepted",
             )
         elif claim.pending:
             await finish_delivery(
                 False,
                 "The message is still being applied. Please retry shortly.",
+                rejection_outcome="outcome_unknown",
             )
         else:
             await finish_delivery(True)
@@ -5388,6 +5615,7 @@ async def _handle_chat_message_unserialized(
                 # Keep the local flag aligned so a later WebSocket ack failure
                 # cannot rewrite an already-running turn as failed delivery.
                 delivery_dispatched = True
+                message_data["_registered_turn_handoff"] = turn_id
                 await finish_delivery(True)
                 return
 
@@ -5452,6 +5680,7 @@ async def _handle_chat_message_unserialized(
                         False,
                         "A previous guidance message is still being applied. "
                         "Please wait for it to finish.",
+                        rejection_outcome="not_accepted",
                     )
                     return
                 # Pass the user-typed bubble text + display-safe file refs
@@ -5465,6 +5694,7 @@ async def _handle_chat_message_unserialized(
                 # ``on_user_message_posted`` callback is the single trace
                 # emission point. Do not emit a second user-message trace.
                 bg_task: asyncio.Task[None] | None = None
+                handoff_registered = False
                 try:
                     if recovered_delivery is not None:
                         delivery_claim = recovered_delivery
@@ -5475,7 +5705,10 @@ async def _handle_chat_message_unserialized(
                                 task_owner_user_id=task_owner_user_id,
                                 content=display_user_message,
                                 attachments=persisted_attachments or None,
+                                file_ids=list(turn_payload.file_ids),
                                 turn_id=turn_id,
+                                expected_run_id=routing.run_id,
+                                expected_status=task_status,
                             )
                         )
                     recovered_delivery = None
@@ -5497,6 +5730,7 @@ async def _handle_chat_message_unserialized(
                                 request_interrupt=True,
                                 reason="new websocket user message",
                             )
+                    delivery_injected = posted
                     if not posted:
                         logger.warning(
                             "Agent execution %s had no exact live lease or "
@@ -5504,20 +5738,6 @@ async def _handle_chat_message_unserialized(
                             "until the resume owner is ready",
                             task_id,
                         )
-                    else:
-                        await run_db_io_cancellation_safe(
-                            lambda: mark_user_message_delivery_sync(
-                                task_id,
-                                turn_id,
-                                DELIVERY_DISPATCHED,
-                            )
-                        )
-                    # ``post_user_message`` has already durably injected the
-                    # turn when it returns True. Preserve that fact even if
-                    # the resume reservation is concurrently withdrawn
-                    # before the coordinator can be registered.
-                    delivery_dispatched = posted
-
                     await task_execution_controller.transition(
                         task_id,
                         TaskControlState.RESUME_REQUESTED,
@@ -5556,10 +5776,34 @@ async def _handle_chat_message_unserialized(
                         )
                     )
                     background_task_manager.register_reserved_resume(task_id, bg_task)
+                    handoff_registered = True
+                    if posted:
+                        # Registration completes the local resume handoff.
+                        # The delivery marker is a best-effort projection and
+                        # must not reject a turn that is already resumable.
+                        delivery_dispatched = True
+                        message_data["_registered_turn_handoff"] = turn_id
+                        try:
+                            await run_db_io_cancellation_safe(
+                                lambda: mark_user_message_delivery_sync(
+                                    task_id,
+                                    turn_id,
+                                    DELIVERY_DISPATCHED,
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "delivery marker failed after registered resume handoff "
+                                "for task %s turn %s",
+                                task_id,
+                                turn_id,
+                                exc_info=True,
+                            )
                 except BaseException:
-                    if bg_task is not None:
+                    if bg_task is not None and not handoff_registered:
                         bg_task.cancel()
-                    background_task_manager.release_resume_reservation(task_id)
+                    if not handoff_registered:
+                        background_task_manager.release_resume_reservation(task_id)
                     raise
 
                 if posted:
@@ -5581,7 +5825,9 @@ async def _handle_chat_message_unserialized(
                     websocket,
                 )
                 await finish_delivery(
-                    False, "Task does not support message continuation."
+                    False,
+                    "Task does not support message continuation.",
+                    rejection_outcome="not_accepted",
                 )
                 return
             else:
@@ -5630,6 +5876,7 @@ async def _handle_chat_message_unserialized(
                         await finish_delivery(
                             False,
                             "Task pause is still being applied; please retry shortly.",
+                            rejection_outcome="not_accepted",
                         )
                         return
                     _clear_task_pause_accepted(task_id)
@@ -5669,6 +5916,7 @@ async def _handle_chat_message_unserialized(
                 # schedule -- so WS and /v1 SDK use one turn-
                 # lifecycle state machine.
                 from ..services.task_orchestrator import (
+                    TaskTurnCommitOutcomeUnknown,
                     TaskTurnError,
                     TaskTurnNotFoundError,
                     TaskTurnOrchestrator,
@@ -5721,7 +5969,9 @@ async def _handle_chat_message_unserialized(
                         task_id,
                     )
                     await finish_delivery(
-                        False, "Internal dispatch error; please retry."
+                        False,
+                        "Internal dispatch error; please retry.",
+                        rejection_outcome="not_accepted",
                     )
                     return
 
@@ -5744,8 +5994,16 @@ async def _handle_chat_message_unserialized(
                         force_fresh=turn_force_fresh,
                         context=context,
                     )
+                    message_data["_registered_turn_handoff"] = turn_id
                     logger.info(f"Task {task_id} started in background")
                     await finish_delivery(True)
+                except TaskTurnCommitOutcomeUnknown:
+                    message_data["_commit_outcome_unknown"] = turn_id
+                    await finish_delivery(
+                        False,
+                        "Message acceptance is still being reconciled. Please retry shortly.",
+                        rejection_outcome="outcome_unknown",
+                    )
                 except TaskTurnNotFoundError:
                     # Task vanished or changed ownership between the
                     # resolve above and the atomic claim — surface it the
@@ -5766,7 +6024,11 @@ async def _handle_chat_message_unserialized(
                         },
                         task_id,
                     )
-                    await finish_delivery(False, "Task is no longer available.")
+                    await finish_delivery(
+                        False,
+                        "Task is no longer available.",
+                        rejection_outcome="not_accepted",
+                    )
                 except TaskTurnError as busy_err:
                     # begin_turn's atomic transaction rolls back on
                     # bg_inflight / busy — neither the status flip
@@ -5794,8 +6056,19 @@ async def _handle_chat_message_unserialized(
                         },
                         task_id,
                     )
-                    await finish_delivery(False, rejection_message)
+                    await finish_delivery(
+                        False,
+                        rejection_message,
+                        rejection_outcome="not_accepted",
+                    )
 
+        except _WebSocketCommitOutcomeUnknown:
+            message_data["_commit_outcome_unknown"] = turn_id
+            await finish_delivery(
+                False,
+                "Message acceptance is still being reconciled. Please retry shortly.",
+                rejection_outcome="outcome_unknown",
+            )
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
             message = f"Data validation error: {str(e)}"
@@ -7349,6 +7622,16 @@ async def _execute_durable_task_command(
         await _handle_chat_message_unserialized(
             websocket, command.task_id, message_data
         )
+        if message_data.get("_commit_outcome_unknown") == command.command_id:
+            raise TaskCommandDeferred(
+                f"Message {command.command_id} has an unknown commit outcome"
+            )
+        if message_data.get("_registered_turn_handoff") == command.command_id:
+            return {
+                "task_id": command.task_id,
+                "command_id": command.command_id,
+                "kind": command.kind.value,
+            }
         delivery_status = await run_db_io_cancellation_safe(
             lambda: _load_command_message_delivery_status(
                 command.task_id,

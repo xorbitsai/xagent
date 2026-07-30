@@ -20,13 +20,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
-from ..models.agent import Agent, is_workforce_generated_manager_agent
+from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.deployment import DeploymentOwnerType
 from ..models.user import User
 from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
+from ..services.share_rate_limit import (
+    get_share_rate_limiter,
+    remote_ip_from_request,
+)
 from ..services.widget_domains import (
     origin_to_domain,
     require_domain_allowed,
@@ -113,21 +117,51 @@ class ResolvedWidgetOwner:
     workforce: Workforce | None = None
 
 
-def _get_widget_enabled_agent(db: Session, agent_id: int) -> Agent:
-    """Load a widget-enabled agent or raise the matching HTTP error."""
+def _get_live_widget_agent(db: Session, agent_id: int) -> Agent:
+    """Load an agent whose widget is actually serving, or raise the matching
+    HTTP error.
+
+    "Live" is four conditions, not just ``widget_enabled``: a real non-manager
+    agent, its widget enabled, a widget key still minted, and the agent still
+    published.
+
+    External access requires the agent to still be published, mirroring
+    ``_workforce_owner_from_ticket``'s ``status == "active"`` check: a ticket
+    minted before an unpublish must not still redeem inside its TTL (#1055).
+    Unpublished collapses into the same "disabled" 403 so the ticket path does
+    not leak an agent's publication state.
+
+    ``widget_key`` is checked for parity with the three sibling gates
+    (:func:`_resolve_widget_agent_by_key`, ``ensure_widget_agent_available``,
+    :func:`_workforce_owner_from_ticket`). No path produces
+    ``widget_enabled=True`` with no key today, but nothing at the schema level
+    forbids it either; without this check such a row would redeem a ticket into
+    a guest token that then 403s on its first real request instead of failing
+    here.
+    """
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if agent is None or is_workforce_generated_manager_agent(agent):
         raise HTTPException(
             status_code=401, detail="Widget owner not found or invalid agent_id"
         )
-    if not agent.widget_enabled:
+    if (
+        not agent.widget_enabled
+        or not agent.widget_key
+        or agent.status != AgentStatus.PUBLISHED
+    ):
         raise HTTPException(status_code=403, detail="Widget is disabled for this agent")
     return agent
 
 
 def _resolve_widget_agent_by_key(db: Session, widget_key: str) -> Agent | None:
     """Return a widget-enabled agent for the key, or ``None`` if no eligible
-    agent matches (unknown key, disabled widget, or a workforce-manager agent).
+    agent matches (unknown key, disabled widget, unpublished agent, or a
+    workforce-manager agent).
+
+    External access requires the agent to still be published, mirroring the
+    workforce branch of :func:`_resolve_widget_owner_by_key` (#1055). Agents are
+    created ``widget_enabled=True`` with a key already minted, so without this
+    a never-published draft would serve its widget too.
 
     Returning ``None`` — rather than raising — lets the caller fall through to
     the workforce lookup; every real failure still collapses to a single 403
@@ -139,6 +173,7 @@ def _resolve_widget_agent_by_key(db: Session, widget_key: str) -> Agent | None:
         or not agent.widget_key
         or is_workforce_generated_manager_agent(agent)
         or not agent.widget_enabled
+        or agent.status != AgentStatus.PUBLISHED
     ):
         return None
     return agent
@@ -313,7 +348,7 @@ def _owner_from_embed_ticket(db: Session, embed_ticket: str) -> ResolvedWidgetOw
     ticket_agent_id = claims.get("agent_id")
     if not isinstance(ticket_agent_id, int):
         raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
-    agent = _get_widget_enabled_agent(db, ticket_agent_id)
+    agent = _get_live_widget_agent(db, ticket_agent_id)
     allowed_domains = agent.allowed_domains
     # Re-check so tickets die immediately if the allowlist shrinks.
     require_domain_allowed(
@@ -419,6 +454,7 @@ get_current_widget_user_dep = build_public_chat_dependency("widget")
 
 @widget_router.post("/files/upload")
 async def upload_widget_file(
+    request: Request,
     file: UploadFile | None = File(None),
     files: list[UploadFile] | None = File(None),
     task_type: str = Form(...),
@@ -428,6 +464,20 @@ async def upload_widget_file(
     widget_info: PublicChatAccessContext = Depends(get_current_widget_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
+    # Abuse control (#973): mirror of the share upload throttle. Keyed on the
+    # widget entity + caller IP, NOT the widget guest_id — unlike share, the
+    # widget guest_id is client-supplied, so a guest-keyed bucket is
+    # rotatable at will. Matters most for the task-less workforce branch,
+    # where each admitted request can mint orphan rows until GC catches up.
+    entity_key = (
+        f"workforce:{widget_info.widget_workforce_id}"
+        if widget_info.widget_workforce_id is not None
+        else f"agent:{widget_info.widget_agent_id}"
+    )
+    if not get_share_rate_limiter().allow_widget_upload(
+        entity_key, remote_ip_from_request(request)
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     return await upload_public_chat_files(
         file=file,
         files=files,

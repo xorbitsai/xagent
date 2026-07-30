@@ -19,6 +19,9 @@ const app = vi.hoisted(() => ({
     token: string
     transport?: AppProviderTransportConfig
   },
+  startScreenProps: null as null | {
+    voiceInputEnabled?: boolean
+  },
 }))
 
 const i18n = vi.hoisted(() => ({ t: (key: string) => key }))
@@ -45,6 +48,8 @@ vi.mock("@/contexts/app-context-chat", () => ({
       sendMessage: app.sendMessage,
       setTaskId: app.setTaskId,
       connectionError: app.connectionError,
+      voiceInputEnabled:
+        app.provider?.transport?.capabilities?.voice !== "disabled",
     }
   },
 }))
@@ -54,19 +59,23 @@ vi.mock("@/contexts/i18n-context", () => ({
 }))
 
 vi.mock("@/components/chat/ChatStartScreen", () => ({
-  ChatStartScreen: ({ onSend, title }: { onSend: (message: string, files: File[], config?: Record<string, string>) => Promise<void>; title: string }) => (
-    <button
-      type="button"
-      onClick={() => {
-        // The real component surfaces a failed send via createTaskError state;
-        // swallow the rejection here so a deliberate task-create failure under
-        // test doesn't register as an unhandled promise rejection.
-        void onSend("first message", [], { mode: "balanced" }).catch(() => undefined)
-      }}
-    >
-      start:{title}
-    </button>
-  ),
+  ChatStartScreen: (props: {
+    onSend: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
+    title: string
+    voiceInputEnabled?: boolean
+  }) => {
+    app.startScreenProps = props
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          void props.onSend("first message", [], { mode: "balanced" }).catch(() => undefined)
+        }}
+      >
+        start:{props.title}
+      </button>
+    )
+  },
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
@@ -154,17 +163,25 @@ async function expectWidgetAuthFailure(detail: string) {
 }
 
 function expectPublicProviderToken() {
-  expect(sessionStorage.getItem("xagent_public_access_token")).toBe("public-access-token")
+  expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   expect(app.provider).toMatchObject({ token: "public-access-token" })
+  expect(app.provider?.transport?.capabilities).toEqual({
+    agentCards: "disabled",
+    voice: "disabled",
+  })
+  expect(app.startScreenProps?.voiceInputEnabled).toBe(false)
   expect(app.provider?.transport?.buildWebSocketUrl?.({
     baseUrl: "wss://api.example",
     taskId: 42,
     token: app.provider?.token,
   })).toBe("wss://api.example/api/widget/chat/ws/42?token=public-access-token")
-}
-
-function seedStalePublicToken() {
-  sessionStorage.setItem("xagent_public_access_token", "stale-public-token")
+  expect(app.provider?.transport?.fileAccess?.inlinePreviewUrl("public-file")).toBe(
+    "https://api.example/api/files/public/preview/public-file?token=public-access-token",
+  )
+  expect(app.provider?.transport?.fileAccess?.inlineDownloadUrl("public-file")).toBe(
+    "https://api.example/api/files/public/download/public-file?token=public-access-token",
+  )
+  expect(app.provider?.transport?.uploadFiles).toEqual(expect.any(Function))
 }
 
 function widgetTaskResponse(taskId: number, status: "pending" | "running") {
@@ -213,6 +230,7 @@ describe("PublicAgentChatPage", () => {
     }
     app.rerender = null
     app.provider = null
+    app.startScreenProps = null
     sessionStorage.clear()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
@@ -273,7 +291,6 @@ describe("PublicAgentChatPage", () => {
   it("fails closed for an invalid direct widget key", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockResolvedValueOnce(jsonResponse({ detail: "Invalid widget key" }, 403))
-    seedStalePublicToken()
 
     renderWidgetPage({ widgetKey: "wk-not-a-real-key" })
 
@@ -300,7 +317,6 @@ describe("PublicAgentChatPage", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       detail: "Domain not allowed: embedded.example",
     }, 403))
-    seedStalePublicToken()
 
     renderWidgetPage({ embedTicket: "domain-bound-ticket", widgetKey: "widget-secret" })
 
@@ -329,7 +345,6 @@ describe("PublicAgentChatPage", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       detail: "Widget is disabled for this agent",
     }, 403))
-    seedStalePublicToken()
 
     renderWidgetPage({
       embedTicket: "ticket-issued-before-disable",

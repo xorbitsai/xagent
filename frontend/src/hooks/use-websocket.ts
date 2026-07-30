@@ -1,19 +1,30 @@
 "use client"
 
-import { useEffect, useRef, useState, useCallback } from "react"
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
+import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
-// Duplicate message detection: record recently sent messages
-const recentMessages: Array<{
+interface RecentMessage {
   message: string
   timestamp: number
-  taskId: number
+  connectionIdentity: string
+  descriptorKey: ConnectionDescriptorIdentity
+  lifecycleEpoch: number
+  attemptEpoch: number
+  deliveryGeneration: number
   clientMessageId: string
-}> = []
+}
+
 const MESSAGE_DUPLICATE_THRESHOLD = 2000 // Same message within 2 seconds is considered duplicate
+const HANDSHAKE_TIMEOUT_MS = 10_000
+const MAX_AUTH_REFRESH_RETRIES = 3
+
+// Connection values may carry credentials. Lifecycle fencing keeps the
+// normalized connection object opaque; it is never serialized or hashed.
+type ConnectionDescriptorIdentity = WebSocketConnection
 
 interface WebSocketMessage {
   type: string
@@ -38,12 +49,178 @@ interface MessageDeliveryAck {
   turn_id: string
 }
 
-interface UseWebSocketOptions {
+export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unknown"
+
+export class MessageDeliveryError extends Error {
+  readonly disposition: MessageDeliveryDisposition
+  readonly retryWithNewId: boolean
+
+  constructor(
+    message: string,
+    disposition: MessageDeliveryDisposition,
+    retryWithNewId = false,
+  ) {
+    super(message)
+    this.name = "MessageDeliveryError"
+    this.disposition = disposition
+    this.retryWithNewId = retryWithNewId
+  }
+}
+
+const deliveryError = (
+  message: string,
+  disposition: MessageDeliveryDisposition,
+  retryWithNewId = false,
+) => new MessageDeliveryError(message, disposition, retryWithNewId)
+
+export type WebSocketCredentialOwner =
+  | {
+    kind: "auth-context"
+    accessToken: string
+    userId: string | null
+    session?: AuthSessionSnapshot
+  }
+  | { kind: "external" }
+
+const getInternalSessionId = (
+  connection: WebSocketConnection | null,
+): string | null => {
+  const credentialOwner = connection?.credentialOwner
+  return credentialOwner?.kind === "auth-context"
+    ? credentialOwner.session?.sessionId ?? null
+    : null
+}
+
+export interface WebSocketConnection {
+  identity: string
+  url: string
+  protocols?: string[]
+  expectedProtocol?: string
+  taskId?: number
+  chatTaskIdMode: "required" | "omit"
+  credentialOwner: WebSocketCredentialOwner
+}
+
+export type WebSocketSendResult = "sent" | "not_sent"
+
+export interface WebSocketConnectionFailure {
+  recoverable: boolean
+  error: Error
+}
+
+interface PendingDelivery {
+  resolve: (ack: MessageDeliveryAck) => void
+  reject: (error: Error) => void
+  timeout: ReturnType<typeof setTimeout>
+  connectionIdentity: string
+  descriptorKey: ConnectionDescriptorIdentity
+  lifecycleEpoch: number
+  attemptEpoch: number
+  deliveryGeneration: number
+  socket: WebSocket
+}
+
+interface MessagePreparationClaim {
+  cancellation: Promise<never>
+  cancel: (error: Error) => void
+  cancelled: boolean
+  connectionIdentity: string
+  descriptorKey: ConnectionDescriptorIdentity
+  lifecycleEpoch: number
+  attemptEpoch: number
+  deliveryGeneration: number
+  socket: WebSocket
+}
+
+interface WebSocketCallbacks {
+  onConnectionClose?: (event: CloseEvent) => "handled" | "default"
+  onConnectionFailure?: (failure: WebSocketConnectionFailure) => void
+  onSessionConnectionClose?: (
+    event: CloseEvent,
+    connectionIdentity: string,
+  ) => "handled" | "default"
+  onSessionConnectionFailure?: (
+    failure: WebSocketConnectionFailure,
+    connectionIdentity: string,
+  ) => void
+  onConnect?: () => void
+  onDisconnect?: () => void
+  onError?: (error: Error) => void
+  onMessage?: (message: WebSocketMessage) => void
+}
+
+const reportConnectionFailure = (
+  callbacks: WebSocketCallbacks,
+  failure: WebSocketConnectionFailure,
+  connectionIdentity?: string,
+) => {
+  const invokeSafely = <T,>(
+    callback: ((value: T) => void) | undefined,
+    value: T,
+  ) => {
+    if (!callback) return
+    try {
+      callback(value)
+    } catch {
+      console.error("WebSocket connection failure callback failed")
+    }
+  }
+
+  if (connectionIdentity && callbacks.onSessionConnectionFailure) {
+    invokeSafely(
+      (value) => callbacks.onSessionConnectionFailure?.(value, connectionIdentity),
+      failure,
+    )
+  } else {
+    invokeSafely(callbacks.onConnectionFailure, failure)
+  }
+  invokeSafely(callbacks.onError, failure.error)
+}
+
+interface SocketOwner {
+  socket: WebSocket
+  connection: WebSocketConnection
+  descriptorKey: ConnectionDescriptorIdentity
+  lifecycleEpoch: number
+  attemptEpoch: number
+  callbacks: WebSocketCallbacks
+  refreshAccessToken: (
+    expectedSession?: AuthSessionSnapshot,
+  ) => Promise<boolean>
+  disconnectNotified: boolean
+  handshakeTimer: ReturnType<typeof setTimeout> | null
+}
+
+interface OwnerRetirementOptions {
+  pendingError: Error
+  preparationError: Error
+  close?: { code?: number; reason?: string }
+  notifyDisconnect: boolean
+}
+
+interface ScheduledRetry {
+  lifecycleEpoch: number
+  attemptEpoch: number
+}
+
+export interface UseWebSocketOptions {
   url?: string
   taskId?: number
   token?: string
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
   uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+  connection?: WebSocketConnection | null
+  deliveryGeneration?: number
+  onConnectionClose?: (event: CloseEvent) => "handled" | "default"
+  onConnectionFailure?: (failure: WebSocketConnectionFailure) => void
+  onSessionConnectionClose?: (
+    event: CloseEvent,
+    connectionIdentity: string,
+  ) => "handled" | "default"
+  onSessionConnectionFailure?: (
+    failure: WebSocketConnectionFailure,
+    connectionIdentity: string,
+  ) => void
   autoConnect?: boolean
   onMessage?: (message: WebSocketMessage) => void
   onConnect?: () => void
@@ -51,13 +228,23 @@ interface UseWebSocketOptions {
   onError?: (error: Error) => void
 }
 
+const useIsomorphicLayoutEffect = typeof window === "undefined"
+  ? useEffect
+  : useLayoutEffect
+
 export function useWebSocket(options: UseWebSocketOptions = {}) {
   const {
-    url = getWsUrl(),
+    url,
     taskId,
     token,
     buildWebSocketUrl,
     uploadFiles,
+    connection: connectionOption,
+    deliveryGeneration = 0,
+    onConnectionClose,
+    onConnectionFailure,
+    onSessionConnectionClose,
+    onSessionConnectionFailure,
     autoConnect = true,
     onMessage,
     onConnect,
@@ -65,8 +252,51 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     onError,
   } = options
 
-  const { token: authToken, refreshToken: authRefreshToken } = useAuth()
+  const {
+    token: authToken,
+    user: authUser,
+    session: authSession,
+    refreshAccessToken,
+  } = useAuth()
 
+  const normalizedConnection = useMemo<WebSocketConnection | null>(() => {
+    if (connectionOption !== undefined) return connectionOption
+    if (!taskId) return null
+
+    const baseUrl = url ?? getWsUrl()
+    const hasExplicitToken = token !== undefined
+    const effectiveToken = hasExplicitToken ? token : authToken || undefined
+    return {
+      identity: `legacy-task:${taskId}`,
+      url: buildWebSocketUrl
+        ? buildWebSocketUrl({
+          baseUrl,
+          taskId,
+          token: effectiveToken,
+        })
+        : `${baseUrl}/ws/chat/${taskId}${effectiveToken ? `?token=${effectiveToken}` : ""}`,
+      taskId,
+      chatTaskIdMode: "required",
+      credentialOwner: !hasExplicitToken && authToken
+        ? {
+          kind: "auth-context",
+          accessToken: authToken,
+          userId: authUser?.id ? String(authUser.id) : null,
+          session: authSession,
+        }
+        : { kind: "external" },
+    }
+  }, [
+    authToken,
+    authUser?.id,
+    authSession,
+    buildWebSocketUrl,
+    connectionOption,
+    taskId,
+    token,
+    url,
+  ])
+  const connectionDescriptorIdentity = normalizedConnection
 
   const [isConnected, setIsConnected] = useState(false)
   const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null)
@@ -74,119 +304,512 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const isConnectingRef = useRef(false)
 
   const socketRef = useRef<WebSocket | null>(null)
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const socketOwnerRef = useRef<SocketOwner | null>(null)
+  const connectionRef = useRef<WebSocketConnection | null>(normalizedConnection)
+  const descriptorKeyRef = useRef<ConnectionDescriptorIdentity | null>(connectionDescriptorIdentity)
+  const retryTimersRef = useRef(new Map<ReturnType<typeof setTimeout>, ScheduledRetry>())
   const reconnectAttemptsRef = useRef(0)
-  const taskIdRef = useRef(taskId)
-  const tokenRef = useRef(token || authToken) // Prioritize passed token, otherwise use auth token
-  const pendingDeliveriesRef = useRef(new Map<string, {
-    resolve: (ack: MessageDeliveryAck) => void
-    reject: (error: Error) => void
-    timeout: ReturnType<typeof setTimeout>
-  }>())
+  const authRefreshRetriesRef = useRef(0)
+  const authRefreshRetryBudgetSessionIdRef = useRef(getInternalSessionId(normalizedConnection))
+  const deliveryGenerationRef = useRef(deliveryGeneration)
+  const deliveryIdentityRef = useRef(normalizedConnection?.identity ?? null)
+  const lifecycleEpochRef = useRef(0)
+  const attemptEpochRef = useRef(0)
+  const mountedRef = useRef(false)
+  const tokenRef = useRef(token !== undefined ? token : authToken)
+  const pendingDeliveriesRef = useRef(new Map<string, PendingDelivery>())
+  const preparationsRef = useRef(new Map<string, MessagePreparationClaim>())
+  const recentMessagesRef = useRef<RecentMessage[]>([])
+  const callbacksRef = useRef<WebSocketCallbacks>({
+    onConnectionClose,
+    onConnectionFailure,
+    onSessionConnectionClose,
+    onSessionConnectionFailure,
+    onConnect,
+    onDisconnect,
+    onError,
+    onMessage,
+  })
+  const refreshAccessTokenRef = useRef(refreshAccessToken)
   const maxReconnectAttempts = 3
 
-  const rejectPendingDeliveries = useCallback((error: Error) => {
-    for (const pending of pendingDeliveriesRef.current.values()) {
+  const rejectPendingDeliveries = useCallback((
+    error: Error,
+    matches: (pending: PendingDelivery) => boolean = () => true,
+  ) => {
+    for (const [clientMessageId, pending] of pendingDeliveriesRef.current) {
+      if (!matches(pending)) continue
       clearTimeout(pending.timeout)
       pending.reject(error)
+      pendingDeliveriesRef.current.delete(clientMessageId)
     }
-    pendingDeliveriesRef.current.clear()
   }, [])
+
+  const rejectPreparations = useCallback((
+    error: Error,
+    matches: (claim: MessagePreparationClaim) => boolean = () => true,
+  ) => {
+    for (const [clientMessageId, claim] of preparationsRef.current) {
+      if (!matches(claim)) continue
+      if (preparationsRef.current.get(clientMessageId) !== claim) continue
+      preparationsRef.current.delete(clientMessageId)
+      claim.cancel(error)
+    }
+  }, [])
+
+  const clearRecentMessages = useCallback((
+    matches: (recent: RecentMessage) => boolean = () => true,
+  ) => {
+    recentMessagesRef.current = recentMessagesRef.current.filter(
+      recent => !matches(recent),
+    )
+  }, [])
+
+  const clearRetryTimers = useCallback((
+    matches: (retry: ScheduledRetry) => boolean = () => true,
+  ) => {
+    for (const [timer, retry] of retryTimersRef.current) {
+      if (!matches(retry)) continue
+      clearTimeout(timer)
+      retryTimersRef.current.delete(timer)
+    }
+  }, [])
+
+  const invalidateLifecycle = useCallback(() => {
+    lifecycleEpochRef.current++
+    clearRetryTimers()
+  }, [clearRetryTimers])
+
+  const isCurrentLifecycle = useCallback((
+    lifecycleEpoch: number,
+  ) => (
+    mountedRef.current
+    && lifecycleEpochRef.current === lifecycleEpoch
+  ), [])
+
+  // Socket callbacks require this exact owner. Async refresh/retry work may
+  // outlive retirement, so it is fenced by the narrower attempt predicate.
+  const isCurrentOwner = useCallback((owner: SocketOwner) => (
+    isCurrentLifecycle(owner.lifecycleEpoch)
+    && socketOwnerRef.current === owner
+    && socketRef.current === owner.socket
+  ), [isCurrentLifecycle])
+
+  const isCurrentAttempt = useCallback((owner: SocketOwner) => (
+    isCurrentLifecycle(owner.lifecycleEpoch)
+    && attemptEpochRef.current === owner.attemptEpoch
+  ), [isCurrentLifecycle])
+
+  const canApplyRetiredOwnerPolicy = useCallback((owner: SocketOwner) => (
+    isCurrentAttempt(owner)
+    && socketOwnerRef.current === null
+    && socketRef.current === null
+  ), [isCurrentAttempt])
+
+  const isCurrentSocket = useCallback((socket: WebSocket, identity: string) => {
+    const owner = socketOwnerRef.current
+    return Boolean(
+      owner
+      && owner.socket === socket
+      && owner.connection.identity === identity
+      && isCurrentOwner(owner),
+    )
+  }, [isCurrentOwner])
+
+  const notifyDisconnect = useCallback((owner: SocketOwner) => {
+    if (owner.disconnectNotified) return
+    owner.disconnectNotified = true
+    try {
+      owner.callbacks.onDisconnect?.()
+    } catch {
+      console.error("WebSocket disconnect handler failed")
+    }
+  }, [])
+
+  const reportPermanentFailure = useCallback((
+    owner: SocketOwner,
+    error: Error,
+  ) => {
+    if (!canApplyRetiredOwnerPolicy(owner)) return
+    setConnectionError(error)
+    reportConnectionFailure(owner.callbacks, {
+      recoverable: false,
+      error,
+    }, owner.connection.identity)
+  }, [canApplyRetiredOwnerPolicy])
+
+  const retireOwnerCore = useCallback((
+    owner: SocketOwner,
+    options: OwnerRetirementOptions,
+  ) => {
+    if (owner.handshakeTimer) {
+      clearTimeout(owner.handshakeTimer)
+      owner.handshakeTimer = null
+    }
+    const wasCurrent = (
+      socketOwnerRef.current === owner
+      && socketRef.current === owner.socket
+    )
+    if (wasCurrent) {
+      clearRetryTimers(retry => (
+        retry.lifecycleEpoch === owner.lifecycleEpoch
+        && retry.attemptEpoch === owner.attemptEpoch
+      ))
+      socketRef.current = null
+      socketOwnerRef.current = null
+      if (mountedRef.current) setIsConnected(false)
+      isConnectingRef.current = false
+    }
+    rejectPendingDeliveries(
+      options.pendingError,
+      pending => (
+        pending.socket === owner.socket
+        && pending.descriptorKey === owner.descriptorKey
+        && pending.lifecycleEpoch === owner.lifecycleEpoch
+        && pending.attemptEpoch === owner.attemptEpoch
+      ),
+    )
+    rejectPreparations(
+      options.preparationError,
+      claim => (
+        claim.socket === owner.socket
+        && claim.descriptorKey === owner.descriptorKey
+        && claim.lifecycleEpoch === owner.lifecycleEpoch
+        && claim.attemptEpoch === owner.attemptEpoch
+      ),
+    )
+    clearRecentMessages(
+      recent => (
+        recent.descriptorKey === owner.descriptorKey
+        && recent.lifecycleEpoch === owner.lifecycleEpoch
+        && recent.attemptEpoch === owner.attemptEpoch
+      ),
+    )
+    return wasCurrent
+  }, [
+    clearRecentMessages,
+    clearRetryTimers,
+    rejectPendingDeliveries,
+    rejectPreparations,
+  ])
+
+  const retireOwner = useCallback((
+    owner: SocketOwner,
+    options: OwnerRetirementOptions,
+  ) => {
+    const wasCurrent = retireOwnerCore(owner, options)
+    if (!wasCurrent) return false
+
+    if (
+      options.close
+      && owner.socket.readyState !== WebSocket.CLOSED
+    ) {
+      try {
+        owner.socket.close(options.close.code, options.close.reason)
+      } catch {
+        console.error("WebSocket close failed")
+      }
+    }
+    if (options.notifyDisconnect) notifyDisconnect(owner)
+    return true
+  }, [
+    notifyDisconnect,
+    retireOwnerCore,
+  ])
+
+  const scheduleRetry = useCallback((
+    callback: () => void,
+    delay: number,
+    lifecycleEpoch: number,
+    attemptEpoch: number,
+  ) => {
+    const timer = setTimeout(() => {
+      retryTimersRef.current.delete(timer)
+      if (
+        !isCurrentLifecycle(lifecycleEpoch)
+        || attemptEpochRef.current !== attemptEpoch
+      ) return
+      callback()
+    }, delay)
+    retryTimersRef.current.set(timer, { lifecycleEpoch, attemptEpoch })
+  }, [isCurrentLifecycle])
+
+  useIsomorphicLayoutEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      invalidateLifecycle()
+    }
+  }, [invalidateLifecycle])
+
+  useIsomorphicLayoutEffect(() => {
+    const previousDescriptorKey = descriptorKeyRef.current
+    const previousIdentity = deliveryIdentityRef.current
+    const previousGeneration = deliveryGenerationRef.current
+    const nextIdentity = normalizedConnection?.identity ?? null
+    const nextAuthSessionId = getInternalSessionId(normalizedConnection)
+
+    if (previousDescriptorKey !== connectionDescriptorIdentity) {
+      invalidateLifecycle()
+      if (previousDescriptorKey !== null) {
+        rejectPreparations(
+          deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
+          claim => claim.descriptorKey === previousDescriptorKey,
+        )
+      }
+    }
+
+    if (
+      nextAuthSessionId !== null
+      && nextAuthSessionId !== authRefreshRetryBudgetSessionIdRef.current
+    ) {
+      authRefreshRetriesRef.current = 0
+      authRefreshRetryBudgetSessionIdRef.current = nextAuthSessionId
+    }
+
+    if (
+      previousIdentity !== null
+      && previousIdentity === nextIdentity
+      && previousGeneration !== deliveryGeneration
+    ) {
+      rejectPendingDeliveries(
+        deliveryError("Message delivery generation changed before acknowledgement.", "outcome_unknown"),
+        pending => (
+          pending.connectionIdentity === previousIdentity
+          && pending.deliveryGeneration === previousGeneration
+        ),
+      )
+      rejectPreparations(
+        deliveryError("Message delivery generation changed before preparation completed.", "not_sent"),
+        claim => (
+          claim.connectionIdentity === previousIdentity
+          && claim.deliveryGeneration === previousGeneration
+        ),
+      )
+      clearRecentMessages(
+        recent => (
+          recent.connectionIdentity === previousIdentity
+          && recent.deliveryGeneration === previousGeneration
+        ),
+      )
+    }
+
+    descriptorKeyRef.current = connectionDescriptorIdentity
+    connectionRef.current = normalizedConnection
+    deliveryIdentityRef.current = nextIdentity
+    deliveryGenerationRef.current = deliveryGeneration
+    callbacksRef.current = {
+      onConnectionClose,
+      onConnectionFailure,
+      onSessionConnectionClose,
+      onSessionConnectionFailure,
+      onConnect,
+      onDisconnect,
+      onError,
+      onMessage,
+    }
+    refreshAccessTokenRef.current = refreshAccessToken
+  })
 
   // Update token ref when token changes
   useEffect(() => {
-    tokenRef.current = token || authToken
+    tokenRef.current = token !== undefined ? token : authToken
   }, [token, authToken])
 
-  // Update token ref when auth token changes (for refresh token support)
-  useEffect(() => {
-    if (!token && authToken) {
-      tokenRef.current = authToken
-
-      // If WebSocket is connected and we got a new token, reconnect with new token
-      if (socketRef.current?.readyState === WebSocket.OPEN && taskId) {
-        disconnect()
-        setTimeout(() => {
-          connect()
-        }, 1000)
-      }
-    }
-  }, [authToken, token, taskId])
-
   const connect = useCallback(() => {
-    if (socketRef.current?.readyState === WebSocket.OPEN || isConnectingRef.current) return
+    if (!mountedRef.current) return
+    if (
+      isConnectingRef.current
+      || (
+        socketRef.current
+        && socketRef.current.readyState < WebSocket.CLOSING
+      )
+    ) return
+
+    const connection = connectionRef.current
+    const descriptorKey = descriptorKeyRef.current
+    if (!connection) return
+    if (!descriptorKey) return
+    if (connection.chatTaskIdMode === "required" && !connection.taskId) return
+
+    const previousOwner = socketOwnerRef.current
+    if (previousOwner) {
+      retireOwner(previousOwner, {
+        pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+        preparationError: deliveryError("Connection replaced before the message was prepared.", "not_sent"),
+        close: {
+          code: 1000,
+          reason: "Connection replaced",
+        },
+        notifyDisconnect: true,
+      })
+      if (socketOwnerRef.current || isConnectingRef.current) return
+    } else if (socketRef.current) {
+      socketRef.current = null
+    }
+
     isConnectingRef.current = true
-
     try {
-      // Don't try to connect if there's no task ID
-      if (!taskId) {
-        isConnectingRef.current = false
-        return
-      }
-
-      const wsUrl = buildWebSocketUrl
-        ? buildWebSocketUrl({
-          baseUrl: url,
-          taskId,
-          token: tokenRef.current || undefined,
-        })
-        : `${url}/ws/chat/${taskId}${tokenRef.current ? `?token=${tokenRef.current}` : ''}`
-
       // Test if the URL is valid before creating WebSocket
-      if (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://')) {
+      if (!connection.url.startsWith('ws://') && !connection.url.startsWith('wss://')) {
         throw new Error("Invalid WebSocket URL configuration")
       }
 
-      const socket = new WebSocket(wsUrl)
+      const attemptEpoch = ++attemptEpochRef.current
+      const socket = connection.protocols
+        ? new WebSocket(connection.url, connection.protocols)
+        : new WebSocket(connection.url)
+      const owner: SocketOwner = {
+        callbacks: callbacksRef.current,
+        connection,
+        descriptorKey,
+        disconnectNotified: false,
+        handshakeTimer: null,
+        lifecycleEpoch: lifecycleEpochRef.current,
+        attemptEpoch,
+        refreshAccessToken: refreshAccessTokenRef.current,
+        socket,
+      }
       socketRef.current = socket
+      socketOwnerRef.current = owner
+
+      owner.handshakeTimer = setTimeout(() => {
+        if (!isCurrentOwner(owner)) return
+        const handshakeError = new Error("WebSocket connection handshake timed out.")
+        const wasCurrent = retireOwner(owner, {
+          pendingError: deliveryError("Connection timed out before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Connection timed out before the message was prepared.", "not_sent"),
+          close: { code: 1000, reason: "Handshake timeout" },
+          notifyDisconnect: true,
+        })
+        if (!wasCurrent || socketOwnerRef.current || socketRef.current) return
+        setConnectionError(handshakeError)
+        reportConnectionFailure(owner.callbacks, {
+          recoverable: true,
+          error: handshakeError,
+        }, owner.connection.identity)
+      }, HANDSHAKE_TIMEOUT_MS)
 
       socket.onopen = () => {
+        if (!isCurrentOwner(owner)) return
+        if (owner.handshakeTimer) {
+          clearTimeout(owner.handshakeTimer)
+          owner.handshakeTimer = null
+        }
+        if (connection.expectedProtocol && socket.protocol !== connection.expectedProtocol) {
+          const protocolError = new Error("WebSocket subprotocol negotiation failed.")
+          // A protocol mismatch is reported as a terminal connection failure;
+          // suppressing disconnect avoids starting a second recovery path.
+          const wasCurrent = retireOwner(owner, {
+            pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
+            preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
+            close: { code: 1002, reason: "WebSocket subprotocol mismatch" },
+            notifyDisconnect: false,
+          })
+          if (!wasCurrent) return
+          setConnectionError(protocolError)
+          reportConnectionFailure(owner.callbacks, {
+            recoverable: false,
+            error: protocolError,
+          }, owner.connection.identity)
+          return
+        }
+
         setIsConnected(true)
         setConnectionError(null)
-        reconnectAttemptsRef.current = 0
         isConnectingRef.current = false
-        onConnect?.()
+        owner.callbacks.onConnect?.()
       }
 
       socket.onclose = (event) => {
-        rejectPendingDeliveries(new Error('Connection closed before the message was accepted.'))
-        setIsConnected(false)
-        isConnectingRef.current = false
-        onDisconnect?.()
+        if (!isCurrentOwner(owner)) return
+
+        const wasCurrent = retireOwnerCore(owner, {
+          pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
+          notifyDisconnect: false,
+        })
+        if (!wasCurrent) return
+
+        let closeDisposition: "handled" | "default"
+        try {
+          closeDisposition = owner.callbacks.onSessionConnectionClose
+            ? owner.callbacks.onSessionConnectionClose(event, owner.connection.identity)
+            : owner.callbacks.onConnectionClose?.(event) ?? "default"
+        } catch {
+          if (canApplyRetiredOwnerPolicy(owner)) {
+            const handlerError = new Error("WebSocket close handler failed.")
+            console.error("WebSocket close handler failed")
+            reportPermanentFailure(owner, handlerError)
+          }
+          return
+        }
+
+        if (!canApplyRetiredOwnerPolicy(owner)) return
+        if (closeDisposition === "handled") return
+
+        notifyDisconnect(owner)
+        if (!canApplyRetiredOwnerPolicy(owner)) return
 
         // Handle authentication errors (4001 = Authentication required)
         if (event.code === 4001) {
-          if (authRefreshToken && typeof authRefreshToken === 'function') {
-            try {
-              const refreshTokenFunc = authRefreshToken as () => Promise<boolean>
-              refreshTokenFunc().then(refreshSuccess => {
+          if (owner.connection.credentialOwner.kind !== "auth-context") {
+            reportPermanentFailure(owner, new Error("Authentication failed"))
+            return
+          }
+          if (!owner.connection.credentialOwner.session) {
+            reportPermanentFailure(owner, new Error("Authentication lineage is unavailable"))
+            return
+          }
+          if (authRefreshRetriesRef.current >= MAX_AUTH_REFRESH_RETRIES) {
+            reportPermanentFailure(
+              owner,
+              new Error("Authentication failed after token refresh retries"),
+            )
+            return
+          }
+          authRefreshRetriesRef.current += 1
+          try {
+            owner.refreshAccessToken(
+              owner.connection.credentialOwner.session,
+            )
+              .then((refreshSuccess) => {
+                if (!canApplyRetiredOwnerPolicy(owner)) return
                 if (refreshSuccess) {
-                  setTimeout(() => {
-                    if (taskIdRef.current) {
-                      connect()
-                    }
-                  }, 1000)
+                  scheduleRetry(
+                    connect,
+                    1000,
+                    owner.lifecycleEpoch,
+                    owner.attemptEpoch,
+                  )
                 } else {
-                  onError?.(new Error('Authentication failed and token refresh failed'))
+                  reportPermanentFailure(
+                    owner,
+                    new Error("Authentication failed and token refresh failed"),
+                  )
                 }
-              }).catch(error => {
-                console.error('Error refreshing auth token for WebSocket', error)
-                onError?.(new Error('Authentication failed and token refresh error'))
               })
-            } catch (error) {
-              console.error('Error refreshing auth token for WebSocket', error)
-              onError?.(new Error('Authentication failed and token refresh error'))
-            }
-          } else {
-            onError?.(new Error('Authentication failed and no refresh token available'))
+              .catch(() => {
+                if (!canApplyRetiredOwnerPolicy(owner)) return
+                console.error("Error refreshing auth token for WebSocket")
+                reportPermanentFailure(
+                  owner,
+                  new Error("Authentication failed and token refresh error"),
+                )
+              })
+          } catch {
+            if (!canApplyRetiredOwnerPolicy(owner)) return
+            console.error("Error refreshing auth token for WebSocket")
+            reportPermanentFailure(
+              owner,
+              new Error("Authentication failed and token refresh error"),
+            )
           }
           return
         }
 
         if (event.code === 4003) {
-          const accessError = new Error(event.reason || 'Access denied')
-          setConnectionError(accessError)
-          onError?.(accessError)
+          reportPermanentFailure(owner, new Error(event.reason || "Access denied"))
           return
         }
 
@@ -200,40 +823,40 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           return
         }
 
-        // Don't reconnect if the reason is component unmounting
-        if (event.reason === 'Component unmounting') {
-          return
-        }
-
-        // Only attempt to reconnect if under max attempts and taskId exists
-        if (reconnectAttemptsRef.current < maxReconnectAttempts && taskId) {
+        // Only attempt to reconnect if under max attempts and the connection is task-bound
+        if (reconnectAttemptsRef.current < maxReconnectAttempts && connection.taskId) {
           reconnectAttemptsRef.current++
           const delay = Math.min(1000 * reconnectAttemptsRef.current, 5000)
-          reconnectTimeoutRef.current = setTimeout(() => {
-            connect()
-          }, delay)
+          scheduleRetry(
+            connect,
+            delay,
+            owner.lifecycleEpoch,
+            owner.attemptEpoch,
+          )
         }
       }
 
-      socket.onerror = (error) => {
-        console.error('WebSocket error', error)
+      socket.onerror = () => {
+        if (!isCurrentOwner(owner)) return
+        console.error("WebSocket error")
         const connectionError = new Error("WebSocket connection failed. The backend WebSocket endpoint may not be available.")
+        const wasCurrent = retireOwner(owner, {
+          pendingError: deliveryError("Connection failed before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Connection failed before the message was prepared.", "not_sent"),
+          close: { code: 1000, reason: "WebSocket transport error" },
+          notifyDisconnect: true,
+        })
+        if (!wasCurrent || socketOwnerRef.current || socketRef.current) return
         setConnectionError(connectionError)
-        setIsConnected(false)
-        isConnectingRef.current = false
-        onError?.(connectionError)
+        reportConnectionFailure(owner.callbacks, {
+          recoverable: true,
+          error: connectionError,
+        }, owner.connection.identity)
 
-        // Don't attempt to reconnect if there's an immediate error (like 404)
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current)
-          reconnectTimeoutRef.current = null
-        }
-
-        // Reset reconnect attempts to prevent immediate reconnection when backend is not available
-        reconnectAttemptsRef.current = maxReconnectAttempts
       }
 
       socket.onmessage = (event) => {
+        if (!isCurrentOwner(owner)) return
         try {
           const data = JSON.parse(event.data)
 
@@ -242,7 +865,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             const pending = typeof clientMessageId === 'string'
               ? pendingDeliveriesRef.current.get(clientMessageId)
               : undefined
-            if (pending) {
+            if (
+              pending
+              && pending.socket === socket
+              && pending.descriptorKey === owner.descriptorKey
+              && pending.lifecycleEpoch === owner.lifecycleEpoch
+              && pending.attemptEpoch === owner.attemptEpoch
+              && pending.deliveryGeneration === deliveryGenerationRef.current
+            ) {
               clearTimeout(pending.timeout)
               pendingDeliveriesRef.current.delete(clientMessageId)
               if (data.type === 'message_accepted') {
@@ -251,11 +881,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
                 })
               } else {
-                const error = new Error(data.message || 'Message was rejected.')
-                Object.assign(error, {
-                  retryWithNewId: data.retry_with_new_id === true,
-                })
-                pending.reject(error)
+                pending.reject(deliveryError(
+                  data.message || "Message was rejected.",
+                  data.rejection_outcome === "not_accepted"
+                    ? "rejected"
+                    : "outcome_unknown",
+                  data.retry_with_new_id === true,
+                ))
               }
             }
             return
@@ -383,56 +1015,79 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           message.task = data.task
 
           setLastMessage(message)
-          onMessage?.(message)
+          owner.callbacks.onMessage?.(message)
         } catch (error) {
           console.error("Error parsing WebSocket message", error)
         }
       }
 
-    } catch (error) {
-      console.error('Failed to create WebSocket connection', error)
-      const connectionError = error instanceof Error ? error : new Error('Failed to create WebSocket connection')
+    } catch {
+      console.error("Failed to create WebSocket connection")
+      const connectionError = new Error("Failed to create WebSocket connection.")
+      isConnectingRef.current = false
       setConnectionError(connectionError)
-      onError?.(connectionError)
+      reportConnectionFailure(callbacksRef.current, {
+        recoverable: false,
+        error: connectionError,
+      }, connectionRef.current?.identity)
     }
-  }, [url, taskId, token, authToken, onConnect, onDisconnect, onError, rejectPendingDeliveries])
+  }, [
+    canApplyRetiredOwnerPolicy,
+    isCurrentOwner,
+    notifyDisconnect,
+    reportPermanentFailure,
+    retireOwner,
+    retireOwnerCore,
+    scheduleRetry,
+  ])
 
   const disconnect = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current)
-      reconnectTimeoutRef.current = null
+    const owner = socketOwnerRef.current
+    invalidateLifecycle()
+    reconnectAttemptsRef.current = 0
+    if (owner) {
+      retireOwner(owner, {
+        pendingError: deliveryError("Disconnected before the message was accepted.", "outcome_unknown"),
+        preparationError: deliveryError("Disconnected before the message was prepared.", "not_sent"),
+        close: {},
+        notifyDisconnect: true,
+      })
+    } else {
+      rejectPendingDeliveries(
+        deliveryError("Disconnected before the message was accepted.", "outcome_unknown"),
+      )
+      rejectPreparations(
+        deliveryError("Disconnected before the message was prepared.", "not_sent"),
+      )
     }
-
-    if (socketRef.current) {
-      socketRef.current.close()
-      socketRef.current = null
-    }
-    rejectPendingDeliveries(new Error('Disconnected before the message was accepted.'))
     setIsConnected(false)
     isConnectingRef.current = false
-  }, [rejectPendingDeliveries])
+  }, [
+    invalidateLifecycle,
+    rejectPendingDeliveries,
+    rejectPreparations,
+    retireOwner,
+  ])
 
-  // Update taskId ref when taskId changes
-  useEffect(() => {
-    // If taskId changes, clear any previous connection errors to allow fresh connection attempt
-    if (taskId !== taskIdRef.current) {
-      setConnectionError(null)
+  const sendMessage = useCallback((
+    message: Record<string, unknown>,
+  ): WebSocketSendResult => {
+    const connection = connectionRef.current
+    const socket = socketRef.current
+    if (
+      connection
+      && socket?.readyState === WebSocket.OPEN
+      && isCurrentSocket(socket, connection.identity)
+    ) {
+      try {
+        socket.send(JSON.stringify(message))
+        return "sent"
+      } catch {
+        return "not_sent"
+      }
     }
-
-    // If taskId changes and we are connected, disconnect to ensure we connect to the new task
-    // logic: if we have a new taskId (different from ref) and we are currently connected
-    if (taskId && taskId !== taskIdRef.current && isConnected) {
-      disconnect()
-    }
-
-    taskIdRef.current = taskId
-  }, [taskId, isConnected, disconnect])
-
-  const sendMessage = useCallback((message: Record<string, unknown>) => {
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify(message))
-    }
-  }, [])
+    return "not_sent"
+  }, [isCurrentSocket])
 
   const sendChatMessage = useCallback(async (
     message: string,
@@ -441,16 +1096,40 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     requestedClientMessageId?: string,
   ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
-    const currentTaskId = taskIdRef.current
-    const socket = socketRef.current
-    if (!currentTaskId || socket?.readyState !== WebSocket.OPEN) {
-      throw new Error('Message not sent: the task connection is not ready.')
+    const owner = socketOwnerRef.current
+    const connection = owner?.connection
+    const socket = owner?.socket
+    if (
+      !connection
+      || socket?.readyState !== WebSocket.OPEN
+      || !owner
+      || !isCurrentOwner(owner)
+      || (connection.chatTaskIdMode === "required" && !connection.taskId)
+    ) {
+      throw deliveryError("Message not sent: the connection is not ready.", "not_sent")
+    }
+    if (connection.chatTaskIdMode === "omit" && files && files.length > 0) {
+      throw deliveryError("File delivery is not supported for this connection.", "not_sent")
     }
 
+    const currentTaskId = connection.taskId
+    const currentDeliveryGeneration = deliveryGenerationRef.current
+    const currentDescriptorKey = owner.descriptorKey
+    const currentLifecycleEpoch = owner.lifecycleEpoch
+    const currentAttemptEpoch = owner.attemptEpoch
     const clientMessageId = requestedClientMessageId || generateClientMessageId()
-    const duplicateMessage = recentMessages.find(
+    if (
+      pendingDeliveriesRef.current.has(clientMessageId)
+      || preparationsRef.current.has(clientMessageId)
+    ) {
+      throw deliveryError("Message not sent: the client message id is already pending.", "not_sent")
+    }
+    const duplicateMessage = recentMessagesRef.current.find(
       msg => (
-        msg.taskId === currentTaskId
+        msg.descriptorKey === currentDescriptorKey
+        && msg.lifecycleEpoch === currentLifecycleEpoch
+        && msg.attemptEpoch === currentAttemptEpoch
+        && msg.deliveryGeneration === currentDeliveryGeneration
         && msg.message === message
         && msg.clientMessageId !== clientMessageId
         && (timestamp - msg.timestamp) < MESSAGE_DUPLICATE_THRESHOLD
@@ -460,177 +1139,303 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       ? pendingDeliveriesRef.current.has(duplicateMessage.clientMessageId)
       : false
     if (!force && duplicateIsPending) {
-      throw new Error('Duplicate message ignored while the previous send is pending.')
+      throw deliveryError("Duplicate message ignored while the previous send is pending.", "not_sent")
     }
 
-    const messageData: Record<string, unknown> = {
-      type: 'chat',
-      message,
-      task_id: currentTaskId,
-      client_message_id: clientMessageId,
-    }
-
-    if (files && files.length > 0) {
-      type FileWithUploadId = File & { file_id?: string }
-      const filesWithUploadIds = files as FileWithUploadId[]
-      const filesToUpload = filesWithUploadIds.filter(file => !file.file_id)
-      const preUploadedFiles = filesWithUploadIds
-        .filter((file): file is FileWithUploadId & { file_id: string } => Boolean(file.file_id))
-        .map(file => ({
-          file_id: file.file_id,
-          name: file.name,
-          size: file.size,
-          type: file.type || '',
-        }))
-      let uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
-
-      if (filesToUpload.length > 0 && uploadFiles) {
-        uploadedFiles = await uploadFiles(filesToUpload, {
-          taskId: currentTaskId,
-          taskType: 'task',
-        })
-      } else if (filesToUpload.length > 0) {
-        const formData = new FormData()
-        filesToUpload.forEach(file => formData.append('files', file))
-        formData.append('task_type', 'task')
-        formData.append('task_id', currentTaskId.toString())
-        const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${tokenRef.current || localStorage.getItem('token') || ''}`,
-          },
-          body: formData,
-        })
-        const parsed = await parseApiResponse(response)
-        if (!response.ok || !isJsonRecord(parsed.data)) {
-          throw new Error(getUploadErrorMessage(response, parsed, {
-            generic: 'Upload failed',
-            ...UPLOAD_ERROR_MESSAGES,
-          }))
-        }
-        const data = parsed.data
-        uploadedFiles = data.success && Array.isArray(data.files)
-          ? data.files
-            .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
-              isJsonRecord(file) && typeof file.file_id === 'string'
-            ))
-            .map(file => ({
-              file_id: file.file_id,
-              name: typeof file.filename === 'string' ? file.filename : '',
-              size: typeof file.file_size === 'number' ? file.file_size : 0,
-              type: typeof file.mime_type === 'string' ? file.mime_type : '',
-            }))
-          : []
-      }
-      messageData.files = [...preUploadedFiles, ...uploadedFiles]
-    }
-
-    const delivery = new Promise<MessageDeliveryAck>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        pendingDeliveriesRef.current.delete(clientMessageId)
-        reject(new Error('Message delivery was not acknowledged. Your draft was kept.'))
-      }, 30000)
-      pendingDeliveriesRef.current.set(clientMessageId, { resolve, reject, timeout })
+    let rejectCancellation!: (error: Error) => void
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      rejectCancellation = reject
     })
+    const claim: MessagePreparationClaim = {
+      cancellation,
+      cancel: (error) => {
+        if (claim.cancelled) return
+        claim.cancelled = true
+        rejectCancellation(error)
+      },
+      cancelled: false,
+      connectionIdentity: connection.identity,
+      descriptorKey: currentDescriptorKey,
+      lifecycleEpoch: currentLifecycleEpoch,
+      attemptEpoch: currentAttemptEpoch,
+      deliveryGeneration: currentDeliveryGeneration,
+      socket,
+    }
+    preparationsRef.current.set(clientMessageId, claim)
 
     try {
-      socket.send(JSON.stringify(messageData))
-    } catch (error) {
-      const pending = pendingDeliveriesRef.current.get(clientMessageId)
-      if (pending) {
-        clearTimeout(pending.timeout)
-        pendingDeliveriesRef.current.delete(clientMessageId)
-        pending.reject(error instanceof Error ? error : new Error(String(error)))
+      const messageData: Record<string, unknown> = {
+        type: 'chat',
+        message,
+        client_message_id: clientMessageId,
+        ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }
+
+      if (files && files.length > 0) {
+        if (!currentTaskId) {
+          throw deliveryError("File delivery requires a task-bound connection.", "not_sent")
+        }
+        type FileWithUploadId = File & { file_id?: string }
+        const filesWithUploadIds = files as FileWithUploadId[]
+        const filesToUpload = filesWithUploadIds.filter(file => !file.file_id)
+        const preUploadedFiles = filesWithUploadIds
+          .filter((file): file is FileWithUploadId & { file_id: string } => Boolean(file.file_id))
+          .map(file => ({
+            file_id: file.file_id,
+            name: file.name,
+            size: file.size,
+            type: file.type || '',
+          }))
+        let uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
+
+        if (filesToUpload.length > 0 && uploadFiles) {
+          uploadedFiles = await Promise.race([
+            uploadFiles(filesToUpload, {
+              taskId: currentTaskId,
+              taskType: 'task',
+            }),
+            claim.cancellation,
+          ])
+        } else if (filesToUpload.length > 0) {
+          const uploadRequest = (async () => {
+            const formData = new FormData()
+            filesToUpload.forEach(file => formData.append('files', file))
+            formData.append('task_type', 'task')
+            formData.append('task_id', currentTaskId.toString())
+            const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${tokenRef.current ?? localStorage.getItem('token') ?? ''}`,
+              },
+              body: formData,
+            })
+            const parsed = await parseApiResponse(response)
+            if (!response.ok || !isJsonRecord(parsed.data)) {
+              throw deliveryError(getUploadErrorMessage(response, parsed, {
+                generic: 'Upload failed',
+                ...UPLOAD_ERROR_MESSAGES,
+              }), "not_sent")
+            }
+            const data = parsed.data
+            return data.success && Array.isArray(data.files)
+              ? data.files
+                .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
+                  isJsonRecord(file) && typeof file.file_id === 'string'
+                ))
+                .map(file => ({
+                  file_id: file.file_id,
+                  name: typeof file.filename === 'string' ? file.filename : '',
+                  size: typeof file.file_size === 'number' ? file.file_size : 0,
+                  type: typeof file.mime_type === 'string' ? file.mime_type : '',
+                }))
+              : []
+          })()
+          uploadedFiles = await Promise.race([uploadRequest, claim.cancellation])
+        }
+        messageData.files = [...preUploadedFiles, ...uploadedFiles]
+      }
+
+      if (
+        preparationsRef.current.get(clientMessageId) !== claim
+        || claim.cancelled
+        || socket.readyState !== WebSocket.OPEN
+        || !isCurrentOwner(owner)
+        || deliveryGenerationRef.current !== currentDeliveryGeneration
+      ) {
+        throw deliveryError("Message not sent: the connection changed before delivery.", "not_sent")
+      }
+      if (pendingDeliveriesRef.current.has(clientMessageId)) {
+        throw deliveryError("Message not sent: the client message id is already pending.", "not_sent")
+      }
+
+      const delivery = new Promise<MessageDeliveryAck>((resolve, reject) => {
+        const pendingDelivery: PendingDelivery = {
+          resolve,
+          reject,
+          timeout: setTimeout(() => {
+            if (pendingDeliveriesRef.current.get(clientMessageId) !== pendingDelivery) return
+            pendingDeliveriesRef.current.delete(clientMessageId)
+            reject(deliveryError("Message delivery was not acknowledged. Your draft was kept.", "outcome_unknown"))
+          }, 30000),
+          connectionIdentity: connection.identity,
+          descriptorKey: currentDescriptorKey,
+          lifecycleEpoch: currentLifecycleEpoch,
+          attemptEpoch: currentAttemptEpoch,
+          deliveryGeneration: currentDeliveryGeneration,
+          socket,
+        }
+        pendingDeliveriesRef.current.set(clientMessageId, pendingDelivery)
+      })
+      if (preparationsRef.current.get(clientMessageId) === claim) {
+        preparationsRef.current.delete(clientMessageId)
+      }
+
+      try {
+        socket.send(JSON.stringify(messageData))
+      } catch (error) {
+        const pending = pendingDeliveriesRef.current.get(clientMessageId)
+        if (
+          pending?.socket === socket
+          && pending.descriptorKey === currentDescriptorKey
+          && pending.lifecycleEpoch === currentLifecycleEpoch
+          && pending.attemptEpoch === currentAttemptEpoch
+          && pending.deliveryGeneration === currentDeliveryGeneration
+        ) {
+          clearTimeout(pending.timeout)
+          pendingDeliveriesRef.current.delete(clientMessageId)
+          pending.reject(deliveryError(
+            error instanceof Error ? error.message : String(error),
+            "not_sent",
+          ))
+        }
+        return delivery
+      }
+
+      recentMessagesRef.current.push({
+        message,
+        timestamp,
+        connectionIdentity: connection.identity,
+        descriptorKey: currentDescriptorKey,
+        lifecycleEpoch: currentLifecycleEpoch,
+        attemptEpoch: currentAttemptEpoch,
+        deliveryGeneration: currentDeliveryGeneration,
+        clientMessageId,
+      })
+      const cutoffTime = timestamp - 5000
+      const firstKeepIndex = recentMessagesRef.current.findIndex(
+        item => item.timestamp >= cutoffTime,
+      )
+      if (firstKeepIndex === -1) {
+        recentMessagesRef.current = []
+      } else if (firstKeepIndex > 0) {
+        recentMessagesRef.current.splice(0, firstKeepIndex)
+      }
+
       return delivery
+    } catch (error) {
+      if (error instanceof MessageDeliveryError) throw error
+      throw deliveryError(
+        error instanceof Error ? error.message : String(error),
+        "not_sent",
+      )
+    } finally {
+      if (preparationsRef.current.get(clientMessageId) === claim) {
+        preparationsRef.current.delete(clientMessageId)
+      }
     }
+  }, [isCurrentOwner, uploadFiles])
 
-    recentMessages.push({
-      message,
-      timestamp,
-      taskId: currentTaskId,
-      clientMessageId,
-    })
-    const cutoffTime = timestamp - 5000
-    const firstKeepIndex = recentMessages.findIndex(item => item.timestamp >= cutoffTime)
-    if (firstKeepIndex === -1) {
-      recentMessages.splice(0, recentMessages.length)
-    } else if (firstKeepIndex > 0) {
-      recentMessages.splice(0, firstKeepIndex)
+  const getCurrentTaskConnection = useCallback(() => {
+    const connection = connectionRef.current
+    const socket = socketRef.current
+    if (
+      !connection?.taskId
+      || socket?.readyState !== WebSocket.OPEN
+      || !isCurrentSocket(socket, connection.identity)
+    ) {
+      return null
     }
-
-    return delivery
-  }, [uploadFiles])
+    return { socket, taskId: connection.taskId }
+  }, [isCurrentSocket])
 
   const executeTask = useCallback((taskDescription: string, files?: Array<{ name: string; type: string; size: number; content?: string }>) => {
-    if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {
+    const current = getCurrentTaskConnection()
+    if (current) {
       const message = JSON.stringify({
         type: "execute_task",
-        task_id: taskIdRef.current,
+        task_id: current.taskId,
         description: taskDescription,
         ...(files && files.length > 0 && { files })
       })
-      socketRef.current.send(message)
+      current.socket.send(message)
     }
-  }, [taskId])
+  }, [getCurrentTaskConnection])
 
   const pauseTask = useCallback(() => {
-    if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {
+    const current = getCurrentTaskConnection()
+    if (current) {
       const message = {
         type: "pause_task",
-        task_id: taskIdRef.current,
+        task_id: current.taskId,
         command_id: generateClientMessageId(),
       }
-      socketRef.current.send(JSON.stringify(message))
+      current.socket.send(JSON.stringify(message))
     }
-  }, [taskId])
+  }, [getCurrentTaskConnection])
 
   const resumeTask = useCallback(() => {
-    if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {
-      socketRef.current.send(JSON.stringify({
+    const current = getCurrentTaskConnection()
+    if (current) {
+      current.socket.send(JSON.stringify({
         type: "resume_task",
-        task_id: taskIdRef.current,
+        task_id: current.taskId,
         command_id: generateClientMessageId(),
       }))
     }
-  }, [taskId])
+  }, [getCurrentTaskConnection])
 
   const requestStatus = useCallback(() => {
-    if (socketRef.current?.readyState === WebSocket.OPEN && taskIdRef.current) {
-      socketRef.current.send(JSON.stringify({
+    const current = getCurrentTaskConnection()
+    if (current) {
+      current.socket.send(JSON.stringify({
         type: "status_request",
-        task_id: taskIdRef.current,
+        task_id: current.taskId,
       }))
     }
-  }, [taskId])
-
+  }, [getCurrentTaskConnection])
 
   useEffect(() => {
-    // Only attempt to connect when taskId changes and autoConnect is enabled
-    // We also check connectionError to avoid infinite loops, but we need to react when it's cleared
-    // Note: We don't check !isConnected here because:
-    // 1. connect() has its own guard checks
-    // 2. When switching tasks, isConnected might still be true from the previous task in this render cycle,
-    //    preventing the new connection if we check it here.
-    if (autoConnect && taskId && !connectionError && !isConnectingRef.current) {
+    const ownedDescriptorKey = connectionDescriptorIdentity
+    setConnectionError(null)
+    reconnectAttemptsRef.current = 0
+    if (autoConnect && ownedDescriptorKey !== null && !isConnectingRef.current) {
       connect()
     }
 
     return () => {
-      // Clean up on unmount or when dependencies change
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current)
-        reconnectTimeoutRef.current = null
+      invalidateLifecycle()
+      const owner = socketOwnerRef.current
+      const ownsCurrentSocket = Boolean(
+        owner
+        && owner.descriptorKey === ownedDescriptorKey,
+      )
+      if (owner && ownsCurrentSocket) {
+        retireOwner(owner, {
+          pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
+          close: {
+            code: 1000,
+            reason: "Component unmounting",
+          },
+          notifyDisconnect: true,
+        })
       }
-      // Close WebSocket connection to prevent port closed errors
-      if (socketRef.current) {
-        socketRef.current.close(1000, 'Component unmounting')
-        socketRef.current = null
+      if (ownedDescriptorKey !== null) {
+        rejectPendingDeliveries(
+          deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+          pending => pending.descriptorKey === ownedDescriptorKey,
+        )
+        rejectPreparations(
+          deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
+          claim => claim.descriptorKey === ownedDescriptorKey,
+        )
+        clearRecentMessages(
+          recent => recent.descriptorKey === ownedDescriptorKey,
+        )
       }
-      setIsConnected(false)
+      if (mountedRef.current) setIsConnected(false)
       isConnectingRef.current = false
     }
-  }, [url, taskId, token, authToken, autoConnect, connectionError]) // Added connectionError to dependencies
+  }, [
+    autoConnect,
+    clearRecentMessages,
+    connect,
+    connectionDescriptorIdentity,
+    invalidateLifecycle,
+    rejectPendingDeliveries,
+    rejectPreparations,
+    retireOwner,
+  ])
 
   // Separate effect to handle connection state changes
   useEffect(() => {

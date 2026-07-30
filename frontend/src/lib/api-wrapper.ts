@@ -2,445 +2,221 @@
 
 import { getApiUrl } from "@/lib/utils"
 import {
-  AUTH_CACHE_KEY,
-  AUTH_TOKEN_UPDATED_EVENT,
-  clearStoredAuth,
-  LEGACY_AUTH_TOKEN_KEY,
-  readAuthCache,
-  writeAuthCache,
+  type AuthSessionSnapshot,
+  type AuthMutationUnavailableReason,
+  clearAuthSessionIfCurrent,
+  compareAuthSession, compareCredentialSession,
+  commitAuthSessionRefresh,
+  getAuthStorageAvailability,
+  isSafeAuthExpirySeconds,
+  readAuthSessionSnapshot,
 } from "@/lib/auth-cache"
 
-const AUTH_REFRESH_LOCK_NAME = "xagent-auth-refresh"
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
-
+const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
 export type AuthRefreshResult =
-  | { accessToken: string }
-  | { accessToken: null; rejected: boolean }
-
+  | { status: "refreshed" | "advanced"; accessToken: string; session: AuthSessionSnapshot }
+  | { status: "rejected"; accessToken: null }
+  | { status: "not_current"; accessToken: null }
+  | { status: "invalid_response"; accessToken: null }
+  | { status: "transport_failed"; accessToken: null }
+  | { status: "unavailable"; accessToken: null; reason: AuthMutationUnavailableReason }
 const refreshPromises = new Map<string, Promise<AuthRefreshResult>>()
-const REFRESH_EXCLUDED_AUTH_ENDPOINTS = [
-  "/api/auth/login",
-  "/api/auth/register",
-  "/api/auth/setup-admin",
-  "/api/auth/forgot-password",
-  "/api/auth/reset-password",
-]
+const REFRESH_EXCLUDED_AUTH_ENDPOINTS = ["/api/auth/login", "/api/auth/register", "/api/auth/setup-admin", "/api/auth/forgot-password", "/api/auth/reset-password"]
 
 function shouldSkipRefresh(url: string): boolean {
-  if (url.includes("/api/auth/refresh")) {
-    return true
-  }
-
+  if (url.includes("/api/auth/refresh")) return true
   try {
-    const parsedUrl = new URL(url, window.location.origin)
-    return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint =>
-      parsedUrl.pathname.endsWith(endpoint)
-    )
-  } catch {
-    return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => url.includes(endpoint))
-  }
+    const parsed = new URL(url, window.location.origin)
+    return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => parsed.pathname.endsWith(endpoint))
+  } catch { return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => url.includes(endpoint)) }
 }
-
-// Fetch function with retry mechanism
-async function fetchWithRetry(
-  url: string,
-  options: RequestInit,
-  maxRetries: number = 2
-): Promise<Response> {
+async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2): Promise<Response> {
   let lastError: Error | null = null
-
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const response = await fetch(url, options)
-
-      // If not a network error, return directly
-      if (response.status !== 0 && !response.url.includes('net::ERR_')) {
-        return response
-      }
-
-      // Network error, retry
+      if (response.status !== 0 && !response.url.includes("net::ERR_")) return response
       lastError = new Error(`Network error on attempt ${attempt + 1}`)
-
     } catch (error) {
       lastError = error as Error
-      console.warn(`Network request failed (attempt ${attempt + 1}/${maxRetries + 1}):`, error)
-
-      // Last attempt, no wait
-      if (attempt < maxRetries) {
-        // Exponential backoff, max wait 1 second
-        await new Promise(resolve => setTimeout(resolve, Math.min(1000, 100 * Math.pow(2, attempt))))
-      }
+      if (attempt < maxRetries) await new Promise(resolve => setTimeout(resolve, Math.min(1000, 100 * 2 ** attempt)))
     }
   }
-
-  // All retries failed, throw last error
-  throw lastError || new Error('All retry attempts failed')
+  throw lastError || new Error("All retry attempts failed")
 }
-
-// Get current tokens
-function getCurrentTokens(): {
-  accessToken: string | null
-  refreshToken: string | null
-  userId: string | null
-} {
-  // Try new cache format first
-  const authCache = readAuthCache()
-  if (authCache) {
-    return {
-      accessToken: authCache.token || null,
-      refreshToken: authCache.refreshToken || null,
-      userId: authCache.user?.id ? String(authCache.user.id) : null,
-    }
-  }
-
-  // Fall back to old format
-  return {
-    accessToken: localStorage.getItem(LEGACY_AUTH_TOKEN_KEY),
-    refreshToken: null,
-    userId: null,
+function refreshLockName(session: AuthSessionSnapshot): string | null {
+  return session.sessionId ? `${AUTH_REFRESH_LOCK_PREFIX}${session.sessionId}` : null
+}
+type RefreshLockAttempt<T> =
+  | { status: "completed"; value: T }
+  | { status: "unavailable"; reason: AuthMutationUnavailableReason }
+async function withRefreshLock<T>(session: AuthSessionSnapshot, action: () => Promise<T>): Promise<RefreshLockAttempt<T>> {
+  const lockName = refreshLockName(session)
+  const locks = typeof navigator === "undefined" ? undefined : navigator.locks
+  if (!lockName) return { status: "unavailable", reason: "operation_failed" }
+  if (!locks) return { status: "unavailable", reason: "coordination_unavailable" }
+  try {
+    return { status: "completed", value: await locks.request(lockName, action) }
+  } catch {
+    return { status: "unavailable", reason: "operation_failed" }
   }
 }
-
-async function withAuthRefreshLock<T>(callback: () => Promise<T>): Promise<T> {
-  if (typeof navigator !== "undefined" && navigator.locks) {
-    return navigator.locks.request(AUTH_REFRESH_LOCK_NAME, callback)
-  }
-
-  return callback()
+type StrictRefreshResponse = {
+  success: true
+  access_token: string
+  refresh_token: string
+  expires_in: number
+  refresh_expires_in: number
 }
-
-function dispatchAuthTokenUpdated() {
-  window.dispatchEvent(new StorageEvent(AUTH_TOKEN_UPDATED_EVENT, {
-    key: AUTH_CACHE_KEY,
-    newValue: localStorage.getItem(AUTH_CACHE_KEY),
-  }))
+function parseStrictRefreshResponse(value: unknown): StrictRefreshResponse | null {
+  if (typeof value !== "object" || value === null) return null
+  const payload = value as Partial<StrictRefreshResponse>
+  const nonblank = (token: unknown): token is string => typeof token === "string" && token.trim().length > 0
+  const expiry = isSafeAuthExpirySeconds
+  return payload.success === true && nonblank(payload.access_token) && nonblank(payload.refresh_token)
+    && expiry(payload.expires_in) && expiry(payload.refresh_expires_in)
+    ? payload as StrictRefreshResponse
+    : null
 }
-
-async function performTokenRefresh(
-  expectedAccessToken: string | null,
-  expectedUserId: string | null
-): Promise<AuthRefreshResult> {
-  return withAuthRefreshLock(async () => {
-    // Another tab may have refreshed while this tab waited for the lock. Reuse
-    // that token instead of rotating its newly-issued refresh token again.
-    const currentTokens = getCurrentTokens()
-    if (currentTokens.userId !== expectedUserId) {
-      return { accessToken: null, rejected: false }
+async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRefreshResult> {
+  const result = await withRefreshLock(session, async () => {
+    const before = compareCredentialSession(session)
+    if (before.status === "credentials_advanced") {
+      return { status: "advanced", accessToken: before.projection.snapshot.accessToken!, session: before.projection.snapshot } satisfies AuthRefreshResult
     }
-
-    if (
-      currentTokens.accessToken &&
-      currentTokens.accessToken !== expectedAccessToken
-    ) {
-      return { accessToken: currentTokens.accessToken }
+    if (before.status !== "exact_credentials") {
+      return { status: "not_current", accessToken: null } satisfies AuthRefreshResult
     }
+    if (!before.projection.cache.refreshToken) return { status: "rejected", accessToken: null } satisfies AuthRefreshResult
 
-    if (!currentTokens.refreshToken) {
-      return { accessToken: null, rejected: true }
-    }
-
-    const abortController = new AbortController()
-    const timeoutId = setTimeout(
-      () => abortController.abort(),
-      AUTH_REFRESH_TIMEOUT_MS
-    )
-
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), AUTH_REFRESH_TIMEOUT_MS)
     try {
       const response = await fetch(`${getApiUrl()}/api/auth/refresh`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ refresh_token: currentTokens.refreshToken }),
-        signal: abortController.signal,
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: before.projection.cache.refreshToken }), signal: controller.signal,
       })
-
-      if (!response.ok) {
+      if (!response.ok) return response.status === 401 || response.status === 403
+        ? { status: "rejected", accessToken: null } satisfies AuthRefreshResult
+        : { status: "transport_failed", accessToken: null } satisfies AuthRefreshResult
+      const payload = parseStrictRefreshResponse(await response.json())
+      if (!payload) return { status: "invalid_response", accessToken: null } satisfies AuthRefreshResult
+      const committed = await commitAuthSessionRefresh(session, payload)
+      if (committed.status === "updated" || committed.status === "advanced") {
         return {
-          accessToken: null,
-          rejected: response.status === 401 || response.status === 403,
-        }
+          status: committed.status === "updated" ? "refreshed" : "advanced",
+          accessToken: committed.projection.snapshot.accessToken!,
+          session: committed.projection.snapshot,
+        } satisfies AuthRefreshResult
       }
-
-      const data = await response.json()
-      if (!data.success || !data.access_token) {
-        return { accessToken: null, rejected: true }
-      }
-
-      const authCache = readAuthCache()
-      if (!authCache) {
-        // The session was cleared while refresh was in flight. Do not let an
-        // older response recreate credentials after logout.
-        return { accessToken: null, rejected: true }
-      }
-
-      const authCacheUserId = authCache.user?.id
-        ? String(authCache.user.id)
-        : null
-      if (authCacheUserId !== expectedUserId) {
-        // A different user replaced the session while this request was in
-        // flight. Do not replay the original request with that user's token.
-        return { accessToken: null, rejected: false }
-      }
-
-      if (
-        authCache.refreshToken &&
-        authCache.refreshToken !== currentTokens.refreshToken
-      ) {
-        // A login may replace the session while an older refresh request is in
-        // flight. Never overwrite that newer session with the old response.
-        return authCache.token
-          ? { accessToken: authCache.token }
-          : { accessToken: null, rejected: true }
-      }
-
-      writeAuthCache(
-        authCache.user,
-        data.access_token,
-        data.refresh_token || authCache.refreshToken,
-        data.expires_in ? data.expires_in : undefined,
-        data.refresh_expires_in ? data.refresh_expires_in : undefined
-      )
-
-      dispatchAuthTokenUpdated()
-      return { accessToken: data.access_token }
+      if (committed.status === "unavailable") return { status: "unavailable", accessToken: null, reason: committed.reason } satisfies AuthRefreshResult
+      if (committed.status === "invalid") return { status: "invalid_response", accessToken: null } satisfies AuthRefreshResult
+      return { status: "not_current", accessToken: null } satisfies AuthRefreshResult
     } catch (error) {
       console.error("Token refresh failed:", error)
-      return { accessToken: null, rejected: false }
+      return { status: "transport_failed", accessToken: null } satisfies AuthRefreshResult
     } finally {
-      clearTimeout(timeoutId)
+      clearTimeout(timeout)
     }
   })
+  return result.status === "completed" ? result.value : { status: "unavailable", accessToken: null, reason: result.reason }
+}
+/** Refreshes only the immutable snapshot captured by the caller. */
+export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): Promise<AuthRefreshResult> {
+  const availability = getAuthStorageAvailability()
+  if (availability.status === "unavailable") return Promise.resolve({ status: "unavailable", accessToken: null, reason: availability.reason })
+  const comparison = compareAuthSession(expectedSession)
+  if (comparison.status === "credentials_advanced" || comparison.status === "credentials_and_profile_advanced") {
+    return Promise.resolve({ status: "advanced", accessToken: comparison.projection.snapshot.accessToken!, session: comparison.projection.snapshot })
+  }
+  if (comparison.status !== "exact" && comparison.status !== "profile_advanced") return Promise.resolve({ status: "not_current", accessToken: null })
+  const key = `${expectedSession.sessionId}::${expectedSession.credentialRevision}::${expectedSession.accessToken}`
+  const pending = refreshPromises.get(key)
+  if (pending) return pending
+  const promise = performTokenRefresh(expectedSession).finally(() => refreshPromises.delete(key))
+  refreshPromises.set(key, promise)
+  return promise
 }
 
-export function refreshStoredAccessToken(
-  expectedAccessToken?: string | null,
-  expectedUserId?: string | number | null
-): Promise<AuthRefreshResult> {
-  const currentTokens = getCurrentTokens()
-  const requestedAccessToken = expectedAccessToken === undefined
-    ? currentTokens.accessToken
-    : expectedAccessToken
-  const requestedUserId = expectedUserId === undefined
-    ? currentTokens.userId
-    : expectedUserId === null
-      ? null
-      : String(expectedUserId)
-  const refreshKey = `${requestedUserId}::${requestedAccessToken}`
-  const pendingRefresh = refreshPromises.get(refreshKey)
-  if (pendingRefresh) {
-    return pendingRefresh
-  }
-
-  const refreshPromise = performTokenRefresh(
-    requestedAccessToken,
-    requestedUserId
-  ).finally(() => {
-    refreshPromises.delete(refreshKey)
-  })
-  refreshPromises.set(refreshKey, refreshPromise)
-  return refreshPromise
+function withBearer(options: RequestInit, token: string): RequestInit {
+  return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
-
-// API request wrapper
-export async function apiRequest(
-  url: string,
-  options: RequestInit = {}
-): Promise<Response> {
-  const { accessToken, userId } = getCurrentTokens()
-
-  // If no token, request directly
-  if (!accessToken) {
-    return fetch(url, options)
+/** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
+export async function apiRequest(url: string, options: RequestInit = {}): Promise<Response> {
+  const session = readAuthSessionSnapshot()
+  if (!session.accessToken) return fetch(url, options)
+  const response = await fetchWithRetry(url, withBearer(options, session.accessToken))
+  if (response.status !== 401 || shouldSkipRefresh(url)) return response
+  const afterResponse = compareAuthSession(session)
+  if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {
+    const advanced = afterResponse.projection.snapshot
+    if (compareCredentialSession(advanced).status === "exact_credentials") return fetch(url, withBearer(options, advanced.accessToken!))
+    return response
   }
-
-  // Add authorization header
-  const headers = {
-    ...options.headers,
-    "Authorization": `Bearer ${accessToken}`,
+  if (afterResponse.status !== "exact" && afterResponse.status !== "profile_advanced") return response
+  const errorType = response.headers.get("Error-Type")
+  if (errorType && errorType !== "TokenExpired") {
+    if ((await clearAuthSessionIfCurrent(session)).status === "cleared") window.location.href = "/login"
+    return response
   }
-
-  // Fetch request with retry mechanism
-  let response = await fetchWithRetry(url, { ...options, headers })
-
-  // If 401 error and not a refresh request, try to refresh token
-  if (response.status === 401 && !shouldSkipRefresh(url)) {
-    // Check if token is expired or invalid
-    const errorType = response.headers.get("Error-Type")
-    const isExpired = errorType === "TokenExpired" || !errorType // Default to expired, try to refresh
-
-    if (!isExpired) {
-      // Explicitly invalid token, redirect to login page directly
-      clearStoredAuth()
-      window.location.href = "/login"
-      return response
-    }
-    const refreshResult = await refreshStoredAccessToken(accessToken, userId)
-
-    if (refreshResult.accessToken !== null) {
-      const retryHeaders = {
-        ...options.headers,
-        "Authorization": `Bearer ${refreshResult.accessToken}`,
+  const refreshed = await refreshStoredAccessToken(session)
+  switch (refreshed.status) {
+    case "refreshed":
+    case "advanced":
+      if (compareCredentialSession(refreshed.session).status === "exact_credentials") {
+        return fetch(url, withBearer(options, refreshed.accessToken))
       }
-      response = await fetch(url, { ...options, headers: retryHeaders })
-    } else if (refreshResult.rejected) {
-      // Only a definitive refresh-token rejection should end the session.
-      console.error("Refresh token was rejected, redirecting to login")
-      clearStoredAuth()
-      window.location.href = "/login"
-    }
+      return response
+    case "rejected":
+      if ((await clearAuthSessionIfCurrent(session)).status === "cleared") {
+        console.error("Refresh token was rejected, redirecting to login")
+        window.location.href = "/login"
+      }
+      return response
+    case "not_current":
+    case "invalid_response":
+    case "transport_failed":
+    case "unavailable":
+      return response
   }
-
-  return response
 }
 
 const MAX_RAW_UPLOAD_MESSAGE_LENGTH = 200
-
-function truncateUploadMessage(text: string): string {
-  const trimmed = text.trim()
-  if (trimmed.length <= MAX_RAW_UPLOAD_MESSAGE_LENGTH) {
-    return trimmed
-  }
-  return `${trimmed.slice(0, MAX_RAW_UPLOAD_MESSAGE_LENGTH)}...`
-}
-
+function truncateUploadMessage(text: string): string { const trimmed = text.trim(); return trimmed.length <= MAX_RAW_UPLOAD_MESSAGE_LENGTH ? trimmed : `${trimmed.slice(0, MAX_RAW_UPLOAD_MESSAGE_LENGTH)}...` }
 type JsonRecord = Record<string, unknown>
-
-export interface ParsedApiResponse {
-  data: JsonRecord | JsonRecord[] | null
-  text: string | null
-  isHtml: boolean
-}
-
-export function isJsonRecord(value: unknown): value is JsonRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
+export interface ParsedApiResponse { data: JsonRecord | JsonRecord[] | null; text: string | null; isHtml: boolean }
+export function isJsonRecord(value: unknown): value is JsonRecord { return typeof value === "object" && value !== null && !Array.isArray(value) }
 export async function parseApiResponse(response: Response): Promise<ParsedApiResponse> {
   const contentType = response.headers.get("content-type")?.toLowerCase() || ""
   const text = await response.text().catch(() => "")
-
-  if (!text) {
-    return {
-      data: null,
-      text: null,
-      isHtml: contentType.includes("text/html"),
-    }
-  }
-
-  try {
-    return {
-      data: JSON.parse(text),
-      text,
-      isHtml: /^\s*</.test(text),
-    }
-  } catch {
-    return {
-      data: null,
-      text,
-      isHtml: contentType.includes("text/html") || /^\s*</.test(text),
-    }
-  }
+  if (!text) return { data: null, text: null, isHtml: contentType.includes("text/html") }
+  try { return { data: JSON.parse(text), text, isHtml: /^\s*</.test(text) } }
+  catch { return { data: null, text, isHtml: contentType.includes("text/html") || /^\s*</.test(text) } }
 }
-
-export const UPLOAD_ERROR_MESSAGES = {
-  tooLarge: "File is too large. Please reduce the upload size and try again.",
-  proxy: "Upload failed before reaching the application. Please check the server upload limit.",
+export const UPLOAD_ERROR_MESSAGES = { tooLarge: "File is too large. Please reduce the upload size and try again.", proxy: "Upload failed before reaching the application. Please check the server upload limit." }
+export function getUploadErrorMessage(response: Response, parsed: ParsedApiResponse, messages: { generic: string; tooLarge: string; proxy: string }): string {
+  if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) return parsed.data.detail
+  if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) return parsed.data.message
+  if (response.status === 413) return messages.tooLarge
+  if (parsed.isHtml) return messages.proxy
+  return parsed.text?.trim() ? truncateUploadMessage(parsed.text) : messages.generic
 }
-
-export function getUploadErrorMessage(
-  response: Response,
-  parsed: ParsedApiResponse,
-  messages: {
-    generic: string
-    tooLarge: string
-    proxy: string
-  }
-): string {
-  if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) {
-    return parsed.data.detail
-  }
-
-  if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) {
-    return parsed.data.message
-  }
-
-  if (response.status === 413) {
-    return messages.tooLarge
-  }
-
-  if (parsed.isHtml) {
-    return messages.proxy
-  }
-
-  if (parsed.text?.trim()) {
-    return truncateUploadMessage(parsed.text)
-  }
-
-  return messages.generic
+export function getApiErrorMessage(response: Response, parsed: ParsedApiResponse, generic: string): string {
+  if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) return parsed.data.detail
+  if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) return parsed.data.message
+  if (parsed.text?.trim() && !parsed.isHtml) return truncateUploadMessage(parsed.text)
+  return response.statusText?.trim() || generic
 }
-
-export function getApiErrorMessage(
-  response: Response,
-  parsed: ParsedApiResponse,
-  generic: string
-): string {
-  if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) {
-    return parsed.data.detail
-  }
-
-  if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) {
-    return parsed.data.message
-  }
-
-  if (parsed.text?.trim() && !parsed.isHtml) {
-    return truncateUploadMessage(parsed.text)
-  }
-
-  if (response.statusText?.trim()) {
-    return response.statusText
-  }
-
-  return generic
-}
-
-// Convenience methods
 export const api = {
-  get: (url: string, options?: RequestInit) =>
-    apiRequest(url, { ...options, method: "GET" }),
-
-  post: (url: string, data?: unknown, options?: RequestInit) =>
-    apiRequest(url, {
-      ...options,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-      },
-      body: data ? JSON.stringify(data) : undefined,
-    }),
-
-  put: (url: string, data?: unknown, options?: RequestInit) =>
-    apiRequest(url, {
-      ...options,
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-      },
-      body: data ? JSON.stringify(data) : undefined,
-    }),
-
-  delete: (url: string, options?: RequestInit) =>
-    apiRequest(url, { ...options, method: "DELETE" }),
+  get: (url: string, options?: RequestInit) => apiRequest(url, { ...options, method: "GET" }),
+  post: (url: string, data?: unknown, options?: RequestInit) => apiRequest(url, { ...options, method: "POST", headers: { "Content-Type": "application/json", ...options?.headers }, body: data ? JSON.stringify(data) : undefined }),
+  put: (url: string, data?: unknown, options?: RequestInit) => apiRequest(url, { ...options, method: "PUT", headers: { "Content-Type": "application/json", ...options?.headers }, body: data ? JSON.stringify(data) : undefined }),
+  delete: (url: string, options?: RequestInit) => apiRequest(url, { ...options, method: "DELETE" }),
 }
-
-// Check response status, if auth error redirect to login
-export function handleAuthError(response: Response) {
-  if (response.status === 401) {
-    clearStoredAuth()
-    window.location.href = "/login"
-    return true
-  }
-  return false
+export async function handleAuthError(response: Response): Promise<boolean> {
+  if (response.status !== 401) return false
+  const cleared = await clearAuthSessionIfCurrent(readAuthSessionSnapshot())
+  if (cleared.status === "cleared") window.location.href = "/login"
+  return cleared.status === "cleared"
 }

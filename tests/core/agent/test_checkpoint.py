@@ -94,6 +94,18 @@ class LegacyCheckpointBackend:
         }
 
 
+class LegacyNamedCheckpointBackend:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def get_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        return {
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "root_execution_id": execution_id,
+            "snapshot": dict(self.payload),
+        }
+
+
 class FailingTraceHandler(TraceHandler):
     async def handle_event(self, _: TraceEvent) -> None:
         raise ValueError("checkpoint write failed: secret=supersecret")
@@ -169,6 +181,20 @@ async def test_trace_checkpoint_store_reads_legacy_checkpoint_marker() -> None:
     store = TraceCheckpointStore(LegacyCheckpointBackend(payload))
 
     loaded = await store.load_latest_checkpoint("legacy-exec")
+
+    assert loaded == payload
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_supports_legacy_reader_name() -> None:
+    payload = {
+        "type": "checkpoint",
+        "execution_id": "legacy-reader-name",
+        "context": {"messages": []},
+    }
+    store = TraceCheckpointStore(LegacyNamedCheckpointBackend(payload))
+
+    loaded = await store.load_latest_checkpoint("legacy-reader-name")
 
     assert loaded == payload
 

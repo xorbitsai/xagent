@@ -5,6 +5,7 @@ Provides web-specific configuration classes that load from database
 and other web-specific sources.
 """
 
+import copy
 import inspect
 import logging
 import os
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import (
     Any,
     Awaitable,
@@ -34,6 +36,7 @@ from ...core.tools.adapters.vibe.config import (
     MCPConfigLoadError,
     MCPFailurePolicy,
     MCPToolLoadSummary,
+    ToolFactoryRuntimeSessionBoundaryError,
     normalize_tool_allowlist,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -174,6 +177,46 @@ def _oauth_token_resolver_registration_matches(
     )
 
 
+def _refresh_delegated_mcp_connection_from_snapshot(
+    *,
+    session_factory: Any,
+    task_id: int | None,
+    turn_id: str | None,
+    user_id: int | None,
+    server_id: int,
+    connection_snapshot: Mapping[str, Any],
+    runtime_bindings: Any,
+    allow_delegated_authorization: bool,
+) -> dict[str, Any] | None:
+    """Refresh delegated MCP headers without retaining construction objects."""
+    if task_id is None or user_id is None:
+        return None
+
+    from ..services.connector_runtime import load_connector_runtime_view
+
+    with session_factory() as db:
+        runtime_view = load_connector_runtime_view(
+            db=db,
+            task_id=task_id,
+            turn_id=turn_id,
+            user_id=user_id,
+        )
+    runtime_values = runtime_view.get(f"mcp:{server_id}")
+    runtime_headers = WebToolConfig._runtime_transport_headers(
+        runtime_values=runtime_values if isinstance(runtime_values, dict) else None,
+        runtime_bindings=runtime_bindings,
+        allow_delegated_authorization=allow_delegated_authorization,
+    )
+    if not runtime_headers:
+        return None
+
+    connection = copy.deepcopy(dict(connection_snapshot))
+    connection["headers"] = dict(connection.get("headers") or {})
+    connection["headers"].update(runtime_headers)
+    connection.pop("auth", None)
+    return connection
+
+
 async def _maybe_await_oauth_token_resolver_result(result: object) -> object:
     if inspect.isawaitable(result):
         return await result
@@ -264,6 +307,77 @@ class _ToolFactoryRuntimeSnapshot:
     music_models: dict[str, Any] = field(default_factory=dict)
     music_model: Any | None = None
     published_agent_records: list[Any] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _RetainedFactoryModelState:
+    """Detached model values that remain readable after factory handoff."""
+
+    load_vision: bool
+    load_image: bool
+    load_video: bool
+    load_audio: bool
+    vision_model: Any | None
+    image_models: Mapping[str, Any]
+    image_generate_model: Any | None
+    image_edit_model: Any | None
+    video_models: Mapping[str, Any]
+    video_model: Any | None
+    asr_models: Mapping[str, Any]
+    asr_model: Any | None
+    tts_models: Mapping[str, Any]
+    tts_model: Any | None
+    sound_effect_models: Mapping[str, Any]
+    sound_effect_model: Any | None
+    music_models: Mapping[str, Any]
+    music_model: Any | None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "image_models",
+            "video_models",
+            "asr_models",
+            "tts_models",
+            "sound_effect_models",
+            "music_models",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                MappingProxyType(dict(getattr(self, field_name))),
+            )
+
+    @classmethod
+    def from_factory_snapshot(
+        cls, snapshot: _ToolFactoryRuntimeSnapshot
+    ) -> "_RetainedFactoryModelState":
+        plan = snapshot.plan
+        return cls(
+            load_vision=plan.load_vision,
+            load_image=plan.load_image,
+            load_video=plan.load_video,
+            load_audio=plan.load_audio,
+            vision_model=snapshot.vision_model if plan.load_vision else None,
+            image_models=snapshot.image_models if plan.load_image else {},
+            image_generate_model=(
+                snapshot.image_generate_model if plan.load_image else None
+            ),
+            image_edit_model=snapshot.image_edit_model if plan.load_image else None,
+            video_models=snapshot.video_models if plan.load_video else {},
+            video_model=snapshot.video_model if plan.load_video else None,
+            asr_models=snapshot.asr_models if plan.load_audio else {},
+            asr_model=snapshot.asr_model if plan.load_audio else None,
+            tts_models=snapshot.tts_models if plan.load_audio else {},
+            tts_model=snapshot.tts_model if plan.load_audio else None,
+            sound_effect_models=(
+                snapshot.sound_effect_models if plan.load_audio else {}
+            ),
+            sound_effect_model=(
+                snapshot.sound_effect_model if plan.load_audio else None
+            ),
+            music_models=snapshot.music_models if plan.load_audio else {},
+            music_model=snapshot.music_model if plan.load_audio else None,
+        )
 
 
 def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
@@ -1133,6 +1247,8 @@ class WebToolConfig(BaseToolConfig):
         self._cached_embedding_model: Optional[str] = None
         self._cached_rerank_model: Optional[str] = None
         self._factory_runtime_snapshot: _ToolFactoryRuntimeSnapshot | None = None
+        self._retained_factory_model_state: _RetainedFactoryModelState | None = None
+        self._factory_runtime_handed_off = False
         self._pending_runtime_policy: _ToolRuntimePolicySnapshot | None = None
 
     def _build_mcp_file_allowed_dirs(self) -> str:
@@ -1211,62 +1327,121 @@ class WebToolConfig(BaseToolConfig):
         """Whether to include basic tools."""
         return True
 
+    def _resolve_factory_model_field(
+        self,
+        *,
+        load_flag: str,
+        field_name: str,
+        cache_name: str,
+        loader: Callable[[], Any],
+        terminal_neutral: Any,
+    ) -> Any:
+        snapshot = self._factory_runtime_snapshot
+        if snapshot is not None and getattr(snapshot.plan, load_flag):
+            return getattr(snapshot, field_name)
+
+        retained = self._retained_factory_model_state
+        if retained is not None and getattr(retained, load_flag):
+            return getattr(retained, field_name)
+
+        if self._factory_runtime_handed_off:
+            return terminal_neutral
+
+        cached = getattr(self, cache_name)
+        if cached is None:
+            cached = loader()
+            setattr(self, cache_name, cached)
+        return cached
+
+    def _get_factory_model_value(
+        self,
+        *,
+        load_flag: str,
+        field_name: str,
+        cache_name: str,
+        loader: Callable[[], Any | None],
+    ) -> Any | None:
+        return self._resolve_factory_model_field(
+            load_flag=load_flag,
+            field_name=field_name,
+            cache_name=cache_name,
+            loader=loader,
+            terminal_neutral=None,
+        )
+
+    def _get_factory_model_mapping(
+        self,
+        *,
+        load_flag: str,
+        field_name: str,
+        cache_name: str,
+        loader: Callable[[], Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        resolved = self._resolve_factory_model_field(
+            load_flag=load_flag,
+            field_name=field_name,
+            cache_name=cache_name,
+            loader=loader,
+            terminal_neutral={},
+        )
+        return dict(resolved)
+
     def get_vision_model(self) -> Optional[Any]:
         """Get vision model, prioritizing explicitly provided model over database."""
         if hasattr(self, "_explicit_vision_model") and self._explicit_vision_model:
             return self._explicit_vision_model
 
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_vision:
-            return snapshot.vision_model
-        if self._cached_vision_config is None:
-            self._cached_vision_config = self._load_vision_model()
-        return self._cached_vision_config
+        return self._get_factory_model_value(
+            load_flag="load_vision",
+            field_name="vision_model",
+            cache_name="_cached_vision_config",
+            loader=self._load_vision_model,
+        )
 
     def get_image_models(self) -> Dict[str, Any]:
         """Load image models from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_image:
-            return snapshot.image_models
-        if self._cached_image_configs is None:
-            self._cached_image_configs = self._load_image_models()
-        return self._cached_image_configs
+        return self._get_factory_model_mapping(
+            load_flag="load_image",
+            field_name="image_models",
+            cache_name="_cached_image_configs",
+            loader=self._load_image_models,
+        )
 
     def get_video_models(self) -> Dict[str, Any]:
         """Load video models from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_video:
-            return snapshot.video_models
-        if self._cached_video_configs is None:
-            self._cached_video_configs = self._load_video_models()
-        return self._cached_video_configs
+        return self._get_factory_model_mapping(
+            load_flag="load_video",
+            field_name="video_models",
+            cache_name="_cached_video_configs",
+            loader=self._load_video_models,
+        )
 
     def get_image_generate_model(self) -> Optional[Any]:
         """Get default image generation model from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_image:
-            return snapshot.image_generate_model
-        if self._cached_image_generate_model is None:
-            self._cached_image_generate_model = self._load_image_generate_model()
-        return self._cached_image_generate_model
+        return self._get_factory_model_value(
+            load_flag="load_image",
+            field_name="image_generate_model",
+            cache_name="_cached_image_generate_model",
+            loader=self._load_image_generate_model,
+        )
 
     def get_image_edit_model(self) -> Optional[Any]:
         """Get default image editing model from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_image:
-            return snapshot.image_edit_model
-        if self._cached_image_edit_model is None:
-            self._cached_image_edit_model = self._load_image_edit_model()
-        return self._cached_image_edit_model
+        return self._get_factory_model_value(
+            load_flag="load_image",
+            field_name="image_edit_model",
+            cache_name="_cached_image_edit_model",
+            loader=self._load_image_edit_model,
+        )
 
     def get_video_model(self) -> Optional[Any]:
         """Get default video generation model from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_video:
-            return snapshot.video_model
-        if self._cached_video_model is None:
-            self._cached_video_model = self._load_video_model()
-        return self._cached_video_model
+        return self._get_factory_model_value(
+            load_flag="load_video",
+            field_name="video_model",
+            cache_name="_cached_video_model",
+            loader=self._load_video_model,
+        )
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
@@ -1390,8 +1565,8 @@ class WebToolConfig(BaseToolConfig):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
     def _runtime_transport_headers(
-        self,
         *,
         runtime_values: Optional[Dict[str, Any]],
         runtime_bindings: Any,
@@ -1477,19 +1652,27 @@ class WebToolConfig(BaseToolConfig):
             server=server, runtime_headers=runtime_headers
         )
 
-    def _refresh_delegated_mcp_connection(
+    def _build_delegated_mcp_refresh_callback(
         self,
         *,
         server: Any,
         runtime_bindings: Any,
         allow_delegated_authorization: bool,
-    ) -> dict[str, Any] | None:
-        self._connector_runtime_view = None
-        runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
-        return self._delegated_mcp_connection(
+    ) -> Callable[[], dict[str, Any] | None]:
+        """Return a refresh callback containing only scalar and copied values."""
+        connection_snapshot = self._mcp_connection_with_runtime_headers(
             server=server,
-            runtime_values=runtime_values,
-            runtime_bindings=runtime_bindings,
+            runtime_headers={},
+        )
+        return partial(
+            _refresh_delegated_mcp_connection_from_snapshot,
+            session_factory=self.get_session_factory(),
+            task_id=self._parse_numeric_task_id(),
+            turn_id=self._connector_runtime_turn_id,
+            user_id=self._user_id,
+            server_id=int(server.id),
+            connection_snapshot=connection_snapshot,
+            runtime_bindings=copy.deepcopy(runtime_bindings),
             allow_delegated_authorization=allow_delegated_authorization,
         )
 
@@ -1538,15 +1721,10 @@ class WebToolConfig(BaseToolConfig):
         return self._allowed_skills
 
     def get_skill_scope_context(self) -> Any:
-        """Build generic context for scoped skill providers."""
-        from ...skills.library import SkillScopeContext
+        """Build detached runtime identity for read-only skill providers."""
+        from ..services.skill_runtime import build_detached_skill_scope
 
-        return SkillScopeContext(
-            user=self._user,
-            user_id=self._user_id,
-            db=self.db,
-            request=self.request,
-        )
+        return build_detached_skill_scope(user_id=self._user_id)
 
     def get_tool_selection_spec(self) -> Optional[Any]:
         """Typed spec accessor (preferred over :meth:`get_allowed_tools`).
@@ -1753,14 +1931,104 @@ class WebToolConfig(BaseToolConfig):
         )
         self._apply_factory_runtime_snapshot(snapshot)
 
-    def release_prepared_factory_runtime(self) -> None:
-        """Discard construction-only detached state after a factory build."""
+    def discard_prepared_factory_runtime(self) -> None:
+        """Discard construction-only snapshots without changing DB ownership."""
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
 
+    def release_prepared_factory_runtime(self) -> None:
+        """Compatibility alias for configs that only discard snapshots."""
+        self.discard_prepared_factory_runtime()
+
+    @staticmethod
+    def _terminally_close_owned_lazy_db(lazy_db: Any) -> bool:
+        """Close or invalidate an owned Session without losing retry ownership."""
+        try:
+            lazy_db.close()
+            return True
+        except Exception:
+            try:
+                lazy_db.invalidate()
+                return True
+            except Exception:
+                logger.warning(
+                    "Failed to invalidate lazy tool-factory database session",
+                    exc_info=True,
+                )
+                return False
+
+    def handoff_factory_runtime(self) -> None:
+        """Verify and detach construction-only database resources.
+
+        The request session remains caller-owned: a failed clean-release leaves
+        it, the request, and its ORM user untouched. A lazily-created session is
+        owned by this config and is therefore terminally closed on every path.
+        """
+        snapshot = self._factory_runtime_snapshot
+        self._detach_factory_runtime_resources()
+        if snapshot is not None:
+            self._retained_factory_model_state = (
+                _RetainedFactoryModelState.from_factory_snapshot(snapshot)
+            )
+        self._factory_runtime_handed_off = True
+        self.discard_prepared_factory_runtime()
+
+    def abort_factory_runtime(self) -> None:
+        """Discard factory-only values while detaching request-owned resources."""
+        self.discard_prepared_factory_runtime()
+        try:
+            self._detach_factory_runtime_resources()
+        finally:
+            self._factory_runtime_handed_off = True
+
+    def _detach_factory_runtime_resources(self) -> None:
+        """Detach every construction-owned session reference after verification."""
+        from sqlalchemy.orm import Session
+
+        from ..models.database import release_db_connection_if_clean
+
+        live_db = self._live_db
+        lazy_db = self._lazy_db
+        if self._db_factory is None and isinstance(live_db, Session):
+            self._db_factory = self.get_session_factory()
+
+        # Only a real SQLAlchemy Session participates in the verified pool
+        # handoff. Standalone embedders and unit tests may supply a duck-typed
+        # object for synchronous getters; prepare_factory_runtime() deliberately
+        # keeps that legacy path out of the worker/session-factory boundary.
+        live_released = (
+            release_db_connection_if_clean(live_db)
+            if isinstance(live_db, Session)
+            else True
+        )
+        lazy_released = (
+            release_db_connection_if_clean(lazy_db) if lazy_db is not None else True
+        )
+
+        if lazy_db is not None:
+            if not lazy_released:
+                try:
+                    lazy_db.rollback()
+                except Exception:
+                    logger.warning(
+                        "Failed to roll back lazy tool-factory database session",
+                        exc_info=True,
+                    )
+            if self._terminally_close_owned_lazy_db(lazy_db):
+                self._lazy_db = None
+            else:
+                lazy_released = False
+
+        if not live_released or not lazy_released:
+            raise ToolFactoryRuntimeSessionBoundaryError()
+
+        self._live_db = None
+        self.request = None
+        self._user = None
+
     async def refresh_runtime_policy(self) -> None:
         """Refresh only detached per-turn policy before signature comparison."""
-        self.release_prepared_factory_runtime()
+        self.discard_prepared_factory_runtime()
         if self._user_id is None or not has_user_tool_policy_hooks():
             policy_snapshot = _ToolRuntimePolicySnapshot()
         else:
@@ -1876,11 +2144,26 @@ class WebToolConfig(BaseToolConfig):
         return self.db
 
     def close(self) -> None:
-        """Close the lazily-opened factory session, if any."""
-        self.release_prepared_factory_runtime()
-        if self._lazy_db is not None:
-            self._lazy_db.close()
-            self._lazy_db = None
+        """Finalize the current factory runtime generation and owned resources.
+
+        This discards the current prepared and retained factory state and
+        closes any owned lazy database session. Old factory/database-backed
+        media getters are neutral after close until a later
+        ``prepare_factory_runtime()`` installs the next generation. An
+        explicit constructor-supplied vision model is independent and remains
+        authoritative after close.
+        """
+        try:
+            self.discard_prepared_factory_runtime()
+            lazy_db = self._lazy_db
+            if lazy_db is not None:
+                if self._terminally_close_owned_lazy_db(lazy_db):
+                    self._lazy_db = None
+                else:
+                    raise ToolFactoryRuntimeSessionBoundaryError()
+        finally:
+            self._retained_factory_model_state = None
+            self._factory_runtime_handed_off = True
 
     def release_db_connection(self) -> None:
         """Return the pooled connection held by this config's session(s).
@@ -2018,12 +2301,12 @@ class WebToolConfig(BaseToolConfig):
 
     def get_asr_models(self) -> Dict[str, Any]:
         """Load ASR models from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.asr_models
-        if self._cached_asr_models is None:
-            self._cached_asr_models = self._load_asr_models()
-        return self._cached_asr_models
+        return self._get_factory_model_mapping(
+            load_flag="load_audio",
+            field_name="asr_models",
+            cache_name="_cached_asr_models",
+            loader=self._load_asr_models,
+        )
 
     def _load_asr_models(self) -> Dict[str, Any]:
         """Load ASR models from database via model service."""
@@ -2039,12 +2322,12 @@ class WebToolConfig(BaseToolConfig):
 
     def get_asr_model(self) -> Optional[Any]:
         """Get default ASR model from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.asr_model
-        if self._cached_asr_model is None:
-            self._cached_asr_model = self._load_asr_model()
-        return self._cached_asr_model
+        return self._get_factory_model_value(
+            load_flag="load_audio",
+            field_name="asr_model",
+            cache_name="_cached_asr_model",
+            loader=self._load_asr_model,
+        )
 
     def _load_asr_model(self) -> Optional[Any]:
         """Load default ASR model from database via model service."""
@@ -2060,12 +2343,12 @@ class WebToolConfig(BaseToolConfig):
 
     def get_tts_models(self) -> Dict[str, Any]:
         """Load TTS models from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.tts_models
-        if self._cached_tts_models is None:
-            self._cached_tts_models = self._load_tts_models()
-        return self._cached_tts_models
+        return self._get_factory_model_mapping(
+            load_flag="load_audio",
+            field_name="tts_models",
+            cache_name="_cached_tts_models",
+            loader=self._load_tts_models,
+        )
 
     def _load_tts_models(self) -> Dict[str, Any]:
         """Load TTS models from database via model service."""
@@ -2081,21 +2364,21 @@ class WebToolConfig(BaseToolConfig):
 
     def get_tts_model(self) -> Optional[Any]:
         """Get default TTS model from database."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.tts_model
-        if self._cached_tts_model is None:
-            self._cached_tts_model = self._load_tts_model()
-        return self._cached_tts_model
+        return self._get_factory_model_value(
+            load_flag="load_audio",
+            field_name="tts_model",
+            cache_name="_cached_tts_model",
+            loader=self._load_tts_model,
+        )
 
     def get_sound_effect_models(self) -> Dict[str, Any]:
         """Load sound effect models from the independent model category."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.sound_effect_models
-        if self._cached_sound_effect_models is None:
-            self._cached_sound_effect_models = self._load_sound_effect_models()
-        return self._cached_sound_effect_models
+        return self._get_factory_model_mapping(
+            load_flag="load_audio",
+            field_name="sound_effect_models",
+            cache_name="_cached_sound_effect_models",
+            loader=self._load_sound_effect_models,
+        )
 
     def _load_sound_effect_models(self) -> Dict[str, Any]:
         try:
@@ -2109,12 +2392,12 @@ class WebToolConfig(BaseToolConfig):
 
     def get_sound_effect_model(self) -> Optional[Any]:
         """Get the user's default sound effect model."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.sound_effect_model
-        if self._cached_sound_effect_model is None:
-            self._cached_sound_effect_model = self._load_sound_effect_model()
-        return self._cached_sound_effect_model
+        return self._get_factory_model_value(
+            load_flag="load_audio",
+            field_name="sound_effect_model",
+            cache_name="_cached_sound_effect_model",
+            loader=self._load_sound_effect_model,
+        )
 
     def _load_sound_effect_model(self) -> Optional[Any]:
         try:
@@ -2128,12 +2411,12 @@ class WebToolConfig(BaseToolConfig):
 
     def get_music_models(self) -> Dict[str, Any]:
         """Load music models from the independent model category."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.music_models
-        if self._cached_music_models is None:
-            self._cached_music_models = self._load_music_models()
-        return self._cached_music_models
+        return self._get_factory_model_mapping(
+            load_flag="load_audio",
+            field_name="music_models",
+            cache_name="_cached_music_models",
+            loader=self._load_music_models,
+        )
 
     def _load_music_models(self) -> Dict[str, Any]:
         try:
@@ -2147,12 +2430,12 @@ class WebToolConfig(BaseToolConfig):
 
     def get_music_model(self) -> Optional[Any]:
         """Get the user's default music model."""
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and snapshot.plan.load_audio:
-            return snapshot.music_model
-        if self._cached_music_model is None:
-            self._cached_music_model = self._load_music_model()
-        return self._cached_music_model
+        return self._get_factory_model_value(
+            load_flag="load_audio",
+            field_name="music_model",
+            cache_name="_cached_music_model",
+            loader=self._load_music_model,
+        )
 
     def _load_music_model(self) -> Optional[Any]:
         try:
@@ -2874,11 +3157,12 @@ class WebToolConfig(BaseToolConfig):
                     allow_delegated_authorization=allow_delegated_authorization,
                 )
                 if delegated_connection:
-                    delegated_connection["_connector_runtime_refresh"] = partial(
-                        self._refresh_delegated_mcp_connection,
-                        server=server,
-                        runtime_bindings=runtime_bindings,
-                        allow_delegated_authorization=allow_delegated_authorization,
+                    delegated_connection["_connector_runtime_refresh"] = (
+                        self._build_delegated_mcp_refresh_callback(
+                            server=server,
+                            runtime_bindings=runtime_bindings,
+                            allow_delegated_authorization=allow_delegated_authorization,
+                        )
                     )
                     transport_config.update(
                         connection_to_transport_config(delegated_connection)

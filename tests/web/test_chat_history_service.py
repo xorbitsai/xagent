@@ -12,11 +12,14 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     claim_user_message_delivery,
     get_latest_waiting_question,
     inspect_user_message_delivery,
     load_task_transcript,
+    mark_user_message_delivery,
     persist_assistant_message,
     persist_assistant_message_no_commit,
     persist_user_message,
@@ -384,6 +387,49 @@ def test_delivery_claim_surfaces_failed_handoff() -> None:
         )
         assert retried.claimed is False
         assert retried.failed is True
+    finally:
+        db_session.close()
+
+
+def test_delivery_transition_does_not_regress_a_completed_turn() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        claim_user_message_delivery(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "Apply guidance",
+            turn_id="completed-turn",
+        )
+
+        assert (
+            mark_user_message_delivery(
+                db_session,
+                task_id=int(task.id),
+                turn_id="completed-turn",
+                status=DELIVERY_DISPATCHED,
+            ).outcome
+            == "updated"
+        )
+        assert (
+            mark_user_message_delivery(
+                db_session,
+                task_id=int(task.id),
+                turn_id="completed-turn",
+                status=DELIVERY_COMPLETED,
+            ).outcome
+            == "updated"
+        )
+        transition = mark_user_message_delivery(
+            db_session,
+            task_id=int(task.id),
+            turn_id="completed-turn",
+            status=DELIVERY_DISPATCHED,
+        )
+
+        assert transition.outcome == "conflict"
+        assert transition.status == DELIVERY_COMPLETED
     finally:
         db_session.close()
 

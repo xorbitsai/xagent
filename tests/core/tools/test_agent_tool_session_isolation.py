@@ -1,7 +1,9 @@
 import asyncio
 import os
 import tempfile
+from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -16,6 +18,135 @@ from xagent.web.services.llm_utils import UserAwareModelStorage
 
 class _Stop(Exception):
     """Halt the run before the sub-agent executes."""
+
+
+class _DelegatedQuery:
+    def __init__(self, agent):
+        self._agent = agent
+
+    def filter(self, *_args):
+        return self
+
+    def first(self):
+        return self._agent
+
+
+class _DelegatedSession:
+    def __init__(self, agent):
+        self._agent = agent
+
+    def query(self, *_args):
+        return _DelegatedQuery(self._agent)
+
+    def commit(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class _FailingCloseConfig:
+    def close(self):
+        raise ValueError("cleanup sentinel")
+
+
+def _delegated_agent_tool() -> AgentTool:
+    return AgentTool(
+        agent_id=1,
+        agent_name="Delegated",
+        agent_description="d",
+        session_factory=lambda: _DelegatedSession(
+            SimpleNamespace(
+                id=1,
+                name="Delegated",
+                instructions=None,
+                knowledge_bases=None,
+                skills=None,
+                tool_categories=[],
+                models={"general": 1},
+                execution_mode=None,
+            )
+        ),
+        user_id=1,
+        tool_name="delegated",
+        tool_description="d",
+    )
+
+
+def _patch_delegated_runtime(monkeypatch, execute_task):
+    import xagent.core.agent.service as service_module
+    import xagent.core.tools.adapters.vibe.agent_model_resolution as resolution
+
+    class FakeAgentService:
+        workspace = None
+
+        def __init__(self, **_kwargs):
+            return None
+
+        async def execute_task(self, **_kwargs):
+            return await execute_task()
+
+    monkeypatch.setattr(mod, "WebToolConfig", lambda **_kwargs: _FailingCloseConfig())
+    monkeypatch.setattr(service_module, "AgentService", FakeAgentService)
+    monkeypatch.setattr(
+        resolution,
+        "resolve_agent_model_llms",
+        lambda *_args: (object(), None, None, None),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_maps_successful_body_cleanup_failure_to_boundary_error(
+    monkeypatch,
+):
+    async def execute_task():
+        return {"output": "completed"}
+
+    _patch_delegated_runtime(monkeypatch, execute_task)
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["response"].endswith("Tool runtime cleanup could not be completed.")
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_preserves_body_failure_when_cleanup_also_fails(
+    monkeypatch, caplog
+):
+    primary = RuntimeError("body sentinel")
+
+    async def execute_task():
+        raise primary
+
+    _patch_delegated_runtime(monkeypatch, execute_task)
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["response"].endswith("body sentinel")
+    assert "Failed to close delegated agent tool runtime after execution" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_preserves_cancelled_error_identity_when_cleanup_fails(
+    monkeypatch,
+):
+    primary = asyncio.CancelledError("cancelled sentinel")
+
+    async def execute_task():
+        raise primary
+
+    _patch_delegated_runtime(monkeypatch, execute_task)
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await tool.run_json_async({"task": "run"})
+
+    assert caught.value is primary
 
 
 def _create_factory() -> tuple[sessionmaker, str]:

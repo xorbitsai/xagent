@@ -366,7 +366,7 @@ def prepare_create_connector_runtime(
     return ConnectorRuntimeCreatePlan(
         task_source=task_source,
         connector_user_id=int(connector_user_id),
-        selected_refs=_sort_connector_refs(selected_refs),
+        selected_refs=selected_refs,
         context_by_ref=context_by_ref,
         ephemeral_by_ref=ephemeral_by_ref,
     )
@@ -391,8 +391,12 @@ def prepare_connector_runtime_selection_snapshot(
 
     if agent is None or connector_user_id is None:
         return ()
-    visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
-    return _plan_selected_refs(agent, visible)
+    selected = resolve_agent_selected_connectors(
+        db=db,
+        agent=agent,
+        connector_user_id=int(connector_user_id),
+    )
+    return _runtime_declared_refs(selected)
 
 
 def bind_connector_runtime_selection_snapshot(
@@ -598,31 +602,78 @@ def _load_visible_runtime_connectors(
     return visible
 
 
+def resolve_agent_selected_connectors(
+    *, db: Session, agent: Agent, connector_user_id: int
+) -> dict[ConnectorRef, Any]:
+    """Return visible connectors selected by ``agent`` for the supplied owner.
+
+    Selection derives only from ``Agent.tool_categories``; task-level runtime
+    overlays are not applied. Callers that need the effective per-task tool set
+    must apply those policies at the task-selection boundary.
+
+    Runtime-declaration filtering is intentionally left to consumers. Results
+    iterate deterministically by ``(connector_type, connector_id)``.
+    """
+
+    visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
+    return _select_agent_visible_connectors(agent, visible)
+
+
 def _plan_selected_refs(
     agent: Agent, visible: dict[ConnectorRef, Any]
 ) -> tuple[ConnectorRef, ...]:
+    selected = _select_agent_visible_connectors(agent, visible)
+    return _runtime_declared_refs(selected)
+
+
+def _runtime_declared_refs(
+    selected: dict[ConnectorRef, Any],
+) -> tuple[ConnectorRef, ...]:
+    """Project declared refs while preserving canonical selection order.
+
+    Callers provide the mapping ordered by the connector selection owner.
+    """
+
+    return tuple(
+        ref
+        for ref, connector in selected.items()
+        if _has_runtime_declaration(connector)
+    )
+
+
+def _select_agent_visible_connectors(
+    agent: Agent, visible: dict[ConnectorRef, Any]
+) -> dict[ConnectorRef, Any]:
+    """Select visible connectors and establish canonical ref iteration order."""
+
     tool_categories = (
         list(agent.tool_categories) if isinstance(agent.tool_categories, list) else None
     )
     spec = ToolSelectionSpec.from_raw(tool_categories=tool_categories)
-    selected: list[ConnectorRef] = []
-    scoped_mcp_servers = spec.scoped_mcp_servers()
+    selected: dict[ConnectorRef, Any] = {}
     for ref, connector in visible.items():
-        if not _has_runtime_declaration(connector):
-            continue
-        name_key = normalize_mcp_server_name(str(connector.name or ""))
-        if ref.connector_type == CONNECTOR_TYPE_MCP:
-            if not spec.includes_mcp():
-                continue
-            if scoped_mcp_servers is not None and name_key not in scoped_mcp_servers:
-                continue
-        elif ref.connector_type == CONNECTOR_TYPE_CUSTOM_API:
-            if not spec.includes_custom_api():
-                continue
-            if scoped_mcp_servers is not None and name_key not in scoped_mcp_servers:
-                continue
-        selected.append(ref)
-    return _sort_connector_refs(selected)
+        if _is_agent_selected_connector(spec, ref, connector):
+            selected[ref] = connector
+    return {ref: selected[ref] for ref in _sort_connector_refs(selected)}
+
+
+def _is_agent_selected_connector(
+    spec: ToolSelectionSpec, ref: ConnectorRef, connector: Any
+) -> bool:
+    if ref.connector_type == CONNECTOR_TYPE_MCP:
+        if not spec.includes_mcp():
+            return False
+    elif ref.connector_type == CONNECTOR_TYPE_CUSTOM_API:
+        if not spec.includes_custom_api():
+            return False
+    else:
+        return False
+
+    scoped_mcp_servers = spec.scoped_mcp_servers()
+    if scoped_mcp_servers is None:
+        return True
+    name_key = normalize_mcp_server_name(connector.name)
+    return name_key in scoped_mcp_servers
 
 
 def _sort_connector_refs(refs: Iterable[ConnectorRef]) -> tuple[ConnectorRef, ...]:

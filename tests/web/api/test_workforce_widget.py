@@ -653,6 +653,35 @@ def test_taskless_widget_upload_enforces_file_count_cap() -> None:
     assert str(MAX_TASKLESS_SHARE_UPLOAD_FILES) in rejected.json()["detail"]
 
 
+def test_taskless_widget_upload_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widget upload path carries its own throttle (#973): keyed per
+    widget entity + caller IP — NOT the client-supplied widget guest_id, so
+    rotating the guest must not reset the budget."""
+    from xagent.web.services.share_rate_limit import reset_share_rate_limiter
+
+    workforce_id = _create_workforce("Widget Upload RL Workforce")
+    key = _enable_widget(workforce_id)
+
+    monkeypatch.setenv("XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    def _upload(headers: dict[str, str]) -> Any:
+        return client.post(
+            "/api/widget/files/upload",
+            headers=headers,
+            data={"task_type": "task"},
+            files=[("files", ("f.txt", io.BytesIO(b"x"), "text/plain"))],
+        )
+
+    first = _upload(_authenticate_widget_guest_by_key(key, guest_id="g-one"))
+    assert first.status_code == 200, first.text
+    # Rotating the (client-supplied) guest_id must not escape the budget.
+    second = _upload(_authenticate_widget_guest_by_key(key, guest_id="g-two"))
+    assert second.status_code == 429, second.text
+
+
 def test_agent_widget_taskless_upload_still_requires_task_id() -> None:
     """The task-less upload relaxation is workforce-only; the agent widget
     path keeps its task_id-required contract (files ride the first WS turn)."""

@@ -41,6 +41,14 @@ class UserMessageDeliveryClaim:
         return str(self.message.delivery_status) == DELIVERY_PENDING
 
 
+@dataclass(frozen=True)
+class UserMessageDeliveryTransition:
+    """Conditional delivery-state transition staged in a caller transaction."""
+
+    status: str | None
+    outcome: str
+
+
 def _attachment_identity(
     attachments: Optional[List[Dict[str, Any]]],
 ) -> tuple[str, ...]:
@@ -160,14 +168,55 @@ def claim_user_message_delivery(
         return raced
 
 
+def claim_user_message_delivery_no_commit(
+    db: Session,
+    task_id: int,
+    user_id: int,
+    content: str,
+    *,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    turn_id: str,
+) -> UserMessageDeliveryClaim:
+    """Stage a delivery claim without committing the caller's transaction."""
+
+    existing = inspect_user_message_delivery(
+        db,
+        task_id,
+        content,
+        attachments=attachments,
+        turn_id=turn_id,
+    )
+    if existing is not None:
+        return existing
+
+    message = TaskChatMessage(
+        task_id=task_id,
+        user_id=user_id,
+        role="user",
+        content=content.strip(),
+        message_type="user_message",
+        interactions=None,
+        turn_id=turn_id,
+        delivery_status=DELIVERY_PENDING,
+        attachments=attachments,
+    )
+    db.add(message)
+    db.flush()
+    return UserMessageDeliveryClaim(
+        message=message,
+        claimed=True,
+        payload_matches=True,
+    )
+
+
 def mark_user_message_delivery(
     db: Session,
     *,
     task_id: int,
     turn_id: str,
     status: str,
-) -> None:
-    """Persist a delivery transition for a claimed user turn."""
+) -> UserMessageDeliveryTransition:
+    """Stage one monotonic delivery transition without committing ``db``."""
 
     if status not in {
         DELIVERY_PENDING,
@@ -176,31 +225,68 @@ def mark_user_message_delivery(
         DELIVERY_FAILED,
     }:
         raise ValueError(f"Unknown delivery status: {status}")
-    db.query(TaskChatMessage).filter(
+    query = db.query(TaskChatMessage).filter(
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.role == "user",
         TaskChatMessage.turn_id == turn_id,
-    ).update({TaskChatMessage.delivery_status: status}, synchronize_session=False)
-    db.commit()
+    )
+    message = query.first()
+    if message is None:
+        return UserMessageDeliveryTransition(status=None, outcome="missing")
+
+    current = str(message.delivery_status)
+    if current == status:
+        return UserMessageDeliveryTransition(status=current, outcome="idempotent")
+    allowed_targets = {
+        DELIVERY_PENDING: {
+            DELIVERY_DISPATCHED,
+            DELIVERY_COMPLETED,
+            DELIVERY_FAILED,
+        },
+        DELIVERY_DISPATCHED: {DELIVERY_COMPLETED},
+    }
+    if status not in allowed_targets.get(current, set()):
+        return UserMessageDeliveryTransition(status=current, outcome="conflict")
+
+    updated = query.filter(TaskChatMessage.delivery_status == current).update(
+        {TaskChatMessage.delivery_status: status},
+        synchronize_session=False,
+    )
+    if updated:
+        return UserMessageDeliveryTransition(status=status, outcome="updated")
+
+    # A concurrent terminal transition won after the read. Reload the durable
+    # state instead of issuing an unguarded write that could regress it.
+    db.expire_all()
+    raced = query.first()
+    if raced is None:
+        return UserMessageDeliveryTransition(status=None, outcome="missing")
+    raced_status = str(raced.delivery_status)
+    return UserMessageDeliveryTransition(
+        status=raced_status,
+        outcome="idempotent" if raced_status == status else "conflict",
+    )
 
 
 def mark_user_message_delivery_sync(
     task_id: int,
     turn_id: str,
     status: str,
-) -> None:
+) -> UserMessageDeliveryTransition:
     """Update one delivery from synchronous or ``asyncio.to_thread`` callers."""
 
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        mark_user_message_delivery(
+        transition = mark_user_message_delivery(
             db,
             task_id=task_id,
             turn_id=turn_id,
             status=status,
         )
+        db.commit()
+        return transition
 
 
 def persist_user_message(

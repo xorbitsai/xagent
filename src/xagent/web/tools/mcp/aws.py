@@ -153,7 +153,7 @@ def aws_cloudwatch_describe_alarms(
             }
             for alarm in (result.get("MetricAlarms") or [])
         ]
-        return _success(alarms=alarms)
+        return _success(alarms=alarms, truncated="NextToken" in result)
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing CloudWatch alarms: {e}")
         return _error(_aws_error_message(e))
@@ -237,7 +237,7 @@ def aws_cloudwatch_describe_log_groups(
             }
             for group in (result.get("logGroups") or [])
         ]
-        return _success(log_groups=groups)
+        return _success(log_groups=groups, truncated="nextToken" in result)
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing log groups: {e}")
         return _error(_aws_error_message(e))
@@ -295,7 +295,10 @@ def aws_dynamodb_list_tables(
     """
     try:
         result = _client("dynamodb", region, role_arn).list_tables(Limit=100)
-        return _success(tables=result.get("TableNames") or [])
+        return _success(
+            tables=result.get("TableNames") or [],
+            truncated="LastEvaluatedTableName" in result,
+        )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing DynamoDB tables: {e}")
         return _error(_aws_error_message(e))
@@ -352,7 +355,10 @@ def aws_sqs_list_queues(
         if name_prefix:
             kwargs["QueueNamePrefix"] = name_prefix
         result = _client("sqs", region, role_arn).list_queues(**kwargs)
-        return _success(queue_urls=result.get("QueueUrls") or [])
+        return _success(
+            queue_urls=result.get("QueueUrls") or [],
+            truncated="NextToken" in result,
+        )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing SQS queues: {e}")
         return _error(_aws_error_message(e))

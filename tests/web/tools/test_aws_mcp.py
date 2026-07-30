@@ -81,6 +81,7 @@ def test_describe_alarms_passes_state_filter_and_shapes_output(monkeypatch):
     assert result["status"] == "success"
     assert result["alarms"][0]["name"] == "high-cpu"
     assert result["alarms"][0]["state"] == "ALARM"
+    assert result["truncated"] is False
     assert cloudwatch.describe_alarms.call_args.kwargs["StateValue"] == "ALARM"
 
 
@@ -223,13 +224,17 @@ def test_describe_log_groups_filters_by_prefix(monkeypatch):
 
 def test_dynamodb_list_tables(monkeypatch):
     dynamodb = Mock()
-    dynamodb.list_tables.return_value = {"TableNames": ["orders", "users"]}
+    dynamodb.list_tables.return_value = {
+        "TableNames": ["orders", "users"],
+        "LastEvaluatedTableName": "users",
+    }
     monkeypatch.setattr(aws, "_client", Mock(return_value=dynamodb))
 
     result = json.loads(aws.aws_dynamodb_list_tables())
 
     assert result["status"] == "success"
     assert result["tables"] == ["orders", "users"]
+    assert result["truncated"] is True
 
 
 def test_dynamodb_describe_table_shapes_health_fields(monkeypatch):

@@ -86,7 +86,8 @@ def _access_tokens(connection):
     )
 
 
-def test_upgrade_adds_pages_read_user_content(tmp_path):
+def test_upgrade_adds_pages_read_user_content(tmp_path, monkeypatch):
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -101,7 +102,8 @@ def test_upgrade_adds_pages_read_user_content(tmp_path):
         ]
 
 
-def test_upgrade_is_idempotent(tmp_path):
+def test_upgrade_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -117,7 +119,8 @@ def test_upgrade_is_idempotent(tmp_path):
         ]
 
 
-def test_downgrade_removes_pages_read_user_content(tmp_path):
+def test_downgrade_removes_pages_read_user_content(tmp_path, monkeypatch):
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -132,7 +135,8 @@ def test_downgrade_removes_pages_read_user_content(tmp_path):
         ]
 
 
-def test_upgrade_invalidates_existing_facebook_grant_only(tmp_path):
+def test_upgrade_invalidates_existing_facebook_grant_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -145,13 +149,39 @@ def test_upgrade_invalidates_existing_facebook_grant_only(tmp_path):
         assert tokens["instagram"] == "old-instagram-token"
 
 
-def test_upgrade_without_user_oauth_table_is_a_noop(tmp_path):
+def test_upgrade_without_user_oauth_table_is_a_noop(tmp_path, monkeypatch):
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
         _create_table(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()  # must not raise when user_oauth doesn't exist
+
+
+def test_upgrade_leaves_grants_connected_under_meta_config_id(tmp_path, monkeypatch):
+    """Under META_CONFIG_ID, invalidating tokens can't be remedied by
+    reconnecting (see upgrade()'s guard), so existing grants must be left
+    alone rather than force-disconnected for nothing.
+    """
+    monkeypatch.setenv("META_CONFIG_ID", "1234567890")
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _create_user_oauth_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        tokens = _access_tokens(connection)
+        assert tokens["facebook"] == "old-facebook-token"
+        assert tokens["instagram"] == "old-instagram-token"
+        # The scope column is still kept in sync regardless.
+        assert _scopes(connection) == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+            "pages_read_user_content",
+        ]
 
 
 def test_migration_scopes_match_registry():

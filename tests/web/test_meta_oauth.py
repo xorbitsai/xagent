@@ -513,6 +513,171 @@ def test_generic_oauth_batch_skips_non_oauth_app_and_connects_oauth_app(
     assert "GMaps" not in server_names  # mis-tagged key-based app skipped
 
 
+def test_bare_meta_login_skips_facebook_but_still_connects_instagram(
+    db_session, monkeypatch
+):
+    """Provider-only ("bare") Meta login (no app_id) only ever requests
+    db_provider.default_scopes, never an app's own oauth_scopes — it can't
+    carry pages_read_user_content. Creating a Facebook UserMCPServer row from
+    this flow would be an orphan the agent runtime picks up directly (bypasses
+    the connected-state check) and can never resolve a token for
+    (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT). Instagram's required scopes
+    haven't changed, so it must still connect via this same bare flow."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic", "instagram_content_publish"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "meta"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+
+    post = Mock(
+        return_value=MockResponse(
+            {"access_token": "short-token", "token_type": "bearer", "expires_in": 3600}
+        )
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            return MockResponse(
+                {
+                    "access_token": "long-token",
+                    "token_type": "bearer",
+                    "expires_in": 5184000,
+                }
+            )
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+    assert response.status_code == 200
+
+    # The bare grant is still created — only the Facebook MCP server isn't.
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "meta")
+        .one()
+    )
+    assert oauth_account.access_token == "long-token"
+
+    server_names = {s.name for s in db.query(MCPServer).all()}
+    assert "Instagram" in server_names
+    assert "Facebook Pages" not in server_names
+
+
+def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(
+    db_session, monkeypatch
+):
+    """UserOAuth has no app_id column: a bare Meta grant (provider="meta")
+    and an app-scoped Facebook grant (provider="facebook") are just two rows.
+    _oauth_keys_for_app still lets Instagram rely on the shared "meta" row, so
+    deleting the Facebook MCP server must not delete it out from under
+    Instagram — the delete path has to stay symmetric with that app-scoped
+    read-path policy."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic", "instagram_content_publish"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    post = Mock(
+        return_value=MockResponse(
+            {"access_token": "short-token", "token_type": "bearer", "expires_in": 3600}
+        )
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            return MockResponse(
+                {
+                    "access_token": "long-token",
+                    "token_type": "bearer",
+                    "expires_in": 5184000,
+                }
+            )
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    # 1. Bare login connects Instagram via the shared provider="meta" grant.
+    bare_state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "meta"},
+        expires_delta=timedelta(minutes=10),
+    )
+    generic_oauth_callback(
+        "meta",
+        SimpleNamespace(query_params={"code": "bare-code", "state": bare_state}),
+        db,
+        _meta_provider(),
+    )
+
+    # 2. A separate app-specific login connects Facebook with its own grant.
+    fb_state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "meta",
+            "app_id": "facebook",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    generic_oauth_callback(
+        "meta",
+        SimpleNamespace(query_params={"code": "fb-code", "state": fb_state}),
+        db,
+        _meta_provider(),
+    )
+
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 1
+
+    from xagent.web.api.mcp import delete_mcp_server
+
+    facebook_server = (
+        db.query(MCPServer).filter(MCPServer.name == "Facebook Pages").one()
+    )
+    delete_mcp_server(facebook_server.id, current_user=user, db=db)
+
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
+    # The shared bare grant Instagram still relies on must survive.
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
+
+
 def test_generic_oauth_single_app_rejects_non_oauth_app_cleanly(
     db_session, monkeypatch
 ):

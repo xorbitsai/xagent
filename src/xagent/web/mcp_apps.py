@@ -4,7 +4,7 @@ This module provides a scalable structure for defining supported MCP application
 their OAuth configurations, and server launch configurations.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from typing import Any, Dict, List
 
@@ -23,6 +23,64 @@ from .models.public_mcp import PublicMCPApp
 # apps; Instagram is deliberately excluded so its existing bare "meta" grants
 # keep working, since its required scopes haven't changed.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook"})
+
+
+def _normalize_oauth_grant_key(value: object) -> str | None:
+    """Case/whitespace-insensitive key, matching mcp.py's _normalize_app_key.
+
+    Duplicated rather than imported: mcp.py imports this module, so importing
+    back would cycle. An admin-created PublicMCPApp.app_id is free-form (see
+    POST /admin/mcp/apps), so every APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
+    membership test must normalize the same way the connector-display layer
+    does, or a differently-cased app_id (e.g. "Facebook") silently bypasses
+    the policy at whichever call site compares raw strings instead.
+    """
+    if value is None:
+        return None
+    normalized = "-".join(str(value).strip().lower().split())
+    return normalized or None
+
+
+def requires_app_scoped_oauth_grant(app_id: object) -> bool:
+    """Whether app_id must not be satisfied by a bare provider-level grant.
+
+    Normalized the same way _app_lookup_keys resolves an app's own id, so a
+    differently-cased or whitespace-padded admin-created app_id (e.g.
+    "Facebook") is covered consistently everywhere this policy is checked.
+    """
+    return _normalize_oauth_grant_key(app_id) in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
+
+
+def restrict_to_app_scoped_oauth_grant(
+    app_id: object, candidates: Iterable[object]
+) -> list[str]:
+    """Narrow OAuth provider/grant candidates to app-scoped ones where required.
+
+    ``candidates`` is typically ``(provider_name, app_id)`` or a list of
+    ``UserOAuth.provider`` values to try. For an app in
+    ``APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT``, only the candidate matching
+    ``app_id`` (normalized) survives — a bare provider-level grant is dropped.
+    For every other app, candidates pass through unchanged (deduped, order
+    preserved). Candidates are returned in their original casing/whitespace:
+    callers match them against exact-case stored values (e.g.
+    ``UserOAuth.provider``), which is why normalization only decides
+    membership and is never applied to the returned strings.
+    """
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate and candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+
+    if not requires_app_scoped_oauth_grant(app_id):
+        return deduped
+    normalized_app_id = _normalize_oauth_grant_key(app_id)
+    return [
+        candidate
+        for candidate in deduped
+        if _normalize_oauth_grant_key(candidate) == normalized_app_id
+    ]
 
 
 def classify_app_auth(transport: Any, launch_config: Any) -> str:

@@ -422,23 +422,11 @@ def _oauth_token_expires_after_cache_window(expires_at: datetime) -> bool:
 
 
 def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
-    from ...web.mcp_apps import APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
+    from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
 
-    candidates = list(
-        dict.fromkeys(
-            value
-            for value in (app_info.get("provider"), app_info.get("id"))
-            if isinstance(value, str) and value
-        )
+    return restrict_to_app_scoped_oauth_grant(
+        app_info.get("id"), (app_info.get("provider"), app_info.get("id"))
     )
-    app_id = app_info.get("id")
-    if isinstance(app_id, str) and app_id in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
-        # A resolver-hook token keyed to the bare provider (e.g. "meta") is
-        # exactly as unscoped as a legacy UserOAuth row under that provider;
-        # see APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT and
-        # _resolve_legacy_oauth_access_token's identical filter.
-        candidates = [value for value in candidates if value == app_id]
-    return candidates
 
 
 def _oauth_token_configured_resource(app_info: Mapping[str, Any]) -> str | None:
@@ -2863,21 +2851,19 @@ class WebToolConfig(BaseToolConfig):
         app_id: object,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one legacy OAuth account in an isolated transaction."""
-        from ...web.mcp_apps import APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
+        from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
         from ...web.models.user_oauth import UserOAuth
 
         oauth_db = self._new_legacy_oauth_session()
         try:
             if app_id:
-                if app_id in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
-                    # A bare provider-level grant (e.g. UserOAuth.provider ==
-                    # "meta") never requested this app's own oauth_scopes, so
-                    # it can't be trusted to carry a permission added after
-                    # that flow already existed. Only an app-scoped grant
-                    # counts here; see APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
-                    providers_to_check = [app_id]
-                else:
-                    providers_to_check = [provider_name, app_id]
+                # A bare provider-level grant (e.g. UserOAuth.provider ==
+                # "meta") never requested this app's own oauth_scopes, so it
+                # can't be trusted to carry a permission added after that flow
+                # already existed. See APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
+                providers_to_check = restrict_to_app_scoped_oauth_grant(
+                    app_id, [provider_name, app_id]
+                )
                 oauth_account = (
                     oauth_db.query(UserOAuth)
                     .filter(

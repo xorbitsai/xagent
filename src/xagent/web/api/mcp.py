@@ -34,9 +34,9 @@ from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIE
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
-    APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT,
     get_all_mcp_apps,
     get_app_by_name,
+    restrict_to_app_scoped_oauth_grant,
 )
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_db
@@ -1590,11 +1590,9 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:
-    app_id = _normalize_app_key(app.get("id"))
-    keys = _app_lookup_keys(app.get("id"), app.get("provider"))
-    if app_id in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
-        keys = [key for key in keys if key == app_id]
-    return keys
+    return restrict_to_app_scoped_oauth_grant(
+        app.get("id"), _app_lookup_keys(app.get("id"), app.get("provider"))
+    )
 
 
 def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
@@ -2821,8 +2819,15 @@ def delete_mcp_server(
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
 
-                # Delete tokens for this specific app
-                providers_to_delete = [p for p in [provider, app_id] if p is not None]
+                # Delete tokens for this specific app. For apps in
+                # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT this must stay
+                # symmetric with the app-scoped read path (_oauth_keys_for_app):
+                # deleting the bare provider row (e.g. "meta") would also
+                # disconnect any other app — Instagram — still relying on
+                # that shared grant.
+                providers_to_delete = restrict_to_app_scoped_oauth_grant(
+                    app_id, [provider, app_id]
+                )
                 if providers_to_delete:
                     db.query(UserOAuth).filter(
                         UserOAuth.user_id == user_id,

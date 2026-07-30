@@ -25,16 +25,10 @@ mcp = FastMCP("facebook-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
 
 
-def _page_path(page_id: str, suffix: str) -> str:
-    if not page_id or not str(page_id).strip():
-        raise ValueError("page_id is required")
-    return f"/{quote(str(page_id).strip(), safe='')}/{suffix}"
-
-
-def _post_path(post_id: str, suffix: str) -> str:
-    if not post_id or not str(post_id).strip():
-        raise ValueError("post_id is required")
-    return f"/{quote(str(post_id).strip(), safe='')}/{suffix}"
+def _graph_path(value: Any, name: str, suffix: str) -> str:
+    if not value or not str(value).strip():
+        raise ValueError(f"{name} is required")
+    return f"/{quote(str(value).strip(), safe='')}/{suffix}"
 
 
 def _normalize_page(page: dict[str, Any]) -> dict[str, Any]:
@@ -112,7 +106,7 @@ def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
         page_token = _page_access_token(page_id)
         result = _graph_request(
             "GET",
-            _page_path(page_id, "feed"),
+            _graph_path(page_id, "page_id", "feed"),
             token=page_token,
             params={
                 "fields": (
@@ -124,7 +118,7 @@ def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
         )
         return _success(
             posts=result.get("data", []),
-            next_link=result.get("paging", {}).get("next"),
+            next_link=(result.get("paging") or {}).get("next"),
         )
     except GraphAPIError as e:
         logger.error("Error listing Facebook Page posts for %s: %s", page_id, e)
@@ -136,12 +130,20 @@ def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
 
 @mcp.tool()
 def facebook_list_post_comments(page_id: str, post_id: str, limit: int = 10) -> str:
-    """List comments left by fans on a Facebook Page post by post_id."""
+    """List comments on a Facebook Page post.
+
+    post_id is the composite Graph API id ("{page_id}_{post_id}"), e.g. the
+    "id" field returned by facebook_list_page_posts — not the numeric post
+    suffix alone. Returns the full flattened comment stream (including
+    replies to other comments), not just top-level comments; no "parent"
+    field is included, so replies can't be distinguished from top-level
+    comments in the response.
+    """
     try:
         page_token = _page_access_token(page_id)
         result = _graph_request(
             "GET",
-            _post_path(post_id, "comments"),
+            _graph_path(post_id, "post_id", "comments"),
             token=page_token,
             params={
                 "fields": "id,message,created_time,from",
@@ -151,7 +153,7 @@ def facebook_list_post_comments(page_id: str, post_id: str, limit: int = 10) -> 
         )
         return _success(
             comments=result.get("data", []),
-            next_link=result.get("paging", {}).get("next"),
+            next_link=(result.get("paging") or {}).get("next"),
         )
     except GraphAPIError as e:
         logger.error("Error listing comments for post %s: %s", post_id, e)
@@ -170,7 +172,7 @@ def facebook_publish_text_post(page_id: str, message: str) -> str:
         page_token = _page_access_token(page_id)
         result = _graph_request(
             "POST",
-            _page_path(page_id, "feed"),
+            _graph_path(page_id, "page_id", "feed"),
             token=page_token,
             data={"message": message},
         )
@@ -204,7 +206,7 @@ def facebook_publish_image_post(
 
         result = _graph_request(
             "POST",
-            _page_path(page_id, "photos"),
+            _graph_path(page_id, "page_id", "photos"),
             token=page_token,
             data=data,
         )

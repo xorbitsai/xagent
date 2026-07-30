@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import text
 
 from xagent.core.task_runtime import TaskRuntimeContribution
 from xagent.web.api.admin_users import delete_user, get_users
-from xagent.web.models.task import Task
+from xagent.web.models.task import DAGExecution, DAGExecutionPhase, Task
 from xagent.web.models.user import User
 from xagent.web.services.task_runtime import (
     register_task_extension,
@@ -86,6 +87,7 @@ async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
     register_task_extension("delete_observer", provider)
     db = _direct_db_session()
     try:
+        db.execute(text("PRAGMA foreign_keys = ON"))
         admin = db.query(User).filter(User.username == "admin").one()
         target = db.query(User).filter(User.username == "runtime-user").one()
         task = Task(
@@ -94,6 +96,13 @@ async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
             description="runtime task",
         )
         db.add(task)
+        db.flush()
+        db.add(
+            DAGExecution(
+                task_id=int(task.id),
+                phase=DAGExecutionPhase.COMPLETED,
+            )
+        )
         db.commit()
         task_id = int(task.id)
         target_id = int(target.id)
@@ -103,9 +112,50 @@ async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
         assert response == {"message": "User deleted successfully"}
         assert provider.task_existed_on_delete == [True]
         assert db.query(Task).filter(Task.id == task_id).count() == 0
+        assert (
+            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).count() == 0
+        )
         assert db.query(User).filter(User.id == target_id).count() == 0
     finally:
         unregister_task_extension("delete_observer")
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_user_delete_preserves_user_when_runtime_cleanup_fails():
+    _admin_headers()
+    _register_second_user("failing-runtime-user", "runtimepass1")
+
+    class _FailingDeleteProvider(_DeleteObserverProvider):
+        async def on_task_deleted(self, context) -> None:
+            await super().on_task_deleted(context)
+            raise RuntimeError("provider cleanup failed")
+
+    provider = _FailingDeleteProvider()
+    register_task_extension("failing_delete_observer", provider)
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "failing-runtime-user").one()
+        task = Task(
+            user_id=int(target.id),
+            title="preserve on cleanup failure",
+            description="",
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+        target_id = int(target.id)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_user(target_id, admin, db)
+
+        assert exc_info.value.status_code == 503
+        assert provider.task_existed_on_delete == [True]
+        assert db.query(Task).filter(Task.id == task_id).count() == 1
+        assert db.query(User).filter(User.id == target_id).count() == 1
+    finally:
+        unregister_task_extension("failing_delete_observer")
         db.close()
 
 

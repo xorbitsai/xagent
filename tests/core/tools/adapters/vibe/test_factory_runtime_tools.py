@@ -183,6 +183,54 @@ async def test_structured_runtime_collision_drops_only_provider(
 
 
 @pytest.mark.asyncio
+async def test_structured_runtime_collision_counts_shared_tool_occurrences(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base_tool = _tool("base_tool")
+    shared_tool = _tool("shared_tool")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "first_runtime": TaskRuntimeContribution(
+                    tools=(shared_tool,),
+                    environment="Use the first runtime.",
+                ),
+                "second_runtime": TaskRuntimeContribution(
+                    tools=(shared_tool,),
+                    environment="Use the second runtime.",
+                ),
+            }
+        )
+    }
+    config = ToolConfig({})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    assert tools == [base_tool, shared_tool]
+    assert contribution_holder["value"].environment == "Use the first runtime."
+    assert tuple(
+        name
+        for name, _contribution in contribution_holder["value"].provider_contributions
+    ) == ("first_runtime",)
+    assert "Dropping task runtime extension 'second_runtime'" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_explicit_runtime_tools_preserve_provider_origin(
     monkeypatch, caplog
 ) -> None:

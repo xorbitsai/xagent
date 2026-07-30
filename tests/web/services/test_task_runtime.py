@@ -33,6 +33,20 @@ from xagent.web.services.task_runtime import (
 )
 
 
+def test_public_task_runtime_facade_exports_provider_contract() -> None:
+    from xagent.task_runtime import TaskRuntimeContext as PublicTaskRuntimeContext
+    from xagent.task_runtime import (
+        TaskRuntimeContribution as PublicTaskRuntimeContribution,
+    )
+    from xagent.task_runtime import (
+        register_task_extension as public_register_task_extension,
+    )
+
+    assert PublicTaskRuntimeContext is TaskRuntimeContext
+    assert PublicTaskRuntimeContribution is TaskRuntimeContribution
+    assert public_register_task_extension is register_task_extension
+
+
 @pytest.fixture
 def registered_names() -> Iterator[list[str]]:
     names: list[str] = []

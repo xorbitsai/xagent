@@ -1218,12 +1218,13 @@ def test_delete_task_keeps_cross_user_access_denied(
 
 
 def test_filtered_runtime_provider_environment_is_not_added_to_system_prompt():
+    from xagent.core.agent.service import AgentService
     from xagent.core.task_runtime import (
         TaskRuntimeContribution,
-        filter_task_runtime_contribution_tools,
         merge_task_runtime_contributions,
+        reconcile_task_runtime_contribution_tools,
     )
-    from xagent.web.api.chat import _append_runtime_environment
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
 
     runtime_tool = MagicMock()
     runtime_tool.name = "leased_browser"
@@ -1236,9 +1237,23 @@ def test_filtered_runtime_provider_environment_is_not_added_to_system_prompt():
         }
     )
 
-    filtered = filter_task_runtime_contribution_tools(contribution, set())
+    filtered, _conflicts = reconcile_task_runtime_contribution_tools(
+        contribution,
+        available_tool_names=set(),
+    )
+    tool_config = ToolConfig({})
+    tool_config.get_task_runtime_contribution = lambda: filtered
 
-    assert _append_runtime_environment("Base prompt.", filtered) == "Base prompt."
+    service = AgentService(
+        name="filtered-runtime-prompt",
+        id="filtered-runtime-prompt",
+        tools=[],
+        tool_config=tool_config,
+        enable_workspace=False,
+        system_prompt="Base prompt.",
+    )
+
+    assert service.system_prompt == "Base prompt."
 
 
 class _TaskRuntimeProvider:
@@ -1281,6 +1296,24 @@ class _TaskRuntimeProvider:
         finally:
             db.close()
         self.events.append(("deleted", context.task_id))
+
+
+def test_task_runtime_unknown_extension_error_does_not_disclose_registry(
+    test_db,
+    user1_headers,
+):
+    response = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "unknown runtime",
+            "runtime_extensions": {"private-provider-name": {}},
+        },
+        headers=user1_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid task runtime extension request"
+    assert "private-provider-name" not in response.text
 
 
 def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
@@ -1632,3 +1665,51 @@ def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
         ]
     finally:
         unregister_task_extension("test_runtime")
+
+
+def test_delete_task_runtime_cleanup_failure_preserves_task_for_retry(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    class _FailingDeleteProvider(_TaskRuntimeProvider):
+        async def on_task_deleted(self, context):
+            await super().on_task_deleted(context)
+            raise RuntimeError("provider cleanup failed")
+
+    provider = _FailingDeleteProvider()
+    register_task_extension("failing_runtime", provider)
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        task = Task(user_id=user.id, title="preserve for retry", description="")
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    try:
+        response = client.delete(
+            f"/api/chat/task/{task_id}",
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "Runtime extension cleanup failed; the task was not deleted"
+        )
+        db = next(get_db())
+        try:
+            assert db.query(Task).filter(Task.id == task_id).count() == 1
+        finally:
+            db.close()
+    finally:
+        unregister_task_extension("failing_runtime")

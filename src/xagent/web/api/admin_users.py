@@ -16,8 +16,8 @@ from ..models.task import Task
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
+from ..services.task_deletion import purge_task_rows
 from ..services.task_runtime import (
-    TaskRuntimeExtensionError,
     delete_task_extensions,
     registered_task_extensions,
 )
@@ -110,17 +110,8 @@ async def delete_user(
         cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
 
         async def _cleanup_context(context: TaskRuntimeContext) -> None:
-            try:
-                async with cleanup_semaphore:
-                    await delete_task_extensions(context)
-            except TaskRuntimeExtensionError:
-                logger.warning(
-                    "User %s was deleted but runtime extension cleanup failed "
-                    "for task %s",
-                    user_id,
-                    context.task_id,
-                    exc_info=True,
-                )
+            async with cleanup_semaphore:
+                await delete_task_extensions(context)
 
         # Keyset pages bound memory and gather fan-out without growing a NOT IN
         # parameter list. New tasks receive higher ids and are picked up by the
@@ -152,9 +143,37 @@ async def delete_user(
                 for task_id, task_user_id, source in task_rows
             ]
             release_db_connection_if_clean(db)
-            await asyncio.gather(
-                *(_cleanup_context(context) for context in task_runtime_contexts)
+            cleanup_results = await asyncio.gather(
+                *(_cleanup_context(context) for context in task_runtime_contexts),
+                return_exceptions=True,
             )
+            for result in cleanup_results:
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+            cleanup_failures = [
+                (context.task_id, result)
+                for context, result in zip(
+                    task_runtime_contexts,
+                    cleanup_results,
+                    strict=True,
+                )
+                if isinstance(result, BaseException)
+            ]
+            if cleanup_failures:
+                for failed_task_id, failure in cleanup_failures:
+                    logger.error(
+                        "Runtime extension cleanup failed; preserving user %s "
+                        "and task %s for retry: %s",
+                        user_id,
+                        failed_task_id,
+                        failure,
+                    )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Runtime extension cleanup failed; the user was not deleted"
+                    ),
+                )
 
     # Re-read after the await: releasing the clean read transaction above may
     # expire ORM state, and extension hooks use their own short sessions.
@@ -169,8 +188,19 @@ async def delete_user(
     # up by table name so user deletion keeps working under strict FK checks.
     _delete_legacy_text2sql_rows(db, user_id)
 
-    # Delete user's tasks
-    db.query(Task).filter(Task.user_id == user_id).delete()
+    # Delete task-owned rows through the same strict-FK-safe path used by the
+    # single-task endpoint. A raw bulk Task delete bypasses ORM cascades for
+    # trace/checkpoint rows and can fail after provider cleanup has succeeded.
+    task_ids = [
+        int(task_id)
+        for (task_id,) in db.query(Task.id).filter(Task.user_id == user_id).all()
+    ]
+    for task_id in task_ids:
+        purge_task_rows(
+            db,
+            task_id=task_id,
+            preserve_uploaded_files=False,
+        )
 
     # Delete user's MCP server associations (not the servers themselves)
     db.query(UserMCPServer).filter(UserMCPServer.user_id == user_id).delete()

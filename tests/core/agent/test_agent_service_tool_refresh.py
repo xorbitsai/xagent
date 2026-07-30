@@ -172,6 +172,66 @@ async def test_agent_service_refreshes_initialized_tools_when_policy_changes(
 
 
 @pytest.mark.asyncio
+async def test_agent_service_refreshes_runtime_prompt_and_modalities_with_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.task_runtime import TaskRuntimeContribution
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+
+    runtime_tool = NamedTool("runtime_tool")
+    contribution_holder = {
+        "value": TaskRuntimeContribution(
+            tools=(runtime_tool,),
+            environment="Use the initial runtime.",
+            preferred_input_modalities=("image",),
+        )
+    }
+    tool_config = ToolConfig({})
+    tool_config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    tool_config.set_task_runtime_contribution = (
+        lambda value: contribution_holder.update(value=value)
+    )
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        contribution_holder["value"] = TaskRuntimeContribution(
+            tools=(runtime_tool,),
+            environment="Use the refreshed runtime.",
+            preferred_input_modalities=("audio",),
+        )
+        return [runtime_tool]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+
+    service = AgentService(
+        name="runtime-context-refresh-test",
+        id="runtime-context-refresh-test",
+        tools=[runtime_tool],
+        tool_config=tool_config,
+        enable_workspace=False,
+        system_prompt="Base prompt.",
+    )
+    service._execution_adapter = service._build_execution_adapter()
+
+    assert service.system_prompt == "Base prompt.\n\nUse the initial runtime."
+    assert service.preferred_input_modalities == ("image",)
+
+    service.invalidate_tools()
+    await service._ensure_tools_initialized()
+
+    assert service.system_prompt == "Base prompt.\n\nUse the refreshed runtime."
+    assert service.preferred_input_modalities == ("audio",)
+    assert service._execution_adapter.config.system_prompt == service.system_prompt
+    assert (
+        service._execution_adapter.config.preferred_input_modalities
+        == service.preferred_input_modalities
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_service_awaits_async_runtime_policy_refresh(monkeypatch) -> None:
     tool_config = AsyncRefreshingToolConfig()
     tool_sets: list[list[Any]] = [

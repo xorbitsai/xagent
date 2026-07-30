@@ -39,7 +39,6 @@ from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     TaskRuntimeClientError,
     TaskRuntimeContext,
-    TaskRuntimeContribution,
 )
 from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
@@ -94,6 +93,7 @@ from ..services.hot_path_cache import (
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
+from ..services.task_deletion import purge_task_rows
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
     materialize_task_execution_recovery_state,
@@ -731,30 +731,6 @@ def _task_runtime_context_for_tool_build(
     )
 
 
-def _task_runtime_contribution(tool_config: Any) -> TaskRuntimeContribution:
-    getter = getattr(tool_config, "get_task_runtime_contribution", None)
-    if not callable(getter):
-        return EMPTY_TASK_RUNTIME_CONTRIBUTION
-    value = getter()
-    return (
-        value
-        if isinstance(value, TaskRuntimeContribution)
-        else EMPTY_TASK_RUNTIME_CONTRIBUTION
-    )
-
-
-def _append_runtime_environment(
-    system_prompt: Optional[str],
-    contribution: TaskRuntimeContribution,
-) -> Optional[str]:
-    parts = [
-        value.strip()
-        for value in (system_prompt, contribution.environment)
-        if isinstance(value, str) and value.strip()
-    ]
-    return "\n\n".join(parts) or None
-
-
 def _compensate_failed_task_extension_create(
     db: Session,
     *,
@@ -763,7 +739,7 @@ def _compensate_failed_task_extension_create(
     """Remove a just-created task after provider binding setup failed."""
 
     db.rollback()
-    deleted = _purge_task_rows(
+    deleted = purge_task_rows(
         db,
         task_id=task_id,
         preserve_uploaded_files=True,
@@ -771,46 +747,6 @@ def _compensate_failed_task_extension_create(
     db.commit()
     if deleted:
         invalidate_task_cache(task_id)
-
-
-def _purge_task_rows(
-    db: Session,
-    *,
-    task_id: int,
-    preserve_uploaded_files: bool,
-) -> bool:
-    """Delete one task and its non-cascading rows in a caller-owned transaction."""
-
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if task is None:
-        return False
-
-    from ..models.task import (
-        DAGExecution,
-        TraceCheckpointBlob,
-        TraceMessageBlob,
-    )
-    from ..models.uploaded_file import UploadedFile
-
-    db.query(TraceCheckpointBlob).filter(TraceCheckpointBlob.task_id == task_id).delete(
-        synchronize_session=False
-    )
-    db.query(TraceMessageBlob).filter(TraceMessageBlob.task_id == task_id).delete(
-        synchronize_session=False
-    )
-    db.query(TraceEvent).filter(TraceEvent.task_id == task_id).delete(
-        synchronize_session=False
-    )
-    db.query(DAGExecution).filter(DAGExecution.task_id == task_id).delete(
-        synchronize_session=False
-    )
-    if preserve_uploaded_files:
-        db.query(UploadedFile).filter(UploadedFile.task_id == task_id).update(
-            {UploadedFile.task_id: None},
-            synchronize_session=False,
-        )
-    db.delete(task)
-    return True
 
 
 def _load_task_delete_snapshot_sync(
@@ -841,7 +777,7 @@ def _delete_task_sync(*, task_id: int) -> bool:
     session_factory = get_session_local()
     delete_db = session_factory()
     try:
-        deleted = _purge_task_rows(
+        deleted = purge_task_rows(
             delete_db,
             task_id=task_id,
             preserve_uploaded_files=False,
@@ -2577,8 +2513,6 @@ class AgentServiceManager:
                 with UserContext(runtime_user_id):
                     # Unpack tools and tool_config from create_default_tools
                     tools_list, tool_config = tools
-                    runtime_contribution = _task_runtime_contribution(tool_config)
-
                     # Get system prompt from agent config (if available)
                     from .agents import enhance_system_prompt_with_kb
 
@@ -2594,11 +2528,6 @@ class AgentServiceManager:
                     system_prompt = _build_workforce_system_prompt(
                         system_prompt, workforce_runtime
                     )
-                    system_prompt = _append_runtime_environment(
-                        system_prompt,
-                        runtime_contribution,
-                    )
-
                     # Extract memory similarity threshold from agent config
                     memory_similarity_threshold = None
                     if agent_config and "memory_similarity_threshold" in agent_config:
@@ -2641,9 +2570,6 @@ class AgentServiceManager:
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=memory_policy.memory_enabled,
                         system_prompt=system_prompt,  # Pass agent builder instructions
-                        preferred_input_modalities=(
-                            runtime_contribution.preferred_input_modalities
-                        ),
                     )
 
                     selected_file_ids = _selected_file_ids_from_agent_config(
@@ -3373,8 +3299,6 @@ class AgentServiceManager:
                 scope=scope,
                 task_setup_snapshot=snapshot,
             )
-            runtime_contribution = _task_runtime_contribution(tool_config)
-
             from .agents import enhance_system_prompt_with_kb
 
             agent_config = snapshot.agent_config
@@ -3384,10 +3308,6 @@ class AgentServiceManager:
             system_prompt = _build_workforce_system_prompt(
                 system_prompt,
                 snapshot.workforce_runtime,
-            )
-            system_prompt = _append_runtime_environment(
-                system_prompt,
-                runtime_contribution,
             )
             memory_similarity_threshold = (
                 agent_config.get("memory_similarity_threshold")
@@ -3427,9 +3347,6 @@ class AgentServiceManager:
                     task_id=str(task_id),
                     memory_similarity_threshold=memory_similarity_threshold,
                     memory_enabled=memory_policy.memory_enabled,
-                    preferred_input_modalities=(
-                        runtime_contribution.preferred_input_modalities
-                    ),
                 )
 
             agent_service = self._agents[task_id]
@@ -3521,7 +3438,11 @@ async def create_task(
                 request.runtime_extensions
             )
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            logger.info("Rejected invalid task runtime extension request: %s", exc)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid task runtime extension request",
+            ) from exc
 
         # Build task description with file information
         task_description = request.description or ""
@@ -4512,12 +4433,16 @@ async def delete_task(
 
         try:
             await delete_task_extensions(runtime_context)
-        except TaskRuntimeExtensionError:
-            logger.warning(
-                "Runtime extension cleanup failed before deleting task %s",
+        except TaskRuntimeExtensionError as exc:
+            logger.error(
+                "Runtime extension cleanup failed; preserving task %s for retry",
                 task_id,
                 exc_info=True,
             )
+            raise HTTPException(
+                status_code=503,
+                detail=("Runtime extension cleanup failed; the task was not deleted"),
+            ) from exc
 
         deleted = await asyncio.to_thread(_delete_task_sync, task_id=task_id)
         if not deleted:

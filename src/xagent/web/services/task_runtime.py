@@ -98,6 +98,8 @@ def _get_task_runtime_hook_executor() -> ThreadPoolExecutor:
     global _task_runtime_hook_executor
     with _task_runtime_hook_executor_lock:
         if _task_runtime_hook_executor is None:
+            # Lazy recreation is intentional for embedded apps and tests that
+            # run more than one application lifespan in the same process.
             _task_runtime_hook_executor = ThreadPoolExecutor(
                 max_workers=get_task_runtime_hook_max_workers(),
                 thread_name_prefix="xagent-task-runtime",

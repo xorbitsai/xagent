@@ -8,6 +8,7 @@ and configuration management.
 # mypy: ignore-errors
 
 import logging
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from typing import (
     TYPE_CHECKING,
@@ -301,12 +302,7 @@ class ToolFactory:
                     await prepare_factory_runtime(config)
                 resolved_additional_tools = additional_tools
                 if resolved_additional_tools is None:
-                    contribution_getter = getattr(
-                        config, "get_task_runtime_contribution", None
-                    )
-                    contribution = (
-                        contribution_getter() if callable(contribution_getter) else None
-                    )
+                    contribution = config.get_task_runtime_contribution()
                     resolved_additional_tools = getattr(contribution, "tools", ())
                     resolved_additional_tool_origins = (
                         dict(getattr(contribution, "tool_origins", ()))
@@ -378,9 +374,9 @@ class ToolFactory:
         """
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
-        core_tool_ids = {id(tool) for tool in tools}
+        core_tool_occurrences = Counter(id(tool) for tool in tools)
         extension_tools = list(additional_tools)
-        extension_tool_ids: set[int] = set()
+        extension_tool_occurrences = Counter(id(tool) for tool in extension_tools)
         extension_names: set[str] = set()
         if extension_tools:
             for tool in extension_tools:
@@ -391,7 +387,6 @@ class ToolFactory:
                         "non-empty string 'name' attribute"
                     )
                 extension_names.add(name.strip())
-                extension_tool_ids.add(id(tool))
             # Keep colliding candidates through the name-policy stages. A tool
             # filtered by task/user policy cannot collide at execution time.
             tools.extend(extension_tools)
@@ -485,9 +480,20 @@ class ToolFactory:
                 allowed_by_hook = set(allowlist)
                 tools = [tool for tool in tools if tool.name in allowed_by_hook]
 
-        policy_surviving_extension_tools = [
-            tool for tool in tools if id(tool) in extension_tool_ids
-        ]
+        # Classify surviving occurrences, not just object identities. Two
+        # providers are allowed to return the same tool object; a bare set of
+        # ``id()`` values would collapse those contributions and could retain
+        # the occurrence owned by a provider that reconciliation dropped.
+        remaining_core_occurrences = core_tool_occurrences.copy()
+        policy_surviving_core_tools: list[Tool] = []
+        policy_surviving_extension_tools: list[Tool] = []
+        for tool in tools:
+            tool_id = id(tool)
+            if remaining_core_occurrences[tool_id] > 0:
+                remaining_core_occurrences[tool_id] -= 1
+                policy_surviving_core_tools.append(tool)
+            elif extension_tool_occurrences[tool_id] > 0:
+                policy_surviving_extension_tools.append(tool)
         policy_surviving_extension_names = {
             tool.name for tool in policy_surviving_extension_tools
         }
@@ -507,56 +513,60 @@ class ToolFactory:
             )
 
         if extension_names:
-            contribution_getter = getattr(config, "get_task_runtime_contribution", None)
-            contribution_setter = getattr(config, "set_task_runtime_contribution", None)
             contribution_reconciled = False
-            if callable(contribution_getter) and callable(contribution_setter):
-                from ....task_runtime import (
-                    TaskRuntimeContribution,
-                    reconcile_task_runtime_contribution_tools,
-                )
+            from ....task_runtime import (
+                TaskRuntimeContribution,
+                reconcile_task_runtime_contribution_tools,
+            )
 
-                contribution = contribution_getter()
-                if (
-                    isinstance(contribution, TaskRuntimeContribution)
-                    and contribution.provider_contributions
-                    and {id(tool) for tool in contribution.tools} == extension_tool_ids
-                ):
-                    reconciled, conflicts = reconcile_task_runtime_contribution_tools(
+            contribution = config.get_task_runtime_contribution()
+            if (
+                isinstance(contribution, TaskRuntimeContribution)
+                and contribution.provider_contributions
+                and Counter(id(tool) for tool in contribution.tools)
+                == extension_tool_occurrences
+            ):
+                reconciled, conflicts = reconcile_task_runtime_contribution_tools(
+                    contribution,
+                    available_tool_names=policy_surviving_extension_names,
+                    reserved_tool_names={
+                        tool.name for tool in policy_surviving_core_tools
+                    },
+                )
+                config.set_task_runtime_contribution(reconciled)
+
+                accepted_extension_occurrences = Counter(
+                    id(tool) for tool in reconciled.tools
+                )
+                remaining_core_occurrences = core_tool_occurrences.copy()
+                retained_tools: list[Tool] = []
+                for tool in tools:
+                    tool_id = id(tool)
+                    if remaining_core_occurrences[tool_id] > 0:
+                        remaining_core_occurrences[tool_id] -= 1
+                        retained_tools.append(tool)
+                    elif accepted_extension_occurrences[tool_id] > 0:
+                        accepted_extension_occurrences[tool_id] -= 1
+                        retained_tools.append(tool)
+                tools = retained_tools
+                contribution_reconciled = True
+                for conflict in conflicts:
+                    logger.warning(
+                        "Dropping task runtime extension '%s' because its "
+                        "post-policy tool names collide: %s",
+                        conflict.provider,
+                        ", ".join(conflict.tool_names),
+                    )
+            elif isinstance(contribution, TaskRuntimeContribution):
+                config.set_task_runtime_contribution(
+                    reconcile_task_runtime_contribution_tools(
                         contribution,
                         available_tool_names=policy_surviving_extension_names,
-                        reserved_tool_names={
-                            tool.name for tool in tools if id(tool) in core_tool_ids
-                        },
-                    )
-                    contribution_setter(reconciled)
-                    accepted_extension_ids = {id(tool) for tool in reconciled.tools}
-                    tools = [
-                        tool
-                        for tool in tools
-                        if id(tool) not in extension_tool_ids
-                        or id(tool) in accepted_extension_ids
-                    ]
-                    contribution_reconciled = True
-                    for conflict in conflicts:
-                        logger.warning(
-                            "Dropping task runtime extension '%s' because its "
-                            "post-policy tool names collide: %s",
-                            conflict.provider,
-                            ", ".join(conflict.tool_names),
-                        )
-                elif isinstance(contribution, TaskRuntimeContribution):
-                    contribution_setter(
-                        reconcile_task_runtime_contribution_tools(
-                            contribution,
-                            available_tool_names=policy_surviving_extension_names,
-                        )[0]
-                    )
+                    )[0]
+                )
 
             if not contribution_reconciled:
-                claimed_names = {
-                    tool.name for tool in tools if id(tool) in core_tool_ids
-                }
+                claimed_names = {tool.name for tool in policy_surviving_core_tools}
                 for tool in policy_surviving_extension_tools:
                     name = tool.name
                     if name in claimed_names:
@@ -578,14 +588,7 @@ class ToolFactory:
             release = getattr(config, "release_db_connection", None)
             if callable(release):
                 release()
-            runtime_workspace_getter = getattr(
-                config, "get_task_runtime_workspace", None
-            )
-            workspace = (
-                runtime_workspace_getter()
-                if callable(runtime_workspace_getter)
-                else None
-            )
+            workspace = config.get_task_runtime_workspace()
             if workspace is None:
                 workspace = ToolFactory._create_workspace(config.get_workspace_config())
             if workspace is not None:

@@ -96,9 +96,10 @@ class TaskRuntimeToolConflict:
 class TaskRuntimeExtensionProvider(Protocol):
     """Lifecycle contract implemented by an out-of-tree task extension.
 
-    ``on_task_deleted`` must be idempotent: core deletion can fail after
-    provider cleanup, and a retry will dispatch the hook again. Providers that
-    release an external lease or sandbox should persist a provider-side
+    ``on_task_deleted`` must be idempotent. A provider failure preserves the
+    core task so the caller can retry; after provider cleanup succeeds, core
+    deletion can still fail and a retry will dispatch the hook again. Providers
+    that release an external lease or sandbox should persist a provider-side
     "release requested" state and reconcile it safely on repeated calls instead
     of treating the first release attempt as an irreversible one-shot action.
     """
@@ -232,25 +233,6 @@ def merge_task_runtime_contributions(
         tool_origins=tuple(tool_origins),
         provider_contributions=tuple(provider_contributions),
     )
-
-
-def filter_task_runtime_contribution_tools(
-    contribution: TaskRuntimeContribution,
-    available_tool_names: set[str],
-) -> TaskRuntimeContribution:
-    """Reconcile provider context with runtime tools that survived policy.
-
-    Providers that contribute no tools retain their environment and modality
-    preferences. When a provider does contribute tools, its entire contribution
-    is removed only if none survive; otherwise its prompt context is retained
-    and its tool list is narrowed to the surviving names.
-    """
-
-    reconciled, _conflicts = reconcile_task_runtime_contribution_tools(
-        contribution,
-        available_tool_names=available_tool_names,
-    )
-    return reconciled
 
 
 def reconcile_task_runtime_contribution_tools(

@@ -194,6 +194,11 @@ def aws_cloudwatch_get_metric_data(
                     },
                 }
             ],
+            # botocore natively accepts ISO 8601 strings for timestamp
+            # params (same as the AWS CLI); an unparsable string raises
+            # ParamValidationError (a BotoCoreError), which the except
+            # below already surfaces. Converting via datetime.fromisoformat
+            # here would only narrow the accepted formats.
             StartTime=start_time,
             EndTime=end_time,
         )

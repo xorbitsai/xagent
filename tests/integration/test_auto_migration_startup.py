@@ -49,7 +49,7 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
         async def stop(self) -> None:
             return None
 
-    class _FakeFeishuChannel:
+    class _FakeChannelManager:
         enabled = False  # Disabled to prevent task creation in tests
 
         async def start(self) -> None:
@@ -67,11 +67,11 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Create fake feishu.bot module
     fake_feishu_bot = ModuleType("xagent.web.channels.feishu.bot")
-    fake_feishu_bot.get_feishu_channel = lambda: _FakeFeishuChannel()
+    fake_feishu_bot.get_feishu_channel = lambda: _FakeChannelManager()
     monkeypatch.setitem(sys.modules, "xagent.web.channels.feishu.bot", fake_feishu_bot)
 
     fake_slack_bot = ModuleType("xagent.web.channels.slack.bot")
-    fake_slack_bot.get_slack_channel = lambda: _FakeFeishuChannel()
+    fake_slack_bot.get_slack_channel = lambda: _FakeChannelManager()
     monkeypatch.setitem(sys.modules, "xagent.web.channels.slack.bot", fake_slack_bot)
 
 

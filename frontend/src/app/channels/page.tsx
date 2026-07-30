@@ -117,12 +117,18 @@ export default function ChannelsPage() {
 
   const handleSubmit = async () => {
     try {
-      if (formData.channel_type === "telegram" && !formData.bot_token) {
+      // The API redacts stored secrets, so edit forms start with empty
+      // secret fields; an empty secret on edit means "keep the stored one".
+      const isCreating = !editingChannel
+      if (formData.channel_type === "telegram" && !formData.bot_token && isCreating) {
         toast.error(t("channels.messages.fill_required"))
         return
       }
 
-      if (formData.channel_type === "feishu" && (!formData.app_id || !formData.app_secret)) {
+      if (
+        formData.channel_type === "feishu"
+        && (!formData.app_id || (!formData.app_secret && isCreating))
+      ) {
         toast.error(t("channels.messages.fill_required"))
         return
       }
@@ -134,6 +140,7 @@ export default function ChannelsPage() {
       if (
         formData.channel_type === "slack"
         && !isOAuthSlackEdit
+        && isCreating
         && (!formData.bot_token || !formData.app_token)
       ) {
         toast.error(t("channels.messages.fill_required"))

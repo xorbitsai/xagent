@@ -2,8 +2,9 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, List
 from urllib.parse import urlencode, urlparse
 
@@ -26,7 +27,11 @@ from xagent.web.api.auth import (
 )
 from xagent.web.models.database import get_db
 from xagent.web.models.user import User
-from xagent.web.models.user_channel import UserChannel
+from xagent.web.models.user_channel import (
+    SlackOAuthFlowState,
+    UserChannel,
+    has_production_channel_encryption_key,
+)
 from xagent.web.schemas.user_channel import (
     UserChannelCreate,
     UserChannelResponse,
@@ -35,6 +40,21 @@ from xagent.web.schemas.user_channel import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Slack workspace identity is established by the OAuth token exchange and must
+# never be writable through the generic channel-update endpoint (see
+# update_user_channel); a client-supplied team_id would re-route another
+# tenant's Slack events into this row.
+_SLACK_SERVER_MANAGED_CONFIG_KEYS = frozenset(
+    {
+        "installation_mode",
+        "team_id",
+        "bot_user_id",
+        "slack_app_id",
+        "enterprise_id",
+        "scope",
+    }
+)
 
 SLACK_OAUTH_AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
 SLACK_OAUTH_ACCESS_URL = "https://slack.com/api/oauth.v2.access"
@@ -165,6 +185,11 @@ def _slack_oauth_missing_config() -> list[str]:
         missing.append("XAGENT_SLACK_APP_TOKEN")
     if not get_slack_oauth_redirect_uri():
         missing.append("XAGENT_SLACK_REDIRECT_URI or XAGENT_PUBLIC_API_BASE_URL")
+    if not has_production_channel_encryption_key():
+        # Workspace tokens are persisted through UserChannel's encrypted
+        # config; without a real key the "encrypted at rest" guarantee is
+        # silently false, so refuse to advertise the OAuth install flow.
+        missing.append("ENCRYPTION_KEY (must not be the built-in dev default)")
     return missing
 
 
@@ -174,6 +199,22 @@ def _frontend_origin_for_slack_oauth(request: Request) -> str:
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}"
     return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def _script_safe_json(value: Any) -> str:
+    """JSON-encode a value for embedding inside an inline <script> block.
+
+    ``json.dumps`` leaves ``/`` and ``<`` intact, so attacker-controlled data
+    containing ``</script>`` would close the surrounding script element early
+    and execute as injected markup. Escaping ``<``, ``>`` and ``&`` keeps the
+    output inert to the HTML tokenizer while remaining valid JSON.
+    """
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
 
 
 def _slack_oauth_popup_response(
@@ -208,8 +249,8 @@ def _slack_oauth_popup_response(
     <script>
       if (window.opener) {{
         window.opener.postMessage(
-          {json.dumps(payload)},
-          {json.dumps(target_origin)}
+          {_script_safe_json(payload)},
+          {_script_safe_json(target_origin)}
         );
         window.close();
       }}
@@ -217,6 +258,13 @@ def _slack_oauth_popup_response(
   </body>
 </html>""",
         status_code=status_code,
+        headers={
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'unsafe-inline'; "
+                "style-src 'unsafe-inline'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -261,7 +309,12 @@ def _upsert_slack_oauth_channel(
 
     existing: UserChannel | None = None
     slack_channels = (
-        db.query(UserChannel).filter(UserChannel.channel_type == "slack").all()
+        db.query(UserChannel)
+        .filter(UserChannel.channel_type == "slack")
+        # Deterministic: if duplicate rows ever claim the same workspace, the
+        # oldest row wins consistently rather than by arbitrary result order.
+        .order_by(UserChannel.id)
+        .all()
     )
     for channel in slack_channels:
         config = channel.config
@@ -281,6 +334,17 @@ def _upsert_slack_oauth_channel(
     existing_config = existing.config if existing is not None else {}
     enterprise = token_data.get("enterprise")
     enterprise_data = enterprise if isinstance(enterprise, dict) else {}
+    if existing is not None:
+        # Reinstalls keep whatever access policy the owner configured.
+        allowed_users = existing_config.get("allowed_users")
+    else:
+        # One-click installs never pass through the config dialog, so an
+        # allow-all default would silently grant every workspace member
+        # access. Start with the installer only; the owner can widen it.
+        authed_user = token_data.get("authed_user")
+        authed_user_data = authed_user if isinstance(authed_user, dict) else {}
+        installer_id = str(authed_user_data.get("id") or "")
+        allowed_users = [installer_id] if installer_id else None
     config = {
         "installation_mode": "oauth",
         "bot_token": access_token,
@@ -290,7 +354,7 @@ def _upsert_slack_oauth_channel(
         "slack_app_id": str(token_data.get("app_id") or ""),
         "enterprise_id": str(enterprise_data.get("id") or ""),
         "scope": str(token_data.get("scope") or ""),
-        "allowed_users": existing_config.get("allowed_users"),
+        "allowed_users": allowed_users,
     }
 
     if existing is None:
@@ -325,25 +389,11 @@ def _upsert_slack_oauth_channel(
     return channel
 
 
-@router.get("/slack/oauth/config")
-def get_slack_oauth_config(
-    current_user: User = Depends(get_current_user),
-) -> dict[str, Any]:
-    """Report whether the deployment can start Slack workspace OAuth."""
-    del current_user
-    missing = _slack_oauth_missing_config()
-    return {
-        "enabled": not missing,
-        "missing": missing,
-        "redirect_uri": get_slack_oauth_redirect_uri(),
-        "scopes": list(SLACK_OAUTH_SCOPES),
-    }
-
-
 @router.post("/slack/oauth/start")
 def start_slack_oauth(
     request: Request,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, str]:
     """Create a signed Slack authorization URL for the current Xagent user."""
     missing = _slack_oauth_missing_config()
@@ -358,11 +408,28 @@ def start_slack_oauth(
     if client_id is None or redirect_uri is None:
         raise HTTPException(status_code=503, detail="Slack OAuth is not configured")
 
+    nonce = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    # The signed JWT alone would be valid for its whole lifetime on every
+    # replay; this ledger row makes the state single-use — the callback
+    # atomically claims the nonce and rejects any second presentation.
+    db.query(SlackOAuthFlowState).filter(
+        SlackOAuthFlowState.expires_at < now - timedelta(days=1)
+    ).delete(synchronize_session=False)
+    db.add(
+        SlackOAuthFlowState(
+            nonce=nonce,
+            user_id=int(current_user.id),
+            expires_at=now + timedelta(minutes=10),
+        )
+    )
+    db.commit()
+
     state = create_access_token(
         data={
             "type": "slack_oauth_state",
             "user_id": int(current_user.id),
-            "nonce": secrets.token_urlsafe(24),
+            "nonce": nonce,
             "frontend_origin": _frontend_origin_for_slack_oauth(request),
         },
         expires_delta=timedelta(minutes=10),
@@ -405,12 +472,44 @@ async def slack_oauth_callback(
             status_code=400,
         )
 
-    error = request.query_params.get("error")
-    if error:
+    # Atomically claim the single-use nonce so a replayed (or forwarded)
+    # state is rejected after its first presentation.
+    nonce = str(state_payload.get("nonce") or "")
+    claim_time = datetime.now(timezone.utc)
+    claimed = (
+        db.query(SlackOAuthFlowState)
+        .filter(
+            SlackOAuthFlowState.nonce == nonce,
+            SlackOAuthFlowState.consumed_at.is_(None),
+            SlackOAuthFlowState.expires_at > claim_time,
+        )
+        .update(
+            {SlackOAuthFlowState.consumed_at: claim_time},
+            synchronize_session=False,
+        )
+        if nonce
+        else 0
+    )
+    if claimed != 1:
+        db.rollback()
         return _slack_oauth_popup_response(
             success=False,
             target_origin=target_origin,
-            message=f"Slack authorization was not completed: {error}",
+            message="The Slack authorization request is invalid or expired.",
+            status_code=400,
+        )
+    db.commit()
+
+    error = request.query_params.get("error")
+    if error:
+        # Slack error codes are short snake_case identifiers. Anything else in
+        # this unauthenticated query parameter is attacker-controlled, so
+        # restrict it to that alphabet before reflecting it anywhere.
+        safe_error = re.sub(r"[^A-Za-z0-9_.-]", "", error)[:64] or "unknown_error"
+        return _slack_oauth_popup_response(
+            success=False,
+            target_origin=target_origin,
+            message=f"Slack authorization was not completed: {safe_error}",
             status_code=400,
         )
 
@@ -473,13 +572,28 @@ async def slack_oauth_callback(
             message=f"{workspace_name} is now connected to Xagent.",
             workspace_name=workspace_name,
         )
-    except Exception as exc:
+    except ValueError as exc:
+        # ValueErrors on this path carry fixed, user-facing strings raised by
+        # our own validation (for example a workspace already connected to a
+        # different Xagent user); they never wrap library internals.
+        db.rollback()
+        logger.warning("Slack OAuth callback rejected: %s", exc)
+        return _slack_oauth_popup_response(
+            success=False,
+            target_origin=target_origin,
+            message=str(exc),
+            status_code=400,
+        )
+    except Exception:
         db.rollback()
         logger.exception("Slack OAuth callback failed")
         return _slack_oauth_popup_response(
             success=False,
             target_origin=target_origin,
-            message=str(exc),
+            message=(
+                "Slack authorization failed because of an internal error. "
+                "Please try again or contact your administrator."
+            ),
             status_code=400,
         )
 
@@ -609,23 +723,43 @@ def update_user_channel(
     if channel_in.config is None:
         new_config = current_config
     else:
+        if channel.channel_type == "slack":
+            # These fields define which Slack workspace the row routes and are
+            # written exclusively by the OAuth callback from Slack's verified
+            # token-exchange response. Accepting them from a client PUT would
+            # let any user re-point their own channel at another tenant's
+            # team_id and hijack that workspace's events.
+            protected_keys = set(_SLACK_SERVER_MANAGED_CONFIG_KEYS)
+            if current_config.get("installation_mode") == "oauth":
+                # OAuth rows also own their credentials; manual rows may
+                # legitimately rotate tokens through this endpoint.
+                protected_keys |= {"bot_token", "app_secret", "app_token"}
+            for key, value in channel_in.config.items():
+                if key not in protected_keys:
+                    continue
+                current_value = current_config.get(key)
+                if value == current_value:
+                    continue
+                # Rows created before installation_mode existed may backfill
+                # the explicit "manual" marker; that is not a mode change.
+                if (
+                    key == "installation_mode"
+                    and not current_value
+                    and value == "manual"
+                ):
+                    continue
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Slack config field '{key}' is managed by the "
+                        "authorization flow and cannot be modified"
+                    ),
+                )
         new_config = dict(current_config)
         for key, value in channel_in.config.items():
             if key in {"bot_token", "app_secret", "app_token"} and not value:
                 continue
             new_config[key] = value
-    if channel.channel_type == "slack":
-        current_installation_mode = current_config.get("installation_mode")
-        new_installation_mode = new_config.get("installation_mode")
-        if (
-            new_installation_mode == "oauth" and current_installation_mode != "oauth"
-        ) or (
-            current_installation_mode == "oauth" and new_installation_mode != "oauth"
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Slack OAuth installation mode can only be changed through the authorization flow",
-            )
 
     if not new_name or not new_name.strip():
         if channel.channel_type == "telegram":

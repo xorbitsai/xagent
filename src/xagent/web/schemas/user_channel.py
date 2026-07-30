@@ -31,11 +31,15 @@ class UserChannelResponse(UserChannelBase):
 
     @field_serializer("config")
     def serialize_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Never return OAuth-issued workspace credentials to the browser."""
-        if config.get("installation_mode") != "oauth":
-            return config
+        """Never return channel credentials to the browser.
+
+        Applies to every channel type and installation mode: clients that
+        edit a channel resubmit only the fields they changed, and the update
+        endpoint keeps the stored secret when the submitted value is empty,
+        so the UI never needs to read a secret back.
+        """
         public_config = dict(config)
-        for field in ("bot_token", "app_token", "refresh_token"):
+        for field in ("bot_token", "app_secret", "app_token", "refresh_token"):
             if public_config.pop(field, None):
                 public_config[f"{field}_configured"] = True
         return public_config

@@ -27,6 +27,7 @@ from ...services.channel_runtime import (
     ChannelConfigurationError,
     DownloadedChannelFile,
     authorize_channel_sender,
+    deactivate_channel_sync,
     load_active_channel_configs,
     load_channel_output_files,
     persist_channel_user_message,
@@ -148,11 +149,17 @@ class SlackBotInstance:
         if not self._accepting:
             return
         event = payload.get("event")
-        if not isinstance(event, dict) or not self._should_handle_event(event):
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type") or "")
+        if event_type in {"app_uninstalled", "tokens_revoked"}:
+            await self._deactivate_after_workspace_removal(event_type)
+            return
+        if not self._should_handle_event(event):
             return
 
-        event_id = str(payload.get("event_id") or "")
-        if event_id and not self._remember_event_id(event_id):
+        dedup_key = self._event_dedup_key(payload, event)
+        if dedup_key and not self._remember_event_id(dedup_key):
             return
 
         conversation_key = self._conversation_key(payload, event)
@@ -162,6 +169,61 @@ class SlackBotInstance:
             self.event_tasks[conversation_key] = asyncio.create_task(
                 self._process_event_queue(conversation_key)
             )
+
+    async def _deactivate_after_workspace_removal(self, event_type: str) -> None:
+        """React to the workspace uninstalling the app or revoking its token.
+
+        The stored bot token is dead, so keep the row from advertising a
+        working connection: stop accepting events, deactivate the channel and
+        drop the revoked token, then let the manager sync tear this instance
+        down. Reinstalling through OAuth reuses the same row via team_id.
+        """
+        logger.warning(
+            "Slack workspace removed the app (%s); deactivating channel %s",
+            event_type,
+            self.channel_id,
+        )
+        self._accepting = False
+        channel_id = self.channel_id
+        if channel_id is None:
+            return
+        try:
+            await run_db_io_cancellation_safe(
+                lambda: deactivate_channel_sync(
+                    channel_id=channel_id,
+                    clear_config_keys=("bot_token",),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to deactivate Slack channel %s after %s",
+                self.channel_id,
+                event_type,
+            )
+            return
+        from ...api.channel import trigger_slack_sync
+
+        # Fire-and-forget: the sync stops this very bot instance, so it must
+        # not be awaited from inside this instance's own dispatch path.
+        asyncio.create_task(trigger_slack_sync())
+
+    @staticmethod
+    def _event_dedup_key(payload: dict[str, Any], event: dict[str, Any]) -> str:
+        """Identify the physical Slack message rather than the event envelope.
+
+        A mention inside an already-active thread is delivered twice — once as
+        ``app_mention`` and once as ``message`` — with distinct ``event_id``
+        values, so deduplication must key on the message itself. Slack retry
+        redeliveries also share this key, so they stay covered.
+        """
+        client_msg_id = str(event.get("client_msg_id") or "")
+        if client_msg_id:
+            return f"msg:{client_msg_id}"
+        channel_id = str(event.get("channel") or "")
+        ts = str(event.get("ts") or "")
+        if channel_id and ts:
+            return f"ts:{channel_id}:{ts}"
+        return str(payload.get("event_id") or "")
 
     def _remember_event_id(self, event_id: str) -> bool:
         if event_id in self._recent_event_id_set:
@@ -999,14 +1061,15 @@ class SlackChannelManager:
     async def _sync_bots_async(self) -> None:
         async with self._sync_lock:
             try:
-                manual_channels = await load_active_channel_configs(
+                # One load, partitioned on the declared installation_mode.
+                # Capability probing (which keys happen to be present) is not
+                # mutually exclusive — a row carrying both app_token and OAuth
+                # identity would otherwise start two bot instances.
+                channels = await load_active_channel_configs(
                     channel_type="slack",
-                    required_config_keys=("bot_token", "app_token"),
-                )
-                oauth_channels = await load_active_channel_configs(
-                    channel_type="slack",
-                    required_config_keys=(
-                        "bot_token",
+                    required_config_keys=("bot_token",),
+                    optional_config_keys=(
+                        "app_token",
                         "team_id",
                         "bot_user_id",
                         "installation_mode",
@@ -1016,6 +1079,16 @@ class SlackChannelManager:
                 logger.exception("Failed to load Slack channels for sync")
                 return
 
+            manual_channels = tuple(
+                channel
+                for channel in channels
+                if channel.config_value("installation_mode") != "oauth"
+            )
+            oauth_channels = tuple(
+                channel
+                for channel in channels
+                if channel.config_value("installation_mode") == "oauth"
+            )
             await self._sync_manual_bots(manual_channels)
             await self._sync_oauth_bots(oauth_channels)
 
@@ -1066,18 +1139,29 @@ class SlackChannelManager:
         app_token = get_slack_app_token()
         oauth_info_by_team: dict[str, dict[str, Any]] = {}
         for channel in channels:
-            if channel.config_value("installation_mode") != "oauth":
-                continue
             team_id = channel.config_value("team_id")
             bot_token = channel.config_value("bot_token")
             bot_user_id = channel.config_value("bot_user_id")
-            if team_id and bot_token and bot_user_id:
-                oauth_info_by_team[team_id] = {
-                    "bot_token": bot_token,
-                    "bot_user_id": bot_user_id,
-                    "id": channel.channel_id,
-                    "name": channel.channel_name,
-                }
+            if not (team_id and bot_token and bot_user_id):
+                continue
+            if team_id in oauth_info_by_team:
+                # Channels arrive ordered by row id, so the oldest row keeps
+                # the workspace; duplicates are a data problem worth surfacing
+                # rather than a silent last-writer-wins overwrite.
+                logger.error(
+                    "Multiple active Slack OAuth channels claim team %s; "
+                    "keeping channel %s and ignoring channel %s",
+                    team_id,
+                    oauth_info_by_team[team_id]["id"],
+                    channel.channel_id,
+                )
+                continue
+            oauth_info_by_team[team_id] = {
+                "bot_token": bot_token,
+                "bot_user_id": bot_user_id,
+                "id": channel.channel_id,
+                "name": channel.channel_name,
+            }
 
         if oauth_info_by_team and not app_token:
             logger.error(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,13 +12,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
-from xagent.web.api.auth import create_access_token, verify_token
+from xagent.web.api.auth import verify_token
 from xagent.web.api.channel import (
     SLACK_OAUTH_SCOPES,
+    _script_safe_json,
     create_user_channel,
     slack_oauth_callback,
     start_slack_oauth,
     trigger_slack_sync,
+    update_user_channel,
 )
 from xagent.web.channels.slack.bot import (
     SlackBotInstance,
@@ -30,8 +31,8 @@ from xagent.web.channels.slack.utils import markdown_to_slack, strip_slack_file_
 from xagent.web.models.database import Base
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
-from xagent.web.models.user_channel import UserChannel
-from xagent.web.schemas.user_channel import UserChannelCreate
+from xagent.web.models.user_channel import SlackOAuthFlowState, UserChannel
+from xagent.web.schemas.user_channel import UserChannelCreate, UserChannelUpdate
 from xagent.web.services.channel_runtime import ChannelConfigSnapshot
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
@@ -213,26 +214,33 @@ async def test_slack_manager_starts_active_configured_bots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = SlackChannelManager()
-    snapshot = ChannelConfigSnapshot(
+    manual_snapshot = ChannelConfigSnapshot(
         channel_id=9,
         channel_name="Workspace Slack",
         config_items=(
-            ("bot_token", "xoxb-test"),
             ("app_token", "xapp-test"),
+            ("bot_token", "xoxb-test"),
+            ("installation_mode", "manual"),
+        ),
+    )
+    # A hostile or corrupted row carrying BOTH manual and OAuth markers must
+    # resolve to exactly one runtime path (its declared installation_mode).
+    ambiguous_oauth_snapshot = ChannelConfigSnapshot(
+        channel_id=10,
+        channel_name="Ambiguous OAuth",
+        config_items=(
+            ("app_token", "xapp-smuggled"),
+            ("bot_token", "xoxb-oauth"),
+            ("bot_user_id", "U_BOT"),
+            ("installation_mode", "oauth"),
+            ("team_id", "T1"),
         ),
     )
 
     async def load_configs(**kwargs: Any) -> tuple[ChannelConfigSnapshot, ...]:
         assert kwargs["channel_type"] == "slack"
-        if kwargs["required_config_keys"] == ("bot_token", "app_token"):
-            return (snapshot,)
-        assert kwargs["required_config_keys"] == (
-            "bot_token",
-            "team_id",
-            "bot_user_id",
-            "installation_mode",
-        )
-        return ()
+        assert kwargs["required_config_keys"] == ("bot_token",)
+        return (manual_snapshot, ambiguous_oauth_snapshot)
 
     started: list[dict[str, Any]] = []
 
@@ -247,6 +255,9 @@ async def test_slack_manager_starts_active_configured_bots(
 
     await manager._sync_bots_async()
 
+    # Only the manual row starts a manual bot; the ambiguous row is routed
+    # exclusively to the OAuth path (which stays idle without a shared
+    # XAGENT_SLACK_APP_TOKEN) instead of starting a second manual instance.
     assert started == [
         {
             "bot_token": "xoxb-test",
@@ -277,9 +288,7 @@ def _request(
     )
 
 
-def test_start_slack_oauth_returns_signed_workspace_authorization_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _patch_slack_oauth_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "xagent.web.api.channel.get_slack_client_id",
         lambda: "client-id",
@@ -297,27 +306,52 @@ def test_start_slack_oauth_returns_signed_workspace_authorization_url(
         lambda: "https://api.example.com/api/channels/slack/oauth/callback",
     )
     monkeypatch.setattr(
+        "xagent.web.api.channel.has_production_channel_encryption_key",
+        lambda: True,
+    )
+
+
+def _oauth_test_session(tmp_path: Path, name: str) -> tuple[Any, Any]:
+    engine = create_engine(f"sqlite:///{tmp_path / name}")
+    Base.metadata.create_all(engine)
+    return engine, sessionmaker(bind=engine)
+
+
+def test_start_slack_oauth_returns_signed_workspace_authorization_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_slack_oauth_config(monkeypatch)
+    monkeypatch.setattr(
         "xagent.web.api.channel.get_app_base_url",
         lambda: "https://app.example.com",
     )
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-oauth-start.db")
 
-    result = start_slack_oauth(
-        _request(path="/api/channels/slack/oauth/start"),
-        SimpleNamespace(id=17),
-    )
+    with SessionLocal() as db:
+        result = start_slack_oauth(
+            _request(path="/api/channels/slack/oauth/start"),
+            SimpleNamespace(id=17),
+            db,
+        )
 
-    parsed = urlparse(result["authorize_url"])
-    query = parse_qs(parsed.query)
-    assert parsed.scheme == "https"
-    assert parsed.netloc == "slack.com"
-    assert result["callback_origin"] == "https://api.example.com"
-    assert query["client_id"] == ["client-id"]
-    assert query["scope"] == [",".join(SLACK_OAUTH_SCOPES)]
-    state = verify_token(query["state"][0])
-    assert state is not None
-    assert state["type"] == "slack_oauth_state"
-    assert state["user_id"] == 17
-    assert state["frontend_origin"] == "https://app.example.com"
+        parsed = urlparse(result["authorize_url"])
+        query = parse_qs(parsed.query)
+        assert parsed.scheme == "https"
+        assert parsed.netloc == "slack.com"
+        assert result["callback_origin"] == "https://api.example.com"
+        assert query["client_id"] == ["client-id"]
+        assert query["scope"] == [",".join(SLACK_OAUTH_SCOPES)]
+        state = verify_token(query["state"][0])
+        assert state is not None
+        assert state["type"] == "slack_oauth_state"
+        assert state["user_id"] == 17
+        assert state["frontend_origin"] == "https://app.example.com"
+
+        flow_state = db.query(SlackOAuthFlowState).one()
+        assert flow_state.nonce == state["nonce"]
+        assert flow_state.consumed_at is None
+    engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -325,21 +359,8 @@ async def test_slack_oauth_callback_creates_encrypted_workspace_channel(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    engine = create_engine(f"sqlite:///{tmp_path / 'slack-oauth.db'}")
-    Base.metadata.create_all(engine)
-    SessionLocal = sessionmaker(bind=engine)
-    monkeypatch.setattr(
-        "xagent.web.api.channel.get_slack_client_id",
-        lambda: "client-id",
-    )
-    monkeypatch.setattr(
-        "xagent.web.api.channel.get_slack_client_secret",
-        lambda: "client-secret",
-    )
-    monkeypatch.setattr(
-        "xagent.web.api.channel.get_slack_oauth_redirect_uri",
-        lambda: "https://api.example.com/api/channels/slack/oauth/callback",
-    )
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-oauth.db")
+    _patch_slack_oauth_config(monkeypatch)
 
     token_data = {
         "ok": True,
@@ -348,6 +369,7 @@ async def test_slack_oauth_callback_creates_encrypted_workspace_channel(
         "bot_user_id": "U_BOT",
         "app_id": "A_APP",
         "team": {"id": "T_WORKSPACE", "name": "Acme"},
+        "authed_user": {"id": "U_INSTALLER"},
         "enterprise": None,
     }
 
@@ -378,14 +400,12 @@ async def test_slack_oauth_callback_creates_encrypted_workspace_channel(
         db.add(user)
         db.commit()
         db.refresh(user)
-        state = create_access_token(
-            data={
-                "type": "slack_oauth_state",
-                "user_id": int(user.id),
-                "frontend_origin": "https://app.example.com",
-            },
-            expires_delta=timedelta(minutes=10),
+        start_result = start_slack_oauth(
+            _request(path="/api/channels/slack/oauth/start"),
+            SimpleNamespace(id=int(user.id)),
+            db,
         )
+        state = parse_qs(urlparse(start_result["authorize_url"]).query)["state"][0]
         background_tasks = BackgroundTasks()
 
         response = await slack_oauth_callback(
@@ -404,10 +424,229 @@ async def test_slack_oauth_callback_creates_encrypted_workspace_channel(
         assert channel.config["installation_mode"] == "oauth"
         assert channel.config["team_id"] == "T_WORKSPACE"
         assert channel.config["bot_token"] == "xoxb-oauth-secret"
+        assert channel.config["allowed_users"] == ["U_INSTALLER"]
         assert channel._config["bot_token"] != "xoxb-oauth-secret"
         assert len(background_tasks.tasks) == 1
         assert background_tasks.tasks[0].func is trigger_slack_sync
     engine.dispose()
+
+
+def test_script_safe_json_neutralizes_script_breakout() -> None:
+    encoded = _script_safe_json({"message": "</script><script>alert(1)</script>"})
+    assert "<" not in encoded
+    assert ">" not in encoded
+    assert "\\u003c" in encoded
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_error_param_cannot_inject_script(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-oauth-xss.db")
+    _patch_slack_oauth_config(monkeypatch)
+
+    with SessionLocal() as db:
+        start_result = start_slack_oauth(
+            _request(path="/api/channels/slack/oauth/start"),
+            SimpleNamespace(id=1),
+            db,
+        )
+        state = parse_qs(urlparse(start_result["authorize_url"]).query)["state"][0]
+
+        response = await slack_oauth_callback(
+            _request(
+                path="/api/channels/slack/oauth/callback",
+                query={
+                    "state": state,
+                    "error": "</script><script>alert(1)</script>",
+                },
+            ),
+            BackgroundTasks(),
+            db,
+        )
+
+        body = response.body.decode()
+        assert response.status_code == 400
+        assert "slack-oauth-error" in body
+        assert "<script>alert" not in body
+        assert "alert(1)" not in body
+        assert "Content-Security-Policy" in response.headers
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_oauth_state_is_single_use(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-oauth-replay.db")
+    _patch_slack_oauth_config(monkeypatch)
+
+    with SessionLocal() as db:
+        start_result = start_slack_oauth(
+            _request(path="/api/channels/slack/oauth/start"),
+            SimpleNamespace(id=1),
+            db,
+        )
+        state = parse_qs(urlparse(start_result["authorize_url"]).query)["state"][0]
+
+        first = await slack_oauth_callback(
+            _request(
+                path="/api/channels/slack/oauth/callback",
+                query={"state": state, "error": "access_denied"},
+            ),
+            BackgroundTasks(),
+            db,
+        )
+        replay = await slack_oauth_callback(
+            _request(
+                path="/api/channels/slack/oauth/callback",
+                query={"state": state, "error": "access_denied"},
+            ),
+            BackgroundTasks(),
+            db,
+        )
+
+        assert "access_denied" in first.body.decode()
+        assert replay.status_code == 400
+        assert "invalid or expired" in replay.body.decode()
+    engine.dispose()
+
+
+def test_update_channel_rejects_oauth_identity_rewrites(tmp_path: Path) -> None:
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-put-guard.db")
+
+    with SessionLocal() as db:
+        user = User(username="slack-put-owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        channel = UserChannel(
+            user_id=int(user.id),
+            channel_type="slack",
+            channel_name="Acme",
+            config={
+                "installation_mode": "oauth",
+                "bot_token": "xoxb-oauth",
+                "team_id": "T_MINE",
+                "bot_user_id": "U_BOT",
+                "slack_app_id": "A_APP",
+                "allowed_users": None,
+            },
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        db.refresh(channel)
+
+        for hostile_config in (
+            {"team_id": "T_VICTIM"},
+            {"bot_user_id": "U_EVIL"},
+            {"installation_mode": "manual"},
+            {"bot_token": "xoxb-attacker"},
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                update_user_channel(
+                    int(channel.id),
+                    UserChannelUpdate(config=hostile_config),
+                    BackgroundTasks(),
+                    SimpleNamespace(id=int(user.id)),
+                    db,
+                )
+            assert exc_info.value.status_code == 400
+
+        updated = update_user_channel(
+            int(channel.id),
+            UserChannelUpdate(config={"allowed_users": ["U123"], "team_id": "T_MINE"}),
+            BackgroundTasks(),
+            SimpleNamespace(id=int(user.id)),
+            db,
+        )
+        assert updated.config["allowed_users"] == ["U123"]
+        assert updated.config["team_id"] == "T_MINE"
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mention_and_message_pair_processed_once() -> None:
+    bot = make_bot()
+    processed: list[str] = []
+
+    async def process_event(
+        _conversation_key: str,
+        _payload: dict[str, Any],
+        event: dict[str, Any],
+    ) -> None:
+        processed.append(str(event["type"]))
+
+    bot._process_event = process_event  # type: ignore[method-assign]
+    bot.active_tasks["T1:C1:U1:1.0"] = 42
+
+    base_event = {
+        "channel": "C1",
+        "channel_type": "channel",
+        "user": "U1",
+        "ts": "2.0",
+        "thread_ts": "1.0",
+        "text": "<@U_BOT> continue",
+    }
+    # Slack delivers one physical in-thread mention as two envelopes with
+    # distinct event ids: an app_mention and a message event.
+    await bot.handle_events_api_payload(
+        {
+            "event_id": "Ev-mention",
+            "team_id": "T1",
+            "event": {**base_event, "type": "app_mention"},
+        }
+    )
+    await bot.handle_events_api_payload(
+        {
+            "event_id": "Ev-message",
+            "team_id": "T1",
+            "event": {**base_event, "type": "message"},
+        }
+    )
+    await asyncio.gather(*bot.event_tasks.values())
+
+    assert processed == ["app_mention"]
+
+
+@pytest.mark.asyncio
+async def test_app_uninstalled_deactivates_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    deactivated: list[dict[str, Any]] = []
+
+    def fake_deactivate(**kwargs: Any) -> bool:
+        deactivated.append(kwargs)
+        return True
+
+    async def fake_db_io(func: Any) -> Any:
+        return func()
+
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.deactivate_channel_sync",
+        fake_deactivate,
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.run_db_io_cancellation_safe",
+        fake_db_io,
+    )
+
+    async def fake_sync() -> None:
+        return None
+
+    monkeypatch.setattr("xagent.web.api.channel.trigger_slack_sync", fake_sync)
+
+    await bot.handle_events_api_payload(
+        {"event_id": "Ev-1", "team_id": "T1", "event": {"type": "app_uninstalled"}}
+    )
+    await asyncio.sleep(0)
+
+    assert bot._accepting is False
+    assert deactivated == [{"channel_id": 7, "clear_config_keys": ("bot_token",)}]
 
 
 @pytest.mark.asyncio

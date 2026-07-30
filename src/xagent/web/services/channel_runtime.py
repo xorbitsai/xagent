@@ -155,6 +155,7 @@ def _load_active_channel_configs_sync(
     *,
     channel_type: str,
     required_config_keys: Sequence[str],
+    optional_config_keys: Sequence[str] = (),
 ) -> tuple[ChannelConfigSnapshot, ...]:
     SessionLocal = get_session_local()
     snapshots: list[ChannelConfigSnapshot] = []
@@ -165,6 +166,10 @@ def _load_active_channel_configs_sync(
                 UserChannel.channel_type == channel_type,
                 UserChannel.is_active.is_(True),
             )
+            # Deterministic ordering so downstream keyed maps (for example
+            # Slack's team_id routing table) resolve duplicates stably
+            # instead of by arbitrary row order.
+            .order_by(UserChannel.id)
             .all()
         )
         for channel in channels:
@@ -176,13 +181,14 @@ def _load_active_channel_configs_sync(
             }
             if len(resolved) != len(required_config_keys):
                 continue
+            for key in optional_config_keys:
+                if config.get(key):
+                    resolved[key] = str(config.get(key))
             snapshots.append(
                 ChannelConfigSnapshot(
                     channel_id=int(channel.id),
                     channel_name=str(channel.channel_name),
-                    config_items=tuple(
-                        (key, resolved[key]) for key in required_config_keys
-                    ),
+                    config_items=tuple(sorted(resolved.items())),
                 )
             )
     return tuple(snapshots)
@@ -192,6 +198,7 @@ async def load_active_channel_configs(
     *,
     channel_type: str,
     required_config_keys: Sequence[str],
+    optional_config_keys: Sequence[str] = (),
 ) -> tuple[ChannelConfigSnapshot, ...]:
     """Load active bot credentials without blocking the asyncio event loop."""
 
@@ -199,8 +206,40 @@ async def load_active_channel_configs(
         lambda: _load_active_channel_configs_sync(
             channel_type=channel_type,
             required_config_keys=required_config_keys,
+            optional_config_keys=optional_config_keys,
         )
     )
+
+
+def deactivate_channel_sync(
+    *,
+    channel_id: int,
+    clear_config_keys: Sequence[str] = (),
+) -> bool:
+    """Deactivate one channel row, optionally dropping dead credentials.
+
+    Used when the remote platform reports the integration is gone (for
+    example Slack's ``app_uninstalled``/``tokens_revoked`` events), so the
+    row stops advertising a connection that no longer works.
+    """
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        channel = db.query(UserChannel).filter(UserChannel.id == channel_id).first()
+        if channel is None:
+            return False
+        changed = False
+        if bool(channel.is_active):
+            channel.is_active = False  # type: ignore[assignment]
+            changed = True
+        if clear_config_keys:
+            config = dict(channel.config)
+            for key in clear_config_keys:
+                if config.pop(key, None) is not None:
+                    changed = True
+            channel.config = config
+        if changed:
+            db.commit()
+        return changed
 
 
 def _load_channel_owner_sync(

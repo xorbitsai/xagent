@@ -32,7 +32,7 @@ from .trigger import (
 from .uploaded_file import UploadedFile
 from .user import User, UserDefaultModel, UserModel
 from .user_api_key import UserApiKey
-from .user_channel import UserChannel
+from .user_channel import SlackOAuthFlowState, UserChannel
 from .user_identity import UserIdentity
 from .user_oauth import UserOAuth
 from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
@@ -48,6 +48,7 @@ __all__ = [
     "UserApiKey",
     "UserOAuth",
     "UserChannel",
+    "SlackOAuthFlowState",
     "UserIdentity",
     "Model",
     "MCPServer",

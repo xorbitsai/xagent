@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from ....core.file_ref import parse_file_id_ref
 
@@ -99,7 +99,7 @@ def _extract_local_file_id(target: str) -> str | None:
     parsed = urlparse(normalized_target)
     for prefix in ("/api/files/preview/", "/api/files/download/"):
         if parsed.path.startswith(prefix):
-            candidate = parsed.path.removeprefix(prefix).strip("/")
+            candidate = unquote(parsed.path.removeprefix(prefix).strip("/"))
             return candidate or None
     return None
 

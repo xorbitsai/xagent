@@ -302,7 +302,11 @@ class ToolFactory:
                     await prepare_factory_runtime(config)
                 resolved_additional_tools = additional_tools
                 if resolved_additional_tools is None:
-                    contribution = config.get_task_runtime_contribution()
+                    contribution = (
+                        config.get_task_runtime_contribution()
+                        if isinstance(config, BaseToolConfig)
+                        else None
+                    )
                     resolved_additional_tools = getattr(contribution, "tools", ())
                     resolved_additional_tool_origins = (
                         dict(getattr(contribution, "tool_origins", ()))
@@ -519,7 +523,12 @@ class ToolFactory:
                 reconcile_task_runtime_contribution_tools,
             )
 
-            contribution = config.get_task_runtime_contribution()
+            runtime_config = config if isinstance(config, BaseToolConfig) else None
+            contribution = (
+                runtime_config.get_task_runtime_contribution()
+                if runtime_config is not None
+                else None
+            )
             if (
                 isinstance(contribution, TaskRuntimeContribution)
                 and contribution.provider_contributions
@@ -533,7 +542,7 @@ class ToolFactory:
                         tool.name for tool in policy_surviving_core_tools
                     },
                 )
-                config.set_task_runtime_contribution(reconciled)
+                runtime_config.set_task_runtime_contribution(reconciled)
 
                 accepted_extension_occurrences = Counter(
                     id(tool) for tool in reconciled.tools
@@ -558,7 +567,7 @@ class ToolFactory:
                         ", ".join(conflict.tool_names),
                     )
             elif isinstance(contribution, TaskRuntimeContribution):
-                config.set_task_runtime_contribution(
+                runtime_config.set_task_runtime_contribution(
                     reconcile_task_runtime_contribution_tools(
                         contribution,
                         available_tool_names=policy_surviving_extension_names,
@@ -588,7 +597,11 @@ class ToolFactory:
             release = getattr(config, "release_db_connection", None)
             if callable(release):
                 release()
-            workspace = config.get_task_runtime_workspace()
+            workspace = (
+                config.get_task_runtime_workspace()
+                if isinstance(config, BaseToolConfig)
+                else None
+            )
             if workspace is None:
                 workspace = ToolFactory._create_workspace(config.get_workspace_config())
             if workspace is not None:

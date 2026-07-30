@@ -112,6 +112,19 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "email_path": "email",
             "default_scopes": ["public_profile"],
         },
+        {
+            "provider_name": "slack",
+            "name": "Slack",
+            "client_id": os.environ.get("SLACK_CLIENT_ID", ""),
+            "client_secret": os.environ.get("SLACK_CLIENT_SECRET", ""),
+            "auth_url": "https://slack.com/oauth/v2/authorize",
+            "token_url": "https://slack.com/api/oauth.v2.access",
+            "redirect_uri": os.environ.get("SLACK_REDIRECT_URI", ""),
+            "userinfo_url": "https://slack.com/api/auth.test",
+            "user_id_path": "team_id",
+            "email_path": "team",
+            "default_scopes": ["chat:write", "chat:write.public", "channels:read"],
+        },
     ]
 
 
@@ -378,6 +391,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "npx",
                 "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
                 "required_env": ["GOOGLE_MAPS_API_KEY"],
+            },
+        },
+        {
+            "app_id": "slack",
+            "name": "Slack",
+            "description": "Connect to Slack to list channels and post messages, e.g. incident summaries and recommended fixes.",
+            "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "slack",
+            "category": "Communication",
+            "oauth_scopes": ["chat:write", "chat:write.public", "channels:read"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.slack"],
+                "env_mapping": {"SLACK_ACCESS_TOKEN": "access_token"},
             },
         },
     ]

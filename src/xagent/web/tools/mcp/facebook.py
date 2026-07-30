@@ -31,6 +31,13 @@ def _graph_path(value: Any, name: str, suffix: str) -> str:
     return f"/{quote(str(value).strip(), safe='')}/{suffix}"
 
 
+_POST_FIELDS_BASE = "id,message,created_time,permalink_url,full_picture,status_type"
+_POST_FIELDS_WITH_ENGAGEMENT = (
+    f"{_POST_FIELDS_BASE},likes.limit(0).summary(true),"
+    "comments.limit(0).summary(true),shares"
+)
+
+
 def _normalize_page(page: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": page.get("id"),
@@ -101,24 +108,42 @@ def facebook_list_pages() -> str:
 
 @mcp.tool()
 def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
-    """List recent posts for a Facebook Page by page_id, including like/comment/share counts."""
+    """List recent posts for a Facebook Page by page_id, including like/comment/share
+    counts. If the connected token lacks pages_read_user_content, falls back to
+    posts without those counts (engagement_available=false) instead of failing
+    outright — the Graph API can reject the whole request when a field in a
+    combined fields= expansion needs a permission the token doesn't have.
+    """
     try:
         page_token = _page_access_token(page_id)
-        result = _graph_request(
-            "GET",
-            _graph_path(page_id, "page_id", "feed"),
-            token=page_token,
-            params={
-                "fields": (
-                    "id,message,created_time,permalink_url,full_picture,status_type,"
-                    "likes.limit(0).summary(true),comments.limit(0).summary(true),shares"
-                ),
-                "limit": _bounded_limit(limit),
-            },
-        )
+        path = _graph_path(page_id, "page_id", "feed")
+        bounded_limit = _bounded_limit(limit)
+        engagement_available = True
+        try:
+            result = _graph_request(
+                "GET",
+                path,
+                token=page_token,
+                params={"fields": _POST_FIELDS_WITH_ENGAGEMENT, "limit": bounded_limit},
+            )
+        except GraphAPIError as engagement_error:
+            logger.warning(
+                "Falling back to Facebook posts without engagement counts for "
+                "page %s: %s",
+                page_id,
+                engagement_error,
+            )
+            engagement_available = False
+            result = _graph_request(
+                "GET",
+                path,
+                token=page_token,
+                params={"fields": _POST_FIELDS_BASE, "limit": bounded_limit},
+            )
         return _success(
             posts=result.get("data", []),
             next_link=(result.get("paging") or {}).get("next"),
+            engagement_available=engagement_available,
         )
     except GraphAPIError as e:
         logger.error("Error listing Facebook Page posts for %s: %s", page_id, e)
@@ -134,10 +159,10 @@ def facebook_list_post_comments(page_id: str, post_id: str, limit: int = 10) -> 
 
     post_id is the composite Graph API id ("{page_id}_{post_id}"), e.g. the
     "id" field returned by facebook_list_page_posts — not the numeric post
-    suffix alone. Returns the full flattened comment stream (including
-    replies to other comments), not just top-level comments; no "parent"
-    field is included, so replies can't be distinguished from top-level
-    comments in the response.
+    suffix alone. Returns the full flattened comment stream, including
+    replies to other comments, not just top-level ones; each comment's
+    "parent" field distinguishes a reply (its "id") from a top-level comment
+    (absent).
     """
     try:
         page_token = _page_access_token(page_id)
@@ -146,7 +171,7 @@ def facebook_list_post_comments(page_id: str, post_id: str, limit: int = 10) -> 
             _graph_path(post_id, "post_id", "comments"),
             token=page_token,
             params={
-                "fields": "id,message,created_time,from",
+                "fields": "id,message,created_time,from,parent",
                 "filter": "stream",
                 "limit": _bounded_limit(limit),
             },

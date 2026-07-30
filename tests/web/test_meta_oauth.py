@@ -678,6 +678,128 @@ def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(
     assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
 
 
+def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_grant(
+    db_session,
+):
+    """Mirror of the previous test's opposite case: no Instagram connection
+    relies on the shared bare "meta" row (e.g. it predates this app-scoped
+    policy, or was left over from a bare login that never connected
+    anything). Excluding it from providers_to_delete is only correct while
+    some sibling app still needs it; with none connected, it must still be
+    cleaned up on disconnect instead of becoming a permanent orphan with no
+    UI path to remove it."""
+    db, user = db_session
+    db.add(UserOAuth(user_id=user.id, provider="meta", access_token="bare-meta-token"))
+    db.add(
+        UserOAuth(user_id=user.id, provider="facebook", access_token="app-scoped-token")
+    )
+    server = MCPServer(name="Facebook Pages", transport="oauth", managed="external")
+    db.add(server)
+    db.commit()
+    db.add(UserMCPServer(user_id=user.id, mcpserver_id=server.id, is_owner=True))
+    db.commit()
+
+    from xagent.web.api.mcp import delete_mcp_server
+
+    delete_mcp_server(server.id, current_user=user, db=db)
+
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 0
+
+
+def test_facebook_server_list_does_not_show_bare_meta_email_as_connected(db_session):
+    """GET /servers must agree with the app-scoped-grant policy: showing a
+    bare "meta" account's email as Facebook's connected_account would tell
+    the user Facebook is connected when _oauth_keys_for_app (and the runtime
+    token resolver) say it isn't."""
+    db, user = db_session
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="meta",
+            access_token="bare-meta-token",
+            email="alice@example.com",
+        )
+    )
+    server = MCPServer(name="Facebook Pages", transport="oauth", managed="external")
+    db.add(server)
+    db.commit()
+    db.add(UserMCPServer(user_id=user.id, mcpserver_id=server.id, is_owner=True))
+    db.commit()
+
+    from xagent.web.api.mcp import get_mcp_servers
+
+    responses = get_mcp_servers(current_user=user, db=db)
+
+    assert len(responses) == 1
+    assert responses[0].connected_account is None
+
+
+def test_facebook_server_list_does_not_show_blanked_token_as_connected(db_session):
+    """The reconnect migration blanks access_token but not email; a stale
+    email must not read as "still connected" once the token is gone."""
+    db, user = db_session
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="facebook",
+            access_token="",
+            email="alice@example.com",
+        )
+    )
+    server = MCPServer(name="Facebook Pages", transport="oauth", managed="external")
+    db.add(server)
+    db.commit()
+    db.add(UserMCPServer(user_id=user.id, mcpserver_id=server.id, is_owner=True))
+    db.commit()
+
+    from xagent.web.api.mcp import get_mcp_servers
+
+    responses = get_mcp_servers(current_user=user, db=db)
+
+    assert len(responses) == 1
+    assert responses[0].connected_account is None
+
+
+def test_instagram_server_list_still_shows_bare_meta_email_as_connected(db_session):
+    """Sanity counterpart: Instagram's required scopes haven't changed, so its
+    display must keep accepting the shared bare "meta" grant."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic", "instagram_content_publish"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="meta",
+            access_token="bare-meta-token",
+            email="alice@example.com",
+        )
+    )
+    server = MCPServer(name="Instagram", transport="oauth", managed="external")
+    db.add(server)
+    db.commit()
+    db.add(UserMCPServer(user_id=user.id, mcpserver_id=server.id, is_owner=True))
+    db.commit()
+
+    from xagent.web.api.mcp import get_mcp_servers
+
+    responses = get_mcp_servers(current_user=user, db=db)
+
+    assert len(responses) == 1
+    assert responses[0].connected_account == "alice@example.com"
+
+
 def test_generic_oauth_single_app_rejects_non_oauth_app_cleanly(
     db_session, monkeypatch
 ):

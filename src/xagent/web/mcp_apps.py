@@ -66,12 +66,7 @@ def restrict_to_app_scoped_oauth_grant(
     ``UserOAuth.provider``), which is why normalization only decides
     membership and is never applied to the returned strings.
     """
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate and candidate not in seen:
-            deduped.append(candidate)
-            seen.add(candidate)
+    deduped = list(dict.fromkeys(c for c in candidates if isinstance(c, str) and c))
 
     if not requires_app_scoped_oauth_grant(app_id):
         return deduped

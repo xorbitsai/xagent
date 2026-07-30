@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import re
+from collections import deque
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable
@@ -68,6 +69,7 @@ _SUPPORTED_MESSAGE_SUBTYPES = {None, "file_share", "thread_broadcast"}
 _CONTROL_START_COMMANDS = {"/start", "start"}
 _CONTROL_NEW_COMMANDS = {"/new", "new", "new task"}
 _MAX_FILE_DOWNLOAD_REDIRECTS = 5
+_MAX_RECENT_EVENT_IDS = 1000
 
 
 class SlackFileDownloadError(RuntimeError):
@@ -102,9 +104,10 @@ class SlackBotInstance:
 
         self.event_queues: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
-        self._recent_event_ids: list[str] = []
+        self._recent_event_ids: deque[str] = deque(maxlen=_MAX_RECENT_EVENT_IDS)
         self._recent_event_id_set: set[str] = set()
         self._accepting = True
+        self._deactivation_sync_task: asyncio.Task[None] | None = None
         self._run_forever = asyncio.Event()
         self._stop_lock: asyncio.Lock | None = None
         self._stop_loop: asyncio.AbstractEventLoop | None = None
@@ -159,7 +162,9 @@ class SlackBotInstance:
         if not isinstance(event, dict):
             return
         event_type = str(event.get("type") or "")
-        if event_type in {"app_uninstalled", "tokens_revoked"}:
+        if event_type == "app_uninstalled" or (
+            event_type == "tokens_revoked" and self._revokes_bot_token(event)
+        ):
             await self._deactivate_after_workspace_removal(event_type)
             return
         if not self._should_handle_event(event):
@@ -177,6 +182,22 @@ class SlackBotInstance:
                 self._process_event_queue(conversation_key)
             )
 
+    @staticmethod
+    def _revokes_bot_token(event: dict[str, Any]) -> bool:
+        """Report whether a ``tokens_revoked`` event kills this bot's token.
+
+        Slack also sends this event when only a user token is revoked, which
+        leaves the bot token working. Tearing the channel down then would
+        destroy a live integration, so require a bot entry in the payload.
+        No ``user_scope`` is requested today, so in practice every such event
+        carries ``tokens.bot`` — but the check keeps that assumption explicit.
+        """
+        tokens = event.get("tokens")
+        if not isinstance(tokens, dict):
+            return False
+        bot_tokens = tokens.get("bot")
+        return bool(bot_tokens)
+
     async def _deactivate_after_workspace_removal(self, event_type: str) -> None:
         """React to the workspace uninstalling the app or revoking its token.
 
@@ -190,7 +211,6 @@ class SlackBotInstance:
             event_type,
             self.channel_id,
         )
-        self._accepting = False
         channel_id = self.channel_id
         if channel_id is None:
             return
@@ -198,21 +218,28 @@ class SlackBotInstance:
             await run_db_io_cancellation_safe(
                 lambda: deactivate_channel_sync(
                     channel_id=channel_id,
-                    clear_config_keys=("bot_token",),
+                    clear_config_keys=("bot_token", "team_id"),
                 )
             )
         except Exception:
+            # The row is still active and this bot's token may still work, so
+            # keep accepting events: a permanently non-accepting instance is
+            # indistinguishable from a healthy one to the manager's sync diff
+            # and would only recover on a process restart.
             logger.exception(
                 "Failed to deactivate Slack channel %s after %s",
                 self.channel_id,
                 event_type,
             )
             return
+        # Only stop accepting once the row is durably deactivated.
+        self._accepting = False
         from ...api.channel import trigger_slack_sync
 
-        # Fire-and-forget: the sync stops this very bot instance, so it must
-        # not be awaited from inside this instance's own dispatch path.
-        asyncio.create_task(trigger_slack_sync())
+        # The sync stops this very bot instance, so it must not be awaited
+        # from inside this instance's own dispatch path. Keep a reference so
+        # the task is not garbage-collected while still running.
+        self._deactivation_sync_task = asyncio.create_task(trigger_slack_sync())
 
     @staticmethod
     def _event_dedup_key(payload: dict[str, Any], event: dict[str, Any]) -> str:
@@ -235,11 +262,12 @@ class SlackBotInstance:
     def _remember_event_id(self, event_id: str) -> bool:
         if event_id in self._recent_event_id_set:
             return False
+        if len(self._recent_event_ids) == _MAX_RECENT_EVENT_IDS:
+            # deque(maxlen=...) drops the oldest entry on append, so read it
+            # before appending to keep the companion set in step.
+            self._recent_event_id_set.discard(self._recent_event_ids[0])
         self._recent_event_ids.append(event_id)
         self._recent_event_id_set.add(event_id)
-        if len(self._recent_event_ids) > 1000:
-            expired = self._recent_event_ids.pop(0)
-            self._recent_event_id_set.discard(expired)
         return True
 
     def _should_handle_event(self, event: dict[str, Any]) -> bool:
@@ -1175,14 +1203,29 @@ class SlackChannelManager:
             if team_id in oauth_info_by_team:
                 # Channels arrive ordered by row id, so the oldest row keeps
                 # the workspace; duplicates are a data problem worth surfacing
-                # rather than a silent last-writer-wins overwrite.
+                # rather than a silent last-writer-wins overwrite. The loser
+                # can never receive events, so deactivate it instead of
+                # leaving a row the API keeps reporting as connected.
                 logger.error(
                     "Multiple active Slack OAuth channels claim team %s; "
-                    "keeping channel %s and ignoring channel %s",
+                    "keeping channel %s and deactivating channel %s",
                     team_id,
                     oauth_info_by_team[team_id]["id"],
                     channel.channel_id,
                 )
+                losing_channel_id = channel.channel_id
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: deactivate_channel_sync(
+                            channel_id=losing_channel_id,
+                            clear_config_keys=("team_id",),
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to deactivate duplicate Slack channel %s",
+                        losing_channel_id,
+                    )
                 continue
             oauth_info_by_team[team_id] = {
                 "bot_token": bot_token,

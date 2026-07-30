@@ -316,6 +316,7 @@ def _upsert_slack_oauth_channel(
         .order_by(UserChannel.id)
         .all()
     )
+    reusable_dead_row: UserChannel | None = None
     for channel in slack_channels:
         config = channel.config
         same_workspace = (
@@ -323,13 +324,23 @@ def _upsert_slack_oauth_channel(
             and str(config.get("team_id") or "") == team_id
         )
         same_token = config.get("bot_token") == access_token
-        if same_workspace or same_token:
-            if int(channel.user_id) != user_id:
-                raise ValueError(
-                    "This Slack workspace is already connected to another Xagent user"
-                )
-            existing = channel
-            break
+        if not (same_workspace or same_token):
+            continue
+        if not bool(channel.is_active):
+            # A deactivated row is the residue of an uninstall: its token is
+            # dead, so it must not block anyone -- including a different
+            # Xagent user -- from installing this workspace again.
+            if reusable_dead_row is None and int(channel.user_id) == user_id:
+                reusable_dead_row = channel
+            continue
+        if int(channel.user_id) != user_id:
+            raise ValueError(
+                "This Slack workspace is already connected to another Xagent user"
+            )
+        existing = channel
+        break
+    if existing is None:
+        existing = reusable_dead_row
 
     existing_config = existing.config if existing is not None else {}
     enterprise = token_data.get("enterprise")
@@ -344,7 +355,14 @@ def _upsert_slack_oauth_channel(
         authed_user = token_data.get("authed_user")
         authed_user_data = authed_user if isinstance(authed_user, dict) else {}
         installer_id = str(authed_user_data.get("id") or "")
-        allowed_users = [installer_id] if installer_id else None
+        if not installer_id:
+            # Falling back to None here would mean allow-all for the whole
+            # workspace, which is the opposite of the intended default.
+            raise ValueError(
+                "Slack did not identify the installing user, so access could "
+                "not be restricted to them. Please retry the installation."
+            )
+        allowed_users = [installer_id]
     config = {
         "installation_mode": "oauth",
         "bot_token": access_token,
@@ -472,14 +490,28 @@ async def slack_oauth_callback(
             status_code=400,
         )
 
-    # Atomically claim the single-use nonce so a replayed (or forwarded)
-    # state is rejected after its first presentation.
     nonce = str(state_payload.get("nonce") or "")
+    state_user_id = state_payload.get("user_id")
+    # The browser that completes this callback is NOT verified to be the one
+    # that called /oauth/start: an attacker can send their own fresh
+    # authorize_url to a victim, and the victim's consent then binds their
+    # workspace to the attacker's user_id (install CSRF). Closing that needs a
+    # browser binding, which a cookie cannot provide while CORS runs with
+    # allow_origins=["*"] -- the first /oauth/start response carries
+    # Access-Control-Allow-Origin: * so the browser refuses to store a
+    # Set-Cookie from it, breaking cross-origin installs outright. Tracked
+    # separately; the claim below only makes a state single-use.
+    #
+    # Atomically claim the nonce so a replayed state is rejected after its
+    # first presentation. The row's user_id must also match the state's, so a
+    # tampered pairing cannot survive even if the JWT signature check were
+    # ever loosened.
     claim_time = datetime.now(timezone.utc)
     claimed = (
         db.query(SlackOAuthFlowState)
         .filter(
             SlackOAuthFlowState.nonce == nonce,
+            SlackOAuthFlowState.user_id == state_user_id,
             SlackOAuthFlowState.consumed_at.is_(None),
             SlackOAuthFlowState.expires_at > claim_time,
         )
@@ -487,7 +519,7 @@ async def slack_oauth_callback(
             {SlackOAuthFlowState.consumed_at: claim_time},
             synchronize_session=False,
         )
-        if nonce
+        if state_user_id is not None
         else 0
     )
     if claimed != 1:
@@ -548,9 +580,7 @@ async def slack_oauth_callback(
                 str(token_data.get("error") or "Slack token exchange failed")
             )
 
-        state_user_id = state_payload.get("user_id")
-        if state_user_id is None:
-            raise ValueError("Slack OAuth state is missing the Xagent user")
+        # Already validated against the claimed flow row above.
         user_id = int(state_user_id)
         if db.query(User.id).filter(User.id == user_id).first() is None:
             raise ValueError(

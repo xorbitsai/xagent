@@ -12,7 +12,6 @@ from ....core.file_ref import parse_file_id_ref
 class SlackFileRef:
     file_id: str
     label: str
-    is_image: bool = False
 
 
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
@@ -32,11 +31,7 @@ def strip_slack_file_refs(text: str) -> tuple[str, list[SlackFileRef]]:
         if not file_id:
             return match.group(0)
         refs.append(
-            SlackFileRef(
-                file_id=file_id,
-                label=match.group(1).strip() or "image",
-                is_image=True,
-            )
+            SlackFileRef(file_id=file_id, label=match.group(1).strip() or "image")
         )
         return ""
 
@@ -84,10 +79,21 @@ def markdown_to_slack(text: str) -> str:
 
     def replace_link(match: re.Match[str]) -> str:
         label = match.group(1)
-        url = html.unescape(match.group(2))
+        # The URL is unescaped so entity-encoded query separators (&amp; ->
+        # &) survive, which reopens the escaping applied to the whole text.
+        # mrkdwn control characters must therefore be neutralized again:
+        # a raw '>' would close this token early and let the remainder of
+        # the URL be parsed as new mrkdwn -- including a live <!channel>
+        # broadcast -- and a raw '|' would forge the label separator.
+        url = _neutralize_mrkdwn_controls(html.unescape(match.group(2)))
         return f"<{url}|{label}>"
 
     return _MARKDOWN_LINK_RE.sub(replace_link, escaped)
+
+
+def _neutralize_mrkdwn_controls(url: str) -> str:
+    """Percent-encode the characters that delimit a Slack ``<url|label>`` token."""
+    return url.replace("<", "%3C").replace(">", "%3E").replace("|", "%7C")
 
 
 class SlackFileUrlError(ValueError):

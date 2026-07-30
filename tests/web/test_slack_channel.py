@@ -66,13 +66,40 @@ def test_slack_markdown_and_file_refs_are_projected_for_transport() -> None:
     )
 
     assert text == "Done"
-    assert [(ref.file_id, ref.label, ref.is_image) for ref in refs] == [
-        ("image-1", "chart", True),
-        ("report-1", "report", False),
+    assert [(ref.file_id, ref.label) for ref in refs] == [
+        ("image-1", "chart"),
+        ("report-1", "report"),
     ]
     assert markdown_to_slack("**Done** [docs](https://example.com?a=1&b=2)") == (
         "*Done* <https://example.com?a=1&b=2|docs>"
     )
+
+
+@pytest.mark.parametrize(
+    ("payload", "forbidden"),
+    [
+        # A raw '>' inside the link URL would close the mrkdwn token early and
+        # let the rest be parsed as a live @channel broadcast.
+        ("[x](https://a.com|hack><!channel>)", "<!channel>"),
+        ("[x](https://a.com|hack><!here>)", "<!here>"),
+        ("[x](https://a.com|hack><!everyone>)", "<!everyone>"),
+        # A raw '|' would forge the label separator.
+        ("[x](https://a.com|<@U123>)", "<@U123>"),
+    ],
+)
+def test_markdown_link_cannot_inject_mrkdwn_control_tokens(
+    payload: str, forbidden: str
+) -> None:
+    converted = markdown_to_slack(payload)
+
+    assert forbidden not in converted
+    # Exactly one mrkdwn token: the link itself, with no stray delimiters.
+    assert converted.count("<") == 1
+    assert converted.count(">") == 1
+
+
+def test_markdown_bare_broadcast_text_stays_inert() -> None:
+    assert markdown_to_slack("ping <!channel> now") == "ping &lt;!channel&gt; now"
 
 
 def test_create_slack_channel_encrypts_tokens_and_schedules_sync(
@@ -752,7 +779,151 @@ async def test_app_uninstalled_deactivates_channel(
     await asyncio.sleep(0)
 
     assert bot._accepting is False
-    assert deactivated == [{"channel_id": 7, "clear_config_keys": ("bot_token",)}]
+    # team_id is cleared too, so the dead row cannot block a later reinstall
+    # of the same workspace by any user.
+    assert deactivated == [
+        {"channel_id": 7, "clear_config_keys": ("bot_token", "team_id")}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_keeps_accepting_when_deactivation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+
+    def failing_deactivate(**_kwargs: Any) -> bool:
+        raise RuntimeError("database unavailable")
+
+    async def fake_db_io(func: Any) -> Any:
+        return func()
+
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.deactivate_channel_sync",
+        failing_deactivate,
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.run_db_io_cancellation_safe",
+        fake_db_io,
+    )
+
+    await bot.handle_events_api_payload(
+        {"event_id": "Ev-1", "team_id": "T1", "event": {"type": "app_uninstalled"}}
+    )
+
+    # The row is still active, so a non-accepting instance would look healthy
+    # to the manager's sync diff and never be replaced short of a restart.
+    assert bot._accepting is True
+
+
+@pytest.mark.asyncio
+async def test_tokens_revoked_without_bot_token_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    deactivated: list[dict[str, Any]] = []
+
+    def fake_deactivate(**kwargs: Any) -> bool:
+        deactivated.append(kwargs)
+        return True
+
+    async def fake_db_io(func: Any) -> Any:
+        return func()
+
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.deactivate_channel_sync",
+        fake_deactivate,
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.run_db_io_cancellation_safe",
+        fake_db_io,
+    )
+
+    # Slack sends tokens_revoked for a user-token revocation as well; the bot
+    # token still works, so tearing the integration down would be wrong.
+    await bot.handle_events_api_payload(
+        {
+            "event_id": "Ev-1",
+            "team_id": "T1",
+            "event": {"type": "tokens_revoked", "tokens": {"oauth": ["U1"]}},
+        }
+    )
+
+    assert deactivated == []
+    assert bot._accepting is True
+
+
+def test_deactivated_row_does_not_block_reinstall_by_other_user(
+    tmp_path: Path,
+) -> None:
+    from xagent.web.api.channel import _upsert_slack_oauth_channel
+
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-reinstall.db")
+
+    with SessionLocal() as db:
+        first = User(username="first-owner", password_hash="hash")
+        second = User(username="second-owner", password_hash="hash")
+        db.add_all([first, second])
+        db.commit()
+        db.refresh(first)
+        db.refresh(second)
+
+        # An uninstall left this row deactivated with its token cleared.
+        dead_row = UserChannel(
+            user_id=int(first.id),
+            channel_type="slack",
+            channel_name="Acme",
+            config={
+                "installation_mode": "oauth",
+                "team_id": "T_ACME",
+                "bot_user_id": "U_BOT",
+            },
+            is_active=False,
+        )
+        db.add(dead_row)
+        db.commit()
+
+        channel = _upsert_slack_oauth_channel(
+            db,
+            user_id=int(second.id),
+            token_data={
+                "access_token": "xoxb-new",
+                "team": {"id": "T_ACME", "name": "Acme"},
+                "bot_user_id": "U_BOT2",
+                "authed_user": {"id": "U_INSTALLER2"},
+            },
+        )
+
+        assert int(channel.user_id) == int(second.id)
+        assert bool(channel.is_active) is True
+        assert channel.config["bot_token"] == "xoxb-new"
+    engine.dispose()
+
+
+def test_missing_authed_user_rejects_install(tmp_path: Path) -> None:
+    from xagent.web.api.channel import _upsert_slack_oauth_channel
+
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-no-installer.db")
+
+    with SessionLocal() as db:
+        user = User(username="installer-missing", password_hash="hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        # Falling back to allowed_users=None here would open the channel to
+        # the entire workspace.
+        with pytest.raises(ValueError, match="installing user"):
+            _upsert_slack_oauth_channel(
+                db,
+                user_id=int(user.id),
+                token_data={
+                    "access_token": "xoxb-new",
+                    "team": {"id": "T_NEW", "name": "NewCo"},
+                    "bot_user_id": "U_BOT",
+                },
+            )
+    engine.dispose()
 
 
 @pytest.mark.asyncio

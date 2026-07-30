@@ -1,7 +1,7 @@
 """add slack oauth flow states table
 
 Revision ID: 20260730_add_slack_oauth_flow_states
-Revises: 20260725_add_uploaded_file_recovery_index
+Revises: 20260724_add_upload_source_to_uploaded_files
 Create Date: 2026-07-30 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260730_add_slack_oauth_flow_states"
-down_revision: Union[str, None] = "20260725_add_uploaded_file_recovery_index"
+down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

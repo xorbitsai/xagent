@@ -1,0 +1,373 @@
+import json
+from unittest.mock import Mock
+
+import pytest
+import requests
+
+from xagent.web.tools.mcp import google_analytics
+
+
+class MockResponse:
+    def __init__(self, json_data=None, text="", status_code=200):
+        self._json_data = json_data if json_data is not None else {}
+        self.text = text or (json.dumps(self._json_data) if json_data else "")
+        self.status_code = status_code
+        self.content = self.text.encode()
+
+    def json(self):
+        return self._json_data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
+
+
+@pytest.fixture(autouse=True)
+def _credentials(monkeypatch):
+    monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "access-token")
+
+
+def test_headers_require_access_token(monkeypatch):
+    monkeypatch.delenv("GOOGLE_ACCESS_TOKEN")
+
+    with pytest.raises(ValueError, match="GOOGLE_ACCESS_TOKEN"):
+        google_analytics._headers()
+
+
+def test_headers_include_bearer_token():
+    headers = google_analytics._headers()
+
+    assert headers["Authorization"] == "Bearer access-token"
+
+
+def test_normalize_property_id_accepts_bare_numeric():
+    assert google_analytics._normalize_property_id("123456") == "123456"
+
+
+def test_normalize_property_id_strips_resource_prefix():
+    assert google_analytics._normalize_property_id("properties/123456") == "123456"
+
+
+def test_normalize_property_id_rejects_non_numeric():
+    with pytest.raises(ValueError, match="property_id"):
+        google_analytics._normalize_property_id("123/../456")
+
+
+def test_normalize_property_id_rejects_empty_after_prefix():
+    with pytest.raises(ValueError, match="property_id"):
+        google_analytics._normalize_property_id("properties/")
+
+
+def test_request_wraps_http_error_with_google_error_message(monkeypatch):
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data={
+                    "error": {
+                        "code": 400,
+                        "message": "Field sessions is not a valid metric.",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="not a valid metric"):
+        google_analytics._request(
+            "POST", f"{google_analytics.DATA_API_BASE_URL}/properties/1:runReport"
+        )
+
+
+def test_request_falls_back_to_raw_text_for_unstructured_error_body(monkeypatch):
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="upstream 500")),
+    )
+
+    with pytest.raises(RuntimeError, match="upstream 500"):
+        google_analytics._request(
+            "GET", f"{google_analytics.ADMIN_API_BASE_URL}/accountSummaries"
+        )
+
+
+def test_list_properties_flattens_account_summaries(monkeypatch):
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "accountSummaries": [
+                        {
+                            "displayName": "Acme Inc",
+                            "propertySummaries": [
+                                {
+                                    "property": "properties/111",
+                                    "displayName": "Acme Website",
+                                },
+                                {
+                                    "property": "properties/222",
+                                    "displayName": "Acme App",
+                                },
+                            ],
+                        }
+                    ]
+                }
+            )
+        ),
+    )
+
+    result = json.loads(google_analytics.google_analytics_list_properties())
+
+    assert result["status"] == "success"
+    assert result["properties"] == [
+        {
+            "account_name": "Acme Inc",
+            "property_id": "111",
+            "property_display_name": "Acme Website",
+        },
+        {
+            "account_name": "Acme Inc",
+            "property_id": "222",
+            "property_display_name": "Acme App",
+        },
+    ]
+
+
+def test_list_properties_follows_pagination(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    "accountSummaries": [
+                        {
+                            "displayName": "Acme Inc",
+                            "propertySummaries": [
+                                {"property": "properties/111", "displayName": "Site A"}
+                            ],
+                        }
+                    ],
+                    "nextPageToken": "page-2",
+                }
+            ),
+            MockResponse(
+                json_data={
+                    "accountSummaries": [
+                        {
+                            "displayName": "Acme Inc",
+                            "propertySummaries": [
+                                {"property": "properties/222", "displayName": "Site B"}
+                            ],
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(google_analytics.google_analytics_list_properties())
+
+    assert result["status"] == "success"
+    assert [p["property_id"] for p in result["properties"]] == ["111", "222"]
+    assert mock_request.call_count == 2
+    second_call = mock_request.call_args_list[1]
+    assert second_call.kwargs["params"]["pageToken"] == "page-2"
+
+
+def test_list_properties_handles_account_without_properties(monkeypatch):
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"accountSummaries": [{"displayName": "Empty Account"}]}
+            )
+        ),
+    )
+
+    result = json.loads(google_analytics.google_analytics_list_properties())
+
+    assert result["status"] == "success"
+    assert result["properties"] == []
+
+
+def test_list_properties_returns_error_payload_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=403,
+                json_data={"error": {"message": "insufficient permissions"}},
+            )
+        ),
+    )
+
+    result = json.loads(google_analytics.google_analytics_list_properties())
+
+    assert result["status"] == "error"
+    assert "insufficient permissions" in result["message"]
+
+
+def test_get_metadata_returns_dimensions_and_metrics(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "dimensions": [{"apiName": "country"}],
+                "metrics": [{"apiName": "sessions"}],
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(google_analytics.google_analytics_get_metadata("properties/42"))
+
+    assert result["status"] == "success"
+    assert result["dimensions"] == [{"apiName": "country"}]
+    assert result["metrics"] == [{"apiName": "sessions"}]
+    assert mock_request.call_args.kwargs["url"].endswith("/properties/42/metadata")
+
+
+def test_get_metadata_rejects_invalid_property_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(google_analytics.google_analytics_get_metadata("not-a-number"))
+
+    assert result["status"] == "error"
+    assert "property_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_run_report_builds_body_and_returns_rows(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "dimensionHeaders": [{"name": "sessionDefaultChannelGroup"}],
+                "metricHeaders": [{"name": "sessions", "type": "TYPE_INTEGER"}],
+                "rows": [
+                    {
+                        "dimensionValues": [{"value": "Organic Search"}],
+                        "metricValues": [{"value": "1200"}],
+                    }
+                ],
+                "rowCount": 1,
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "properties/42",
+            metrics=["sessions", "conversions"],
+            date_ranges=[
+                {
+                    "start_date": "2026-07-01",
+                    "end_date": "2026-07-28",
+                    "name": "current",
+                },
+                {
+                    "start_date": "2026-06-03",
+                    "end_date": "2026-06-30",
+                    "name": "previous",
+                },
+            ],
+            dimensions=["sessionDefaultChannelGroup"],
+            limit=50,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["row_count"] == 1
+    assert result["rows"][0]["metricValues"] == [{"value": "1200"}]
+
+    call_kwargs = mock_request.call_args.kwargs
+    assert call_kwargs["url"].endswith("/properties/42:runReport")
+    body = call_kwargs["json"]
+    assert body["metrics"] == [{"name": "sessions"}, {"name": "conversions"}]
+    assert body["dateRanges"] == [
+        {"startDate": "2026-07-01", "endDate": "2026-07-28", "name": "current"},
+        {"startDate": "2026-06-03", "endDate": "2026-06-30", "name": "previous"},
+    ]
+    assert body["dimensions"] == [{"name": "sessionDefaultChannelGroup"}]
+    assert body["limit"] == "50"
+    assert "dimensionFilter" not in body
+    assert "orderBys" not in body
+
+
+def test_run_report_passes_through_filter_and_order(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    dimension_filter = {
+        "filter": {
+            "fieldName": "sessionCampaignName",
+            "stringFilter": {"value": "summer-sale"},
+        }
+    }
+    order_bys = [{"metric": {"metricName": "sessions"}, "desc": True}]
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            dimension_filter=dimension_filter,
+            order_bys=order_bys,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["rows"] == []
+    body = mock_request.call_args.kwargs["json"]
+    assert body["dimensionFilter"] == dimension_filter
+    assert body["orderBys"] == order_bys
+    assert body["dateRanges"] == [{"startDate": "7daysAgo", "endDate": "today"}]
+
+
+def test_run_report_rejects_invalid_property_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42; DROP TABLE",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "property_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_run_report_returns_error_payload_on_api_failure(monkeypatch):
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data={"error": {"message": "bad metric name"}},
+            )
+        ),
+    )
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["not-real"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "bad metric name" in result["message"]

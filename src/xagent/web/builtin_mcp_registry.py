@@ -257,6 +257,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "google-analytics",
+            "name": "Google Analytics",
+            "description": "Connect to Google Analytics (GA4) to list properties and run performance reports.",
+            "icon": "https://www.google.com/s2/favicons?domain=analytics.google.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "google",
+            "category": "Marketing",
+            "oauth_scopes": ["https://www.googleapis.com/auth/analytics.readonly"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_analytics"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "hubspot",
             "name": "HubSpot",
             "description": "Connect to HubSpot CRM to search, create, and update contacts and companies, read deals, and log notes.",

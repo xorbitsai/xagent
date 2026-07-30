@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import itertools
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -252,6 +253,9 @@ def _create_gmail_oauth(db, user: User) -> UserOAuth:
     return oauth
 
 
+_gmail_trigger_agent_names = itertools.count(1)
+
+
 def _create_gmail_trigger(
     db,
     user: User,
@@ -261,7 +265,7 @@ def _create_gmail_trigger(
 ) -> AgentTrigger:
     agent = Agent(
         user_id=int(user.id),
-        name="Gmail trigger agent",
+        name=f"Gmail trigger agent {next(_gmail_trigger_agent_names)}",
         description="test",
         instructions="Handle Gmail.",
         execution_mode="balanced",

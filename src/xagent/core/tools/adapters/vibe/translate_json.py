@@ -382,7 +382,7 @@ async def create_translate_json_tool(config: "BaseToolConfig") -> List[Any]:
     if workspace_config:
         from .factory import ToolFactory
 
-        workspace = ToolFactory._create_workspace(workspace_config)
+        workspace = ToolFactory.create_workspace(workspace_config)
 
     try:
         # Create tool with LLM and workspace

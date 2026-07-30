@@ -1166,7 +1166,7 @@ class WebToolConfig(BaseToolConfig):
         # Use uploads dir if workspace_base_dir not explicitly provided
         if workspace_base_dir is None:
             workspace_base_dir = str(get_uploads_dir())
-        # Ensure base_dir is in workspace_config (required by ToolFactory._create_workspace)
+        # Ensure base_dir is in workspace_config (required by ToolFactory.create_workspace)
         if "base_dir" not in workspace_config:
             workspace_config["base_dir"] = workspace_base_dir
         if self._user_id is not None and "user_id" not in workspace_config:

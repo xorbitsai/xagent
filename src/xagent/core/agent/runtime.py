@@ -60,39 +60,23 @@ async def prepare_llm_for_context(
     """Resolve virtual models before compaction and apply their context window.
 
     Models without a per-call preparation hook are returned unchanged.
-    RouterLLM exposes an explicit modality-aware hook and returns a one-call
-    wrapper for the concrete xrouter selection, ensuring the selected model is
-    reused after compaction instead of routing twice. Legacy virtual models keep
-    their original one-argument ``prepare_for_call(messages)`` contract.
+    RouterLLM implements the hook and returns a one-call wrapper for the
+    concrete xrouter selection, ensuring the selected model is reused after
+    compaction instead of routing twice.
     """
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
-    prepare_with_modalities = getattr(
-        llm,
-        "prepare_for_call_with_modalities",
-        None,
-    )
-    if callable(prepare) or callable(prepare_with_modalities):
+    if callable(prepare):
         metadata = getattr(context, "metadata", None)
         preferred_modalities = normalize_input_modalities(
             ()
             if not metadata or not isinstance(metadata, Mapping)
             else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
         )
-        if callable(prepare_with_modalities):
-            prepared = prepare_with_modalities(
-                messages,
-                preferred_input_modalities=preferred_modalities,
-            )
-        elif callable(prepare):
-            if preferred_modalities:
-                logger.debug(
-                    "LLM %s exposes only legacy prepare_for_call; ignoring "
-                    "preferred input modalities %s",
-                    type(llm).__name__,
-                    preferred_modalities,
-                )
-            prepared = prepare(messages)
+        prepared = prepare(
+            messages,
+            preferred_input_modalities=preferred_modalities,
+        )
         if inspect.isawaitable(prepared):
             prepared = await prepared
 

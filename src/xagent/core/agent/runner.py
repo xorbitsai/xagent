@@ -633,10 +633,11 @@ class AgentRunner:
         if metadata is None:
             return
         if restored:
-            if PREFERRED_INPUT_MODALITIES_METADATA_KEY not in metadata:
-                return
+            # Symmetric with the fresh-context branch below: the current run's
+            # metadata is authoritative for the modality preference, so an
+            # absent key clears any checkpointed value rather than keeping it.
             preferred_modalities = normalize_input_modalities(
-                metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY]
+                metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
             )
             if preferred_modalities:
                 context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 PREFERRED_INPUT_MODALITIES_METADATA_KEY = "preferred_input_modalities"
@@ -18,6 +18,12 @@ MAX_TASK_RUNTIME_JSON_BYTES = 64 * 1024
 MAX_TASK_RUNTIME_ENVIRONMENT_BYTES = 64 * 1024
 MAX_TASK_RUNTIME_TOOLS = 64
 MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES = 256 * 1024
+# Aggregate cap on one create request's runtime-extension configurations. The
+# per-extension MAX_TASK_RUNTIME_JSON_BYTES cap alone leaves the total
+# unbounded (MAX_TASK_RUNTIME_EXTENSIONS x 64 KiB is ~1 MiB), so the create
+# path bounds the whole payload the way the public-metadata read path bounds
+# the whole response.
+MAX_TASK_RUNTIME_REQUEST_BYTES = 256 * 1024
 
 
 class TaskRuntimeClientError(Exception):
@@ -68,19 +74,39 @@ class TaskRuntimeContribution:
 
     ``environment`` is non-secret system context describing the selected
     resource and how the agent should use it. ``preferred_input_modalities`` is
-    a routing preference, not a hard model requirement.
+    a routing preference, not a hard model requirement: a router that cannot
+    honour it degrades by routing without it. Only modalities the conversation
+    itself carries are enforced as hard requirements.
+
+    ``tools``, ``environment`` and ``preferred_input_modalities`` are the only
+    provider-owned fields. The remaining three are registry-internal
+    bookkeeping: a provider *may* set them because ``frozen=True`` only blocks
+    post-init mutation, but ``normalize_task_runtime_contribution`` strips them
+    from every provider-returned value, so setting them has no effect and
+    cannot be used to misattribute tools to another provider.
     """
 
     tools: tuple[Any, ...] = ()
     environment: str | None = None
     preferred_input_modalities: tuple[str, ...] = ()
-    # Populated by the registry merge for filtering diagnostics. Providers do
-    # not need to set this field themselves.
+    # Populated by the registry merge for filtering diagnostics. Registry
+    # bookkeeping: a provider-set value is discarded by normalization.
     tool_origins: tuple[tuple[str, str], ...] = ()
     # Detached per-provider contributions retained by the registry merge so
     # policy filtering can remove a provider's prompt context when none of its
-    # tools survive. Providers do not set this field themselves.
+    # tools survive. Registry bookkeeping: a provider-set value is discarded
+    # by normalization.
     provider_contributions: tuple[tuple[str, "TaskRuntimeContribution"], ...] = ()
+    # Registry-internal back-reference: on a policy-narrowed view this is the
+    # full pre-policy contribution the view was derived from. Tool policy can
+    # widen again on a later turn, so every rebuild must re-derive from the
+    # full contribution instead of re-narrowing an already-narrowed value,
+    # which would lose filtered tools permanently. Excluded from equality and
+    # repr so a narrowed view still compares as the plain contribution it is.
+    # Registry bookkeeping: a provider-set value is discarded by normalization.
+    source_contribution: "TaskRuntimeContribution | None" = field(
+        default=None, compare=False, repr=False
+    )
 
 
 EMPTY_TASK_RUNTIME_CONTRIBUTION = TaskRuntimeContribution()
@@ -181,11 +207,19 @@ def normalize_task_runtime_contribution(
             f"Task runtime contribution exceeds the {MAX_TASK_RUNTIME_TOOLS}-tool limit"
         )
     modalities = normalize_input_modalities(value.preferred_input_modalities)
+    # ``tool_origins``, ``provider_contributions`` and ``source_contribution``
+    # are registry-internal bookkeeping. ``frozen=True`` only blocks post-init
+    # mutation, so nothing at the type level stops an out-of-tree provider from
+    # passing fabricated entries to the constructor -- entries that would
+    # misattribute its tools to another provider and mislead the attribution
+    # guard in ``ToolFactory._create_all_tools_prepared``. Normalization is the
+    # trust boundary: they are dropped here unconditionally and re-derived from
+    # the tools the provider actually handed over by
+    # ``merge_task_runtime_contributions``.
     return TaskRuntimeContribution(
         tools=tools,
         environment=environment,
         preferred_input_modalities=modalities,
-        tool_origins=tuple(value.tool_origins),
     )
 
 
@@ -236,79 +270,76 @@ def merge_task_runtime_contributions(
     )
 
 
+def full_task_runtime_contribution(
+    contribution: TaskRuntimeContribution,
+) -> TaskRuntimeContribution:
+    """Return the pre-policy contribution a possibly narrowed view came from.
+
+    Tool policy can widen again between turns, so callers that rebuild tools
+    must start from the full contribution. Re-narrowing an already-narrowed
+    value would make every policy filter permanent for the lifetime of the
+    cached configuration.
+    """
+
+    source = contribution.source_contribution
+    return source if isinstance(source, TaskRuntimeContribution) else contribution
+
+
 def reconcile_task_runtime_contribution_tools(
     contribution: TaskRuntimeContribution,
     *,
-    available_tool_names: set[str] | None = None,
-    available_tools: Sequence[Any] | None = None,
+    available_tools: Sequence[Any],
     reserved_tool_names: set[str] | None = None,
 ) -> tuple[TaskRuntimeContribution, tuple[TaskRuntimeToolConflict, ...]]:
     """Apply tool policy and isolate providers whose surviving names collide.
 
-    Exactly one survivor view must be supplied:
-
-    ``available_tools`` is the preferred, structured form: the accepted tool
-    *occurrences* that survived the task's selection and user policy, matched
-    back to their owning provider by object identity. Identity matching is
+    ``available_tools`` is the accepted tool *occurrences* that survived the
+    task's selection and user policy, matched back to their owning provider by
+    object identity. Identity matching — rather than matching by name — is
     required because a tool the caller already rejected (for example a
     contribution without a usable tool category) may share its ``name`` with a
     different provider's accepted tool; name matching would then let the
     rejected object claim the name and evict the tool that actually survived.
-
-    ``available_tool_names`` is the legacy, name-only fallback for callers whose
-    survivor objects are not the ones stored on ``contribution`` (so identity
-    cannot be compared at all).
 
     ``reserved_tool_names`` contains core tool names that survived the same
     policy. Providers are considered in registry order; a provider with any
     collision is removed as one unit so its prompt environment and modality
     preference cannot describe tools that were discarded. A provider left with
     no surviving tool is removed for the same reason.
+
+    ``contribution`` may itself be a previously narrowed view; reconciliation
+    always re-derives from its full pre-policy source so a policy that widens
+    again restores the tools, prompt text and provider entries it had removed.
+    The returned view carries that full contribution forward.
     """
 
-    if (available_tool_names is None) == (available_tools is None):
-        raise ValueError(
-            "Provide exactly one of 'available_tools' or 'available_tool_names'"
-        )
+    full_contribution = full_task_runtime_contribution(contribution)
 
-    if not contribution.provider_contributions:
-        return contribution, ()
+    if not full_contribution.provider_contributions:
+        return full_contribution, ()
 
     # Occurrence counts, not a bare identity set: two providers may legitimately
     # contribute the same tool object, and each accepted occurrence belongs to
     # exactly one of them.
-    remaining_available_occurrences = (
-        Counter(id(tool) for tool in available_tools)
-        if available_tools is not None
-        else None
-    )
-    # Bound to a separate name: ``surviving_names`` below is rebound per provider.
-    available_names = (
-        available_tool_names if available_tool_names is not None else set()
-    )
+    remaining_available_occurrences = Counter(id(tool) for tool in available_tools)
 
     retained: dict[str, TaskRuntimeContribution] = {}
     conflicts: list[TaskRuntimeToolConflict] = []
     claimed_names = set(reserved_tool_names or ())
-    for provider_name, provider_contribution in contribution.provider_contributions:
+    for (
+        provider_name,
+        provider_contribution,
+    ) in full_contribution.provider_contributions:
         provider_tools = tuple(provider_contribution.tools)
         if not provider_tools:
             retained[provider_name] = provider_contribution
             continue
-        if remaining_available_occurrences is not None:
-            accepted: list[Any] = []
-            for tool in provider_tools:
-                if remaining_available_occurrences[id(tool)] > 0:
-                    remaining_available_occurrences[id(tool)] -= 1
-                    accepted.append(tool)
-            surviving_tools = tuple(accepted)
-        else:
-            surviving_tools = tuple(
-                tool
-                for tool in provider_tools
-                if isinstance((name := getattr(tool, "name", None)), str)
-                and name in available_names
-            )
+        accepted: list[Any] = []
+        for tool in provider_tools:
+            if remaining_available_occurrences[id(tool)] > 0:
+                remaining_available_occurrences[id(tool)] -= 1
+                accepted.append(tool)
+        surviving_tools = tuple(accepted)
         if not surviving_tools:
             continue
 
@@ -342,4 +373,6 @@ def reconcile_task_runtime_contribution_tools(
         if retained
         else EMPTY_TASK_RUNTIME_CONTRIBUTION
     )
-    return reconciled, tuple(conflicts)
+    # Keep the full contribution reachable from the narrowed view so a later,
+    # more permissive policy can restore what this pass filtered out.
+    return replace(reconciled, source_contribution=full_contribution), tuple(conflicts)

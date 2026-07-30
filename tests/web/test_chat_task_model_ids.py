@@ -1239,7 +1239,7 @@ def test_filtered_runtime_provider_environment_is_not_added_to_system_prompt():
 
     filtered, _conflicts = reconcile_task_runtime_contribution_tools(
         contribution,
-        available_tool_names=set(),
+        available_tools=(),
     )
     tool_config = ToolConfig({})
     tool_config.get_task_runtime_contribution = lambda: filtered
@@ -1585,6 +1585,55 @@ def test_task_runtime_extension_compensation_failure_preserves_client_error(
         unregister_task_extension("test_runtime")
 
 
+def test_create_task_records_runtime_extension_bindings_for_deletion(
+    test_db,
+    user1_headers,
+):
+    """End-to-end: create records the binding, delete dispatches on it.
+
+    Without a persisted binding record the delete path has no way to tell which
+    providers own state for this task, and would have to fall back to the whole
+    process-wide registry.
+    """
+
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        task_extension_bindings_from_agent_config,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+    register_task_extension("test_runtime", provider)
+    try:
+        created = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "bound task",
+                "runtime_extensions": {"test_runtime": {"target": "one"}},
+            },
+            headers=user1_headers,
+        )
+        assert created.status_code == 200, created.text
+        task_id = int(created.json()["task_id"])
+
+        db = next(get_db())
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert task_extension_bindings_from_agent_config(task.agent_config) == (
+                "test_runtime",
+            )
+        finally:
+            db.close()
+
+        deleted = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert deleted.status_code == 200, deleted.text
+        assert ("deleted", task_id) in provider.events
+    finally:
+        unregister_task_extension("test_runtime")
+
+
 def test_delete_task_reports_concurrent_disappearance(
     test_db,
     user1_headers,
@@ -1623,6 +1672,7 @@ def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
     from xagent.web.models.task import Task
     from xagent.web.models.user import User
     from xagent.web.services.task_runtime import (
+        agent_config_with_task_extension_bindings,
         register_task_extension,
         unregister_task_extension,
     )
@@ -1632,7 +1682,16 @@ def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
     db = next(get_db())
     try:
         user = db.query(User).filter(User.username == "user1").one()
-        task = Task(user_id=user.id, title="retry delete", description="")
+        # Cleanup dispatch is filtered by the task's binding record, so the
+        # task has to actually claim the provider for this retry to exercise it.
+        task = Task(
+            user_id=user.id,
+            title="retry delete",
+            description="",
+            agent_config=agent_config_with_task_extension_bindings(
+                {}, ["test_runtime"]
+            ),
+        )
         db.add(task)
         db.commit()
         task_id = int(task.id)
@@ -1675,6 +1734,7 @@ def test_delete_task_runtime_cleanup_failure_preserves_task_for_retry(
     from xagent.web.models.task import Task
     from xagent.web.models.user import User
     from xagent.web.services.task_runtime import (
+        agent_config_with_task_extension_bindings,
         register_task_extension,
         unregister_task_extension,
     )
@@ -1689,7 +1749,14 @@ def test_delete_task_runtime_cleanup_failure_preserves_task_for_retry(
     db = next(get_db())
     try:
         user = db.query(User).filter(User.username == "user1").one()
-        task = Task(user_id=user.id, title="preserve for retry", description="")
+        task = Task(
+            user_id=user.id,
+            title="preserve for retry",
+            description="",
+            agent_config=agent_config_with_task_extension_bindings(
+                {}, ["failing_runtime"]
+            ),
+        )
         db.add(task)
         db.commit()
         task_id = int(task.id)

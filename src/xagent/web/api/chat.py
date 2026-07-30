@@ -111,11 +111,13 @@ from ..services.task_lease_service import (
 )
 from ..services.task_runtime import (
     TaskRuntimeExtensionError,
+    agent_config_with_task_extension_bindings,
     build_task_runtime,
     create_task_extensions,
     delete_task_extensions,
     get_task_runtime_public_metadata,
     registered_task_extensions,
+    task_extension_bindings_from_agent_config,
     validate_task_extension_requests,
 )
 from ..services.task_setup_snapshot import (
@@ -668,9 +670,7 @@ async def create_default_tools(
                 ToolFactory.create_workspace,
                 tool_config.get_workspace_config(),
             )
-            workspace_setter = getattr(tool_config, "set_task_runtime_workspace", None)
-            if callable(workspace_setter):
-                workspace_setter(workspace)
+            tool_config.set_task_runtime_workspace(workspace)
             runtime_contribution = await build_task_runtime(
                 task_runtime_context.with_workspace(workspace)
             )
@@ -754,8 +754,12 @@ def _load_task_delete_snapshot_sync(
     task_id: int,
     requester_user_id: int,
     is_admin: bool,
-) -> tuple[str, int, Any] | None:
-    """Load detached delete inputs without sharing the request session."""
+) -> tuple[str, int, Any, tuple[str, ...]] | None:
+    """Load detached delete inputs without sharing the request session.
+
+    The fourth element is the task's runtime-extension binding record, so
+    provider cleanup dispatches only to providers this task actually bound to.
+    """
 
     session_factory = get_session_local()
     delete_db = session_factory()
@@ -766,7 +770,12 @@ def _load_task_delete_snapshot_sync(
         task = query.first()
         if task is None:
             return None
-        return str(task.title), int(task.user_id), task.source
+        return (
+            str(task.title),
+            int(task.user_id),
+            task.source,
+            task_extension_bindings_from_agent_config(task.agent_config),
+        )
     finally:
         delete_db.close()
 
@@ -2513,6 +2522,7 @@ class AgentServiceManager:
                 with UserContext(runtime_user_id):
                     # Unpack tools and tool_config from create_default_tools
                     tools_list, tool_config = tools
+
                     # Get system prompt from agent config (if available)
                     from .agents import enhance_system_prompt_with_kb
 
@@ -2528,6 +2538,7 @@ class AgentServiceManager:
                     system_prompt = _build_workforce_system_prompt(
                         system_prompt, workforce_runtime
                     )
+
                     # Extract memory similarity threshold from agent config
                     memory_similarity_threshold = None
                     if agent_config and "memory_similarity_threshold" in agent_config:
@@ -3299,6 +3310,7 @@ class AgentServiceManager:
                 scope=scope,
                 task_setup_snapshot=snapshot,
             )
+
             from .agents import enhance_system_prompt_with_kb
 
             agent_config = snapshot.agent_config
@@ -3434,6 +3446,17 @@ async def create_task(
     """Create new chat task"""
     try:
         try:
+            # Pre-flight only. ``create_task_extensions`` validates again below,
+            # and both calls are needed:
+            #  * here, so an unregistered extension or an oversized
+            #    configuration is a 400 *before* the ``Task`` row is committed
+            #    and has to be compensated away again;
+            #  * there, because the service layer is the SSOT: SDK and internal
+            #    callers reach ``create_task_extensions`` without ever passing
+            #    through this endpoint, and it re-reads the registry immediately
+            #    before dispatching, so an extension unregistered between the
+            #    two points is rejected instead of dispatched.
+            # Do not delete either call as a "duplicate".
             runtime_extension_requests = validate_task_extension_requests(
                 request.runtime_extensions
             )
@@ -3770,6 +3793,22 @@ async def create_task(
                     {UploadedFile.task_id: int(task.id)},
                     synchronize_session=False,
                 )
+            )
+
+        if runtime_extension_requests:
+            # Record which providers this task binds to *before* any hook runs,
+            # in the same transaction that creates the task. Deletion dispatches
+            # only to this set, so over-recording (a provider whose hook never
+            # completed) is safe -- ``on_task_deleted`` is required to be
+            # idempotent -- while under-recording would silently leak
+            # provider-owned state.
+            setattr(
+                task,
+                "agent_config",
+                agent_config_with_task_extension_bindings(
+                    task.agent_config,
+                    runtime_extension_requests.keys(),
+                ),
             )
 
         db.commit()
@@ -4368,7 +4407,29 @@ async def get_task_runtime_extensions(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Return live, provider-approved runtime metadata for one task."""
+    """Return live, provider-approved runtime metadata for one task.
+
+    Metadata is re-read from every registered runtime extension on each call
+    rather than served from the task row, so it reflects provider state now
+    instead of at creation time. Only fields a provider explicitly publishes
+    are returned; provider-internal state and secrets are never exposed.
+
+    Access follows normal task ownership: an admin may read any task, other
+    users only their own, and an unreadable or missing task is a 404.
+
+    Unlike ``POST /task/create``, where metadata is optional decoration, this
+    endpoint is fail-closed: a provider error is surfaced as its approved
+    client error (400/403) or a generic 500, never as partial data.
+
+    Response fields:
+        ``task_id``: the task the metadata belongs to.
+        ``runtime_extensions``: extension name to that provider's public
+            metadata object.
+        ``runtime_extensions_status``: ``complete`` when every registered
+            provider's metadata is included, ``truncated`` when some was
+            dropped to keep the response under its aggregate size cap.
+        ``runtime_extensions_omitted``: names dropped for that size cap.
+    """
 
     query = db.query(Task).filter(Task.id == task_id)
     if not user.is_admin:
@@ -4409,22 +4470,33 @@ async def get_task_runtime_extensions(
 async def delete_task(
     task_id: int,
     request: Any = None,
+    # Admin escape hatch: delete the core task rows even when a runtime
+    # extension that owns state for this task fails to release it. A plain
+    # default (not ``Query(...)``) keeps this callable directly from internal
+    # code and tests without picking up a truthy ``Query`` sentinel.
+    force: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Delete a task and all related data"""
     try:
         requester_user_id = int(user.id)
+        is_admin = bool(user.is_admin)
+        if force and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Force delete requires admin access",
+            )
         release_db_connection_if_clean(db)
         task_snapshot = await asyncio.to_thread(
             _load_task_delete_snapshot_sync,
             task_id=task_id,
             requester_user_id=requester_user_id,
-            is_admin=bool(user.is_admin),
+            is_admin=is_admin,
         )
         if task_snapshot is None:
             raise HTTPException(status_code=404, detail="Task not found")
-        task_title, task_user_id, task_source = task_snapshot
+        task_title, task_user_id, task_source, bound_extensions = task_snapshot
         runtime_context = _task_runtime_context(
             task_id=task_id,
             user_id=task_user_id,
@@ -4432,7 +4504,13 @@ async def delete_task(
         )
 
         try:
-            await delete_task_extensions(runtime_context)
+            # Only the providers this task actually bound to are dispatched, so
+            # an unrelated broken extension cannot block deletion.
+            unreleased = await delete_task_extensions(
+                runtime_context,
+                bound_extensions=bound_extensions,
+                force=force,
+            )
         except TaskRuntimeExtensionError as exc:
             logger.error(
                 "Runtime extension cleanup failed; preserving task %s for retry",
@@ -4443,6 +4521,12 @@ async def delete_task(
                 status_code=503,
                 detail=("Runtime extension cleanup failed; the task was not deleted"),
             ) from exc
+        if unreleased:
+            logger.error(
+                "Deleting task %s with unreleased runtime extension state for %s",
+                task_id,
+                ", ".join(unreleased),
+            )
 
         deleted = await asyncio.to_thread(_delete_task_sync, task_id=task_id)
         if not deleted:

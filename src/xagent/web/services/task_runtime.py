@@ -12,7 +12,7 @@ import inspect
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import RLock
@@ -27,6 +27,7 @@ from ...core.task_runtime import (
     MAX_TASK_RUNTIME_EXTENSIONS,
     MAX_TASK_RUNTIME_JSON_BYTES,
     MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
+    MAX_TASK_RUNTIME_REQUEST_BYTES,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     TaskRuntimeExtensionProvider,
@@ -52,6 +53,10 @@ _TASK_RUNTIME_HOOK_TIMEOUT_SECONDS = {
 _task_runtime_hook_executor: ThreadPoolExecutor | None = None
 _task_runtime_hook_executor_lock = RLock()
 _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
+# Reserved ``tasks.agent_config`` key holding the sorted list of runtime
+# extension names one task actually bound to. Reusing the existing JSON column
+# keeps the per-task binding record migration-free.
+TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
 logger = logging.getLogger(__name__)
 
 
@@ -65,13 +70,24 @@ class _ProviderHookRaised:
 class TaskRuntimeExtensionError(RuntimeError):
     """One registered provider failed a lifecycle operation."""
 
-    def __init__(self, extension: str, operation: str, cause: BaseException):
+    def __init__(
+        self,
+        extension: str,
+        operation: str,
+        cause: BaseException,
+        *,
+        unreleased_extensions: tuple[str, ...] = (),
+    ):
         super().__init__(
             f"Task runtime extension '{extension}' failed during {operation}: {cause}"
         )
         self.extension = extension
         self.operation = operation
         self.cause = cause
+        # Bound extensions whose task-owned state is still held. Callers that
+        # persist a per-task binding record narrow it to exactly this set so a
+        # retry does not re-dispatch providers that already released.
+        self.unreleased_extensions = unreleased_extensions or (extension,)
 
 
 @dataclass(frozen=True)
@@ -110,10 +126,13 @@ def _get_task_runtime_hook_executor() -> ThreadPoolExecutor:
 def register_task_extension(
     name: str,
     provider: TaskRuntimeExtensionProvider,
-    *,
-    replace: bool = False,
 ) -> None:
-    """Register one process-wide task runtime provider."""
+    """Register one process-wide task runtime provider.
+
+    Registration is deliberately not idempotent: re-registering a name raises
+    so a second provider cannot silently shadow the first. Replacing a live
+    provider is an ``unregister_task_extension`` followed by a fresh register.
+    """
 
     normalized = _normalize_extension_name(name)
     missing = [
@@ -127,7 +146,7 @@ def register_task_extension(
             + ", ".join(missing)
         )
     with _task_runtime_extensions_lock:
-        if normalized in _task_runtime_extensions and not replace:
+        if normalized in _task_runtime_extensions:
             raise ValueError(
                 f"Task runtime extension '{normalized}' is already registered"
             )
@@ -180,6 +199,17 @@ def validate_task_extension_requests(value: Any) -> dict[str, dict[str, Any]]:
         configuration = dict(raw_configuration)
         _ensure_json_compatible(configuration, label=f"'{name}' configuration")
         normalized[name] = configuration
+        # Aggregate cap, checked as each entry is added the same way the
+        # public-metadata read path bounds its aggregate response. The
+        # per-extension cap above bounds one entry; without this, the entry
+        # count limit still admits MAX_TASK_RUNTIME_EXTENSIONS x 64 KiB.
+        # Unlike the read path this rejects rather than omits: an accepted
+        # create request must bind exactly what the caller asked for.
+        if _json_encoded_size(normalized) > MAX_TASK_RUNTIME_REQUEST_BYTES:
+            raise ValueError(
+                "runtime_extensions configurations exceed the "
+                f"{MAX_TASK_RUNTIME_REQUEST_BYTES}-byte limit"
+            )
     return normalized
 
 
@@ -302,16 +332,58 @@ async def get_task_runtime_public_metadata(
     )
 
 
-async def delete_task_extensions(context: TaskRuntimeContext) -> None:
+async def delete_task_extensions(
+    context: TaskRuntimeContext,
+    *,
+    bound_extensions: Iterable[str],
+    force: bool = False,
+) -> tuple[str, ...]:
     """Release provider-owned state before the core task row is deleted.
 
-    All providers are attempted even when one fails. A combined extension error
-    is raised afterwards so callers can log cleanup failures and decide whether
-    to continue deleting the core task.
+    Only providers listed in ``bound_extensions`` -- the per-task binding record
+    written when the task was created -- are dispatched. Deletion is therefore
+    fail-closed against the providers that actually own something for this task
+    and completely independent of every other provider in the process-wide
+    registry, so one broken extension cannot block deletion deployment-wide.
+
+    ``bound_extensions`` is keyword-only and required on purpose: passing the
+    whole registry is exactly the bug this parameter exists to prevent, so it
+    has to be a deliberate act at the call site.
+
+    All bound providers are attempted even when one fails. With ``force=False``
+    a combined :class:`TaskRuntimeExtensionError` is raised so the caller can
+    preserve the task and retry. With ``force=True`` -- the admin escape hatch
+    for a chronically failing provider -- failures are logged loudly and
+    returned instead of raised, and the caller deletes the core rows anyway.
+
+    Returns:
+        The bound extension names whose state was **not** released: providers
+        that raised, plus bindings whose provider is no longer registered.
     """
 
+    bound = _normalized_binding_names(bound_extensions)
+    if not bound:
+        return ()
+
+    items = [
+        (name, provider)
+        for name, provider in _registered_extension_items()
+        if name in bound
+    ]
+    unregistered = tuple(sorted(bound.difference(name for name, _ in items)))
+    if unregistered:
+        # Blocking deletion forever because a provider was unloaded from the
+        # deployment would be worse than the leak; make the leak loud instead.
+        logger.error(
+            "Task %s is bound to runtime extension(s) %s that are not registered; "
+            "their task-owned state cannot be released and needs manual "
+            "reconciliation",
+            context.task_id,
+            ", ".join(unregistered),
+        )
+
     failures: list[tuple[str, BaseException]] = []
-    for name, provider in reversed(_registered_extension_items()):
+    for name, provider in reversed(items):
         try:
             await _invoke_provider_hook(
                 provider,
@@ -321,7 +393,9 @@ async def delete_task_extensions(context: TaskRuntimeContext) -> None:
         except BaseException as exc:
             _propagate_control_flow_exception(exc)
             failures.append((name, exc))
-    if failures:
+
+    unreleased = tuple(sorted({name for name, _exc in failures}.union(unregistered)))
+    if failures and not force:
         failure_name, first_cause = failures[0]
         reported_cause: BaseException = first_cause
         if len(failures) > 1:
@@ -332,7 +406,86 @@ async def delete_task_extensions(context: TaskRuntimeContext) -> None:
             failure_name,
             "on_task_deleted",
             reported_cause,
+            unreleased_extensions=unreleased,
         ) from first_cause
+    if failures:
+        logger.error(
+            "Force-deleting task %s despite runtime extension cleanup failure(s): %s. "
+            "Provider-owned state for %s is leaked and needs manual reconciliation.",
+            context.task_id,
+            "; ".join(f"{name}: {error}" for name, error in failures),
+            ", ".join(name for name, _error in failures),
+        )
+    return unreleased
+
+
+def task_extension_bindings_from_agent_config(agent_config: Any) -> tuple[str, ...]:
+    """Decode the per-task provider binding record from ``Task.agent_config``.
+
+    A missing or malformed record decodes to ``()``: tasks predating the
+    binding record never bound to any provider, and a corrupt record must not
+    make the task undeletable.
+    """
+
+    if not isinstance(agent_config, Mapping):
+        return ()
+    recorded = agent_config.get(TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY)
+    if not isinstance(recorded, (list, tuple)):
+        return ()
+    return tuple(sorted({item for item in recorded if isinstance(item, str) and item}))
+
+
+def agent_config_with_task_extension_bindings(
+    agent_config: Any,
+    extensions: Iterable[str],
+) -> dict[str, Any]:
+    """Return a new ``agent_config`` mapping carrying ``extensions``.
+
+    The binding set rides on the existing ``tasks.agent_config`` JSON column
+    under a reserved key -- the same convention ``execution_scope`` and the A2A
+    context id already use -- so recording bindings needs no schema migration.
+    """
+
+    updated = dict(agent_config) if isinstance(agent_config, Mapping) else {}
+    normalized = sorted(_normalized_binding_names(extensions))
+    if normalized:
+        updated[TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY] = normalized
+    else:
+        updated.pop(TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY, None)
+    return updated
+
+
+def store_task_extension_bindings(
+    db: Any,
+    *,
+    task_id: int,
+    extensions: Iterable[str],
+) -> bool:
+    """Write one task's binding record. Synchronous; never call on the loop.
+
+    The caller owns the transaction. Returns ``False`` when the task row is
+    already gone.
+    """
+
+    from ..models.task import Task
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        return False
+    setattr(
+        task,
+        "agent_config",
+        agent_config_with_task_extension_bindings(task.agent_config, extensions),
+    )
+    return True
+
+
+def _normalized_binding_names(extensions: Iterable[str]) -> set[str]:
+    return {
+        stripped
+        for item in extensions
+        if isinstance(item, str) and (stripped := item.strip())
+    }
 
 
 async def _cleanup_after_create_failure(

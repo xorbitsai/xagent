@@ -66,7 +66,7 @@ async def create_sound_effect_tools_from_config(
     models = config.get_sound_effect_models()
     if not models:
         return []
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
     if workspace is None:
         return []
     try:

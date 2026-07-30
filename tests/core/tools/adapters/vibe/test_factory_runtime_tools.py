@@ -659,3 +659,138 @@ async def test_extension_bypass_does_not_leak_out_of_category_core_name(
     assert names == ["browser_use"]
     # And the colliding provider is still dropped from the contribution.
     assert contribution_holder["value"].provider_contributions == ()
+
+
+@pytest.mark.asyncio
+async def test_policy_narrowed_contribution_returns_when_policy_widens(
+    monkeypatch,
+) -> None:
+    """A contribution filtered by a restrictive policy must come back later.
+
+    Turn 1 narrows the stored contribution to nothing. Turn 2 relaxes the
+    allowlist; the tool, its prompt environment, its modality preference and
+    its ``provider_contributions`` entry must all be re-derived from the full
+    contribution instead of staying permanently lost.
+    """
+    base_tool = _tool("base_tool")
+    runtime_tool = _tool("runtime_tool")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "browser_runtime": TaskRuntimeContribution(
+                    tools=(runtime_tool,),
+                    environment="Use the leased browser.",
+                    preferred_input_modalities=("image",),
+                )
+            }
+        )
+    }
+    config = ToolConfig({"allowed_tools": ["base_tool"]})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    narrowed = await ToolFactory.create_all_tools(config)
+
+    assert [tool.name for tool in narrowed] == ["base_tool"]
+    assert contribution_holder["value"].environment is None
+    assert contribution_holder["value"].provider_contributions == ()
+
+    # Turn 2: the restrictive allowlist is relaxed back to normal.
+    config.allowed_tools = ["base_tool", "runtime_tool"]
+
+    widened = await ToolFactory.create_all_tools(config)
+
+    assert [tool.name for tool in widened] == ["base_tool", "runtime_tool"]
+    restored = contribution_holder["value"]
+    assert restored.environment == "Use the leased browser."
+    assert restored.preferred_input_modalities == ("image",)
+    assert tuple(name for name, _c in restored.provider_contributions) == (
+        "browser_runtime",
+    )
+    assert restored.tools == (runtime_tool,)
+
+
+@pytest.mark.asyncio
+async def test_whitespace_padded_runtime_tool_is_not_reported_as_filtered(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tool whose name carries padding must not look policy-filtered.
+
+    Policy matching compares the raw ``tool.name``, so tracking the contributed
+    names in a stripped form makes a surviving padded name look dropped.
+    """
+    base_tool = _tool("base_tool")
+    runtime_tool = _tool(" foo ")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "browser_runtime": TaskRuntimeContribution(
+                    tools=(runtime_tool,),
+                    environment="Use the padded tool.",
+                )
+            }
+        )
+    }
+    config = ToolConfig({"allowed_tools": ["base_tool", " foo "]})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    assert tools == [base_tool, runtime_tool]
+    assert "filtered by task tool policy" not in caplog.text
+    assert contribution_holder["value"].environment == "Use the padded tool."
+
+
+@pytest.mark.asyncio
+async def test_whitespace_padded_duplicate_tool_reports_its_provider(
+    monkeypatch,
+) -> None:
+    """Origin lookup must find the provider of a padded, colliding tool name.
+
+    ``tool_origins`` is keyed by the stripped name, so a raw-name lookup would
+    attribute the duplicate to "unknown".
+    """
+    core_tool = _tool(" foo ")
+    runtime_tool = _tool(" foo ")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [core_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    config = ToolConfig({})
+
+    with pytest.raises(ValueError, match="browser_runtime"):
+        await ToolFactory.create_all_tools(
+            config,
+            additional_tools=(runtime_tool,),
+            additional_tool_origins={"foo": "browser_runtime"},
+        )

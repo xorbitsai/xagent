@@ -1813,7 +1813,7 @@ async def test_dag_plan_generation_forwards_runtime_modality_preference() -> Non
         def __init__(self) -> None:
             self.preferred_modalities: list[tuple[str, ...]] = []
 
-        async def prepare_for_call_with_modalities(
+        async def prepare_for_call(
             self,
             messages: list[dict[str, Any]],
             *,
@@ -2612,7 +2612,7 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     resumed_llm = SequenceLLM([{"content": "The answer is 42.", "done": True}])
 
     class _TrackingRouter:
-        async def prepare_for_call_with_modalities(
+        async def prepare_for_call(
             self,
             messages: list[dict[str, Any]],
             *,

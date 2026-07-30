@@ -9,6 +9,7 @@ from xagent.web.api.admin_users import delete_user, get_users
 from xagent.web.models.task import DAGExecution, DAGExecutionPhase, Task
 from xagent.web.models.user import User
 from xagent.web.services.task_runtime import (
+    agent_config_with_task_extension_bindings,
     register_task_extension,
     unregister_task_extension,
 )
@@ -23,6 +24,12 @@ pytestmark = pytest.mark.usefixtures("_test_db")
 def _reset_hidden_filter():
     yield
     set_hidden_user_filter(None)
+
+
+def _bound_to(*extensions: str) -> dict:
+    """Task ``agent_config`` recording the runtime extensions the task bound to."""
+
+    return agent_config_with_task_extension_bindings({}, extensions)
 
 
 class _DeleteObserverProvider:
@@ -94,6 +101,7 @@ async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
             user_id=int(target.id),
             title="runtime task",
             description="runtime task",
+            agent_config=_bound_to("delete_observer"),
         )
         db.add(task)
         db.flush()
@@ -141,6 +149,7 @@ async def test_admin_user_delete_preserves_user_when_runtime_cleanup_fails():
             user_id=int(target.id),
             title="preserve on cleanup failure",
             description="",
+            agent_config=_bound_to("failing_delete_observer"),
         )
         db.add(task)
         db.commit()
@@ -226,6 +235,7 @@ async def test_admin_user_delete_cleans_task_created_during_runtime_cleanup():
                             user_id=context.user_id,
                             title="replacement during cleanup",
                             description="",
+                            agent_config=_bound_to("racy_delete_observer"),
                         )
                     )
                     replacement_db.commit()
@@ -242,6 +252,7 @@ async def test_admin_user_delete_cleans_task_created_during_runtime_cleanup():
             user_id=int(target.id),
             title="initial runtime task",
             description="",
+            agent_config=_bound_to("racy_delete_observer"),
         )
         db.add(task)
         db.commit()
@@ -286,6 +297,7 @@ async def test_admin_user_delete_pages_runtime_cleanup(monkeypatch):
                 user_id=int(target.id),
                 title=f"runtime task {index}",
                 description="",
+                agent_config=_bound_to("paged_delete_observer"),
             )
             for index in range(5)
         ]

@@ -43,6 +43,42 @@ logger = logging.getLogger(__name__)
 __all__ = ["ToolFactory", "ToolRegistry", "register_tool"]
 
 
+def _extension_tool_origin(
+    origins: Mapping[str, str] | None,
+    tool_name: str,
+) -> str:
+    """Attribute one contributed tool name to the provider that sent it.
+
+    Tool policy matches the raw ``tool.name``, while ``tool_origins`` is keyed
+    by the stripped name. Try the raw key first and fall back to the stripped
+    one so a padded name is not reported as coming from an unknown provider.
+    """
+
+    resolved = origins or {}
+    if tool_name in resolved:
+        return resolved[tool_name]
+    return resolved.get(tool_name.strip(), "unknown")
+
+
+def _full_stored_contribution(contribution: Any) -> Any:
+    """Resolve a stored contribution back to its full, pre-policy form.
+
+    Non-contribution values (including ``None``) pass through untouched so a
+    duck-typed config keeps working.
+    """
+
+    # Imported lazily: ``core.task_runtime`` is a leaf module, but the factory
+    # is imported from it indirectly through provider packages.
+    from .....core.task_runtime import (
+        TaskRuntimeContribution,
+        full_task_runtime_contribution,
+    )
+
+    if isinstance(contribution, TaskRuntimeContribution):
+        return full_task_runtime_contribution(contribution)
+    return contribution
+
+
 class ToolRegistry:
     """
     Global registry for tool creators using decorator pattern.
@@ -307,6 +343,11 @@ class ToolFactory:
                         if isinstance(config, BaseToolConfig)
                         else None
                     )
+                    # Start every rebuild from the full, pre-policy
+                    # contribution. The stored value may be a view narrowed by
+                    # an earlier turn's tool policy; re-narrowing it would make
+                    # each filter permanent even after the policy widens again.
+                    contribution = _full_stored_contribution(contribution)
                     resolved_additional_tools = getattr(contribution, "tools", ())
                     resolved_additional_tool_origins = (
                         dict(getattr(contribution, "tool_origins", ()))
@@ -398,7 +439,11 @@ class ToolFactory:
             id(tool) for tool in candidate_extension_tools
         )
         runtime_config = config if isinstance(config, BaseToolConfig) else None
-        contribution = (
+        # Resolved back to the full, pre-policy contribution: the stored value
+        # may be a view narrowed by an earlier build, and reconciliation must
+        # re-derive from the full one so a widened policy restores what a
+        # previous, more restrictive policy removed.
+        contribution = _full_stored_contribution(
             runtime_config.get_task_runtime_contribution()
             if runtime_config is not None
             else None
@@ -450,9 +495,7 @@ class ToolFactory:
                     provider = (
                         owners.pop(0)
                         if owners
-                        else (additional_tool_origins or {}).get(
-                            name.strip(), "unknown"
-                        )
+                        else _extension_tool_origin(additional_tool_origins, name)
                     )
                     logger.warning(
                         "Dropping task runtime extension tool '%s' from '%s' "
@@ -461,7 +504,10 @@ class ToolFactory:
                         provider,
                     )
                     continue
-                extension_names.add(name.strip())
+                # Track the RAW name: every policy stage below matches on
+                # ``tool.name`` as-is, so a stripped bookkeeping name would make
+                # a surviving padded name look like it was filtered out.
+                extension_names.add(name)
                 extension_tools.append(tool)
         extension_tool_occurrences = Counter(id(tool) for tool in extension_tools)
         if extension_tools:
@@ -598,11 +644,10 @@ class ToolFactory:
         }
         dropped_extension_names = extension_names - policy_surviving_extension_names
         if dropped_extension_names:
-            origins = additional_tool_origins or {}
             dropped_by_provider: dict[str, list[str]] = {}
             for name in sorted(dropped_extension_names):
-                provider = origins.get(name, "unknown")
-                dropped_by_provider.setdefault(provider, []).append(name)
+                provider = _extension_tool_origin(additional_tool_origins, name)
+                dropped_by_provider.setdefault(provider, []).append(name.strip())
             logger.warning(
                 "Task runtime extension tools were filtered by task tool policy: %s",
                 "; ".join(
@@ -653,20 +698,18 @@ class ToolFactory:
                         conflict.provider,
                         ", ".join(conflict.tool_names),
                     )
-            elif isinstance(contribution, TaskRuntimeContribution):
-                runtime_config.set_task_runtime_contribution(
-                    reconcile_task_runtime_contribution_tools(
-                        contribution,
-                        available_tool_names=policy_surviving_extension_names,
-                    )[0]
-                )
+            # No name-only fallback: an unstructured contribution carries no
+            # per-provider view to reconcile, and matching survivors by name
+            # would let a tool this factory already rejected claim the name of
+            # a different provider's accepted tool. Such a contribution falls
+            # through to the duplicate-name guard below instead.
 
             if not contribution_reconciled:
                 claimed_names = {tool.name for tool in policy_surviving_core_tools}
                 for tool in policy_surviving_extension_tools:
                     name = tool.name
                     if name in claimed_names:
-                        provider = (additional_tool_origins or {}).get(name, "unknown")
+                        provider = _extension_tool_origin(additional_tool_origins, name)
                         raise ValueError(
                             f"Task runtime extension '{provider}' contributed "
                             f"duplicate tool '{name}'"
@@ -690,7 +733,7 @@ class ToolFactory:
                 else None
             )
             if workspace is None:
-                workspace = ToolFactory._create_workspace(config.get_workspace_config())
+                workspace = ToolFactory.create_workspace(config.get_workspace_config())
             if workspace is not None:
                 from .sandboxed_tool.sandboxed_tool_wrapper import (
                     create_workspace_in_sandbox,
@@ -827,14 +870,6 @@ class ToolFactory:
         except Exception as e:
             logger.warning(f"Failed to create workspace: {e}")
             return None
-
-    @staticmethod
-    def _create_workspace(
-        workspace_config: dict[str, Any] | None,
-    ) -> TaskWorkspace | None:
-        """Backward-compatible internal alias for existing tool creators."""
-
-        return ToolFactory.create_workspace(workspace_config)
 
     @staticmethod
     def _create_unavailable_mcp_tool(

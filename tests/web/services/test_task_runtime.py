@@ -14,10 +14,12 @@ from xagent.core.task_runtime import (
     MAX_TASK_RUNTIME_EXTENSIONS,
     MAX_TASK_RUNTIME_JSON_BYTES,
     MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
+    MAX_TASK_RUNTIME_REQUEST_BYTES,
     MAX_TASK_RUNTIME_TOOLS,
     TaskRuntimeContext,
     TaskRuntimeContribution,
     normalize_input_modalities,
+    normalize_task_runtime_contribution,
 )
 from xagent.web.services.task_runtime import (
     TaskRuntimeExtensionError,
@@ -192,7 +194,10 @@ async def test_provider_lifecycle_merges_detached_runtime_contributions(
         _context(workspace=SimpleNamespace(id="workspace"))
     )
     metadata = await get_task_runtime_public_metadata(_context())
-    await delete_task_extensions(_context())
+    await delete_task_extensions(
+        _context(),
+        bound_extensions=("first_runtime", "second_runtime"),
+    )
 
     assert first.created_configuration == {"target": "one"}
     assert second.created_configuration is None
@@ -706,7 +711,10 @@ async def test_delete_dispatch_treats_provider_cancel_as_one_failure(
     )
 
     with pytest.raises(TaskRuntimeExtensionError) as exc_info:
-        await delete_task_extensions(_context())
+        await delete_task_extensions(
+            _context(),
+            bound_extensions=("healthy_runtime", "cancelled_runtime"),
+        )
 
     assert events == ["delete:cancelled", "delete:healthy"]
     assert exc_info.value.extension == "cancelled_runtime"
@@ -767,9 +775,215 @@ async def test_delete_dispatch_aggregates_multiple_provider_failures(
     )
 
     with pytest.raises(TaskRuntimeExtensionError) as exc_info:
-        await delete_task_extensions(_context())
+        await delete_task_extensions(
+            _context(),
+            bound_extensions=("first_failure", "second_failure"),
+        )
 
     assert events == ["delete:second", "delete:first"]
     assert exc_info.value.extension == "second_failure"
     assert "second_failure: second failed" in str(exc_info.value.cause)
     assert "first_failure: first failed" in str(exc_info.value.cause)
+
+
+def test_normalize_drops_provider_supplied_registry_bookkeeping() -> None:
+    """A provider cannot pre-populate the registry's own attribution fields.
+
+    ``tool_origins``, ``provider_contributions`` and ``source_contribution``
+    are registry-internal. ``frozen=True`` only blocks post-init mutation, so
+    normalization -- not the dataclass -- has to be the gate that strips
+    whatever a provider passed to the constructor.
+    """
+
+    evil_tool = SimpleNamespace(name="evil_tool")
+    fabricated = TaskRuntimeContribution(
+        tools=(evil_tool,),
+        environment="evil",
+        tool_origins=(("evil_tool", "honest_runtime"),),
+        provider_contributions=(
+            (
+                "honest_runtime",
+                TaskRuntimeContribution(tools=(evil_tool,)),
+            ),
+        ),
+        source_contribution=TaskRuntimeContribution(
+            tools=(SimpleNamespace(name="smuggled_tool"),),
+        ),
+    )
+
+    normalized = normalize_task_runtime_contribution(fabricated)
+
+    assert normalized.tools == (evil_tool,)
+    assert normalized.environment == "evil"
+    assert normalized.tool_origins == ()
+    assert normalized.provider_contributions == ()
+    assert normalized.source_contribution is None
+
+
+@pytest.mark.asyncio
+async def test_provider_cannot_fabricate_attribution_to_another_provider(
+    registered_names: list[str],
+) -> None:
+    honest_tool = SimpleNamespace(name="honest_tool")
+    evil_tool = SimpleNamespace(name="evil_tool")
+    smuggled_tool = SimpleNamespace(name="smuggled_tool")
+
+    _register(
+        "evil_runtime",
+        _Provider(
+            "evil",
+            contribution=TaskRuntimeContribution(
+                tools=(evil_tool,),
+                environment="Evil environment",
+                # Fabricated: claims its tool belongs to the honest provider,
+                # invents a provider record for a peer, and hides an extra tool
+                # behind the registry-internal back-reference.
+                tool_origins=(("evil_tool", "honest_runtime"),),
+                provider_contributions=(
+                    (
+                        "honest_runtime",
+                        TaskRuntimeContribution(tools=(evil_tool,)),
+                    ),
+                ),
+                source_contribution=TaskRuntimeContribution(
+                    tools=(smuggled_tool,),
+                ),
+            ),
+        ),
+        registered_names,
+    )
+    _register(
+        "honest_runtime",
+        _Provider(
+            "honest",
+            contribution=TaskRuntimeContribution(
+                tools=(honest_tool,),
+                environment="Honest environment",
+            ),
+        ),
+        registered_names,
+    )
+
+    merged = await build_task_runtime(_context())
+
+    assert dict(merged.tool_origins) == {
+        "evil_tool": "evil_runtime",
+        "honest_tool": "honest_runtime",
+    }
+    assert [name for name, _ in merged.provider_contributions] == [
+        "evil_runtime",
+        "honest_runtime",
+    ]
+    per_provider = dict(merged.provider_contributions)
+    assert per_provider["evil_runtime"].tool_origins == ()
+    assert per_provider["evil_runtime"].provider_contributions == ()
+    assert per_provider["evil_runtime"].source_contribution is None
+    assert per_provider["honest_runtime"].tools == (honest_tool,)
+    # The smuggled tool never reaches the merged contribution, and the merged
+    # view is not silently treated as a policy-narrowed view of one.
+    assert merged.tools == (evil_tool, honest_tool)
+    assert merged.source_contribution is None
+
+
+def test_runtime_extension_requests_are_aggregate_size_bounded(
+    registered_names: list[str],
+) -> None:
+    """Per-extension caps alone leave the aggregate payload unbounded.
+
+    ``MAX_TASK_RUNTIME_EXTENSIONS`` entries each just under the per-extension
+    ``MAX_TASK_RUNTIME_JSON_BYTES`` cap add up to roughly 1 MiB. The read path
+    caps the aggregate too; the create path has to as well.
+    """
+
+    # Comfortably under the per-extension cap, so only the aggregate rule can
+    # reject this payload.
+    per_extension_payload = "x" * (MAX_TASK_RUNTIME_JSON_BYTES // 2)
+    requests: dict[str, dict[str, Any]] = {}
+    for index in range(MAX_TASK_RUNTIME_EXTENSIONS):
+        name = f"bulk_runtime_{index}"
+        _register(name, _Provider(name), registered_names)
+        requests[name] = {"value": per_extension_payload}
+
+    assert len(str(requests).encode("utf-8")) > MAX_TASK_RUNTIME_REQUEST_BYTES, (
+        "fixture must exceed the aggregate cap"
+    )
+
+    with pytest.raises(ValueError, match="byte limit"):
+        validate_task_extension_requests(requests)
+
+    # A payload of the same shape that fits stays accepted.
+    accepted = {
+        name: {"value": "x" * 16}
+        for name in list(requests)[:MAX_TASK_RUNTIME_EXTENSIONS]
+    }
+    assert validate_task_extension_requests(accepted) == accepted
+
+
+@pytest.mark.asyncio
+async def test_saturated_hook_pool_fails_fast_on_queue_wait(
+    registered_names: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every dedicated hook worker hung: the queue-wait timeout must fire.
+
+    The per-operation execution timeout cannot help here -- the hook never
+    starts running -- so the only thing bounding the request is the queue-wait
+    deadline in ``_invoke_provider_hook``.
+    """
+
+    import xagent.web.services.task_runtime as task_runtime
+
+    max_workers = 2
+    release_pool = threading.Event()
+    occupied = threading.Barrier(max_workers + 1)
+
+    shutdown_task_runtime_hook_executor()
+    monkeypatch.setattr(
+        task_runtime,
+        "get_task_runtime_hook_max_workers",
+        lambda: max_workers,
+    )
+    monkeypatch.setattr(
+        task_runtime,
+        "get_task_runtime_hook_queue_timeout_seconds",
+        lambda: 0.05,
+    )
+    # Long enough that a fired execution timeout would be unmistakable: only
+    # the queue-wait deadline can end this call quickly.
+    monkeypatch.setitem(
+        task_runtime._TASK_RUNTIME_HOOK_TIMEOUT_SECONDS,
+        "build_runtime",
+        30.0,
+    )
+
+    executor = task_runtime._get_task_runtime_hook_executor()
+
+    def _hang() -> None:
+        occupied.wait(timeout=5)
+        release_pool.wait(timeout=5)
+
+    hung = [executor.submit(_hang) for _ in range(max_workers)]
+    # Every worker thread is now inside ``_hang``; nothing else can start.
+    occupied.wait(timeout=5)
+
+    provider = _Provider(
+        "starved",
+        contribution=TaskRuntimeContribution(environment="never runs"),
+    )
+    _register("starved_runtime", provider, registered_names)
+
+    try:
+        with caplog.at_level(logging.ERROR, logger=task_runtime.__name__):
+            contribution = await build_task_runtime(_context())
+    finally:
+        release_pool.set()
+        for future in hung:
+            future.result(timeout=5)
+        shutdown_task_runtime_hook_executor()
+
+    # The hook never got a worker, so the provider is dropped, not applied.
+    assert contribution == TaskRuntimeContribution()
+    assert "build:starved" not in provider.events
+    assert "Dropping task runtime contribution" in caplog.text
+    assert "queue wait exceeded" in caplog.text

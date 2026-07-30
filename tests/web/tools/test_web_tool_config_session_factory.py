@@ -450,12 +450,18 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
     class _FakeToolConfig:
         def __init__(self, **kwargs):
             self.runtime_contribution = None
+            self.runtime_workspace = None
 
         def get_workspace_config(self):
             return {"task_id": "web_task_11"}
 
         def set_task_runtime_contribution(self, contribution) -> None:
             self.runtime_contribution = contribution
+
+        # Both runtime setters are concrete no-ops on ``BaseToolConfig``, so
+        # every real config has them; the double has to as well.
+        def set_task_runtime_workspace(self, workspace) -> None:
+            self.runtime_workspace = workspace
 
     async def create_tools(config):
         return ["core-tool"]

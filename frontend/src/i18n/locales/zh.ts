@@ -3722,7 +3722,7 @@ const zh = {
       secretEditPlaceholder: "留空则保留当前 secret",
       watchLabel: "监听标签或文件夹（可选）",
       watchLabelPlaceholder: "例如 Support —— 留空则监听所有收到的邮件",
-      watchLabelHelp: "使用 * 或 all 可匹配任意标签。该值不区分大小写。",
+      watchLabelHelp: "留空则监听所有收到的邮件（始终不包括已发送、草稿、垃圾邮件和回收站）。标签不区分大小写。",
       gmailAccount: "Gmail 账号",
       gmailAccountPlaceholder: "选择要监听的 Gmail 账号",
       gmailAccountHelp: "此触发器只会响应所选邮箱中的邮件。",

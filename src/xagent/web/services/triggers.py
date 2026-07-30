@@ -50,6 +50,7 @@ from .trigger_providers.registry import maybe_get_trigger_provider
 from .trigger_providers.schemas import (
     normalize_day_of_month,
     normalize_schedule_timezone,
+    normalize_time_of_day,
     normalize_weekdays,
     parse_trigger_config,
 )
@@ -257,15 +258,10 @@ def _normalize_trigger_name(name: str | None, *, default: str | None = None) -> 
 
 
 def _parse_time_of_day(value: Any) -> time:
-    """Parse a "HH:MM" (or "HH:MM:SS") string into a time, defaulting to
-    midnight."""
-    if not value:
-        return time(0, 0)
     try:
-        parts = str(value).split(":")
-        return time(int(parts[0]), int(parts[1]))
-    except (TypeError, ValueError, IndexError) as exc:
-        raise TriggerServiceError("Invalid time_of_day") from exc
+        return normalize_time_of_day(value)
+    except ValueError as exc:
+        raise TriggerServiceError(str(exc)) from exc
 
 
 def _weekday_set(config: dict[str, Any]) -> set[int]:
@@ -297,6 +293,34 @@ def _schedule_tzinfo(config: dict[str, Any]) -> tzinfo:
         raise TriggerServiceError(str(exc)) from exc
 
 
+def _localize(naive_local: datetime, tz: tzinfo) -> datetime:
+    """Attach `tz` to a naive local datetime, normalizing a nonexistent local
+    time (a DST spring-forward gap — e.g. 2:30 AM on the day a zone jumps
+    from 2:00 to 3:00) by shifting forward past the gap instead of silently
+    resolving to whichever UTC instant `fold=0` happens to pick."""
+    aware = naive_local.replace(tzinfo=tz)
+    roundtrip = aware.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None)
+    if roundtrip != naive_local:
+        # `naive_local` doesn't exist in `tz`. The round-trip reveals how far
+        # off the nearest realizable instant is; shifting by that same delta
+        # lands on it directly (verified: the shifted time round-trips to
+        # itself, since it no longer falls inside the gap).
+        aware = (naive_local + (roundtrip - naive_local)).replace(tzinfo=tz)
+    return aware
+
+
+def _next_daily_occurrence(base: datetime, time_of_day: time, tz: tzinfo) -> datetime:
+    """Earliest datetime strictly after `base` at `time_of_day`, interpreted
+    in `tz` (the user's schedule timezone). Returned as UTC."""
+    local_base = base.astimezone(tz)
+    for offset in range(3):  # today, tomorrow, plus headroom for a DST shift
+        candidate_date = local_base.date() + timedelta(days=offset)
+        candidate = _localize(datetime.combine(candidate_date, time_of_day), tz)
+        if candidate > base:
+            return candidate.astimezone(timezone.utc)
+    raise TriggerServiceError("Unable to compute next daily occurrence")
+
+
 def _next_weekly_occurrence(
     base: datetime, weekdays: set[int], time_of_day: time, tz: tzinfo
 ) -> datetime:
@@ -304,15 +328,15 @@ def _next_weekly_occurrence(
     `weekdays` (0=Mon..6=Sun) with `time_of_day`, both interpreted in `tz`
     (the user's schedule timezone). Returned as UTC."""
     local_base = base.astimezone(tz)
-    for offset in range(8):
+    for offset in range(9):
         candidate_date = local_base.date() + timedelta(days=offset)
         if candidate_date.weekday() not in weekdays:
             continue
-        candidate = datetime.combine(candidate_date, time_of_day, tzinfo=tz)
+        candidate = _localize(datetime.combine(candidate_date, time_of_day), tz)
         if candidate > base:
             return candidate.astimezone(timezone.utc)
     # Unreachable: a full week (7 days) always contains every weekday at
-    # least once, so offset 0..7 always yields a match strictly after base.
+    # least once, so offset 0..8 always yields a match strictly after base.
     raise TriggerServiceError("Unable to compute next weekly occurrence")
 
 
@@ -327,7 +351,7 @@ def _next_monthly_occurrence(
     for _ in range(24):  # 24 months is far more than enough headroom
         last_day = calendar.monthrange(year, month)[1]
         day = min(day_of_month, last_day)
-        candidate = datetime.combine(date(year, month, day), time_of_day, tzinfo=tz)
+        candidate = _localize(datetime.combine(date(year, month, day), time_of_day), tz)
         if candidate > base:
             return candidate.astimezone(timezone.utc)
         month += 1
@@ -350,7 +374,7 @@ def _compute_next_run_at(
     now = _coerce_utc(from_time) or _now()
 
     recurrence = config.get("recurrence")
-    if recurrence in ("weekly", "monthly"):
+    if recurrence in ("daily", "weekly", "monthly"):
         time_of_day = _parse_time_of_day(config.get("time_of_day"))
         tz = _schedule_tzinfo(config)
         # Only the first computation (no previous fire yet) may be pushed out
@@ -367,13 +391,19 @@ def _compute_next_run_at(
                     # Subtract a second so a start date that itself matches
                     # the recurrence still qualifies as its own first fire.
                     base = start - timedelta(seconds=1)
-        # Like the interval path below, never schedule in the past: a stale
-        # previous_due_at (downtime, long-disabled trigger) skips the missed
-        # occurrences instead of firing a catch-up burst.
+        # Never schedule in the past: a stale previous_due_at (downtime,
+        # long-disabled trigger) skips the missed occurrences instead of
+        # firing a catch-up burst, and this same clamp makes it always safe
+        # to recompute from an unchanged config (see _apply_trigger_updates)
+        # without ever re-arming a past instant.
         base = max(base, now)
         if recurrence == "weekly":
             return _next_weekly_occurrence(base, _weekday_set(config), time_of_day, tz)
-        return _next_monthly_occurrence(base, _day_of_month(config), time_of_day, tz)
+        if recurrence == "monthly":
+            return _next_monthly_occurrence(
+                base, _day_of_month(config), time_of_day, tz
+            )
+        return _next_daily_occurrence(base, time_of_day, tz)
 
     if include_explicit:
         explicit_next = config.get("next_run_at")
@@ -826,29 +856,28 @@ def _apply_trigger_updates(
         setattr(trigger, "secret_encrypted", encrypt_value(plain_secret))
 
     if trigger.type == TriggerType.SCHEDULED.value:
+        # Keyed on whether the SCHEDULE ITSELF actually changed (comparing
+        # the resulting config, not whether the request payload happened to
+        # include a `config` key) rather than on `"config" in updates`: the
+        # editor's full-form Save always resends the complete config,
+        # including hourly/custom's flat next_run_at/interval_seconds anchor
+        # — which was computed once at creation and never advances (only the
+        # DB column does, via scans). Gating on payload shape alone made this
+        # branch effectively dead for the real Save flow, since `config` is
+        # present on essentially every edit.
+        new_config = dict(trigger.config or {})
         if not trigger.enabled:
             setattr(trigger, "next_run_at", None)
-        elif "config" in updates and updates["config"] is not None:
-            # The schedule itself was intentionally resubmitted — recompute
-            # from the new config.
-            setattr(
-                trigger,
-                "next_run_at",
-                _compute_next_run_at(dict(trigger.config or {})),
-            )
-        elif not old_enabled:
-            # Just re-enabled (next_run_at was cleared to None above on the
-            # disabling update) — needs a fresh value from its own config.
-            setattr(
-                trigger,
-                "next_run_at",
-                _compute_next_run_at(dict(trigger.config or {})),
-            )
-        # else: already enabled, schedule fields untouched — leave
+        elif not old_enabled or new_config != old_config:
+            # Re-enabled, or the schedule was intentionally changed —
+            # recompute from the (possibly new) config.
+            setattr(trigger, "next_run_at", _compute_next_run_at(new_config))
+        # else: already enabled, config byte-identical to before — leave
         # next_run_at as its current, possibly scan-advanced value. Blindly
-        # recomputing here on every unrelated edit (rename, prompt tweak,
-        # secret rotation) would re-read the same stored explicit anchor and
-        # re-arm an already-progressed schedule back to a stale due time.
+        # recomputing here on every edit that resends an unchanged config
+        # (rename, prompt tweak, secret rotation) would re-read the same
+        # stored explicit anchor and re-arm an already-progressed schedule
+        # back to a stale due time.
 
     db.add(trigger)
     db.commit()

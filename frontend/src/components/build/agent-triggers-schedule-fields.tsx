@@ -36,58 +36,39 @@ const FIELD_LABEL_CLASS = "text-xs font-semibold text-muted-foreground"
 const WEEKDAY_KEYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] as const
 export const RECURRENCE_TYPES: ScheduleRecurrence[] = ["hourly", "daily", "weekly", "monthly", "custom"]
 
+/** Shared selected/unselected styling for the recurrence and weekday chips. */
+function chipClass(selected: boolean): string {
+  return cn(
+    "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+    selected
+      ? "border-primary bg-primary/10 text-primary"
+      : "bg-background text-muted-foreground hover:border-primary/50 hover:text-foreground",
+  )
+}
+
+const ORDINAL_SUFFIXES: Record<string, string> = { one: "st", two: "nd", few: "rd", other: "th" }
+
 function ordinalDay(day: number, locale?: string): string {
   const loc = locale || "en"
   if (loc.startsWith("zh")) return `${day}日`
-  const remainder100 = day % 100
-  if (remainder100 >= 11 && remainder100 <= 13) return `${day}th`
-  switch (day % 10) {
-    case 1:
-      return `${day}st`
-    case 2:
-      return `${day}nd`
-    case 3:
-      return `${day}rd`
-    default:
-      return `${day}th`
-  }
-}
-
-// Intl.DateTimeFormat construction dominates locale formatting cost, and
-// summarizeSchedule runs on every editor keystroke — cache per locale.
-const timeFormatters = new Map<string, Intl.DateTimeFormat>()
-const dateFormatters = new Map<string, Intl.DateTimeFormat>()
-
-function cachedFormatter(
-  cache: Map<string, Intl.DateTimeFormat>,
-  locale: string,
-  options: Intl.DateTimeFormatOptions,
-): Intl.DateTimeFormat {
-  let formatter = cache.get(locale)
-  if (!formatter) {
-    formatter = new Intl.DateTimeFormat(locale, options)
-    cache.set(locale, formatter)
-  }
-  return formatter
+  const category = new Intl.PluralRules(loc, { type: "ordinal" }).select(day)
+  return `${day}${ORDINAL_SUFFIXES[category] ?? "th"}`
 }
 
 function formatTimeLabel(hhmm: string, locale: string): string {
   const [hour, minute] = (hhmm || "00:00").split(":").map((part) => Number(part))
   if (Number.isNaN(hour) || Number.isNaN(minute)) return hhmm
-  return cachedFormatter(timeFormatters, locale, {
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(new Date(2000, 0, 1, hour, minute))
+  return new Intl.DateTimeFormat(locale, { hour: "numeric", minute: "2-digit" }).format(
+    new Date(2000, 0, 1, hour, minute),
+  )
 }
 
 function formatDateLabel(dateStr: string, locale: string): string {
   const date = new Date(`${dateStr}T00:00:00`)
   if (Number.isNaN(date.getTime())) return dateStr
-  return cachedFormatter(dateFormatters, locale, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  }).format(date)
+  return new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", year: "numeric" }).format(
+    date,
+  )
 }
 
 const CUSTOM_UNIT_KEYS: Record<ScheduleCustomUnit, string> = {
@@ -142,6 +123,11 @@ export function localIsoDate(date: Date): string {
   ).padStart(2, "0")}`
 }
 
+/** A Date's LOCAL wall-clock time as HH:MM (what <input type="time"> expects). */
+export function localTimeOfDay(date: Date): string {
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`
+}
+
 export function scheduleFieldsDefaults(): ScheduleFieldsValue {
   const iso = localIsoDate(new Date())
   return {
@@ -191,12 +177,7 @@ export function ScheduleFields({ value, onChange, t, locale }: ScheduleFieldsPro
               key={type}
               type="button"
               onClick={() => onChange("recurrence", type)}
-              className={cn(
-                "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                value.recurrence === type
-                  ? "border-primary bg-primary/10 text-primary"
-                  : "bg-background text-muted-foreground hover:border-primary/50 hover:text-foreground",
-              )}
+              className={chipClass(value.recurrence === type)}
             >
               {t(`triggers.schedule.${type}` as never)}
             </button>
@@ -213,12 +194,7 @@ export function ScheduleFields({ value, onChange, t, locale }: ScheduleFieldsPro
                 key={key}
                 type="button"
                 onClick={() => toggleWeekday(index)}
-                className={cn(
-                  "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                  value.weekdays.includes(index)
-                    ? "border-primary bg-primary/10 text-primary"
-                    : "bg-background text-muted-foreground hover:border-primary/50 hover:text-foreground",
-                )}
+                className={chipClass(value.weekdays.includes(index))}
               >
                 {t(`triggers.schedule.weekday${key}` as never)}
               </button>
@@ -284,12 +260,16 @@ export function ScheduleFields({ value, onChange, t, locale }: ScheduleFieldsPro
       ) : null}
 
       <div className="space-y-2">
-        <Label className={cn(FIELD_LABEL_CLASS, "flex items-center gap-1.5")}>
+        <Label
+          htmlFor="schedule-start-date"
+          className={cn(FIELD_LABEL_CLASS, "flex items-center gap-1.5")}
+        >
           <CalendarDays className="h-3.5 w-3.5" />
           {t("triggers.schedule.startCheckbox")}
         </Label>
         <div className="flex items-center gap-2">
           <Input
+            id="schedule-start-date"
             type="date"
             value={value.startDate}
             onChange={(event) => onChange("startDate", event.target.value)}

@@ -7,7 +7,7 @@ registration results, and the typed trigger config union.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -138,6 +138,18 @@ def normalize_day_of_month(value: Any) -> int:
     return day
 
 
+def normalize_time_of_day(value: Any) -> time:
+    """Validate and coerce a "HH:MM" (or "HH:MM:SS") time-of-day string,
+    defaulting to midnight when absent."""
+    if not value:
+        return time(0, 0)
+    try:
+        parts = str(value).split(":")
+        return time(int(parts[0]), int(parts[1]))
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError('time_of_day must be "HH:MM" (24h)') from exc
+
+
 def normalize_schedule_timezone(value: Any) -> ZoneInfo:
     """Validate an IANA timezone name and return its ZoneInfo."""
     try:
@@ -155,20 +167,28 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
     interval_seconds: int | None = None
     next_run_at: str | None = None
     recurrence: Literal["hourly", "daily", "weekly", "monthly", "custom"] | None = None
-    """Recurrence family driving the schedule UI. Hourly/daily/custom keep the
-    flat interval_seconds/next_run_at mechanism below (interval_seconds is
-    still what the scheduler advances by); weekly/monthly require real
-    calendar math and are computed from weekdays/day_of_month instead."""
+    """Recurrence family driving the schedule UI. Hourly/custom keep the flat
+    interval_seconds/next_run_at mechanism below (interval_seconds is still
+    what the scheduler advances by); daily/weekly/monthly require real,
+    timezone-aware calendar math computed from time_of_day (and
+    weekdays/day_of_month for weekly/monthly) instead — a flat interval would
+    drift across DST transitions and never actually land on the picked
+    wall-clock time in the picked zone."""
     time_of_day: str | None = None
-    """"HH:MM" (24h), the time-of-day component for daily/weekly/monthly."""
+    """"HH:MM" (24h), the time-of-day component for daily/weekly/monthly.
+    Required for those three; unused by hourly/custom."""
     weekdays: list[int] | None = None
     """0=Monday..6=Sunday. Required when recurrence == "weekly"."""
     day_of_month: int | None = None
     """1-31, clamped to the last day of short months. Required when
     recurrence == "monthly"."""
     start_at: str | None = None
-    """ISO date/datetime; optional anchor before which weekly/monthly won't
-    fire their first run."""
+    """ISO date/datetime; optional anchor before which daily/weekly/monthly
+    won't fire their first run."""
+    timezone: str | None = None
+    """IANA timezone name (e.g. "Asia/Shanghai") that time_of_day and
+    weekdays/day_of_month are expressed in. Defaults to UTC when absent
+    (legacy configs)."""
 
     @field_validator("interval_seconds")
     @classmethod
@@ -176,11 +196,6 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
         if value is not None and value <= 0:
             raise ValueError("interval_seconds must be positive")
         return value
-
-    timezone: str | None = None
-    """IANA timezone name (e.g. "Asia/Shanghai") that time_of_day and
-    weekdays/day_of_month are expressed in. Defaults to UTC when absent
-    (legacy configs)."""
 
     @field_validator("weekdays")
     @classmethod
@@ -196,6 +211,13 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
             normalize_day_of_month(value)
         return value
 
+    @field_validator("time_of_day")
+    @classmethod
+    def _valid_time_of_day(cls, value: str | None) -> str | None:
+        if value is not None:
+            normalize_time_of_day(value)
+        return value
+
     @field_validator("timezone")
     @classmethod
     def _valid_timezone(cls, value: str | None) -> str | None:
@@ -205,12 +227,16 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
 
     @model_validator(mode="after")
     def _require_schedule(self) -> "ScheduledTriggerConfig":
-        if self.recurrence == "weekly":
-            if not self.weekdays:
+        if self.recurrence in ("daily", "weekly", "monthly"):
+            if not (self.time_of_day or "").strip():
+                raise ValueError(f"{self.recurrence} schedule requires time_of_day")
+            if self.interval_seconds is not None:
+                raise ValueError(
+                    f"{self.recurrence} schedule must not set interval_seconds"
+                )
+            if self.recurrence == "weekly" and not self.weekdays:
                 raise ValueError("weekly schedule requires weekdays")
-            return self
-        if self.recurrence == "monthly":
-            if self.day_of_month is None:
+            if self.recurrence == "monthly" and self.day_of_month is None:
                 raise ValueError("monthly schedule requires day_of_month")
             return self
         if self.interval_seconds is None and not (self.next_run_at or "").strip():

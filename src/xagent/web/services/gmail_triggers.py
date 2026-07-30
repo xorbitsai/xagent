@@ -416,13 +416,23 @@ def _message_payload(
     }
 
 
+# Gmail's own non-incoming categories: a message the user sent, drafted, or
+# that landed in spam/trash. `history.list` is called with no `labelId`
+# filter, so these show up alongside real incoming mail and must be excluded
+# explicitly — the UI's "watch all incoming emails" promise otherwise means
+# "watch literally everything, sent mail included."
+_NON_INCOMING_LABELS = {"sent", "draft", "spam", "trash"}
+
+
 def _trigger_matches_message(trigger: AgentTrigger, payload: dict[str, Any]) -> bool:
     config = dict(trigger.config or {})
     label_ids = {str(label_id).lower() for label_id in payload.get("label_ids", [])}
     watch_label = str(config.get("watch_label") or "INBOX").strip().lower()
-    if watch_label and watch_label not in {"*", "all"}:
-        if watch_label not in label_ids:
+    if watch_label in {"*", "all"}:
+        if label_ids & _NON_INCOMING_LABELS:
             return False
+    elif watch_label and watch_label not in label_ids:
+        return False
 
     sender_filter = str(config.get("sender_filter") or "").strip().lower()
     if sender_filter and sender_filter not in str(payload.get("from") or "").lower():

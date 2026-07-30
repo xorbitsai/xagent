@@ -1433,17 +1433,72 @@ def test_scheduled_weekly_skips_missed_occurrences_after_downtime() -> None:
     assert next_run_at == datetime(2026, 2, 2, 9, 0, tzinfo=timezone.utc)
 
 
+def test_scheduled_daily_respects_schedule_timezone() -> None:
+    # Daily at 09:00 in Asia/Shanghai (UTC+8) is 01:00 UTC — daily is routed
+    # through the same tz-aware occurrence math as weekly/monthly, not the
+    # flat interval mechanism (which never consulted timezone/time_of_day at
+    # all, so a "daily at 09:00" schedule silently ran on UTC wall-clock
+    # time and drifted across DST).
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "daily", "time_of_day": "09:00", "timezone": "Asia/Shanghai"},
+        from_time=base,
+        previous_due_at=base,
+    )
+    assert next_run_at == datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_daily_skips_missed_occurrences_after_downtime() -> None:
+    # Mirrors the weekly/monthly downtime behavior: a daily schedule that
+    # missed several days must land on the next occurrence after `now`, not
+    # fire a catch-up burst of stale days.
+    now = datetime(2026, 1, 10, 12, 0, tzinfo=timezone.utc)
+    stale_due = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "daily", "time_of_day": "09:00"},
+        from_time=now,
+        previous_due_at=stale_due,
+        include_explicit=False,
+    )
+    assert next_run_at == datetime(2026, 1, 11, 9, 0, tzinfo=timezone.utc)
+
+
+def test_scheduled_dst_spring_forward_gap_shifts_forward_instead_of_drifting() -> None:
+    # 2026-03-08 is when America/New_York springs forward (2:00 AM -> 3:00
+    # AM); a daily schedule at 2:30 AM names a local time that never occurs
+    # that day. Rather than silently resolving to whatever UTC instant
+    # fold=0 happens to pick, it must land on the first valid instant past
+    # the gap (3:30 AM EDT == 07:30 UTC — verified directly against
+    # zoneinfo's real 2026 transition).
+    base = datetime(2026, 3, 8, 6, 0, tzinfo=timezone.utc)  # ~1:00 AM EST
+    next_run_at = _compute_next_run_at(
+        {"recurrence": "daily", "time_of_day": "02:30", "timezone": "America/New_York"},
+        from_time=base,
+        previous_due_at=base,
+    )
+    assert next_run_at == datetime(2026, 3, 8, 7, 30, tzinfo=timezone.utc)
+
+    # An ordinary (non-gap) time on the same transition day is unaffected.
+    ordinary = _compute_next_run_at(
+        {"recurrence": "daily", "time_of_day": "09:00", "timezone": "America/New_York"},
+        from_time=base,
+        previous_due_at=base,
+    )
+    assert ordinary == datetime(2026, 3, 8, 13, 0, tzinfo=timezone.utc)
+
+
 def test_scheduled_explicit_anchor_is_honored_verbatim_past_or_future() -> None:
     # An explicit next_run_at is authoritative either way: a future anchor
     # is a genuine start time, and a past one means the trigger is already
     # due — the same semantics as enabling a cron job whose scheduled time
     # already passed. scan_due_scheduled_triggers (not this function) is
-    # what decides whether "due" means "fire now".
+    # what decides whether "due" means "fire now". This applies to the flat
+    # interval mechanism (hourly/custom, or no recurrence at all — legacy
+    # configs); daily/weekly/monthly are tz-aware and always clamp to the
+    # future instead (see test_scheduled_daily_never_rearms_to_the_past).
     now = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc)
     config = {
-        "recurrence": "daily",
         "interval_seconds": 86400,
-        "time_of_day": "09:00",
         "next_run_at": "2026-01-01T09:00:00+00:00",
     }
     past = _compute_next_run_at(config, from_time=now)
@@ -1545,6 +1600,65 @@ def test_scheduled_config_validation_rejects_incomplete_weekly_and_monthly() -> 
 
     with pytest.raises(ValidationError):
         parse_trigger_config("scheduled", {"recurrence": "weekly", "weekdays": [0, 7]})
+
+
+def test_scheduled_config_validation_requires_time_of_day_for_calendar_recurrences() -> (
+    None
+):
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"recurrence": "daily"})
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"recurrence": "weekly", "weekdays": [0]})
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"recurrence": "monthly", "day_of_month": 1})
+
+    # Present, it's accepted (daily has no other required field).
+    daily = parse_trigger_config(
+        "scheduled", {"recurrence": "daily", "time_of_day": "09:00:00"}
+    )
+    assert daily.time_of_day == "09:00:00"
+
+
+def test_scheduled_config_validation_rejects_interval_seconds_for_calendar_recurrences() -> (
+    None
+):
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    # A contradictory config — a calendar recurrence carrying the flat
+    # mechanism's interval_seconds too — is rejected rather than silently
+    # ignoring one of the two.
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {"recurrence": "daily", "time_of_day": "09:00", "interval_seconds": 3600},
+        )
+
+
+def test_scheduled_config_validation_rejects_malformed_time_of_day() -> None:
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled", {"recurrence": "daily", "time_of_day": "not-a-time"}
+        )
+
+
+def test_normalize_weekdays_coerces_a_bare_scalar_to_a_single_day() -> None:
+    from xagent.web.services.trigger_providers.schemas import normalize_weekdays
+
+    # A bare scalar (e.g. weekdays=3, or the stringified "3") means one day,
+    # not a sequence to iterate — must not be split character-by-character
+    # (str) or rejected as non-iterable (int/bool).
+    assert normalize_weekdays(3) == {3}
+    assert normalize_weekdays("3") == {3}
 
 
 def test_scheduled_scan_fires_due_trigger_and_advances_next_run(
@@ -1654,6 +1768,70 @@ def test_scheduled_unrelated_update_does_not_reset_advanced_next_run(
     # The stored config's stale anchor is untouched, but the schedule's
     # advanced next_run_at must survive the unrelated rename.
     assert _coerce_utc(datetime.fromisoformat(patched.json()["next_run_at"])) == (
+        advanced_next_run_at
+    )
+
+
+def test_scheduled_full_form_save_with_unchanged_config_does_not_reset_next_run_at(
+    mock_bg_scheduler,
+) -> None:
+    # The real editor's Save always resends the COMPLETE config, including
+    # the original creation-time anchor, whether or not the user touched the
+    # schedule (PR #1051 review: gating the "don't rewind" guard on whether
+    # `config` appeared in the request body at all — rather than on whether
+    # it actually CHANGED — made that guard unreachable from this exact
+    # flow, since a real Save's payload always contains a `config` key).
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    original_config = {
+        "interval_seconds": 60,
+        "next_run_at": "2020-01-01T00:00:00+00:00",
+    }
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Every minute",
+            "config": original_config,
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    db = _direct_db_session()
+    try:
+        scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+        db.refresh(db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one())
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        advanced_next_run_at = _coerce_utc(trigger.next_run_at)
+        assert advanced_next_run_at is not None
+        assert advanced_next_run_at > datetime(2020, 1, 1, tzinfo=timezone.utc)
+    finally:
+        db.close()
+
+    # Resend the SAME config unchanged, exactly like a full-form Save whose
+    # user only touched the prompt template — must not re-arm next_run_at
+    # back to the stale 2020 anchor still sitting in the config.
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={"config": dict(original_config), "prompt_template": "Say hi"},
+    )
+    assert patched.status_code == 200, patched.text
+    assert _coerce_utc(datetime.fromisoformat(patched.json()["next_run_at"])) == (
+        advanced_next_run_at
+    )
+
+    # A genuinely changed config (the user actually edits the schedule) must
+    # still recompute.
+    repatched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={"config": {**original_config, "interval_seconds": 120}},
+    )
+    assert repatched.status_code == 200, repatched.text
+    assert _coerce_utc(datetime.fromisoformat(repatched.json()["next_run_at"])) != (
         advanced_next_run_at
     )
 

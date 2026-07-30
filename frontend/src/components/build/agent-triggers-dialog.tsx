@@ -62,6 +62,7 @@ import {
   RECURRENCE_TYPES,
   ScheduleFields,
   localIsoDate,
+  localTimeOfDay,
   scheduleFieldsDefaults,
   summarizeSchedule,
   type ScheduleCustomUnit,
@@ -218,18 +219,25 @@ function inferCustomAmountUnit(intervalSeconds: number): { amount: string; unit:
 function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFieldsValue {
   const defaults = scheduleFieldsDefaults()
   const recurrenceRaw = configString(config, "recurrence")
-  const timeOfDay = configString(config, "time_of_day") || defaults.timeOfDay
   // The stored anchor is UTC; render it back as the user's LOCAL calendar
-  // date (slicing the ISO string would show the UTC date and make every
-  // edit round-trip drift the anchor for non-UTC users).
+  // date and time (slicing the ISO string would show the UTC values and
+  // make every edit round-trip drift the anchor for non-UTC users).
   const startAtRaw = configString(config, "start_at") || configString(config, "next_run_at")
   let startDate = ""
+  let anchorTimeOfDay: string | null = null
   if (startAtRaw) {
     const anchorDate = new Date(startAtRaw)
     if (!Number.isNaN(anchorDate.getTime())) {
       startDate = localIsoDate(anchorDate)
+      anchorTimeOfDay = localTimeOfDay(anchorDate)
     }
   }
+  // A stored time_of_day is authoritative when present; otherwise fall back
+  // to the REAL scheduled time carried by the anchor timestamp itself
+  // (legacy configs, or any config saved before a recurrence used
+  // time_of_day) rather than a hardcoded default — the latter would show a
+  // fabricated time and silently move the schedule there on the next Save.
+  const timeOfDay = configString(config, "time_of_day") || anchorTimeOfDay || defaults.timeOfDay
 
   if ((RECURRENCE_TYPES as string[]).includes(recurrenceRaw)) {
     const recurrence = recurrenceRaw as ScheduleRecurrence
@@ -264,13 +272,14 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
   }
 
   // Legacy config saved before `recurrence` existed: only interval_seconds /
-  // next_run_at are present.
+  // next_run_at are present. `timeOfDay` still carries the anchor-derived
+  // real time (not defaults.timeOfDay's hardcoded "09:00") from above.
   const interval = Number(configNumber(config, "interval_seconds")) || 3600
   if (interval === 3600) {
-    return { ...defaults, recurrence: "hourly", startDate }
+    return { ...defaults, recurrence: "hourly", timeOfDay, startDate }
   }
   if (interval === 86400) {
-    return { ...defaults, recurrence: "daily", startDate }
+    return { ...defaults, recurrence: "daily", timeOfDay, startDate }
   }
   const { amount, unit } = inferCustomAmountUnit(interval)
   return {
@@ -278,6 +287,7 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
     recurrence: "custom",
     customAmount: amount,
     customUnit: unit,
+    timeOfDay,
     startDate,
   }
 }
@@ -721,6 +731,16 @@ export function AgentTriggersDialog({
       return config
     }
 
+    if (sourceForm.recurrence === "daily") {
+      // Routed through the same timezone-aware occurrence math as
+      // weekly/monthly (start_at, no interval_seconds) instead of flat
+      // interval arithmetic — a fixed wall-clock time needs real calendar
+      // math to survive DST and to land on the picked time in the picked
+      // zone at all.
+      config.start_at = anchor.toISOString()
+      return config
+    }
+
     let intervalSeconds = 3600
     if (sourceForm.recurrence === "custom") {
       const amount = Number(sourceForm.customAmount)
@@ -728,8 +748,6 @@ export function AgentTriggersDialog({
         throw new Error(t("triggers.validation.interval"))
       }
       intervalSeconds = amount * unitSecondsFor(sourceForm.customUnit)
-    } else if (sourceForm.recurrence === "daily") {
-      intervalSeconds = 86400
     }
     config.interval_seconds = intervalSeconds
     config.next_run_at = anchor.toISOString()

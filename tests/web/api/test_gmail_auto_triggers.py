@@ -1353,6 +1353,65 @@ def test_collect_gmail_pubsub_events_accepts_wildcard_star_label() -> None:
         db.close()
 
 
+def test_collect_gmail_pubsub_events_wildcard_label_excludes_non_incoming_mail() -> (
+    None
+):
+    # PR #1051 review: `history.list` has no labelId filter, so it returns
+    # messagesAdded events for EVERY label (sent, drafts, spam, trash, not
+    # just the inbox). A blank/wildcard watch label must mean "watch all
+    # INCOMING email" (matching the UI copy) — not literally every message
+    # of any kind, which would newly match mail the user themselves sent.
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-star-excludes-sent-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(db, user, config={"watch_label": "*"})
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [
+                    {
+                        "messagesAdded": [
+                            {"message": {"id": "msg-sent"}},
+                            {"message": {"id": "msg-inbox"}},
+                        ]
+                    }
+                ]
+            },
+            messages={
+                "msg-sent": _gmail_message("msg-sent", label_ids=["SENT"]),
+                "msg-inbox": _gmail_message("msg-inbox", label_ids=["INBOX"]),
+            },
+        )
+
+        result = asyncio.run(
+            collect_gmail_pubsub_events(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-mixed",
+                ),
+                state=state,
+                service_factory=lambda _db, _oauth: fake_service,
+            )
+        )
+
+        assert [event.source_event_id for event in result.events] == ["gmail:msg-inbox"]
+        assert result.events[0].trigger_id == int(trigger.id)
+        assert result.skipped == 1
+    finally:
+        db.close()
+
+
 def test_collect_gmail_pubsub_events_skips_sender_mismatch() -> None:
     db = _direct_db_session()
     try:

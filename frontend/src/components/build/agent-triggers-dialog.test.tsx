@@ -1761,22 +1761,37 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     await screen.findByText("triggers.schedule.recurrenceLabel")
   }
 
+  // toEqual (not toMatchObject) against the FULL config object: a partial
+  // match would stay green even if a field (e.g. time_of_day, start_at) is
+  // silently dropped from buildConfig, since it simply wouldn't be listed
+  // in the expectation either. Dynamic fields (timezone / the anchor
+  // timestamp) are asserted via expect.any(String) rather than mocking the
+  // clock and Intl locale.
+  async function saveAndGetConfig(getBody: () => Record<string, unknown> | null) {
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+    await waitFor(() => {
+      expect(getBody()).not.toBeNull()
+    })
+    return (getBody() as { config: Record<string, unknown> }).config
+  }
+
   it("saves an hourly schedule with the default recurrence", async () => {
     const getBody = mockCreate()
     await openScheduleDraft()
 
-    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+    const config = await saveAndGetConfig(getBody)
 
-    await waitFor(() => {
-      expect(getBody()).toMatchObject({
-        config: { recurrence: "hourly", interval_seconds: 3600 },
-      })
+    // Hourly is a flat repeat interval with no fixed civil time to honor, so
+    // it (like custom) keeps the interval_seconds/next_run_at mechanism —
+    // time_of_day/timezone still ride along (harmless, unused server-side)
+    // in case a future "anchor to the hour" feature wants them.
+    expect(config).toEqual({
+      recurrence: "hourly",
+      time_of_day: "09:00",
+      timezone: expect.any(String),
+      interval_seconds: 3600,
+      next_run_at: expect.any(String),
     })
-    // The user's IANA timezone and the (defaulted-to-today) start anchor
-    // always ride along, so the backend can honor the picked local time.
-    const config = (getBody() as { config: Record<string, unknown> }).config
-    expect(config.timezone).toBeTruthy()
-    expect(config.next_run_at).toBeTruthy()
   })
 
   it("saves a daily schedule", async () => {
@@ -1784,12 +1799,16 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     await openScheduleDraft()
 
     fireEvent.click(screen.getByText("triggers.schedule.daily"))
-    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+    const config = await saveAndGetConfig(getBody)
 
-    await waitFor(() => {
-      expect(getBody()).toMatchObject({
-        config: { recurrence: "daily", interval_seconds: 86400 },
-      })
+    // Daily has a fixed civil time to honor every day, so — unlike
+    // hourly/custom — it's routed through the timezone-aware occurrence
+    // mechanism (start_at), not a flat interval that would drift across DST.
+    expect(config).toEqual({
+      recurrence: "daily",
+      time_of_day: "09:00",
+      timezone: expect.any(String),
+      start_at: expect.any(String),
     })
   })
 
@@ -1800,12 +1819,14 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     fireEvent.click(screen.getByText("triggers.schedule.weekly"))
     // Default weekday selection is Monday (index 0); add Wednesday (index 2).
     fireEvent.click(await screen.findByText("triggers.schedule.weekdayWed"))
-    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+    const config = await saveAndGetConfig(getBody)
 
-    await waitFor(() => {
-      expect(getBody()).toMatchObject({
-        config: { recurrence: "weekly", weekdays: [0, 2] },
-      })
+    expect(config).toEqual({
+      recurrence: "weekly",
+      time_of_day: "09:00",
+      timezone: expect.any(String),
+      weekdays: [0, 2],
+      start_at: expect.any(String),
     })
   })
 
@@ -1814,12 +1835,14 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     await openScheduleDraft()
 
     fireEvent.click(screen.getByText("triggers.schedule.monthly"))
-    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+    const config = await saveAndGetConfig(getBody)
 
-    await waitFor(() => {
-      expect(getBody()).toMatchObject({
-        config: { recurrence: "monthly", day_of_month: 1 },
-      })
+    expect(config).toEqual({
+      recurrence: "monthly",
+      time_of_day: "09:00",
+      timezone: expect.any(String),
+      day_of_month: 1,
+      start_at: expect.any(String),
     })
   })
 
@@ -1830,15 +1853,75 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     fireEvent.click(screen.getByText("triggers.schedule.custom"))
     const amountInput = await screen.findByLabelText("triggers.schedule.runEvery")
     fireEvent.change(amountInput, { target: { value: "2" } })
+    // Default unit is minutes: 2 minutes = 120 seconds.
+    const config = await saveAndGetConfig(getBody)
+
+    expect(config).toEqual({
+      recurrence: "custom",
+      time_of_day: "09:00",
+      timezone: expect.any(String),
+      interval_seconds: 120,
+      next_run_at: expect.any(String),
+    })
+  })
+
+  // One test per buildConfig validation-throw path: none of these were
+  // exercised at all before, so a regression in any of them (e.g. a
+  // guard silently removed) would ship undetected.
+  it("rejects saving when the start date is cleared", async () => {
+    const getBody = mockCreate()
+    await openScheduleDraft()
+
+    fireEvent.change(document.getElementById("schedule-start-date") as HTMLInputElement, {
+      target: { value: "" },
+    })
     fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
 
     await waitFor(() => {
-      // Default unit is minutes: 2 minutes = 120 seconds.
-      expect(getBody()).toMatchObject({
-        config: { recurrence: "custom", interval_seconds: 120 },
-      })
+      expect(toastMocks.error).toHaveBeenCalledWith("triggers.validation.startDate")
     })
+    expect(getBody()).toBeNull()
   })
+
+  it("rejects saving a weekly schedule with no weekday selected", async () => {
+    const getBody = mockCreate()
+    await openScheduleDraft()
+
+    fireEvent.click(screen.getByText("triggers.schedule.weekly"))
+    // Deselect the only (default) selected day, Monday.
+    fireEvent.click(screen.getByText("triggers.schedule.weekdayMon"))
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+
+    await waitFor(() => {
+      expect(toastMocks.error).toHaveBeenCalledWith("triggers.validation.scheduleRequired")
+    })
+    expect(getBody()).toBeNull()
+  })
+
+  it("rejects saving a custom schedule with a non-positive amount", async () => {
+    const getBody = mockCreate()
+    await openScheduleDraft()
+
+    fireEvent.click(screen.getByText("triggers.schedule.custom"))
+    const amountInput = await screen.findByLabelText("triggers.schedule.runEvery")
+    fireEvent.change(amountInput, { target: { value: "0" } })
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+
+    await waitFor(() => {
+      expect(toastMocks.error).toHaveBeenCalledWith("triggers.validation.interval")
+    })
+    expect(getBody()).toBeNull()
+  })
+
+  // buildConfig's `Number.isNaN(anchor.getTime())` guard (triggers.validation
+  // .nextRunAt) has no test here: both <input type="date"> and
+  // type="time"> self-sanitize an invalid or out-of-range value to "" per
+  // the HTML spec (verified directly against jsdom — a malformed string and
+  // a real-but-nonexistent date like Feb 30 both land as ""), which is then
+  // caught by the empty-startDate check above instead, or defaulted to
+  // "00:00" for the time. The guard is unreachable through the actual
+  // editor UI; only a caller constructing a form value directly could hit
+  // it, and buildConfig is a component-scoped closure, not an exported unit.
 })
 
 describe("AgentTriggersDialog owner routing", () => {

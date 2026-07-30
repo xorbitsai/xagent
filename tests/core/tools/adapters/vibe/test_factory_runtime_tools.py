@@ -10,12 +10,20 @@ from xagent.core.task_runtime import (
 from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
 
 def _tool(name: str) -> Any:
     return SimpleNamespace(
         name=name,
         metadata=SimpleNamespace(category=ToolCategory.OTHER),
+    )
+
+
+def _categorized_tool(name: str, category: ToolCategory) -> Any:
+    return SimpleNamespace(
+        name=name,
+        metadata=SimpleNamespace(category=category),
     )
 
 
@@ -308,3 +316,235 @@ async def test_runtime_tools_require_a_non_empty_string_name(monkeypatch) -> Non
             ToolConfig({}),
             additional_tools=(SimpleNamespace(),),
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_tool_without_metadata_category_is_dropped_not_fatal(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A provider tool lacking ``metadata.category`` must not kill the build.
+
+    A plain LangChain ``@tool`` function has ``metadata = None``, so the
+    category sort key would raise ``AttributeError`` and take down the whole
+    task's tool initialization together with every core tool.
+    """
+    base_tool = _tool("base_tool")
+    good_runtime_tool = _tool("good_runtime_tool")
+    no_metadata_tool = SimpleNamespace(name="no_metadata_tool")
+    none_metadata_tool = SimpleNamespace(name="none_metadata_tool", metadata=None)
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    config = ToolConfig({})
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(
+            config,
+            additional_tools=(
+                good_runtime_tool,
+                no_metadata_tool,
+                none_metadata_tool,
+            ),
+            additional_tool_origins={
+                "good_runtime_tool": "browser_runtime",
+                "no_metadata_tool": "browser_runtime",
+                "none_metadata_tool": "desktop_runtime",
+            },
+        )
+
+    names = [tool.name for tool in tools]
+    assert names == ["base_tool", "good_runtime_tool"]
+    assert "no_metadata_tool" not in names
+    assert "none_metadata_tool" not in names
+    assert "no_metadata_tool" in caplog.text
+    assert "none_metadata_tool" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_structured_collision_still_drops_only_provider_with_malformed_peer(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed peer contribution must not turn a collision into a crash.
+
+    ``provider_a`` contributes one tool without ``metadata.category`` (dropped)
+    plus one well-formed tool; ``provider_b`` independently collides with a
+    core tool name. Dropping the malformed tool shrinks the extension list, so
+    the reconciliation identity guard must still recognise the structured
+    contribution instead of falling through to the fatal duplicate-name check.
+    """
+    core_tool = _tool("computer")
+    malformed_tool = SimpleNamespace(name="malformed_tool", metadata=None)
+    good_tool = _tool("a_good_tool")
+    colliding_tool = _tool("computer")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [core_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "provider_a": TaskRuntimeContribution(
+                    tools=(malformed_tool, good_tool),
+                    environment="Use provider a.",
+                ),
+                "provider_b": TaskRuntimeContribution(
+                    tools=(colliding_tool,),
+                    environment="Use provider b.",
+                ),
+            }
+        )
+    }
+    config = ToolConfig({})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    assert tools == [core_tool, good_tool]
+    assert "malformed_tool" in caplog.text
+    assert "Dropping task runtime extension 'provider_b'" in caplog.text
+    assert tuple(
+        name
+        for name, _contribution in contribution_holder["value"].provider_contributions
+    ) == ("provider_a",)
+    assert contribution_holder["value"].environment == "Use provider a."
+
+
+@pytest.mark.asyncio
+async def test_runtime_tools_survive_category_scoped_agent_config(monkeypatch) -> None:
+    """Category-scoped agents must still get task-runtime extension tools.
+
+    An agent configured through the normal agent-builder flow carries a
+    non-empty ``tool_categories``, i.e. a ``_SpecByCategories`` spec. Every
+    task-runtime-contributed tool keeps ``ToolMetadata``'s default
+    ``ToolCategory.OTHER``, and ``"other"`` is unconditionally stripped from a
+    configured category set (``AGENT_CONFIG_UNASSIGNABLE_CATEGORIES``), so a
+    pure default-deny category filter would silently drop every contributed
+    tool for the majority of production agents.
+
+    Task-runtime tools are requested explicitly at task-creation time and
+    validated against the extension registry, which is a stronger, task-scoped
+    opt-in than the agent-level category policy — so the spec must admit them
+    regardless of category. The category filter itself must stay intact for
+    everything else: a core tool whose category is outside the configured set
+    is still excluded.
+    """
+    in_scope_core_tool = _categorized_tool("browser_use", ToolCategory.BROWSER)
+    out_of_scope_core_tool = _categorized_tool("read_file", ToolCategory.FILE)
+    runtime_tool = _tool("runtime_tool")  # default ToolCategory.OTHER
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [in_scope_core_tool, out_of_scope_core_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    config = ToolConfig({})
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(
+        tool_categories=[ToolCategory.BROWSER.value],
+    )
+    config.get_task_runtime_contribution = lambda: TaskRuntimeContribution(
+        tools=(runtime_tool,),
+        tool_origins=(("runtime_tool", "browser_runtime"),),
+    )
+
+    tools = await ToolFactory.create_all_tools(config)
+
+    names = {tool.name for tool in tools}
+    # The headline capability: the contributed tool survives the category spec.
+    assert "runtime_tool" in names
+    # The configured category still admits its own tools ...
+    assert "browser_use" in names
+    # ... and the category filter is NOT weakened for non-contributed tools.
+    assert "read_file" not in names
+
+
+def test_selection_spec_extension_bypass_is_scoped_to_contributed_names() -> None:
+    """The bypass admits only the names the caller declares as contributed."""
+    contributed = _tool("runtime_tool")
+    other_out_of_category = _categorized_tool("read_file", ToolCategory.FILE)
+    in_category = _categorized_tool("browser_use", ToolCategory.BROWSER)
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=[ToolCategory.BROWSER.value])
+
+    assert spec.compute_allowed_names(
+        [contributed, other_out_of_category, in_category],
+    ) == frozenset({"browser_use"})
+    assert spec.compute_allowed_names(
+        [contributed, other_out_of_category, in_category],
+        extension_tool_names=frozenset({"runtime_tool"}),
+    ) == frozenset({"browser_use", "runtime_tool"})
+
+
+@pytest.mark.asyncio
+async def test_extension_bypass_does_not_leak_out_of_category_core_name(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A contributed name colliding with a core tool must not widen the policy.
+
+    The final selection filter is name-based, so admitting a contributed name
+    into ``allowed_names`` admits *every* tool carrying that name — including a
+    core tool whose real category the agent's ``tool_categories`` excludes.
+    The colliding contribution is doomed anyway (reconciliation drops the
+    offending provider), so it must never be granted the category bypass.
+    """
+    in_scope_core_tool = _categorized_tool("browser_use", ToolCategory.BROWSER)
+    out_of_scope_core_tool = _categorized_tool("read_file", ToolCategory.FILE)
+    colliding_runtime_tool = _tool("read_file")  # default ToolCategory.OTHER
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [in_scope_core_tool, out_of_scope_core_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "file_runtime": TaskRuntimeContribution(
+                    tools=(colliding_runtime_tool,),
+                    environment="Use the file runtime.",
+                ),
+            }
+        )
+    }
+    config = ToolConfig({})
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(
+        tool_categories=[ToolCategory.BROWSER.value],
+    )
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    names = [tool.name for tool in tools]
+    # The out-of-category core tool must stay excluded by the category policy.
+    assert "read_file" not in names
+    # The in-category core tool is unaffected.
+    assert names == ["browser_use"]
+    # And the colliding provider is still dropped from the contribution.
+    assert contribution_holder["value"].provider_contributions == ()

@@ -379,18 +379,50 @@ class ToolFactory:
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
         core_tool_occurrences = Counter(id(tool) for tool in tools)
-        extension_tools = list(additional_tools)
-        extension_tool_occurrences = Counter(id(tool) for tool in extension_tools)
+        # Snapshot the core name space BEFORE extension tools are merged into
+        # ``tools`` below, so it can never include a contributed name.
+        core_tool_names = {
+            tool.name for tool in tools if isinstance(getattr(tool, "name", None), str)
+        }
+        candidate_extension_tools = list(additional_tools)
+        extension_tools: list[Tool] = []
         extension_names: set[str] = set()
-        if extension_tools:
-            for tool in extension_tools:
+        if candidate_extension_tools:
+            for tool in candidate_extension_tools:
                 name = getattr(tool, "name", None)
                 if not isinstance(name, str) or not name.strip():
                     raise TypeError(
                         "Task runtime extension contributed a tool without a "
                         "non-empty string 'name' attribute"
                     )
+                # ``TaskRuntimeContribution.tools`` is untyped, so a provider can
+                # hand over a plain LangChain ``@tool`` function whose
+                # ``metadata`` is ``None``. Category sorting and downstream
+                # metadata consumers would then raise and take down the whole
+                # task's tool build, including every core tool. Drop only the
+                # malformed contribution.
+                if getattr(getattr(tool, "metadata", None), "category", None) is None:
+                    provider = (additional_tool_origins or {}).get(
+                        name.strip(), "unknown"
+                    )
+                    logger.warning(
+                        "Dropping task runtime extension tool '%s' from '%s' "
+                        "because it has no usable 'metadata.category'",
+                        name.strip(),
+                        provider,
+                    )
+                    continue
                 extension_names.add(name.strip())
+                extension_tools.append(tool)
+        extension_tool_occurrences = Counter(id(tool) for tool in extension_tools)
+        # Identity guard baseline for reconciliation below: it must reflect what
+        # the contribution actually handed over, before malformed tools were
+        # dropped, otherwise dropping one tool would disable structured
+        # reconciliation for every other provider.
+        candidate_extension_occurrences = Counter(
+            id(tool) for tool in candidate_extension_tools
+        )
+        if extension_tools:
             # Keep colliding candidates through the name-policy stages. A tool
             # filtered by task/user policy cannot collide at execution time.
             tools.extend(extension_tools)
@@ -431,7 +463,28 @@ class ToolFactory:
                     type(config).__name__,
                     len(legacy_when_spec),
                 )
-            allowed_names = spec.compute_allowed_names(tools)
+            # Task-runtime contributions are an ID-level scope the spec cannot
+            # see on its own: a contributed tool keeps the default
+            # ``ToolCategory.OTHER``, which is never present in a configured
+            # category set, so a category spec would silently drop all of them.
+            # Pass the contributed names so BY_CATEGORIES can admit them on the
+            # task-scoped opt-in, exactly like an ``mcp:<server>`` scope.
+            #
+            # Names already claimed by a core tool are excluded: the filter
+            # below matches on NAME only, so admitting such a name would also
+            # admit the identically named CORE tool even when the agent's
+            # category policy excludes its real category. The colliding
+            # contribution gains nothing from the bypass anyway — the
+            # reconciliation pass below drops the offending provider for the
+            # name collision regardless.
+            allowed_names = spec.compute_allowed_names(
+                tools,
+                extension_tool_names=frozenset(
+                    tool.name
+                    for tool in extension_tools
+                    if tool.name not in core_tool_names
+                ),
+            )
         else:
             # Legacy contract: ``BaseToolConfig.get_allowed_tools()`` is
             # still a public accessor on non-WebToolConfig subclasses
@@ -533,7 +586,7 @@ class ToolFactory:
                 isinstance(contribution, TaskRuntimeContribution)
                 and contribution.provider_contributions
                 and Counter(id(tool) for tool in contribution.tools)
-                == extension_tool_occurrences
+                == candidate_extension_occurrences
             ):
                 reconciled, conflicts = reconcile_task_runtime_contribution_tools(
                     contribution,

@@ -90,6 +90,39 @@ def markdown_to_slack(text: str) -> str:
     return _MARKDOWN_LINK_RE.sub(replace_link, escaped)
 
 
+class SlackFileUrlError(ValueError):
+    """Raised when a Slack-supplied download URL is not a Slack-hosted URL."""
+
+
+# Slack serves file downloads from these hosts. The download URL arrives inside
+# an inbound event payload and is fetched with the workspace bot token in an
+# Authorization header, so it must be pinned to Slack's own CDN: an arbitrary
+# host would turn attachment handling into a credential-leaking SSRF primitive.
+_SLACK_FILE_HOST_SUFFIXES = (
+    ".slack.com",
+    ".slack-edge.com",
+    ".slack-files.com",
+    ".slack-msgs.com",
+    ".slackb.com",
+)
+
+
+def validate_slack_file_url(url: str) -> str:
+    """Return ``url`` when it is an HTTPS URL served by a Slack file host."""
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise SlackFileUrlError("Slack file URL must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise SlackFileUrlError("Slack file URL must not embed credentials")
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if not hostname:
+        raise SlackFileUrlError("Slack file URL must have a hostname")
+    if hostname != "slack.com" and not hostname.endswith(_SLACK_FILE_HOST_SUFFIXES):
+        raise SlackFileUrlError(f"Slack file URL host is not a Slack host: {hostname}")
+    return url
+
+
 def _extract_local_file_id(target: str) -> str | None:
     normalized_target = html.unescape(target.strip())
     internal_file_id = parse_file_id_ref(normalized_target)

@@ -53,7 +53,13 @@ from ...services.task_execution_context_service import (
 from ...services.task_lease_service import TaskLeaseLostError
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
 from .trace_handler import SlackTraceHandler
-from .utils import SlackFileRef, markdown_to_slack, strip_slack_file_refs
+from .utils import (
+    SlackFileRef,
+    SlackFileUrlError,
+    markdown_to_slack,
+    strip_slack_file_refs,
+    validate_slack_file_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,7 @@ _DIRECT_MESSAGE_CHANNEL_TYPES = {"im", "mpim"}
 _SUPPORTED_MESSAGE_SUBTYPES = {None, "file_share", "thread_broadcast"}
 _CONTROL_START_COMMANDS = {"/start", "start"}
 _CONTROL_NEW_COMMANDS = {"/new", "new", "new task"}
+_MAX_FILE_DOWNLOAD_REDIRECTS = 5
 
 
 class SlackFileDownloadError(RuntimeError):
@@ -692,6 +699,9 @@ class SlackBotInstance:
                 )
         if not download_url:
             return None
+        # The URL comes from an inbound Slack event and is fetched with the bot
+        # token attached, so validate the host before any request is made.
+        validate_slack_file_url(download_url)
 
         from ...api.websocket import build_unique_target_path, normalize_filename
 
@@ -702,16 +712,34 @@ class SlackBotInstance:
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
+            # Redirects are followed manually so every hop is re-validated
+            # against the Slack host allowlist; httpx's own redirect handling
+            # would let one off-Slack hop receive the bot token.
             async with httpx.AsyncClient(
                 headers={"Authorization": f"Bearer {self.bot_token}"},
-                follow_redirects=True,
+                follow_redirects=False,
                 timeout=60.0,
             ) as client:
-                async with client.stream("GET", download_url) as http_response:
-                    http_response.raise_for_status()
-                    with target_path.open("wb") as target:
-                        async for chunk in http_response.aiter_bytes():
-                            target.write(chunk)
+                current_url = download_url
+                for _ in range(_MAX_FILE_DOWNLOAD_REDIRECTS + 1):
+                    async with client.stream("GET", current_url) as http_response:
+                        if http_response.is_redirect:
+                            location = http_response.headers.get("location") or ""
+                            if not location:
+                                raise SlackFileUrlError(
+                                    "Slack file redirect is missing a location"
+                                )
+                            current_url = validate_slack_file_url(
+                                str(httpx.URL(current_url).join(location))
+                            )
+                            continue
+                        http_response.raise_for_status()
+                        with target_path.open("wb") as target:
+                            async for chunk in http_response.aiter_bytes():
+                                target.write(chunk)
+                        break
+                else:
+                    raise SlackFileUrlError("Slack file download redirected too often")
         except BaseException:
             target_path.unlink(missing_ok=True)
             raise

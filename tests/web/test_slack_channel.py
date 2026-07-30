@@ -27,7 +27,12 @@ from xagent.web.channels.slack.bot import (
     SlackChannelManager,
     SlackOAuthSocketGateway,
 )
-from xagent.web.channels.slack.utils import markdown_to_slack, strip_slack_file_refs
+from xagent.web.channels.slack.utils import (
+    SlackFileUrlError,
+    markdown_to_slack,
+    strip_slack_file_refs,
+    validate_slack_file_url,
+)
 from xagent.web.models.database import Base
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
@@ -429,6 +434,107 @@ async def test_slack_oauth_callback_creates_encrypted_workspace_channel(
         assert len(background_tasks.tasks) == 1
         assert background_tasks.tasks[0].func is trigger_slack_sync
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://files.slack.com/files-pri/T1-F1/report.pdf",
+        "https://slack.com/files-pri/T1-F1/report.pdf",
+        "https://a.b.slack-edge.com/x.png",
+        "https://downloads.slack-files.com/x.png",
+    ],
+)
+def test_validate_slack_file_url_accepts_slack_hosts(url: str) -> None:
+    assert validate_slack_file_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example.com/steal",
+        # Suffix-confusion: must not match on a bare substring.
+        "https://slack.com.evil.example.com/steal",
+        "https://notslack-files.com/x",
+        # Non-public targets reachable from the backend.
+        "https://169.254.169.254/latest/meta-data/",
+        "https://127.0.0.1/admin",
+        # Plaintext and credential-bearing URLs.
+        "http://files.slack.com/x",
+        "https://user:pass@files.slack.com/x",
+    ],
+)
+def test_validate_slack_file_url_rejects_non_slack_targets(url: str) -> None:
+    with pytest.raises(SlackFileUrlError):
+        validate_slack_file_url(url)
+
+
+@pytest.mark.asyncio
+async def test_slack_file_download_rejects_off_slack_url() -> None:
+    bot = make_bot()
+    bot.bot_token = "xoxb-secret"
+
+    # A hostile url_private_download in an inbound event must never be
+    # fetched, because the request would carry the workspace bot token.
+    with pytest.raises(SlackFileUrlError):
+        await bot._download_slack_file(
+            {"id": "F1", "url_private_download": "https://evil.example.com/steal"},
+            Path("/tmp"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_slack_file_download_rejects_off_slack_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bot = make_bot()
+    bot.bot_token = "xoxb-secret"
+    requested: list[str] = []
+
+    class FakeStream:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.is_redirect = True
+            self.headers = {"location": "https://evil.example.com/steal"}
+
+        async def __aenter__(self) -> "FakeStream":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, _method: str, url: str) -> FakeStream:
+            requested.append(url)
+            return FakeStream(url)
+
+    monkeypatch.setattr("xagent.web.channels.slack.bot.httpx.AsyncClient", FakeClient)
+    target_dir = tmp_path / "slack-input"
+
+    with pytest.raises(SlackFileUrlError):
+        await bot._download_slack_file(
+            {
+                "id": "F1",
+                "name": "report.pdf",
+                "url_private_download": "https://files.slack.com/files-pri/T1-F1/r.pdf",
+            },
+            target_dir,
+        )
+
+    # The off-Slack redirect target was never requested, and the partial
+    # download was cleaned up.
+    assert requested == ["https://files.slack.com/files-pri/T1-F1/r.pdf"]
+    assert list(target_dir.iterdir()) == []
 
 
 def test_script_safe_json_neutralizes_script_breakout() -> None:

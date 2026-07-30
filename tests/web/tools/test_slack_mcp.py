@@ -102,7 +102,7 @@ def test_list_channels_passes_exclude_archived_and_types(monkeypatch):
     slack.slack_list_channels(exclude_archived=False)
 
     params = mock_request.call_args.kwargs["params"]
-    assert params["exclude_archived"] is False
+    assert params["exclude_archived"] == "false"
     assert params["types"] == "public_channel"
     assert "cursor" not in params
 
@@ -167,7 +167,7 @@ def test_post_message_returns_channel_and_ts(monkeypatch):
     assert result["ts"] == "1753900000.000100"
     call_kwargs = mock_request.call_args.kwargs
     assert call_kwargs["url"].endswith("/chat.postMessage")
-    assert call_kwargs["params"] == {"channel": "C0123", "text": "Incident detected"}
+    assert call_kwargs["json"] == {"channel": "C0123", "text": "Incident detected"}
 
 
 def test_post_message_accepts_channel_name(monkeypatch):
@@ -178,7 +178,7 @@ def test_post_message_accepts_channel_name(monkeypatch):
 
     json.loads(slack.slack_post_message("#incidents", "hello"))
 
-    assert mock_request.call_args.kwargs["params"]["channel"] == "#incidents"
+    assert mock_request.call_args.kwargs["json"]["channel"] == "#incidents"
 
 
 def test_post_message_returns_error_payload_on_channel_not_found(monkeypatch):

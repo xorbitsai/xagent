@@ -41,18 +41,24 @@ def _request(
     path: str,
     *,
     params: dict[str, Any] | None = None,
+    json_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Call a Slack Web API method.
 
     Slack always answers with HTTP 200, even on failure — success/failure is
     only signalled by the body's "ok" boolean plus an "error" code, so error
     detection here is on that field, not on raise_for_status().
+
+    Write calls pass json_data rather than params: message text can exceed
+    URL length limits, and query strings are commonly logged in plaintext by
+    proxies/load balancers, which would leak message content.
     """
     response = requests.request(
         method=method,
         url=f"{SLACK_BASE_URL}/{path}",
         headers=_headers(),
         params=params,
+        json=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
@@ -75,7 +81,10 @@ def slack_list_channels(exclude_archived: bool = True) -> str:
         for _ in range(MAX_PAGES):
             params: dict[str, Any] = {
                 "types": "public_channel",
-                "exclude_archived": exclude_archived,
+                # Slack expects a lowercase "true"/"false" string; requests
+                # would otherwise serialize the Python bool as "True"/"False",
+                # which Slack's parser doesn't recognize as a boolean.
+                "exclude_archived": "true" if exclude_archived else "false",
                 "limit": 200,
             }
             if cursor:
@@ -109,7 +118,7 @@ def slack_post_message(channel: str, text: str) -> str:
         result = _request(
             "POST",
             "chat.postMessage",
-            params={"channel": channel, "text": text},
+            json_data={"channel": channel, "text": text},
         )
         return _success(channel=result.get("channel"), ts=result.get("ts"))
     except Exception as e:

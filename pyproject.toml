@@ -42,6 +42,7 @@ dependencies = [
   "mcp>=1.12.4",
   "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
   "requests >= 2.32.0",
+  "boto3 >= 1.34.0",  # AWS built-in MCP connector (CloudWatch/DynamoDB/SQS, read-only)
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",
   "pillow >= 10.0.0",
@@ -314,6 +315,8 @@ module = [
   "xrouter_llm",
   "xrouter_llm.*",
   "google.pubsub_v1",
+  "boto3",
+  "botocore.*",
 ]
 ignore_missing_imports = true
 

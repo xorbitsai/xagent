@@ -495,6 +495,30 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "auth": {"type": "mcp_oauth"},
             },
         },
+        {
+            "app_id": "aws",
+            "name": "AWS",
+            "description": "Connect to AWS to read CloudWatch alarms, metrics and logs, DynamoDB table health, and SQS queue depth for diagnostics. Read-only — pair with a read-only IAM policy.",
+            "icon": "https://www.google.com/s2/favicons?domain=aws.amazon.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Operations",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like google-maps: the user supplies an
+            # access key at connect time. Cross-account access goes through the
+            # per-call role_arn tool parameter (STS AssumeRole inside the MCP
+            # module), not a fourth env key — required_env has no optional slots.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.aws"],
+                "required_env": [
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_REGION",
+                ],
+            },
+        },
     ]
 
 

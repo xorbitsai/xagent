@@ -1,7 +1,7 @@
 """add pages_read_user_content scope to the Facebook connector
 
 Revision ID: 20260728_add_facebook_pages_read_user_content_scope
-Revises: 20260725_add_uploaded_file_recovery_index
+Revises: 20260724_add_upload_source_to_uploaded_files
 Create Date: 2026-07-28
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260728_add_facebook_pages_read_user_content_scope"
-down_revision: Union[str, None] = "20260725_add_uploaded_file_recovery_index"
+down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

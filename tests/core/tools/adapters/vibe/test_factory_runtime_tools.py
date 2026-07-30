@@ -427,6 +427,117 @@ async def test_structured_collision_still_drops_only_provider_with_malformed_pee
 
 
 @pytest.mark.asyncio
+async def test_all_tools_malformed_drops_provider_prompt_context(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A provider whose every tool is malformed must lose its prompt context.
+
+    When the malformed-tool filter removes the provider's only contribution,
+    the stored contribution must be reconciled too. Otherwise the agent keeps
+    the provider's ``environment`` text and ``preferred_input_modalities``
+    routing preference for a capability that has no tool behind it.
+    """
+    base_tool = _tool("base_tool")
+    malformed_tool = SimpleNamespace(name="malformed_tool", metadata=None)
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "browser_runtime": TaskRuntimeContribution(
+                    tools=(malformed_tool,),
+                    environment="Use the leased browser.",
+                    preferred_input_modalities=("image",),
+                )
+            }
+        )
+    }
+    config = ToolConfig({})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    assert tools == [base_tool]
+    assert "malformed_tool" in caplog.text
+    assert contribution_holder["value"].environment is None
+    assert contribution_holder["value"].preferred_input_modalities == ()
+    assert contribution_holder["value"].provider_contributions == ()
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_name_does_not_evict_a_valid_peer_provider(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected tool name must not claim the name for its provider.
+
+    ``provider_a`` contributes a malformed tool named ``shared_tool`` that the
+    factory drops before reconciliation. ``provider_b`` contributes a *valid*
+    tool with the same name. Name-only reconciliation would let ``provider_a``
+    claim ``shared_tool`` with an object that never survived, flag
+    ``provider_b`` as the colliding provider, and drop the only real tool.
+    """
+    base_tool = _tool("base_tool")
+    malformed_tool = SimpleNamespace(name="shared_tool", metadata=None)
+    valid_tool = _tool("shared_tool")
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        return [base_tool]
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    contribution_holder = {
+        "value": merge_task_runtime_contributions(
+            {
+                "provider_a": TaskRuntimeContribution(
+                    tools=(malformed_tool,),
+                    environment="Use provider a.",
+                ),
+                "provider_b": TaskRuntimeContribution(
+                    tools=(valid_tool,),
+                    environment="Use provider b.",
+                ),
+            }
+        )
+    }
+    config = ToolConfig({})
+    config.get_task_runtime_contribution = lambda: contribution_holder["value"]
+    config.set_task_runtime_contribution = lambda value: contribution_holder.update(
+        value=value
+    )
+
+    with caplog.at_level("WARNING"):
+        tools = await ToolFactory.create_all_tools(config)
+
+    # provider_b's valid tool must reach execution.
+    assert tools == [base_tool, valid_tool]
+    # The malformed-tool drop must be attributed to the provider that sent it.
+    assert "'shared_tool' from 'provider_a'" in caplog.text
+    assert "from 'provider_b'" not in caplog.text
+    # provider_b survives reconciliation; provider_a is gone.
+    assert tuple(
+        name
+        for name, _contribution in contribution_holder["value"].provider_contributions
+    ) == ("provider_b",)
+    assert contribution_holder["value"].environment == "Use provider b."
+
+
+@pytest.mark.asyncio
 async def test_runtime_tools_survive_category_scoped_agent_config(monkeypatch) -> None:
     """Category-scoped agents must still get task-runtime extension tools.
 

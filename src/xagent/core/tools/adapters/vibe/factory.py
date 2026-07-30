@@ -376,6 +376,11 @@ class ToolFactory:
         Returns:
             List of configured tools
         """
+        from ....task_runtime import (
+            TaskRuntimeContribution,
+            reconcile_task_runtime_contribution_tools,
+        )
+
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
         core_tool_occurrences = Counter(id(tool) for tool in tools)
@@ -385,6 +390,45 @@ class ToolFactory:
             tool.name for tool in tools if isinstance(getattr(tool, "name", None), str)
         }
         candidate_extension_tools = list(additional_tools)
+        # Identity guard baseline for reconciliation below: it must reflect what
+        # the contribution actually handed over, before malformed tools are
+        # dropped, otherwise dropping one tool would disable structured
+        # reconciliation for every other provider.
+        candidate_extension_occurrences = Counter(
+            id(tool) for tool in candidate_extension_tools
+        )
+        runtime_config = config if isinstance(config, BaseToolConfig) else None
+        contribution = (
+            runtime_config.get_task_runtime_contribution()
+            if runtime_config is not None
+            else None
+        )
+        # The structured, provider-owned view of the very same objects that were
+        # handed to this call. Resolved up front so the malformed-tool filter
+        # below can attribute a rejected tool to the provider that really sent
+        # it, and so reconciliation can match survivors by identity.
+        structured_contribution = (
+            contribution
+            if isinstance(contribution, TaskRuntimeContribution)
+            and contribution.provider_contributions
+            and Counter(id(tool) for tool in contribution.tools)
+            == candidate_extension_occurrences
+            else None
+        )
+        # ``additional_tool_origins`` is keyed by tool NAME, so two providers
+        # contributing the same name collapse into a single entry and every
+        # name-keyed diagnostic is attributed to whichever provider was merged
+        # last. Keep an identity-keyed queue in provider-registry order instead.
+        extension_tool_providers: dict[int, list[str]] = {}
+        if structured_contribution is not None:
+            for (
+                provider_name,
+                provider_contribution,
+            ) in structured_contribution.provider_contributions:
+                for tool in provider_contribution.tools:
+                    extension_tool_providers.setdefault(id(tool), []).append(
+                        provider_name
+                    )
         extension_tools: list[Tool] = []
         extension_names: set[str] = set()
         if candidate_extension_tools:
@@ -402,8 +446,13 @@ class ToolFactory:
                 # task's tool build, including every core tool. Drop only the
                 # malformed contribution.
                 if getattr(getattr(tool, "metadata", None), "category", None) is None:
-                    provider = (additional_tool_origins or {}).get(
-                        name.strip(), "unknown"
+                    owners = extension_tool_providers.get(id(tool))
+                    provider = (
+                        owners.pop(0)
+                        if owners
+                        else (additional_tool_origins or {}).get(
+                            name.strip(), "unknown"
+                        )
                     )
                     logger.warning(
                         "Dropping task runtime extension tool '%s' from '%s' "
@@ -415,13 +464,6 @@ class ToolFactory:
                 extension_names.add(name.strip())
                 extension_tools.append(tool)
         extension_tool_occurrences = Counter(id(tool) for tool in extension_tools)
-        # Identity guard baseline for reconciliation below: it must reflect what
-        # the contribution actually handed over, before malformed tools were
-        # dropped, otherwise dropping one tool would disable structured
-        # reconciliation for every other provider.
-        candidate_extension_occurrences = Counter(
-            id(tool) for tool in candidate_extension_tools
-        )
         if extension_tools:
             # Keep colliding candidates through the name-policy stages. A tool
             # filtered by task/user policy cannot collide at execution time.
@@ -569,28 +611,20 @@ class ToolFactory:
                 ),
             )
 
-        if extension_names:
+        # Gate on the UNFILTERED candidate list, not on the names that survived
+        # the malformed-tool filter: when every tool a provider contributed was
+        # rejected there is nothing left in ``extension_names``, yet the stored
+        # contribution still carries that provider's prompt environment and
+        # modality preference and must be reconciled away too.
+        if candidate_extension_tools:
             contribution_reconciled = False
-            from ....task_runtime import (
-                TaskRuntimeContribution,
-                reconcile_task_runtime_contribution_tools,
-            )
-
-            runtime_config = config if isinstance(config, BaseToolConfig) else None
-            contribution = (
-                runtime_config.get_task_runtime_contribution()
-                if runtime_config is not None
-                else None
-            )
-            if (
-                isinstance(contribution, TaskRuntimeContribution)
-                and contribution.provider_contributions
-                and Counter(id(tool) for tool in contribution.tools)
-                == candidate_extension_occurrences
-            ):
+            if structured_contribution is not None:
+                # Match survivors by object identity. A tool this factory
+                # rejected above must not be able to claim its name back and
+                # evict a different provider's accepted tool of the same name.
                 reconciled, conflicts = reconcile_task_runtime_contribution_tools(
-                    contribution,
-                    available_tool_names=policy_surviving_extension_names,
+                    structured_contribution,
+                    available_tools=policy_surviving_extension_tools,
                     reserved_tool_names={
                         tool.name for tool in policy_surviving_core_tools
                     },

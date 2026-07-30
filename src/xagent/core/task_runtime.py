@@ -7,7 +7,8 @@ without importing ORM models, request objects, or a live database session.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections import Counter
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -238,21 +239,53 @@ def merge_task_runtime_contributions(
 def reconcile_task_runtime_contribution_tools(
     contribution: TaskRuntimeContribution,
     *,
-    available_tool_names: set[str],
+    available_tool_names: set[str] | None = None,
+    available_tools: Sequence[Any] | None = None,
     reserved_tool_names: set[str] | None = None,
 ) -> tuple[TaskRuntimeContribution, tuple[TaskRuntimeToolConflict, ...]]:
     """Apply tool policy and isolate providers whose surviving names collide.
 
-    ``available_tool_names`` contains extension tool names that survived the
-    task's selection and user policy. ``reserved_tool_names`` contains core
-    tool names that survived the same policy. Providers are considered in
-    registry order; a provider with any collision is removed as one unit so
-    its prompt environment and modality preference cannot describe tools that
-    were discarded.
+    Exactly one survivor view must be supplied:
+
+    ``available_tools`` is the preferred, structured form: the accepted tool
+    *occurrences* that survived the task's selection and user policy, matched
+    back to their owning provider by object identity. Identity matching is
+    required because a tool the caller already rejected (for example a
+    contribution without a usable tool category) may share its ``name`` with a
+    different provider's accepted tool; name matching would then let the
+    rejected object claim the name and evict the tool that actually survived.
+
+    ``available_tool_names`` is the legacy, name-only fallback for callers whose
+    survivor objects are not the ones stored on ``contribution`` (so identity
+    cannot be compared at all).
+
+    ``reserved_tool_names`` contains core tool names that survived the same
+    policy. Providers are considered in registry order; a provider with any
+    collision is removed as one unit so its prompt environment and modality
+    preference cannot describe tools that were discarded. A provider left with
+    no surviving tool is removed for the same reason.
     """
+
+    if (available_tool_names is None) == (available_tools is None):
+        raise ValueError(
+            "Provide exactly one of 'available_tools' or 'available_tool_names'"
+        )
 
     if not contribution.provider_contributions:
         return contribution, ()
+
+    # Occurrence counts, not a bare identity set: two providers may legitimately
+    # contribute the same tool object, and each accepted occurrence belongs to
+    # exactly one of them.
+    remaining_available_occurrences = (
+        Counter(id(tool) for tool in available_tools)
+        if available_tools is not None
+        else None
+    )
+    # Bound to a separate name: ``surviving_names`` below is rebound per provider.
+    available_names = (
+        available_tool_names if available_tool_names is not None else set()
+    )
 
     retained: dict[str, TaskRuntimeContribution] = {}
     conflicts: list[TaskRuntimeToolConflict] = []
@@ -262,12 +295,20 @@ def reconcile_task_runtime_contribution_tools(
         if not provider_tools:
             retained[provider_name] = provider_contribution
             continue
-        surviving_tools = tuple(
-            tool
-            for tool in provider_tools
-            if isinstance((name := getattr(tool, "name", None)), str)
-            and name in available_tool_names
-        )
+        if remaining_available_occurrences is not None:
+            accepted: list[Any] = []
+            for tool in provider_tools:
+                if remaining_available_occurrences[id(tool)] > 0:
+                    remaining_available_occurrences[id(tool)] -= 1
+                    accepted.append(tool)
+            surviving_tools = tuple(accepted)
+        else:
+            surviving_tools = tuple(
+                tool
+                for tool in provider_tools
+                if isinstance((name := getattr(tool, "name", None)), str)
+                and name in available_names
+            )
         if not surviving_tools:
             continue
 

@@ -2355,6 +2355,22 @@ def _ensure_catalog_mcp_oauth_server(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A user-owned server already exists under this catalog id",
             )
+        # The catalog stays the source of truth for the row's auth config: if
+        # the registry entry's auth changed since this shared row was created
+        # (e.g. a scope hint or static client_id was added), sync it so
+        # already-connected users don't keep running against stale auth.
+        # Compare on the decrypted form — sensitive auth fields are encrypted
+        # at rest, so comparing the raw stored value against the catalog's
+        # plaintext would spuriously differ on every connect once any secret
+        # is configured. Runs only after the owned-check above: a user-owned
+        # row is rejected, never mutated.
+        if server._decrypt_auth_config(server.auth) != auth:
+            encrypted_auth = dict(auth)
+            for key in SENSITIVE_AUTH_FIELDS:
+                if key in encrypted_auth and encrypted_auth[key]:
+                    encrypted_auth[key] = encrypt_value(encrypted_auth[key])
+            cast(Any, server).auth = encrypted_auth
+            db.commit()
     if not server:
         try:
             config = _build_server_config(

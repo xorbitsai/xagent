@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -277,8 +278,10 @@ async def test_zoom_expired_token_refresh_uses_http_basic_auth(db_session, monke
     }
     auth = kwargs["auth"]
     assert isinstance(auth, tool_config.httpx.BasicAuth)
-    expected_auth = tool_config.httpx.BasicAuth("zoom-client-id", "zoom-client-secret")
-    assert auth._auth_header == expected_auth._auth_header
+    expected_credential = base64.b64encode(b"zoom-client-id:zoom-client-secret").decode(
+        "ascii"
+    )
+    assert auth._auth_header == f"Basic {expected_credential}"
 
 
 @pytest.mark.asyncio

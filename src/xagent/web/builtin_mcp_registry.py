@@ -141,12 +141,15 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "userinfo_url": "https://api.zoom.us/v2/users/me",
             "user_id_path": "id",
             "email_path": "email",
-            # Identity-only, matching the other providers here (google:
-            # userinfo.email, meta: public_profile) — the functional scopes
-            # this connector actually calls live on the app row's
-            # oauth_scopes below and are merged in at authorize time by
-            # _merge_oauth_scopes, so listing them here too would just be a
-            # second place scope changes have to be kept in sync.
+            # Identity-only for this connector, similar in spirit to google
+            # (userinfo.email/profile) and meta (public_profile) — though
+            # it isn't a strict rule across every provider here (linkedin's
+            # default_scopes includes the functional w_member_social write
+            # scope). The functional scopes this connector actually calls
+            # live on the app row's oauth_scopes below and are merged in at
+            # authorize time by _merge_oauth_scopes, so listing them here
+            # too would just be a second place scope changes have to be
+            # kept in sync.
             "default_scopes": ["user:read:user"],
         },
     ]

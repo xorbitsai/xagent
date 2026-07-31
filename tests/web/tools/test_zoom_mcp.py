@@ -117,6 +117,14 @@ def test_vtt_to_text_strips_scaffolding():
     )
 
 
+def test_vtt_to_text_strips_short_form_timestamp_and_its_cue_index():
+    """WebVTT allows the hours group to be omitted (MM:SS.mmm); both that
+    timestamp line and the cue-index line preceding it must still be
+    recognized as scaffolding and dropped."""
+    vtt = "WEBVTT\n\n1\n00:01.000 --> 00:04.000\nAlice: quick clip.\n"
+    assert zoom._vtt_to_text(vtt) == "Alice: quick clip."
+
+
 def test_vtt_to_text_keeps_spoken_digit_only_line():
     """A cue-index line is digit-only AND immediately followed by a
     timestamp line; a spoken line that happens to be all digits (a PIN, an
@@ -133,6 +141,14 @@ def test_vtt_to_text_keeps_spoken_digit_only_line():
         "Thanks for confirming the year.\n"
     )
     assert zoom._vtt_to_text(vtt) == ("2024\nThanks for confirming the year.")
+
+
+def test_vtt_to_text_drops_trailing_bare_digit_line():
+    """A digit-only line with no following line at all (a truncated/partial
+    VTT download ending mid-cue) can never be complete spoken content — it
+    must still be dropped as a cue index, not kept as a stray line."""
+    vtt = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nhi\n\n2\n"
+    assert zoom._vtt_to_text(vtt) == "hi"
 
 
 def test_list_meetings_returns_meetings_and_page_token(monkeypatch):
@@ -370,8 +386,10 @@ def test_get_meeting_transcript_reports_not_ready_instead_of_restricted(monkeypa
 def test_get_meeting_transcript_respects_can_download_false_without_reason(
     monkeypatch,
 ):
-    """can_download is the authoritative Zoom signal and must be consulted
-    even when download_restriction_reason is absent."""
+    """can_download is a signal, but the recordings listing is consulted
+    first: only once it independently finds no transcript file either is
+    can_download trusted to report "restricted" rather than a silent
+    downgrade of a transcript the recordings endpoint could still serve."""
     mock_request = Mock(return_value=MockResponse(json_data={"can_download": False}))
     monkeypatch.setattr(zoom.requests, "request", mock_request)
 
@@ -379,7 +397,44 @@ def test_get_meeting_transcript_respects_can_download_false_without_reason(
 
     assert result["status"] == "error"
     assert "restricted" in result["message"].lower()
-    mock_request.assert_called_once()
+    assert mock_request.call_count == 2
+
+
+def test_get_meeting_transcript_can_download_false_still_falls_back_to_recordings(
+    monkeypatch,
+):
+    """can_download: false on the transcript-shortcut endpoint must not
+    short-circuit before the recordings listing is checked: the two
+    endpoints can disagree, and a transcript file the recordings endpoint
+    can still serve must not be misreported as restricted."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"can_download": False}),
+            MockResponse(
+                json_data={
+                    "recording_files": [
+                        {
+                            "file_type": "TRANSCRIPT",
+                            "download_url": "https://download.zoom.us/transcript.vtt",
+                        },
+                    ]
+                }
+            ),
+        ]
+    )
+    mock_get = Mock(
+        return_value=MockResponse(
+            text="WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nstill downloadable\n"
+        )
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+    monkeypatch.setattr(zoom.requests, "get", mock_get)
+
+    result = json.loads(zoom.zoom_get_meeting_transcript("123"))
+
+    assert result["status"] == "success"
+    assert result["transcript"] == "still downloadable"
+    assert mock_request.call_count == 2
 
 
 def test_get_meeting_transcript_falls_back_to_recording_files_on_404(monkeypatch):
@@ -602,6 +657,19 @@ def test_download_text_rejects_non_zoom_host(monkeypatch):
     with pytest.raises(RuntimeError, match="unexpected host"):
         zoom._download_text("https://evil.example.com/t.vtt?token=SECRET")
     mock_get.assert_not_called()
+
+
+def test_download_text_allows_bare_zoom_us_host(monkeypatch):
+    """The exact-match branch (host == "zoom.us", as opposed to a
+    subdomain matching the ".zoom.us" suffix) must actually allow the
+    request through rather than only being reachable in theory."""
+    monkeypatch.setattr(
+        zoom.requests, "get", Mock(return_value=MockResponse(text="WEBVTT\n"))
+    )
+
+    text = zoom._download_text("https://zoom.us/t.vtt")
+
+    assert text == "WEBVTT\n"
 
 
 def test_get_current_user_returns_profile(monkeypatch):

@@ -41,7 +41,10 @@ MEETING_LIST_TYPES = (
     "upcoming",
 )
 
-_VTT_TIMESTAMP_LINE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:")
+# Zoom always exports the full HH:MM:SS.mmm form, but WebVTT itself allows
+# the hours group to be omitted (MM:SS.mmm) — match both so a cue-index
+# line preceding a short-form timestamp is still recognized as scaffolding.
+_VTT_TIMESTAMP_LINE = re.compile(r"^(?:\d{2}:)?\d{2}:\d{2}\.\d{3}\s+-->")
 
 
 class _ZoomApiError(RuntimeError):
@@ -181,14 +184,17 @@ def _vtt_to_text(vtt_text: str) -> str:
             continue
         if _VTT_TIMESTAMP_LINE.match(line):
             continue
-        # A cue-index line is digit-only *and* immediately followed by a
-        # timestamp line — checking structure, not just line.isdigit(),
-        # keeps a genuinely spoken digit-only line (a PIN, an order number, a
-        # year read aloud) in the transcript instead of silently dropping it.
-        if (
-            line.isdigit()
-            and index + 1 < len(raw_lines)
-            and _VTT_TIMESTAMP_LINE.match(raw_lines[index + 1])
+        # A cue-index line is digit-only *and* either the last line in the
+        # file or immediately followed by a timestamp line — checking
+        # structure, not just line.isdigit(), keeps a genuinely spoken
+        # digit-only line (a PIN, an order number, a year read aloud) in the
+        # transcript instead of silently dropping it. A trailing bare-digit
+        # line can never be complete spoken content, since a real cue
+        # always requires its own following timestamp and text line, so
+        # it's treated as a (truncated) cue index too.
+        if line.isdigit() and (
+            index + 1 >= len(raw_lines)
+            or _VTT_TIMESTAMP_LINE.match(raw_lines[index + 1])
         ):
             continue
         lines.append(line)
@@ -322,9 +328,6 @@ def zoom_get_meeting_transcript(meeting_id: str) -> str:
                 )
             return _error(f"Transcript download is restricted: {restriction_reason}")
 
-        if not download_url and can_download is False:
-            return _error("Transcript download is restricted")
-
         if not download_url:
             try:
                 recordings = _request("GET", f"/meetings/{encoded_id}/recordings")
@@ -342,9 +345,17 @@ def zoom_get_meeting_transcript(meeting_id: str) -> str:
                 else []
             )
             transcript_file = _find_transcript_file(recording_files)
-            if transcript_file is None:
+            if transcript_file is not None:
+                download_url = transcript_file.get("download_url")
+            elif can_download is False:
+                # The transcript-shortcut endpoint said no, and the
+                # independent recordings listing found no transcript file
+                # either — trust can_download only once both endpoints
+                # agree, rather than short-circuiting on it alone before
+                # ever checking recordings.
+                return _error("Transcript download is restricted")
+            else:
                 return _error("No transcript found for this meeting")
-            download_url = transcript_file.get("download_url")
 
         if not download_url:
             return _error("Transcript file has no download_url")

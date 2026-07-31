@@ -1036,6 +1036,43 @@ describe("workforce route entry points", () => {
     })
   })
 
+  it("opens the member detail dialog when a worker card is activated via keyboard", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      workers: [
+        {
+          id: 100,
+          agent: {
+            id: 8,
+            name: "Worker Agent",
+            description: null,
+            logo_url: null,
+            status: "published",
+          },
+          alias: "Researcher",
+          assignment_instructions: "Research launch tasks",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          sort_order: 1,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+    })
+    listAgentOptionsMock.mockResolvedValueOnce([])
+
+    render(<WorkforceDetailPage />)
+
+    const card = (await screen.findByText("Researcher")).closest('[role="button"]')!
+    expect(card).toHaveAttribute("tabIndex", "0")
+    fireEvent.keyDown(card, { key: "Enter" })
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument()
+    expect(within(screen.getByRole("dialog")).getByDisplayValue("Research launch tasks")).toBeInTheDocument()
+  })
+
   it("keeps the detail page visible while refreshing after adding a worker", async () => {
     const agentOptions = [
       {

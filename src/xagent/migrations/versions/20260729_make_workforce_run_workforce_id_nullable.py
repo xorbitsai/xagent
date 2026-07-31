@@ -26,6 +26,12 @@ depends_on: Union[str, Sequence[str], None] = None
 TABLE = "workforce_runs"
 COLUMN = "workforce_id"
 
+# WorkforceRun has FKs to workforces/tasks/users; without resolve_fks=False,
+# batch mode's FK reflection can raise NoSuchTableError on a migration-only
+# database where a referenced table isn't yet visible (see the same fix in
+# 20260724_add_upload_source_to_uploaded_files.py).
+BATCH_REFLECT_KWARGS = {"resolve_fks": False}
+
 
 def _column_nullable(inspector: Inspector, table: str, column: str) -> bool | None:
     for col in inspector.get_columns(table):
@@ -35,30 +41,38 @@ def _column_nullable(inspector: Inspector, table: str, column: str) -> bool | No
 
 
 def upgrade() -> None:
-    from alembic import context
-
-    bind = context.get_bind()
-    inspector = Inspector.from_engine(bind)
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
     if TABLE not in inspector.get_table_names():
         return
 
     if _column_nullable(inspector, TABLE, COLUMN) is False:
-        with op.batch_alter_table(TABLE) as batch_op:
+        with op.batch_alter_table(
+            TABLE, reflect_kwargs=BATCH_REFLECT_KWARGS
+        ) as batch_op:
             batch_op.alter_column(COLUMN, existing_type=sa.Integer(), nullable=True)
 
 
 def downgrade() -> None:
-    from alembic import context
-
-    bind = context.get_bind()
-    inspector = Inspector.from_engine(bind)
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
     if TABLE not in inspector.get_table_names():
         return
 
     # Ephemeral preview runs have no Workforce to backfill; they cannot
-    # survive the NOT NULL restore, so drop them first.
+    # survive the NOT NULL restore, so drop them first -- and their paired
+    # hidden Task rows too, or those become orphans (nothing else references
+    # them once the owning WorkforceRun row is gone).
+    bind.execute(
+        sa.text(
+            f"DELETE FROM tasks WHERE id IN "
+            f"(SELECT task_id FROM {TABLE} WHERE {COLUMN} IS NULL AND task_id IS NOT NULL)"
+        )
+    )
     bind.execute(sa.text(f"DELETE FROM {TABLE} WHERE {COLUMN} IS NULL"))
 
     if _column_nullable(inspector, TABLE, COLUMN) is not False:
-        with op.batch_alter_table(TABLE) as batch_op:
+        with op.batch_alter_table(
+            TABLE, reflect_kwargs=BATCH_REFLECT_KWARGS
+        ) as batch_op:
             batch_op.alter_column(COLUMN, existing_type=sa.Integer(), nullable=False)

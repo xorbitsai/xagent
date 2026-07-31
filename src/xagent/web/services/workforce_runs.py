@@ -402,7 +402,7 @@ def _create_preview_run_record_no_commit(
 ) -> WorkforceRunRecordResult:
     """Stage a PENDING WorkforceRun and Task for an unsaved workforce draft."""
 
-    snapshot = build_preview_workforce_snapshot(
+    snapshot, manager_agent = build_preview_workforce_snapshot(
         db,
         user,
         name=name,
@@ -410,7 +410,6 @@ def _create_preview_run_record_no_commit(
         manager_agent_id=manager_agent_id,
         workers=workers,
     )
-    manager_agent = cast(Agent, db.get(Agent, manager_agent_id))
     policy = get_workforce_policy()
     policy.before_workforce_run(db, user, None)
 

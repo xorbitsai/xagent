@@ -21,7 +21,9 @@ vi.mock("next/navigation", () => ({
 }))
 
 vi.mock("next/link", () => ({
-  default: ({ children, href }: { children: React.ReactNode; href: string }) => <a href={href}>{children}</a>,
+  default: ({ children, href, onClick }: { children: React.ReactNode; href: string; onClick?: (e: React.MouseEvent) => void }) => (
+    <a href={href} onClick={onClick}>{children}</a>
+  ),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -299,6 +301,53 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     expect(runWorkforcePreviewMock).toHaveBeenCalledOnce()
   })
 
+  it("starts a fresh preview run instead of continuing a stale one when the unsaved draft is edited", async () => {
+    runWorkforcePreviewMock
+      .mockResolvedValueOnce({
+        workforce_run_id: 1,
+        task_id: 42,
+        status: "running",
+        redirect_url: "/task/42",
+      })
+      .mockResolvedValueOnce({
+        workforce_run_id: 2,
+        task_id: 43,
+        status: "running",
+        redirect_url: "/task/43",
+      })
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    // Test the unsaved draft -- pins an ephemeral preview run (task 42).
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => expect(runWorkforcePreviewMock).toHaveBeenCalledTimes(1))
+
+    // Edit the still-unsaved draft (add another worker) before saving.
+    fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+    fireEvent.click(await screen.findByText("Silent Analyst"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    // A later test message must start a brand-new preview run, proving the
+    // edit invalidated the one pinned before it -- not silently continue
+    // chatting into task 42 with the now-stale two-worker config.
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => {
+      expect(runWorkforcePreviewMock).toHaveBeenCalledTimes(2)
+    })
+  })
+
   it("does not let a preview response that resolves after Create clobber the reset with the stale task", async () => {
     let resolvePreview: (value: unknown) => void = () => {}
     runWorkforcePreviewMock.mockImplementationOnce(
@@ -478,6 +527,76 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     await waitFor(() => {
       expect(screen.queryByText("workforces.detail.membersTitle")).not.toBeInTheDocument()
     })
+
+    confirmSpy.mockRestore()
+  })
+
+  it("confirms before following the back link away from an in-progress details edit", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm")
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Draft name" } })
+
+    const backLink = screen.getByRole("link")
+
+    // Declining leaves the navigation cancelled (fireEvent.click returns
+    // false when the event's default was prevented) and the edit intact.
+    confirmSpy.mockReturnValueOnce(false)
+    expect(fireEvent.click(backLink)).toBe(false)
+    expect(screen.getByDisplayValue("Draft name")).toBeInTheDocument()
+
+    // Agreeing lets the navigation proceed (default not prevented).
+    confirmSpy.mockReturnValueOnce(true)
+    expect(fireEvent.click(backLink)).toBe(true)
+
+    confirmSpy.mockRestore()
+  })
+
+  it("confirms before creating the workforce while a details edit is in progress", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm")
+    const created = { id: 55, name: "Draft name", status: "draft" }
+    createWorkforceMock.mockResolvedValueOnce(created)
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    // Commit an initial name so Create is enabled, independent of the
+    // still-unsaved second edit started below.
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Launch Team" } })
+    fireEvent.click(screen.getByText("common.save"))
+
+    const createButton = screen.getByText("workforces.actions.createTeam")
+    await waitFor(() => expect(createButton).not.toBeDisabled())
+
+    // Start a second, never-saved edit.
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Draft name" } })
+
+    // Declining must not create the workforce at all.
+    confirmSpy.mockReturnValueOnce(false)
+    fireEvent.click(createButton)
+    expect(confirmSpy).toHaveBeenCalledOnce()
+    expect(createWorkforceMock).not.toHaveBeenCalled()
+
+    // Agreeing proceeds with Create as usual.
+    confirmSpy.mockReturnValueOnce(true)
+    fireEvent.click(createButton)
+    await waitFor(() => expect(createWorkforceMock).toHaveBeenCalledOnce())
 
     confirmSpy.mockRestore()
   })

@@ -246,8 +246,16 @@ export function WorkforceConfigPanel({
               return (
                 <div
                   key={worker.id}
-                  className="group relative flex flex-col items-start gap-2 rounded-xl border p-4 text-left hover:border-foreground/30 hover:shadow-sm transition-all cursor-pointer"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => dialogs.openMemberDetail(worker)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault()
+                      dialogs.openMemberDetail(worker)
+                    }
+                  }}
+                  className="group relative flex flex-col items-start gap-2 rounded-xl border p-4 text-left hover:border-foreground/30 hover:shadow-sm transition-all cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   {!isArchived && (
                     <button

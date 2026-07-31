@@ -80,6 +80,11 @@ export function AgentPickerDialog({
   // template pending name confirmation
   const [pendingTemplate, setPendingTemplate] = useState<Template | null>(null)
   const [pendingName, setPendingName] = useState("")
+  // Guards against a rapid double-click adding the same agent twice: the
+  // create-mode draft path resolves onSelectAgent synchronously with no
+  // network round trip, so the `saving` prop (only set by the edit-mode
+  // API-backed path) never disables the row in time.
+  const [selecting, setSelecting] = useState(false)
 
   // Reset on open
   useEffect(() => {
@@ -88,6 +93,7 @@ export function AgentPickerDialog({
       setSearch("")
       setPendingTemplate(null)
       setPendingName("")
+      setSelecting(false)
     }
   }, [open])
 
@@ -120,6 +126,21 @@ export function AgentPickerDialog({
       (t) => t.name.toLowerCase().includes(q) || (t.description || "").toLowerCase().includes(q),
     )
   }, [templates, search])
+
+  const handleSelect = async (agentId: number, description?: string) => {
+    if (selecting) return
+    setSelecting(true)
+    try {
+      await onSelectAgent(agentId, description)
+    } catch {
+      // The caller (handleChangeLead/handleAddWorker) already toasts the
+      // error and re-throws only so its own try/finally runs; this is a
+      // fire-and-forget onClick with no caller to propagate to, so swallow
+      // it here instead of leaving an unhandled promise rejection.
+    } finally {
+      setSelecting(false)
+    }
+  }
 
   const handleSelectTemplate = (template: Template) => {
     setPendingTemplate(template)
@@ -158,7 +179,12 @@ export function AgentPickerDialog({
     toast.success(t("workforces.templates.createSuccess", { name: newAgent!.name }))
     setPendingTemplate(null)
     setPendingName("")
-    await onSelectAgent(newAgent!.id, newAgent!.description || pendingTemplate.name)
+    try {
+      await onSelectAgent(newAgent!.id, newAgent!.description || pendingTemplate.name)
+    } catch {
+      // Same fire-and-forget rationale as handleSelect: the caller already
+      // toasted its own error, nothing here to propagate to.
+    }
   }
 
   const tabBtn = (id: "my-agents" | "built-in", label: string) => (
@@ -216,8 +242,8 @@ export function AgentPickerDialog({
                   <button
                     key={agent.id}
                     type="button"
-                    onClick={() => onSelectAgent(agent.id, agent.description || undefined)}
-                    disabled={saving}
+                    onClick={() => handleSelect(agent.id, agent.description || undefined)}
+                    disabled={saving || selecting}
                     className="w-full flex items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-muted/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
                   >
                     <AgentAvatar name={agent.name} size="sm" />

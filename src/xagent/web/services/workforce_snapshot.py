@@ -404,7 +404,7 @@ def build_preview_workforce_snapshot(
     description: str | None,
     manager_agent_id: int,
     workers: list[dict[str, Any]],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], Agent]:
     """Build a run snapshot for an unsaved (never-persisted) workforce draft.
 
     Mirrors ``build_workforce_snapshot`` but reads the manager/workers by id
@@ -414,6 +414,10 @@ def build_preview_workforce_snapshot(
     matching the persisted run path), not via ``ensure_workforce_agent_run_access``
     which requires a real Workforce, and not via the looser
     ``ensure_agent_access`` used for agent *selection*.
+
+    Returns ``(snapshot, manager_agent)`` -- the caller needs the already-
+    validated manager ORM object too (for the Task's ``agent_id``/execution
+    mode), and re-fetching it by id would be a redundant, unvalidated lookup.
     """
     manager_agent = _ensure_preview_agent_run_access(
         db.get(Agent, manager_agent_id), user, db
@@ -512,7 +516,7 @@ def build_preview_workforce_snapshot(
     # workforce_runtime.py), so leaving this unset is safe.
     snapshot["config_fingerprint"] = None
     snapshot["config_fingerprint_version"] = WORKFORCE_CONFIG_FINGERPRINT_VERSION
-    return snapshot
+    return snapshot, manager_agent
 
 
 def build_workforce_task_config(

@@ -96,8 +96,16 @@ export function WorkforceDeployDialog({
           {options.map((option) => (
             <Card
               key={option.id}
-              className="cursor-pointer shadow-sm transition-colors hover:border-primary"
+              role="button"
+              tabIndex={0}
               onClick={option.onClick}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault()
+                  option.onClick()
+                }
+              }}
+              className="cursor-pointer shadow-sm transition-colors hover:border-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <CardHeader>
                 <div className={`mb-2 flex h-10 w-10 items-center justify-center rounded-lg ${option.iconBg}`}>

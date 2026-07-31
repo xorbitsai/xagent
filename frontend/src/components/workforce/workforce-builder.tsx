@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { ArrowLeft, LayoutDashboard, MessageSquare, Webhook } from "lucide-react"
@@ -103,12 +103,22 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     // state) with no autosave, so the switch is gated on this.
     const [isEditingDetails, setIsEditingDetails] = useState(false)
 
+    // Shared by every action that would discard an in-progress Details edit
+    // (switching views, navigating away, saving via Create) -- not just the
+    // Configure/Canvas toggle.
+    const confirmDiscardDetailsEdit = () =>
+        !isEditingDetails || window.confirm(t("workforces.detail.discardEditConfirm"))
+
     const switchView = (view: ActiveView) => {
         if (view === activeView) return
-        if (isEditingDetails && !window.confirm(t("workforces.detail.discardEditConfirm"))) {
-            return
-        }
+        if (!confirmDiscardDetailsEdit()) return
         setActiveView(view)
+    }
+
+    const handleBackLinkClick = (e: React.MouseEvent) => {
+        if (!confirmDiscardDetailsEdit()) {
+            e.preventDefault()
+        }
     }
 
     // Create-mode draft — local only, nothing hits the API until the first Create call.
@@ -215,6 +225,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         if (!isEditMode) {
             setDraftName(data.name)
             setDraftDescription(data.description)
+            invalidatePreviewRun()
             return
         }
         if (!localId) return
@@ -240,6 +251,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const handleChangeLead = async (agentId: number) => {
         if (!isEditMode) {
             setDraftManagerAgentId(String(agentId))
+            invalidatePreviewRun()
             return
         }
         if (!localId) return
@@ -269,9 +281,12 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                     alias: "",
                     assignment_instructions: instructions,
                     enabled: true,
-                    sort_order: current.length + 1,
+                    // Max-based, not length-based: collides with a survivor's
+                    // sort_order once a middle draft worker has been removed.
+                    sort_order: Math.max(0, ...current.map((w) => w.sort_order)) + 1,
                 },
             ])
+            invalidatePreviewRun()
             return
         }
         if (!localId) return
@@ -313,6 +328,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                         : draft,
                 ),
             )
+            invalidatePreviewRun()
             return
         }
         if (!localId) return
@@ -353,6 +369,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                     .filter((_, index) => index !== worker.id)
                     .map((draft, index) => ({ ...draft, sort_order: index + 1 })),
             )
+            invalidatePreviewRun()
             return
         }
         if (!localId) return
@@ -427,6 +444,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
 
     const handleCreate = async () => {
         if (!canCreate || saving) return
+        if (!confirmDiscardDetailsEdit()) return
         try {
             beginMutation()
             const created = await createWorkforce({
@@ -522,9 +540,17 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const manager: WorkforceAgentSummary | null = isEditMode
         ? workforce?.manager ?? null
         : agents.find((a) => String(a.id) === draftManagerAgentId) ?? null
+    // Memoized so the array reference is stable across unrelated re-renders
+    // (e.g. opening a dialog) in create mode -- otherwise handleSaveDetails's
+    // useCallback stabilization for the canvas node-layout memo is defeated
+    // by a fresh `workers` value every time regardless.
+    const createModeWorkers = useMemo(
+        () => draftWorkers.map((draft, index) => toFakeWorker(draft, index, agents)),
+        [draftWorkers, agents],
+    )
     const workers: WorkforceWorker[] = isEditMode
         ? (workforce?.workers ?? [])
-        : draftWorkers.map((draft, index) => toFakeWorker(draft, index, agents))
+        : createModeWorkers
     const displayName = isEditMode ? (workforce?.name ?? "") : draftName
     const displayDescription = isEditMode ? (workforce?.description ?? "") : draftDescription
 
@@ -573,7 +599,11 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         <div className="flex h-full flex-col overflow-hidden">
             {/* Page header */}
             <div className="flex-none border-b bg-card/30 px-4 h-14 flex items-center gap-3">
-                <Link href="/workforces" className="text-muted-foreground hover:text-foreground transition-colors">
+                <Link
+                    href="/workforces"
+                    onClick={handleBackLinkClick}
+                    className="text-muted-foreground hover:text-foreground transition-colors"
+                >
                     <ArrowLeft className="h-4 w-4" />
                 </Link>
                 <span className="text-sm text-muted-foreground">{t("workforces.list.title")}</span>

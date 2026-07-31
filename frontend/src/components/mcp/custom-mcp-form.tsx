@@ -12,6 +12,10 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { MCPServerFormData } from "./custom-api-form"
 import {
+  parseMcpOAuthErrorMessage,
+  type McpOAuthConnectResponse,
+} from "@/lib/mcp-utils"
+import {
   RuntimeInputsForm,
   type RuntimeConfigErrorKey,
 } from "./runtime-inputs-form"
@@ -56,27 +60,11 @@ interface McpOAuthDiscoveryResponse {
   scopes: string[]
 }
 
-interface McpOAuthConnectResponse {
-  authorization_url: string
-}
-
 const MASKED_SECRET_VALUE = "********"
 const HTTP_MCP_OAUTH_TRANSPORTS = new Set(["streamable_http", "sse", "websocket"])
 
 export function isHttpMcpOAuthTransport(transport: string): boolean {
   return HTTP_MCP_OAUTH_TRANSPORTS.has(transport)
-}
-
-async function parseMcpOAuthErrorMessage(response: Response, fallback: string): Promise<string> {
-  try {
-    const payload = await response.json()
-    if (typeof payload?.detail === "string") return payload.detail
-    if (payload?.detail?.message) return payload.detail.message
-    if (payload?.detail?.code) return payload.detail.code
-  } catch {
-    // Keep the provided fallback.
-  }
-  return fallback
 }
 
 export function CustomMcpForm({

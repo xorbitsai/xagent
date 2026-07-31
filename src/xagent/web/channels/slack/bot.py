@@ -99,13 +99,13 @@ class _RetryBackoff:
         initial_seconds: float = _RETRY_INITIAL_SECONDS,
         max_seconds: float = _RETRY_MAX_SECONDS,
     ) -> None:
-        self._initial = initial_seconds
-        self._max = max_seconds
-        self.attempts = 0
+        self._initial: float = initial_seconds
+        self._max: float = max_seconds
+        self.attempts: int = 0
 
     @property
     def delay(self) -> float:
-        return min(self._initial * (2**self.attempts), self._max)
+        return min(self._initial * float(2**self.attempts), self._max)
 
     async def sleep(self) -> None:
         await asyncio.sleep(self.delay)

@@ -4251,6 +4251,7 @@ const zh = {
       addMemberTitle: "添加成员",
       changeLeadTitle: "选择 Workforce 负责人",
       createNewAgent: "创建新 Agent",
+      discardEditConfirm: "Workforce 详情有未保存的修改，切换视图会丢弃这些修改，确定继续吗？",
     },
     loading: {
       list: "正在加载 Workforces...",

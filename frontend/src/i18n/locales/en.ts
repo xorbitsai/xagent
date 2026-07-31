@@ -4251,6 +4251,7 @@ Build when you need.`,
       addMemberTitle: "Add a Member",
       changeLeadTitle: "Choose a Workforce Lead",
       createNewAgent: "Create new agent",
+      discardEditConfirm: "You have unsaved changes to the Workforce Details. Switch views and discard them?",
     },
     loading: {
       list: "Loading workforces...",

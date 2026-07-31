@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
@@ -178,6 +179,9 @@ export function AgentPickerDialog({
       <DialogContent className="sm:max-w-md p-0 gap-0 overflow-hidden">
         <DialogHeader className="px-6 pt-6 pb-4">
           <DialogTitle>{title}</DialogTitle>
+          <DialogDescription className="sr-only">
+            {t("workforces.workers.searchPlaceholder")}
+          </DialogDescription>
         </DialogHeader>
 
         {/* Search */}
@@ -485,9 +489,9 @@ export function WorkforceEditDialogs({
                     <DialogTitle className="text-base truncate">
                       {selectedWorker.alias || selectedWorker.agent.name}
                     </DialogTitle>
-                    <p className="text-xs text-muted-foreground line-clamp-2 mt-0.5">
+                    <DialogDescription className="text-xs text-muted-foreground line-clamp-2 mt-0.5">
                       {selectedWorker.agent.description || ""}
-                    </p>
+                    </DialogDescription>
                   </div>
                 </div>
               </DialogHeader>

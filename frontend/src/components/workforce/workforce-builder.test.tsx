@@ -435,4 +435,50 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     expect(await screen.findByText("3/6")).toBeInTheDocument()
     expect(screen.queryByText("4/6")).not.toBeInTheDocument()
   })
+
+  it("confirms before switching to Canvas mid-edit, and only discards the edit if the user agrees", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm")
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Draft name" } })
+
+    // Declining the confirm must leave the edit form open on Configure --
+    // membersTitle only renders on the Configure panel, never on Canvas.
+    confirmSpy.mockReturnValueOnce(false)
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    expect(confirmSpy).toHaveBeenCalledOnce()
+    expect(screen.getByDisplayValue("Draft name")).toBeInTheDocument()
+    expect(screen.getByText("workforces.detail.membersTitle")).toBeInTheDocument()
+
+    // Agreeing discards the in-progress edit and switches to Canvas.
+    confirmSpy.mockReturnValueOnce(true)
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    expect(confirmSpy).toHaveBeenCalledTimes(2)
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.membersTitle")).not.toBeInTheDocument()
+    })
+
+    confirmSpy.mockRestore()
+  })
+
+  it("does not confirm when switching views without an in-progress details edit", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm")
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+
+    expect(confirmSpy).not.toHaveBeenCalled()
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.membersTitle")).not.toBeInTheDocument()
+    })
+
+    confirmSpy.mockRestore()
+  })
 })

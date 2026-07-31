@@ -58,8 +58,18 @@ export function DetailsNode({ data }: { data: DetailsNodeData }) {
   useEffect(() => setDescription(data.description), [data.description])
 
   const commit = () => {
-    if (name !== data.name || description !== data.description) {
-      data.onSave({ name, description })
+    // Mirror the Configure panel's save button, which is disabled while the
+    // trimmed name is empty: don't fire an empty-name save (a 422 in edit
+    // mode, or a silently-blanked draft name with no explanation in create
+    // mode) -- revert to the last saved value instead.
+    if (!name.trim()) {
+      setName(data.name)
+      return
+    }
+    const trimmedName = name.trim()
+    const trimmedDescription = description.trim()
+    if (trimmedName !== data.name || trimmedDescription !== data.description) {
+      data.onSave({ name: trimmedName, description: trimmedDescription })
     }
   }
 

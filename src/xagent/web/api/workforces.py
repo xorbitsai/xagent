@@ -627,6 +627,9 @@ async def list_workforce_agent_options(
     ]
 
 
+# Must stay declared before POST /{workforce_id}/runs below: FastAPI matches
+# routes in declaration order, and "preview" would otherwise be captured as
+# workforce_id (failing int conversion) instead of reaching this handler.
 @router.post("/preview/runs")
 async def create_workforce_preview_run(
     request: WorkforcePreviewRunRequest,

@@ -145,4 +145,15 @@ describe("WorkforceCanvas", () => {
 
     expect(onSaveDetails).toHaveBeenCalledWith({ name: "Renamed Workforce", description: "Coordinate launch work" })
   })
+
+  it("reverts an emptied name on blur instead of saving it", () => {
+    const { onSaveDetails } = renderCanvas({ name: "Launch Workforce", description: "Coordinate launch work" })
+
+    const nameInput = screen.getByDisplayValue("Launch Workforce")
+    fireEvent.change(nameInput, { target: { value: "   " } })
+    fireEvent.blur(nameInput)
+
+    expect(onSaveDetails).not.toHaveBeenCalled()
+    expect(screen.getByDisplayValue("Launch Workforce")).toBeInTheDocument()
+  })
 })

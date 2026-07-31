@@ -30,6 +30,10 @@ interface WorkforceConfigPanelProps {
   getStartedSteps: GetStartedStep[]
   getStartedCollapsed: boolean
   onToggleGetStarted: () => void
+  /** Reports whether the Workforce Details form is mid-edit, so a parent
+   * that conditionally unmounts this panel (e.g. switching to the Canvas
+   * tab) can warn before silently discarding an unsaved edit. */
+  onEditingDetailsChange?: (editing: boolean) => void
 }
 
 // ─── Main panel ────────────────────────────────────────────────────────────
@@ -45,6 +49,7 @@ export function WorkforceConfigPanel({
   getStartedSteps,
   getStartedCollapsed,
   onToggleGetStarted,
+  onEditingDetailsChange,
 }: WorkforceConfigPanelProps) {
   const { t } = useI18n()
 
@@ -57,6 +62,15 @@ export function WorkforceConfigPanel({
     setDetailsName(name)
     setDetailsDescription(description)
   }, [name, description])
+
+  useEffect(() => {
+    onEditingDetailsChange?.(editingDetails)
+    // Report "not editing" on unmount too -- a parent that force-switched
+    // away mid-edit (after the user confirmed discarding it) shouldn't be
+    // left thinking an edit is still in progress.
+    return () => onEditingDetailsChange?.(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingDetails])
 
   const handleSaveDetails = async () => {
     await onSaveDetails({
@@ -264,21 +278,6 @@ export function WorkforceConfigPanel({
   )
 }
 
-export function workerEditState(worker: WorkforceWorker): WorkerEditState {
-  return {
-    alias: worker.alias || "",
-    assignment_instructions: worker.assignment_instructions || "",
-    enabled: worker.enabled,
-    sort_order: String(worker.sort_order ?? 1),
-  }
-}
-
-export function buildWorkerEditState(workers: WorkforceWorker[]): Record<number, WorkerEditState> {
-  return workers.reduce<Record<number, WorkerEditState>>((acc, w) => {
-    acc[w.id] = workerEditState(w)
-    return acc
-  }, {})
-}
 
 export function normalizeWorkerSortOrder(
   value: string,

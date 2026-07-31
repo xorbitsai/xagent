@@ -411,7 +411,10 @@ def _create_preview_run_record_no_commit(
         workers=workers,
     )
     manager_agent = cast(Agent, db.get(Agent, manager_agent_id))
-    return _create_run_and_task_no_commit(
+    policy = get_workforce_policy()
+    policy.before_workforce_run(db, user, None)
+
+    record = _create_run_and_task_no_commit(
         db,
         user,
         workforce_id=None,
@@ -422,6 +425,10 @@ def _create_preview_run_record_no_commit(
         ),
         request=request,
     )
+    policy.after_workforce_run_created(
+        db, user, None, record.workforce_run, record.task
+    )
+    return record
 
 
 def create_workforce_run_record(

@@ -35,18 +35,16 @@ function runDuration(run: WorkforceRunHistoryItem): string | null {
 interface WorkforceRunsListProps {
   workforceId: number | string
   onSelectRun?: (run: WorkforceRunHistoryItem) => void
-  compact?: boolean
   className?: string
 }
 
 export function WorkforceRunsList({
   workforceId,
   onSelectRun,
-  compact = false,
   className,
 }: WorkforceRunsListProps) {
   const { t } = useI18n()
-  const size = compact ? 10 : 20
+  const size = 20
 
   const [data, setData] = useState<WorkforceRunHistoryResponse | null>(null)
   const [page, setPage] = useState(1)
@@ -111,28 +109,26 @@ export function WorkforceRunsList({
 
   return (
     <div className={cn("flex flex-col", className)}>
-      {!compact && (
-        <div className="flex items-center justify-between pb-3">
-          <span className="text-xs text-muted-foreground">
-            {t("workforces.pagination.showing", {
-              start: (page - 1) * size + 1,
-              end: (page - 1) * size + items.length,
-              total: data?.total ?? items.length,
-            })}
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="gap-1.5 text-muted-foreground"
-            onClick={() => void load(page, { silent: true })}
-          >
-            <RefreshCw className="h-3.5 w-3.5" />
-            {t("workforces.runs.refresh")}
-          </Button>
-        </div>
-      )}
+      <div className="flex items-center justify-between pb-3">
+        <span className="text-xs text-muted-foreground">
+          {t("workforces.pagination.showing", {
+            start: (page - 1) * size + 1,
+            end: (page - 1) * size + items.length,
+            total: data?.total ?? items.length,
+          })}
+        </span>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="gap-1.5 text-muted-foreground"
+          onClick={() => void load(page, { silent: true })}
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+          {t("workforces.runs.refresh")}
+        </Button>
+      </div>
 
-      <ul className={cn("flex flex-col", compact ? "gap-0.5" : "gap-1.5")}>
+      <ul className="flex flex-col gap-1.5">
         {items.map((run) => {
           const title =
             run.task_title || run.message || t("workforces.runs.untitled", { id: run.id })
@@ -148,15 +144,14 @@ export function WorkforceRunsList({
                   if (clickable && onSelectRun) onSelectRun(run)
                 }}
                 className={cn(
-                  "flex w-full flex-col gap-1 rounded-lg border bg-card text-left transition-colors",
-                  compact ? "px-3 py-2" : "px-4 py-3",
+                  "flex w-full flex-col gap-1 rounded-lg border bg-card px-4 py-3 text-left transition-colors",
                   clickable
                     ? "hover:border-primary/40 hover:bg-muted/50 cursor-pointer"
                     : "opacity-70 cursor-default",
                 )}
               >
                 <div className="flex items-center gap-2">
-                  <span className={cn("truncate font-medium", compact ? "text-xs" : "text-sm")}>
+                  <span className="truncate text-sm font-medium">
                     {title}
                   </span>
                   {run.is_preview && (

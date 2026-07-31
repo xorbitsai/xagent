@@ -62,8 +62,9 @@ class WorkforcePolicy:
         return None
 
     def before_workforce_run(
-        self, db: Session, user: User, workforce: Workforce
+        self, db: Session, user: User, workforce: Workforce | None
     ) -> None:
+        """``workforce`` is ``None`` for an unsaved draft's preview run."""
         del db, user, workforce
 
     def is_agent_in_workforce_run_scope(
@@ -86,10 +87,11 @@ class WorkforcePolicy:
         self,
         db: Session,
         user: User,
-        workforce: Workforce,
+        workforce: Workforce | None,
         run: Any,
         task: Any,
     ) -> None:
+        """``workforce`` is ``None`` for an unsaved draft's preview run."""
         del db, user, workforce, run, task
 
     def record_workforce_event(

@@ -309,18 +309,18 @@ export default function WorkforcesPage() {
           open={deployView === "api"}
           workforceId={deployItem.id}
           workforceName={deployItem.name}
-          onClose={() => setDeployView(null)}
+          onClose={() => setDeployView("options")}
         />
       )}
       <WorkforceWidgetDialog
         workforce={deployView === "embed" ? deployItem : null}
         open={deployView === "embed"}
-        onClose={() => setDeployView(null)}
+        onClose={() => setDeployView("options")}
       />
       <WorkforceShareDialog
         workforce={deployView === "share" ? deployItem : null}
         open={deployView === "share"}
-        onClose={() => setDeployView(null)}
+        onClose={() => setDeployView("options")}
       />
       <AgentTriggersDialog
         agentId={null}

@@ -619,6 +619,7 @@ async def test_create_preview_workforce_run_rejects_admin_using_anothers_private
 @pytest.mark.asyncio
 async def test_create_preview_workforce_run_honors_custom_run_scope_policy(
     db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A custom ``WorkforcePolicy`` (e.g. team-shared execution) must apply
     identically to preview and saved runs. The preview path checks agent
@@ -638,6 +639,7 @@ async def test_create_preview_workforce_run_honors_custom_run_scope_policy(
             del db, user, workforce, agent
             return True
 
+    _patch_schedule_bg(monkeypatch)
     set_workforce_policy(TeamScopePolicy())
 
     owner = _create_user(db_session, "team-scope-owner")
@@ -664,6 +666,65 @@ async def test_create_preview_workforce_run_honors_custom_run_scope_policy(
         message="Hello",
     )
     await result.background_task
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_invokes_policy_run_hooks(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """before_workforce_run / after_workforce_run_created must fire for
+    preview runs too (with workforce=None) -- they're the extension point a
+    custom WorkforcePolicy would use for quota gating, audit logging, or
+    billing side-effects, and preview runs execute real agents and consume
+    real spend just like a saved run."""
+
+    _patch_schedule_bg(monkeypatch)
+    calls: list[tuple[str, Workforce | None]] = []
+
+    class AuditingPolicy(WorkforcePolicy):
+        def before_workforce_run(
+            self, db: Session, user: User, workforce: Workforce | None
+        ) -> None:
+            del db, user
+            calls.append(("before", workforce))
+
+        def after_workforce_run_created(
+            self,
+            db: Session,
+            user: User,
+            workforce: Workforce | None,
+            run: Any,
+            task: Any,
+        ) -> None:
+            del db, user, run, task
+            calls.append(("after", workforce))
+
+    set_workforce_policy(AuditingPolicy())
+
+    user = _create_user(db_session, "audited-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": None,
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="Hello",
+    )
+    await result.background_task
+
+    assert calls == [("before", None), ("after", None)]
 
 
 @pytest.mark.asyncio

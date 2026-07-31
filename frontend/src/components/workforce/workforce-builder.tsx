@@ -98,6 +98,18 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const [triggersOpen, setTriggersOpen] = useState(false)
     const [getStartedCollapsed, setGetStartedCollapsed] = useState(true)
     const [hasSentTestMessage, setHasSentTestMessage] = useState(false)
+    // Set by WorkforceConfigPanel while its Workforce Details form is
+    // mid-edit; switching to Canvas unmounts the panel (and its local edit
+    // state) with no autosave, so the switch is gated on this.
+    const [isEditingDetails, setIsEditingDetails] = useState(false)
+
+    const switchView = (view: ActiveView) => {
+        if (view === activeView) return
+        if (isEditingDetails && !window.confirm(t("workforces.detail.discardEditConfirm"))) {
+            return
+        }
+        setActiveView(view)
+    }
 
     // Create-mode draft — local only, nothing hits the API until the first Create call.
     const [draftName, setDraftName] = useState("")
@@ -175,6 +187,27 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         setError(null)
     }
 
+    // Drop any in-progress/completed test run so the next test message starts
+    // a fresh one -- called after every persisted manager/worker/instructions
+    // edit, since the running (or already-sent) preview task's snapshot was
+    // frozen at send time and silently ignores later config changes.
+    const invalidatePreviewRun = useCallback(() => {
+        previewGenerationRef.current += 1
+        previewTaskIdRef.current = null
+        // The config just changed, so any prior test message was against a
+        // now-stale snapshot -- the Get Started "test" step shouldn't stay
+        // checked for a config nobody has actually tested yet.
+        setHasSentTestMessage(false)
+        closeFilePreview()
+        dispatch({ type: "CLEAR_MESSAGES" })
+        dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
+        dispatch({ type: "SET_STEPS", payload: [] })
+        dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+        dispatch({ type: "SET_CURRENT_TASK", payload: null })
+        dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+        setTaskId(null, { navigate: false })
+    }, [closeFilePreview, dispatch, setTaskId])
+
     // useCallback: workforce-canvas.tsx's node-layout memo depends on this
     // reference, and a fresh one on every unrelated re-render (e.g. opening a
     // dialog) would otherwise rebuild the whole nodes array from scratch.
@@ -192,6 +225,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                 description: data.description || null,
             })
             setWorkforce(next)
+            invalidatePreviewRun()
             toast.success(t("workforces.messages.updated"))
         } catch (err) {
             const nextError = err instanceof Error ? err.message : t("workforces.errors.update")
@@ -201,7 +235,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         } finally {
             setSaving(false)
         }
-    }, [isEditMode, localId, t])
+    }, [isEditMode, localId, invalidatePreviewRun, t])
 
     const handleChangeLead = async (agentId: number) => {
         if (!isEditMode) {
@@ -213,6 +247,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             beginMutation()
             const next = await updateWorkforce(localId, { manager_agent_id: agentId })
             setWorkforce(next)
+            invalidatePreviewRun()
             toast.success(t("workforces.messages.updated"))
         } catch (err) {
             const nextError = err instanceof Error ? err.message : t("workforces.errors.update")
@@ -242,14 +277,21 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         if (!localId) return
         try {
             beginMutation()
+            // Length-based would collide with a survivor's sort_order once a
+            // middle worker has been removed (e.g. 1,2,3 -> remove #2 leaves
+            // 1,3, but length+1 computes 3 again) -- derive from the actual
+            // max instead.
+            const nextSortOrder =
+                Math.max(0, ...(workforce?.workers.map((w) => w.sort_order ?? 0) ?? [])) + 1
             await addWorkforceAgent(localId, {
                 source_type: "existing",
                 agent_id: agentId,
                 assignment_instructions: instructions,
                 enabled: true,
-                sort_order: (workforce?.workers.length || 0) + 1,
+                sort_order: nextSortOrder,
             })
             await load({ silent: true })
+            invalidatePreviewRun()
             toast.success(t("workforces.messages.workerAdded"))
         } catch (err) {
             const nextError = err instanceof Error ? err.message : t("workforces.errors.addWorker")
@@ -292,6 +334,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                     }
                     : current,
             )
+            invalidatePreviewRun()
             toast.success(t("workforces.messages.workerUpdated"))
         } catch (err) {
             const nextError = err instanceof Error ? err.message : t("workforces.errors.updateWorker")
@@ -317,6 +360,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             beginMutation()
             await removeWorkforceAgent(localId, worker.id)
             await load({ silent: true })
+            invalidatePreviewRun()
             toast.success(t("workforces.messages.workerRemoved"))
         } catch (err) {
             const nextError = err instanceof Error ? err.message : t("workforces.errors.removeWorker")
@@ -396,16 +440,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             // against the just-saved workforce instead of continuing to chat
             // into the stale draft's conversation, which would silently
             // ignore any config changes made after saving.
-            previewGenerationRef.current += 1
-            previewTaskIdRef.current = null
-            closeFilePreview()
-            dispatch({ type: "CLEAR_MESSAGES" })
-            dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-            dispatch({ type: "SET_STEPS", payload: [] })
-            dispatch({ type: "SET_DAG_EXECUTION", payload: null })
-            dispatch({ type: "SET_CURRENT_TASK", payload: null })
-            dispatch({ type: "SET_HISTORY_LOADING", payload: false })
-            setTaskId(null, { navigate: false })
+            invalidatePreviewRun()
             setWorkforce(created)
             setLocalId(String(created.id))
             router.replace(`/workforces/${created.id}`)
@@ -555,7 +590,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                 {/* Configure / Canvas toggle */}
                 <div className="ml-4 flex items-center gap-1 rounded-lg border bg-muted/50 p-1">
                     <button
-                        onClick={() => setActiveView("configure")}
+                        onClick={() => switchView("configure")}
                         className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                             activeView === "configure"
                                 ? "bg-background text-foreground shadow-sm"
@@ -566,7 +601,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                         {t("workforces.detail.configure")}
                     </button>
                     <button
-                        onClick={() => setActiveView("canvas")}
+                        onClick={() => switchView("canvas")}
                         className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                             activeView === "canvas"
                                 ? "bg-background text-foreground shadow-sm"
@@ -647,6 +682,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                                     getStartedSteps={getStartedSteps}
                                     getStartedCollapsed={getStartedCollapsed}
                                     onToggleGetStarted={() => setGetStartedCollapsed((current) => !current)}
+                                    onEditingDetailsChange={setIsEditingDetails}
                                 />
                             </div>
                         ) : (

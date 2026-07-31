@@ -861,6 +861,87 @@ describe("workforce route entry points", () => {
     })
   })
 
+  it("starts a fresh test run instead of continuing a stale one after the config changes mid-session", async () => {
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
+    listAgentOptionsMock.mockResolvedValueOnce([
+      {
+        id: 8,
+        name: "Worker Agent",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+    ])
+    runWorkforceMock
+      .mockResolvedValueOnce({
+        workforce_run_id: 6,
+        task_id: 100,
+        status: "running",
+        redirect_url: "/task/100",
+      })
+      .mockResolvedValueOnce({
+        workforce_run_id: 7,
+        task_id: 200,
+        status: "running",
+        redirect_url: "/task/200",
+      })
+    addWorkforceAgentMock.mockResolvedValueOnce({ id: 101 })
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      workers: [
+        {
+          id: 100,
+          agent: {
+            id: 8,
+            name: "Worker Agent",
+            description: null,
+            logo_url: null,
+            status: "published",
+          },
+          alias: null,
+          assignment_instructions: "Worker Agent",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          sort_order: 1,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+    })
+
+    render(<WorkforceDetailPage />)
+
+    // First test message pins a run in flight.
+    fireEvent.click(await screen.findByRole("button", { name: "Send Test" }))
+    await waitFor(() => {
+      expect(runWorkforceMock).toHaveBeenCalledTimes(1)
+    })
+
+    // Editing the roster mid-session -- this persists immediately and must
+    // invalidate the pinned run, since its snapshot no longer matches.
+    fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+    fireEvent.click(await screen.findByText("Worker Agent"))
+    await waitFor(() => {
+      expect(addWorkforceAgentMock).toHaveBeenCalled()
+    })
+
+    // A later test message must start a brand-new run (second runWorkforce
+    // call) instead of silently continuing to chat into the run pinned
+    // before the edit, which would test a config that no longer exists.
+    fireEvent.click(await screen.findByRole("button", { name: "Send Test" }))
+    await waitFor(() => {
+      expect(runWorkforceMock).toHaveBeenCalledTimes(2)
+    })
+    expect(runWorkforceMock).toHaveBeenLastCalledWith("42", {
+      files: [],
+      is_preview: true,
+      is_visible: false,
+      message: "test message",
+    })
+  })
+
   it("opens a past run on the run page via the run query param", async () => {
     searchParamsMock.set("run", "9")
     getWorkforceMock.mockResolvedValueOnce(workforceDetail)
@@ -1022,6 +1103,62 @@ describe("workforce route entry points", () => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
     })
     expect(await screen.findByText("Worker Agent")).toBeInTheDocument()
+  })
+
+  it("does not collide with a surviving worker's sort_order when the roster has a gap", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      workers: [
+        {
+          id: 100,
+          agent: {
+            id: 8,
+            name: "Analyst",
+            description: null,
+            logo_url: null,
+            status: "published",
+          },
+          alias: null,
+          assignment_instructions: "Research launch tasks",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          // A middle worker was removed earlier, leaving a gap (no #2):
+          // length (1) + 1 would recompute 2, which happens to still be
+          // free here, so use 3 to force a real collision against length+1.
+          sort_order: 3,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+    })
+    listAgentOptionsMock.mockResolvedValueOnce([
+      {
+        id: 9,
+        name: "New Recruit",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+    ])
+    addWorkforceAgentMock.mockResolvedValueOnce({ id: 102 })
+
+    render(<WorkforceDetailPage />)
+
+    fireEvent.click(await screen.findByText("workforces.actions.addAgent"))
+    fireEvent.click((await screen.findByText("New Recruit")).closest("button")!)
+
+    await waitFor(() => {
+      expect(addWorkforceAgentMock).toHaveBeenCalledWith("42", {
+        agent_id: 9,
+        alias: undefined,
+        assignment_instructions: "New Recruit",
+        enabled: true,
+        sort_order: 4,
+        source_type: "existing",
+      })
+    })
   })
 
 })

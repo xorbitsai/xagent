@@ -42,6 +42,8 @@ import { sanitizeAppIntegrations } from "@/lib/team-sharing-sanitizers"
 
 import {
   isValidMcpName,
+  parseMcpOAuthErrorMessage,
+  type McpOAuthConnectResponse,
   buildCustomApiPayload,
   buildMcpServerPayload,
   customApiDetailToEditState,
@@ -516,12 +518,79 @@ export function ConnectMcpDialog({
     }
   }
 
+  // Remote-MCP OAuth catalog app (e.g. Granola): the backend ensures the
+  // shared server row + this user's association, runs Dynamic Client
+  // Registration when the provider has no static client, and returns the
+  // authorization URL. Mirrors custom-mcp-form's handleConnectMcpOAuth,
+  // but keyed by catalog app_id instead of a server id.
+  const handleConnectMcpOAuthApp = async (app: AppIntegration, autoSelect: boolean) => {
+    setLoadingApp(app.id)
+    // Open the popup synchronously on the click, before any await — popup
+    // blockers reject windows opened outside direct user-gesture handling.
+    const popup = window.open("about:blank", "_blank")
+    if (!popup) {
+      toast.error("Popup blocked. Please allow popups for this site to connect.")
+      setLoadingApp(null)
+      return
+    }
+    popup.opener = null
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/oauth/connect`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ redirect_after: "/tools?tab=mcp" }),
+      })
+      if (!response.ok) {
+        popup.close()
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthConnectFailed'))
+        toast.error(message)
+        setLoadingApp(null)
+        return
+      }
+      const data = await response.json() as McpOAuthConnectResponse
+      if (!data.authorization_url) {
+        popup.close()
+        toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+        setLoadingApp(null)
+        return
+      }
+      popup.location.href = data.authorization_url
+    } catch (error) {
+      console.error("Failed to start MCP OAuth connect:", error)
+      popup.close()
+      toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+      setLoadingApp(null)
+      return
+    }
+
+    // The OAuth callback lands the popup on the app's own /tools page (no
+    // postMessage like the builtin flow) — so refresh once the popup closes.
+    const checkPopup = setInterval(() => {
+      if (popup.closed) {
+        clearInterval(checkPopup)
+        setLoadingApp(null)
+        loadApps()
+        if (onSuccess) onSuccess()
+        if (autoSelect && onConnectSelected) {
+          setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name])
+        }
+        setSelectedApp(null)
+      }
+    }, 500)
+  }
+
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
     if (app.auth_type !== "builtin_oauth") {
-      // Key-based catalog app: collect the key. Anything else is a mis-authored
-      // entry (neither OAuth nor a launchable key-based command).
+      // Key-based catalog app: collect the key; remote-MCP OAuth app: start
+      // the per-user OAuth (DCR) flow. Anything else is a mis-authored entry.
       if (app.auth_type === "api_key") {
         openKeyConnect(app);
+      } else if (app.auth_type === "mcp_oauth") {
+        handleConnectMcpOAuthApp(app, autoSelect);
       } else {
         toast.error(t('tools.mcp.alerts.notConfigured'));
       }

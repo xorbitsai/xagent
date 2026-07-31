@@ -540,3 +540,23 @@ export function buildMcpServerPayload(
   })
   return payload
 }
+
+// --- MCP OAuth (remote server) connect helpers -----------------------------
+
+export interface McpOAuthConnectResponse {
+  authorization_url: string
+}
+
+/** Extract a human-readable message from an MCP OAuth endpoint error body.
+ * Shared by the custom-server form and the catalog connect dialog. */
+export async function parseMcpOAuthErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json()
+    if (typeof payload?.detail === "string") return payload.detail
+    if (payload?.detail?.message) return payload.detail.message
+    if (payload?.detail?.code) return payload.detail.code
+  } catch {
+    // Keep the provided fallback.
+  }
+  return fallback
+}

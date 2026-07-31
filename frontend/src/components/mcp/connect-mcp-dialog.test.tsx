@@ -93,9 +93,11 @@ vi.mock("./official-mcp-settings-dialog", () => ({
   OfficialMcpSettingsDialog: ({
     onConfigure,
     onOpenChange,
+    onConnectStart,
   }: {
     onConfigure: (app: object) => void
     onOpenChange: (open: boolean) => void
+    onConnectStart: (app: object) => void
   }) => (
     <div>
       <button
@@ -112,6 +114,9 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       </button>
       <button type="button" onClick={() => onConfigure(mcpApp(3, "aggregated-mcp"))}>
         configure-mcp
+      </button>
+      <button type="button" onClick={() => onConnectStart(mcpOauthApp())}>
+        connect-granola
       </button>
       <button type="button" onClick={() => onOpenChange(false)}>
         close-settings
@@ -158,6 +163,20 @@ function mcpApp(id: number, name: string) {
     is_local: true,
     server_id: id,
     transport: "streamable_http",
+  }
+}
+
+// A remote-MCP OAuth (DCR) catalog app, e.g. Granola: no provider, no
+// launch command — connecting must go through /apps/{id}/oauth/connect.
+function mcpOauthApp() {
+  return {
+    id: "granola",
+    name: "Granola",
+    description: "",
+    icon: "",
+    is_connected: false,
+    transport: "streamable_http",
+    auth_type: "mcp_oauth",
   }
 }
 
@@ -344,6 +363,70 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
         description: "Updated MCP description",
       })
     })
+  })
+
+  it("connects a remote-MCP OAuth catalog app through the oauth/connect endpoint", async () => {
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    try {
+      apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          expect(options?.method).toBe("POST")
+          expect((options?.headers as Record<string, string>)?.Accept).toBe("application/json")
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize?client_id=dyn-1" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      renderDialog()
+      fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+
+      await waitFor(() => {
+        expect(popup.location.href).toBe("https://auth.granola.ai/authorize?client_id=dyn-1")
+      })
+      expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank")
+      expect(popup.close).not.toHaveBeenCalled()
+      expect(toastErrorMock).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
+  it("surfaces the backend error and closes the popup when oauth/connect fails", async () => {
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: false,
+            status: 400,
+            json: async () => ({ detail: "This app is not a remote-OAuth connector" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      renderDialog()
+      fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+
+      await waitFor(() => {
+        expect(toastErrorMock).toHaveBeenCalledWith("This app is not a remote-OAuth connector")
+      })
+      expect(popup.close).toHaveBeenCalled()
+      expect(popup.location.href).toBe("")
+    } finally {
+      openSpy.mockRestore()
+    }
   })
 
   it("keeps masked baseline entries in an MCP user-env replacement", async () => {

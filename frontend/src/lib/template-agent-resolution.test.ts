@@ -20,11 +20,7 @@ vi.mock("@/lib/utils", async () => {
   };
 });
 
-import {
-  findExistingAgentForTemplate,
-  resolveAgentForTemplate,
-  toAgentId,
-} from "./template-agent-resolution";
+import { resolveAgentForTemplate, toAgentId } from "./template-agent-resolution";
 
 function jsonResponse(data: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(data), {
@@ -50,33 +46,17 @@ describe("toAgentId", () => {
   });
 });
 
-describe("findExistingAgentForTemplate", () => {
-  it("matches by template_id, not by name", () => {
-    const agents = [
-      { id: 1, name: "Renamed Agent", template_id: "tmpl-a" },
-      { id: 2, name: "tmpl-a", template_id: null },
-    ];
-
-    expect(findExistingAgentForTemplate("tmpl-a", agents)?.id).toBe(1);
-    expect(findExistingAgentForTemplate("tmpl-missing", agents)).toBeNull();
-  });
-});
-
 describe("resolveAgentForTemplate", () => {
   beforeEach(() => {
     apiRequestMock.mockReset();
   });
 
-  it("reuses a known agent without any network calls", async () => {
-    const known = [{ id: 7, name: "Inbox Manager", template_id: "support-inbox-manager", status: "published" }];
-
-    const result = await resolveAgentForTemplate("support-inbox-manager", known);
-
-    expect(result).toEqual({ agent: known[0], created: false });
-    expect(apiRequestMock).not.toHaveBeenCalled();
-  });
-
-  it("asks the server's resolve endpoint when no known agent matches", async () => {
+  it("always calls the server's resolve endpoint - no client-side cache shortcut", async () => {
+    // Regression test for PR review finding B5: a prior client-side fast
+    // path matched against a locally-cached agent list (from GET
+    // /api/agents, which can include teammates' agents under a team-scope
+    // hook) before ever reaching the server, with no ownership check. The
+    // server round-trip must be the only path, every time.
     apiRequestMock.mockResolvedValueOnce(
       jsonResponse({
         agent: { id: 10, name: "Inbox Manager", template_id: "support-inbox-manager", status: "published" },
@@ -84,7 +64,7 @@ describe("resolveAgentForTemplate", () => {
       })
     );
 
-    const result = await resolveAgentForTemplate("support-inbox-manager", []);
+    const result = await resolveAgentForTemplate("support-inbox-manager");
 
     expect(result.created).toBe(true);
     expect(result.agent).toMatchObject({ id: 10, status: "published" });
@@ -106,7 +86,7 @@ describe("resolveAgentForTemplate", () => {
       })
     );
 
-    const result = await resolveAgentForTemplate("support-inbox-manager", []);
+    const result = await resolveAgentForTemplate("support-inbox-manager");
 
     expect(result.created).toBe(false);
     expect(result.agent).toMatchObject({ id: 11 });
@@ -117,7 +97,7 @@ describe("resolveAgentForTemplate", () => {
       jsonResponse({ detail: "boom" }, { status: 500 })
     );
 
-    await expect(resolveAgentForTemplate("support-inbox-manager", [])).rejects.toThrow(
+    await expect(resolveAgentForTemplate("support-inbox-manager")).rejects.toThrow(
       "Failed to resolve agent from template (500)"
     );
   });
@@ -125,7 +105,7 @@ describe("resolveAgentForTemplate", () => {
   it("throws on a malformed resolve response body", async () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse({ created: true }));
 
-    await expect(resolveAgentForTemplate("support-inbox-manager", [])).rejects.toThrow(
+    await expect(resolveAgentForTemplate("support-inbox-manager")).rejects.toThrow(
       "Malformed resolve response"
     );
   });

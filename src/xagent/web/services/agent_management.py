@@ -21,7 +21,12 @@ from ...core.utils.api_key import (
     generate_api_key,
 )
 from ...templates.manager import TemplateManager
-from ..models.agent import AGENT_NAME_UNIQUE_INDEX, Agent, AgentStatus
+from ..models.agent import (
+    AGENT_NAME_UNIQUE_INDEX,
+    AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX,
+    Agent,
+    AgentOrigin,
+)
 from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.model import Model as DBModel
@@ -62,6 +67,12 @@ TEMPLATE_RESOLVE_RACE_RETRIES = 3
 
 class DuplicateAgentNameError(ValueError):
     """Raised when a user already owns an agent with the requested name."""
+
+
+class TemplateQuickAccessRaceError(ValueError):
+    """Raised when a concurrent insert wins the (user_id, template_id)
+    quick-access race - see AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX and
+    _resolve_agent_from_template_sync's retry loop."""
 
 
 class TemplateNotFoundError(LookupError):
@@ -593,6 +604,7 @@ class AgentManagementService:
         generate_runtime_key: bool = True,
         runtime_key_candidate: ApiKeyCandidate | None = None,
         template_id: str | None = None,
+        origin: str = AgentOrigin.USER.value,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
         """Create an agent and (optionally) its first runtime key in a
         single transaction. Internal transaction executor: assumes
@@ -620,8 +632,12 @@ class AgentManagementService:
         ``visibility="team"`` agent, or all of them for an admin) that this
         per-user index does not mirror -- two different users on the same
         team can still race past it with identical names; only a single
-        user's own double-submit is guaranteed to be caught here. The only
-        other IntegrityError source is the runtime key's
+        user's own double-submit is guaranteed to be caught here. A second
+        partial unique index, ``uq_agents_user_id_template_id_quick_access``
+        (scoped to ``origin=template_quick_access``), similarly turns an
+        insert into ``TemplateQuickAccessRaceError`` below -- see
+        ``AgentManagementService._resolve_agent_from_template_sync``. The
+        only remaining IntegrityError source is the runtime key's
         ``key_prefix`` unique constraint (the ``uq_agent_api_keys_agent_active``
         partial index that used to also live here was dropped for multi-key
         support -- an agent may hold more than one active key now), handled
@@ -651,12 +667,15 @@ class AgentManagementService:
                 tool_categories=tool_categories or [],
                 suggested_prompts=suggested_prompts or [],
                 template_id=template_id,
+                origin=origin,
             )
         except IntegrityError as exc:
             self.db.rollback()
-            if not is_agent_name_unique_violation(exc):
-                raise
-            raise DuplicateAgentNameError(name) from exc
+            if is_agent_name_unique_violation(exc):
+                raise DuplicateAgentNameError(name) from exc
+            if is_agent_template_quick_access_unique_violation(exc):
+                raise TemplateQuickAccessRaceError(template_id) from exc
+            raise
 
         # The agent-name race is handled above via the add_agent flush; the
         # runtime key is the only remaining write that can raise
@@ -933,6 +952,33 @@ def is_agent_name_unique_violation(error: BaseException) -> bool:
         if (
             "agents.user_id" in message
             and "agents.name" in message
+            and ("unique" in message or "duplicate" in message)
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_agent_template_quick_access_unique_violation(error: BaseException) -> bool:
+    """Recognize the authoritative (user_id, template_id) quick-access
+    unique index failure - the counterpart to is_agent_name_unique_violation
+    above, for AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX. Fires when a
+    concurrent request wins the resolve flow's create race even when the two
+    inserts picked different (disambiguated) names, so
+    is_agent_name_unique_violation alone would miss it (PR review findings
+    B1/B2).
+    """
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX.lower() in message:
+            return True
+        if (
+            "agents.user_id" in message
+            and "agents.template_id" in message
             and ("unique" in message or "duplicate" in message)
         ):
             return True
@@ -1273,19 +1319,26 @@ class AgentManagementRuntime:
         template_id: str,
         name: str | None = None,
     ) -> tuple[AgentResponseSnapshot, bool]:
-        """Atomic server-side get-or-create keyed on (user_id, template_id).
+        """Atomic server-side get-or-create keyed on (user_id, template_id,
+        origin=template_quick_access).
 
         Backs flows with reuse semantics (the /task template quick-access):
-        return the caller's own existing agent for this template - publishing
-        it first if it is still a draft - or create and publish a fresh one.
-        Unlike the plain create path this never raises on a duplicate default
-        name; it disambiguates server-side instead.
+        return the caller's own existing quick-access agent for this
+        template as-is, or create and publish a fresh one. Unlike the plain
+        create path this never raises on a duplicate default name; it
+        disambiguates server-side instead. Reuse never republishes a found
+        agent that isn't currently published - see
+        :meth:`_resolve_agent_from_template_sync` for why.
 
         Contrast with :meth:`create_agent_from_template`, which is a pure
         create used by flows that deliberately mint multiple instances of one
-        template under user-chosen names (workforce workers); a DB-level
-        uniqueness constraint on (user_id, template_id) would break those, so
-        idempotency for the reuse flow lives here instead.
+        template under user-chosen names (workforce workers, via the plain
+        ``origin=user`` ``POST /from-template``); those agents are invisible
+        to this method's reuse query (origin-scoped, see
+        AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX) and a DB-level uniqueness
+        constraint on plain (user_id, template_id) would have broken them, so
+        the constraint backing this method's idempotency is scoped to the
+        quick-access origin specifically.
 
         Returns the detached agent snapshot and whether it was newly created.
         """
@@ -1328,28 +1381,41 @@ class AgentManagementRuntime:
         SessionLocal = get_session_local()
         with SessionLocal() as db:
             service = AgentManagementService(db)
+            last_error: (
+                DuplicateAgentNameError | TemplateQuickAccessRaceError | None
+            ) = None
             for _ in range(TEMPLATE_RESOLVE_RACE_RETRIES):
                 # Strictly the caller's own rows (user_id filter, not the
                 # team-wide owned_agent_clause): this path may publish what it
                 # finds, and publishing a teammate's in-progress draft on this
                 # user's behalf is exactly the bug this server-side resolve
-                # exists to prevent (PR review finding F1). Lowest id wins so
-                # concurrent duplicates resolve deterministically (F3).
+                # exists to prevent (PR review finding F1). Also strictly
+                # scoped to the quick-access origin (PR review finding B4):
+                # without it, this query could adopt (and publish) an
+                # unrelated agent the workforce-builder UI built from the
+                # same template under a user-chosen name, since that flow
+                # writes template_id too. Lowest id wins so concurrent
+                # duplicates resolve deterministically (F3).
                 existing = (
                     db.query(Agent)
                     .filter(
                         Agent.user_id == user_id,
                         Agent.template_id == template_id,
+                        Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
                     )
                     .order_by(Agent.id)
                     .first()
                 )
                 if existing is not None:
-                    if existing.status != AgentStatus.PUBLISHED:
-                        existing = (
-                            service.store.publish_agent(user_id, int(existing.id))
-                            or existing
-                        )
+                    # Deliberately does not auto-publish a found draft (PR
+                    # review finding B3): status/published_at alone can't
+                    # distinguish "never published yet" (the create-then-
+                    # publish below failed) from "the user explicitly
+                    # unpublished it" - both look identical. Silently
+                    # republishing on an unrelated later call would revert
+                    # that choice with zero visible signal. Returning it
+                    # as-is is honest either way; the response's own
+                    # status/published_at fields tell the caller the truth.
                     return (
                         _agent_response_snapshot(
                             service.store.agent_to_response_dict(existing)
@@ -1374,19 +1440,26 @@ class AgentManagementRuntime:
                         suggested_prompts=list(spec.suggested_prompts),
                         generate_runtime_key=False,
                         template_id=template_id,
+                        origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
                     )
-                except DuplicateAgentNameError:
+                except (DuplicateAgentNameError, TemplateQuickAccessRaceError) as exc:
                     # A concurrent request inserted between our select and our
-                    # insert (the unique name we picked, or this same template's
-                    # agent). Re-select: if it was this template we reuse it,
-                    # otherwise resolve_unique_agent_name picks a fresh name.
+                    # insert. DuplicateAgentNameError means it took the exact
+                    # name we picked; TemplateQuickAccessRaceError means it
+                    # won this same (user, template)'s quick-access row even
+                    # under a *different*, disambiguated name - the case the
+                    # name-collision-only retry used to miss entirely (PR
+                    # review findings B1/B2). Either way, re-select: if it was
+                    # this template's quick-access agent we reuse it, else
+                    # resolve_unique_agent_name picks a fresh name next pass.
+                    last_error = exc
                     db.rollback()
                     continue
 
                 # Publish in a second commit. If this fails the create still
-                # stands, and the next resolve call finds the draft and
-                # publishes it - the flow self-heals instead of needing the
-                # client-side delete-on-failure rollback it replaced.
+                # stands as an unpublished draft; per the note on the reuse
+                # branch above, a later resolve call now returns it as-is
+                # rather than silently republishing it.
                 agent = service.store.publish_agent(user_id, int(agent.id)) or agent
                 return (
                     _agent_response_snapshot(
@@ -1394,7 +1467,7 @@ class AgentManagementRuntime:
                     ),
                     True,
                 )
-            raise DuplicateAgentNameError(spec.name)
+            raise last_error or DuplicateAgentNameError(spec.name)
 
     async def rotate_agent_runtime_key(
         self,

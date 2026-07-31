@@ -193,7 +193,7 @@ function TaskHomePageContent() {
     if (agentId === null && selectedTemplate) {
       let result: { agent: AgentCard; created: boolean };
       try {
-        result = await resolveAgentForTemplate(selectedTemplate.id, agents);
+        result = await resolveAgentForTemplate(selectedTemplate.id);
       } catch (error) {
         console.error("Failed to create agent from template:", error);
         // Rethrow (translated) rather than swallowing: ChatInput's own
@@ -205,15 +205,18 @@ function TaskHomePageContent() {
       }
 
       agentId = toAgentId(result.agent);
-      // Keep local state in sync so sending from this template again in the
-      // same session (without a page reload) resolves instantly instead of
-      // re-querying the backend - this also covers the case where the
-      // agent was resolved via the 400-retry lookup (created === false)
-      // rather than freshly created, which the local list wouldn't know
-      // about otherwise.
-      setAgents((prev) =>
-        prev.some((agent) => agent.id === result.agent.id) ? prev : [...prev, result.agent]
-      );
+      // Keep local `agents` state in sync for other consumers (e.g. the
+      // `?agent=` deep link) - resolveAgentForTemplate always asks the
+      // server (see its own docstring for why), this does not shortcut
+      // that. Only add it if published: `agents` is otherwise exclusively
+      // published agents (see the mount-time fetch above), and the resolve
+      // flow's reuse branch can now return a still-unpublished draft
+      // as-is (PR review finding B3) rather than always republishing it.
+      if (result.agent.status === "published") {
+        setAgents((prev) =>
+          prev.some((agent) => agent.id === result.agent.id) ? prev : [...prev, result.agent]
+        );
+      }
 
       if (result.created) {
         const templateName = selectedTemplate.name;
@@ -295,8 +298,10 @@ function TaskHomePageContent() {
               grid (passed via `templates` below) replaces the old "Chat with
               Agents" avatar picker on this page, matching the redesigned
               Task page. `agents` state itself is still fetched and used -
-              for the `?agent=` deep link above and for template-reuse
-              matching - just not rendered as a picker here. */}
+              for the `?agent=` deep link above - just not rendered as a
+              picker here. Template-reuse resolution goes through the server
+              unconditionally (see resolveAgentForTemplate); there is no
+              client-side matching against this list anymore. */}
           <ChatStartScreen
             title={t("chatPage.page.emptyTitle", { appName: branding.appName })}
             description={t("chatPage.page.emptyDescription")}

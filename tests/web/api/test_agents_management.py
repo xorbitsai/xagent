@@ -32,6 +32,7 @@ from xagent.web.services.agent_management import (
     AgentManagementService,
     AgentWorkforceConflictError,
     AgentWorkforceReference,
+    TemplateQuickAccessRaceError,
 )
 from xagent.web.services.task_runtime import (
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
@@ -334,9 +335,14 @@ def test_resolve_from_template_reuses_the_same_agent_on_repeat_calls(
     assert len(matching) == 1
 
 
-def test_resolve_from_template_publishes_the_callers_own_draft(
+def test_resolve_from_template_does_not_adopt_a_workforce_builder_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Regression test for PR review finding B4: the plain POST
+    /from-template (workforce-builder UI, one-off named creates) writes
+    template_id but not the quick-access origin marker. The resolve flow's
+    reuse query must not adopt (and publish) that unrelated draft - it has
+    to mint its own separate quick-access agent instead."""
     headers = _admin_headers()
     _install_resolve_template_stub(monkeypatch)
 
@@ -354,9 +360,49 @@ def test_resolve_from_template_publishes_the_callers_own_draft(
         json={"template_id": "resolve-template"},
     )
     assert resolved.status_code == 200, resolved.text
-    assert resolved.json()["created"] is False
-    assert resolved.json()["agent"]["id"] == created.json()["id"]
+    assert resolved.json()["created"] is True
+    assert resolved.json()["agent"]["id"] != created.json()["id"]
     assert resolved.json()["agent"]["status"] == "published"
+
+    # The workforce-builder draft is untouched - still its own draft.
+    workforce_draft = client.get(f"/api/agents/{created.json()['id']}", headers=headers)
+    assert workforce_draft.status_code == 200, workforce_draft.text
+    assert workforce_draft.json()["status"] == "draft"
+
+
+def test_resolve_from_template_does_not_republish_a_deliberate_unpublish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B3: status/published_at alone
+    can't distinguish "never published yet" from "the user explicitly
+    unpublished it" - both are status=draft, published_at=None. Resolve must
+    not silently flip a deliberate unpublish back to published on a later,
+    unrelated call."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["agent"]["status"] == "published"
+    agent_id = first.json()["agent"]["id"]
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+    assert unpublished.json()["agent"]["status"] == "draft"
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert second.json()["agent"]["id"] == agent_id
+    assert second.json()["agent"]["status"] == "draft"
 
 
 def test_resolve_from_template_never_touches_another_users_agent(
@@ -419,13 +465,15 @@ def test_resolve_from_template_disambiguates_a_colliding_default_name(
     assert body["agent"]["status"] == "published"
 
 
-def test_resolve_from_template_converges_when_a_racing_insert_wins(
+def test_resolve_from_template_converges_when_a_racing_insert_wins_the_same_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression test for PR review finding F3: if a concurrent request
     creates this template's agent between our select and our insert, the
     retry loop must re-select and reuse that row instead of erroring or
-    minting a duplicate."""
+    minting a duplicate. Here the racing insert collides on name too, which
+    is caught by the (user_id, name) unique index alone - see the sibling
+    test below for the interleaving where names do *not* collide (B1/B2)."""
 
     from xagent.web.services import agent_management as management_module
     from xagent.web.services.agent_store import AgentStore
@@ -450,6 +498,7 @@ def test_resolve_from_template_converges_when_a_racing_insert_wins(
                 instructions="Follow the template.",
                 execution_mode="balanced",
                 template_id="resolve-template",
+                origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
             )
             db.commit()
             racing_agent_id["id"] = int(racing.id)
@@ -468,6 +517,99 @@ def test_resolve_from_template_converges_when_a_racing_insert_wins(
     assert resolved.status_code == 200, resolved.text
     assert resolved.json()["created"] is False
     assert resolved.json()["agent"]["id"] == racing_agent_id["id"]
+
+
+def test_resolve_from_template_converges_when_a_racing_insert_wins_a_different_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B2: the realistic interleaving
+    is a racing insert that takes its *own* disambiguated name - no
+    (user_id, name) collision at all - which the plain name-collision retry
+    from the sibling test above can't catch (it never fires, so the old
+    code's retry loop never re-selected, and two rows ended up sharing one
+    template_id with different names, both reporting created=True).
+    Convergence here depends entirely on
+    AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX - the (user_id, template_id)
+    partial unique index scoped to the quick-access origin (B1/D2/D3)."""
+
+    from xagent.web.services import agent_management as management_module
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    real_resolve_name = management_module.resolve_unique_agent_name
+    racing_agent_id: dict[str, int] = {}
+
+    def race_then_delegate(db: Any, *, user_id: int, name: str) -> str:
+        # Simulate a concurrent request winning the race between our SELECT
+        # and our INSERT - but, unlike the sibling test above, under a
+        # disambiguated name that never collides with our own. Only the
+        # first call (the "our own" resolve's own resolve_unique_agent_name
+        # lookup) triggers the race; the racing insert's own internal
+        # resolve_unique_agent_name call must not recurse into this hook.
+        if not racing_agent_id:
+            store = AgentStore(db)
+            racing = store.create_agent(
+                user_id=user_id,
+                name="Totally Unrelated Name",
+                description="raced in first, under a name that never collides",
+                instructions="Follow the template.",
+                execution_mode="balanced",
+                template_id="resolve-template",
+                origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                status=AgentStatus.PUBLISHED,
+            )
+            db.commit()
+            racing_agent_id["id"] = int(racing.id)
+            # Our own insert proceeds under its natural, undisambiguated
+            # name - no name collision occurs at all.
+            return name
+        return real_resolve_name(db, user_id=user_id, name=name)
+
+    monkeypatch.setattr(
+        management_module, "resolve_unique_agent_name", race_then_delegate
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is False
+    assert resolved.json()["agent"]["id"] == racing_agent_id["id"]
+    assert resolved.json()["agent"]["name"] == "Totally Unrelated Name"
+
+
+def test_resolve_from_template_reports_409_when_retries_are_exhausted_by_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every TEMPLATE_RESOLVE_RACE_RETRIES attempt loses the
+    (user_id, template_id) quick-access race, the error must say so
+    honestly - not the name-collision 400, since no name collision is
+    involved at all in this failure mode."""
+    from xagent.web.services import agent_management as management_module
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    def always_races(*args: Any, **kwargs: Any) -> Any:
+        raise TemplateQuickAccessRaceError("resolve-template")
+
+    monkeypatch.setattr(
+        management_module.AgentManagementService,
+        "create_agent_with_optional_key",
+        always_races,
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 409, resolved.text
+    assert "name" not in resolved.json()["detail"].lower()
 
 
 def test_manually_created_agent_has_no_template_id() -> None:

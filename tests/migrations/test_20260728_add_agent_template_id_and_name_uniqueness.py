@@ -142,6 +142,34 @@ def _agent_names_by_id(engine: Any) -> dict[int, str]:
     return {row[0]: row[1] for row in rows}
 
 
+def _insert_agent_with_template(
+    conn: Any,
+    *,
+    agent_id: int,
+    user_id: int,
+    name: str,
+    template_id: str,
+    origin: str = "template_quick_access",
+) -> None:
+    """Only valid post-migration - template_id doesn't exist beforehand."""
+    conn.execute(
+        sa.text(
+            "INSERT INTO agents "
+            "(id, user_id, name, execution_mode, widget_enabled, share_enabled, "
+            "origin, status, template_id, created_at, updated_at) "
+            "VALUES (:id, :user_id, :name, 'balanced', 1, 0, :origin, 'draft', "
+            ":template_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ),
+        {
+            "id": agent_id,
+            "user_id": user_id,
+            "name": name,
+            "origin": origin,
+            "template_id": template_id,
+        },
+    )
+
+
 class TestUpgradeAddsSchema:
     def test_template_id_column_and_index_added(
         self, db_url: str, config_at_parent_revision: Config
@@ -203,6 +231,90 @@ class TestUpgradeAddsSchema:
         with engine.begin() as conn:
             count = conn.execute(
                 sa.text("SELECT COUNT(*) FROM agents WHERE name = 'Manager'")
+            ).scalar()
+        assert count == 2
+        engine.dispose()
+
+
+class TestTemplateQuickAccessUniqueIndex:
+    """Covers AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX, the partial unique
+    index on (user_id, template_id) scoped to origin='template_quick_access'
+    that backs the /task template quick-access resolve flow's atomicity
+    (PR review findings B1/B2/D2/D3)."""
+
+    def test_index_added(self, db_url: str, config_at_parent_revision: Config) -> None:
+        with create_engine(db_url).begin() as conn:
+            _insert_user(conn, 1)
+
+        command.upgrade(config_at_parent_revision, TARGET_REVISION)
+
+        engine = create_engine(db_url)
+        inspector = inspect(engine)
+        index_names = {idx["name"] for idx in inspector.get_indexes("agents")}
+        assert "uq_agents_user_id_template_id_quick_access" in index_names
+        engine.dispose()
+
+    def test_rejects_same_user_template_duplicate_within_quick_access_origin(
+        self, db_url: str, config_at_parent_revision: Config
+    ) -> None:
+        with create_engine(db_url).begin() as conn:
+            _insert_user(conn, 1)
+
+        command.upgrade(config_at_parent_revision, TARGET_REVISION)
+
+        engine = create_engine(db_url)
+        with engine.begin() as conn:
+            _insert_agent_with_template(
+                conn,
+                agent_id=1,
+                user_id=1,
+                name="Quick Access Agent",
+                template_id="tmpl-a",
+            )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                _insert_agent_with_template(
+                    conn,
+                    agent_id=2,
+                    user_id=1,
+                    name="Quick Access Agent 2",
+                    template_id="tmpl-a",
+                )
+        engine.dispose()
+
+    def test_allows_a_non_quick_access_duplicate_for_the_same_template(
+        self, db_url: str, config_at_parent_revision: Config
+    ) -> None:
+        """A workforce-builder agent (origin='user') built from the same
+        template as an existing quick-access agent must not collide - the
+        index is scoped to the quick-access origin only (B4)."""
+        with create_engine(db_url).begin() as conn:
+            _insert_user(conn, 1)
+
+        command.upgrade(config_at_parent_revision, TARGET_REVISION)
+
+        engine = create_engine(db_url)
+        with engine.begin() as conn:
+            _insert_agent_with_template(
+                conn,
+                agent_id=1,
+                user_id=1,
+                name="Quick Access Agent",
+                template_id="tmpl-a",
+                origin="template_quick_access",
+            )
+        with engine.begin() as conn:
+            _insert_agent_with_template(
+                conn,
+                agent_id=2,
+                user_id=1,
+                name="Workforce Worker",
+                template_id="tmpl-a",
+                origin="user",
+            )
+        with engine.begin() as conn:
+            count = conn.execute(
+                sa.text("SELECT COUNT(*) FROM agents WHERE template_id = 'tmpl-a'")
             ).scalar()
         assert count == 2
         engine.dispose()

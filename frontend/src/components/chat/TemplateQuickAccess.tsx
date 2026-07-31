@@ -91,10 +91,34 @@ export function TemplateQuickAccess({
 }: TemplateQuickAccessProps) {
   const { t } = useI18n();
 
+  // Both useMemo calls (and the plain activeCategory derivation between them)
+  // must run unconditionally, on every render, in the same order - the
+  // loading/error early return below used to sit between them, so the
+  // loading render executed one hook and the loaded render executed two,
+  // crashing with "Rendered fewer hooks than expected" (PR review finding
+  // C1). Keep every hook above any return statement.
   const categoryTabs = useMemo(
     () => getOrderedCategoriesWithCounts(templates),
     [templates]
   );
+
+  // The parent may hand us a selectedCategory (e.g. the "Featured" default)
+  // that no longer has a matching tab - a deployment with no featured
+  // templates, for instance. Fall back to the first available tab instead of
+  // rendering an empty, unlabeled panel.
+  const activeCategory = categoryTabs.some((tab) => tab.id === selectedCategory)
+    ? selectedCategory
+    : categoryTabs[0]?.id ?? selectedCategory;
+
+  const cards = useMemo(
+    () => getTemplatesForCategory(templates, activeCategory),
+    [templates, activeCategory]
+  );
+
+  const categoryLabel = (categoryId: string) => {
+    const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(categoryId)];
+    return key ? t(key) : categoryId;
+  };
 
   // While the initial fetch is in flight or has failed, `templates` is still
   // `[]` and categoryTabs would be empty too - without this, the grid area
@@ -127,24 +151,6 @@ export function TemplateQuickAccess({
       </div>
     );
   }
-
-  // The parent may hand us a selectedCategory (e.g. the "Featured" default)
-  // that no longer has a matching tab - a deployment with no featured
-  // templates, for instance. Fall back to the first available tab instead of
-  // rendering an empty, unlabeled panel.
-  const activeCategory = categoryTabs.some((tab) => tab.id === selectedCategory)
-    ? selectedCategory
-    : categoryTabs[0]?.id ?? selectedCategory;
-
-  const cards = useMemo(
-    () => getTemplatesForCategory(templates, activeCategory),
-    [templates, activeCategory]
-  );
-
-  const categoryLabel = (categoryId: string) => {
-    const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(categoryId)];
-    return key ? t(key) : categoryId;
-  };
 
   if (categoryTabs.length === 0) {
     return null;

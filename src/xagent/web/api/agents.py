@@ -38,6 +38,7 @@ from ..services.agent_management import (
     AgentWorkforceConflictError,
     DuplicateAgentNameError,
     TemplateNotFoundError,
+    TemplateQuickAccessRaceError,
     is_agent_name_unique_violation,
 )
 from ..services.agent_store import (
@@ -528,12 +529,18 @@ async def resolve_agent_from_template(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ResolvedTemplateAgentResponse:
-    """Get-or-create the caller's agent for a template, atomically.
+    """Get-or-create the caller's quick-access agent for a template,
+    atomically.
 
-    Reuses the caller's own existing agent for this template (publishing it
-    if still a draft) or creates and publishes a new one, disambiguating the
-    name server-side on collision. Unlike POST /from-template this is
-    idempotent per (user, template) - repeat calls return the same agent.
+    Reuses the caller's own existing quick-access agent for this template
+    as-is (never silently republishing a draft - see the note on
+    ``_resolve_agent_from_template_sync``), or creates and publishes a new
+    one, disambiguating the name server-side on collision. Idempotent per
+    (user, template) for this flow specifically: unlike the plain
+    POST /from-template (used by the workforce-builder UI to mint several
+    named instances of one template), repeat calls here return the same
+    agent, backed by a DB-level unique index scoped to this flow's own
+    origin marker.
     """
     user_id = int(current_user.id)
     is_admin = bool(current_user.is_admin)
@@ -562,6 +569,16 @@ async def resolve_agent_from_template(
     except DuplicateAgentNameError:
         raise HTTPException(
             status_code=400, detail="Agent with this name already exists"
+        )
+    except TemplateQuickAccessRaceError:
+        # Distinct from the name-collision case above: every one of
+        # TEMPLATE_RESOLVE_RACE_RETRIES concurrent attempts lost the
+        # (user_id, template_id) quick-access race to another request, with
+        # no name collision involved at all - "already exists" would be
+        # misleading here since the client never even chose a name.
+        raise HTTPException(
+            status_code=409,
+            detail="Too many concurrent requests for this template; please retry",
         )
     except Exception as e:
         logger.error(f"Failed to resolve agent from template: {e}")

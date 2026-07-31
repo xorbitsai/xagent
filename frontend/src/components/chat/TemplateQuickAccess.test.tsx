@@ -83,4 +83,41 @@ describe("TemplateQuickAccess", () => {
 
     expect(container).toBeEmptyDOMElement();
   });
+
+  it("survives the loading -> loaded transition without a hooks-order crash", () => {
+    // Regression test for PR review finding C1: the real /task mount order is
+    // (isLoading=false, templates=[]) on the very first render - falling
+    // through to the full render path - then a mount effect synchronously
+    // flips isLoading to true before the fetch resolves, forcing a second
+    // render down the early-return path. Both useMemo calls must run on
+    // every render regardless of which path is taken, or React throws
+    // "Rendered fewer hooks than expected."
+    const { rerender } = render(
+      <TemplateQuickAccess
+        templates={[]}
+        selectedCategory={FEATURED_CATEGORY_ID}
+        onCategoryChange={vi.fn()}
+        selectedPromptKey={null}
+        onPromptSelect={vi.fn()}
+        isLoading={false}
+      />
+    );
+
+    expect(() =>
+      rerender(
+        <TemplateQuickAccess
+          templates={[]}
+          selectedCategory={FEATURED_CATEGORY_ID}
+          onCategoryChange={vi.fn()}
+          selectedPromptKey={null}
+          onPromptSelect={vi.fn()}
+          isLoading={true}
+        />
+      )
+    ).not.toThrow();
+
+    expect(
+      screen.getByText("chatPage.templateQuickAccess.loading")
+    ).toBeInTheDocument();
+  });
 });

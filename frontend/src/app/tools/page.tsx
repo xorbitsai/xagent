@@ -57,6 +57,8 @@ import {
   mcpServerDetailToEditState,
   parseCustomApiDetail,
   parseMcpServerDetail,
+  shouldSelfCloseMcpOauthPopup,
+  MCP_OAUTH_SUCCESS_PARAM,
   type CustomApiDetail,
   type McpServerDetail,
 } from "@/lib/mcp-utils"
@@ -196,19 +198,24 @@ function ToolsPageContent() {
 
   useEffect(() => {
     // The MCP OAuth callback redirects the connect popup here after a
-    // successful authorization. The popup was opened under this window name
-    // by the connect flows; self-close it so the opener's popup-closed poll
-    // refreshes connection state, instead of showing the whole app in the
-    // popup. On error, stay open so the toast above is readable.
-    if (
-      typeof window !== "undefined" &&
-      window.name === "mcp-oauth" &&
-      !searchParams.get("mcp_oauth_error") &&
-      !searchParams.get("mcp_oauth_error_message")
-    ) {
+    // successful authorization, appending mcp_oauth_success=1. The popup was
+    // opened under this window name by the connect flows; self-close it so
+    // the opener's popup-closed poll refreshes connection state, instead of
+    // showing the whole app in the popup. On error the popup stays open so
+    // the toast above is readable. shouldSelfCloseMcpOauthPopup is keyed on
+    // the explicit success param, not the absence of error params, so a
+    // future error param added to the callback can't be mistaken for success.
+    if (!searchParams.get(MCP_OAUTH_SUCCESS_PARAM)) return
+    if (typeof window !== "undefined" && shouldSelfCloseMcpOauthPopup(window.name, searchParams)) {
       window.close()
+      return
     }
-  }, [searchParams])
+    // Not the popup (e.g. the flow ran in a full tab): just tidy the URL.
+    const nextParams = new URLSearchParams(searchParams.toString())
+    nextParams.delete(MCP_OAUTH_SUCCESS_PARAM)
+    const nextQuery = nextParams.toString()
+    router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
+  }, [router, searchParams])
 
   useEffect(() => {
     loadTools()

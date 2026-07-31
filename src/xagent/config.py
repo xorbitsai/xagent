@@ -106,6 +106,7 @@ BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
@@ -736,6 +737,22 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
         60 * 60,
         minimum=60,
     )
+
+
+def get_workforce_preview_run_stale_seconds() -> int:
+    """Age after which an abandoned builder preview run is GC-eligible.
+
+    Preview runs (workforce builder "test before save", ``workforce_id`` NULL)
+    are only invalidated client-side when the draft changes; a closed tab,
+    crashed browser, or network drop leaves the run (and its hidden Task)
+    active server-side forever with no owner left to invalidate it. Rows
+    still non-terminal past this age are reaped by the scheduled sweep.
+
+    Priority:
+        1. XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS environment variable
+        2. Default 7200 (2 hours)
+    """
+    return _get_positive_int_env(WORKFORCE_PREVIEW_RUN_STALE_SECONDS, 7200, minimum=300)
 
 
 def get_trigger_dispatcher_enabled() -> bool:

@@ -248,6 +248,17 @@ def ensure_workforce_agent_run_access(
 ) -> Agent:
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    # A workforce-generated manager agent (create_workforce_from_prompt) is
+    # only ever legitimate as its own workforce's manager. Selecting one
+    # elsewhere is already rejected by ensure_agent_access/
+    # _ensure_preview_agent_run_access at creation/preview time, and
+    # Agent.origin is immutable after that -- so this is unreachable via any
+    # known path today, but closes the same gap defensively at run time too,
+    # matching the preview path's check (workforce_snapshot.py).
+    if is_workforce_generated_manager_agent(agent) and int(agent.id) != int(
+        workforce.manager_agent_id
+    ):
+        raise HTTPException(status_code=404, detail="Agent not found")
     if agent.status != AgentStatus.PUBLISHED:
         raise HTTPException(
             status_code=400, detail="Workforce agents must be published"

@@ -1,8 +1,10 @@
 "use client"
 
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   ReactFlow,
+  ReactFlowProvider,
+  useReactFlow,
   Background,
   BackgroundVariant,
   Controls,
@@ -11,6 +13,7 @@ import {
   MarkerType,
   Node,
   Edge,
+  FitViewOptions,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
 import { Crown, Plus, Settings } from "lucide-react"
@@ -210,7 +213,14 @@ const DETAILS_WIDTH = 320 // w-80
 const MANAGER_WIDTH = 288 // w-72
 const WORKER_WIDTH_PX = 224 // w-56
 
-export function WorkforceCanvas({
+// Reserve room in the top-left corner so fitView doesn't center graph
+// content underneath the fixed Get Started overlay (which floats above the
+// canvas and isn't part of the flow itself).
+const FIT_VIEW_OPTIONS: FitViewOptions = {
+  padding: { top: "220px", left: "340px", right: "40px", bottom: "40px" },
+}
+
+function WorkforceCanvasInner({
   name,
   description,
   onSaveDetails,
@@ -223,6 +233,20 @@ export function WorkforceCanvas({
   onToggleGetStarted,
 }: WorkforceCanvasProps) {
   const { t } = useI18n()
+  const { fitView } = useReactFlow()
+  const isFirstRenderRef = useRef(true)
+
+  // The `fitView` prop below only fits once, on mount. Expanding the Get
+  // Started checklist after that grows the fixed overlay FIT_VIEW_OPTIONS
+  // reserves room for, so without this, nodes laid out for the collapsed
+  // (smaller) reservation can end up overlapping it.
+  useEffect(() => {
+    if (isFirstRenderRef.current) {
+      isFirstRenderRef.current = false
+      return
+    }
+    fitView(FIT_VIEW_OPTIONS)
+  }, [getStartedCollapsed, fitView])
 
   const { nodes, edges } = useMemo(() => {
     const newNodes: Node[] = []
@@ -386,10 +410,7 @@ export function WorkforceCanvas({
         nodeTypes={nodeTypes}
         onNodeClick={handleNodeClick}
         fitView
-        // Reserve room in the top-left corner so the initial fit doesn't
-        // center graph content underneath the fixed Get Started overlay
-        // (which floats above the canvas and isn't part of the flow itself).
-        fitViewOptions={{ padding: { top: "220px", left: "340px", right: "40px", bottom: "40px" } }}
+        fitViewOptions={FIT_VIEW_OPTIONS}
         minZoom={0.1}
         maxZoom={1.5}
       >
@@ -397,5 +418,13 @@ export function WorkforceCanvas({
         <Controls />
       </ReactFlow>
     </div>
+  )
+}
+
+export function WorkforceCanvas(props: WorkforceCanvasProps) {
+  return (
+    <ReactFlowProvider>
+      <WorkforceCanvasInner {...props} />
+    </ReactFlowProvider>
   )
 }

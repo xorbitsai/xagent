@@ -1569,3 +1569,84 @@ def test_workforce_manager_with_tool_categories_keeps_categories_and_workers() -
             _mock_tool("agent_99", "agent"),
         ]
     ) == frozenset({"browser_use", "agent_1"})
+
+
+# ===== Generated-manager agent run-access asymmetry (#1060 round-4 review) =====
+
+
+def _create_generated_manager_agent(db: Session, user: User, name: str) -> Agent:
+    """A ``create_workforce_from_prompt``-style auto-generated manager agent."""
+    from xagent.web.models.agent import AgentOrigin
+
+    agent = Agent(
+        user_id=user.id,
+        name=name,
+        description=f"{name} description",
+        instructions=f"{name} instructions",
+        execution_mode="think",
+        models={"general": "test-model"},
+        knowledge_bases=[],
+        skills=[],
+        tool_categories=[],
+        suggested_prompts=[],
+        status=AgentStatus.PUBLISHED,
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+    db.add(agent)
+    db.flush()
+    return agent
+
+
+def test_run_allows_a_workforces_own_generated_manager(db_session: Session) -> None:
+    """The AI-prompt creation flow's manager legitimately IS generated -- must still run."""
+    from xagent.web.services.workforce_snapshot import validate_workforce_for_run
+
+    user = _create_user(db_session, "prompt-owner")
+    manager = _create_generated_manager_agent(db_session, user, "Auto Manager")
+    worker = _create_agent(db_session, user, "Worker")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, worker)
+
+    manager_agent, enabled_workers = validate_workforce_for_run(
+        db_session, user, workforce
+    )
+
+    assert manager_agent.id == manager.id
+    assert [w.agent_id for w in enabled_workers] == [worker.id]
+
+
+def test_run_rejects_a_foreign_generated_manager_agent_used_as_worker(
+    db_session: Session,
+) -> None:
+    """Defence-in-depth: a generated manager agent smuggled in as a worker
+    (unreachable via create_workforce_worker's own check today, but the run
+    path should not silently trust it either) must not be allowed to run.
+    """
+    from xagent.web.models.workforce import WorkforceAgent
+    from xagent.web.services.workforce_snapshot import validate_workforce_for_run
+
+    user = _create_user(db_session, "victim-owner")
+    manager = _create_agent(db_session, user, "Real Manager")
+    workforce = _create_workforce(db_session, user, manager)
+
+    foreign_generated_manager = _create_generated_manager_agent(
+        db_session, user, "Someone Else's Auto Manager"
+    )
+    # Bypasses create_workforce_worker's ensure_agent_access gate on purpose,
+    # to simulate the row existing despite that (the scenario the run-time
+    # check now also guards against).
+    db_session.add(
+        WorkforceAgent(
+            workforce_id=workforce.id,
+            agent_id=foreign_generated_manager.id,
+            alias="Smuggled Worker",
+            assignment_instructions="Should never run",
+            enabled=True,
+            sort_order=1,
+        )
+    )
+    db_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_workforce_for_run(db_session, user, workforce)
+    assert exc_info.value.status_code == 404

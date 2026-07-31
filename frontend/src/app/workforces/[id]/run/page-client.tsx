@@ -774,13 +774,13 @@ function WorkforceRunPageInner() {
         ) : null}
         <div className="flex min-w-0 flex-1">
           <ResizableSplitLayout
-            // Remount (instead of relying on ResizableSplitLayout's own
-            // initialLeftWidth reactivity) when crossing the file/non-file
-            // boundary so the split snaps to the file-preview preset even if
-            // the user had manually dragged it in flow/agent mode -- switching
-            // between flow and agent alone keeps the same key and preserves
-            // any manual resize, matching ResizableSplitLayout's contract.
-            key={inspectorMode === "file" ? "file" : "graph"}
+            // ResizableSplitLayout resets its split to initialLeftWidth
+            // whenever that prop's value changes while the right panel is
+            // already open, so crossing the file/non-file boundary snaps to
+            // the file-preview preset without remounting either panel (which
+            // would otherwise drop the chat panel's scroll position and any
+            // unsent input). Switching between flow and agent alone keeps
+            // the same value (65) and preserves a manual resize.
             initialLeftWidth={inspectorMode === "file" ? 50 : 65}
             minLeftWidth={35}
             maxLeftWidth={80}

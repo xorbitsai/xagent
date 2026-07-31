@@ -26,12 +26,21 @@ export function ResizableSplitLayout({
   const containerRef = React.useRef<HTMLDivElement>(null)
   const rightPanelOpen = rightPanel !== undefined && rightPanel !== null
   const wasRightPanelOpenRef = React.useRef(rightPanelOpen)
+  const prevInitialLeftWidthRef = React.useRef(initialLeftWidth)
 
   useEffect(() => {
-    if (rightPanelOpen && !wasRightPanelOpenRef.current) {
+    // Reset on the closed->open transition (existing behavior: reopening
+    // snaps back to the preset even after a manual drag), and also when a
+    // caller changes its desired initialLeftWidth while already open (e.g.
+    // switching the right panel from a graph/agent view to a file preview,
+    // which wants a different split without remounting either panel and
+    // losing the left panel's scroll position / unsent input).
+    const initialLeftWidthChanged = prevInitialLeftWidthRef.current !== initialLeftWidth
+    if (rightPanelOpen && (!wasRightPanelOpenRef.current || initialLeftWidthChanged)) {
       setLeftWidth(initialLeftWidth)
     }
     wasRightPanelOpenRef.current = rightPanelOpen
+    prevInitialLeftWidthRef.current = initialLeftWidth
   }, [initialLeftWidth, rightPanelOpen])
 
   const handleMouseDown = useCallback(() => {

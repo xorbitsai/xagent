@@ -1,5 +1,5 @@
 export { DeployWorkforceDialog } from "./deploy-workforce-dialog"
-export { WorkforceDeployDialog } from "./workforce-deploy-dialog"
+export { WorkforceDeployHubDialog } from "./workforce-deploy-hub-dialog"
 export { WorkforceBuilder } from "./workforce-builder"
 export { WorkforceCanvas } from "./workforce-canvas"
 export { WorkforceConfigPanel, normalizeWorkerSortOrder } from "./workforce-config-panel"

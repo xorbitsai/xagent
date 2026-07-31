@@ -18,7 +18,7 @@ import { toast } from "sonner"
 import { WorkforceCreateView } from "@/components/workforce/workforce-create-view"
 import {
   WorkforceStatusBadge,
-  WorkforceDeployDialog,
+  WorkforceDeployHubDialog,
   DeployWorkforceDialog,
   WorkforceShareDialog,
   WorkforceWidgetDialog,
@@ -292,7 +292,7 @@ export default function WorkforcesPage() {
         ) : null}
       </div>
 
-      <WorkforceDeployDialog
+      <WorkforceDeployHubDialog
         open={!!deployItem && deployView === "options"}
         onClose={closeDeploy}
         workforceName={deployItem?.name ?? ""}

@@ -132,6 +132,13 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     // handleTestSendMessage call started before Create doesn't clobber the
     // reset with its now-orphaned (pre-save) result once its await resolves.
     const previewGenerationRef = useRef(0)
+    // Independent of previewTaskIdRef's -1 sentinel: invalidatePreviewRun
+    // resets that ref to null even while a preview-creation request is
+    // in-flight (a config edit mid-send), which would otherwise let a second
+    // handleTestSendMessage call slip past the "-1 means pending" guard and
+    // fire a second, concurrent runWorkforcePreview/runWorkforce request.
+    // This ref is only ever touched by handleTestSendMessage itself.
+    const previewRequestInFlightRef = useRef(false)
     const isArchived = workforce?.status === "archived"
 
     const load = useCallback(async (options: LoadOptions = {}) => {
@@ -475,10 +482,11 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         if (isEditMode ? !localId : !canTestDraft) return
 
         let taskId = previewTaskIdRef.current
-        if (taskId === -1) return
+        if (taskId === -1 || previewRequestInFlightRef.current) return
 
         const generationAtStart = previewGenerationRef.current
 
+        previewRequestInFlightRef.current = true
         try {
             if (!taskId) {
                 previewTaskIdRef.current = -1
@@ -534,6 +542,8 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             if (previewTaskIdRef.current === -1) previewTaskIdRef.current = null
             const nextError = err instanceof Error ? err.message : t("workforces.errors.run")
             toast.error(nextError)
+        } finally {
+            previewRequestInFlightRef.current = false
         }
     }
 

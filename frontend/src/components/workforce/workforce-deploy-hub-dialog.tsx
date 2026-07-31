@@ -6,7 +6,7 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/com
 import { Rocket, LayoutGrid, Code2, Share, Webhook, ArrowRight } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 
-interface WorkforceDeployDialogProps {
+interface WorkforceDeployHubDialogProps {
   open: boolean
   onClose: () => void
   workforceName: string
@@ -23,7 +23,7 @@ interface WorkforceDeployDialogProps {
  * WorkforceWidgetDialog, AgentTriggersDialog) instead of reimplementing
  * their logic inline.
  */
-export function WorkforceDeployDialog({
+export function WorkforceDeployHubDialog({
   open,
   onClose,
   workforceName,
@@ -31,7 +31,7 @@ export function WorkforceDeployDialog({
   onSelectApi,
   onSelectShare,
   onSelectWebhook,
-}: WorkforceDeployDialogProps) {
+}: WorkforceDeployHubDialogProps) {
   const { t } = useI18n()
 
   const options = [

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -13,6 +14,10 @@ from ..services.background_jobs import (
     update_job_progress,
 )
 from ..services.triggers import prepare_trigger_run, scan_due_scheduled_triggers
+from ..services.workforce_runtime import (
+    pause_workforce_tasks_after_archive,
+    reap_stale_preview_workforce_runs,
+)
 from .celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -84,7 +89,9 @@ def scan_due_triggers() -> dict[str, Any]:
     """Celery Beat entrypoint for scheduled trigger scans and job recovery.
 
     Full trigger definitions and agent handoff are kept outside Celery. This task
-    also requeues stale DB-backed jobs after broker loss or worker crashes.
+    also requeues stale DB-backed jobs after broker loss or worker crashes, and
+    reaps abandoned workforce-builder preview runs (see
+    ``reap_stale_preview_workforce_runs``).
     """
     logger.info("Scheduled trigger scan tick")
     try:
@@ -97,10 +104,25 @@ def scan_due_triggers() -> dict[str, Any]:
     try:
         requeued_jobs = requeue_stale_background_jobs(db)
         runs = scan_due_scheduled_triggers(db)
+        reaped_pause_targets = reap_stale_preview_workforce_runs(db)
+        if reaped_pause_targets:
+            asyncio.run(
+                pause_workforce_tasks_after_archive(
+                    reaped_pause_targets,
+                    # Preview runs have no workforce_id; only used for the
+                    # log message on a failed dispatch.
+                    workforce_id=0,
+                    actor_user_id=None,
+                    reason="preview-reap",
+                )
+            )
         return {
             "status": "ok",
             "requeued_stale_jobs": len(requeued_jobs),
             "trigger_runs_created": len(runs),
+            # Only counts reaped runs whose Task was still RUNNING (i.e. that
+            # needed an explicit PAUSE dispatch), not every reaped run.
+            "reaped_preview_run_pause_dispatches": len(reaped_pause_targets),
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
     finally:

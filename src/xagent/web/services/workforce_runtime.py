@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, selectinload
@@ -265,6 +265,28 @@ class WorkforceRunPauseTarget:
     task_id: int
 
 
+def _cancel_workforce_run_rows(
+    runs: list[WorkforceRun],
+) -> list[WorkforceRunPauseTarget]:
+    """Flip a batch of already-loaded runs to terminal ``cancelled`` in-place.
+
+    Shared by the workforce-archive cancel path and the stale-preview-run
+    reaper below; callers differ only in how ``runs`` was selected and
+    whether they commit inline or hand the transaction to their own caller.
+    """
+    pause_targets: list[WorkforceRunPauseTarget] = []
+    for run in runs:
+        task = run.task
+        if task is not None and task.status == TaskStatus.RUNNING:
+            pause_targets.append(
+                WorkforceRunPauseTarget(run_id=int(run.id), task_id=int(task.id))
+            )
+        setattr(run, "status", "cancelled")
+        if run.completed_at is None:
+            setattr(run, "completed_at", datetime.now(timezone.utc))
+    return pause_targets
+
+
 def cancel_active_workforce_runs(
     db: Session,
     workforce_id: int,
@@ -293,17 +315,55 @@ def cancel_active_workforce_runs(
         )
         .all()
     )
+    return _cancel_workforce_run_rows(runs)
 
-    pause_targets: list[WorkforceRunPauseTarget] = []
-    for run in runs:
-        task = run.task
-        if task is not None and task.status == TaskStatus.RUNNING:
-            pause_targets.append(
-                WorkforceRunPauseTarget(run_id=int(run.id), task_id=int(task.id))
-            )
-        setattr(run, "status", "cancelled")
-        if run.completed_at is None:
-            setattr(run, "completed_at", datetime.now(timezone.utc))
+
+def reap_stale_preview_workforce_runs(
+    db: Session,
+    *,
+    stale_after_seconds: int | None = None,
+    limit: int = 100,
+) -> list[WorkforceRunPauseTarget]:
+    """Cancel abandoned workforce-builder preview runs.
+
+    Preview runs (``workforce_id IS NULL``, the builder's "test before save")
+    belong to no saved Workforce, so archiving and
+    :func:`cancel_active_workforce_runs` never see them. The frontend clears
+    its own reference whenever the draft changes, but that is a client-side
+    signal only -- a closed tab, crashed browser, or network drop leaves the
+    run (and its hidden Task) active server-side with no owner left to
+    invalidate it. This is the server-side backstop: a scheduled sweep,
+    mirroring :func:`~.background_jobs.requeue_stale_background_jobs`, that
+    reaps rows still non-terminal past ``stale_after_seconds``.
+
+    Unlike :func:`cancel_active_workforce_runs`, this commits its own
+    cancellations -- it is the only state change in its transaction (no
+    sibling archive flip to stay atomic with) -- and returns pause targets
+    for the caller to dispatch PAUSE to, same as the archive path.
+    """
+    from ...config import get_workforce_preview_run_stale_seconds
+
+    stale_seconds = stale_after_seconds or get_workforce_preview_run_stale_seconds()
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+
+    runs = (
+        db.query(WorkforceRun)
+        .options(selectinload(WorkforceRun.task))
+        .filter(
+            WorkforceRun.workforce_id.is_(None),
+            WorkforceRun.status.in_(ACTIVE_WORKFORCE_RUN_STATUSES),
+            WorkforceRun.created_at.is_not(None),
+            WorkforceRun.created_at <= cutoff,
+        )
+        .order_by(WorkforceRun.created_at.asc())
+        .limit(max(1, min(limit, 500)))
+        .all()
+    )
+    if not runs:
+        return []
+
+    pause_targets = _cancel_workforce_run_rows(runs)
+    db.commit()
     return pause_targets
 
 
@@ -312,14 +372,21 @@ async def pause_workforce_tasks_after_archive(
     *,
     workforce_id: int,
     actor_user_id: int | None,
+    reason: str = "archive",
 ) -> None:
-    """Best-effort PAUSE dispatch for tasks left running by an archive.
+    """Best-effort PAUSE dispatch for tasks left running by a cancellation.
 
-    Runs AFTER the caller committed the archive/cancel transaction, on its
-    own short-lived sessions, so the durable enqueue's internal commit can
-    never leak a partial archive state. A failed pause is logged and skipped:
-    the run is already terminal and the turn-entry guard blocks new turns,
-    so the orphaned execution can only run its current turn to completion.
+    Runs AFTER the caller committed its cancel transaction (archive flip,
+    or the stale-preview-run reaper's own commit), on its own short-lived
+    sessions, so the durable enqueue's internal commit can never leak a
+    partial state from the caller's transaction. A failed pause is logged
+    and skipped: the run is already terminal and the turn-entry guard blocks
+    new turns, so the orphaned execution can only run its current turn to
+    completion.
+
+    ``reason`` is a short label (e.g. ``"archive"``, ``"preview-reap"``)
+    distinguishing why the cancellation happened, used only for the
+    command id and log message -- it has no effect on dispatch behavior.
     """
     if not pause_targets:
         return
@@ -339,7 +406,7 @@ async def pause_workforce_tasks_after_archive(
                     command_db,
                     task_id=target.task_id,
                     actor_user_id=actor_user_id,
-                    command_id=f"workforce-archive-{target.run_id}",
+                    command_id=f"workforce-{reason}-{target.run_id}",
                     kind=TaskCommandKind.PAUSE,
                     payload={},
                 )
@@ -351,9 +418,10 @@ async def pause_workforce_tasks_after_archive(
             )
         except Exception:
             logger.warning(
-                "Failed to pause running task %s while archiving workforce %s",
+                "Failed to pause running task %s after workforce %s (%s)",
                 target.task_id,
                 workforce_id,
+                reason,
                 exc_info=True,
             )
 

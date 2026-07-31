@@ -5,10 +5,22 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const translateMock = vi.hoisted(() => (key: string) => key)
+const fitViewSpy = vi.hoisted(() => vi.fn())
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: translateMock }),
 }))
+
+// Only useReactFlow's fitView is wrapped -- @xyflow/react's own initial
+// fitView (from the `fitView` prop) still runs against its real internal
+// store, so this only observes the imperative re-fit our own effect issues.
+vi.mock("@xyflow/react", async () => {
+  const actual = await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react")
+  return {
+    ...actual,
+    useReactFlow: () => ({ ...actual.useReactFlow(), fitView: fitViewSpy }),
+  }
+})
 
 import { WorkforceCanvas } from "./workforce-canvas"
 import type { WorkforceAgentSummary, WorkforceWorker } from "@/types/workforce"
@@ -65,29 +77,55 @@ function makeDialogs(overrides: Partial<WorkforceEditDialogsState> = {}): Workfo
   }
 }
 
-function renderCanvas(props: Partial<React.ComponentProps<typeof WorkforceCanvas>> = {}) {
+function buildCanvasElement(props: Partial<React.ComponentProps<typeof WorkforceCanvas>>) {
   const dialogs = props.dialogs ?? makeDialogs()
   const onSaveDetails = props.onSaveDetails ?? vi.fn().mockResolvedValue(undefined)
-  render(
-    <WorkforceCanvas
-      name={props.name ?? "Launch Workforce"}
-      description={props.description ?? ""}
-      onSaveDetails={onSaveDetails}
-      manager={"manager" in props ? props.manager! : manager}
-      workers={props.workers ?? [worker]}
-      isArchived={props.isArchived ?? false}
-      dialogs={dialogs}
-      getStartedSteps={props.getStartedSteps ?? []}
-      getStartedCollapsed={props.getStartedCollapsed ?? false}
-      onToggleGetStarted={props.onToggleGetStarted ?? vi.fn()}
-    />,
-  )
-  return { dialogs, onSaveDetails }
+  return {
+    element: (
+      <WorkforceCanvas
+        name={props.name ?? "Launch Workforce"}
+        description={props.description ?? ""}
+        onSaveDetails={onSaveDetails}
+        manager={"manager" in props ? props.manager! : manager}
+        workers={props.workers ?? [worker]}
+        isArchived={props.isArchived ?? false}
+        dialogs={dialogs}
+        getStartedSteps={props.getStartedSteps ?? []}
+        getStartedCollapsed={props.getStartedCollapsed ?? false}
+        onToggleGetStarted={props.onToggleGetStarted ?? vi.fn()}
+      />
+    ),
+    dialogs,
+    onSaveDetails,
+  }
+}
+
+function renderCanvas(props: Partial<React.ComponentProps<typeof WorkforceCanvas>> = {}) {
+  const { element, dialogs, onSaveDetails } = buildCanvasElement(props)
+  const { rerender } = render(element)
+  return {
+    dialogs,
+    onSaveDetails,
+    rerender: (nextProps: Partial<React.ComponentProps<typeof WorkforceCanvas>>) =>
+      rerender(buildCanvasElement({ ...props, ...nextProps, dialogs, onSaveDetails }).element),
+  }
 }
 
 describe("WorkforceCanvas", () => {
   afterEach(() => {
     cleanup()
+    fitViewSpy.mockClear()
+  })
+
+  it("re-fits the canvas when the Get Started checklist is expanded or collapsed after mount", () => {
+    const { rerender } = renderCanvas({ getStartedCollapsed: true })
+    expect(fitViewSpy).not.toHaveBeenCalled()
+
+    rerender({ getStartedCollapsed: false })
+    expect(fitViewSpy).toHaveBeenCalledTimes(1)
+
+    rerender({ getStartedCollapsed: true })
+    expect(fitViewSpy).toHaveBeenCalledTimes(2)
   })
 
   it("clicking the manager node opens the change-lead dialog", () => {

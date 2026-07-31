@@ -348,6 +348,69 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     })
   })
 
+  it("does not fire a second concurrent preview-creation request when a draft edit invalidates the first one mid-flight", async () => {
+    let resolveFirstPreview: (value: unknown) => void = () => {}
+    runWorkforcePreviewMock
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirstPreview = resolve }))
+      .mockResolvedValueOnce({
+        workforce_run_id: 2,
+        task_id: 43,
+        status: "running",
+        redirect_url: "/task/43",
+      })
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    // Start a test send whose network call won't resolve until we say so.
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => expect(runWorkforcePreviewMock).toHaveBeenCalledTimes(1))
+
+    // Edit the still-unsaved draft while the first request is in flight --
+    // invalidatePreviewRun resets previewTaskIdRef synchronously, which used
+    // to also clear the "-1 means a creation request is pending" guard.
+    fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+    fireEvent.click(await screen.findByText("Silent Analyst"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    // Sending again before the first request settles must NOT fire a second
+    // concurrent runWorkforcePreview call -- it must be a no-op until the
+    // first one resolves.
+    fireEvent.click(screen.getByText("Send Test"))
+    await Promise.resolve()
+    expect(runWorkforcePreviewMock).toHaveBeenCalledTimes(1)
+
+    // Let the first (now-stale) request resolve and flush its continuation.
+    await act(async () => {
+      resolveFirstPreview({
+        workforce_run_id: 1,
+        task_id: 42,
+        status: "running",
+        redirect_url: "/task/42",
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // The guard must release afterward -- a further send starts a fresh run.
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => {
+      expect(runWorkforcePreviewMock).toHaveBeenCalledTimes(2)
+    })
+  })
+
   it("does not let a preview response that resolves after Create clobber the reset with the stale task", async () => {
     let resolvePreview: (value: unknown) => void = () => {}
     runWorkforcePreviewMock.mockImplementationOnce(

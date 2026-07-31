@@ -43,6 +43,7 @@ import { sanitizeAppIntegrations } from "@/lib/team-sharing-sanitizers"
 import {
   isValidMcpName,
   parseMcpOAuthErrorMessage,
+  MCP_OAUTH_POPUP_WINDOW_NAME,
   type McpOAuthConnectResponse,
   buildCustomApiPayload,
   buildMcpServerPayload,
@@ -126,6 +127,10 @@ export function ConnectMcpDialog({
   const [customApiEditBaseline, setCustomApiEditBaseline] = useState<CustomApiDetail | null>(null)
   const [mcpEditBaseline, setMcpEditBaseline] = useState<McpServerDetail | null>(null)
   const connectorEditRequestRef = React.useRef(0)
+  // Popup-closed poll intervals for in-flight mcp_oauth connects, so they can
+  // be cleared on unmount instead of leaking (N3: the poll otherwise has no
+  // unmount cleanup, unlike custom-mcp-form's equivalent).
+  const mcpOauthPollTimersRef = React.useRef<Set<number>>(new Set())
 
   // Custom MCP Server state
   const [isSavingCustom, setIsSavingCustom] = useState(false)
@@ -242,6 +247,11 @@ export function ConnectMcpDialog({
 
   useEffect(() => () => {
     connectorEditRequestRef.current += 1
+  }, [])
+
+  useEffect(() => () => {
+    mcpOauthPollTimersRef.current.forEach((timer) => window.clearInterval(timer))
+    mcpOauthPollTimersRef.current.clear()
   }, [])
 
   useEffect(() => {
@@ -535,7 +545,7 @@ export function ConnectMcpDialog({
     const top = window.screenY + (window.outerHeight - height) / 2
     const popup = window.open(
       "about:blank",
-      "mcp-oauth",
+      MCP_OAUTH_POPUP_WINDOW_NAME,
       `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`,
     )
     if (!popup) {
@@ -577,20 +587,49 @@ export function ConnectMcpDialog({
       return
     }
 
-    // The OAuth callback lands the popup on the app's own /tools page (no
-    // postMessage like the builtin flow) — so refresh once the popup closes.
-    const checkPopup = setInterval(() => {
-      if (popup.closed) {
-        clearInterval(checkPopup)
-        setLoadingApp(null)
+    // The popup's opener link is severed (popup.opener = null), so unlike the
+    // builtin flow there is no postMessage channel — and a closed popup can
+    // mean success OR a cancelled/denied/failed authorization (the error
+    // redirect leaves the popup open for the user to read, then they close it
+    // by hand). So on close, ask the backend which one actually happened and
+    // gate the success actions on the app really being connected; is_connected
+    // for mcp_oauth apps requires a completed grant, not just the association.
+    const startedAt = Date.now()
+    const maxWaitMs = 5 * 60 * 1000
+    const checkPopup = window.setInterval(() => {
+      const expired = Date.now() - startedAt >= maxWaitMs
+      if (!popup.closed && !expired) return
+      window.clearInterval(checkPopup)
+      mcpOauthPollTimersRef.current.delete(checkPopup)
+      setLoadingApp(null)
+      if (!popup.closed) {
+        // Timed out with the popup still open: stop the spinner. If the user
+        // eventually finishes, the next apps refresh shows the connection.
+        return
+      }
+      void (async () => {
+        let connected = false
+        try {
+          const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=remote`)
+          if (response.ok) {
+            const data = sanitizeAppIntegrations(await response.json())
+            connected = data.some(
+              (candidate) => candidate.id === app.id && candidate.is_connected,
+            )
+          }
+        } catch (error) {
+          console.error("Failed to refresh apps after the OAuth popup closed:", error)
+        }
         loadApps()
+        if (!connected) return
         if (onSuccess) onSuccess()
         if (autoSelect && onConnectSelected) {
           setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name])
         }
         setSelectedApp(null)
-      }
+      })()
     }, 500)
+    mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {

@@ -435,6 +435,160 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     }
   })
 
+  it("fires onSuccess and auto-selects only once the closed popup is confirmed connected", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    const onConnectSelected = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url === "http://api.local/api/mcp/apps?location=remote") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => [{ id: "granola", name: "Granola", description: "", icon: "", is_connected: true }],
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+          onConnectSelected={onConnectSelected}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      // The popup closes only after the redirect (simulating the user
+      // completing the real authorization in it).
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500)
+      })
+
+      expect(onSuccess).toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("does not fire onSuccess when the popup closes on a cancelled/failed authorization", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url === "http://api.local/api/mcp/apps?location=remote") {
+          // The user closed the error popup by hand (or cancelled consent) —
+          // the backend never recorded a completed grant, so is_connected
+          // stays false even though the association row already exists (M1).
+          return Promise.resolve({
+            ok: true,
+            json: async () => [{ id: "granola", name: "Granola", description: "", icon: "", is_connected: false }],
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("stops the loading spinner without firing success after the 5-minute poll timeout", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      const callsBeforeTimeout = apiRequestMock.mock.calls.length
+
+      // Popup never closes (user walked away with it open); the poll must
+      // still give up after 5 minutes rather than spinning forever (N3).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 1000)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+      // The timeout path stops polling without ever issuing the
+      // is-it-really-connected check the popup-closed path makes.
+      expect(apiRequestMock.mock.calls.length).toBe(callsBeforeTimeout)
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
   it("keeps masked baseline entries in an MCP user-env replacement", async () => {
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
       if (url.includes("/api/mcp/apps?")) {

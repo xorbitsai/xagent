@@ -560,3 +560,27 @@ export async function parseMcpOAuthErrorMessage(response: Response, fallback: st
   }
   return fallback
 }
+
+/** The window name the mcp_oauth connect popup opens under (connect-mcp-dialog
+ * and custom-mcp-form both use this), and the query param the callback
+ * appends on success. Shared so the popup-open side and the tools page's
+ * self-close guard can't drift apart on either literal. */
+export const MCP_OAUTH_POPUP_WINDOW_NAME = "mcp-oauth"
+export const MCP_OAUTH_SUCCESS_PARAM = "mcp_oauth_success"
+
+/** Whether the tools page, loaded with these search params under this window
+ * name, is the mcp_oauth connect popup landing on a successful callback and
+ * should self-close. Keyed on the explicit success param (not on the absence
+ * of error params) so a future error param added to the callback redirect
+ * can't be mistaken for success here — see the PR review that flagged this
+ * coupling (N5). Extracted as a pure function so it's unit-testable without
+ * mounting the full tools page. */
+export function shouldSelfCloseMcpOauthPopup(
+  windowName: string,
+  searchParams: URLSearchParams,
+): boolean {
+  return (
+    searchParams.get(MCP_OAUTH_SUCCESS_PARAM) !== null &&
+    windowName === MCP_OAUTH_POPUP_WINDOW_NAME
+  )
+}

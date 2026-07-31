@@ -5,9 +5,38 @@ import {
   buildMcpServerPayload,
   customApiDetailToEditState,
   mcpServerDetailToEditState,
+  MCP_OAUTH_POPUP_WINDOW_NAME,
+  MCP_OAUTH_SUCCESS_PARAM,
   parseCustomApiDetail,
   parseMcpServerDetail,
+  shouldSelfCloseMcpOauthPopup,
 } from "./mcp-utils"
+
+describe("shouldSelfCloseMcpOauthPopup", () => {
+  it("closes when the success param is present and the window is the mcp_oauth popup", () => {
+    const params = new URLSearchParams({ [MCP_OAUTH_SUCCESS_PARAM]: "1" })
+    expect(shouldSelfCloseMcpOauthPopup(MCP_OAUTH_POPUP_WINDOW_NAME, params)).toBe(true)
+  })
+
+  it("does not close without the success param, even under the popup window name", () => {
+    const params = new URLSearchParams()
+    expect(shouldSelfCloseMcpOauthPopup(MCP_OAUTH_POPUP_WINDOW_NAME, params)).toBe(false)
+  })
+
+  it("does not close on an error redirect, even under the popup window name", () => {
+    const params = new URLSearchParams({
+      mcp_oauth_error: "invalid_resource",
+      mcp_oauth_error_message: "MCP OAuth token_type must be at most 50 characters",
+    })
+    expect(shouldSelfCloseMcpOauthPopup(MCP_OAUTH_POPUP_WINDOW_NAME, params)).toBe(false)
+  })
+
+  it("does not close a differently-named window even with the success param", () => {
+    const params = new URLSearchParams({ [MCP_OAUTH_SUCCESS_PARAM]: "1" })
+    expect(shouldSelfCloseMcpOauthPopup("", params)).toBe(false)
+    expect(shouldSelfCloseMcpOauthPopup("some-other-window", params)).toBe(false)
+  })
+})
 
 const detailPayload = {
   id: 41,

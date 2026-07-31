@@ -193,6 +193,29 @@ def _slack_oauth_missing_config() -> list[str]:
     return missing
 
 
+def _release_slack_oauth_claim(db: Session, *, nonce: str) -> None:
+    """Un-consume a claimed OAuth nonce so the user can retry the same link.
+
+    Only for failures that are not the user's doing (transport error, Slack
+    5xx). The row stays subject to its original ``expires_at``, so releasing
+    it cannot extend the window an attacker has to replay a state.
+    """
+    if not nonce:
+        return
+    try:
+        db.rollback()
+        db.query(SlackOAuthFlowState).filter(SlackOAuthFlowState.nonce == nonce).update(
+            {SlackOAuthFlowState.consumed_at: None}, synchronize_session=False
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "Could not release the Slack OAuth nonce after a failed exchange",
+            exc_info=True,
+        )
+
+
 def _frontend_origin_for_slack_oauth(request: Request) -> str:
     candidate = get_app_base_url() or request.headers.get("origin") or ""
     parsed = urlparse(candidate)
@@ -567,15 +590,24 @@ async def slack_oauth_callback(
         )
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                SLACK_OAUTH_ACCESS_URL,
-                data={"code": code, "redirect_uri": redirect_uri},
-                auth=httpx.BasicAuth(client_id, client_secret),
-                timeout=15.0,
-            )
-            response.raise_for_status()
-            token_data = response.json()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    SLACK_OAUTH_ACCESS_URL,
+                    data={"code": code, "redirect_uri": redirect_uri},
+                    auth=httpx.BasicAuth(client_id, client_secret),
+                    timeout=15.0,
+                )
+                response.raise_for_status()
+                token_data = response.json()
+        except (httpx.HTTPError, ValueError):
+            # The nonce was claimed before this call so a replay cannot race
+            # the exchange. A transport failure or a Slack 5xx is not the
+            # user's fault though, so release the claim and let them retry the
+            # same authorization instead of restarting the whole flow. Slack's
+            # authorization code stays valid for its own short window.
+            _release_slack_oauth_claim(db, nonce=nonce)
+            raise
         if not token_data.get("ok"):
             raise ValueError(
                 str(token_data.get("error") or "Slack token exchange failed")

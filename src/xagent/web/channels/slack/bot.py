@@ -74,10 +74,50 @@ _MAX_RECENT_EVENT_IDS = 1000
 # and clamp again after conversion, since entity escaping can expand text.
 _MAX_SOURCE_CHUNK_CHARS = 3500
 _MAX_MESSAGE_CHARS = 3900
+# Connection retries back off from 10s to 5min so a permanently broken token
+# or an unreachable gateway stops emitting a warning every 10 seconds.
+_RETRY_INITIAL_SECONDS = 10.0
+_RETRY_MAX_SECONDS = 300.0
 
 
 class SlackFileDownloadError(RuntimeError):
     """Slack supplied attachments but none could be registered for the turn."""
+
+
+class _RetryBackoff:
+    """Exponential backoff with a ceiling for Slack connection retry loops.
+
+    A flat retry interval makes a permanently broken config (a revoked app
+    token, an unreachable gateway) indistinguishable from a transient blip:
+    it just logs at the same rate forever. Growing the delay keeps a transient
+    failure fast to recover from while letting a persistent one fall quiet.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial_seconds: float = _RETRY_INITIAL_SECONDS,
+        max_seconds: float = _RETRY_MAX_SECONDS,
+    ) -> None:
+        self._initial = initial_seconds
+        self._max = max_seconds
+        self.attempts = 0
+
+    @property
+    def delay(self) -> float:
+        return min(self._initial * (2**self.attempts), self._max)
+
+    async def sleep(self) -> None:
+        await asyncio.sleep(self.delay)
+        self.attempts += 1
+
+    def reset(self) -> None:
+        self.attempts = 0
+
+    @property
+    def exhausted_quiet_threshold(self) -> bool:
+        """Whether the delay has reached its ceiling (log less past this)."""
+        return self.delay >= self._max
 
 
 def _payload_team_id(payload: dict[str, Any]) -> str | None:
@@ -958,6 +998,7 @@ class SlackBotInstance:
             return
         if not self.app_token:
             raise RuntimeError("Manual Slack Socket Mode requires an app-level token")
+        backoff = _RetryBackoff()
         while self._accepting:
             try:
                 auth = await self.web_client.auth_test()
@@ -967,12 +1008,21 @@ class SlackBotInstance:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # A revoked app token never recovers, so once the delay has
+                # grown to its ceiling report that plainly instead of
+                # repeating an identical warning forever.
                 logger.warning(
-                    "Slack bot %s authentication failed; retrying",
+                    "Slack bot %s authentication failed (attempt %d); "
+                    "retrying in %.0fs%s",
                     self.instance_id,
-                    exc_info=True,
+                    backoff.attempts + 1,
+                    backoff.delay,
+                    " -- check whether the bot token is still valid"
+                    if backoff.exhausted_quiet_threshold
+                    else "",
+                    exc_info=not backoff.exhausted_quiet_threshold,
                 )
-                await asyncio.sleep(10)
+                await backoff.sleep()
         if not self._accepting:
             return
 
@@ -1067,6 +1117,7 @@ class SlackOAuthSocketGateway:
         # The socket is closed in finally so a normal return or a cancellation
         # cannot leak an open websocket, which would let a restarted gateway
         # race a still-connected one for the same app token.
+        backoff = _RetryBackoff()
         try:
             while self._accepting:
                 try:
@@ -1079,20 +1130,31 @@ class SlackOAuthSocketGateway:
                     )
                     logger.info("Starting shared Slack OAuth Socket Mode gateway")
                     await self.socket_client.connect()
+                    # Connected: a later drop restarts from the short delay.
+                    backoff.reset()
                     await self._run_forever.wait()
                     return
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    # This gateway serves every OAuth workspace, so a
+                    # persistent failure here is the more likely of the two
+                    # loops to sit broken for a long time.
                     logger.warning(
-                        "Shared Slack OAuth Socket Mode connection failed; retrying",
-                        exc_info=True,
+                        "Shared Slack OAuth Socket Mode connection failed "
+                        "(attempt %d); retrying in %.0fs%s",
+                        backoff.attempts + 1,
+                        backoff.delay,
+                        " -- check XAGENT_SLACK_APP_TOKEN and network egress"
+                        if backoff.exhausted_quiet_threshold
+                        else "",
+                        exc_info=not backoff.exhausted_quiet_threshold,
                     )
                     if self.socket_client is not None:
                         with suppress(Exception):
                             await self.socket_client.close()
                         self.socket_client = None
-                    await asyncio.sleep(10)
+                    await backoff.sleep()
         finally:
             if self.socket_client is not None:
                 with suppress(Exception):

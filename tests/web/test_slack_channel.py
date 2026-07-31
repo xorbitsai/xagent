@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import httpx
 import pytest
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import create_engine
@@ -26,6 +27,7 @@ from xagent.web.channels.slack.bot import (
     SlackBotInstance,
     SlackChannelManager,
     SlackOAuthSocketGateway,
+    _RetryBackoff,
 )
 from xagent.web.channels.slack.utils import (
     SlackFileUrlError,
@@ -640,6 +642,72 @@ async def test_slack_file_download_rejects_off_slack_redirect(
     # download was cleaned up.
     assert requested == ["https://files.slack.com/files-pri/T1-F1/r.pdf"]
     assert list(target_dir.iterdir()) == []
+
+
+def test_retry_backoff_grows_and_caps() -> None:
+    backoff = _RetryBackoff(initial_seconds=10.0, max_seconds=300.0)
+
+    delays = []
+    for _ in range(8):
+        delays.append(backoff.delay)
+        backoff.attempts += 1
+
+    assert delays[:5] == [10.0, 20.0, 40.0, 80.0, 160.0]
+    # Capped, so a permanently broken config stops logging every 10 seconds.
+    assert delays[5:] == [300.0, 300.0, 300.0]
+    assert backoff.exhausted_quiet_threshold is True
+
+    backoff.reset()
+    assert backoff.delay == 10.0
+    assert backoff.exhausted_quiet_threshold is False
+
+
+@pytest.mark.asyncio
+async def test_oauth_claim_released_when_token_exchange_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-oauth-retry.db")
+    _patch_slack_oauth_config(monkeypatch)
+
+    class FailingClient:
+        async def __aenter__(self) -> "FailingClient":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def post(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise httpx.ConnectError("slack unreachable")
+
+    monkeypatch.setattr("xagent.web.api.channel.httpx.AsyncClient", FailingClient)
+
+    with SessionLocal() as db:
+        user = User(username="retry-owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        start_result = start_slack_oauth(
+            _request(path="/api/channels/slack/oauth/start"),
+            SimpleNamespace(id=int(user.id)),
+            db,
+        )
+        state = parse_qs(urlparse(start_result["authorize_url"]).query)["state"][0]
+
+        response = await slack_oauth_callback(
+            _request(
+                path="/api/channels/slack/oauth/callback",
+                query={"code": "oauth-code", "state": state},
+            ),
+            BackgroundTasks(),
+            db,
+        )
+
+        assert response.status_code == 400
+        # A Slack-side outage must not burn the nonce: the same link retries.
+        flow_state = db.query(SlackOAuthFlowState).one()
+        assert flow_state.consumed_at is None
+    engine.dispose()
 
 
 def test_script_safe_json_neutralizes_script_breakout() -> None:

@@ -1305,10 +1305,18 @@ async def startup_event() -> None:
             )
 
     # Warmup sandbox manager
-    from .sandbox_manager import get_sandbox_manager
+    from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 
     sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
+        # Readiness runs before cleanup/warmup and is deliberately not
+        # wrapped in try/except: a static SANDBOX_VOLUMES/code-mount/
+        # external-upload-dir conflict must fail startup outright rather
+        # than surface later as a per-task SandboxRuntimeConflictError.
+        # This also resolves and caches the backend-capability probe as a
+        # side effect, so cleanup() below reads the cached value instead of
+        # resolving it again.
+        await check_sandbox_static_readiness(sandbox_mgr)
         await sandbox_mgr.cleanup()
         await sandbox_mgr.warmup()
         logger.info("Sandbox manager initialized and warmed up")
@@ -1453,6 +1461,10 @@ async def shutdown_event() -> None:
 
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
+
+    from .services.task_runtime import shutdown_task_runtime_hook_executor
+
+    shutdown_task_runtime_hook_executor()
 
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager

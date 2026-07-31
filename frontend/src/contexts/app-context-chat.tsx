@@ -2036,6 +2036,19 @@ export function AppProvider({
     }
   }, [isConnected, pendingMessage, sendChatMessage])
 
+  // A queued message can only ever flush to its target task. If the task is
+  // switched away before that socket connects (e.g. the widget's "New
+  // conversation" reset), fail it immediately — left queued it would sit out
+  // the 30s timeout and vanish as an unhandled rejection with no visible error.
+  useEffect(() => {
+    if (!pendingMessage?.targetTaskId) return
+    if (state.taskId === pendingMessage.targetTaskId) return
+    pendingMessage.reject?.(
+      new Error('Message not sent: the conversation was reset before it could be delivered.')
+    )
+    setPendingMessage(current => (current === pendingMessage ? null : current))
+  }, [pendingMessage, state.taskId])
+
   const queuePendingMessage = useCallback((message: Omit<PendingMessage, 'resolve' | 'reject'>) => {
     return new Promise<void>((resolve, reject) => {
       const timeout = window.setTimeout(() => {

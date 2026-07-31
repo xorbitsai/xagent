@@ -17,6 +17,7 @@ from xagent.core.agent.runtime import (
     resolved_llm_metadata,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 class SlowLLM:
@@ -38,8 +39,14 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
         context_window = 1_048_576
 
     class VirtualLLM:
-        async def prepare_for_call(self, messages: list[dict[str, Any]]) -> Any:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
             assert messages[-1]["content"] == "make a podcast"
+            assert preferred_input_modalities == ()
             return PreparedLLM()
 
     context = ExecutionContext()
@@ -55,6 +62,75 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
         "selected_model": "deepseek/deepseek-v4-flash",
         "context_window": 1_048_576,
     }
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_passes_runtime_modality_preferences() -> None:
+    captured: list[tuple[str, ...]] = []
+
+    class PreparedLLM:
+        context_window = 128_000
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            captured.append(preferred_input_modalities)
+            return PreparedLLM()
+
+    context = ExecutionContext()
+    context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = [
+        "IMAGE",
+        "image",
+        "audio",
+    ]
+
+    await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "inspect the selected target"}],
+        context=context,
+    )
+
+    assert captured == [("image", "audio")]
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_reads_runtime_metadata_once() -> None:
+    class PreparedLLM:
+        pass
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert preferred_input_modalities == ("image",)
+            return PreparedLLM()
+
+    class Metadata(dict[str, list[str]]):
+        pass
+
+    class Context:
+        metadata_reads = 0
+
+        @property
+        def metadata(self) -> Metadata:
+            self.metadata_reads += 1
+            return Metadata({PREFERRED_INPUT_MODALITIES_METADATA_KEY: ["image"]})
+
+    context = Context()
+    await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "inspect the selected target"}],
+        context=context,
+    )
+
+    assert context.metadata_reads == 1
 
 
 @pytest.mark.asyncio

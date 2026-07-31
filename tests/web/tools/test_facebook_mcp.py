@@ -27,6 +27,21 @@ def _payload(result: str):
     return json.loads(result)
 
 
+def test_graph_path_builds_encoded_path():
+    assert facebook._graph_path("page-1", "page_id", "feed") == "/page-1/feed"
+    assert facebook._graph_path(" page/1 ", "page_id", "feed") == "/page%2F1/feed"
+
+
+def test_graph_path_rejects_missing_value():
+    for missing in (None, "", "   ", 0):
+        try:
+            facebook._graph_path(missing, "page_id", "feed")
+        except ValueError as exc:
+            assert "page_id is required" in str(exc)
+        else:
+            raise AssertionError(f"expected ValueError for {missing!r}")
+
+
 def test_auth_status_uses_injected_meta_token(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     mock_request = Mock(
@@ -128,7 +143,10 @@ def test_list_page_posts_uses_page_access_token(monkeypatch):
         assert url == "https://graph.facebook.com/v25.0/page-1/feed"
         assert kwargs["headers"]["Authorization"] == "Bearer page-token"
         assert kwargs["params"] == {
-            "fields": "id,message,created_time,permalink_url,full_picture,status_type",
+            "fields": (
+                "id,message,created_time,permalink_url,full_picture,status_type,"
+                "likes.limit(0).summary(true),comments.limit(0).summary(true),shares"
+            ),
             "limit": 5,
         }
         return MockResponse(
@@ -145,6 +163,131 @@ def test_list_page_posts_uses_page_access_token(monkeypatch):
     assert result == {
         "status": "success",
         "posts": [{"id": "post-1", "message": "hello"}],
+        "next_link": "https://graph.facebook.com/next",
+        "engagement_available": True,
+    }
+
+
+def test_list_page_posts_falls_back_without_engagement_on_permission_error(
+    monkeypatch,
+):
+    """The Graph API can reject the whole request when a field in a combined
+    fields= expansion needs a permission the token doesn't have (e.g.
+    pages_read_user_content missing for comments.summary). Must degrade to
+    posts without engagement counts rather than failing outright.
+    """
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    feed_calls = []
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {"data": [{"id": "page-1", "access_token": "page-token"}]}
+            )
+        assert url == "https://graph.facebook.com/v25.0/page-1/feed"
+        feed_calls.append(kwargs["params"]["fields"])
+        if "comments" in kwargs["params"]["fields"]:
+            return MockResponse(
+                {"error": {"message": "permission denied", "code": 10}},
+                status_code=400,
+            )
+        assert kwargs["params"]["fields"] == facebook._POST_FIELDS_BASE
+        return MockResponse({"data": [{"id": "post-1", "message": "hello"}]})
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(facebook.facebook_list_page_posts("page-1", limit=5))
+
+    assert result == {
+        "status": "success",
+        "posts": [{"id": "post-1", "message": "hello"}],
+        "next_link": None,
+        "engagement_available": False,
+    }
+    assert len(feed_calls) == 2
+
+
+def test_list_page_posts_does_not_mask_non_permission_errors(monkeypatch):
+    """Only a permission/OAuth-scope error should trigger the engagement
+    fallback. A transient or rate-limit failure on the first request must
+    surface as a genuine error instead of being silently reported as
+    engagement_available=False.
+    """
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    feed_calls = []
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {"data": [{"id": "page-1", "access_token": "page-token"}]}
+            )
+        assert url == "https://graph.facebook.com/v25.0/page-1/feed"
+        feed_calls.append(kwargs["params"]["fields"])
+        return MockResponse(
+            {"error": {"message": "rate limited", "code": 4}},
+            status_code=400,
+        )
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(facebook.facebook_list_page_posts("page-1", limit=5))
+
+    assert result["status"] == "error"
+    assert len(feed_calls) == 1
+
+
+def test_list_post_comments_uses_page_access_token(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {
+                    "data": [
+                        {
+                            "id": "page-1",
+                            "name": "Launch Page",
+                            "access_token": "page-token",
+                        }
+                    ]
+                }
+            )
+        assert method == "GET"
+        assert url == "https://graph.facebook.com/v25.0/page-1_post-1/comments"
+        assert kwargs["headers"]["Authorization"] == "Bearer page-token"
+        assert kwargs["params"] == {
+            "fields": "id,message,created_time,from,parent",
+            "filter": "stream",
+            "limit": 5,
+        }
+        return MockResponse(
+            {
+                "data": [
+                    {
+                        "id": "comment-1",
+                        "message": "Great news!",
+                        "from": {"id": "fan-1", "name": "A Fan"},
+                    }
+                ],
+                "paging": {"next": "https://graph.facebook.com/next"},
+            }
+        )
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(
+        facebook.facebook_list_post_comments("page-1", "page-1_post-1", limit=5)
+    )
+
+    assert result == {
+        "status": "success",
+        "comments": [
+            {
+                "id": "comment-1",
+                "message": "Great news!",
+                "from": {"id": "fan-1", "name": "A Fan"},
+            }
+        ],
         "next_link": "https://graph.facebook.com/next",
     }
 

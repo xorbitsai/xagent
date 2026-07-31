@@ -13,11 +13,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import xagent.web.sandbox_manager as sandbox_manager_module
+from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.core.execution_scope import (
     ExecutionScope,
     InvalidScopeComponentError,
     set_execution_scope_resolver,
 )
+from xagent.sandbox.base import SandboxMountIntent
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.sandbox_keys import (
     make_user_lifecycle_id,
@@ -78,7 +80,7 @@ class TestSandboxKeyHelpers:
 
 
 def _make_sandbox_manager() -> SandboxManager:
-    service = AsyncMock()
+    service = FakeSandboxService()
     service.list_sandboxes = AsyncMock(return_value=[])
     service.delete = AsyncMock()
     return SandboxManager(service)
@@ -102,12 +104,12 @@ class TestScopedSandboxAcquisition:
         sandbox_mgr.get_or_create_lease_provider = AsyncMock(return_value=provider)
 
         sandbox = await manager._get_or_create_task_sandbox(
-            task_id=1, workspace_owner_id=7, workspace_config={}
+            task_id=1, workspace_owner_id=7, mount_intent=None
         )
 
         assert sandbox is provider
         sandbox_mgr.get_or_create_lease_provider.assert_awaited_once_with(
-            "user", "7", workspace_config={}
+            "user", "7", mount_intent=None, prepare_root=None
         )
         assert manager._agent_sandbox_keys[1] == "user:7"
 
@@ -119,12 +121,12 @@ class TestScopedSandboxAcquisition:
         scope = ExecutionScope(sandbox_key_suffix="tenant-a")
 
         sandbox = await manager._get_or_create_task_sandbox(
-            task_id=1, workspace_owner_id=7, workspace_config={}, scope=scope
+            task_id=1, workspace_owner_id=7, mount_intent=None, scope=scope
         )
 
         assert sandbox is provider
         sandbox_mgr.get_or_create_lease_provider.assert_awaited_once_with(
-            "user", "7:tenant-a", workspace_config={}
+            "user", "7:tenant-a", mount_intent=None, prepare_root=None
         )
         assert manager._agent_sandbox_keys[1] == "user:7:tenant-a"
 
@@ -137,11 +139,11 @@ class TestScopedSandboxAcquisition:
         scope = ExecutionScope(workspace_segments=("proj",))
 
         await manager._get_or_create_task_sandbox(
-            task_id=1, workspace_owner_id=7, workspace_config={}, scope=scope
+            task_id=1, workspace_owner_id=7, mount_intent=None, scope=scope
         )
 
         sandbox_mgr.get_or_create_lease_provider.assert_awaited_once_with(
-            "user", "7", workspace_config={}
+            "user", "7", mount_intent=None, prepare_root=None
         )
         assert manager._agent_sandbox_keys[1] == "user:7"
 
@@ -155,13 +157,13 @@ class TestScopedSandboxAcquisition:
         await manager._get_or_create_task_sandbox(
             task_id=1,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
             scope=ExecutionScope(sandbox_key_suffix="tenant-a"),
         )
         await manager._get_or_create_task_sandbox(
             task_id=2,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
             scope=ExecutionScope(sandbox_key_suffix="tenant-b"),
         )
 
@@ -356,13 +358,17 @@ class TestSandboxManagerScopedKeys:
 
     def test_ca_prefix_mount_is_shared_across_end_users(self, tmp_path) -> None:
         """#79-01: two end users of one client application supply a
-        workspace_config whose ``base_dir`` is the CA-level mount prefix, so
+        mount intent whose ``mount_root`` is the CA-level mount prefix, so
         both produce the identical mount root — the prerequisite for sharing
         one container without tripping config-equivalence."""
         ca_root = tmp_path / "user_5" / "clients" / "3"
-        cfg_eu7 = {"base_dir": str(ca_root)}
-        cfg_eu8 = {"base_dir": str(ca_root)}
+        intent_eu7 = SandboxMountIntent(mount_root=str(ca_root))
+        intent_eu8 = SandboxMountIntent(mount_root=str(ca_root))
 
-        paths_eu7 = SandboxManager._workspace_mount_paths("user", "5:client-3", cfg_eu7)
-        paths_eu8 = SandboxManager._workspace_mount_paths("user", "5:client-3", cfg_eu8)
+        paths_eu7 = SandboxManager._workspace_mount_paths(
+            "user", "5:client-3", intent_eu7
+        )
+        paths_eu8 = SandboxManager._workspace_mount_paths(
+            "user", "5:client-3", intent_eu8
+        )
         assert paths_eu7 == paths_eu8 == [(ca_root, True)]

@@ -10,6 +10,7 @@ import pytest
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.service import AgentService
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 class FakeLLM:
@@ -122,6 +123,35 @@ class ReusedExecutionAdapter:
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         self.execute_kwargs = dict(kwargs)
         return {"success": True}
+
+
+def test_execution_metadata_carries_runtime_modality_preferences() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="test",
+            pattern="react",
+            llm=FakeLLM([]),
+            preferred_input_modalities=("IMAGE", "image"),
+        )
+    )
+
+    metadata = adapter._execution_metadata(execution_type="react")
+
+    assert metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] == ["image"]
+
+
+def test_execution_metadata_omits_empty_runtime_modality_preferences() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="test",
+            pattern="react",
+            llm=FakeLLM([]),
+        )
+    )
+
+    metadata = adapter._execution_metadata(execution_type="react")
+
+    assert PREFERRED_INPUT_MODALITIES_METADATA_KEY not in metadata
 
 
 def auto_decision(

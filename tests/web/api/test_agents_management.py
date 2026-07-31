@@ -33,6 +33,10 @@ from xagent.web.services.agent_management import (
     AgentWorkforceConflictError,
     AgentWorkforceReference,
 )
+from xagent.web.services.task_runtime import (
+    TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
+    task_extension_bindings_from_agent_config,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 
@@ -1152,6 +1156,55 @@ def test_widget_task_create_persists_connector_runtime_selection_snapshot() -> N
             .one()
         )
         assert task.connector_runtime_selected_refs == []
+    finally:
+        db.close()
+
+
+def test_widget_task_create_drops_forged_runtime_extension_bindings() -> None:
+    """Widget guests are explicitly denied ``runtime_extensions`` (400), yet the
+    client ``agent_config`` copy would still let a guest write the server-owned
+    per-task binding record directly. Task deletion dispatches provider cleanup
+    by that record, so a forged entry naming a broken provider can wedge the
+    owner's task."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Widget Binding Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    create_task_response = client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "forged binding",
+            "description": "forged binding",
+            "agent_id": agent_id,
+            "agent_config": {
+                TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY: ["victim_ext"],
+                "keep_me": "client value",
+            },
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 200, create_task_response.text
+
+    db = _direct_db_session()
+    try:
+        task = (
+            db.query(Task)
+            .filter(Task.id == create_task_response.json()["task_id"])
+            .one()
+        )
+        assert task_extension_bindings_from_agent_config(task.agent_config) == ()
+        # Only the reserved key goes; ordinary client config and the
+        # server-owned keys layered on top both survive.
+        assert task.agent_config.get("keep_me") == "client value"
+        assert task.agent_config.get("auth_mode") == "widget"
+        assert task.agent_config.get("guest_id") == "guest-1"
     finally:
         db.close()
 

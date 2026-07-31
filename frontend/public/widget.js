@@ -28,6 +28,12 @@
     identity_mismatch: true,
     rate_limited: true
   };
+  // Only diagnostic reasons registered for their session error code may be logged.
+  var SESSION_ERROR_REASONS = {
+    agent_not_granted: {
+      origin_not_allowed: true
+    }
+  };
   function sessionAbortError() {
     return new DOMException('session request superseded', 'AbortError');
   }
@@ -51,9 +57,37 @@
     });
   }
 
-  function sessionErrorCode(result) {
-    var code = result && result.data && result.data.error && result.data.error.code;
-    return typeof code === 'string' ? code : null;
+  function isPlainSessionErrorObject(value) {
+    if (!value || typeof value !== 'object') return false;
+    // Prototype identity is not affected by host-page Symbol.toStringTag pollution.
+    var prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype;
+  }
+
+  function ownSessionErrorString(value, key) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) return null;
+    var candidate = value[key];
+    return typeof candidate === 'string' ? candidate : null;
+  }
+
+  function sessionErrorEnvelope(result) {
+    if (!isPlainSessionErrorObject(result.data) ||
+        !Object.prototype.hasOwnProperty.call(result.data, 'error') ||
+        !isPlainSessionErrorObject(result.data.error)) {
+      return { code: null, reason: null };
+    }
+    var error = result.data.error;
+    var code = ownSessionErrorString(error, 'code');
+    var reason = ownSessionErrorString(error, 'reason');
+    var allowedReasons = code && Object.prototype.hasOwnProperty.call(SESSION_ERROR_REASONS, code)
+      ? SESSION_ERROR_REASONS[code]
+      : null;
+    return {
+      code: code,
+      reason: allowedReasons && reason && Object.prototype.hasOwnProperty.call(allowedReasons, reason)
+        ? reason
+        : null
+    };
   }
 
   function isKnownSessionErrorCode(code) {
@@ -140,7 +174,7 @@
       retry.attempts += 1;
       return makeRequest(requestTimeoutMs).then(function (result) {
         if (signal.aborted) throw sessionAbortError();
-        var code = sessionErrorCode(result);
+        var code = sessionErrorEnvelope(result).code;
         if (code === 'rate_limited') {
           if (retry.rateLimited >= policy.maxRateLimitRetries) return result;
           retry.rateLimited += 1;
@@ -386,9 +420,10 @@
     return 'g' + hash.toString(16);
   }
 
-  function logSession(level, text, code, status) {
+  function logSession(level, text, code, status, reason) {
     var suffix = status ? ' (HTTP ' + status + ')' : '';
-    console[level]('Xagent Widget: ' + text + ' [' + code + ']' + suffix + '.');
+    var diagnostic = reason ? code + '/' + reason : code;
+    console[level]('Xagent Widget: ' + text + ' [' + diagnostic + ']' + suffix + '.');
   }
 
   function createSessionMode(scriptTag, host) {
@@ -710,20 +745,21 @@
       flush();
     }
 
-    function recordFailure(code, status) {
+    function recordFailure(code, status, reason) {
       if (state.terminalCode) return;
       state.terminalCode = code;
       state.recoverableCode = null;
-      logSession('error', 'chat unavailable', code, status);
+      logSession('error', 'chat unavailable', code, status, reason);
       flush();
     }
 
     function classifySessionFailure(result) {
-      if (result && result.syntheticCode) return result.syntheticCode;
-      var code = sessionErrorCode(result);
-      if (isKnownSessionErrorCode(code)) return code;
-      if (result.status >= 500) return 'network_unavailable';
-      return 'unexpected_error';
+      var syntheticCode = ownSessionErrorString(result, 'syntheticCode');
+      if (syntheticCode) return { code: syntheticCode, reason: null };
+      var envelope = sessionErrorEnvelope(result);
+      if (isKnownSessionErrorCode(envelope.code)) return envelope;
+      if (result.status >= 500) return { code: 'network_unavailable', reason: null };
+      return { code: 'unexpected_error', reason: null };
     }
 
     function handleResult(result, phase) {
@@ -739,8 +775,8 @@
         return;
       }
 
-      var code = classifySessionFailure(result);
-      recordFailure(code, result.status);
+      var failure = classifySessionFailure(result);
+      recordFailure(failure.code, result.status, failure.reason);
     }
 
     function postJson(url, body, timeoutMs, operationSignal) {

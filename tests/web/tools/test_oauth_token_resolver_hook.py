@@ -1428,6 +1428,79 @@ async def test_hook_is_skipped_when_user_id_is_none(db_session):
 
 
 @pytest.mark.asyncio
+async def test_hook_ignores_bare_meta_token_for_app_scoped_facebook(db_session):
+    """A resolver-hook token keyed to the bare "meta" provider must not be
+    injected for the Facebook connector, mirroring the legacy UserOAuth
+    scoping in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT: the bare provider flow
+    never requested Facebook's app-specific oauth_scopes (e.g.
+    pages_read_user_content), so it can't stand in for an app-scoped grant.
+    """
+    db, user = db_session
+    server = _add_oauth_server(
+        db,
+        user,
+        name="Facebook Pages",
+        app_id="facebook",
+        provider="meta",
+        launch_config=_launch_config(env_key="META_ACCESS_TOKEN"),
+    )
+    seen_providers: list[str] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen_providers.append(request.provider)
+        if request.provider == "meta":
+            return ResolvedToken(access_token="bare-meta-hook-token", expires_at=None)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen_providers == ["facebook"]
+    _assert_unavailable_mcp_config(
+        configs[0], server, reason="oauth_token_required", oauth_token_required=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_still_accepts_bare_meta_token_for_instagram(db_session):
+    """Negative counterpart to the Facebook filtering test above: Instagram is
+    deliberately absent from APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT (its
+    required scopes haven't changed), so a resolver-hook token keyed to the
+    bare "meta" provider must still be usable. Guards against an
+    over-filtering regression in _oauth_token_provider_candidates that only
+    the Facebook-side test above wouldn't catch.
+    """
+    db, user = db_session
+    _add_oauth_server(
+        db,
+        user,
+        name="Instagram",
+        app_id="instagram",
+        provider="meta",
+        launch_config=_launch_config(env_key="META_ACCESS_TOKEN"),
+    )
+    seen_providers: list[str] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen_providers.append(request.provider)
+        if request.provider == "meta":
+            return ResolvedToken(access_token="bare-meta-hook-token", expires_at=None)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen_providers == ["meta"]
+    assert _access_token_env(configs[0], key="META_ACCESS_TOKEN") == (
+        "bare-meta-hook-token"
+    )
+
+
+@pytest.mark.asyncio
 async def test_invalid_launch_config_with_uncacheable_hook_token_is_not_cached(
     db_session,
 ):

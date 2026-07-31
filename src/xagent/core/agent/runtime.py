@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
@@ -24,6 +25,10 @@ from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
+from ..task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
 from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
@@ -54,14 +59,24 @@ async def prepare_llm_for_context(
 ) -> Any:
     """Resolve virtual models before compaction and apply their context window.
 
-    Normal models are returned unchanged. RouterLLM exposes ``prepare_for_call``
-    and returns a one-call wrapper for the concrete xrouter selection, ensuring
-    the selected model is reused after compaction instead of routing twice.
+    Models without a per-call preparation hook are returned unchanged.
+    RouterLLM implements the hook and returns a one-call wrapper for the
+    concrete xrouter selection, ensuring the selected model is reused after
+    compaction instead of routing twice.
     """
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
     if callable(prepare):
-        prepared = prepare(messages)
+        metadata = getattr(context, "metadata", None)
+        preferred_modalities = normalize_input_modalities(
+            ()
+            if not metadata or not isinstance(metadata, Mapping)
+            else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
+        )
+        prepared = prepare(
+            messages,
+            preferred_input_modalities=preferred_modalities,
+        )
         if inspect.isawaitable(prepared):
             prepared = await prepared
 

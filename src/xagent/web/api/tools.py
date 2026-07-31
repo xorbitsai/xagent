@@ -259,7 +259,15 @@ async def get_available_tools(
             sandbox = await sandbox_manager.get_or_create_lease_provider(
                 "tools", sandbox_user_id
             )
-            sandbox_attached = await sandbox_manager.attach("tools", sandbox_user_id)
+            # attach_provider (identity-checked), not the existence-only
+            # attach(): this call already holds the specific provider object
+            # returned above, so it must catch the case where that object was
+            # already replaced by a rebuild/sweep/eviction between creation
+            # and attach (ABA) — the same pattern chat.py's
+            # ``_acquire_sandbox_task`` uses when it holds a provider handle.
+            sandbox_attached = await sandbox_manager.attach_provider(
+                "tools", sandbox_user_id, sandbox
+            )
             if not sandbox_attached:
                 # The provider was reclaimed by a concurrent sweep/eviction
                 # between creation and attach. Drop the stale reference and

@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.task_runtime import TaskRuntimeClientError
 from xagent.web.api.auth import auth_router
 from xagent.web.api.chat import (
     AgentServiceManager,
@@ -1214,3 +1215,568 @@ def test_delete_task_keeps_cross_user_access_denied(
         assert db.query(Task).filter(Task.id == task_id).count() == 1
     finally:
         db.close()
+
+
+def test_filtered_runtime_provider_environment_is_not_added_to_system_prompt():
+    from xagent.core.agent.service import AgentService
+    from xagent.core.task_runtime import (
+        TaskRuntimeContribution,
+        merge_task_runtime_contributions,
+        reconcile_task_runtime_contribution_tools,
+    )
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+
+    runtime_tool = MagicMock()
+    runtime_tool.name = "leased_browser"
+    contribution = merge_task_runtime_contributions(
+        {
+            "browser_runtime": TaskRuntimeContribution(
+                tools=(runtime_tool,),
+                environment="Use the leased browser.",
+            )
+        }
+    )
+
+    filtered, _conflicts = reconcile_task_runtime_contribution_tools(
+        contribution,
+        available_tools=(),
+    )
+    tool_config = ToolConfig({})
+    tool_config.get_task_runtime_contribution = lambda: filtered
+
+    service = AgentService(
+        name="filtered-runtime-prompt",
+        id="filtered-runtime-prompt",
+        tools=[],
+        tool_config=tool_config,
+        enable_workspace=False,
+        system_prompt="Base prompt.",
+    )
+
+    assert service.system_prompt == "Base prompt."
+
+
+class _TaskRuntimeProvider:
+    def __init__(
+        self,
+        *,
+        fail_create: bool = False,
+        metadata_error: Exception | None = None,
+    ):
+        self.fail_create = fail_create
+        self.metadata_error = metadata_error
+        self.events: list[tuple[str, int]] = []
+        self.configuration: dict | None = None
+        self.task_existed_on_delete: list[bool] = []
+
+    async def on_task_created(self, context, configuration):
+        self.events.append(("created", context.task_id))
+        self.configuration = dict(configuration)
+        if self.fail_create:
+            raise TaskRuntimeClientError("invalid target")
+
+    async def build_runtime(self, context):
+        from xagent.core.task_runtime import TaskRuntimeContribution
+
+        return TaskRuntimeContribution()
+
+    async def public_metadata(self, context):
+        if self.metadata_error is not None:
+            raise self.metadata_error
+        return {"target": self.configuration["target"]} if self.configuration else {}
+
+    async def on_task_deleted(self, context):
+        from xagent.web.models.task import Task
+
+        db = context.session_factory()
+        try:
+            self.task_existed_on_delete.append(
+                db.query(Task).filter(Task.id == context.task_id).count() == 1
+            )
+        finally:
+            db.close()
+        self.events.append(("deleted", context.task_id))
+
+
+def test_task_runtime_unknown_extension_error_does_not_disclose_registry(
+    test_db,
+    user1_headers,
+):
+    response = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "unknown runtime",
+            "runtime_extensions": {"private-provider-name": {}},
+        },
+        headers=user1_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid task runtime extension request"
+    assert "private-provider-name" not in response.text
+
+
+def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
+    test_db,
+    user1_headers,
+    user2_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    release_count = 0
+    original_release = chat_module.release_db_connection_if_clean
+
+    def record_release(db):
+        nonlocal release_count
+        release_count += 1
+        return original_release(db)
+
+    monkeypatch.setattr(
+        chat_module,
+        "release_db_connection_if_clean",
+        record_release,
+    )
+
+    class _ReleaseAwareProvider(_TaskRuntimeProvider):
+        minimum_release_count = 1
+
+        async def on_task_created(self, context, configuration):
+            assert release_count >= self.minimum_release_count
+            await super().on_task_created(context, configuration)
+
+        async def public_metadata(self, context):
+            assert release_count >= self.minimum_release_count
+            return await super().public_metadata(context)
+
+    provider = _ReleaseAwareProvider()
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "runtime task",
+                "description": "inspect the selected target",
+                "runtime_extensions": {"test_runtime": {"target": "approved_browser"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+        assert response.json()["runtime_extensions"] == {
+            "test_runtime": {"target": "approved_browser"}
+        }
+        assert response.json()["runtime_extensions_status"] == "complete"
+        assert response.json()["runtime_extensions_omitted"] == []
+        provider.minimum_release_count = release_count + 1
+        metadata = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user1_headers,
+        )
+        assert metadata.status_code == 200
+        assert metadata.json()["runtime_extensions"] == {
+            "test_runtime": {"target": "approved_browser"}
+        }
+        assert metadata.json()["runtime_extensions_status"] == "complete"
+        assert metadata.json()["runtime_extensions_omitted"] == []
+        denied = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user2_headers,
+        )
+        assert denied.status_code == 404
+
+        deleted = client.delete(
+            f"/api/chat/task/{task_id}",
+            headers=user1_headers,
+        )
+        assert deleted.status_code == 200
+        assert provider.events == [
+            ("created", task_id),
+            ("deleted", task_id),
+        ]
+        assert provider.task_existed_on_delete == [True]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+@pytest.mark.parametrize(
+    ("metadata_error", "expected_status", "expected_detail"),
+    [
+        (
+            TaskRuntimeClientError("target denied", status_code=403),
+            403,
+            "target denied",
+        ),
+        (TaskRuntimeClientError("invalid metadata"), 400, "invalid metadata"),
+        (TypeError("provider implementation detail"), 500, "Internal server error"),
+        (RuntimeError("database unavailable"), 500, "Internal server error"),
+    ],
+)
+def test_task_runtime_metadata_maps_provider_error_status(
+    test_db,
+    user1_headers,
+    metadata_error,
+    expected_status,
+    expected_detail,
+):
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider(metadata_error=metadata_error)
+    register_task_extension("test_runtime", provider)
+    task_id = None
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "runtime metadata error",
+                "runtime_extensions": {"test_runtime": {"target": "approved_browser"}},
+            },
+            headers=user1_headers,
+        )
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+        assert response.json()["runtime_extensions_status"] == "failed"
+        assert response.json()["runtime_extensions_omitted"] == []
+
+        metadata = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user1_headers,
+        )
+
+        assert metadata.status_code == expected_status
+        assert metadata.json()["detail"] == expected_detail
+    finally:
+        if task_id is not None:
+            client.delete(
+                f"/api/chat/task/{task_id}",
+                headers=user1_headers,
+            )
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_create_failure_compensates_task(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider(fail_create=True)
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "invalid runtime task",
+                "description": "must be compensated",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 400
+        db = next(get_db())
+        try:
+            assert (
+                db.query(Task).filter(Task.title == "invalid runtime task").count() == 0
+            )
+        finally:
+            db.close()
+        assert [event for event, _task_id in provider.events] == [
+            "created",
+            "deleted",
+        ]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_create_server_error_is_sanitized(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+
+    async def fail_create(context, configuration):
+        provider.events.append(("created", context.task_id))
+        raise RuntimeError("database password leaked")
+
+    provider.on_task_created = fail_create
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "unavailable runtime task",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Service unavailable"
+        assert "database password leaked" not in response.text
+        db = next(get_db())
+        try:
+            assert (
+                db.query(Task).filter(Task.title == "unavailable runtime task").count()
+                == 0
+            )
+        finally:
+            db.close()
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_compensation_failure_preserves_client_error(
+    test_db,
+    user1_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+
+    provider = _TaskRuntimeProvider(fail_create=True)
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    def fail_compensation(db, *, task_id):
+        raise RuntimeError("compensation database unavailable")
+
+    monkeypatch.setattr(
+        chat_module,
+        "_compensate_failed_task_extension_create",
+        fail_compensation,
+    )
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "failed compensation task",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "invalid target"
+        assert "compensation database unavailable" not in response.text
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_create_task_records_runtime_extension_bindings_for_deletion(
+    test_db,
+    user1_headers,
+):
+    """End-to-end: create records the binding, delete dispatches on it.
+
+    Without a persisted binding record the delete path has no way to tell which
+    providers own state for this task, and would have to fall back to the whole
+    process-wide registry.
+    """
+
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        task_extension_bindings_from_agent_config,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+    register_task_extension("test_runtime", provider)
+    try:
+        created = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "bound task",
+                "runtime_extensions": {"test_runtime": {"target": "one"}},
+            },
+            headers=user1_headers,
+        )
+        assert created.status_code == 200, created.text
+        task_id = int(created.json()["task_id"])
+
+        db = next(get_db())
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert task_extension_bindings_from_agent_config(task.agent_config) == (
+                "test_runtime",
+            )
+        finally:
+            db.close()
+
+        deleted = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert deleted.status_code == 200, deleted.text
+        assert ("deleted", task_id) in provider.events
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_delete_task_reports_concurrent_disappearance(
+    test_db,
+    user1_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        task = Task(user_id=user.id, title="concurrent delete", description="")
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(chat_module, "_delete_task_sync", lambda **_kwargs: False)
+
+    response = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Task no longer exists"
+
+
+def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
+    test_db,
+    user1_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+    from xagent.web.services.task_runtime import (
+        agent_config_with_task_extension_bindings,
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+    register_task_extension("test_runtime", provider)
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        # Cleanup dispatch is filtered by the task's binding record, so the
+        # task has to actually claim the provider for this retry to exercise it.
+        task = Task(
+            user_id=user.id,
+            title="retry delete",
+            description="",
+            agent_config=agent_config_with_task_extension_bindings(
+                {}, ["test_runtime"]
+            ),
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    original_delete = chat_module._delete_task_sync
+
+    def fail_delete(*, task_id):
+        raise RuntimeError("core delete unavailable")
+
+    try:
+        monkeypatch.setattr(chat_module, "_delete_task_sync", fail_delete)
+        first = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert first.status_code == 500
+        assert first.json()["detail"] == "Internal server error"
+
+        db = next(get_db())
+        try:
+            assert db.query(Task).filter(Task.id == task_id).count() == 1
+        finally:
+            db.close()
+
+        monkeypatch.setattr(chat_module, "_delete_task_sync", original_delete)
+        second = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert second.status_code == 200
+        assert [event for event, _task_id in provider.events] == [
+            "deleted",
+            "deleted",
+        ]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_delete_task_runtime_cleanup_failure_preserves_task_for_retry(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+    from xagent.web.services.task_runtime import (
+        agent_config_with_task_extension_bindings,
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    class _FailingDeleteProvider(_TaskRuntimeProvider):
+        async def on_task_deleted(self, context):
+            await super().on_task_deleted(context)
+            raise RuntimeError("provider cleanup failed")
+
+    provider = _FailingDeleteProvider()
+    register_task_extension("failing_runtime", provider)
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        task = Task(
+            user_id=user.id,
+            title="preserve for retry",
+            description="",
+            agent_config=agent_config_with_task_extension_bindings(
+                {}, ["failing_runtime"]
+            ),
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    try:
+        response = client.delete(
+            f"/api/chat/task/{task_id}",
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "Runtime extension cleanup failed; the task was not deleted"
+        )
+        db = next(get_db())
+        try:
+            assert db.query(Task).filter(Task.id == task_id).count() == 1
+        finally:
+            db.close()
+    finally:
+        unregister_task_extension("failing_runtime")

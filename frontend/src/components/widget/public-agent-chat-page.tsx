@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useState } from "react"
-import { Loader2 } from "lucide-react"
+import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
@@ -220,6 +220,25 @@ function PublicConversationContent({
     setTaskId(null, { navigate: false })
   }, [authMode, connectionError, state.taskId, storageKey, setTaskId])
 
+  // Ending a conversation is purely client-side: drop the persisted id and the
+  // active taskId, and the visitor is back on the start screen; the next
+  // message creates a fresh task through handleSend. #1039
+  const handleNewConversation = useCallback(() => {
+    safeRemoveItem(storageKey)
+    setTaskId(null, { navigate: false })
+    // Nulling taskId closes the socket, so no terminal WS event will ever
+    // reset these. Left stale mid-run, isProcessing keeps the start screen's
+    // composer disabled forever, currentTask pins the header on
+    // "Connecting...", and isHistoryLoading (cleared by an onConnect timer
+    // that may never have been scheduled) pins it on "Initializing".
+    dispatch({ type: "SET_PROCESSING", payload: false })
+    dispatch({ type: "SET_CURRENT_TASK", payload: null })
+    dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+    setDraftMessage("")
+    setDraftFiles([])
+    setCreateTaskError(null)
+  }, [dispatch, storageKey, setTaskId])
+
   const handleSend = useCallback(async (
     message: string,
     config?: PublicMessageConfig,
@@ -368,6 +387,17 @@ function PublicConversationContent({
               <p className="text-xs text-destructive">{createTaskError}</p>
             )}
           </div>
+          {state.taskId && (
+            <button
+              type="button"
+              onClick={handleNewConversation}
+              title={t("widgetChat.newConversation")}
+              aria-label={t("widgetChat.newConversation")}
+              className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+            >
+              <MessageSquarePlus className="w-4 h-4" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -406,6 +436,10 @@ function PublicConversationContent({
             showTokenUsage={false}
             showDagPreview={false}
             showTaskFiles={false}
+            // A visitor on a customer's site gets the answer, not the run: no
+            // reasoning, no tool arguments, no raw tool output. Share links
+            // keep the trace — #1041 scopes the hiding to the widget only.
+            showProcessView={authMode === "share"}
             hideFileUpload={false}
             hideConfig={true}
             compactInput={true}

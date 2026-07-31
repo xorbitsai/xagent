@@ -207,6 +207,22 @@ def normalize_tool_allowlist(value: Any) -> Optional[List[str]]:
 class BaseToolConfig(ABC):
     """Abstract base class for tool configuration."""
 
+    def set_task_runtime_contribution(self, contribution: Any) -> None:
+        """Attach a detached task-runtime contribution to this factory run."""
+
+    def get_task_runtime_contribution(self) -> Any:
+        """Return the detached task-runtime contribution for this factory run."""
+
+        return None
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain a workspace shared by task-runtime and sandbox setup."""
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return a workspace prepared by the task runtime, when present."""
+
+        return None
+
     @abstractmethod
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:
         """Get workspace configuration."""

@@ -106,6 +106,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     taskStatus,
     processStatus,
     showEmptyStatus,
+    showProcessView,
     onOpenExecutionPlan,
   }: {
     content?: string | null
@@ -114,6 +115,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     taskStatus?: string
     processStatus?: string
     showEmptyStatus?: boolean
+    showProcessView?: boolean
     onOpenExecutionPlan?: () => void
   }) => (
     <div
@@ -123,6 +125,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-task-status={taskStatus || ""}
       data-process-status={processStatus || ""}
       data-show-empty-status={showEmptyStatus ? "true" : "false"}
+      data-show-process-view={showProcessView ? "true" : "false"}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -642,6 +645,15 @@ describe("TaskConversationPanel", () => {
     // Only the user turn and the failure reason — no extra virtual message.
     expect(renderedMessages).toHaveLength(2)
     expect(renderedMessages[1]).toHaveTextContent(quotaReason)
+    // Trace visible: the reason renders as plain content, not the failed path.
+    expect(renderedMessages[1]).toHaveAttribute("data-task-status", "")
+    cleanup()
+
+    // With the trace hidden the same verbatim reason must reach ChatMessage
+    // flagged as failed, so its raw text gets the generic replacement there.
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+    const hiddenTraceMessages = screen.getAllByTestId("chat-message")
+    expect(hiddenTraceMessages[1]).toHaveAttribute("data-task-status", "failed")
   })
 
   it("applies current task status only to the latest trace process group", () => {
@@ -1030,5 +1042,46 @@ describe("TaskConversationPanel", () => {
 
     expect(await screen.findByTestId("center-panel")).toHaveAttribute("data-node-count", "3")
     expect(screen.getByTestId("center-panel")).toHaveAttribute("data-edge-count", "0")
+  })
+
+  it("shows the process view by default and hides it when asked to", () => {
+    const runningTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+    appState.messages = []
+    appState.traceEvents = [
+      {
+        event_id: "tool-1",
+        event_type: "tool_call",
+        timestamp: 1000,
+        data: { tool_name: "web_search", args: { query: "secret" } },
+      },
+    ] as any
+    appState.currentTask = runningTask
+    appState.isProcessing = true
+
+    const { unmount } = render(<TaskConversationPanel mode="page" />)
+    for (const message of screen.getAllByTestId("chat-message")) {
+      expect(message).toHaveAttribute("data-show-process-view", "true")
+    }
+    unmount()
+
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+    for (const message of screen.getAllByTestId("chat-message")) {
+      expect(message).toHaveAttribute("data-show-process-view", "false")
+    }
+    cleanup()
+
+    // Unlike the mode-derived sibling flags, showProcessView defaults to true
+    // for every mode; only the widget opts out explicitly.
+    render(<TaskConversationPanel mode="embedded-preview" />)
+    for (const message of screen.getAllByTestId("chat-message")) {
+      expect(message).toHaveAttribute("data-show-process-view", "true")
+    }
   })
 })

@@ -1530,7 +1530,7 @@ class DockerSandboxService(SandboxService):
                     name, container, info, self._store, control, self._locks
                 )
 
-    async def stop_existing(self, name: str) -> None:
+    async def stop_existing(self, name: str, *, timeout: Optional[int] = None) -> None:
         """Stop an existing sandbox, idempotent if already stopped.
 
         Reference-count-blind (see ``create()``) and, like
@@ -1541,6 +1541,14 @@ class DockerSandboxService(SandboxService):
         through a ``DockerSandbox`` handle on purpose: the handle's ``stop()``
         acquires this same non-reentrant lock entry, so delegating to it from
         inside this critical section would self-deadlock.
+
+        ``timeout`` is passed straight through to docker-py's own
+        ``container.stop(timeout=...)`` (seconds to wait for a graceful
+        stop before SIGKILL); omitted, docker-py applies its own default
+        (10s). This is a blocking call bounded by that timeout, not an
+        externally-cancellable wait: the caller observes the outcome by
+        re-inspecting afterward rather than racing this call with a
+        separate deadline.
         """
         async with self._named_lock(name):
             container = await self._find_container(name)
@@ -1553,8 +1561,19 @@ class DockerSandboxService(SandboxService):
                 await asyncio.to_thread(container.reload)
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state == "running":
-                    await asyncio.to_thread(container.stop)
+                    if timeout is None:
+                        await asyncio.to_thread(container.stop)
+                    else:
+                        await asyncio.to_thread(container.stop, timeout=timeout)
                 self._store.update_info_state(name, "stopped")
+
+    async def get_store_record(self, name: str) -> Optional[SandboxInfo]:
+        """Return the store's own row for this name, or None (see base class)."""
+        return self._store.get_info(name)
+
+    async def persist_store_record(self, name: str, info: SandboxInfo) -> None:
+        """Write/overwrite the store row for this name (see base class)."""
+        self._store.add_info(name, info)
 
     async def list_sandboxes(self) -> list[SandboxInfo]:
         """List all managed Docker sandboxes."""

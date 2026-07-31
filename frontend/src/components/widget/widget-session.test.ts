@@ -86,6 +86,15 @@ function jsonResponse(status: number, body: unknown, headers: Record<string, str
   })
 }
 
+function directJsonResponse(status: number, data: unknown): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers(),
+    json: () => Promise.resolve(data),
+  } as Response
+}
+
 function errorResponse(status: number, code: string) {
   return jsonResponse(status, { error: { code, message: "nope" } })
 }
@@ -755,6 +764,265 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it("logs the registered exchange diagnostic reason without forwarding it to the iframe", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(403, {
+      error: {
+        code: "agent_not_granted",
+        reason: "origin_not_allowed",
+        message: "remote diagnostic must not be logged",
+      },
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
+    ))
+    fromIframe("ready")
+
+    expect(post.mock.calls[0][0]).toEqual({
+      xagent: true,
+      v: 1,
+      type: "session_terminal",
+      code: "agent_not_granted",
+    })
+  })
+
+  it("scopes a registered diagnostic reason to its owning terminal code", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(401, {
+      error: {
+        code: "session_expired",
+        reason: "origin_not_allowed",
+      },
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(errorSpy.mock.calls).toEqual([[
+      "Xagent Widget: chat unavailable [session_expired] (HTTP 401).",
+    ]]))
+    fromIframe("ready")
+
+    expect(post.mock.calls[0][0]).toEqual({
+      xagent: true,
+      v: 1,
+      type: "session_terminal",
+      code: "session_expired",
+    })
+  })
+
+  it("ignores an inherited synthetic session failure code", async () => {
+    const syntheticCodeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, "syntheticCode")
+    Object.defineProperty(Object.prototype, "syntheticCode", {
+      configurable: true,
+      value: "network_unavailable",
+    })
+    try {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(jsonResponse(403, {
+        error: {
+          code: "agent_not_granted",
+          reason: "origin_not_allowed",
+        },
+      }))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy.mock.calls).toEqual([[
+        "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
+      ]]))
+      fromIframe("ready")
+
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "agent_not_granted" })
+    } finally {
+      if (syntheticCodeDescriptor) {
+        Object.defineProperty(Object.prototype, "syntheticCode", syntheticCodeDescriptor)
+      } else {
+        Reflect.deleteProperty(Object.prototype, "syntheticCode")
+      }
+    }
+  })
+
+  it("keeps a registered diagnostic intact when Object.prototype has a toString tag", async () => {
+    const toStringTagDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, Symbol.toStringTag)
+    Object.defineProperty(Object.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "polluted",
+    })
+    try {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(jsonResponse(403, {
+        error: {
+          code: "agent_not_granted",
+          reason: "origin_not_allowed",
+        },
+      }))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+        "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
+      ))
+      fromIframe("ready")
+
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "agent_not_granted" })
+    } finally {
+      if (toStringTagDescriptor) {
+        Object.defineProperty(Object.prototype, Symbol.toStringTag, toStringTagDescriptor)
+      } else {
+        Reflect.deleteProperty(Object.prototype, Symbol.toStringTag)
+      }
+    }
+  })
+
+  it("keeps the existing exchange diagnostic unchanged when the reason is absent", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(403, "agent_not_granted"))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      "Xagent Widget: chat unavailable [agent_not_granted] (HTTP 403).",
+    ))
+  })
+
+  it("logs the registered reconnect diagnostic reason without forwarding it to the iframe", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(403, {
+        error: {
+          code: "agent_not_granted",
+          reason: "origin_not_allowed",
+          message: "remote diagnostic must not be logged",
+        },
+      }))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await flushAsync()
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
+    ))
+    expect(post).toHaveBeenCalledWith({
+      xagent: true,
+      v: 1,
+      type: "session_terminal",
+      code: "agent_not_granted",
+    }, HOST)
+  })
+
+  it.each([
+    ["root array", () => ["agent_not_granted", "origin_not_allowed"], "unexpected_error"],
+    ["missing error", () => ({}), "unexpected_error"],
+    ["null error", () => ({ error: null }), "unexpected_error"],
+    ["error array", () => ({ error: ["agent_not_granted", "origin_not_allowed"] }), "unexpected_error"],
+    ["non-string code", () => ({ error: { code: 42, reason: "origin_not_allowed", message: "sentinel" } }), "unexpected_error"],
+    ["non-string code array", () => ({ error: { code: ["agent_not_granted"], reason: "origin_not_allowed", message: "sentinel" } }), "unexpected_error"],
+    ["missing reason", () => ({ error: { code: "agent_not_granted", message: "sentinel" } }), "agent_not_granted"],
+    ["null reason", () => ({ error: { code: "agent_not_granted", reason: null, message: "sentinel" } }), "agent_not_granted"],
+    ["non-string reason", () => ({ error: { code: "agent_not_granted", reason: 42, message: "sentinel" } }), "agent_not_granted"],
+    ["non-string reason array", () => ({ error: { code: "agent_not_granted", reason: ["origin_not_allowed"], message: "sentinel" } }), "agent_not_granted"],
+    ["unregistered reason", () => ({ error: { code: "agent_not_granted", reason: "future_reason", message: "sentinel" } }), "agent_not_granted"],
+    ["prototype-key reason", () => ({ error: { code: "agent_not_granted", reason: "toString", message: "sentinel" } }), "agent_not_granted"],
+  ])("suppresses an untrusted %s diagnostic component from a JSON response", async (_case, makeData, expectedCode) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(403, makeData()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      `Xagent Widget: chat unavailable [${expectedCode}] (HTTP 403).`,
+    ))
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("origin_not_allowed"))
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("sentinel"))
+    fromIframe("ready")
+
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: expectedCode })
+  })
+
+  it("fails closed on null-prototype response objects", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    const error = Object.assign(Object.create(null), {
+      code: "agent_not_granted",
+      reason: "origin_not_allowed",
+    })
+    const data = Object.assign(Object.create(null), { error })
+    fetchMock.mockResolvedValueOnce(directJsonResponse(403, data))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      "Xagent Widget: chat unavailable [unexpected_error] (HTTP 403).",
+    ))
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("origin_not_allowed"))
+    fromIframe("ready")
+
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "unexpected_error" })
+  })
+
+  it.each([
+    [
+      "data.error",
+      "error",
+      { code: "agent_not_granted", reason: "origin_not_allowed" },
+      () => ({}),
+      "unexpected_error",
+    ],
+    [
+      "error.code",
+      "code",
+      "agent_not_granted",
+      () => ({ error: { reason: "origin_not_allowed" } }),
+      "unexpected_error",
+    ],
+    [
+      "error.reason",
+      "reason",
+      "origin_not_allowed",
+      () => ({ error: { code: "agent_not_granted" } }),
+      "agent_not_granted",
+    ],
+  ])("suppresses an inherited %s diagnostic component from Object.prototype", async (
+    _boundary,
+    property,
+    inheritedValue,
+    makeData,
+    expectedCode,
+  ) => {
+    const descriptor = Object.getOwnPropertyDescriptor(Object.prototype, property)
+    Object.defineProperty(Object.prototype, property, {
+      configurable: true,
+      writable: true,
+      value: inheritedValue,
+    })
+    try {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(jsonResponse(403, makeData()))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+        `Xagent Widget: chat unavailable [${expectedCode}] (HTTP 403).`,
+      ))
+      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("origin_not_allowed"))
+      fromIframe("ready")
+
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: expectedCode })
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(Object.prototype, property, descriptor)
+      } else {
+        Reflect.deleteProperty(Object.prototype, property)
+      }
+    }
+  })
+
   it("does not retry a coded 4xx and reports unexpected_error for an uncoded one", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockResolvedValueOnce(new Response("<html>payload too large</html>", { status: 413 }))
@@ -894,6 +1162,39 @@ describe("widget session mode", () => {
     expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("[future_server_code]"))
   })
 
+  it("keeps unknown-5xx retry warnings and terminal frames code-only", async () => {
+    vi.useFakeTimers()
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(503, {
+      error: {
+        code: "future_server_code",
+        reason: "origin_not_allowed",
+        message: "retry diagnostic must not be logged",
+      },
+    })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+
+    await vi.advanceTimersByTimeAsync(7_000)
+
+    expect(warnSpy.mock.calls).toEqual([
+      ["Xagent Widget: session recovery is retrying [network_unavailable]."],
+      ["Xagent Widget: session recovery is retrying [network_unavailable]."],
+      ["Xagent Widget: session recovery is retrying [network_unavailable]."],
+    ])
+    expect(errorSpy).toHaveBeenCalledWith(
+      "Xagent Widget: chat unavailable [network_unavailable] (HTTP 503).",
+    )
+    expect(post.mock.calls.map(([message]) => message)).toEqual([
+      { xagent: true, v: 1, type: "session_degraded", code: "network_unavailable" },
+      { xagent: true, v: 1, type: "session_degraded", code: "network_unavailable" },
+      { xagent: true, v: 1, type: "session_degraded", code: "network_unavailable" },
+      { xagent: true, v: 1, type: "session_terminal", code: "network_unavailable" },
+    ])
+  })
+
   it("retries a server-supplied network_unavailable 5xx as an unknown transport failure", async () => {
     vi.useFakeTimers()
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
@@ -1011,6 +1312,31 @@ describe("widget session mode", () => {
     await vi.advanceTimersByTimeAsync(3000)
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[rate_limited] (HTTP 429)"))
+  })
+
+  it("keeps rate-limit retry warnings and degraded frames code-only", async () => {
+    vi.useFakeTimers()
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(429, {
+      error: {
+        code: "rate_limited",
+        reason: "origin_not_allowed",
+        message: "retry diagnostic must not be logged",
+      },
+    }, { "Retry-After": "1" })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Xagent Widget: session recovery is retrying [rate_limited].",
+    )
+    expect(post).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "session_degraded", code: "rate_limited" },
+      HOST,
+    )
   })
 
   it("honors an HTTP-date Retry-After value", async () => {

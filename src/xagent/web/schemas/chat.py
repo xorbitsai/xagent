@@ -1,9 +1,11 @@
 """Chat API request and response models"""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
+
+from ...core.task_runtime import MAX_TASK_RUNTIME_EXTENSIONS
 
 
 class ChatMessage(BaseModel):
@@ -60,6 +62,21 @@ class TaskCreateRequest(BaseModel):
     )
     agent_type: Optional[str] = "standard"
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
+    # Transport-shape violations intentionally remain Pydantic 422 responses;
+    # registry/semantic validation happens in the service layer as HTTP 400.
+    runtime_extensions: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        max_length=MAX_TASK_RUNTIME_EXTENSIONS,
+        description=(
+            "Runtime extensions to bind this task to, keyed by registered "
+            "extension name, each mapping to that provider's configuration "
+            "object. Names must be registered in this deployment; an unknown "
+            f"name is rejected. At most {MAX_TASK_RUNTIME_EXTENSIONS} entries; "
+            "each configuration must be JSON-serializable and is bounded in "
+            "size, as is the combined payload. Bindings are recorded on the "
+            "task and released again when the task is deleted."
+        ),
+    )
     is_preview: bool = False  # Backward-compatible alias for is_visible=False.
     is_visible: bool = True
 
@@ -108,6 +125,34 @@ class TaskCreateResponse(BaseModel):
     run_id: Optional[str] = None
     state_version: int = 0
     control_state: str = "idle"
+    runtime_extensions: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Public metadata published by each bound runtime extension, keyed "
+            "by extension name. Decoration only: the bindings are already "
+            "persisted when this response is produced, so an empty mapping "
+            "does not mean nothing was bound. Re-read the live values from "
+            "GET /task/{task_id}/runtime-extensions."
+        ),
+    )
+    runtime_extensions_status: Literal["complete", "truncated", "failed"] = Field(
+        default="complete",
+        description=(
+            "Delivery status of `runtime_extensions`: `complete` when every "
+            "provider's metadata is included, `truncated` when some was "
+            "dropped to keep the response under its aggregate size cap, and "
+            "`failed` when metadata could not be collected at all. The task "
+            "was created successfully in every case."
+        ),
+    )
+    runtime_extensions_omitted: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Extension names whose metadata was dropped for the aggregate "
+            "size cap, i.e. the names missing from `runtime_extensions` when "
+            "the status is `truncated`. Empty otherwise."
+        ),
+    )
 
 
 class ExecutionStatus(BaseModel):

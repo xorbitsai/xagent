@@ -402,7 +402,7 @@ if TYPE_CHECKING:
 @register_tool(categories={"skill"})
 async def create_skill_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     """Create skill documentation access tools from configuration."""
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
     if not workspace:
         return []
 

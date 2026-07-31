@@ -79,7 +79,9 @@ vi.mock("@/components/chat/ChatStartScreen", () => ({
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
-  TaskConversationPanel: () => <div data-testid="conversation-panel" />,
+  TaskConversationPanel: ({ showProcessView }: { showProcessView?: boolean }) => (
+    <div data-testid="conversation-panel" data-show-process-view={String(showProcessView)} />
+  ),
 }))
 
 vi.mock("@/lib/utils", async () => {
@@ -377,8 +379,10 @@ describe("PublicAgentChatPage", () => {
 
     renderWidgetPage()
 
-    expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
+    const panel = await screen.findByTestId("conversation-panel")
     expect(app.setTaskId).toHaveBeenCalledWith(71, { navigate: false })
+    // A widget visitor gets the answer, never the execution trace.
+    expect(panel).toHaveAttribute("data-show-process-view", "false")
   })
 
   it("shows the start screen and defers task creation until the first agent message", async () => {
@@ -388,6 +392,47 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    // No conversation yet — nothing to end.
+    expect(screen.queryByRole("button", { name: "widgetChat.newConversation" })).toBeNull()
+  })
+
+  it("ends the conversation and returns to the start screen", async () => {
+    const taskKey = "widget_task_17_guest-1"
+    localStorage.setItem(taskKey, "71")
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderWidgetPage()
+
+    await screen.findByTestId("conversation-panel")
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+
+    // The persisted id is dropped, so a reload cannot resurrect the old task,
+    // and the next message goes through the fresh-task path in handleSend.
+    expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
+    expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
+    expect(localStorage.getItem(taskKey)).toBeNull()
+  })
+
+  it("clears processing state when ending a conversation mid-run", async () => {
+    localStorage.setItem("widget_task_17_guest-1", "71")
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+    // The agent is still streaming: isProcessing was set by a WS event, and
+    // once taskId nulls the socket closes, so no terminal event will ever
+    // reset it — the reset must come from the button handler itself, or the
+    // start screen's composer stays disabled forever.
+    app.state = { ...app.state, isProcessing: true }
+
+    renderWidgetPage()
+
+    await screen.findByTestId("conversation-panel")
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+
+    expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_PROCESSING", payload: false })
+    expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_CURRENT_TASK", payload: null })
+    // The onConnect timer that normally clears this may never have been
+    // scheduled, so the reset must clear it or the header sticks on
+    // "Initializing".
+    expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_HISTORY_LOADING", payload: false })
   })
 
   it("creates an agent task and then sends its opening message", async () => {
@@ -616,8 +661,33 @@ describe("PublicAgentChatPage", () => {
 
     renderSharePage()
 
-    expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
+    const panel = await screen.findByTestId("conversation-panel")
     expect(app.setTaskId).toHaveBeenCalledWith(71, { navigate: false })
+    expect(fetchMock).not.toHaveBeenCalled()
+    // Hiding the trace is scoped to the widget (#1041); share links keep it.
+    expect(panel).toHaveAttribute("data-show-process-view", "true")
+  })
+
+  it("ends a share conversation and returns to the start screen", async () => {
+    localStorage.clear()
+    const token = makeShareJwt({ guest_id: "guest-A", exp: futureExp() })
+    localStorage.setItem(
+      SHARE_AUTH_KEY,
+      JSON.stringify({ ...successfulAgentAuth, access_token: token }),
+    )
+    const taskKey = "share_task_share-tok_17_guest-A"
+    localStorage.setItem(taskKey, "71")
+
+    renderSharePage()
+
+    await screen.findByTestId("conversation-panel")
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+
+    expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
+    expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
+    expect(localStorage.getItem(taskKey)).toBeNull()
+    // Only the task pointer is dropped — the guest auth survives, so no re-auth.
+    expect(localStorage.getItem(SHARE_AUTH_KEY)).not.toBeNull()
     expect(fetchMock).not.toHaveBeenCalled()
   })
 

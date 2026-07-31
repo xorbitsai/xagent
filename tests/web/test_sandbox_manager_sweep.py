@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import xagent.web.sandbox_manager as sandbox_manager_module
+from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.web.sandbox_manager import SandboxManager
 
 TTL = 100.0
@@ -41,7 +42,7 @@ def clock(monkeypatch) -> _FakeClock:
 
 
 def _make_manager(listed_names: list[str] | None = None) -> SandboxManager:
-    service = AsyncMock()
+    service = FakeSandboxService()
     service.list_sandboxes = AsyncMock(
         return_value=[_listed(name) for name in listed_names or []]
     )
@@ -126,7 +127,7 @@ async def test_fresh_provider_fetch_resets_idle_clock(clock) -> None:
     """get_or_create_lease_provider bumps activity, protecting the
     create-to-attach window from a concurrent sweep."""
     manager = _make_manager(["user::7"])
-    manager.create_lease_provider = AsyncMock(return_value=MagicMock())
+    manager._create_lease_provider_locked = AsyncMock(return_value=MagicMock())
 
     clock.advance(TTL + 1)
     await manager.get_or_create_lease_provider("user", "7")
@@ -159,7 +160,7 @@ async def test_swept_sandbox_is_recreated_cleanly_on_next_use(clock) -> None:
     manager._cache["user::7"] = MagicMock()
     manager._config_cache["user::7"] = MagicMock()
     providers = [MagicMock(), MagicMock()]
-    manager.create_lease_provider = AsyncMock(side_effect=providers)
+    manager._create_lease_provider_locked = AsyncMock(side_effect=providers)
 
     first = await manager.get_or_create_lease_provider("user", "7")
     clock.advance(TTL + 1)
@@ -238,6 +239,30 @@ async def test_sweep_loop_runs_periodically_and_survives_errors(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_reconcile_route_idle_sandbox_is_swept(clock, monkeypatch) -> None:
+    """The idle sweep also reclaims containers created via the
+    spec-reconciliation route (``FakeSandboxService(runtime_spec_supported=
+    True)``), not only the legacy ``get_or_create()`` route the rest of this
+    module drives."""
+    monkeypatch.setattr(
+        sandbox_manager_module,
+        "build_code_mount_volumes",
+        lambda: [("/repo/src", "/app/src", "ro")],
+    )
+    service = FakeSandboxService(runtime_spec_supported=True)
+    manager = SandboxManager(service)
+    await manager.get_or_create_sandbox("task", "7")
+    assert "task::7" in service._containers
+
+    clock.advance(TTL + 1)
+    reclaimed = await manager.sweep_idle_sandboxes(TTL)
+
+    assert reclaimed == ["task::7"]
+    assert "task::7" in service.deleted
+    assert "task::7" not in service._containers
+
+
+@pytest.mark.asyncio
 async def test_concurrent_recreate_during_sweep_waits_for_lifecycle_lock(
     clock,
 ) -> None:
@@ -255,7 +280,7 @@ async def test_concurrent_recreate_during_sweep_waits_for_lifecycle_lock(
 
     manager._service.delete.side_effect = slow_delete
     providers = [MagicMock(), MagicMock()]
-    manager.create_lease_provider = AsyncMock(side_effect=providers)
+    manager._create_lease_provider_locked = AsyncMock(side_effect=providers)
 
     clock.advance(TTL + 1)
     sweep_task = asyncio.create_task(manager.sweep_idle_sandboxes(TTL))
@@ -273,5 +298,5 @@ async def test_concurrent_recreate_during_sweep_waits_for_lifecycle_lock(
 
     assert reclaimed == ["user::7"]
     assert provider is providers[0]
-    manager.create_lease_provider.assert_awaited_once()
+    manager._create_lease_provider_locked.assert_awaited_once()
     assert manager._lease_providers["user::7"] is provider

@@ -31,6 +31,7 @@ from xagent.sandbox.base import (
     ResolvedSandboxRuntimeSpec,
     SandboxAlreadyExistsError,
     SandboxConfig,
+    SandboxInfo,
     SandboxInspection,
     SandboxNotFoundError,
     SandboxRuntimeConflictError,
@@ -131,6 +132,8 @@ class TestLifecycleApiSignatures:
             "create",
             "start_existing",
             "stop_existing",
+            "get_store_record",
+            "persist_store_record",
         ],
     )
     def test_docker_override_matches_base_signature(self, method_name):
@@ -1327,6 +1330,94 @@ class TestStartStopExisting:
             inspection = await service.inspect(name)
             assert inspection is not None
             assert inspection.state == "running"
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_stop_existing_accepts_timeout_kwarg(self, docker_service):
+        """An explicit timeout is passed straight through to
+        docker-py's own container.stop(timeout=...) bound."""
+        name = _unique_name("stop-timeout")
+        service = docker_service
+        try:
+            await service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(cpus=1, memory=256),
+            )
+            await service.stop_existing(name, timeout=1)
+
+            inspection = await service.inspect(name)
+            assert inspection is not None
+            assert inspection.state == "stopped"
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+
+# --- get_store_record() / persist_store_record() ---
+
+
+@requires_docker
+class TestStoreRecordAccess:
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_get_store_record_returns_none_for_absent_sandbox(
+        self, docker_service
+    ):
+        name = _unique_name("store-absent")
+        assert await docker_service.get_store_record(name) is None
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_get_store_record_reflects_create(self, docker_service):
+        name = _unique_name("store-created")
+        service = docker_service
+        try:
+            config = SandboxConfig(cpus=1, memory=256)
+            await service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config,
+            )
+
+            record = await service.get_store_record(name)
+
+            assert record is not None
+            assert record.name == name
+            assert record.template.image == DEFAULT_SANDBOX_IMAGE
+            assert record.config.cpus == 1
+            assert record.config.memory == 256
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_persist_store_record_backfills_a_missing_row(self, docker_service):
+        """Simulates reconciliation's MATCH-with-no-row backfill: the store
+        row was independently lost (label is immutable, unaffected)."""
+        name = _unique_name("store-backfill")
+        service = docker_service
+        try:
+            template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
+            config = SandboxConfig(cpus=1, memory=256)
+            await service.create(name, template, config)
+            service._store.delete_info(name)
+            assert await service.get_store_record(name) is None
+
+            info = SandboxInfo(
+                name=name, state="running", template=template, config=config
+            )
+            await service.persist_store_record(name, info)
+
+            record = await service.get_store_record(name)
+            assert record is not None
+            assert record.config.cpus == 1
         finally:
             try:
                 await service.delete(name)

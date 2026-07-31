@@ -14,7 +14,7 @@ import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
-import { resolveTraceProcessStatus } from "@/lib/trace-process-status";
+import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
 
 const MARKDOWN_FILE_REF_RE = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
 const BACKTICK_FILE_REF_RE = /`([^`]+)`/g;
@@ -85,16 +85,8 @@ export interface ChatMessageProps {
   onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
 }
 
-function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latestTitle?: string, taskStatus?: string, errorMessage?: string }) {
+function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
   const { t } = useI18n();
-
-  if (taskStatus === 'failed') {
-    return (
-      <div className="py-3 text-sm leading-relaxed text-red-500">
-        <span>{errorMessage || t("common.errors.unknown")}</span>
-      </div>
-    );
-  }
 
   const displayTitle = taskStatus === 'paused'
     ? t("common.taskPaused")
@@ -105,7 +97,7 @@ function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latest
   return (
     <div className="py-3 text-sm leading-relaxed text-muted-foreground flex items-center">
       <span>{displayTitle}</span>
-      {!["failed", "paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
+      {!["paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
         <span className="ml-1 inline-flex items-end gap-1">
           <span className="dot" />
           <span className="dot" />
@@ -299,7 +291,9 @@ export function ChatMessage({
   content,
   rawContent,
   traceEvents,
-  showProcessView,
+  // Default matches TaskConversationPanelProps: an unwired caller gets the
+  // internal-page behavior; public surfaces opt out explicitly.
+  showProcessView = true,
   taskStatus,
   processStatus,
   timestamp,
@@ -335,12 +329,8 @@ export function ChatMessage({
     })
     : "";
 
-  const shouldShowProcess =
-    !!showProcessView &&
-    Array.isArray(traceEvents) &&
-    traceEvents.length > 0;
-  const isProcessOnlyMessage =
-    shouldShowProcess && !isUser && !content && showEmptyStatus === false;
+  const hasTraceEvents = Array.isArray(traceEvents) && traceEvents.length > 0;
+  const shouldShowProcess = !!showProcessView && hasTraceEvents;
 
   // Map event/action to i18n key
   const getEventTitle = (e: TraceEvent | undefined) => {
@@ -365,8 +355,30 @@ export function ChatMessage({
     traceEvents,
   });
 
+  // A turn that stopped without an answer — failed, paused, or waiting for
+  // user input — must leave a visible mark once the trace is hidden: dropping
+  // its bubble too would show the visitor's question followed by nothing.
+  const isStoppedWithoutAnswer =
+    isStoppedTraceProcessStatus(resolvedProcessStatus) &&
+    resolvedProcessStatus !== "completed";
+
+  // A trace-only turn carries no answer text and no status line of its own, so
+  // its bubble would render as a bare avatar. Drop it whether the trace above
+  // was rendered (internal pages) or suppressed (embedded chat) — keying this
+  // off the events themselves rather than off shouldShowProcess. Stopped
+  // unanswered turns are the exception once the trace is hidden (see above).
+  const isProcessOnlyMessage =
+    hasTraceEvents &&
+    !isUser &&
+    !content &&
+    showEmptyStatus === false &&
+    (showProcessView || !isStoppedWithoutAnswer);
+
+  // The trace carries the backend's raw error string (a Python exception, more
+  // often than not). With the trace hidden the failure line must not become its
+  // replacement channel, so only mine the events when the process view is on.
   let errorMessage = "";
-  if (resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
+  if (showProcessView && resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
     for (let i = traceEvents.length - 1; i >= 0; i--) {
       const event = traceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
@@ -375,10 +387,19 @@ export function ChatMessage({
       }
     }
   }
+  const failureText =
+    errorMessage
+    || (showProcessView ? t("common.errors.unknown") : t("common.errors.taskFailed"));
+  // A failed turn's content is failure text by construction (final_answer_error
+  // streams str(exc); the terminal handler stores the reason verbatim), so with
+  // the trace hidden it needs the same generic replacement as mined errors.
   const failedMessageText =
-    typeof content === "string" && content.trim()
+    showProcessView && typeof content === "string" && content.trim()
       ? content
-      : errorMessage || t("common.errors.unknown");
+      : failureText;
+
+  // The copy button must not hand out what the bubble refuses to show: on a
+  // failed turn, copy exactly the (possibly redacted) text that is displayed.
   const isAssistantFailure = !isUser && resolvedProcessStatus === "failed";
   const copyableContent = isAssistantFailure
     ? failedMessageText
@@ -394,6 +415,23 @@ export function ChatMessage({
       setTimeout(() => setCopied(false), 2000);
     }
   };
+
+  // latestTitle names the running step ("calling web_search"), which is part of
+  // the trace: with the trace hidden it would leak the very detail the status
+  // line replaces.
+  const statusTitle = showProcessView
+    ? latestTitle
+    : resolvedProcessStatus === "completed"
+      ? t("common.statusDone")
+      : t("common.thinking");
+
+  // Neither the trace nor the bubble is going to render, so there is nothing
+  // left to wrap. Bail out rather than emit an empty div: the timeline
+  // separates children with space-y-*, so a childless wrapper still takes its
+  // gap, and a stray rawContent would leave the copy button floating alone.
+  if (isProcessOnlyMessage && !shouldShowProcess) {
+    return null;
+  }
 
   return (
     <div className="w-full space-y-2 animate-fade-in group">
@@ -460,7 +498,11 @@ export function ChatMessage({
                   <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
                 )
               ) : (
-                !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={resolvedProcessStatus || taskStatus} errorMessage={errorMessage} />
+                // A past paused/waiting turn has showEmptyStatus=false, but with
+                // the trace hidden its status line is all that marks the turn.
+                !isUser && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
+                  <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} />
+                )
               )}
               {!isUser && interactions && interactions.length > 0 && (
                 <div className="mt-4 border-t pt-4">

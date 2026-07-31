@@ -159,7 +159,12 @@ class _AvailableToolsRouteHarness:
                 harness.events.append("sandbox_get")
                 return object()
 
-            async def attach(self, _scope: str, _user_id: str) -> bool:
+            async def attach_provider(
+                self, _scope: str, _user_id: str, _provider: object
+            ) -> bool:
+                # The route holds the provider it just obtained, so it
+                # attaches that object by identity rather than asking whether
+                # some provider exists for the key.
                 harness.events.append("sandbox_attach")
                 return True
 
@@ -1367,16 +1372,16 @@ class TestAvailableToolsSandboxLifecycle:
     def test_reclaimed_provider_before_attach_lists_without_sandbox(
         self, monkeypatch
     ) -> None:
-        """attach() returning False (provider reclaimed between creation and
-        attach) must drop the stale reference and still serve the listing,
-        without releasing what was never attached."""
+        """attach_provider() returning False (provider reclaimed between
+        creation and attach) must drop the stale reference and still serve
+        the listing, without releasing what was never attached."""
         from unittest.mock import AsyncMock, MagicMock
 
         sandbox_manager = MagicMock()
         sandbox_manager.get_or_create_lease_provider = AsyncMock(
             return_value=MagicMock()
         )
-        sandbox_manager.attach = AsyncMock(return_value=False)
+        sandbox_manager.attach_provider = AsyncMock(return_value=False)
         sandbox_manager.release = AsyncMock()
         monkeypatch.setattr(
             "xagent.web.sandbox_manager.get_sandbox_manager",
@@ -1390,7 +1395,7 @@ class TestAvailableToolsSandboxLifecycle:
 
         assert response.status_code == 200
         assert response.json()["count"] > 0
-        sandbox_manager.attach.assert_awaited_once()
+        sandbox_manager.attach_provider.assert_awaited_once()
         sandbox_manager.release.assert_not_awaited()
 
     def test_attached_sandbox_is_released_after_listing(self, monkeypatch) -> None:
@@ -1402,7 +1407,7 @@ class TestAvailableToolsSandboxLifecycle:
         provider.primary_sandbox.exec = AsyncMock()
         sandbox_manager = MagicMock()
         sandbox_manager.get_or_create_lease_provider = AsyncMock(return_value=provider)
-        sandbox_manager.attach = AsyncMock(return_value=True)
+        sandbox_manager.attach_provider = AsyncMock(return_value=True)
         sandbox_manager.release = AsyncMock()
         monkeypatch.setattr(
             "xagent.web.sandbox_manager.get_sandbox_manager",

@@ -19,6 +19,7 @@ const zh = {
     resume: "继续",
     executing: "正在执行中",
     planning: "正在制定计划",
+    thinking: "正在思考",
     taskPaused: "任务已暂停",
     waitingForUser: "等待你的回复",
     noData: "暂无数据",
@@ -35,9 +36,11 @@ const zh = {
     create: "创建",
     edit: "编辑",
     done: "完成",
+    statusDone: "已完成",
     customPlaceholder: "自定义...",
     errors: {
       unknown: "未知错误",
+      taskFailed: "出了点问题，请重试。",
     },
   },
   voiceInput: {
@@ -467,6 +470,7 @@ const zh = {
   },
   widgetChat: {
     title: "AI 助手",
+    newConversation: "新建会话",
     status: {
       initializing: "正在初始化...",
       connecting: "连接中...",

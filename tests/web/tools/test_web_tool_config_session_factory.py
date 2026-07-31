@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.task_runtime import TaskRuntimeContext
 from xagent.core.tools.adapters.vibe.config import (
     MCPConfigLoadError,
     ToolFactoryRuntimeSessionBoundaryError,
@@ -361,6 +362,9 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.task_runtime_contribution = contribution
+
         async def refresh_runtime_policy(self) -> None:
             raise AssertionError("create_default_tools must not pre-refresh policy")
 
@@ -383,6 +387,225 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     assert tools == ["prepared-tool"]
     assert captured["db"] is None
     assert captured["db_factory"] is session_factory
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_skips_runtime_workspace_without_providers(
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.api.chat import create_default_tools
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            self.runtime_contribution = None
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+    async def create_tools(config):
+        return []
+
+    def unexpected_workspace(_config):
+        raise AssertionError("workspace must not be created without providers")
+
+    async def unexpected_runtime(_context):
+        raise AssertionError("runtime build must not run without providers")
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+    monkeypatch.setattr(ToolFactory, "create_workspace", unexpected_workspace)
+    monkeypatch.setattr(chat_module, "build_task_runtime", unexpected_runtime)
+    monkeypatch.setattr(chat_module, "registered_task_extensions", lambda: ())
+
+    tools, config = await create_default_tools(
+        None,
+        user=SimpleNamespace(id=7, is_admin=False),
+        task_id="web_task_11",
+        task_runtime_context=TaskRuntimeContext(
+            task_id=11,
+            user_id=7,
+            source="internal",
+            session_factory=lambda: object(),
+        ),
+    )
+
+    assert tools == []
+    assert config.runtime_contribution.tools == ()
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
+    monkeypatch,
+    caplog,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.task_runtime import TaskRuntimeExtensionError
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            self.runtime_contribution = None
+            self.runtime_workspace = None
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+        # Both runtime setters are concrete no-ops on ``BaseToolConfig``, so
+        # every real config has them; the double has to as well.
+        def set_task_runtime_workspace(self, workspace) -> None:
+            self.runtime_workspace = workspace
+
+    async def create_tools(config):
+        return ["core-tool"]
+
+    async def fail_runtime(_context):
+        raise TaskRuntimeExtensionError(
+            "broken_runtime",
+            "build_runtime",
+            RuntimeError("provider unavailable"),
+        )
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        lambda _config: SimpleNamespace(id="workspace"),
+    )
+    monkeypatch.setattr(chat_module, "build_task_runtime", fail_runtime)
+    monkeypatch.setattr(
+        chat_module,
+        "registered_task_extensions",
+        lambda: ("broken_runtime",),
+    )
+
+    with caplog.at_level("ERROR"):
+        tools, config = await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+            task_runtime_context=TaskRuntimeContext(
+                task_id=11,
+                user_id=7,
+                source="internal",
+                session_factory=lambda: object(),
+            ),
+        )
+
+    assert tools == ["core-tool"]
+    assert config.runtime_contribution.tools == ()
+    assert "broken_runtime" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_isolates_runtime_tool_name_collision(
+    monkeypatch,
+    caplog,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.core.task_runtime import (
+        TaskRuntimeContribution,
+        merge_task_runtime_contributions,
+    )
+    from xagent.core.tools.adapters.vibe.config import (
+        ToolConfig as StandaloneToolConfig,
+    )
+    from xagent.web.api.chat import create_default_tools
+
+    core_tool = SimpleNamespace(
+        name="computer",
+        metadata=SimpleNamespace(category="other"),
+    )
+    runtime_tool = SimpleNamespace(
+        name="computer",
+        metadata=SimpleNamespace(category="other"),
+    )
+
+    class _FakeToolConfig(StandaloneToolConfig):
+        def __init__(self, **kwargs):
+            super().__init__({})
+            self.runtime_contribution = TaskRuntimeContribution()
+            self.runtime_workspace = None
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+        def get_task_runtime_contribution(self):
+            return self.runtime_contribution
+
+        def set_task_runtime_workspace(self, workspace) -> None:
+            self.runtime_workspace = workspace
+
+        def get_task_runtime_workspace(self):
+            return self.runtime_workspace
+
+    async def create_registered_tools(config):
+        return [core_tool]
+
+    async def build_runtime(_context):
+        return merge_task_runtime_contributions(
+            {
+                "desktop_runtime": TaskRuntimeContribution(
+                    tools=(runtime_tool,),
+                    environment="Control the desktop.",
+                    preferred_input_modalities=("image",),
+                )
+            }
+        )
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        lambda _config: SimpleNamespace(id="workspace"),
+    )
+    monkeypatch.setattr(chat_module, "build_task_runtime", build_runtime)
+    monkeypatch.setattr(
+        chat_module,
+        "registered_task_extensions",
+        lambda: ("desktop_runtime",),
+    )
+
+    with caplog.at_level("WARNING"):
+        tools, config = await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+            task_runtime_context=TaskRuntimeContext(
+                task_id=11,
+                user_id=7,
+                source="internal",
+                session_factory=lambda: object(),
+            ),
+        )
+
+    assert tools == [core_tool]
+    assert config.runtime_contribution == TaskRuntimeContribution()
+    assert "Dropping task runtime extension 'desktop_runtime'" in caplog.text
 
 
 @pytest.mark.asyncio

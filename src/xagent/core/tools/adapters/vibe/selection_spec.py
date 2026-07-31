@@ -186,8 +186,24 @@ class ToolSelectionSpec(ABC):
     # ── Final name-level filter ───────────────────────────────────
 
     @abstractmethod
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
         """Resolve the final allowed-tool-names set for this spec.
+
+        Args:
+            all_tools: the built tool objects to filter.
+            extension_tool_names: names of tools contributed by task-runtime
+                extensions for THIS task (``TaskRuntimeContribution.tools``).
+                Such a tool is requested explicitly at task-creation time and
+                validated against the extension registry, so it carries a
+                task-scoped opt-in that is stronger than the agent-level
+                category policy; BY_CATEGORIES therefore admits it regardless
+                of its category. Defaults to empty, i.e. "no contributed
+                tools", so every existing caller keeps pure category /
+                server-scoped semantics.
 
         Returns:
             ``None``       — caller keeps every tool in ``all_tools``
@@ -453,9 +469,14 @@ class _SpecAll(ToolSelectionSpec):
         # explicit-empty ``mcp_servers`` exclude before the creator runs.)
         return None
 
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
         # None signals "no name-level filter" -- factory keeps
-        # every tool returned by the registry.
+        # every tool returned by the registry, contributed tools included, so
+        # ``extension_tool_names`` needs no special handling here.
         return None
 
 
@@ -497,10 +518,20 @@ class _SpecNone(ToolSelectionSpec):
         # NONE mode: MCP not selected -> initialize no servers.
         return frozenset()
 
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
         # Empty frozenset signals "filter to []" -- factory drops
         # every tool returned by the registry. Distinct from
         # ``None`` (ALL mode, keep everything).
+        # ``extension_tool_names`` is deliberately NOT admitted: NONE is an
+        # explicit "this agent runs with zero tools" decision, so it outranks
+        # a task-level contribution. Only BY_CATEGORIES needs the bypass,
+        # because there "unknown category" is an accident of the category
+        # taxonomy (contributed tools carry the internal ``other`` fallback)
+        # rather than a deliberate exclusion.
         return frozenset()
 
 
@@ -602,9 +633,13 @@ class _SpecByCategories(ToolSelectionSpec):
             return None
         return self.mcp_servers or frozenset()
 
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
-        """Filter ``all_tools`` by ``categories`` + ``mcp_servers``,
-        then union ``name_allowlist``.
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
+        """Filter ``all_tools`` by ``categories`` + ``mcp_servers``
+        (+ task-runtime contribution), then union ``name_allowlist``.
 
         Reads the orthogonal policy fields directly (no ``_user_picked``
         reconstruction):
@@ -621,6 +656,19 @@ class _SpecByCategories(ToolSelectionSpec):
             ``mcp:<server>`` therefore admits both the server's MCP tools
             and its ``api_<server>_call`` wrapper, since both carry the same
             ``source_server``;
+          - otherwise a tool whose name is in ``extension_tool_names`` -- the
+            tools this task's runtime extensions contributed -- is admitted
+            regardless of category. Same shape as the server-scoped admit
+            above (an ID-level scope supplied by the caller rather than a
+            category match), and necessary because a contributed tool keeps
+            ``ToolMetadata``'s default ``ToolCategory.OTHER`` while ``"other"``
+            is stripped from every configured category set
+            (``AGENT_CONFIG_UNASSIGNABLE_CATEGORIES``): a pure default-deny
+            filter would silently drop every contributed tool for any agent
+            with a configured ``tool_categories``. The contribution is already
+            access-controlled at task creation (validated against the
+            extension registry), which is a stronger, task-scoped opt-in than
+            the agent-level category policy;
           - finally ``name_allowlist`` names are unioned in.
 
         Duck-typed access to ``tool.metadata`` keeps this module free of any
@@ -631,10 +679,18 @@ class _SpecByCategories(ToolSelectionSpec):
         }
         names: Set[str] = set()
         for tool in all_tools:
-            if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
-                continue
             tool_name = getattr(tool, "name", None)
             if not isinstance(tool_name, str):
+                continue
+
+            # Task-runtime admit, checked before the metadata shape guard so a
+            # contributed tool is admitted on the task-scoped signal alone and
+            # never depends on its (default ``other``) category metadata.
+            if tool_name in extension_tool_names:
+                names.add(tool_name)
+                continue
+
+            if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
                 continue
             category = str(tool.metadata.category.value)
 

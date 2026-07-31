@@ -30,6 +30,10 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.services import workforce_runs as workforce_runs_service
+from xagent.web.services.task_runtime import (
+    TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
+    task_extension_bindings_from_agent_config,
+)
 from xagent.web.services.workforce_snapshot import build_workforce_task_config
 
 from .conftest import (
@@ -303,6 +307,44 @@ def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
 
     # And the forged value buys no access to the victim's tasks anyway.
     assert _upload_to_task(attacker, task_id).status_code == 200
+
+
+def test_agent_share_task_create_drops_forged_runtime_extension_bindings() -> None:
+    """Share guests are explicitly denied ``runtime_extensions`` (400), yet the
+    client ``agent_config`` copy would still let a guest write the server-owned
+    per-task binding record directly. Deletion dispatches by that record, so a
+    forged entry naming a broken provider can wedge the owner's task."""
+    assert _create_published_agent("Binding Agent", "binding-agent-tok")
+    guest = _authenticate_share_guest("binding-agent-tok")
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest,
+        json={
+            "title": "forged binding",
+            "description": "forged binding",
+            "agent_config": {
+                TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY: ["victim_ext"],
+                "keep_me": "client value",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task_extension_bindings_from_agent_config(task.agent_config) == ()
+        # Only the reserved key goes; ordinary client config and the
+        # server-owned keys layered on top both survive.
+        assert task.agent_config.get("keep_me") == "client value"
+        assert task.agent_config.get("auth_mode") == "share"
+        assert task.agent_config.get("guest_id") == _share_guest_id(
+            guest["Authorization"]
+        )
+    finally:
+        db.close()
 
 
 # ===== workforce-share cross-guest isolation =====

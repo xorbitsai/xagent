@@ -18,7 +18,7 @@ async def create_browser_tools(config: "BaseToolConfig") -> List[Any]:
         return []
 
     task_id = config.get_task_id()
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
 
     try:
         from .browser_use import create_browser_tools

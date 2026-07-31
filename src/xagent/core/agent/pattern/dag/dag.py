@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from ....model.intent import goal_scope
+from ....task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
 from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
@@ -18,7 +22,12 @@ from ...language import (
     output_language_policy,
 )
 from ...result import unwrap_final_answer_content
-from ...runtime import ExecutionInterrupted, LLMCallInterrupted, PatternRuntime
+from ...runtime import (
+    ExecutionInterrupted,
+    LLMCallInterrupted,
+    PatternRuntime,
+    prepare_llm_for_context,
+)
 from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
 from ..react import ReActPattern, ReActReasoningMode
@@ -295,9 +304,16 @@ class _DAGStepRuntime:
 class _RuntimeLLMProxy:
     runtime: PatternRuntime
     llm: Any
+    context: Any
 
     async def chat(self, **kwargs: Any) -> Any:
-        return await self.runtime.run_llm_call(self.llm, **kwargs)
+        messages = list(kwargs.get("messages") or [])
+        call_llm = await prepare_llm_for_context(
+            llm=self.llm,
+            messages=messages,
+            context=self.context,
+        )
+        return await self.runtime.run_llm_call(call_llm, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.llm, name)
@@ -808,6 +824,10 @@ class DAGPattern(AgentPattern):
         output_language = self._output_language(root_context)
         if active_context is not None:
             child_context = type(root_context).from_dict(active_context)
+            self._refresh_restored_step_runtime_metadata(
+                child_context,
+                root_context,
+            )
             if output_language and not child_context.metadata.get(
                 OUTPUT_LANGUAGE_METADATA_KEY
             ):
@@ -1308,8 +1328,13 @@ class DAGPattern(AgentPattern):
             emitter=final_answer_stream,
         )
         try:
+            call_llm = await prepare_llm_for_context(
+                llm=llm,
+                messages=messages,
+                context=context,
+            )
             response = await runtime.run_streaming_llm_call(
-                llm,
+                call_llm,
                 messages=messages,
                 tools=tools,
                 tool_choice="required",
@@ -1622,7 +1647,7 @@ class DAGPattern(AgentPattern):
         )
         self.plan = await self.plan_generator.generate_plan(
             request=request,
-            llm=_RuntimeLLMProxy(runtime=runtime, llm=llm),
+            llm=_RuntimeLLMProxy(runtime=runtime, llm=llm, context=context),
         )
         self.plan.validate()
         self._apply_completed_results_to_plan()
@@ -1705,6 +1730,7 @@ class DAGPattern(AgentPattern):
             return False
 
         child_context = type(root_context).from_dict(active_context)
+        self._refresh_restored_step_runtime_metadata(child_context, root_context)
         for message in root_user_messages[self.planned_user_message_count :]:
             child_context.add_user_message(
                 message.content,
@@ -1720,6 +1746,29 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = len(root_user_messages)
         self.status = "running"
         return True
+
+    @staticmethod
+    def _refresh_restored_step_runtime_metadata(
+        child_context: Any,
+        root_context: Any,
+    ) -> None:
+        """Refresh volatile routing metadata on a checkpoint-restored DAG step."""
+
+        root_metadata = getattr(root_context, "metadata", {})
+        preferred_modalities = normalize_input_modalities(
+            root_metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
+            if isinstance(root_metadata, dict)
+            else ()
+        )
+        if preferred_modalities:
+            child_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
+        else:
+            child_context.metadata.pop(
+                PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+                None,
+            )
 
     def _waiting_step_id(self) -> str | None:
         for step_id in self.active_step_ids:

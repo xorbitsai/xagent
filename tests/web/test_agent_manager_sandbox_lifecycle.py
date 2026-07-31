@@ -12,6 +12,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from xagent.core.execution_scope import ExecutionScope
+from xagent.sandbox.base import (
+    SandboxRecoveryRequiredError,
+    SandboxRuntimeConflictError,
+)
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.sandbox_manager import SandboxCapacityError, SandboxManager
 
@@ -128,7 +132,7 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) ->
         return new_provider
 
     sandbox_mgr._service.list_sandboxes.side_effect = slow_list_sandboxes
-    sandbox_mgr.create_lease_provider = AsyncMock(side_effect=create_provider)
+    sandbox_mgr._create_lease_provider_locked = AsyncMock(side_effect=create_provider)
     await _seed_attached_provider(sandbox_mgr, 7, AsyncMock())
 
     release_task = asyncio.create_task(manager._release_sandbox_task("user:7"))
@@ -138,7 +142,7 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) ->
         manager._get_or_create_task_sandbox(
             task_id=3,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
         )
     )
 
@@ -154,7 +158,7 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) ->
         await asyncio.gather(release_task, create_task, return_exceptions=True)
 
     assert sandbox is new_provider
-    sandbox_mgr.create_lease_provider.assert_awaited_once()
+    sandbox_mgr._create_lease_provider_locked.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -322,7 +326,7 @@ async def test_capacity_error_rejects_task_by_default(sandbox_mgr, monkeypatch) 
         await manager._get_or_create_task_sandbox(
             task_id=1,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
         )
 
     assert 1 not in manager._agent_sandbox_keys
@@ -342,7 +346,7 @@ async def test_capacity_error_falls_back_locally_when_enabled(
     sandbox = await manager._get_or_create_task_sandbox(
         task_id=1,
         workspace_owner_id=7,
-        workspace_config={},
+        mount_intent=None,
     )
 
     assert sandbox is None
@@ -363,7 +367,7 @@ async def test_sandbox_unavailability_keeps_local_fallback(
     sandbox = await manager._get_or_create_task_sandbox(
         task_id=1,
         workspace_owner_id=7,
-        workspace_config={},
+        mount_intent=None,
     )
 
     assert sandbox is None
@@ -426,7 +430,7 @@ async def test_suffix_scoped_execution_fails_closed(
         await manager._get_or_create_task_sandbox(
             task_id=1,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
             scope=_SCOPE,
         )
 
@@ -470,9 +474,152 @@ async def test_suffixless_scope_keeps_unscoped_fallback(
     sandbox = await manager._get_or_create_task_sandbox(
         task_id=1,
         workspace_owner_id=7,
-        workspace_config={},
+        mount_intent=None,
         scope=_SUFFIXLESS_SCOPE,
     )
 
     assert sandbox is None
     assert 1 not in manager._agent_sandbox_keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scope",
+    [
+        pytest.param(None, id="unscoped"),
+        pytest.param(_SUFFIXLESS_SCOPE, id="suffixless-scope"),
+        pytest.param(_SCOPE, id="scoped"),
+    ],
+)
+@pytest.mark.parametrize(
+    "contract_error",
+    [
+        pytest.param(
+            SandboxRuntimeConflictError("runtime configuration drifted"),
+            id="runtime-conflict",
+        ),
+        pytest.param(
+            SandboxRecoveryRequiredError("needs recovery before use"),
+            id="recovery-required",
+        ),
+    ],
+)
+async def test_contract_error_always_fails_closed(
+    sandbox_mgr, monkeypatch, scope, contract_error
+) -> None:
+    """A sandbox lifecycle contract violation never falls back to local
+    execution, for unscoped, suffixless-scope, or suffix-scoped tasks alike.
+
+    The local-execution fallback exists for sandbox-service
+    *unavailability* (a non-contract ``Exception``); a
+    ``SandboxContractError`` means the manager explicitly refused to honor
+    the desired mount/runtime spec, and silently running the task on the
+    host would defeat that refusal rather than surface it. Enabling the
+    capacity opt-in flag must not change this -- it is unrelated to
+    contract violations.
+    """
+    monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
+    manager = AgentServiceManager()
+    manager._agent_sandbox_keys[1] = "stale-key"
+    manager._agent_sandbox_providers[1] = object()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(side_effect=contract_error)
+
+    with pytest.raises(type(contract_error)):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            mount_intent=None,
+            scope=scope,
+        )
+
+    assert 1 not in manager._agent_sandbox_keys
+    assert 1 not in manager._agent_sandbox_providers
+
+
+@pytest.mark.asyncio
+async def test_capacity_semantics_unchanged_by_contract_classification(
+    sandbox_mgr, monkeypatch
+) -> None:
+    """SandboxCapacityError is not a SandboxContractError: adding the
+    contract-error branch must not change unscoped capacity's own opt-in
+    local-fallback semantics (already covered above, re-asserted here as a
+    classification-boundary pin)."""
+    monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
+        side_effect=SandboxCapacityError(cap=2, in_use=2)
+    )
+
+    sandbox = await manager._get_or_create_task_sandbox(
+        task_id=1,
+        workspace_owner_id=7,
+        mount_intent=None,
+    )
+
+    assert sandbox is None
+    assert 1 not in manager._agent_sandbox_keys
+    assert 1 not in manager._agent_sandbox_providers
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_task_sandbox_records_provider(sandbox_mgr) -> None:
+    """A successful sandbox build must record its provider object (keyed
+    the same as the sandbox key) so ``_acquire_sandbox_task`` can later
+    attach by identity instead of key existence alone."""
+    manager = AgentServiceManager()
+    provider = AsyncMock()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(return_value=provider)
+
+    sandbox = await manager._get_or_create_task_sandbox(
+        task_id=1,
+        workspace_owner_id=7,
+        mount_intent=None,
+    )
+
+    assert sandbox is provider
+    assert manager._agent_sandbox_providers[1] is provider
+
+
+@pytest.mark.asyncio
+async def test_acquire_falls_back_to_attach_when_no_provider_recorded(
+    sandbox_mgr,
+) -> None:
+    """A cache entry with a recorded key but no recorded provider (e.g. a
+    pre-ABA cache state) keeps the existence-only ``attach()`` behavior."""
+    manager = AgentServiceManager()
+    manager._agent_owner_ids[1] = 7
+    manager._agent_sandbox_keys[1] = "user:7"
+    sandbox_mgr._lease_providers["user::7"] = AsyncMock()
+
+    sandbox_key = await manager._acquire_sandbox_task("1")
+
+    assert sandbox_key == "user:7"
+    assert sandbox_mgr.ref_count("user", "7") == 1
+
+
+@pytest.mark.asyncio
+async def test_acquire_detects_provider_replaced_since_build_time(
+    sandbox_mgr,
+) -> None:
+    """ABA: the key still resolves to a live provider, but it is not the
+    same object the cached agent's tools were built against (a rebuild
+    replaced it) -- ``attach_provider`` must catch this by identity and the
+    caller must evict and rebuild exactly like the existence-only case."""
+    manager = AgentServiceManager()
+    old_provider = object()
+    manager._agents[1] = AsyncMock()
+    manager._agent_owner_ids[1] = 7
+    manager._agent_sandbox_keys[1] = "user:7"
+    manager._agent_sandbox_providers[1] = old_provider
+    # A rebuild since then installed a genuinely different provider object
+    # for the same lifecycle key.
+    sandbox_mgr._lease_providers["user::7"] = object()
+
+    with pytest.raises(RuntimeError, match="reclaimed before"):
+        await manager._acquire_sandbox_task("1")
+
+    assert 1 not in manager._agents
+    assert 1 not in manager._agent_owner_ids
+    assert 1 not in manager._agent_sandbox_keys
+    assert 1 not in manager._agent_sandbox_providers
+    assert sandbox_mgr.ref_count("user", "7") == 0

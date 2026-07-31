@@ -11,8 +11,14 @@ from ...config import get_uploads_dir
 from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
+from ..task_runtime import (
+    EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    TaskRuntimeContribution,
+    normalize_input_modalities,
+)
 from ..tools.adapters.vibe import Tool
 from ..tools.adapters.vibe.config import (
+    BaseToolConfig,
     RequiredMCPUnavailableError,
     ToolFactoryRuntimeSessionBoundaryError,
     normalize_tool_allowlist,
@@ -55,6 +61,7 @@ class AgentService:
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
+        preferred_input_modalities: tuple[str, ...] | list[str] | None = None,
         tools_initialized: bool | None = None,
         **agent_kwargs: Any,
     ) -> None:
@@ -68,7 +75,12 @@ class AgentService:
         self.fast_llm = fast_llm
         self.vision_llm = vision_llm
         self.compact_llm = compact_llm
-        self.system_prompt = system_prompt
+        self._base_system_prompt = system_prompt
+        self._base_preferred_input_modalities = normalize_input_modalities(
+            preferred_input_modalities
+        )
+        self.system_prompt = self._base_system_prompt
+        self.preferred_input_modalities = self._base_preferred_input_modalities
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
         if tools is not None and tool_config is not None:
@@ -176,6 +188,8 @@ class AgentService:
             self.tool_config = self._create_default_tool_config()
             self.allowed_skills = self._get_allowed_skills_from_config(self.tool_config)
 
+        self._refresh_task_runtime_context()
+
         # Compatibility shim for callers/tests that inspect service.agent.tools.
         self.agent = SimpleNamespace(
             name=self.name,
@@ -199,6 +213,31 @@ class AgentService:
 
         self._tools_initialized = False
         self._tool_policy_signature = None
+
+    def _refresh_task_runtime_context(self) -> None:
+        """Refresh prompt and model preferences from the current tool contribution."""
+
+        contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
+        if isinstance(self.tool_config, BaseToolConfig):
+            value = self.tool_config.get_task_runtime_contribution()
+            if isinstance(value, TaskRuntimeContribution):
+                contribution = value
+
+        prompt_parts = [
+            value.strip()
+            for value in (
+                self._base_system_prompt,
+                contribution.environment,
+            )
+            if isinstance(value, str) and value.strip()
+        ]
+        self.system_prompt = "\n\n".join(prompt_parts) or None
+        self.preferred_input_modalities = normalize_input_modalities(
+            (
+                *self._base_preferred_input_modalities,
+                *contribution.preferred_input_modalities,
+            )
+        )
 
     async def execute_task(
         self,
@@ -458,6 +497,10 @@ class AgentService:
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
             )
+            self._execution_adapter.config.system_prompt = self.system_prompt
+            self._execution_adapter.config.preferred_input_modalities = (
+                self.preferred_input_modalities
+            )
 
         return cast(
             dict[str, Any],
@@ -507,6 +550,7 @@ class AgentService:
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,
+                preferred_input_modalities=self.preferred_input_modalities,
             )
         )
 
@@ -685,6 +729,7 @@ class AgentService:
                 # Rebuild the tool list so disabled tools disappear from reused agents.
                 new_tools = await ToolFactory.create_all_tools(self.tool_config)
                 self.tools = list(new_tools)
+                self._refresh_task_runtime_context()
 
                 if hasattr(self.tool_config, "get_allowed_tools"):
                     allowed_tools = self.tool_config.get_allowed_tools()
@@ -699,6 +744,10 @@ class AgentService:
                 self.agent.tools = self.tools
                 if self._execution_adapter is not None:
                     self._execution_adapter.config.tools = self.tools
+                    self._execution_adapter.config.system_prompt = self.system_prompt
+                    self._execution_adapter.config.preferred_input_modalities = (
+                        self.preferred_input_modalities
+                    )
                 self._tools_initialized = True
                 self._tool_policy_signature = policy_signature
             except ConnectorRuntimeError:

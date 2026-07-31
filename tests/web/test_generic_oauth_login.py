@@ -226,7 +226,8 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     qs = parse_qs(urlparse(_location(resp)).query)
 
     assert qs["scope"] == [
-        "public_profile,pages_manage_posts,pages_read_engagement,pages_show_list"
+        "public_profile,pages_manage_posts,pages_read_engagement,"
+        "pages_read_user_content,pages_show_list"
     ]
 
 
@@ -261,6 +262,57 @@ def test_meta_login_uses_config_id_without_scope_when_configured(
         provider="meta",
         token=token,
         app_id="instagram",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["1234567890"]
+    assert "scope" not in qs
+
+
+def test_meta_login_uses_config_id_without_scope_for_facebook(db_session, monkeypatch):
+    """Facebook Pages via config_id: pages_read_user_content is NOT requested.
+
+    In this mode the Login Configuration in the Meta App Dashboard is the sole
+    source of truth for granted permissions (see META_CONFIG_ID in example.env)
+    - our builtin registry scopes are not sent at all. This test documents that
+    gap so a future change to the request-scope path doesn't silently mask it.
+    """
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "1234567890")
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=[
+                "pages_show_list",
+                "pages_read_engagement",
+                "pages_manage_posts",
+                "pages_read_user_content",
+            ],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
         redirect=None,
         db=db,
         db_provider=provider,

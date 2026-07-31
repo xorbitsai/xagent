@@ -213,6 +213,48 @@ async def test_prepare_for_call_prefers_and_exposes_context_ref_modality(
     assert prepared.has_ability("vision")
 
 
+@pytest.mark.asyncio
+async def test_prepare_for_call_merges_runtime_and_message_modalities(monkeypatch):
+    downstream = _ScriptedChatLLM([])
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    selected: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+
+    async def select_model(
+        prompt: str,
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+        advisory_input_modalities: tuple[str, ...] = (),
+    ) -> str:
+        selected.append((prompt, preferred_input_modalities, advisory_input_modalities))
+        return "openai/gpt-5.5"
+
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: 128_000)
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda _model_id: ("text", "image"),
+    )
+
+    prepared = await router.prepare_for_call(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect"},
+                    {"type": "input_audio", "input_audio": {}},
+                ],
+            }
+        ],
+        preferred_input_modalities=(None, "IMAGE"),  # type: ignore[arg-type]
+    )
+
+    # Message-derived audio is a hard requirement; the extension-declared image
+    # preference stays advisory and is kept separately addressable.
+    assert selected == [("inspect", ("audio",), ("image",))]
+    assert prepared.has_ability("vision")
+
+
 def test_router_detects_modalities_from_refs_and_content_parts() -> None:
     reference = ContextReference(
         file_ref={
@@ -277,6 +319,32 @@ def test_route_sync_forwards_modalities_when_router_supports_them(
     ]
 
 
+def test_route_sync_forwards_advisory_modalities_when_supported(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class Service:
+        def route(
+            self,
+            prompt: str,
+            *,
+            config_name: str,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> dict[str, Any]:
+            del prompt, config_name
+            calls.append(preferred_input_modalities)
+            return {"selected": ["openai/gpt-5.5"]}
+
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: Service(),
+    )
+
+    selected = RouterLLM()._route_sync("inspect", ("audio",), ("image",))
+
+    assert selected == ["openai/gpt-5.5"]
+    assert calls == [("image", "audio")]
+
+
 def test_route_sync_rejects_older_router_api_for_modality_requests(
     monkeypatch,
 ) -> None:
@@ -312,6 +380,93 @@ async def test_modality_support_error_is_not_hidden_by_generic_fallback(
         await router._select_model(
             "inspect",
             preferred_input_modalities=("image",),
+        )
+
+
+class _LegacyModalityUnawareService:
+    """An installed xrouter-llm whose route() predates modality preferences."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def route(self, prompt: str, *, config_name: str) -> dict[str, Any]:
+        self.calls.append({"prompt": prompt, "config_name": config_name})
+        return {"selected": ["text/model"]}
+
+
+def _legacy_modality_unaware_router(monkeypatch) -> tuple[RouterLLM, Any]:
+    service = _LegacyModalityUnawareService()
+    monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "fallback/model")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        lambda: service,
+    )
+    downstream = _ScriptedChatLLM([])
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: 128_000)
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda _model_id: ("text",),
+    )
+    return router, service
+
+
+@pytest.mark.asyncio
+async def test_extension_modalities_degrade_when_router_cannot_honor_them(
+    monkeypatch,
+) -> None:
+    """Extension-declared modalities are advisory: degrade, never hard-fail."""
+
+    router, service = _legacy_modality_unaware_router(monkeypatch)
+
+    prepared = await router.prepare_for_call(
+        [{"role": "user", "content": "plain text only"}],
+        preferred_input_modalities=("image",),
+    )
+
+    assert prepared.model_name == "text/model"
+    assert service.calls == [{"prompt": "plain text only", "config_name": "auto"}]
+
+
+@pytest.mark.asyncio
+async def test_message_derived_modalities_still_hard_fail(monkeypatch) -> None:
+    """A modality the conversation actually carries stays a hard requirement."""
+
+    router, _service = _legacy_modality_unaware_router(monkeypatch)
+
+    with pytest.raises(RouterModalityRoutingError, match="image"):
+        await router.prepare_for_call(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "inspect"},
+                        {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+                    ],
+                }
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_mixed_modalities_hard_fail_on_message_derived_requirement(
+    monkeypatch,
+) -> None:
+    router, _service = _legacy_modality_unaware_router(monkeypatch)
+
+    with pytest.raises(RouterModalityRoutingError, match="image"):
+        await router.prepare_for_call(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "inspect"},
+                        {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+                    ],
+                }
+            ],
+            preferred_input_modalities=("audio",),
         )
 
 

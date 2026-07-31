@@ -159,7 +159,7 @@ async def create_image_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not image_models:
         return []
 
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
     if not workspace:
         return []
 

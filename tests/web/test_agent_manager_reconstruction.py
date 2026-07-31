@@ -367,7 +367,12 @@ class TestAgentServiceManagerReconstruction:
                 "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
             ) as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
-            patch("xagent.web.api.chat.get_uploads_dir", return_value=uploads_dir),
+            # Backend workspace paths are composed in the workspace
+            # projection, so that is the seam the base dir comes from.
+            patch(
+                "xagent.web.services.workspace_binding.get_uploads_dir",
+                return_value=uploads_dir,
+            ),
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
             ) as mock_tool_factory,
@@ -431,8 +436,9 @@ class TestAgentServiceManagerReconstruction:
         async def create_all_tools(
             config,
             apply_user_override_filter: bool = True,
+            additional_tools=(),
         ):
-            return [basic_tool, browser_tool]
+            return [basic_tool, browser_tool, *additional_tools]
 
         monkeypatch.setattr(
             "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
@@ -481,8 +487,12 @@ class TestAgentServiceManagerReconstruction:
     ):
         sample_task.source = source
 
-        async def create_all_tools(config, apply_user_override_filter=True):
-            return []
+        async def create_all_tools(
+            config,
+            apply_user_override_filter=True,
+            additional_tools=(),
+        ):
+            return list(additional_tools)
 
         monkeypatch.setattr(
             "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",

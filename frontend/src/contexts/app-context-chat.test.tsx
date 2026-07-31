@@ -853,6 +853,58 @@ describe("AppProvider websocket message routing", () => {
     expect(messages).toEqual([])
   })
 
+  it("rejects a queued message once the conversation is reset before delivery", async () => {
+    let send: (() => Promise<void> | undefined) | undefined
+    let reset: (() => void) | undefined
+    function ResetProbe() {
+      const { sendMessage, setTaskId } = useApp()
+      send = () => {
+        // Mirrors the widget's bootstrap: taskId is set in the same tick the
+        // opening message is queued for it.
+        setTaskId(9, { navigate: false })
+        return sendMessage("hello there", {
+          clientMessageId: "turn-reset",
+          targetTaskId: 9,
+        })
+      }
+      reset = () => setTaskId(null, { navigate: false })
+      return null
+    }
+
+    // The new task's socket never connects, so the message stays queued.
+    wsHarness.isConnected = false
+    render(
+      <AppProvider token="token">
+        <ResetProbe />
+      </AppProvider>
+    )
+
+    let deliveryError: Error | undefined
+    let delivery: Promise<void | undefined> | undefined
+    await act(async () => {
+      delivery = Promise.resolve(send?.()).catch((error: Error) => {
+        deliveryError = error
+        return undefined
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(deliveryError).toBeUndefined()
+
+    // "New conversation" nulls the taskId: the queued message must fail now,
+    // not sit out the 30s timeout as an unhandled rejection.
+    await act(async () => {
+      reset?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => {
+      await delivery
+    })
+
+    expect(deliveryError?.message).toMatch(/reset/)
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+  })
+
   it("shows the sender's message live when a new task's run dies before tracing", async () => {
     // A run refused at the quota gate returns before agent tracing starts, so
     // the live user_message trace event is never emitted. The sender's bubble

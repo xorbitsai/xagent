@@ -27,6 +27,7 @@ from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
@@ -1792,6 +1793,55 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_plan_generation_forwards_runtime_modality_preference() -> None:
+    prepared_llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "inspect",
+                    "task": "Inspect the authorized page",
+                    "dependencies": [],
+                    "termination_condition": "Stop after inspection.",
+                    "completion_evidence": "The page was inspected.",
+                    "tool_names": [],
+                }
+            ]
+        )
+    )
+
+    class _RouterLikeLLM:
+        def __init__(self) -> None:
+            self.preferred_modalities: list[tuple[str, ...]] = []
+
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert messages
+            self.preferred_modalities.append(preferred_input_modalities)
+            return prepared_llm
+
+    context = ExecutionContext(execution_id="dag-runtime-modality")
+    context.add_user_message("Inspect the page")
+    context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["image"]
+    router_llm = _RouterLikeLLM()
+    pattern = DAGPattern(LLMPlanGenerator())
+
+    await pattern._generate_plan(
+        context=context,
+        tools=[],
+        llm=router_llm,
+        runtime=PatternRuntime(execution_id=context.execution_id),
+        replan=False,
+    )
+
+    assert router_llm.preferred_modalities == [("image",)]
+    assert prepared_llm.calls
+
+
+@pytest.mark.asyncio
 async def test_llm_plan_generator_retries_missing_required_tool_call() -> None:
     generator = LLMPlanGenerator()
     context = ExecutionContext(execution_id="dag-llm-plan-retry")
@@ -2518,6 +2568,7 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     )
     first_context = ExecutionContext(execution_id="dag-resume-pending-tool")
     first_context.add_user_message("Root task")
+    first_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["image"]
 
     interrupted = await first_pattern.run(
         context=first_context,
@@ -2555,18 +2606,34 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     )
     restored_pattern.load_state(checkpoint["pattern_state"])
     restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["audio"]
     restored_tool = FakeTool()
+    resumed_modalities: list[tuple[str, ...]] = []
+    resumed_llm = SequenceLLM([{"content": "The answer is 42.", "done": True}])
+
+    class _TrackingRouter:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert messages
+            resumed_modalities.append(preferred_input_modalities)
+            return resumed_llm
 
     resumed = await restored_pattern.run(
         context=restored_context,
         tools=[restored_tool],
-        llm=SequenceLLM([{"content": "The answer is 42.", "done": True}]),
+        llm=_TrackingRouter(),
     )
 
     assert resumed["success"] is True
     assert resumed["status"] == "completed"
     assert resumed["step_results"]["calc"] == "The answer is 42."
     assert restored_tool.calls == [{"expression": "6*7"}]
+    assert resumed_modalities
+    assert all(modalities == ("audio",) for modalities in resumed_modalities)
 
 
 @pytest.mark.asyncio

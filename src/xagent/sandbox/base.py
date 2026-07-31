@@ -62,6 +62,27 @@ class SandboxRuntimeConflictError(SandboxContractError):
     """
 
 
+class SandboxMountEscapeError(SandboxContractError):
+    """Raised when a mount candidate escapes the root that must contain it.
+
+    ``SandboxMountIntent``'s covered/covering/disjoint split is lexical, so
+    a caller that needs a candidate to be *physically* inside (or to
+    physically contain) the mount root owns the resolved view as well. When
+    such a candidate's lexical containment and its ``realpath`` containment
+    disagree, no fold verdict is safe: dropping it loses access to a path
+    the surviving bind does not expose, promoting it re-roots onto a
+    directory that does not contain the old root, and granting it a separate
+    bind exposes whatever the symlink points at.
+
+    Callers raise this for candidates whose containment is a precondition
+    rather than an observation -- a path derived from a workspace root that
+    the mount root is required to cover. A candidate that is an
+    independently declared mount in its own right (an operator-configured
+    external directory) has no such precondition and keeps its own bind
+    instead.
+    """
+
+
 class SandboxRecoveryRequiredError(SandboxContractError):
     """Raised when a sandbox is in a state that needs recovery before use.
 
@@ -517,12 +538,16 @@ class SandboxMountIntent:
     Classification into ``covered_extras`` / ``covering_extras`` /
     ``disjoint_extras`` is purely lexical string comparison over the
     normalized paths — it does not touch the filesystem and cannot detect
-    symlinks, bind-mount aliasing, or host-side path mappings. Callers must
-    pass backend-side absolute paths that have already been resolved (e.g.
-    via ``realpath``) on their own side before constructing this type; this
-    type performs no such resolution itself. Deciding what to do with the
-    disjoint set (e.g. fail-closed against an allow-list) is left to the
-    caller.
+    symlinks, bind-mount aliasing, or host-side path mappings, and this type
+    performs no resolution of its own. A caller acting on the verdict owns
+    the resolved view: both folding directions (dropping a covered extra,
+    promoting a covering one) assume the surviving mount physically contains
+    the dropped path, and a symlink breaks that in either direction. So
+    either pass backend-side paths that are already resolved (e.g. via
+    ``realpath``), or classify the resolved paths as well and treat a
+    disagreement between the two verdicts as disjoint. Deciding what to do
+    with the disjoint set (e.g. fail-closed against an allow-list) is left
+    to the caller.
     """
 
     mount_root: Optional[str] = None
@@ -626,14 +651,18 @@ def spec_matches_inspection(
     corresponding store record should fall back to a full desired-state
     comparison against the record — recognizing that this is blind to
     drift in the actual running container and does not verify it, only the
-    previously-recorded intent. A sandbox with a fingerprint label but no
-    store record is the one case that reconciliation must always treat as
-    needing rebuild, since it is the only situation where both label and
-    record can be brought into agreement at once. Regardless of verdict,
-    any destructive action still must go through the reference-count check
-    that applies to all sandbox teardown; the fallback for a
-    non-zero-reference-count sandbox is to reject new callers, not to tear
-    down one already in use.
+    previously-recorded intent. A sandbox with a matching fingerprint label
+    but no store record (``MATCH`` here, row missing) is the one case
+    reconciliation must always treat as needing a store-row backfill, not a
+    rebuild: the label already attests the live container matches
+    ``desired``, so destroying it over a persistence-layer gap would be
+    pure waste and would turn a row-write failure into an unnecessary
+    container-destruction event; writing the missing row is the only
+    action needed to bring label and record into agreement. Regardless of
+    verdict, any destructive action still must go through the
+    reference-count check that applies to all sandbox teardown; the
+    fallback for a non-zero-reference-count sandbox is to reject new
+    callers, not to tear down one already in use.
     """
     if inspection.fingerprint_label is None or inspection.version_label is None:
         return SpecVerdict.UNVERIFIED
@@ -1015,10 +1044,16 @@ class SandboxService(abc.ABC):
             f"{type(self).__name__} does not support start_existing()"
         )
 
-    async def stop_existing(self, name: str) -> None:
+    async def stop_existing(self, name: str, *, timeout: Optional[int] = None) -> None:
         """Stop an existing sandbox, preserving its state.
 
         Idempotent: stopping an already-stopped sandbox is a no-op.
+
+        Args:
+            timeout: Seconds to wait for a graceful stop before a forced
+                kill (backend-native bound, e.g. docker-py's own
+                ``container.stop(timeout=...)``). ``None`` uses the
+                backend's own default.
 
         Raises:
             SandboxNotFoundError: No sandbox with this name exists.
@@ -1028,3 +1063,42 @@ class SandboxService(abc.ABC):
         raise SandboxReconcileUnsupportedError(
             f"{type(self).__name__} does not support stop_existing()"
         )
+
+    async def get_store_record(self, name: str) -> Optional[SandboxInfo]:
+        """Return the backend's own persistent store record for this name.
+
+        Unlike ``list_sandboxes()``'s merged view (store-row-augmented when
+        a row exists, reconstructed-from-live-facts otherwise —
+        indistinguishable from the caller's side), this exposes the store
+        row itself so reconciliation can tell "no row" apart from "row
+        happens to equal live facts", and can rebuild the previously
+        desired spec from what ``create()`` (or the legacy
+        ``get_or_create()``) actually persisted rather than from live
+        inspection facts alone — env in particular cannot be reliably
+        reconstructed from live facts (see ``ObservedRuntimeFacts``).
+
+        Returns None if the backend has no row for this name, including
+        backends that keep no persistent store at all.
+
+        Defaults to None; backends that implement the reconciliation
+        lifecycle override this alongside inspect/create/start_existing/
+        stop_existing.
+        """
+        return None
+
+    async def persist_store_record(self, name: str, info: SandboxInfo) -> None:
+        """Write (or overwrite) the backend's persistent store row for this name.
+
+        Used only by reconciliation to backfill a store row for a
+        container whose live facts and fingerprint label already verify a
+        MATCH against the desired spec but whose store write did not land
+        (``create()``'s own store write is best-effort after publish
+        verification passes — see its docstring, step 7). Not used by any
+        other lifecycle method; a normal ``create()``/``get_or_create()``
+        persists its own row itself.
+
+        Defaults to a no-op; backends that implement the reconciliation
+        lifecycle override this alongside inspect/create/start_existing/
+        stop_existing.
+        """
+        return None

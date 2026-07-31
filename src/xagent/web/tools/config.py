@@ -422,12 +422,10 @@ def _oauth_token_expires_after_cache_window(expires_at: datetime) -> bool:
 
 
 def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
-    return list(
-        dict.fromkeys(
-            value
-            for value in (app_info.get("provider"), app_info.get("id"))
-            if isinstance(value, str) and value
-        )
+    from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
+
+    return restrict_to_app_scoped_oauth_grant(
+        app_info.get("id"), (app_info.get("provider"), app_info.get("id"))
     )
 
 
@@ -1137,6 +1135,8 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_failure_policy = mcp_failure_policy
         self._mcp_load_summary_tracer = mcp_load_summary_tracer
         self._mcp_load_summary_trace_task_id = mcp_load_summary_trace_task_id
+        self._task_runtime_contribution: Any = None
+        self._task_runtime_workspace: Any = None
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -1164,7 +1164,7 @@ class WebToolConfig(BaseToolConfig):
         # Use uploads dir if workspace_base_dir not explicitly provided
         if workspace_base_dir is None:
             workspace_base_dir = str(get_uploads_dir())
-        # Ensure base_dir is in workspace_config (required by ToolFactory._create_workspace)
+        # Ensure base_dir is in workspace_config (required by ToolFactory.create_workspace)
         if "base_dir" not in workspace_config:
             workspace_config["base_dir"] = workspace_base_dir
         if self._user_id is not None and "user_id" not in workspace_config:
@@ -1707,6 +1707,26 @@ class WebToolConfig(BaseToolConfig):
     def get_browser_tools_enabled(self) -> bool:
         """Whether to include browser automation tools."""
         return self._browser_tools_enabled
+
+    def set_task_runtime_contribution(self, contribution: Any) -> None:
+        """Attach the detached contribution built for this task."""
+
+        self._task_runtime_contribution = contribution
+
+    def get_task_runtime_contribution(self) -> Any:
+        """Return the contribution consumed while building ``AgentService``."""
+
+        return self._task_runtime_contribution
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain the workspace already prepared for runtime providers."""
+
+        self._task_runtime_workspace = workspace
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return the workspace shared by providers and sandbox setup."""
+
+        return self._task_runtime_workspace
 
     def get_task_id(self) -> Optional[str]:
         """Get task ID for session tracking."""
@@ -2853,12 +2873,19 @@ class WebToolConfig(BaseToolConfig):
         app_id: object,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one legacy OAuth account in an isolated transaction."""
+        from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
         from ...web.models.user_oauth import UserOAuth
 
         oauth_db = self._new_legacy_oauth_session()
         try:
             if app_id:
-                providers_to_check = [provider_name, app_id]
+                # A bare provider-level grant (e.g. UserOAuth.provider ==
+                # "meta") never requested this app's own oauth_scopes, so it
+                # can't be trusted to carry a permission added after that flow
+                # already existed. See APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
+                providers_to_check = restrict_to_app_scoped_oauth_grant(
+                    app_id, [provider_name, app_id]
+                )
                 oauth_account = (
                     oauth_db.query(UserOAuth)
                     .filter(

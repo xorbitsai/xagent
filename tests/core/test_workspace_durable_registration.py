@@ -773,7 +773,7 @@ def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
 
 
 def test_tool_factory_workspace_preserves_db_task_id(tmp_path):
-    workspace = ToolFactory._create_workspace(
+    workspace = ToolFactory.create_workspace(
         {
             "base_dir": str(tmp_path / "workspaces"),
             "task_id": "agent_2_abcd1234",

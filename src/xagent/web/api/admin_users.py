@@ -1,16 +1,42 @@
+import asyncio
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
+from ...core.task_runtime import TaskRuntimeContext
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db
-from ..models.task import Task
+from ..models.chat_message import TaskChatMessage
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
+from ..models.task import (
+    DAGExecution,
+    Task,
+    TraceCheckpointBlob,
+    TraceEvent,
+    TraceMessageBlob,
+)
+from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
+from ..services.task_runtime import (
+    TaskRuntimeExtensionError,
+    delete_task_extensions,
+    registered_task_extensions,
+    store_task_extension_bindings,
+    task_extension_bindings_from_agent_config,
+)
 from ..services.user_admin_scope import hidden_user_ids
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
+logger = logging.getLogger(__name__)
+_TASK_RUNTIME_DELETE_CONCURRENCY = 4
+_TASK_RUNTIME_DELETE_PAGE_SIZE = 100
 
 
 def _delete_legacy_text2sql_rows(db: Session, user_id: int) -> None:
@@ -22,6 +48,152 @@ def _delete_legacy_text2sql_rows(db: Session, user_id: int) -> None:
         text("DELETE FROM text2sql_databases WHERE user_id = :user_id"),
         {"user_id": user_id},
     )
+
+
+def _purge_user_task_rows(db: Session, *, user_id: int) -> None:
+    """Delete every task-owned row for one user with one statement per table.
+
+    The single-task endpoint purges row-by-row through ``purge_task_rows``.
+    Doing that in a loop costs a SELECT plus five statements per task, and the
+    ORM ``db.delete(task)`` additionally loads and per-row-deletes every
+    ``TaskChatMessage`` and per-row-NULLs every ``UploadedFile``. Admin user
+    deletion has no bound on task count, so it uses set-based statements keyed
+    off a single ``tasks`` sub-select instead.
+
+    Ordering matches ``purge_task_rows``: every child row referencing
+    ``tasks.id`` goes before the ``tasks`` delete, so the purge stays valid
+    under enforced foreign keys regardless of whether the deployment's schema
+    carries ``ON DELETE`` clauses.
+    """
+
+    task_ids = select(Task.id).where(Task.user_id == user_id).scalar_subquery()
+
+    # Children without a DB-level ``ON DELETE`` clause -- these are the rows a
+    # bare ``DELETE FROM tasks`` would strand or fail on under strict FKs.
+    for model in (
+        TraceCheckpointBlob,
+        TraceMessageBlob,
+        TraceEvent,
+        DAGExecution,
+    ):
+        db.query(model).filter(model.task_id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+
+    # ``Task.chat_messages`` relies on an ORM ``delete-orphan`` cascade that a
+    # bulk ``tasks`` delete bypasses. Delete explicitly so the behaviour does
+    # not depend on the DB honouring the FK's ``ON DELETE CASCADE``.
+    db.query(TaskChatMessage).filter(TaskChatMessage.task_id.in_(task_ids)).delete(
+        synchronize_session=False
+    )
+
+    # ``Task.uploaded_files`` has no cascade, so ORM deletion detaches the rows
+    # rather than removing them. Preserve that behaviour: the files are removed
+    # by the ``uploaded_files.user_id`` cascade when the user row goes away.
+    db.query(UploadedFile).filter(UploadedFile.task_id.in_(task_ids)).update(
+        {UploadedFile.task_id: None},
+        synchronize_session=False,
+    )
+
+    db.query(Task).filter(Task.user_id == user_id).delete(synchronize_session=False)
+
+
+def _load_task_page_sync(
+    *,
+    user_id: int,
+    last_seen_task_id: int,
+    page_size: int,
+) -> list[tuple[int, int, str | None, object]]:
+    """Read one keyset page of a user's tasks in an operation-local session.
+
+    The page count grows with the user's task count and is unbounded, so this
+    read cannot run on the event loop. It selects scalar columns and returns
+    plain tuples, so nothing session-bound crosses the thread boundary.
+    """
+
+    session_factory = get_session_local()
+    page_db = session_factory()
+    try:
+        return [
+            (int(task_id), int(task_user_id), source, agent_config)
+            for task_id, task_user_id, source, agent_config in page_db.query(
+                Task.id, Task.user_id, Task.source, Task.agent_config
+            )
+            .filter(
+                Task.user_id == user_id,
+                Task.id > last_seen_task_id,
+            )
+            .order_by(Task.id)
+            .limit(page_size)
+            .all()
+        ]
+    finally:
+        page_db.close()
+
+
+def _record_settled_bindings_sync(
+    *,
+    settled: list[tuple[int, tuple[str, ...]]],
+) -> None:
+    """Persist the post-cleanup binding record for each task on a page.
+
+    This is the DB-visible marker that provider state was released. It makes a
+    partially-completed multi-page user deletion honest: tasks whose providers
+    already released are no longer bound to them, so retrying the deletion does
+    not re-dispatch cleanup for state that is already gone.
+    """
+
+    if not settled:
+        return
+    session_factory = get_session_local()
+    record_db = session_factory()
+    try:
+        for task_id, remaining in settled:
+            store_task_extension_bindings(
+                record_db,
+                task_id=task_id,
+                extensions=remaining,
+            )
+        record_db.commit()
+    except Exception:
+        record_db.rollback()
+        # A lost marker only costs an idempotent re-dispatch on retry; it must
+        # not mask the provider failure the caller is about to report.
+        logger.exception("Failed to persist runtime extension binding markers")
+    finally:
+        record_db.close()
+
+
+def _delete_user_rows_sync(*, user_id: int) -> bool:
+    """Delete one user and every row it owns in an operation-local session."""
+
+    from ..models.mcp import UserMCPServer
+
+    session_factory = get_session_local()
+    delete_db = session_factory()
+    try:
+        user = delete_db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            return False
+
+        # Existing deployments may still have the removed Text2SQL table. Clean
+        # it up by table name so user deletion keeps working under strict FKs.
+        _delete_legacy_text2sql_rows(delete_db, user_id)
+        _purge_user_task_rows(delete_db, user_id=user_id)
+
+        # Delete user's MCP server associations (not the servers themselves)
+        delete_db.query(UserMCPServer).filter(UserMCPServer.user_id == user_id).delete()
+
+        # Delete the user (UserModel and UserDefaultModel have cascade delete)
+        delete_db.delete(user)
+        delete_db.commit()
+        ModelStore(delete_db).invalidate_after_user_delete()
+        return True
+    except Exception:
+        delete_db.rollback()
+        raise
+    finally:
+        delete_db.close()
 
 
 @router.get("", response_model=UserListResponse)
@@ -89,22 +261,105 @@ async def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Delete related data in correct order to respect foreign key constraints
-    from ..models.mcp import UserMCPServer
+    if registered_task_extensions():
+        session_factory = get_session_local()
+        cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
 
-    # Existing deployments may still have the removed Text2SQL table. Clean it
-    # up by table name so user deletion keeps working under strict FK checks.
-    _delete_legacy_text2sql_rows(db, user_id)
+        async def _cleanup_context(
+            context: TaskRuntimeContext,
+            bound_extensions: tuple[str, ...],
+        ) -> tuple[str, ...]:
+            async with cleanup_semaphore:
+                return await delete_task_extensions(
+                    context,
+                    bound_extensions=bound_extensions,
+                )
 
-    # Delete user's tasks
-    db.query(Task).filter(Task.user_id == user_id).delete()
+        # Keyset pages bound memory and gather fan-out without growing a NOT IN
+        # parameter list. New tasks receive higher ids and are picked up by the
+        # next page after provider cleanup awaits external systems.
+        last_seen_task_id = 0
+        while True:
+            release_db_connection_if_clean(db)
+            task_rows = await asyncio.to_thread(
+                _load_task_page_sync,
+                user_id=user_id,
+                last_seen_task_id=last_seen_task_id,
+                page_size=_TASK_RUNTIME_DELETE_PAGE_SIZE,
+            )
+            if not task_rows:
+                break
+            last_seen_task_id = max(int(row[0]) for row in task_rows)
+            page = [
+                (
+                    TaskRuntimeContext(
+                        task_id=int(task_id),
+                        user_id=int(task_user_id),
+                        source=str(source) if source is not None else None,
+                        session_factory=session_factory,
+                    ),
+                    task_extension_bindings_from_agent_config(agent_config),
+                )
+                for task_id, task_user_id, source, agent_config in task_rows
+            ]
+            # Tasks with no binding record own nothing in any provider; skip
+            # them entirely so a broken extension cannot block the account.
+            bound_page = [(context, bindings) for context, bindings in page if bindings]
+            if not bound_page:
+                continue
+            release_db_connection_if_clean(db)
+            cleanup_results = await asyncio.gather(
+                *(
+                    _cleanup_context(context, bindings)
+                    for context, bindings in bound_page
+                ),
+                return_exceptions=True,
+            )
+            for result in cleanup_results:
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
 
-    # Delete user's MCP server associations (not the servers themselves)
-    db.query(UserMCPServer).filter(UserMCPServer.user_id == user_id).delete()
+            # Narrow every task's binding record to what is still held before
+            # deciding whether to abort. Without this, a failure on a later page
+            # would leave earlier pages' tasks with released provider bindings,
+            # no DB-visible marker, and a retry that re-dispatches them.
+            settled: list[tuple[int, tuple[str, ...]]] = []
+            cleanup_failures: list[tuple[int, BaseException]] = []
+            for (context, bindings), result in zip(
+                bound_page, cleanup_results, strict=True
+            ):
+                if isinstance(result, TaskRuntimeExtensionError):
+                    settled.append((context.task_id, result.unreleased_extensions))
+                    cleanup_failures.append((context.task_id, result))
+                elif isinstance(result, BaseException):
+                    # Unknown failure: assume nothing was released.
+                    cleanup_failures.append((context.task_id, result))
+                else:
+                    settled.append((context.task_id, tuple(result)))
+            await asyncio.to_thread(_record_settled_bindings_sync, settled=settled)
 
-    # Delete the user (UserModel and UserDefaultModel have cascade delete)
-    db.delete(user)
-    db.commit()
-    ModelStore(db).invalidate_after_user_delete()
+            if cleanup_failures:
+                for failed_task_id, failure in cleanup_failures:
+                    logger.error(
+                        "Runtime extension cleanup failed; preserving user %s "
+                        "and task %s for retry: %s",
+                        user_id,
+                        failed_task_id,
+                        failure,
+                    )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Runtime extension cleanup failed; the user was not deleted"
+                    ),
+                )
+
+    # The rest of user deletion is synchronous ORM/DBAPI work whose cost scales
+    # with the user's task count. Run it in a worker thread and in its own
+    # session so an admin deleting a large account cannot stall the event loop.
+    release_db_connection_if_clean(db)
+    deleted = await asyncio.to_thread(_delete_user_rows_sync, user_id=user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")
 
     return {"message": "User deleted successfully"}

@@ -32,6 +32,10 @@ interface TaskConversationPanelProps {
   showTokenUsage?: boolean
   showDagPreview?: boolean
   showTaskFiles?: boolean
+  // Renders the execution trace (reasoning, tool arguments, tool output) above
+  // each answer. Off for the embedded widget, where a visitor should see the
+  // answer and a status line, not the run; share links keep it on.
+  showProcessView?: boolean
   hideFileUpload?: boolean
   hideConfig?: boolean
   compactInput?: boolean
@@ -181,6 +185,7 @@ export function TaskConversationPanel({
   showTokenUsage = mode === "page",
   showDagPreview = mode === "page",
   showTaskFiles = mode === "page",
+  showProcessView = true,
   hideFileUpload = false,
   hideConfig = mode === "embedded-preview",
   compactInput = false,
@@ -714,8 +719,13 @@ export function TaskConversationPanel({
                     if (item.isSystemNotice) {
                       return <CompactionNotice key={item.id} text={item.content as string} />
                     }
-                    const isFailedFinalAnswerStream =
-                      item.isStreamingFinalAnswer && item.status === "failed"
+                    // A failed final-answer stream always renders as failed; a
+                    // verbatim terminal reason (#893) only needs the flag when
+                    // the trace is hidden, so its raw text gets the generic
+                    // replacement in ChatMessage.
+                    const isFailedResultMessage =
+                      item.status === "failed" &&
+                      (item.isStreamingFinalAnswer || !showProcessView)
                     return (
                       <ChatMessage
                         key={item.id}
@@ -723,10 +733,10 @@ export function TaskConversationPanel({
                         content={item.content}
                         rawContent={item.rawContent}
                         traceEvents={item.traceEvents as any || []}
-                        showProcessView={true}
+                        showProcessView={showProcessView}
                         processStatus={item.processStatus}
                         taskStatus={
-                          isFailedFinalAnswerStream
+                          isFailedResultMessage
                             ? "failed"
                             : item.showEmptyStatus
                               ? item.status
@@ -747,7 +757,7 @@ export function TaskConversationPanel({
                       role="assistant"
                       content={state.currentTask?.status === "waiting_for_user" ? waitingPrompt : null}
                       traceEvents={currentTurnTraceEvents as any || []}
-                      showProcessView={true}
+                      showProcessView={showProcessView}
                       isVirtual
                       processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}

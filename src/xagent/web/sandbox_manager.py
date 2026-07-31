@@ -5,16 +5,19 @@ Sandbox management in application layer.
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from ..config import (
+    SANDBOX_VOLUMES,
     get_boxlite_home_dir,
+    get_external_upload_dirs,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_host_storage_root,
@@ -33,12 +36,34 @@ from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
 )
 from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
-from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
+from ..sandbox.base import (
+    ResolvedSandboxRuntimeSpec,
+    Sandbox,
+    SandboxAlreadyExistsError,
+    SandboxConfig,
+    SandboxContractError,
+    SandboxInfo,
+    SandboxInspection,
+    SandboxMountIntent,
+    SandboxNotFoundError,
+    SandboxRecoveryRequiredError,
+    SandboxRuntimeConflictError,
+    SandboxTemplate,
+    SpecVerdict,
+    canonical_sandbox_path,
+    spec_matches_inspection,
+)
 from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
 
 logger = logging.getLogger(__name__)
 
 _WORKER_LIFECYCLE_MARKER = "::worker::"
+
+# Bound on the graceful-stop wait for a sandbox container the manager itself
+# stops (mismatch rebuild, quiesce): the same seconds budget for both call
+# sites, rather than each falling back to the backend's own (backend-specific,
+# potentially unbounded) default.
+_SANDBOX_STOP_TIMEOUT_SECONDS = 30
 
 
 class SandboxCapacityError(RuntimeError):
@@ -125,13 +150,13 @@ class SandboxLeaseProvider:
         lifecycle_type: str,
         lifecycle_id: str,
         primary_sandbox: Sandbox,
-        workspace_config: Mapping[str, Any] | None,
+        mount_intent: SandboxMountIntent | None,
         max_concurrency: int,
     ) -> None:
         self._manager = manager
         self._lifecycle_type = lifecycle_type
         self._lifecycle_id = lifecycle_id
-        self._workspace_config = workspace_config
+        self._mount_intent = mount_intent
         self._available_slots: asyncio.Queue[int] = asyncio.Queue()
         self._worker_locks: dict[int, asyncio.Lock] = {}
         self._workers: dict[int, Sandbox] = {}
@@ -154,12 +179,21 @@ class SandboxLeaseProvider:
     async def get_worker_sandbox(self, slot: int) -> Sandbox:
         """Get or lazily create a worker sandbox for a slot.
 
-        When the container cap leaves no room for a worker, the lease
+        The worker's desired spec is derived from the same ``mount_intent``
+        the primary sandbox was built from (same physical mount set, a
+        different name) — routed through the manager's per-lifecycle-key
+        gate (``get_or_create_sandbox``), the same gate provider creation and
+        release-to-zero use, so a worker can never be created while its
+        primary is mid-release or mid-reconcile.
+
+        When the container cap leaves no room for a worker, or the worker's
+        own reconciliation is rejected (e.g. a same-key runtime-config
+        conflict, or a sandbox that needs recovery before use), the lease
         degrades to the primary sandbox instead of failing the tool
         mid-task — the same sharing semantics non-concurrency-safe leases
         already have, trading isolation for availability. The degraded
         result is not cached, so a later lease retries worker creation
-        once capacity frees up.
+        once the underlying condition clears.
         """
         if slot in self._workers:
             return self._workers[slot]
@@ -171,18 +205,24 @@ class SandboxLeaseProvider:
             if slot in self._workers:
                 return self._workers[slot]
             try:
+                # Resolved through the manager's locked entry point, not the
+                # unlocked resolver: it takes this worker's *primary*
+                # lifecycle gate -- the same lock provider creation and
+                # release-to-zero use -- so a worker cannot be created
+                # while its primary is mid-release or mid-reconcile.
                 worker = await self._manager.get_or_create_sandbox(
                     self._lifecycle_type,
                     f"{self._lifecycle_id}::worker::{slot}",
-                    workspace_config=self._workspace_config,
+                    mount_intent=self._mount_intent,
                 )
-            except SandboxCapacityError as exc:
+            except (SandboxCapacityError, SandboxContractError) as exc:
                 logger.warning(
-                    "No capacity for worker sandbox %s::%s::worker::%d; "
+                    "Worker sandbox %s::%s::worker::%d unavailable (%s); "
                     "degrading to the primary sandbox: %s",
                     self._lifecycle_type,
                     self._lifecycle_id,
                     slot,
+                    type(exc).__name__,
                     exc,
                 )
                 return self.primary_sandbox
@@ -196,6 +236,42 @@ class SandboxLeaseProvider:
             self._lifecycle_id,
         )
         self._workers.clear()
+
+
+def absolute_backend_mount_path(path: str | Path) -> Path:
+    """Absolutize one backend-domain path: env vars, then ``~``, then cwd.
+
+    The backend domain is this process's own filesystem; translation to the
+    machine actually running the container backend happens afterwards, in
+    ``SandboxPathMapper``. The configuration values that reach it
+    (``XAGENT_UPLOADS_DIR``, ``XAGENT_EXTERNAL_UPLOAD_DIRS``) are raw strings
+    and may be relative or ``~``-prefixed, while every downstream mount
+    consumer -- the volume tuples and ``SandboxMountIntent``'s lexical
+    classification alike -- requires an absolute path. Every producer of a
+    backend-domain mount path goes through this one function so a relative
+    spelling resolves to the same directory everywhere.
+    """
+    backend_path = Path(os.path.expandvars(str(path))).expanduser()
+    if not backend_path.is_absolute():
+        backend_path = Path.cwd() / backend_path
+    return backend_path
+
+
+def resolve_backend_mount_path(path: str | Path) -> str:
+    """Absolutize a backend-domain path and resolve its symlinks.
+
+    ``SandboxMountIntent``'s covered/covering/disjoint split is purely
+    lexical, so it cannot tell a directory that is lexically inside a mount
+    root from a symlink at that same lexical position pointing somewhere
+    else entirely. Only the second one is *not* exposed by the root's bind,
+    so folding decisions must be taken against resolved paths -- this is the
+    resolver that answers that question.
+
+    The paths that end up mounted deliberately keep their unresolved
+    spelling: the guest mount point has to stay the path the rest of the
+    system (file tools, the workspace allowlist) already refers to.
+    """
+    return os.path.realpath(absolute_backend_mount_path(path))
 
 
 class SandboxPathMapper:
@@ -227,10 +303,7 @@ class SandboxPathMapper:
 
     @staticmethod
     def _as_backend_path(path: str | Path) -> Path:
-        backend_path = Path(os.path.expandvars(str(path))).expanduser()
-        if not backend_path.is_absolute():
-            backend_path = Path.cwd() / backend_path
-        return backend_path
+        return absolute_backend_mount_path(path)
 
     def _relative_to_backend_storage(self, backend_path: Path) -> Path | None:
         try:
@@ -271,7 +344,43 @@ class SandboxPathMapper:
 class SandboxManager:
     """Manages sandbox instances, their activity state, and reclamation.
 
-    Concurrency model — the invariants every change must preserve:
+    Primitives (what each dict/lock is the single source of truth for):
+
+    - ``_cache`` / ``_config_cache``: the live ``Sandbox`` instance and the
+      ``ResolvedSandboxRuntimeSpec`` it was built from, per exact sandbox
+      name (primary or worker). Always written and popped together. A
+      ``_config_cache`` hit for a name is the first gate any route (legacy
+      or reconciliation) must pass: a mismatching freshly-desired spec is a
+      loud ``SandboxRuntimeConflictError``, never a silent adoption.
+    - ``_lease_providers``: the cached ``SandboxLeaseProvider``, per primary
+      (base) lifecycle name only — never per worker name.
+    - ``_activity``: ref-count + last-activity, per base lifecycle name.
+      The single source of truth reclamation decisions are made from.
+    - ``_reconcile_budget``: remaining mismatch-triggered rebuilds, per base
+      lifecycle name. Only the reconciliation route's mismatch branch
+      consumes it (never the absent-\\>create branch, and never the delete
+      *inside* a mismatch rebuild — see ``_reconcile_delete`` — since that
+      would erase the decrement this same rebuild just made); ``cleanup()``
+      resets it wholesale, and ``_delete_sandbox_names`` drops the one entry
+      for a base name once its delete for that name has actually succeeded
+      — a still-live container (delete failed) keeps its exhausted budget,
+      so a later occupant of the key only starts with a fresh budget once
+      the earlier container is confirmed gone. A worker-only disposal
+      (``delete_worker_sandboxes`` / release-to-zero) never touches it: the
+      primary the budget is scoped to is still live.
+    - ``_locks`` / ``_locks_guard``: per-exact-name creation lock used only
+      by the legacy (non-reconciling) backend route — see
+      ``_legacy_get_or_create``. The reconciliation route never inserts
+      into this dict: its own per-key exclusion is ``_lifecycle_locked``.
+    - ``_lifecycle_locks``: per-base-name lock with waiter tracking. The
+      single per-key gate every route now funnels through — provider
+      creation, release-to-zero, worker creation, and (for the
+      reconciling backend) the entire inspect-then-act reconciliation
+      sequence. Entries are garbage-collected when the last holder/waiter
+      leaves.
+    - ``_capacity_gate`` (global): serializes the cap check + eviction +
+      container creation so concurrent creations for different names cannot
+      all pass the count check.
 
     Synchronization primitives, from innermost to outermost:
 
@@ -284,32 +393,85 @@ class SandboxManager:
       (a cancellation delivered at that await point would skip the cleanup).
       Independent single dict operations do NOT need it.
     - ``_lifecycle_locks`` (per lifecycle key, waiter-counted): serialize
-      lease provider creation with release-to-zero worker cleanup and with
+      lease provider creation, worker creation, release-to-zero worker
+      cleanup, and (reconciling backend) the full reconcile sequence, with
       the idle sweep, per key. Entries are garbage-collected when the last
       holder/waiter leaves.
     - ``_locks`` + ``_locks_guard`` (per sandbox name): serialize container
-      creation per name inside ``get_or_create_sandbox``.
-    - ``_capacity_gate`` (global): serializes the cap check + eviction +
-      container creation so concurrent creations for different names cannot
-      all pass the count check.
+      creation per name inside the legacy route only.
+    - ``_capacity_gate`` (global): see above.
 
     Ordering rules:
 
-    - lifecycle lock -> per-name lock -> capacity gate is the only nesting
-      direction; never acquire a lifecycle lock while holding the gate
-      (a same-key creator holds its lifecycle lock while waiting for the
-      gate, so gate -> lifecycle closes a deadlock cycle). Capacity
-      eviction therefore does NOT lock the victim's lifecycle: it relies on
-      the gate plus the atomic claim purging the instance cache, which
-      forces any concurrent same-key re-creation to cache-miss and queue
-      behind the gate until the deletion finished.
+    - lifecycle lock -> (legacy route: per-name lock) -> capacity gate is
+      the only nesting direction; never acquire a lifecycle lock while
+      holding the gate (a same-key creator holds its lifecycle lock while
+      waiting for the gate, so gate -> lifecycle closes a deadlock cycle).
+      Capacity eviction therefore does NOT lock the victim's lifecycle: it
+      relies on the gate plus the atomic claim purging the instance cache,
+      which forces any concurrent same-key re-creation to cache-miss and
+      queue behind the gate until the deletion finished, AND on
+      ``_pick_eviction_victim`` skipping any base name whose lifecycle lock
+      is currently held or awaited — which is what keeps a reconciliation
+      in progress for key X safe from being picked as an eviction victim by
+      an unrelated key Y's capacity check.
+
+    Destruction paths and what each one pops (identity-only ABA depends on
+    every destructive path using this same pop set for ``_lease_providers``
+    — a fresh object always replaces the old one, never a mutation):
+
+    - ``_delete_sandbox_names`` (explicit ``delete_sandbox`` /
+      ``delete_worker_sandboxes`` / sweep / capacity eviction): pops
+      ``_cache``, ``_config_cache``, ``_locks``, ``_lease_providers``,
+      ``_activity`` for every name whose backend delete was attempted
+      (even on failure — the instance may be in an unknown state), and
+      additionally ``_reconcile_budget`` for a name that is itself a base
+      (primary) name, but ONLY once that name's own delete succeeded — a
+      failed delete leaves the budget exhausted, since the same
+      mismatching container is still there. Never popped for a
+      worker-only ``delete_worker_sandboxes`` call, where the primary the
+      budget is scoped to is untouched regardless of outcome.
+    - ``_claim_idle_sandbox`` (idle sweep / capacity eviction, ahead of the
+      ``_delete_sandbox_names`` call that follows): pops the primary's and
+      its workers' ``_cache``/``_config_cache`` entries plus
+      ``_lease_providers``. It does not touch ``_reconcile_budget`` — the
+      physical delete has not run yet at this point, so whether the
+      container is actually gone is still unknown; that decision belongs
+      to ``_delete_sandbox_names`` above.
+    - ``release`` (ref-count reaches zero): pops ``_lease_providers`` only
+      (under ``_lifecycle_locked`` + ``_activity_guard``), then deletes
+      worker sandboxes (which pops their ``_cache``/``_config_cache``
+      through the path above). The primary's own ``_cache``/
+      ``_config_cache``/``_activity``/``_reconcile_budget`` entries are
+      deliberately left alone — the primary container itself is not deleted
+      on release, only its provider and workers.
+    - ``_reconcile_delete`` (mismatch rebuild, reconciliation route only):
+      pops ``_cache``, ``_config_cache``, ``_lease_providers``,
+      ``_activity`` for the one name being rebuilt — never ``_locks``
+      (the reconciliation route never inserts into it in the first place)
+      and never ``_reconcile_budget``: this delete is immediately followed,
+      in the same call, by ``_reconcile_create`` re-populating the same
+      name, so popping the budget here would erase the very decrement
+      ``_reconcile_mismatch`` just made and let the same base name rebuild
+      without limit.
+    - ``cleanup()`` (both routes): clears ``_cache``, ``_config_cache``,
+      ``_lease_providers``, ``_activity`` wholesale; the reconciling
+      route's ``_quiesce`` additionally clears ``_reconcile_budget``
+      (the only place that dict is ever reset) and never deletes
+      containers (only stops running ones); the legacy route's
+      ``_legacy_cleanup`` also clears ``_locks`` and may delete containers
+      whose config has drifted (see its own docstring).
 
     Safety contract:
 
     - A lifecycle with a non-zero ref-count is never deleted, stopped, or
-      evicted — by the sweep, by capacity eviction, or by any race between
-      them. Both reclamation paths go through ``_evict_idle_sandbox``,
-      whose claim re-validates the ref-count under ``_activity_guard``.
+      evicted — by the sweep, by capacity eviction, by the reconciliation
+      matrix's mismatch handling, or by any race between them. The idle
+      sweep and capacity eviction go through ``_evict_idle_sandbox``, whose
+      claim re-validates the ref-count under ``_activity_guard``; the
+      reconciliation matrix's mismatch branch re-checks the same
+      ``_activity`` ref-count before ever calling ``stop_existing`` or
+      deleting, and rejects the new caller instead when it is non-zero.
     """
 
     def __init__(self, service: SandboxService):
@@ -321,7 +483,7 @@ class SandboxManager:
         """
         self._service: SandboxService = service
         self._cache: dict[str, Sandbox] = {}
-        self._config_cache: dict[str, SandboxConfig] = {}
+        self._config_cache: dict[str, ResolvedSandboxRuntimeSpec] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
         # Activity tracking: lease providers, active-task ref-counts, and
@@ -336,6 +498,16 @@ class SandboxManager:
         # per-name locks cannot stop two concurrent creations for different
         # names from both passing the count check.
         self._capacity_gate = asyncio.Lock()
+        # Remaining mismatch-triggered rebuilds per base lifecycle name (the
+        # reconciliation route only). See the class docstring's destruction
+        # matrix for exactly which paths do (and do not) touch this.
+        self._reconcile_budget: dict[str, int] = {}
+        # Cached result of ``await service.supports_runtime_spec()``: None
+        # until the first caller resolves it (see ``_resolve_backend_probe``).
+        # The app-startup readiness step resolves this eagerly in a later
+        # stage; every entry point here resolves it lazily on first use so
+        # this manager is correct with or without that wiring.
+        self._backend_probe: bool | None = None
 
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
@@ -414,6 +586,25 @@ class SandboxManager:
         if self._lifecycle_locks.get(base_name) is entry:
             self._lifecycle_locks.pop(base_name, None)
 
+    def _assert_lifecycle_locked(self, base_name: str) -> None:
+        """Assert the caller already holds ``_lifecycle_locked(base_name)``.
+
+        Mirrors ``DockerSandboxService._get_live_control``'s pattern: this
+        can only check that *some* task holds the lock right now, not that
+        it is the caller (``asyncio.Lock`` has no owner concept), so it is a
+        guard against the lock not being held at all, not a full runtime
+        proof. The structural half of this contract — that
+        ``_get_or_create_sandbox_locked`` and ``_create_lease_provider_locked``
+        are themselves only ever called from inside a ``_lifecycle_locked``
+        block — is pinned at the source level by
+        ``test_sandbox_manager_reconcile.py``'s
+        ``test_gate_helper_call_sites_are_structurally_pinned``.
+        """
+        entry = self._lifecycle_locks.get(base_name)
+        assert entry is not None and entry.lock.locked(), (
+            f"called without holding _lifecycle_locked({base_name!r})"
+        )
+
     def _touch_locked(self, base_name: str) -> _SandboxActivity:
         """Bump last-activity for a key; caller must hold ``_activity_guard``."""
         activity = self._activity.get(base_name)
@@ -433,6 +624,39 @@ class SandboxManager:
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._activity_guard:
             if base_name not in self._lease_providers:
+                return False
+            self._touch_locked(base_name).ref_count += 1
+        return True
+
+    async def attach_provider(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        provider: SandboxLeaseProvider,
+    ) -> bool:
+        """Attach one active task to a *specific* provider object (ABA-safe).
+
+        Unlike ``attach()`` (existence-only: does the key have *a* cached
+        provider), this additionally verifies the caller's ``provider`` is
+        identically the object currently cached for this lifecycle key.
+        Identity, not equality, is the guard: every path that replaces a
+        provider (mismatch rebuild, sweep, capacity eviction,
+        release-to-zero) always installs a genuinely new object rather than
+        mutating the old one in place, so a stale handle obtained before
+        such a replacement is caught here even though the *key* still
+        resolves to a live (different) provider. No integer generation
+        counter is needed: object identity already encodes "did this
+        exact handle survive the last replacement".
+
+        Returns False when the caller's handle is stale or nothing is
+        cached; the caller must treat that exactly like ``attach()``
+        returning False — evict its own cache and rebuild — rather than
+        proceeding with a provider that may already be torn down.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._activity_guard:
+            current = self._lease_providers.get(base_name)
+            if current is None or current is not provider:
                 return False
             self._touch_locked(base_name).ref_count += 1
         return True
@@ -542,24 +766,22 @@ class SandboxManager:
     def _workspace_mount_paths(
         lifecycle_type: str,
         lifecycle_id: str,
-        workspace_config: Mapping[str, Any] | None,
+        mount_intent: SandboxMountIntent | None,
     ) -> list[tuple[Path, bool]]:
         paths: list[tuple[Path, bool]] = []
 
-        if workspace_config:
-            base_dir = workspace_config.get("base_dir")
-            if base_dir:
-                paths.append((Path(str(base_dir)), True))
-
-            for raw_dir in workspace_config.get("allowed_external_dirs") or []:
-                paths.append((Path(str(raw_dir)), False))
+        if mount_intent is not None:
+            if mount_intent.mount_root:
+                paths.append((Path(mount_intent.mount_root), True))
+            for extra in mount_intent.extra_mounts:
+                paths.append((Path(extra), False))
         elif lifecycle_type == USER_LIFECYCLE_TYPE:
             owner_lifecycle_id = SandboxManager._base_lifecycle_id(lifecycle_id)
             # A scope-suffixed lifecycle id ("7:tenant-a") still mounts the
             # user-level upload dir: the scope suffix namespaces the
             # container, not this default mount (scope-local dirs come from
-            # workspace_config). Unparsable ids keep the historical
-            # verbatim-path behavior.
+            # mount_intent). Unparsable ids keep the historical verbatim-path
+            # behavior.
             try:
                 owner_id, _suffix = parse_user_lifecycle_id(owner_lifecycle_id)
                 mount_root = scoped_user_root(get_uploads_dir(), owner_id)
@@ -571,57 +793,154 @@ class SandboxManager:
 
         return paths
 
+    def _prepare_workspace_mounts(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None = None,
+    ) -> None:
+        """Create on-host directories for a sandbox's workspace mount paths.
+
+        The mount root is always created; each extra/allowlist mount is
+        created only if it already exists (never freshly created) — same
+        split as the historical base_dir(True)/allowed_external_dirs(False)
+        behavior. Called explicitly right before a creation attempt (never
+        on a cache hit or a plain reuse/start_existing), independent of
+        spec/volume-list construction: this is not a side effect threaded
+        through volume-list building.
+
+        ``prepare_root``, when given, overrides *only* the mount root's
+        creation target (see ``ChatWorkspaceBinding.prepare_root``): folding
+        can re-root ``mount_intent.mount_root`` onto a covering ancestor
+        shared by several scopes, but this task's own files live at the
+        deeper, pre-fold ``prepare_root`` — that is the directory that must
+        exist on disk, not necessarily the (possibly shallower) directory
+        actually bind-mounted. Extra/allowlist mounts are unaffected.
+        """
+        for backend_path, should_create in self._workspace_mount_paths(
+            lifecycle_type, lifecycle_id, mount_intent
+        ):
+            target = backend_path
+            if (
+                should_create
+                and prepare_root is not None
+                and mount_intent is not None
+                # Identifies the mount-root entry (there is at most one) so
+                # ``prepare_root`` only redirects that path, never an
+                # extra/allowlist mount. ``backend_path`` here is exactly
+                # ``Path(mount_intent.mount_root)`` (see
+                # ``_workspace_mount_paths``), so this comparison reduces to
+                # ``str(Path(c)) == c`` for ``c = mount_intent.mount_root``.
+                # That holds because ``mount_intent.mount_root`` always
+                # passed through ``canonical_sandbox_path``, which is a
+                # fixed point of ``Path``: ``str(Path(canonical_sandbox_path(
+                # x))) == canonical_sandbox_path(x)`` — not because its
+                # normalization is a subset of ``Path``'s own (it is not:
+                # e.g. ``canonical_sandbox_path("/a/b/..") == "/a"`` while
+                # ``str(Path("/a/b/.."))`` leaves the ``..`` unresolved). If
+                # the normalizer ever stops being idempotent under ``Path``,
+                # this comparison can start missing the mount root.
+                and str(backend_path) == mount_intent.mount_root
+            ):
+                target = Path(prepare_root)
+            try:
+                if should_create or target.exists():
+                    os.makedirs(target, exist_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to prepare sandbox workspace mount %s: %s",
+                    target,
+                    exc,
+                )
+
     @staticmethod
-    def _config_equivalent(left: SandboxConfig, right: SandboxConfig) -> bool:
-        return (
-            left.cpus == right.cpus
-            and left.memory == right.memory
-            and (left.env or {}) == (right.env or {})
-            and set(left.volumes or []) == set(right.volumes or [])
-        )
+    def _config_equivalent(
+        left: ResolvedSandboxRuntimeSpec, right: ResolvedSandboxRuntimeSpec
+    ) -> bool:
+        return left == right
 
     @staticmethod
     def _ensure_config_equivalent(
         sandbox_name: str,
-        cached_config: SandboxConfig | None,
-        desired_config: SandboxConfig,
+        cached_spec: ResolvedSandboxRuntimeSpec | None,
+        desired_spec: ResolvedSandboxRuntimeSpec,
     ) -> None:
-        if cached_config is None:
+        if cached_spec is None:
             return
-        if SandboxManager._config_equivalent(cached_config, desired_config):
+        if SandboxManager._config_equivalent(cached_spec, desired_spec):
             return
-        raise RuntimeError(
+        raise SandboxRuntimeConflictError(
             f"Sandbox {sandbox_name!r} already exists with different runtime "
             "configuration. Use a distinct lifecycle id for different workspace "
             "mounts."
         )
 
-    def _build_sandbox_config(
+    @staticmethod
+    def _spec_from_stored_info(info: SandboxInfo) -> ResolvedSandboxRuntimeSpec:
+        """Rebuild the desired spec a backend store record represents.
+
+        Used only for the UNVERIFIED-with-a-store-row branch: since a live
+        container's environment cannot be reliably reconstructed from
+        inspection facts alone (see ``ObservedRuntimeFacts``), the
+        previously-recorded intent is compared against instead — blind to
+        drift in the actual running container, but the best available
+        signal for a container with no fingerprint attestation.
+        """
+        return ResolvedSandboxRuntimeSpec.from_parts(
+            template_type=info.template.type or "image",
+            image=info.template.image,
+            snapshot_id=info.template.snapshot_id,
+            working_dir=info.config.working_dir,
+            cpus=info.config.cpus,
+            memory=info.config.memory,
+            env=info.config.env,
+            volumes=info.config.volumes,
+            network_isolated=bool(info.config.network_isolated),
+            ports=info.config.ports,
+        )
+
+    def _build_runtime_spec(
         self,
         lifecycle_type: str,
         lifecycle_id: str,
         *,
-        ensure_dir: bool,
-        workspace_config: Mapping[str, Any] | None = None,
-    ) -> tuple[str, SandboxConfig]:
+        mount_intent: SandboxMountIntent | None = None,
+    ) -> ResolvedSandboxRuntimeSpec:
+        """Build the single canonical desired-state spec for one sandbox name.
+
+        The sole normalizer from environment config + code mounts + intent
+        mounts to ``ResolvedSandboxRuntimeSpec``: both the legacy and the
+        reconciliation routes compare against this same spec via the
+        process-local ``_config_cache``, and the reconciliation route also
+        hands it straight to ``service.create()`` / ``spec_matches_inspection()``.
+        Pure — no directory creation or other side effects; see
+        ``_prepare_workspace_mounts`` for that.
+        """
         image, config = self._get_sandbox_image_and_config()
-        config_volumes = list(config.volumes) if config.volumes else []
-        default_volumes = self._make_default_volumes(
-            lifecycle_type,
-            lifecycle_id,
-            ensure_dir=ensure_dir,
-            workspace_config=workspace_config,
+        volumes = list(config.volumes) if config.volumes else []
+        volumes += self._make_default_volumes(
+            lifecycle_type, lifecycle_id, mount_intent=mount_intent
         )
-        config.volumes = config_volumes + default_volumes
-        return image, config
+        return ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image",
+            image=image,
+            working_dir=config.working_dir,
+            cpus=config.cpus,
+            memory=config.memory,
+            env=config.env,
+            volumes=volumes,
+            network_isolated=bool(config.network_isolated),
+            ports=config.ports,
+        )
 
     def _make_default_volumes(
         self,
         lifecycle_type: str,
         lifecycle_id: str,
         *,
-        ensure_dir: bool,
-        workspace_config: Mapping[str, Any] | None = None,
+        mount_intent: SandboxMountIntent | None = None,
     ) -> list[tuple[str, str, str]]:
         """
         Build default volume mounts.
@@ -632,102 +951,191 @@ class SandboxManager:
         Args:
             lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
-            ensure_dir: When True, create the host directory
-            workspace_config: Actual tool workspace configuration, when known
+            mount_intent: Actual sandbox mount intent, when known
         """
         # Code mounts are always present (at least src/)
         volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
         path_mapper = SandboxPathMapper.from_env()
 
-        # Mount actual workspace roots as read-write.
-        for backend_path, should_create in self._workspace_mount_paths(
+        for backend_path, _should_create in self._workspace_mount_paths(
             lifecycle_type,
             lifecycle_id,
-            workspace_config,
+            mount_intent,
         ):
-            if ensure_dir:
-                try:
-                    if should_create or backend_path.exists():
-                        os.makedirs(backend_path, exist_ok=True)
-                except OSError as exc:
-                    logger.warning(
-                        "Failed to prepare sandbox workspace mount %s: %s",
-                        backend_path,
-                        exc,
-                    )
-
             self._append_unique_volume(
                 volumes, path_mapper.volume_for_backend_path(backend_path, "rw")
             )
 
         return volumes
 
+    async def _resolve_backend_probe(self) -> bool:
+        """Resolve and cache ``await service.supports_runtime_spec()``.
+
+        Resolved once per manager instance. App startup resolves this
+        eagerly during the readiness step in a later stage; every entry
+        point below resolves it lazily on first use so this manager behaves
+        correctly with or without that wiring (tests included).
+        """
+        if self._backend_probe is None:
+            self._backend_probe = await self._service.supports_runtime_spec()
+        return self._backend_probe
+
+    # --- Primary/worker sandbox resolution ---
+    #
+    # Entry points, all funneling through ``_lifecycle_locked(base_name)``
+    # exactly once before reaching the unlocked internal resolver:
+    # ``get_or_create_sandbox`` (one exact name, primary or worker: the
+    # lease provider's worker path uses it, and it is otherwise a test seam)
+    # and ``get_or_create_lease_provider`` (the production entry point).
+
     async def get_or_create_sandbox(
         self,
         lifecycle_type: str,
         lifecycle_id: str,
         *,
-        workspace_config: Mapping[str, Any] | None = None,
+        mount_intent: SandboxMountIntent | None = None,
     ) -> Sandbox:
-        """
-        Get or create a sandbox.
+        """Get or create the sandbox for one exact lifecycle name.
 
-        Args:
-            lifecycle_type: e.g. task|user
-            lifecycle_id: e.g. task_id|user_id
-            workspace_config: Actual tool workspace configuration to mount
-
-        Returns:
-            Sandbox instance
+        Acquires this name's per-key gate (shared with provider creation,
+        worker creation, and release-to-zero) and delegates to the unlocked
+        internal resolver. Direct callers of this method do not get a
+        ``SandboxLeaseProvider`` — most production code goes through
+        ``get_or_create_lease_provider`` instead, which additionally caches
+        the provider object itself.
         """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._lifecycle_locked(base_name):
+            async with self._activity_guard:
+                self._touch_locked(base_name)
+            return await self._get_or_create_sandbox_locked(
+                lifecycle_type, lifecycle_id, mount_intent=mount_intent
+            )
+
+    async def _get_or_create_sandbox_locked(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
+    ) -> Sandbox:
+        """Resolve (create/reuse/recover) the sandbox for one exact name.
+
+        Callers must already hold ``_lifecycle_locked(base_name)`` for this
+        name's lifecycle base — this function takes no lock of its own.
+        This used to be the public ``get_or_create_sandbox`` body,
+        independently locked per exact name via ``_locks``; every caller
+        now already holds the broader per-key gate, and the reconciliation
+        route below additionally needs that same gate held across its
+        inspect-then-act sequence, which a second, narrower lock could not
+        provide on its own.
+
+        First gate, common to both routes: an in-process spec-cache hit for
+        this exact name must match the freshly-desired spec exactly, or the
+        new caller is rejected outright with ``SandboxRuntimeConflictError``
+        — regardless of which route (legacy or reconciliation) is about to
+        run. On a miss, routes on the cached backend-capability probe: the
+        full spec-reconciliation matrix when the backend supports it
+        (``_reconcile_sandbox``), else the untouched legacy
+        ``service.get_or_create()`` path (``_legacy_get_or_create``).
+
+        ``prepare_root``, when given, overrides the on-host mkdir target for
+        the mount root on a creation attempt (see
+        ``ChatWorkspaceBinding.prepare_root`` and ``_prepare_workspace_mounts``);
+        ``None`` keeps the historical behavior of creating
+        ``mount_intent.mount_root`` itself.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        self._assert_lifecycle_locked(base_name)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
-        async with self._activity_guard:
-            self._touch_locked(self._base_sandbox_name(lifecycle_type, lifecycle_id))
 
-        image, desired_config = self._build_sandbox_config(
-            lifecycle_type,
-            lifecycle_id,
-            ensure_dir=False,
-            workspace_config=workspace_config,
+        desired = self._build_runtime_spec(
+            lifecycle_type, lifecycle_id, mount_intent=mount_intent
         )
 
-        cached_config = self._config_cache.get(sandbox_name)
-        if sandbox_name in self._cache:
-            self._ensure_config_equivalent(sandbox_name, cached_config, desired_config)
+        cached_spec = self._config_cache.get(sandbox_name)
+        if cached_spec is not None:
+            self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
             return self._cache[sandbox_name]
 
-        # Acquire per-name lock to prevent concurrent creation
+        probe = await self._resolve_backend_probe()
+        if not probe:
+            return await self._legacy_get_or_create(
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
+            )
+        return await self._reconcile_sandbox(
+            lifecycle_type,
+            lifecycle_id,
+            sandbox_name,
+            base_name,
+            desired,
+            mount_intent,
+            prepare_root=prepare_root,
+        )
+
+    async def _legacy_get_or_create(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        sandbox_name: str,
+        *,
+        mount_intent: SandboxMountIntent | None,
+        prepare_root: str | None = None,
+    ) -> Sandbox:
+        """Untouched legacy path: adopts any existing container silently via
+        ``service.get_or_create()``. Used only when
+        ``service.supports_runtime_spec()`` is False (Boxlite today) — #296's
+        reconciliation guarantee does not extend to this backend.
+
+        Caller (``_get_or_create_sandbox_locked``) already holds
+        ``_lifecycle_locked(base_name)`` and has already checked the spec
+        cache for a hit; this only runs on that cache miss. Also acquires
+        this exact name's ``_locks`` entry, mirroring the historical
+        per-name double-checked-locking structure byte for byte: the
+        broader per-key gate the caller holds already excludes any
+        concurrent call for this same name, so this inner lock is provably
+        uncontended and kept only so this path's own structure — and
+        ``_locks``' role in it — matches the legacy (non-reconciling)
+        backend byte for byte.
+        """
         async with self._locks_guard:
             if sandbox_name not in self._locks:
                 self._locks[sandbox_name] = asyncio.Lock()
             lock = self._locks[sandbox_name]
 
         async with lock:
-            # Double-check after acquiring lock
-            cached_config = self._config_cache.get(sandbox_name)
-            if sandbox_name in self._cache:
-                self._ensure_config_equivalent(
-                    sandbox_name, cached_config, desired_config
+            cached_spec = self._config_cache.get(sandbox_name)
+            if cached_spec is not None:
+                desired = self._build_runtime_spec(
+                    lifecycle_type, lifecycle_id, mount_intent=mount_intent
                 )
+                self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
                 return self._cache[sandbox_name]
 
-            # Get base image and config from environment variables
-            image, config = self._build_sandbox_config(
+            self._prepare_workspace_mounts(
                 lifecycle_type,
                 lifecycle_id,
-                ensure_dir=True,
-                workspace_config=workspace_config,
+                mount_intent,
+                prepare_root=prepare_root,
             )
+            desired = self._build_runtime_spec(
+                lifecycle_type, lifecycle_id, mount_intent=mount_intent
+            )
+            template, config = desired.to_backend_config()
+
             logger.info(
                 "Getting/creating sandbox: image=%r, cpus=%r, memory=%r, volumes=%r, env_count=%r",
-                image,
-                config.cpus,
-                config.memory,
+                desired.image,
+                desired.cpus,
+                desired.memory,
                 config.volumes,
-                len(config.env or {}),
+                len(desired.env),
             )
-
-            template = SandboxTemplate(type="image", image=image)
 
             logger.debug(f"Getting or creating sandbox for: {sandbox_name}")
             cap = get_sandbox_max_containers()
@@ -747,28 +1155,438 @@ class SandboxManager:
                     )
 
             self._cache[sandbox_name] = sandbox
-            self._config_cache[sandbox_name] = config
+            self._config_cache[sandbox_name] = desired
             return sandbox
+
+    # --- Spec-reconciliation route (backends with supports_runtime_spec()) ---
+
+    async def _reconcile_sandbox(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        sandbox_name: str,
+        base_name: str,
+        desired: ResolvedSandboxRuntimeSpec,
+        mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None = None,
+    ) -> Sandbox:
+        """Reconciliation matrix entry point for one exact sandbox name.
+
+        Caller already holds ``_lifecycle_locked(base_name)`` and has
+        already ruled out an in-process spec-cache hit.
+        """
+        inspection = await self._service.inspect(sandbox_name)
+        if inspection is None:
+            return await self._reconcile_create(
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                base_name,
+                desired,
+                mount_intent,
+                prepare_root=prepare_root,
+                retry_on_already_exists=True,
+            )
+        return await self._reconcile_existing(
+            lifecycle_type,
+            lifecycle_id,
+            sandbox_name,
+            base_name,
+            desired,
+            mount_intent,
+            inspection,
+            prepare_root=prepare_root,
+        )
+
+    async def _reconcile_create(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        sandbox_name: str,
+        base_name: str,
+        desired: ResolvedSandboxRuntimeSpec,
+        mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None = None,
+        retry_on_already_exists: bool,
+    ) -> Sandbox:
+        """Create a brand-new sandbox for the absent (or just-deleted) row.
+
+        ``retry_on_already_exists`` covers the cross-process race where
+        another process created the same name between our ``inspect()``
+        and this ``create()``: a single re-inspect-then-act retry, not a
+        fail-closed error — the alternative would spuriously reject a
+        legitimate concurrent creator.
+        """
+        self._prepare_workspace_mounts(
+            lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
+        )
+        template, config = desired.to_backend_config()
+
+        cap = get_sandbox_max_containers()
+        try:
+            if cap is None:
+                sandbox = await self._service.create(sandbox_name, template, config)
+            else:
+                async with self._capacity_gate:
+                    await self._ensure_capacity_for(sandbox_name, cap)
+                    sandbox = await self._service.create(sandbox_name, template, config)
+        except SandboxAlreadyExistsError:
+            if not retry_on_already_exists:
+                raise
+            inspection = await self._service.inspect(sandbox_name)
+            if inspection is None:
+                raise
+            return await self._reconcile_existing(
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                base_name,
+                desired,
+                mount_intent,
+                inspection,
+                prepare_root=prepare_root,
+            )
+
+        async with self._activity_guard:
+            self._cache[sandbox_name] = sandbox
+            self._config_cache[sandbox_name] = desired
+        return sandbox
+
+    async def _reconcile_existing(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        sandbox_name: str,
+        base_name: str,
+        desired: ResolvedSandboxRuntimeSpec,
+        mount_intent: SandboxMountIntent | None,
+        inspection: SandboxInspection,
+        *,
+        prepare_root: str | None = None,
+    ) -> Sandbox:
+        """Dispatch on the matcher verdict plus store-row presence.
+
+        | verdict    | store row | action                                    |
+        |------------|-----------|-------------------------------------------|
+        | MATCH      | present   | reuse (``start_existing``)                 |
+        | MATCH      | absent    | backfill the row, then reuse               |
+        | UNVERIFIED | present   | t0(row)==t1(desired) -> reuse; else mismatch |
+        | UNVERIFIED | absent    | mismatch (rebuild is the only convergence) |
+        | MISMATCH   | either    | mismatch handling (see ``_reconcile_mismatch``) |
+        """
+        verdict = spec_matches_inspection(desired, inspection)
+        stored = await self._service.get_store_record(sandbox_name)
+
+        if verdict is SpecVerdict.MATCH:
+            if stored is None:
+                await self._backfill_store_record(sandbox_name, desired, inspection)
+            return await self._reconcile_reuse(
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                base_name,
+                desired,
+                mount_intent,
+                prepare_root=prepare_root,
+            )
+
+        if verdict is SpecVerdict.UNVERIFIED and stored is not None:
+            recorded = self._spec_from_stored_info(stored)
+            if recorded == desired:
+                return await self._reconcile_reuse(
+                    lifecycle_type,
+                    lifecycle_id,
+                    sandbox_name,
+                    base_name,
+                    desired,
+                    mount_intent,
+                    prepare_root=prepare_root,
+                )
+
+        return await self._reconcile_mismatch(
+            lifecycle_type,
+            lifecycle_id,
+            sandbox_name,
+            base_name,
+            desired,
+            mount_intent,
+            inspection,
+            prepare_root=prepare_root,
+        )
+
+    async def _backfill_store_record(
+        self,
+        sandbox_name: str,
+        desired: ResolvedSandboxRuntimeSpec,
+        inspection: SandboxInspection,
+    ) -> None:
+        """Persist a store row for a MATCH-verified container that has none.
+
+        The container's live facts and fingerprint label already attest to
+        ``desired``, so writing the missing row is a pure convergence
+        action, never a rebuild: destroying an already-verified, healthy
+        container over a persistence-layer gap would be pure waste and
+        would turn a row-write failure into a container-destruction event.
+        """
+        template, config = desired.to_backend_config()
+        info = SandboxInfo(
+            name=sandbox_name,
+            state=inspection.state,
+            template=template,
+            config=config,
+            created_at=inspection.facts.created_at,
+        )
+        try:
+            await self._service.persist_store_record(sandbox_name, info)
+        except Exception as exc:
+            logger.warning(
+                "Failed to backfill store record for %s after MATCH verification: %s",
+                sandbox_name,
+                exc,
+            )
+
+    async def _reconcile_reuse(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        sandbox_name: str,
+        base_name: str,
+        desired: ResolvedSandboxRuntimeSpec,
+        mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None = None,
+    ) -> Sandbox:
+        """Publish a reused sandbox via the idempotent ``start_existing``.
+
+        Works uniformly whether the container is currently running or
+        stopped. The publish itself runs under ``_capacity_gate`` exactly
+        like ``_reconcile_create``/``_legacy_get_or_create`` (only when a
+        cap is configured — with no cap there is no eviction to race in the
+        first place), the same gate capacity eviction's claim-then-delete
+        of an unrelated key always runs under (see ``_ensure_capacity_for``).
+
+        A *same-process* eviction pass can never pick this call's own
+        ``base_name`` as its LRU victim while this runs: the caller
+        (``get_or_create_sandbox`` / ``_create_lease_provider_locked``) has
+        held ``_lifecycle_locked(base_name)`` since before ``_reconcile_sandbox``
+        was ever entered, so ``_pick_eviction_victim``'s lock-skip already
+        excludes this key for this call's entire duration, not just from
+        some later point once reuse is "underway". What the gate and the
+        ``SandboxNotFoundError`` handling below actually guard against is
+        an actor the in-process lock cannot see at all: another process
+        sharing the same backend (its own independent capacity eviction, or
+        a cross-process mismatch rebuild) or a manual/administrative
+        removal against the backend directly. If the container vanishes
+        between the inspect that chose this reuse and this
+        ``start_existing`` call, the raised ``SandboxNotFoundError`` is not
+        surfaced to this call's caller as a failure — it converges to the
+        ordinary absent-\\>create path instead, re-inspecting under the
+        now-free gate and creating the (confirmed-absent) sandbox fresh.
+        """
+        cap = get_sandbox_max_containers()
+        try:
+            if cap is None:
+                sandbox = await self._service.start_existing(sandbox_name)
+            else:
+                async with self._capacity_gate:
+                    sandbox = await self._service.start_existing(sandbox_name)
+        except SandboxNotFoundError:
+            inspection = await self._service.inspect(sandbox_name)
+            if inspection is not None:
+                return await self._reconcile_existing(
+                    lifecycle_type,
+                    lifecycle_id,
+                    sandbox_name,
+                    base_name,
+                    desired,
+                    mount_intent,
+                    inspection,
+                    prepare_root=prepare_root,
+                )
+            return await self._reconcile_create(
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                base_name,
+                desired,
+                mount_intent,
+                prepare_root=prepare_root,
+                retry_on_already_exists=True,
+            )
+
+        async with self._activity_guard:
+            self._cache[sandbox_name] = sandbox
+            self._config_cache[sandbox_name] = desired
+        return sandbox
+
+    async def _reject_if_now_active(self, base_name: str, sandbox_name: str) -> None:
+        """Re-validate the ref-count immediately before a destructive step.
+
+        ``_lifecycle_locked`` only excludes a concurrent *reconcile* for
+        this base name; ``attach``/``attach_provider`` never wait for it
+        (only ``_activity_guard``, see the class docstring), so a caller
+        holding an already-cached lease provider for this base name can
+        attach a new task while a mismatch rebuild is mid-flight here.
+        Re-reading right before each destructive action — not only once at
+        this function's entry — is what actually closes that window.
+        """
+        activity = self._activity.get(base_name)
+        if activity is not None and activity.ref_count > 0:
+            raise SandboxRuntimeConflictError(
+                f"Sandbox {sandbox_name!r} became active while a mismatch "
+                f"rebuild was in flight (lifecycle {base_name!r}); "
+                "rejecting instead of tearing down an in-use sandbox."
+            )
+
+    async def _reconcile_mismatch(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        sandbox_name: str,
+        base_name: str,
+        desired: ResolvedSandboxRuntimeSpec,
+        mount_intent: SandboxMountIntent | None,
+        inspection: SandboxInspection,
+        *,
+        prepare_root: str | None = None,
+    ) -> Sandbox:
+        """Handle a MISMATCH verdict (or an UNVERIFIED verdict that a
+        store-record comparison could not reconcile).
+
+        A non-zero ref-count on the base lifecycle rejects the new caller
+        outright — no destructive action is ever taken against a sandbox
+        still in use, regardless of state. With a zero ref-count: a running
+        mismatch is stopped first (idempotent no-op if already stopped by
+        the time this runs) and, once genuinely stopped, converges exactly
+        like a stopped mismatch — delete + create, gated by the per-key
+        reconcile rebuild budget. The ref-count is re-read (see
+        ``_reject_if_now_active``) immediately before each destructive step,
+        not only here at entry, since attach can land in between.
+        """
+        await self._reject_if_now_active(base_name, sandbox_name)
+
+        if inspection.state == "running":
+            try:
+                await self._service.stop_existing(
+                    sandbox_name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+                )
+            except Exception as exc:
+                raise SandboxRecoveryRequiredError(
+                    f"Failed to stop mismatched sandbox {sandbox_name!r} for "
+                    f"rebuild: {exc}"
+                ) from exc
+
+            post_stop = await self._service.inspect(sandbox_name)
+            if post_stop is not None and post_stop.state == "running":
+                raise SandboxRecoveryRequiredError(
+                    f"Sandbox {sandbox_name!r} did not stop; needs recovery "
+                    "before it can be rebuilt."
+                )
+
+        budget = self._reconcile_budget.get(base_name, 1)
+        if budget <= 0:
+            logger.warning(
+                "Reconcile rebuild budget exhausted for lifecycle %s (sandbox "
+                "%s); rejecting the new caller instead of rebuilding again",
+                base_name,
+                sandbox_name,
+            )
+            raise SandboxRuntimeConflictError(
+                f"Sandbox {sandbox_name!r} needs a rebuild but its per-key "
+                "reconciliation budget is exhausted."
+            )
+        self._reconcile_budget[base_name] = budget - 1
+
+        await self._reject_if_now_active(base_name, sandbox_name)
+        await self._reconcile_delete(sandbox_name)
+        return await self._reconcile_create(
+            lifecycle_type,
+            lifecycle_id,
+            sandbox_name,
+            base_name,
+            desired,
+            mount_intent,
+            prepare_root=prepare_root,
+            retry_on_already_exists=True,
+        )
+
+    async def _reconcile_delete(self, sandbox_name: str) -> None:
+        """Delete primitive used only by reconciliation mismatch rebuilds.
+
+        Unlike ``_delete_sandbox_names`` (the legacy/lifecycle delete path),
+        this never touches ``_locks``: the reconciliation route never
+        inserts into that dict in the first place, since its own per-key
+        exclusion is ``_lifecycle_locked`` (held by the caller throughout
+        this whole sequence). Cache/activity bookkeeping otherwise matches
+        ``_delete_sandbox_names`` exactly, so the identity-only ABA contract
+        (a fresh provider/instance after a rebuild) holds regardless of
+        which path triggered the delete.
+        """
+        try:
+            await self._service.delete(sandbox_name)
+            logger.debug("Sandbox deleted for rebuild: %s", sandbox_name)
+        finally:
+            # Plain synchronous pops on purpose, same as
+            # ``_delete_sandbox_names``: each is a single dict operation with
+            # no compound invariant, and awaiting ``_activity_guard`` inside
+            # ``finally`` would risk skipping the eviction entirely if the
+            # task were cancelled at that await point (see the class
+            # docstring's ``_activity_guard`` rule).
+            self._cache.pop(sandbox_name, None)
+            self._config_cache.pop(sandbox_name, None)
+            self._lease_providers.pop(sandbox_name, None)
+            self._activity.pop(sandbox_name, None)
 
     async def create_lease_provider(
         self,
         lifecycle_type: str,
         lifecycle_id: str,
         *,
-        workspace_config: Mapping[str, Any] | None = None,
+        mount_intent: SandboxMountIntent | None = None,
     ) -> SandboxLeaseProvider:
-        """Create a lease provider for primary and worker sandboxes."""
-        primary = await self.get_or_create_sandbox(
+        """Create a lease provider for primary and worker sandboxes.
+
+        Acquires this lifecycle's per-key gate (shared with worker creation
+        and release-to-zero) before delegating to the unlocked internal
+        builder. Direct callers get a *fresh* provider every time — no
+        caching; ``get_or_create_lease_provider`` is the caching entry
+        point most production code should use instead.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._lifecycle_locked(base_name):
+            return await self._create_lease_provider_locked(
+                lifecycle_type, lifecycle_id, mount_intent=mount_intent
+            )
+
+    async def _create_lease_provider_locked(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
+    ) -> SandboxLeaseProvider:
+        """Unlocked internal builder for a lease provider.
+
+        Caller must already hold ``_lifecycle_locked(base_name)`` for this
+        lifecycle key.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        self._assert_lifecycle_locked(base_name)
+        primary = await self._get_or_create_sandbox_locked(
             lifecycle_type,
             lifecycle_id,
-            workspace_config=workspace_config,
+            mount_intent=mount_intent,
+            prepare_root=prepare_root,
         )
         return SandboxLeaseProvider(
             manager=self,
             lifecycle_type=lifecycle_type,
             lifecycle_id=lifecycle_id,
             primary_sandbox=primary,
-            workspace_config=workspace_config,
+            mount_intent=mount_intent,
             max_concurrency=get_sandbox_max_concurrency(),
         )
 
@@ -793,7 +1611,8 @@ class SandboxManager:
 
         Skips primaries with active tasks, the protected key, and keys whose
         lifecycle lock is currently held or awaited (in-flight creation or
-        release-to-zero cleanup).
+        release-to-zero cleanup — including an in-flight reconciliation
+        sequence, which holds the same lock for its whole duration).
         """
         async with self._activity_guard:
             candidates: list[tuple[float, str]] = []
@@ -838,6 +1657,13 @@ class SandboxManager:
         cannot short-circuit and hand out the doomed container — it falls
         through to the capacity gate and recreates only after the deletion
         has finished.
+
+        This only claims the instance cache and lease provider; the base
+        name's reconcile budget is left untouched here. The physical
+        delete has not run yet, so the container this budget is scoped to
+        may still be there if that delete goes on to fail — see
+        ``_delete_sandbox_names``, which is what actually pops the budget,
+        and only once its own delete for the base name succeeds.
 
         Returns False when the lifecycle became active since selection.
         """
@@ -935,26 +1761,54 @@ class SandboxManager:
         lifecycle_type: str,
         lifecycle_id: str,
         *,
-        workspace_config: Mapping[str, Any] | None = None,
+        mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
     ) -> SandboxLeaseProvider:
         """Get the cached lease provider for a lifecycle key or create one.
 
         Creation is serialized per key with release-to-zero cleanup, so a new
         provider can never create worker sandboxes while an old provider's
-        workers are still being deleted.
+        workers are still being deleted. Holds ``_lifecycle_locked`` exactly
+        once for the whole check-then-create sequence; the internal builder
+        it calls on a cache miss takes no lock of its own.
+
+        A cached provider is handed out only after the requested mount
+        intent passes the same spec-cache gate a cached *sandbox* must pass
+        (``_get_or_create_sandbox_locked``'s first gate): the provider owns
+        the mount intent its primary container was built from and hands it
+        to every worker it later creates, so returning it to a caller
+        wanting different mounts would silently serve the first caller's
+        container — the exact silent adoption that gate exists to reject.
+        A cached provider always implies a cached spec for its primary
+        (every pop site drops both together), so the comparison never
+        degrades to "no cached spec, allow".
+
+        ``prepare_root``, when given, is only consulted on that cache miss
+        (a fresh creation attempt) — see ``ChatWorkspaceBinding.prepare_root``
+        and ``_prepare_workspace_mounts``; a cache hit never creates
+        directories at all.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._lifecycle_locked(base_name):
             async with self._activity_guard:
                 provider = self._lease_providers.get(base_name)
                 if provider is not None:
+                    self._ensure_config_equivalent(
+                        sandbox_name,
+                        self._config_cache.get(sandbox_name),
+                        self._build_runtime_spec(
+                            lifecycle_type, lifecycle_id, mount_intent=mount_intent
+                        ),
+                    )
                     self._touch_locked(base_name)
                     return provider
 
-            provider = await self.create_lease_provider(
+            provider = await self._create_lease_provider_locked(
                 lifecycle_type,
                 lifecycle_id,
-                workspace_config=workspace_config,
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
 
             async with self._activity_guard:
@@ -1028,9 +1882,11 @@ class SandboxManager:
 
     async def _delete_sandbox_names(self, sandbox_names: set[str]) -> None:
         for name in sorted(sandbox_names):
+            deleted = False
             try:
                 await self._service.delete(name)
                 logger.debug(f"Sandbox deleted: {name}")
+                deleted = True
             except Exception as e:
                 logger.error(f"Failed to delete sandbox {name}: {e}")
             finally:
@@ -1047,6 +1903,25 @@ class SandboxManager:
                 # await point.
                 self._lease_providers.pop(name, None)
                 self._activity.pop(name, None)
+            if not deleted:
+                # The backend delete failed, so the container this budget
+                # is scoped to is still live: leave the entry exhausted
+                # rather than granting the next mismatch a fresh rebuild
+                # allowance for a container that never actually went away.
+                continue
+            # The reconcile budget is keyed by base (primary) name and
+            # shared with every worker under it, so it is only dropped
+            # here when the primary itself is the name just deleted
+            # (``delete_sandbox``'s full-lifecycle set) — never on a
+            # worker-only delete (``delete_worker_sandboxes`` / release-
+            # to-zero), where the primary, and the budget scoped to it,
+            # is still live. Every name reaching this point came from
+            # ``make_sandbox_name``/a worker-prefix filter, so it always
+            # contains ``"::"`` and ``parse_sandbox_name`` cannot raise.
+            lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+            base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+            if name == base_name:
+                self._reconcile_budget.pop(base_name, None)
 
     async def sweep_idle_sandboxes(self, idle_ttl: float) -> list[str]:
         """Delete sandboxes with no attached tasks that are idle past the TTL.
@@ -1167,11 +2042,63 @@ class SandboxManager:
             logger.error(f"Failed to warmup sandbox image: {e}")
 
     async def cleanup(self) -> None:
+        """Stop all running sandboxes and reset process-local caches.
+
+        Routes on the cached backend-capability probe: backends that
+        support spec reconciliation (Docker today) get ``_quiesce`` — no
+        config-diff guessing, since first-use reconciliation now owns that
+        decision entirely (running both would be two competing judges of
+        the same question). Backends that do not (Boxlite today) keep
+        ``_legacy_cleanup``, unchanged.
+        """
+        if await self._resolve_backend_probe():
+            await self._quiesce()
+            return
+        await self._legacy_cleanup()
+
+    async def _quiesce(self) -> None:
+        """Stop every managed running sandbox; reset process-local caches.
+
+        Deliberately does not delete or otherwise inspect any container's
+        configuration: whether a stopped container's desired spec still
+        matches is the reconciliation matrix's job on next use, not this
+        method's. This intentionally replaces the legacy config-diff
+        delete-guessing for this backend (see ``_legacy_cleanup``).
+        """
+        try:
+            sandboxes = await self._service.list_sandboxes()
+        except Exception as exc:
+            logger.error(f"Failed to list sandboxes for quiesce: {exc}")
+            sandboxes = []
+
+        for sb in sandboxes or []:
+            if sb.state != "running":
+                continue
+            try:
+                await self._service.stop_existing(
+                    sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+                )
+                logger.debug(f"Stopped sandbox: {sb.name}")
+            except Exception as exc:
+                logger.error(f"Failed to stop sandbox {sb.name} during quiesce: {exc}")
+
+        self._cache.clear()
+        self._config_cache.clear()
+        self._lease_providers.clear()
+        self._activity.clear()
+        self._reconcile_budget.clear()
+        logger.info("Sandbox quiesce completed")
+
+    async def _legacy_cleanup(self) -> None:
         """Stop all running sandboxes.
 
         Delete sandboxes whose config (image, cpus, memory, volumes)
         differs from the current environment so they get recreated
         with the correct settings next time.
+
+        Used only when the backend does not support spec reconciliation
+        (Boxlite today): config-diff delete-guessing, as opposed to
+        ``_quiesce``'s stop-only behavior for backends that do.
 
         Note:
             If ``get_uploads_dir()`` (via ``XAGENT_UPLOADS_DIR`` env var) changes
@@ -1210,7 +2137,7 @@ class SandboxManager:
                     old_volumes = sb.config.volumes or []
 
                     default_volumes = self._make_default_volumes(
-                        lifecycle_type, lifecycle_id, ensure_dir=False
+                        lifecycle_type, lifecycle_id
                     )
                     config_volumes = list(config.volumes) if config.volumes else []
                     # Merge volumes
@@ -1288,6 +2215,237 @@ class SandboxManager:
             logger.info("Sandbox cleanup completed")
         except Exception as e:
             logger.error(f"Failed to cleanup sandboxes: {e}")
+
+
+def _check_no_conflicting_readiness_volumes(
+    volumes: list[tuple[str, str, str]],
+) -> None:
+    """Reject readiness volumes that disagree at a shared host or guest path.
+
+    Two directions, both against the same normalized triple set:
+
+    - host conflict: two entries share a host path but disagree on guest
+      path or mode (the backend indexes bind mounts by host path and would
+      silently drop one of them).
+    - guest conflict ("guest crash"): two entries share a guest path but
+      disagree on host source (Docker rejects the duplicate mount point at
+      container creation; failing here at startup surfaces the bad static
+      configuration before any task is accepted).
+
+    An exactly identical triple repeated across sources (e.g. the same
+    directory named twice) collapses onto itself in both directions and is
+    legal. Paths are canonicalized through ``canonical_sandbox_path``, the
+    same owner the desired spec uses, so this check groups exactly the
+    spellings the backend itself would collapse onto one mount point.
+    """
+    seen_by_host: dict[str, tuple[str, str]] = {}
+    seen_by_guest: dict[str, tuple[str, str]] = {}
+    for host_path, guest_path, mode in volumes:
+        norm_host = canonical_sandbox_path(host_path)
+        norm_guest = canonical_sandbox_path(guest_path)
+
+        host_key = (norm_guest, mode)
+        prior_for_host = seen_by_host.get(norm_host)
+        if prior_for_host is not None and prior_for_host != host_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting sandbox volume mounts for host path "
+                f"{norm_host!r}: {prior_for_host} vs {host_key}"
+            )
+        seen_by_host[norm_host] = host_key
+
+        guest_key = (norm_host, mode)
+        prior_for_guest = seen_by_guest.get(norm_guest)
+        if prior_for_guest is not None and prior_for_guest != guest_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting sandbox volume mounts for guest path "
+                f"{norm_guest!r}: {prior_for_guest} vs {guest_key}"
+            )
+        seen_by_guest[norm_guest] = guest_key
+
+
+def _reserved_uploads_user_subtree(
+    path_mapper: "SandboxPathMapper",
+) -> tuple[str, str]:
+    """Return ``(guest_uploads_root, reserved_prefix)`` for the per-user subtree.
+
+    Every task's default volumes reserve
+    ``<guest_uploads_root>/<reserved_prefix><user_id>`` for that user's own
+    workspace mount (see ``_workspace_mount_paths`` / ``_make_default_volumes``,
+    both built on ``scoped_user_root``); the id is a runtime fact, not
+    enumerable at startup, so readiness instead treats the whole
+    ``<reserved_prefix>\\d+`` shape under the uploads guest root as reserved.
+    ``reserved_prefix`` is read off ``scoped_user_root``'s own output for two
+    sentinel ids (never a hardcoded ``"user_"`` literal), so a rename of that
+    naming scheme cannot silently desync this check from the path it
+    protects: a single sentinel cannot distinguish "the id is the trailing
+    token" from "the id happens to end in a digit that looks like part of
+    the prefix" (e.g. a zero-padded ``user_0000`` would strip only one
+    trailing ``"0"``), so two sentinels are compared and the derived prefix
+    is verified to actually reproduce both before it is trusted. The uploads
+    root is mapped into the same host/guest domain the runtime mount-
+    building path uses: ``absolute_backend_mount_path`` then
+    ``SandboxPathMapper``.
+
+    Raises:
+        SandboxContractError: the derived prefix does not reproduce both
+            sentinel names, meaning the naming scheme no longer fits the
+            ``<prefix><id>`` shape this check assumes — better to fail
+            startup than silently protect nothing.
+    """
+    uploads_root = get_uploads_dir()
+    backend_uploads_root = absolute_backend_mount_path(uploads_root)
+    _host, guest_uploads_root, _mode = path_mapper.volume_for_backend_path(
+        backend_uploads_root, "rw"
+    )
+    sample_0 = scoped_user_root(uploads_root, 0).name
+    sample_1 = scoped_user_root(uploads_root, 1).name
+    common_len = 0
+    for a, b in zip(sample_0, sample_1):
+        if a != b:
+            break
+        common_len += 1
+    reserved_prefix = sample_0[:common_len]
+    # An empty prefix satisfies the reproduction check below trivially and
+    # leaves a bare ``\d+`` pattern that claims every numeric directory name
+    # under the uploads root -- the silent mismatch this derivation exists to
+    # prevent, arising at its own boundary.
+    if (
+        not reserved_prefix
+        or reserved_prefix + "0" != sample_0
+        or reserved_prefix + "1" != sample_1
+    ):
+        raise SandboxContractError(
+            "Cannot derive a reserved per-user uploads prefix from "
+            f"scoped_user_root output {sample_0!r} / {sample_1!r}: they do not "
+            "reproduce from a non-empty common prefix plus their sentinel id. "
+            "The per-user naming scheme no longer fits the <prefix><id> shape "
+            "the reserved-uploads readiness check assumes."
+        )
+    return canonical_sandbox_path(guest_uploads_root), reserved_prefix
+
+
+def _check_no_reserved_uploads_conflict(
+    volumes: list[tuple[str, str, str]],
+    guest_uploads_root: str,
+    reserved_prefix: str,
+) -> None:
+    """Reject a configured mount whose guest path IS a reserved per-user dir.
+
+    The per-user workspace mount every task adds by default cannot be
+    enumerated here — user ids are runtime facts — so the exact
+    ``<guest_uploads_root>/<reserved_prefix><id>`` guest path is treated as
+    reserved: a static mount claiming that exact guest path collides with
+    the mount every future task for that user needs there, which today only
+    surfaces as ``SandboxRuntimeConflictError`` at that user's first task
+    rather than here at startup.
+
+    A mount nested *under* a reserved directory (e.g.
+    ``<uploads>/user_1/models``) is a distinct guest path and is NOT
+    rejected: nested bind mounts at different guest paths are legal —
+    ``_check_no_conflicting_volumes`` (the per-create check) and Docker
+    itself only flag exact guest-path collisions, never parent/child
+    nesting — and a deployment-named ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry
+    landing there is exactly the exception ``_fold_mount_paths`` implements
+    (see ``_MountCandidate``'s ``"deployment"`` provenance in
+    ``workspace_binding.py``): an operator-named mount keeps its own bind
+    regardless of where it falls relative to the reserved subtree. A mount
+    elsewhere under the uploads root (e.g. a shared knowledge-base
+    directory) does not match the reserved shape either and still passes.
+    """
+    reserved_re = re.compile(rf"^{re.escape(reserved_prefix)}\d+$")
+    prefix_with_sep = guest_uploads_root + "/"
+    for _host_path, guest_path, _mode in volumes:
+        norm_guest = canonical_sandbox_path(guest_path)
+        if not norm_guest.startswith(prefix_with_sep):
+            continue
+        remainder = norm_guest[len(prefix_with_sep) :]
+        if "/" in remainder:
+            # Nested under a reserved directory, not the directory itself.
+            continue
+        if reserved_re.match(remainder):
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox mount with guest path {guest_path!r} "
+                "collides with the reserved per-user uploads path "
+                f"{guest_uploads_root!r}/{reserved_prefix}<id>: every task's "
+                "default workspace mount for that user needs that exact "
+                "guest path."
+            )
+
+
+async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
+    """Validate static sandbox mount configuration before serving traffic.
+
+    Called once at app startup, before ``cleanup()``/``warmup()``: a
+    misconfigured deployment fails to start instead of only surfacing as a
+    per-task ``SandboxRuntimeConflictError`` once real workloads land. Also
+    resolves and caches ``sandbox_mgr``'s backend-capability probe as a side
+    effect (via ``_resolve_backend_probe()``), so the cleanup step that runs
+    right after reads the cached value instead of resolving it again.
+
+    Only meaningful for backends that support spec reconciliation (Docker
+    today): the legacy Boxlite route never reconciles a desired spec against
+    a live container, so there is nothing here for it to protect. Skipped
+    entirely when neither ``SANDBOX_VOLUMES`` nor
+    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured — code mounts alone never
+    conflict with themselves, and they never land under the uploads guest
+    root either (``build_code_mount_volumes`` mounts fixed ``/app/src`` and
+    ``/app/tests`` paths), so with nothing operator-configured the per-user
+    reserved-subtree check below has nothing to reject; that is also why the
+    reserved-subtree check runs after this early return rather than before
+    it. When the check does run, code mounts are still part of the scanned
+    volume list along with everything else — they are not specially
+    exempted, they simply do not match the reserved shape.
+
+    Domain discipline: ``SANDBOX_VOLUMES`` (via ``get_sandbox_volumes``,
+    using the same ``host_side_sources`` flag the runtime build path uses)
+    and code mounts (``build_code_mount_volumes``) are already host-domain
+    triples and are compared as-is. External upload dirs are backend-domain
+    paths: they are absolutized through ``absolute_backend_mount_path`` (the
+    same owner the runtime mount-building path uses, so a relative
+    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry is checked as the directory it
+    actually names) and folded (normalized + deduplicated, the same
+    backend-domain normalization ``SandboxMountIntent`` itself applies)
+    before being converted to host domain through the same
+    ``SandboxPathMapper`` the runtime mount-building path uses. Conflict
+    detection itself always runs in the post-mapper host domain, over the
+    combined triple set from all three sources.
+
+    Beyond mutual conflicts among the configured mounts, one configured
+    mount can also collide with a mount that does not exist yet: every
+    task's per-user uploads mount (see ``_workspace_mount_paths`` /
+    ``_make_default_volumes``), whose user id is a runtime fact this
+    startup step cannot enumerate. ``_check_no_reserved_uploads_conflict``
+    catches that case instead by treating the whole per-user subtree shape
+    under the uploads guest root as reserved, so a configured mount landing
+    there fails now instead of at that user's first task.
+
+    Raises:
+        SandboxRuntimeConflictError: Two configured mounts disagree at a
+            shared host or guest path, or a configured mount lands inside
+            the reserved per-user uploads subtree.
+    """
+    if not await sandbox_mgr._resolve_backend_probe():
+        return
+
+    external_dirs = get_external_upload_dirs()
+    if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:
+        return
+
+    path_mapper = SandboxPathMapper.from_env()
+    volumes = list(
+        get_sandbox_volumes(host_side_sources=path_mapper.uses_host_storage_root)
+    )
+    volumes.extend(build_code_mount_volumes())
+
+    folded_external = SandboxMountIntent(
+        extra_mounts=tuple(str(absolute_backend_mount_path(d)) for d in external_dirs)
+    ).extra_mounts
+    for backend_dir in folded_external:
+        volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
+
+    _check_no_conflicting_readiness_volumes(volumes)
+    guest_uploads_root, reserved_prefix = _reserved_uploads_user_subtree(path_mapper)
+    _check_no_reserved_uploads_conflict(volumes, guest_uploads_root, reserved_prefix)
 
 
 # Global sandbox manager instance

@@ -83,6 +83,10 @@ WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
 TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
+TASK_RUNTIME_HOOK_MAX_WORKERS = "XAGENT_TASK_RUNTIME_HOOK_MAX_WORKERS"
+TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS = (
+    "XAGENT_TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS"
+)
 CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
 CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
@@ -546,6 +550,18 @@ def get_tool_max_concurrency() -> int:
         The per-batch concurrency cap (>= 1).
     """
     return _get_positive_int_env(TOOL_MAX_CONCURRENCY, 3)
+
+
+def get_task_runtime_hook_max_workers() -> int:
+    """Maximum process-wide worker threads for task runtime provider hooks."""
+
+    return _get_positive_int_env(TASK_RUNTIME_HOOK_MAX_WORKERS, 8)
+
+
+def get_task_runtime_hook_queue_timeout_seconds() -> int:
+    """Seconds a provider hook may wait for a runtime worker before starting."""
+
+    return _get_positive_int_env(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, 30)
 
 
 def get_checkpoint_encoding_v2_enabled() -> bool:
@@ -1105,6 +1121,85 @@ def get_web_dir() -> Path:
     return Path(__file__).parent / "web"
 
 
+class UploadsDirConfigurationError(Exception):
+    """The configured uploads directory has no single physical meaning.
+
+    Raised where the value is read, which for the web app is
+    ``app.py``'s module body: the failure lands during import, before the
+    application object exists, so no request-handling frame is on the stack to
+    swallow it and the process simply refuses to start. That -- not this
+    exception's place in the hierarchy -- is what keeps a misconfigured
+    deployment from being reported as a transient per-request failure.
+    """
+
+
+# First absolutized reading of each cwd-dependent uploads root, kept so the
+# root cannot move mid-process (see _require_unambiguous_uploads_dir). Keyed by
+# the configured spelling, so changing the configuration still takes effect.
+_pinned_relative_uploads_roots: dict[str, Path] = {}
+
+
+def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
+    """Reject an uploads dir whose two normalizations name different places.
+
+    Paths under the uploads root reach consumers that normalize differently,
+    and both normalizations are load-bearing:
+
+    - lexical (``canonical_sandbox_path``) is what sandbox mount identity and
+      desired-vs-observed spec comparison must use, because a path that keeps
+      ``..`` can never byte-match what a container backend reports;
+    - physical (``realpath``) is what ``TaskWorkspace``, the upload writers
+      and ``files.py``'s containment checks use, because files have to be
+      found.
+
+    They agree on every spelling but one: a symlink followed by ``..``, where
+    the lexical form discards the symlink the physical form follows. That
+    configuration makes one logical directory two real ones, so an uploaded
+    file can land where the sandbox never mounted and agent tools cannot see
+    it. Rejecting the input is what lets each consumer keep its own
+    normalization: none has to defend against this, and a new consumer cannot
+    reintroduce it by picking the "wrong" one.
+
+    An ordinary symlink is untouched -- following one is not a disagreement,
+    both spellings still name a single directory.
+
+    Returns the absolutized value rather than the configured one, so callers
+    receive the path this check actually examined. A relative or
+    ``~``/``$VAR``-prefixed value is resolved against the environment as it
+    stands here; returning it unresolved would let a later ``os.chdir`` (the
+    Python execution tool does exactly that, process-wide, while a task runs)
+    move the directory out from under the guarantee.
+    """
+    from .sandbox.base import canonical_sandbox_path
+
+    raw = str(uploads_dir)
+    expanded = Path(os.path.expandvars(raw)).expanduser()
+    if expanded.is_absolute():
+        absolute = expanded
+    else:
+        # A relative value means whatever the working directory says, and this
+        # process changes it: the Python execution tool chdirs process-wide for
+        # the duration of a task's code. Pinning the first reading keeps one
+        # root for the process, so two callers cannot compose paths from two
+        # different directories depending on when they asked.
+        absolute = _pinned_relative_uploads_roots.setdefault(raw, Path.cwd() / expanded)
+    canonical = canonical_sandbox_path(str(absolute))
+    if os.path.realpath(canonical) != os.path.realpath(absolute):
+        # Name whichever variable actually produced this root, so the
+        # operator edits the one that is set.
+        source = UPLOADS_DIR if os.getenv(UPLOADS_DIR) else WEB_DIR
+        raise UploadsDirConfigurationError(
+            f"The uploads root {str(uploads_dir)!r} (from {source}) names two "
+            f"different directories depending on how it is normalized: "
+            f"lexically it is {canonical!r}, resolving to "
+            f"{os.path.realpath(canonical)!r}, while resolving the configured "
+            f"spelling directly gives {os.path.realpath(absolute)!r}. A '..' "
+            "segment after a symlink does that. Configure the directory you "
+            "actually mean."
+        )
+    return absolute
+
+
 def get_uploads_dir() -> Path:
     """Get the uploads directory path.
 
@@ -1112,16 +1207,29 @@ def get_uploads_dir() -> Path:
     1. XAGENT_UPLOADS_DIR environment variable
     2. Default to WEB_DIR/uploads for backward compatibility
 
+    Validated here rather than at each consumer: this is the root every
+    workspace, upload, knowledge-base and sandbox-mount path is composed
+    from, so one check covers all of them -- see
+    :func:`_require_unambiguous_uploads_dir`. The validation is on the value
+    this function returns, not on one of the two branches that produce it:
+    ``XAGENT_WEB_DIR`` reaches the uploads root just as directly as
+    ``XAGENT_UPLOADS_DIR`` does, and an ambiguous spelling in either is the
+    same ambiguity downstream.
+
     Returns:
         Path object for uploads directory
+
+    Raises:
+        UploadsDirConfigurationError: The resulting root's lexical and
+            physical normalizations name different directories.
     """
     env_dir = os.getenv(UPLOADS_DIR)
     if env_dir:
-        return Path(env_dir)
-
-    # Default: web/uploads
-    web_dir = get_web_dir()
-    return web_dir / "uploads"
+        uploads_dir = Path(env_dir)
+    else:
+        # Default: web/uploads
+        uploads_dir = get_web_dir() / "uploads"
+    return _require_unambiguous_uploads_dir(uploads_dir)
 
 
 def get_frontend_dist_dir() -> Path:

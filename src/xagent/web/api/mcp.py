@@ -33,7 +33,11 @@ from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
-from ..mcp_apps import get_all_mcp_apps, get_app_by_name
+from ..mcp_apps import (
+    get_all_mcp_apps,
+    get_app_by_name,
+    restrict_to_app_scoped_oauth_grant,
+)
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
@@ -1529,7 +1533,11 @@ def _enrich_oauth_server_info(
 
     provider = app_info.get("provider")
     app_id = app_info.get("id")
-    connected_account = oauth_emails.get(app_id) or oauth_emails.get(provider)
+    connected_account = None
+    for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
+        connected_account = oauth_emails.get(key)
+        if connected_account:
+            break
 
     return app_id, provider, connected_account
 
@@ -1586,7 +1594,9 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:
-    return _app_lookup_keys(app.get("id"), app.get("provider"))
+    return restrict_to_app_scoped_oauth_grant(
+        app.get("id"), _app_lookup_keys(app.get("id"), app.get("provider"))
+    )
 
 
 def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
@@ -2046,7 +2056,7 @@ def get_mcp_servers(
         oauth_emails = {
             str(oauth.provider): str(oauth.email)
             for oauth in oauth_accounts
-            if oauth.email
+            if oauth.email and _oauth_account_can_connect(oauth)
         }
 
         is_admin = getattr(current_user, "is_admin", False)
@@ -2158,7 +2168,9 @@ def get_mcp_server(
 
         oauth_accounts = db.query(UserOAuth).filter(UserOAuth.user_id == user_id).all()
         oauth_emails = {
-            oauth.provider: oauth.email for oauth in oauth_accounts if oauth.email
+            oauth.provider: oauth.email
+            for oauth in oauth_accounts
+            if oauth.email and _oauth_account_can_connect(oauth)
         }
 
         app_id, provider, connected_account = _enrich_oauth_server_info(
@@ -2813,13 +2825,54 @@ def delete_mcp_server(
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
 
-                # Delete tokens for this specific app
-                providers_to_delete = [p for p in [provider, app_id] if p is not None]
+                # Delete tokens for this specific app. For apps in
+                # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT this must stay
+                # symmetric with the app-scoped read path (_oauth_keys_for_app):
+                # deleting the bare provider row (e.g. "meta") would also
+                # disconnect any other app — Instagram — still relying on
+                # that shared grant.
+                providers_to_delete = restrict_to_app_scoped_oauth_grant(
+                    app_id, [provider, app_id]
+                )
                 if providers_to_delete:
                     db.query(UserOAuth).filter(
                         UserOAuth.user_id == user_id,
                         UserOAuth.provider.in_(providers_to_delete),
                     ).delete(synchronize_session=False)
+
+                # The app-scoped restriction above deliberately excluded the
+                # bare provider row (e.g. "meta") so a sibling app under the
+                # same provider (Instagram) keeps working. If this user has no
+                # other connected app sharing that provider, nothing needs
+                # that row anymore — delete it too rather than leaving an
+                # inert orphan token behind.
+                if provider and provider not in providers_to_delete:
+                    from ..mcp_apps import get_app_for_mcp_server
+
+                    other_servers = (
+                        db.query(MCPServer)
+                        .join(
+                            UserMCPServer,
+                            UserMCPServer.mcpserver_id == MCPServer.id,
+                        )
+                        .filter(
+                            UserMCPServer.user_id == user_id,
+                            MCPServer.id != server_id,
+                        )
+                        .all()
+                    )
+                    normalized_provider = _normalize_app_key(provider)
+                    sibling_still_connected = any(
+                        (sibling_app := get_app_for_mcp_server(db, other_server))
+                        and _normalize_app_key(sibling_app.get("provider"))
+                        == normalized_provider
+                        for other_server in other_servers
+                    )
+                    if not sibling_still_connected:
+                        db.query(UserOAuth).filter(
+                            UserOAuth.user_id == user_id,
+                            UserOAuth.provider == provider,
+                        ).delete(synchronize_session=False)
 
         # Remove user-server association
         db.delete(user_mcp)

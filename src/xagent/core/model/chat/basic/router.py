@@ -36,6 +36,7 @@ from typing import Any, AsyncIterator, Callable, List, Optional, cast
 
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
 from ....model import ChatModelConfig
+from ....task_runtime import normalize_input_modalities
 from ...providers import default_base_url_for_provider
 from ..types import StreamChunk
 from .base import BaseLLM
@@ -445,17 +446,40 @@ class RouterLLM(BaseLLM):
                 current_thinking = next_thinking
 
     # ---- Routing ------------------------------------------------------------
-    async def prepare_for_call(self, messages: list[dict[str, Any]]) -> BaseLLM:
+    async def prepare_for_call(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> BaseLLM:
         """Resolve one xrouter decision into a reusable per-call LLM.
 
         The returned wrapper keeps RouterLLM's compatibility retries without
         routing a second time, and carries the selected model's context window
         from xrouter's model profile catalog.
+
+        ``preferred_input_modalities`` supplied by the caller (task runtime
+        extensions) is *advisory*: a router that cannot honour it degrades by
+        routing without it. Modalities derived from the messages themselves are
+        hard requirements, because the conversation genuinely cannot be sent to
+        a model that does not accept them.
         """
-        preferred_input_modalities = self._preferred_input_modalities(messages)
+        required_input_modalities = self._preferred_input_modalities(messages)
+        advisory_input_modalities = tuple(
+            modality
+            for modality in dict.fromkeys(
+                normalize_input_modalities(preferred_input_modalities)
+            )
+            if modality not in required_input_modalities
+        )
+        route_input_modalities = (
+            *advisory_input_modalities,
+            *required_input_modalities,
+        )
         model_id, downstream = await self._resolve_route(
             messages,
-            preferred_input_modalities=preferred_input_modalities,
+            preferred_input_modalities=required_input_modalities,
+            advisory_input_modalities=advisory_input_modalities,
         )
         context_window = getattr(self, "context_window", None)
         if not context_window:
@@ -465,9 +489,7 @@ class RouterLLM(BaseLLM):
         if not context_window:
             context_window = getattr(downstream, "context_window", None)
         input_modalities = (
-            self._profile_input_modalities(model_id)
-            if preferred_input_modalities
-            else ()
+            self._profile_input_modalities(model_id) if route_input_modalities else ()
         )
         return _ResolvedRouterLLM(
             router=self,
@@ -482,6 +504,7 @@ class RouterLLM(BaseLLM):
         messages: list[dict[str, Any]],
         *,
         preferred_input_modalities: tuple[str, ...] = (),
+        advisory_input_modalities: tuple[str, ...] = (),
     ) -> tuple[str, BaseLLM]:
         # Route on the agent's current goal (the user's request, or a DAG step's
         # objective) rather than the scaffolded sub-prompt this particular LLM
@@ -489,13 +512,12 @@ class RouterLLM(BaseLLM):
         from ...intent import current_goal
 
         prompt = current_goal() or self._extract_prompt(messages)
+        select_kwargs: dict[str, Any] = {}
         if preferred_input_modalities:
-            model_id = await self._select_model(
-                prompt,
-                preferred_input_modalities=preferred_input_modalities,
-            )
-        else:
-            model_id = await self._select_model(prompt)
+            select_kwargs["preferred_input_modalities"] = preferred_input_modalities
+        if advisory_input_modalities:
+            select_kwargs["advisory_input_modalities"] = advisory_input_modalities
+        model_id = await self._select_model(prompt, **select_kwargs)
         logger.info("xrouter selected %s -> openrouter", model_id)
         if self._downstream_resolver is not None:
             # Reuse the user-configured OpenRouter model (credentials + base_url).
@@ -559,6 +581,7 @@ class RouterLLM(BaseLLM):
         prompt: str,
         *,
         preferred_input_modalities: tuple[str, ...] = (),
+        advisory_input_modalities: tuple[str, ...] = (),
     ) -> str:
         # The decision loads/embeds in-process and is CPU-bound, so run it in a
         # worker thread to avoid blocking the event loop.
@@ -567,6 +590,7 @@ class RouterLLM(BaseLLM):
                 self._route_sync,
                 prompt,
                 preferred_input_modalities,
+                advisory_input_modalities,
             )
         except RouterModalityRoutingError:
             raise
@@ -592,7 +616,16 @@ class RouterLLM(BaseLLM):
         self,
         prompt: str,
         preferred_input_modalities: tuple[str, ...] = (),
+        advisory_input_modalities: tuple[str, ...] = (),
     ) -> list[str]:
+        """Route once.
+
+        ``preferred_input_modalities`` are hard requirements derived from the
+        conversation's own content; ``advisory_input_modalities`` are
+        preferences declared by a task runtime extension. When the installed
+        router cannot express modality preferences at all, the hard
+        requirements raise while the advisory ones are simply dropped.
+        """
         service = _get_service()
         route_kwargs: dict[str, Any] = {"config_name": self._config_name}
         try:
@@ -606,8 +639,11 @@ class RouterLLM(BaseLLM):
                 for parameter in route_parameters.values()
             )
         )
-        if preferred_input_modalities and supports_modality_preferences:
-            route_kwargs["preferred_input_modalities"] = preferred_input_modalities
+        requested_modalities = tuple(
+            dict.fromkeys((*advisory_input_modalities, *preferred_input_modalities))
+        )
+        if requested_modalities and supports_modality_preferences:
+            route_kwargs["preferred_input_modalities"] = requested_modalities
         elif preferred_input_modalities:
             requested = ", ".join(preferred_input_modalities)
             raise RouterModalityRoutingError(
@@ -615,6 +651,15 @@ class RouterLLM(BaseLLM):
                 f"modalities ({requested}). Choose an explicit compatible model or "
                 "install an xrouter-llm build whose route() API accepts "
                 "preferred_input_modalities."
+            )
+        elif advisory_input_modalities:
+            # Advisory only: routing without the preference is a valid
+            # degradation, unlike a conversation that actually carries the
+            # unsupported modality.
+            logger.info(
+                "The installed xrouter-llm RoutingService cannot express input "
+                "modality preferences (%s); routing without them.",
+                ", ".join(advisory_input_modalities),
             )
         result = service.route(prompt, **route_kwargs)
         return list(result.get("selected") or [])

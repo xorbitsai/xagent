@@ -25,10 +25,33 @@ mcp = FastMCP("facebook-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
 
 
-def _page_path(page_id: str, suffix: str) -> str:
-    if not page_id.strip():
-        raise ValueError("page_id is required")
-    return f"/{quote(page_id.strip(), safe='')}/{suffix}"
+def _graph_path(value: Any, name: str, suffix: str) -> str:
+    if not value or not str(value).strip():
+        raise ValueError(f"{name} is required")
+    return f"/{quote(str(value).strip(), safe='')}/{suffix}"
+
+
+_POST_FIELDS_BASE = "id,message,created_time,permalink_url,full_picture,status_type"
+_POST_FIELDS_WITH_ENGAGEMENT = (
+    f"{_POST_FIELDS_BASE},likes.limit(0).summary(true),"
+    "comments.limit(0).summary(true),shares"
+)
+
+
+def _is_permission_error(error: GraphAPIError) -> bool:
+    """Whether a GraphAPIError indicates a missing OAuth permission/scope.
+
+    Used to decide whether the engagement-fields fallback in
+    facebook_list_page_posts should mask the error as
+    engagement_available=False, versus letting a non-permission error (e.g. a
+    transient failure or rate limit) surface as a genuine failure instead of
+    being silently reported as "no engagement data".
+    """
+    details = error.details
+    error_body = details.get("error") if isinstance(details, dict) else None
+    if not isinstance(error_body, dict):
+        return False
+    return error_body.get("type") == "OAuthException" or error_body.get("code") == 10
 
 
 def _normalize_page(page: dict[str, Any]) -> dict[str, Any]:
@@ -101,27 +124,85 @@ def facebook_list_pages() -> str:
 
 @mcp.tool()
 def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
-    """List recent posts for a Facebook Page by page_id."""
+    """List recent posts for a Facebook Page by page_id, including like/comment/share
+    counts. If the connected token lacks pages_read_user_content, falls back to
+    posts without those counts (engagement_available=false) instead of failing
+    outright — the Graph API can reject the whole request when a field in a
+    combined fields= expansion needs a permission the token doesn't have.
+    """
     try:
         page_token = _page_access_token(page_id)
-        result = _graph_request(
-            "GET",
-            _page_path(page_id, "feed"),
-            token=page_token,
-            params={
-                "fields": "id,message,created_time,permalink_url,full_picture,status_type",
-                "limit": _bounded_limit(limit),
-            },
-        )
+        path = _graph_path(page_id, "page_id", "feed")
+        bounded_limit = _bounded_limit(limit)
+        engagement_available = True
+        try:
+            result = _graph_request(
+                "GET",
+                path,
+                token=page_token,
+                params={"fields": _POST_FIELDS_WITH_ENGAGEMENT, "limit": bounded_limit},
+            )
+        except GraphAPIError as engagement_error:
+            if not _is_permission_error(engagement_error):
+                raise
+            logger.warning(
+                "Falling back to Facebook posts without engagement counts for "
+                "page %s: %s",
+                page_id,
+                engagement_error,
+            )
+            engagement_available = False
+            result = _graph_request(
+                "GET",
+                path,
+                token=page_token,
+                params={"fields": _POST_FIELDS_BASE, "limit": bounded_limit},
+            )
         return _success(
             posts=result.get("data", []),
-            next_link=result.get("paging", {}).get("next"),
+            next_link=(result.get("paging") or {}).get("next"),
+            engagement_available=engagement_available,
         )
     except GraphAPIError as e:
         logger.error("Error listing Facebook Page posts for %s: %s", page_id, e)
         return _graph_error(e)
     except Exception as e:
         logger.error("Error listing Facebook Page posts for %s: %s", page_id, e)
+        return _error(str(e))
+
+
+@mcp.tool()
+def facebook_list_post_comments(page_id: str, post_id: str, limit: int = 10) -> str:
+    """List comments on a Facebook Page post.
+
+    post_id is the composite Graph API id ("{page_id}_{post_id}"), e.g. the
+    "id" field returned by facebook_list_page_posts — not the numeric post
+    suffix alone. Returns the full flattened comment stream, including
+    replies to other comments, not just top-level ones; each comment's
+    "parent" field distinguishes a reply (its "id") from a top-level comment
+    (absent).
+    """
+    try:
+        page_token = _page_access_token(page_id)
+        result = _graph_request(
+            "GET",
+            _graph_path(post_id, "post_id", "comments"),
+            token=page_token,
+            params={
+                "fields": "id,message,created_time,from,parent",
+                "filter": "stream",
+                "limit": _bounded_limit(limit),
+            },
+        )
+        return _success(
+            comments=result.get("data", []),
+            next_link=(result.get("paging") or {}).get("next"),
+        )
+    except GraphAPIError as e:
+        logger.error("Error listing comments for post %s: %s", post_id, e)
+        return _graph_error(e)
+    except Exception as e:
+        logger.error("Error listing comments for post %s: %s", post_id, e)
         return _error(str(e))
 
 
@@ -134,7 +215,7 @@ def facebook_publish_text_post(page_id: str, message: str) -> str:
         page_token = _page_access_token(page_id)
         result = _graph_request(
             "POST",
-            _page_path(page_id, "feed"),
+            _graph_path(page_id, "page_id", "feed"),
             token=page_token,
             data={"message": message},
         )
@@ -168,7 +249,7 @@ def facebook_publish_image_post(
 
         result = _graph_request(
             "POST",
-            _page_path(page_id, "photos"),
+            _graph_path(page_id, "page_id", "photos"),
             token=page_token,
             data=data,
         )

@@ -17,6 +17,7 @@ from xagent.web.api.websocket import (
     _output_path_in_current_task_scope,
     _scope_segments_for_task,
 )
+from xagent.web.services.workspace_binding import _build_external_allowlist
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +61,68 @@ class TestAllowedExternalDirs:
         scope = ExecutionScope(isolate_external_dirs=True)
         dirs = _build_allowed_external_dirs(7, scope=scope)
         assert str(tmp_path / "user_7") in dirs
+
+
+class TestAllowedExternalDirsMatchesWorkspaceBinding:
+    """Two independent implementations of the same computation exist today:
+    ``chat._build_allowed_external_dirs`` (consumed by ``WebToolConfig``) and
+    ``workspace_binding._build_external_allowlist`` (the sandbox mount
+    intent's folding input) -- see the ``workspace_binding`` module
+    docstring for why they are not yet collapsed onto one. Pin them
+    equivalent across scope shapes so a change to one that silently
+    diverges from the other is caught here instead of only showing up as a
+    runtime access-policy/mount mismatch.
+    """
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            None,
+            ExecutionScope(workspace_segments=("tenant-a",)),
+            ExecutionScope(
+                workspace_segments=("tenant-a",), isolate_external_dirs=True
+            ),
+            ExecutionScope(isolate_external_dirs=True),
+            ExecutionScope(
+                sandbox_key_suffix="ca-1",
+                workspace_segments=("ca1", "actor7"),
+                sandbox_mount_segments=("ca1",),
+                isolate_external_dirs=True,
+            ),
+        ],
+    )
+    def test_equivalent_across_scope_shapes(self, monkeypatch, tmp_path, scope):
+        monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path))
+        # get_external_upload_dirs() only includes dirs that exist on disk.
+        external_dir = tmp_path.parent / f"{tmp_path.name}-shared-kb"
+        external_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("XAGENT_EXTERNAL_UPLOAD_DIRS", str(external_dir))
+
+        assert tuple(_build_allowed_external_dirs(7, scope=scope)) == tuple(
+            candidate.path for candidate in _build_external_allowlist(7, scope)
+        )
+
+    def test_provenance_marks_only_the_user_upload_dir_as_scope_derived(
+        self, monkeypatch, tmp_path
+    ):
+        """The folding input additionally carries each entry's provenance,
+        which is what decides whether an unfoldable candidate may become its
+        own bind. Only the scope-narrowed user upload dir is workspace
+        derived; deployment external dirs are operator-declared mounts."""
+        monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path))
+        external_dir = tmp_path.parent / f"{tmp_path.name}-shared-kb"
+        external_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("XAGENT_EXTERNAL_UPLOAD_DIRS", str(external_dir))
+
+        scope = ExecutionScope(
+            workspace_segments=("tenant-a",), isolate_external_dirs=True
+        )
+        candidates = _build_external_allowlist(7, scope)
+
+        assert [(c.path, c.origin) for c in candidates] == [
+            (str(tmp_path / "user_7" / "tenant-a"), "scope"),
+            (str(external_dir), "deployment"),
+        ]
 
 
 class TestScopeSegmentsForTask:

@@ -11,6 +11,10 @@ from ...config import get_compact_threshold_default, get_compact_threshold_ratio
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY
 from ..model.intent import enter_goal, exit_goal
+from ..task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
 from ..workspace import WorkspaceManager
 from .checkpoint import read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
@@ -86,6 +90,7 @@ class AgentRunner:
             )
         if checkpoint and isinstance(checkpoint.get("context"), dict):
             context = ExecutionContext.from_dict(checkpoint["context"])
+            self._merge_context_metadata(context, metadata, restored=True)
             self.context_manager.set_context(context)
             execution_id = context.execution_id
             workspace = None
@@ -622,15 +627,9 @@ class AgentRunner:
         # is restored verbatim from the checkpoint, so a context-window or ratio
         # change made after checkpointing only affects newly started tasks.
         context.compact_config.threshold = self._resolve_compact_threshold()
-        if metadata:
-            context.metadata.update(metadata)
+        self._merge_context_metadata(context, metadata)
         if task:
             context.metadata.setdefault("task", task)
-        request_context = (
-            metadata.get("request_context") if isinstance(metadata, dict) else None
-        )
-        if isinstance(request_context, dict):
-            self._apply_request_context(context, request_context)
 
         memory_session = await self._resolve_memory_session(
             execution_id=execution_id,
@@ -642,6 +641,50 @@ class AgentRunner:
             context.attach_memory_session(memory_id, snapshot)
 
         return context, workspace
+
+    def _merge_context_metadata(
+        self,
+        context: ExecutionContext,
+        metadata: dict[str, Any] | None,
+        *,
+        restored: bool = False,
+    ) -> None:
+        """Overlay current-run metadata on new or checkpoint-restored context."""
+
+        if metadata is None:
+            return
+        if restored:
+            # Symmetric with the fresh-context branch below: the current run's
+            # metadata is authoritative for the modality preference, so an
+            # absent key clears any checkpointed value rather than keeping it.
+            preferred_modalities = normalize_input_modalities(
+                metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
+            )
+            if preferred_modalities:
+                context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                    preferred_modalities
+                )
+            else:
+                context.metadata.pop(
+                    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+                    None,
+                )
+            return
+
+        current_metadata = dict(metadata)
+        preferred_modalities = normalize_input_modalities(
+            current_metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
+        )
+        if preferred_modalities:
+            context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
+        else:
+            context.metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, None)
+        context.metadata.update(current_metadata)
+        request_context = metadata.get("request_context")
+        if isinstance(request_context, dict):
+            self._apply_request_context(context, request_context)
 
     def _resolve_compact_threshold(self) -> int:
         """Derive the context-compaction threshold from the model's context window.

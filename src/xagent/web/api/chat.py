@@ -35,17 +35,26 @@ from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
+from ...core.task_runtime import (
+    EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    TaskRuntimeClientError,
+    TaskRuntimeContext,
+)
 from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
 )
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
-from ...core.workspace import scoped_user_root
+from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
-from ..models.database import get_db, release_db_connection_if_clean
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
@@ -84,6 +93,7 @@ from ..services.hot_path_cache import (
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
+from ..services.task_deletion import purge_task_rows
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
     materialize_task_execution_recovery_state,
@@ -99,6 +109,18 @@ from ..services.task_lease_service import (
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
 )
+from ..services.task_runtime import (
+    TaskRuntimeExtensionError,
+    agent_config_with_task_extension_bindings,
+    build_task_runtime,
+    create_task_extensions,
+    delete_task_extensions,
+    get_task_runtime_public_metadata,
+    registered_task_extensions,
+    sanitize_client_agent_config,
+    task_extension_bindings_from_agent_config,
+    validate_task_extension_requests,
+)
 from ..services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskOwnerMismatchError,
@@ -110,6 +132,10 @@ from ..services.workforce_runtime import (
     release_task_lease_with_workforce_sync,
     resolve_workforce_task_runtime,
     sync_workforce_run_status_for_task_id_isolated,
+)
+from ..services.workspace_binding import (
+    build_chat_workspace_binding,
+    canonical_workspace_base,
 )
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -134,10 +160,10 @@ def _build_task_agent_config(
     selected_file_ids: list[str],
 ) -> Optional[Dict[str, Any]]:
     """Build task agent_config with server-owned selected file ids."""
-    task_agent_config: Dict[str, Any] = {}
-    if isinstance(request_agent_config, dict):
-        task_agent_config.update(request_agent_config)
-        task_agent_config.pop("selected_file_ids", None)
+    task_agent_config: Dict[str, Any] = sanitize_client_agent_config(
+        request_agent_config
+    )
+    task_agent_config.pop("selected_file_ids", None)
     if selected_file_ids:
         task_agent_config["selected_file_ids"] = selected_file_ids
     return task_agent_config or None
@@ -501,9 +527,12 @@ def _build_allowed_external_dirs(
             if scope is not None and scope.isolate_external_dirs
             else ()
         )
-        user_upload_dir = scoped_user_root(get_uploads_dir(), user_id, segments)
-        if not only_existing or user_upload_dir.exists():
-            dirs.append(str(user_upload_dir))
+        # Probe the same spelling that gets appended: with a symlinked
+        # uploads dir the raw and canonical spellings can name different
+        # directories, and the gate has to answer for the one handed on.
+        user_upload_dir = canonical_workspace_base(user_id, segments)
+        if not only_existing or Path(user_upload_dir).exists():
+            dirs.append(user_upload_dir)
     dirs.extend([str(d) for d in get_external_upload_dirs()])
     return dirs
 
@@ -551,6 +580,7 @@ async def create_default_tools(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[List[int]] = None,
     scope: Optional[ExecutionScope] = None,
+    task_runtime_context: TaskRuntimeContext | None = None,
     connector_runtime_turn_id: Optional[str] = None,
     mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
     mcp_load_summary_tracer: Optional[Any] = None,
@@ -596,9 +626,7 @@ async def create_default_tools(
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
         workspace_config={
-            "base_dir": str(
-                scoped_user_root(get_uploads_dir(), owner_id, scope_segments)
-            ),
+            "base_dir": canonical_workspace_base(owner_id, scope_segments),
             "task_id": task_id,
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
@@ -641,11 +669,136 @@ async def create_default_tools(
 
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
+    runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
+    if task_runtime_context is not None and registered_task_extensions():
+        try:
+            workspace = await asyncio.to_thread(
+                ToolFactory.create_workspace,
+                tool_config.get_workspace_config(),
+            )
+            tool_config.set_task_runtime_workspace(workspace)
+            runtime_contribution = await build_task_runtime(
+                task_runtime_context.with_workspace(workspace)
+            )
+        except TaskRuntimeExtensionError as exc:
+            # Runtime tools are optional enrichment. A broken out-of-tree
+            # provider must not prevent every task from constructing its core
+            # tool set; lifecycle and metadata endpoints remain fail-closed.
+            logger.error(
+                "Ignoring failed task runtime contribution from extension '%s' "
+                "while building tools for task %s",
+                exc.extension,
+                task_id,
+                exc_info=True,
+            )
+        except Exception:
+            logger.exception(
+                "Ignoring unexpected task runtime setup failure while building "
+                "tools for task %s",
+                task_id,
+            )
+    tool_config.set_task_runtime_contribution(runtime_contribution)
+
     # Use ToolFactory to create proper xagent tools
     tools = await ToolFactory.create_all_tools(tool_config)
 
     logger.info(f"Created {len(tools)} default tools using ToolFactory")
     return tools, tool_config
+
+
+def _task_runtime_context(
+    *,
+    task_id: int,
+    user_id: int,
+    source: Any,
+) -> TaskRuntimeContext:
+    return TaskRuntimeContext(
+        task_id=task_id,
+        user_id=user_id,
+        source=str(source) if source is not None else None,
+        session_factory=get_session_local(),
+    )
+
+
+def _task_runtime_context_for_tool_build(
+    *,
+    task_id: int,
+    user_id: int,
+    source: Any,
+) -> TaskRuntimeContext | None:
+    """Avoid constructing a DB session factory on the no-provider hot path."""
+
+    if not registered_task_extensions():
+        return None
+    return _task_runtime_context(
+        task_id=task_id,
+        user_id=user_id,
+        source=source,
+    )
+
+
+def _compensate_failed_task_extension_create(
+    db: Session,
+    *,
+    task_id: int,
+) -> None:
+    """Remove a just-created task after provider binding setup failed."""
+
+    db.rollback()
+    deleted = purge_task_rows(db, task_id=task_id)
+    db.commit()
+    if deleted:
+        invalidate_task_cache(task_id)
+
+
+def _load_task_delete_snapshot_sync(
+    *,
+    task_id: int,
+    requester_user_id: int,
+    is_admin: bool,
+) -> tuple[str, int, Any, tuple[str, ...]] | None:
+    """Load detached delete inputs without sharing the request session.
+
+    The fourth element is the task's runtime-extension binding record, so
+    provider cleanup dispatches only to providers this task actually bound to.
+    """
+
+    session_factory = get_session_local()
+    delete_db = session_factory()
+    try:
+        query = delete_db.query(Task).filter(Task.id == task_id)
+        if not is_admin:
+            query = query.filter(Task.user_id == requester_user_id)
+        task = query.first()
+        if task is None:
+            return None
+        return (
+            str(task.title),
+            int(task.user_id),
+            task.source,
+            task_extension_bindings_from_agent_config(task.agent_config),
+        )
+    finally:
+        delete_db.close()
+
+
+def _delete_task_sync(*, task_id: int) -> bool:
+    """Delete one task in an operation-local session."""
+
+    session_factory = get_session_local()
+    delete_db = session_factory()
+    try:
+        deleted = purge_task_rows(delete_db, task_id=task_id)
+        if not deleted:
+            delete_db.rollback()
+            return False
+        delete_db.commit()
+        return True
+    except Exception:
+        delete_db.rollback()
+        raise
+    finally:
+        delete_db.close()
 
 
 def _selected_file_ids_from_agent_config(
@@ -961,6 +1114,15 @@ class AgentServiceManager:
         # under a different user (e.g. once built with the wrong identity).
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
+        # Lease provider each cached AgentService's sandbox tools were built
+        # against, keyed the same as ``_agent_sandbox_keys`` (same lifetime,
+        # always written/popped together). Lets ``_acquire_sandbox_task``
+        # attach by object identity (``SandboxManager.attach_provider``)
+        # instead of by key existence alone, so a provider that was replaced
+        # by a rebuild (mismatch reconcile, sweep, capacity eviction,
+        # release-to-zero) is caught even though the key still resolves to a
+        # live -- but different -- provider (ABA).
+        self._agent_sandbox_providers: Dict[int, Any] = {}
         # ExecutionScope fingerprint each cached AgentService was built
         # under (None sentinel = unscoped). Sandbox keys and workspace
         # paths are baked in at build time, so a task reassigned to a
@@ -1000,13 +1162,24 @@ class AgentServiceManager:
         owner-only key would silently miss a scope-suffixed sandbox and
         skip the ref-count attach.
 
+        When a lease provider was recorded alongside the key, attaches by
+        object identity (``SandboxManager.attach_provider``) rather than
+        key existence alone: the key can still resolve to a live provider
+        after the original one was replaced by a rebuild (mismatch
+        reconcile, sweep, capacity eviction, release-to-zero), and identity
+        is the only way to catch that the cached agent's tools were built
+        against the now-superseded object (ABA). Falls back to the
+        existence-only ``attach()`` when no provider was recorded (e.g. a
+        cache entry from before this field existed).
+
         Raises:
             RuntimeError: The task's agent was built with a sandbox lease
-                provider (recorded key) that has since been reclaimed by
-                the idle sweep or capacity eviction. Running anyway would
-                hit deleted containers with cryptic tool errors; failing
-                clearly lets a retry rebuild the agent and transparently
-                recreate the sandbox.
+                provider (recorded key, or key+provider) that has since
+                been reclaimed or replaced by the idle sweep, capacity
+                eviction, or a reconcile rebuild. Running anyway would hit
+                deleted containers or a torn-down provider with cryptic
+                tool errors; failing clearly lets a retry rebuild the agent
+                and transparently recreate the sandbox.
         """
         if task_id is None:
             return None
@@ -1026,7 +1199,14 @@ class AgentServiceManager:
             return None
 
         lifecycle_type, lifecycle_id = self._parse_sandbox_key(sandbox_key)
-        if await sandbox_mgr.attach(lifecycle_type, lifecycle_id):
+        provider = self._agent_sandbox_providers.get(task_key)
+        if provider is not None:
+            attached = await sandbox_mgr.attach_provider(
+                lifecycle_type, lifecycle_id, provider
+            )
+        else:
+            attached = await sandbox_mgr.attach(lifecycle_type, lifecycle_id)
+        if attached:
             return sandbox_key
 
         # Evict the stale cached agent so a retry rebuilds its tools
@@ -1034,6 +1214,7 @@ class AgentServiceManager:
         self._agents.pop(task_key, None)
         self._agent_owner_ids.pop(task_key, None)
         self._agent_sandbox_keys.pop(task_key, None)
+        self._agent_sandbox_providers.pop(task_key, None)
         self._agent_scope_fingerprints.pop(task_key, None)
         raise RuntimeError(
             f"The sandbox for task {task_key} was reclaimed before "
@@ -1063,6 +1244,7 @@ class AgentServiceManager:
             self._agents.pop(task_key, None)
             self._agent_owner_ids.pop(task_key, None)
             self._agent_sandbox_keys.pop(task_key, None)
+            self._agent_sandbox_providers.pop(task_key, None)
             self._agent_scope_fingerprints.pop(task_key, None)
             logger.info(
                 "Evicted cached AgentService for task %s after releasing sandbox %s",
@@ -1075,8 +1257,9 @@ class AgentServiceManager:
         *,
         task_id: int,
         workspace_owner_id: int,
-        workspace_config: Mapping[str, Any],
+        mount_intent: Optional[SandboxMountIntent],
         scope: Optional[ExecutionScope] = None,
+        prepare_root: Optional[str] = None,
     ) -> Any | None:
         """Get the task's sandbox lease provider, or None for local execution.
 
@@ -1085,11 +1268,25 @@ class AgentServiceManager:
         scope under the same platform user. Unscoped execution keeps
         producing ``user:{owner}`` and reuses today's containers untouched.
 
-        Capacity exhaustion and sandbox-service unavailability are distinct
-        failure classes. For **unscoped** execution the historical behavior is
-        kept: a ``SandboxCapacityError`` rejects the task by default (opt-in
-        local fallback via XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY),
-        and any other sandbox failure falls back to local execution.
+        ``prepare_root`` (``ChatWorkspaceBinding.prepare_root``) is the
+        on-host directory that must exist for this task's own files — the
+        pre-fold mount root, which folding may have re-rooted ``mount_intent``
+        onto a shallower, shared ancestor (see ``build_chat_workspace_binding``).
+
+        Capacity exhaustion, sandbox lifecycle contract violations, and
+        general sandbox-service unavailability are distinct failure classes.
+        For **unscoped** execution the historical behavior is kept for the
+        latter two: a ``SandboxCapacityError`` rejects the task by default
+        (opt-in local fallback via
+        XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY), and a non-contract
+        sandbox failure falls back to local execution. A ``SandboxContractError``
+        (runtime-config conflict, recovery-required state, or any other
+        explicit lifecycle contract violation) never falls back to local
+        execution for either scoped or unscoped tasks: it means the desired
+        mount/runtime spec could not be honored as requested, and running
+        the task unsandboxed on the host would silently defeat that request
+        rather than surface it — the observable outcome is a failed task,
+        not a quiet downgrade.
 
         A scope that carries a ``sandbox_key_suffix`` isolates an untrusted /
         third-party workload in a per-scope container; running it outside that
@@ -1099,20 +1296,31 @@ class AgentServiceManager:
         with the opt-in flag on) nor a sandbox-service failure may downgrade
         such a task to local execution. A scope *without* a suffix shares the
         unscoped ``user:{owner}`` container and thus has no isolation to
-        protect; it keeps the unscoped fallback behavior.
+        protect; it keeps the unscoped fallback behavior for non-contract
+        failures.
 
         Raises:
             SandboxCapacityError: The container cap is reached, nothing is
                 evictable, and (for a task with no scope suffix) local fallback
                 on capacity is not enabled, or the scope carries a suffix.
-            Exception: A suffix-scoped execution hit a non-capacity sandbox
-                failure; re-raised instead of falling back to local execution.
+            SandboxContractError: The sandbox lifecycle contract was violated
+                (e.g. a runtime-config conflict or a container that needs
+                recovery before use); re-raised for both scoped and unscoped
+                tasks, never downgraded to local execution.
+            Exception: A suffix-scoped execution hit a non-capacity,
+                non-contract sandbox failure; re-raised instead of falling
+                back to local execution.
         """
-        from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
+        from ..sandbox_manager import (
+            SandboxCapacityError,
+            SandboxContractError,
+            get_sandbox_manager,
+        )
 
         sandbox_mgr = get_sandbox_manager()
         if not sandbox_mgr:
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             return None
 
         # The isolation boundary is the per-scope key suffix, not
@@ -1127,10 +1335,12 @@ class AgentServiceManager:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
                 USER_LIFECYCLE_TYPE,
                 make_user_lifecycle_id(workspace_owner_id, suffix),
-                workspace_config=workspace_config,
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
         except SandboxCapacityError as e:
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             from ...config import get_sandbox_allow_local_fallback_on_capacity
 
             if not scoped and get_sandbox_allow_local_fallback_on_capacity():
@@ -1151,8 +1361,36 @@ class AgentServiceManager:
                 e,
             )
             raise
+        except SandboxContractError as e:
+            # Fail closed for scoped and unscoped tasks alike: a contract
+            # violation means the desired mount/runtime spec could not be
+            # honored, and the local-execution fallback below exists for
+            # sandbox-service *unavailability*, not for a misconfigured or
+            # conflicting spec. Silently running such a task on the host
+            # would be a bigger surprise than failing the task outright.
+            #
+            # One documented exception, and it is not a downgrade: a *worker*
+            # slot that cannot be provisioned degrades to its own lifecycle's
+            # primary sandbox (``SandboxLeaseProvider.get_worker_sandbox``),
+            # the same correctly scoped container this task already holds.
+            # That costs a concurrency slot, never a trust boundary. What
+            # reaches this handler is the task's own sandbox, where there is
+            # nothing safe to degrade to.
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            logger.error(
+                "Sandbox lifecycle contract violated for task %s (workspace "
+                "owner %s, scoped=%s); failing closed instead of falling "
+                "back to local execution: %s",
+                task_id,
+                workspace_owner_id,
+                scoped,
+                e,
+            )
+            raise
         except Exception as e:
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             if scoped:
                 logger.error(
                     "Sandbox creation failed for scoped task %s (workspace "
@@ -1174,6 +1412,7 @@ class AgentServiceManager:
         self._agent_sandbox_keys[task_id] = make_user_sandbox_key(
             workspace_owner_id, suffix
         )
+        self._agent_sandbox_providers[task_id] = sandbox
         return sandbox
 
     async def _release_sandbox_task(self, sandbox_key: Optional[str]) -> None:
@@ -1603,25 +1842,10 @@ class AgentServiceManager:
             agent_config, workforce_runtime, task_id=task_id
         )
         workspace_owner_id = int(task.user_id)
-        scope_segments = scope.workspace_segments if scope is not None else ()
-        # The sandbox bind mount covers the scope's mount prefix (the full
-        # workspace_segments when no prefix is declared); the deeper
-        # workspace subtree lives inside it but is NOT isolated from a
-        # co-mounted sibling — the rw mount and the code-execution tools
-        # bypass scoped_user_root, so a mount prefix must only group scopes
-        # of the same trust principal (see ExecutionScope.sandbox_mount_segments).
-        mount_segments = scope.effective_mount_segments if scope is not None else ()
-        sandbox_workspace_config = {
-            "base_dir": str(
-                scoped_user_root(get_uploads_dir(), workspace_owner_id, mount_segments)
-            ),
-            "task_id": f"web_task_{task_id}",
-            "user_id": workspace_owner_id,
-            "allowed_external_dirs": _build_allowed_external_dirs(
-                workspace_owner_id, scope=scope
-            ),
-            "scope_segments": scope_segments,
-        }
+        # Actor-logical access policy + CA-physical mount intent, built by
+        # the single shared projection (see build_chat_workspace_binding's
+        # docstring for the covered/covering/disjoint folding it applies).
+        workspace_binding = build_chat_workspace_binding(workspace_owner_id, scope)
 
         # Sandbox startup is container/network work that can take seconds;
         # don't hold this session's read transaction (and its pool slot)
@@ -1631,8 +1855,9 @@ class AgentServiceManager:
         sandbox = await self._get_or_create_task_sandbox(
             task_id=task_id,
             workspace_owner_id=workspace_owner_id,
-            workspace_config=sandbox_workspace_config,
+            mount_intent=workspace_binding.mount_intent,
             scope=scope,
+            prepare_root=workspace_binding.prepare_root,
         )
 
         return await create_default_tools(
@@ -1642,6 +1867,11 @@ class AgentServiceManager:
             task_id=f"web_task_{task_id}",
             workspace_owner_id=int(task.user_id),
             scope=scope,
+            task_runtime_context=_task_runtime_context_for_tool_build(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                source=getattr(task, "source", None),
+            ),
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
             else None,
@@ -1839,6 +2069,7 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
 
         # Scope invariant: the cached instance baked its sandbox key (and,
@@ -1879,6 +2110,7 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
 
         if task_id not in self._agents:
@@ -2004,6 +2236,7 @@ class AgentServiceManager:
                         self._agents.pop(task_id, None)
                         self._agent_owner_ids.pop(task_id, None)
                         self._agent_sandbox_keys.pop(task_id, None)
+                        self._agent_sandbox_providers.pop(task_id, None)
                         self._agent_scope_fingerprints.pop(task_id, None)
                         raise
                     except Exception as e:
@@ -2015,6 +2248,7 @@ class AgentServiceManager:
                             del self._agents[task_id]
                             self._agent_owner_ids.pop(task_id, None)
                             self._agent_sandbox_keys.pop(task_id, None)
+                            self._agent_sandbox_providers.pop(task_id, None)
                             self._agent_scope_fingerprints.pop(task_id, None)
                         if is_database_pool_timeout(e):
                             raise
@@ -2257,34 +2491,20 @@ class AgentServiceManager:
                     if db is not None and task is not None
                     else None
                 )
-                workspace_owner_id = (
-                    int(task.user_id)
-                    if task and task.user_id is not None
-                    else int(runtime_user.id)
-                )
+                # ``runtime_user_id`` is resolved from the persisted task owner
+                # above and remains authoritative even when this path uses a
+                # detached snapshot rather than a live ``Task`` ORM object.
+                if runtime_user_id is None:
+                    raise ValueError(f"Task {task_id} has no resolved owner")
+                workspace_owner_id = int(runtime_user_id)
                 scope_segments = scope.workspace_segments if scope is not None else ()
-                # Sandbox mount covers the scope's mount prefix (full
-                # workspace_segments when no prefix is declared); the deeper
-                # subtree is NOT isolated from a co-mounted sibling (rw mount,
-                # code-execution tools bypass scoped_user_root), so a mount
-                # prefix must only group scopes of the same trust principal
-                # (see ExecutionScope.sandbox_mount_segments).
-                mount_segments = (
-                    scope.effective_mount_segments if scope is not None else ()
+                # Actor-logical access policy + CA-physical mount intent,
+                # built by the single shared projection (see
+                # build_chat_workspace_binding's docstring for the
+                # covered/covering/disjoint folding it applies).
+                workspace_binding = build_chat_workspace_binding(
+                    workspace_owner_id, scope
                 )
-                sandbox_workspace_config = {
-                    "base_dir": str(
-                        scoped_user_root(
-                            get_uploads_dir(), workspace_owner_id, mount_segments
-                        )
-                    ),
-                    "task_id": f"web_task_{task_id}",
-                    "user_id": workspace_owner_id,
-                    "allowed_external_dirs": _build_allowed_external_dirs(
-                        workspace_owner_id, scope=scope
-                    ),
-                    "scope_segments": scope_segments,
-                }
 
                 # Sandbox startup is container/network work that can take
                 # seconds; don't hold this session's read transaction (and
@@ -2294,8 +2514,9 @@ class AgentServiceManager:
                 sandbox = await self._get_or_create_task_sandbox(
                     task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
-                    workspace_config=sandbox_workspace_config,
+                    mount_intent=workspace_binding.mount_intent,
                     scope=scope,
+                    prepare_root=workspace_binding.prepare_root,
                 )
 
                 tool_selection_spec = _build_tool_selection_spec_for_task(
@@ -2313,6 +2534,17 @@ class AgentServiceManager:
                     task_id=f"web_task_{task_id}",
                     workspace_owner_id=workspace_owner_id,
                     scope=scope,
+                    task_runtime_context=_task_runtime_context_for_tool_build(
+                        task_id=task_id,
+                        user_id=workspace_owner_id,
+                        source=getattr(
+                            task
+                            if task is not None
+                            else getattr(snapshot, "task", None),
+                            "source",
+                            None,
+                        ),
+                    ),
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
@@ -2398,10 +2630,8 @@ class AgentServiceManager:
                         pattern=task_pattern,  # Use pattern instead of use_dag_pattern
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
-                        workspace_base_dir=str(
-                            scoped_user_root(
-                                get_uploads_dir(), workspace_owner_id, scope_segments
-                            )
+                        workspace_base_dir=canonical_workspace_base(
+                            workspace_owner_id, scope_segments
                         ),  # Use user- (and scope-) isolated base directory
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
                         scope_segments=scope_segments,
@@ -2527,6 +2757,7 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
             self._agent_evicted_scope_fingerprints.pop(task_id, None)
             logger.info(f"Removed AgentService for task {task_id}")
@@ -3013,10 +3244,19 @@ class AgentServiceManager:
         """Clean up workspace directory for a task when agent is not in memory"""
         from ...core.workspace import TaskWorkspace
 
-        # Try the scoped workspace first (when a resolver maps this task to
-        # a scope), then the user-isolated workspace, then the legacy
-        # uploads-root fallback.
-        workspace_ids = []
+        workspace_id = f"web_task_{task_id}"
+
+        # Scoped workspace first (when a resolver maps this task to a scope),
+        # then the user-isolated one, then the legacy uploads-root fallback.
+        # One spelling per candidate: the uploads root is rejected at
+        # configuration time unless its two readings name the same directory
+        # (see ``config.get_uploads_dir``), so the canonical spelling and the
+        # raw one reach the same place and a second candidate would only
+        # re-probe what the first already probed. A tree written under a root
+        # spelling that configuration now refuses is not reachable from any
+        # spelling of the current value, so recovering it is an operator
+        # migration rather than a candidate this loop can enumerate.
+        base_dirs: list[str] = []
         if user_id:
             # Contextvar-first for the same reason as get_agent_for_task:
             # cleanup inside an activated turn reuses the turn's resolution.
@@ -3024,20 +3264,15 @@ class AgentServiceManager:
             if scope is None:
                 scope = resolve_execution_scope(task_id)
             segments = scope.workspace_segments if scope is not None else ()
-            if segments:
-                workspace_ids.append(
-                    (
-                        f"web_task_{task_id}",
-                        str(scoped_user_root(get_uploads_dir(), user_id, segments)),
-                    )
-                )
-            workspace_ids.append(
-                (
-                    f"web_task_{task_id}",
-                    str(scoped_user_root(get_uploads_dir(), user_id)),
-                )
-            )
-        workspace_ids.append((f"web_task_{task_id}", str(get_uploads_dir())))
+            for base_dir in (
+                canonical_workspace_base(user_id, segments),
+                canonical_workspace_base(user_id),
+            ):
+                if base_dir not in base_dirs:
+                    base_dirs.append(base_dir)
+        legacy_root = str(get_uploads_dir())
+        if legacy_root not in base_dirs:
+            base_dirs.append(legacy_root)
 
         # Build allowed external directories (user's upload directory for knowledge base files).
         # Use only_existing=True here because cleanup runs against on-disk state.
@@ -3045,21 +3280,26 @@ class AgentServiceManager:
             user_id, only_existing=True
         )
 
-        for workspace_id, base_dir in workspace_ids:
+        for base_dir in base_dirs:
+            # Probed before constructing: TaskWorkspace's constructor creates
+            # the workspace tree, so building one per candidate would make
+            # every probe succeed and delete a directory it had just created,
+            # leaving the task's real workspace untouched.
+            if not (Path(base_dir) / workspace_id).exists():
+                continue
+
             workspace = TaskWorkspace(
                 workspace_id, base_dir, allowed_external_dirs=allowed_external_dirs
             )
             workspace_path = str(workspace.workspace_dir)
-
-            if workspace.workspace_dir.exists():
-                logger.info(
-                    f"Found existing workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-                )
-                workspace.cleanup()
-                logger.info(
-                    f"Cleaned up workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-                )
-                break
+            logger.info(
+                f"Found existing workspace directory for task {task_id} (user {user_id}): {workspace_path}"
+            )
+            workspace.cleanup()
+            logger.info(
+                f"Cleaned up workspace directory for task {task_id} (user {user_id}): {workspace_path}"
+            )
+            break
         else:
             logger.info(
                 f"No workspace directory found for task {task_id} (user {user_id})"
@@ -3179,8 +3419,8 @@ class AgentServiceManager:
                     tracer=tracer,
                     system_prompt=system_prompt,
                     enable_workspace=True,
-                    workspace_base_dir=str(
-                        scoped_user_root(get_uploads_dir(), user_id, scope_segments)
+                    workspace_base_dir=canonical_workspace_base(
+                        user_id, scope_segments
                     ),
                     allowed_external_dirs=allowed_external_dirs,
                     scope_segments=scope_segments,
@@ -3273,6 +3513,28 @@ async def create_task(
 ) -> TaskCreateResponse:
     """Create new chat task"""
     try:
+        try:
+            # Pre-flight only. ``create_task_extensions`` validates again below,
+            # and both calls are needed:
+            #  * here, so an unregistered extension or an oversized
+            #    configuration is a 400 *before* the ``Task`` row is committed
+            #    and has to be compensated away again;
+            #  * there, because the service layer is the SSOT: SDK and internal
+            #    callers reach ``create_task_extensions`` without ever passing
+            #    through this endpoint, and it re-reads the registry immediately
+            #    before dispatching, so an extension unregistered between the
+            #    two points is rejected instead of dispatched.
+            # Do not delete either call as a "duplicate".
+            runtime_extension_requests = validate_task_extension_requests(
+                request.runtime_extensions
+            )
+        except (TypeError, ValueError) as exc:
+            logger.info("Rejected invalid task runtime extension request: %s", exc)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid task runtime extension request",
+            ) from exc
+
         # Build task description with file information
         task_description = request.description or ""
 
@@ -3601,8 +3863,78 @@ async def create_task(
                 )
             )
 
+        if runtime_extension_requests:
+            # Record which providers this task binds to *before* any hook runs,
+            # in the same transaction that creates the task. Deletion dispatches
+            # only to this set, so over-recording (a provider whose hook never
+            # completed) is safe -- ``on_task_deleted`` is required to be
+            # idempotent -- while under-recording would silently leak
+            # provider-owned state.
+            setattr(
+                task,
+                "agent_config",
+                agent_config_with_task_extension_bindings(
+                    task.agent_config,
+                    runtime_extension_requests.keys(),
+                ),
+            )
+
         db.commit()
         db.refresh(task)
+
+        runtime_context = _task_runtime_context(
+            task_id=int(task.id),
+            user_id=int(task.user_id),
+            source=task.source,
+        )
+        release_db_connection_if_clean(db)
+        try:
+            await create_task_extensions(
+                runtime_context,
+                runtime_extension_requests,
+            )
+        except TaskRuntimeExtensionError as exc:
+            task_id = int(task.id)
+            try:
+                _compensate_failed_task_extension_create(db, task_id=task_id)
+            except Exception:
+                logger.exception(
+                    "Failed to compensate task %s after runtime extension "
+                    "creation failure",
+                    task_id,
+                )
+            get_agent_manager(request).remove_agent(task_id, int(user.id))
+            if isinstance(exc.cause, TaskRuntimeClientError):
+                status_code = exc.cause.status_code
+                detail = exc.cause.detail
+            else:
+                status_code = 503
+                detail = "Service unavailable"
+                logger.exception(
+                    "Task runtime extension creation failed for task %s",
+                    task_id,
+                )
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+
+        # Public metadata is optional decoration on the create response. The
+        # binding has already been persisted successfully, so creation degrades
+        # to an empty mapping here; the dedicated GET endpoint remains
+        # fail-closed because metadata is its primary response.
+        runtime_extensions_status = "complete"
+        runtime_extensions_omitted: list[str] = []
+        try:
+            metadata_result = await get_task_runtime_public_metadata(runtime_context)
+            runtime_extensions = metadata_result.extensions
+            runtime_extensions_status = metadata_result.status
+            runtime_extensions_omitted = list(metadata_result.omitted_extensions)
+        except TaskRuntimeExtensionError:
+            logger.warning(
+                "Failed to load public runtime metadata for task %s",
+                task.id,
+                exc_info=True,
+            )
+            runtime_extensions = {}
+            runtime_extensions_status = "failed"
 
         return TaskCreateResponse(
             task_id=task.id,
@@ -3628,6 +3960,9 @@ async def create_task(
             run_id=task.run_id,
             state_version=int(task.state_version or 0),
             control_state=str(task.control_state or "idle"),
+            runtime_extensions=runtime_extensions,
+            runtime_extensions_status=runtime_extensions_status,
+            runtime_extensions_omitted=runtime_extensions_omitted,
         )
 
     except HTTPException:
@@ -4134,67 +4469,140 @@ async def update_task(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@chat_router.get("/task/{task_id}/runtime-extensions")
+async def get_task_runtime_extensions(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return live, provider-approved runtime metadata for one task.
+
+    Metadata is re-read from every registered runtime extension on each call
+    rather than served from the task row, so it reflects provider state now
+    instead of at creation time. Only fields a provider explicitly publishes
+    are returned; provider-internal state and secrets are never exposed.
+
+    Access follows normal task ownership: an admin may read any task, other
+    users only their own, and an unreadable or missing task is a 404.
+
+    Unlike ``POST /task/create``, where metadata is optional decoration, this
+    endpoint is fail-closed: a provider error is surfaced as its approved
+    client error (400/403) or a generic 500, never as partial data.
+
+    Response fields:
+        ``task_id``: the task the metadata belongs to.
+        ``runtime_extensions``: extension name to that provider's public
+            metadata object.
+        ``runtime_extensions_status``: ``complete`` when every registered
+            provider's metadata is included, ``truncated`` when some was
+            dropped to keep the response under its aggregate size cap.
+        ``runtime_extensions_omitted``: names dropped for that size cap.
+    """
+
+    query = db.query(Task).filter(Task.id == task_id)
+    if not user.is_admin:
+        query = query.filter(Task.user_id == user.id)
+    task = query.first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    context = _task_runtime_context(
+        task_id=int(task.id),
+        user_id=int(task.user_id),
+        source=task.source,
+    )
+    release_db_connection_if_clean(db)
+    try:
+        metadata_result = await get_task_runtime_public_metadata(context)
+    except TaskRuntimeExtensionError as exc:
+        if isinstance(exc.cause, TaskRuntimeClientError):
+            status_code = exc.cause.status_code
+            detail = exc.cause.detail
+        else:
+            status_code = 500
+            detail = "Internal server error"
+            logger.exception(
+                "Failed to load public runtime metadata for task %s",
+                task_id,
+            )
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return {
+        "task_id": task_id,
+        "runtime_extensions": metadata_result.extensions,
+        "runtime_extensions_status": metadata_result.status,
+        "runtime_extensions_omitted": list(metadata_result.omitted_extensions),
+    }
+
+
 @chat_router.delete("/task/{task_id}")
 async def delete_task(
     task_id: int,
     request: Any = None,
+    # Admin escape hatch: delete the core task rows even when a runtime
+    # extension that owns state for this task fails to release it. A plain
+    # default (not ``Query(...)``) keeps this callable directly from internal
+    # code and tests without picking up a truthy ``Query`` sentinel.
+    force: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Delete a task and all related data"""
     try:
-        # Run synchronous database queries in thread pool to avoid blocking event loop
-        def _delete_task_sync() -> Task:
-            # Get task - admin can delete any task, regular users can only delete their own
-            if user.is_admin:
-                task = db.query(Task).filter(Task.id == task_id).first()
-            else:
-                task = (
-                    db.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
-                    .first()
-                )
-            if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
+        requester_user_id = int(user.id)
+        is_admin = bool(user.is_admin)
+        if force and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Force delete requires admin access",
+            )
+        release_db_connection_if_clean(db)
+        task_snapshot = await asyncio.to_thread(
+            _load_task_delete_snapshot_sync,
+            task_id=task_id,
+            requester_user_id=requester_user_id,
+            is_admin=is_admin,
+        )
+        if task_snapshot is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        task_title, task_user_id, task_source, bound_extensions = task_snapshot
+        runtime_context = _task_runtime_context(
+            task_id=task_id,
+            user_id=task_user_id,
+            source=task_source,
+        )
 
-            # Delete related data in correct order to respect foreign key constraints
-            logger.info(f"Deleting task {task_id} and all related data")
-
-            # Delete task-owned rows that do not all have DB-level cascades.
-            from ..models.task import (
-                DAGExecution,
-                TraceCheckpointBlob,
-                TraceEvent,
-                TraceMessageBlob,
+        try:
+            # Only the providers this task actually bound to are dispatched, so
+            # an unrelated broken extension cannot block deletion.
+            unreleased = await delete_task_extensions(
+                runtime_context,
+                bound_extensions=bound_extensions,
+                force=force,
+            )
+        except TaskRuntimeExtensionError as exc:
+            logger.error(
+                "Runtime extension cleanup failed; preserving task %s for retry",
+                task_id,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=("Runtime extension cleanup failed; the task was not deleted"),
+            ) from exc
+        if unreleased:
+            logger.error(
+                "Deleting task %s with unreleased runtime extension state for %s",
+                task_id,
+                ", ".join(unreleased),
             )
 
-            db.query(TraceCheckpointBlob).filter(
-                TraceCheckpointBlob.task_id == task_id
-            ).delete(synchronize_session=False)
-            db.query(TraceMessageBlob).filter(
-                TraceMessageBlob.task_id == task_id
-            ).delete(synchronize_session=False)
-            db.query(TraceEvent).filter(TraceEvent.task_id == task_id).delete(
-                synchronize_session=False
-            )
-            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).delete(
-                synchronize_session=False
-            )
-
-            # Note: tool_usages, agents, and agent_tools tables have been removed
-
-            # Delete the task itself
-            db.delete(task)
-            db.commit()
-
-            return task
-
-        # Execute database operations in thread pool to avoid blocking
-        task = await asyncio.to_thread(_delete_task_sync)
+        deleted = await asyncio.to_thread(_delete_task_sync, task_id=task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Task no longer exists")
         invalidate_task_cache(task_id)
 
         # Remove agent from manager if it exists
-        get_agent_manager(request).remove_agent(task_id, int(user.id))
+        get_agent_manager(request).remove_agent(task_id, requester_user_id)
 
         from .websocket import background_task_manager, manager
 
@@ -4214,7 +4622,7 @@ async def delete_task(
 
         return {
             "success": True,
-            "message": f"Task '{task.title}' deleted successfully",
+            "message": f"Task '{task_title}' deleted successfully",
             "task_id": task_id,
         }
 
@@ -4223,7 +4631,7 @@ async def delete_task(
     except Exception as e:
         logger.error(f"Delete task failed: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @chat_router.get("/workspace/{task_id}/files")

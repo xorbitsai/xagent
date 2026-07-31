@@ -655,6 +655,7 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "pages_show_list",
             "pages_read_engagement",
             "pages_manage_posts",
+            "pages_read_user_content",
         ]
         assert facebook_app.launch_config == {
             "command": "python",

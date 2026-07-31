@@ -19,6 +19,7 @@ const en = {
     resume: "Resume",
     executing: "Executing",
     planning: "Formulating Plan",
+    thinking: "Thinking",
     taskPaused: "Task Paused",
     waitingForUser: "Waiting for your response",
     noData: "No Data",
@@ -35,9 +36,11 @@ const en = {
     create: "Create",
     edit: "Edit",
     done: "Done",
+    statusDone: "Done",
     customPlaceholder: "Custom...",
     errors: {
       unknown: "Unknown error",
+      taskFailed: "Something went wrong. Please try again.",
     },
   },
   voiceInput: {
@@ -467,6 +470,7 @@ Build when you need.`,
   },
   widgetChat: {
     title: "AI Assistant",
+    newConversation: "New conversation",
     status: {
       initializing: "Initializing...",
       connecting: "Connecting...",

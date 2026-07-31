@@ -332,6 +332,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "pages_show_list",
                 "pages_read_engagement",
                 "pages_manage_posts",
+                "pages_read_user_content",
             ],
             "is_visible_in_connector": True,
             "launch_config": {

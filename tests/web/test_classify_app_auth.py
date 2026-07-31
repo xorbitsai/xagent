@@ -63,6 +63,27 @@ def test_mcp_oauth_requires_both_url_and_auth_type():
     )
 
 
+def test_remote_mcp_oauth_transport_check_is_case_insensitive():
+    # N1: the builtin_oauth check above lowercases ("OAuth" -> "oauth"); the
+    # remote-transport check must be equally forgiving, or an admin PATCH that
+    # stores a mixed-case transport puts the two halves of this feature in
+    # disagreement about the same row.
+    assert (
+        classify_app_auth(
+            "Streamable_HTTP",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+    assert (
+        classify_app_auth(
+            "SSE",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+
+
 def test_mcp_oauth_shape_requires_a_remote_transport():
     # Same launch_config shape on a stdio transport must not be misrouted —
     # only sse/websocket/streamable_http describe a genuine remote MCP server.

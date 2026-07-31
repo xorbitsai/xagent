@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import re
+import time
 from typing import Any
 
 import requests
@@ -19,6 +21,15 @@ mcp = FastMCP("slack-mcp")
 SLACK_BASE_URL = "https://slack.com/api"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_PAGES = 20
+MAX_CHANNELS = 1000
+# conversations.list is Tier-2 rate-limited (~20 req/min); on a 429 with a
+# small Retry-After we wait once and retry rather than failing the page.
+MAX_RETRY_AFTER_SECONDS = 30
+
+# Slack channel/user/group ids are uppercase alphanumerics with a letter
+# prefix; channel *names* are forced lowercase by Slack, so this can't
+# misclassify a name as an id.
+_SLACK_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{5,}$")
 
 
 def _success(**payload: Any) -> str:
@@ -34,6 +45,16 @@ def _headers() -> dict[str, str]:
     if not access_token:
         raise ValueError("SLACK_ACCESS_TOKEN environment variable is missing")
     return {"Authorization": f"Bearer {access_token}"}
+
+
+def _normalize_channel(channel: str) -> str:
+    """Accept a channel id ("C0123456789") or a name with or without the
+    leading "#"; bare names get the "#" prepended so all three documented
+    forms reach the API in a shape it accepts."""
+    value = channel.strip()
+    if value.startswith("#") or _SLACK_ID_PATTERN.match(value):
+        return value
+    return f"#{value}"
 
 
 def _request(
@@ -52,15 +73,28 @@ def _request(
     Write calls pass json_data rather than params: message text can exceed
     URL length limits, and query strings are commonly logged in plaintext by
     proxies/load balancers, which would leak message content.
+
+    Rate limiting is the one non-200 case worth special handling: on a 429
+    with a small Retry-After, wait once and retry instead of failing.
     """
-    response = requests.request(
-        method=method,
-        url=f"{SLACK_BASE_URL}/{path}",
-        headers=_headers(),
-        params=params,
-        json=json_data,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-    )
+    for attempt in (0, 1):
+        response = requests.request(
+            method=method,
+            url=f"{SLACK_BASE_URL}/{path}",
+            headers=_headers(),
+            params=params,
+            json=json_data,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 429 and attempt == 0:
+            try:
+                retry_after = int(response.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after = 0
+            if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
+                time.sleep(retry_after)
+                continue
+        break
     response.raise_for_status()
     payload: dict[str, Any] = response.json()
     if not payload.get("ok"):
@@ -69,16 +103,29 @@ def _request(
 
 
 @mcp.tool()
-def slack_list_channels(exclude_archived: bool = True) -> str:
+def slack_list_channels(
+    exclude_archived: bool = True,
+    name_contains: str = "",
+    limit: int = MAX_CHANNELS,
+) -> str:
     """
     List public channels in the connected Slack workspace (id, name, is_archived).
-    Use this to resolve a channel name to an id before posting, or to find the
-    right channel when the user names one imprecisely.
+    Use this to resolve a channel name to an id before posting.
+    name_contains: optional case-insensitive substring filter on the channel
+    name — pass it when looking for a specific channel in a large workspace
+    instead of listing everything.
+    limit: maximum channels to return (default 1000).
+    The response includes truncated=true when there were more channels than
+    returned (more pages, the limit was hit, or a page failed mid-way — a
+    partial list is returned rather than discarded).
     """
+    channels: list[dict[str, Any]] = []
+    needle = name_contains.strip().lower()
+    max_channels = max(1, min(int(limit), MAX_CHANNELS))
+    cursor: str | None = None
+    truncated = False
     try:
-        channels: list[dict[str, Any]] = []
-        cursor: str | None = None
-        for _ in range(MAX_PAGES):
+        for page_index in range(MAX_PAGES):
             params: dict[str, Any] = {
                 "types": "public_channel",
                 # Slack expects a lowercase "true"/"false" string; requests
@@ -89,19 +136,36 @@ def slack_list_channels(exclude_archived: bool = True) -> str:
             }
             if cursor:
                 params["cursor"] = cursor
-            result = _request("GET", "conversations.list", params=params)
-            channels.extend(
-                {
-                    "id": channel.get("id"),
-                    "name": channel.get("name"),
-                    "is_archived": channel.get("is_archived", False),
-                }
-                for channel in result.get("channels", [])
-            )
+            try:
+                result = _request("GET", "conversations.list", params=params)
+            except Exception as page_exc:
+                if not channels:
+                    raise
+                # A mid-pagination failure (e.g. a rate limit that outlived
+                # the single retry) must not discard the pages already
+                # fetched — return the partial list with a marker instead.
+                logger.warning(f"Slack channel pagination stopped early: {page_exc}")
+                return _success(channels=channels, truncated=True, error=str(page_exc))
+            for channel in result.get("channels") or []:
+                name = str(channel.get("name") or "")
+                if needle and needle not in name.lower():
+                    continue
+                channels.append(
+                    {
+                        "id": channel.get("id"),
+                        "name": channel.get("name"),
+                        "is_archived": channel.get("is_archived", False),
+                    }
+                )
+                if len(channels) >= max_channels:
+                    return _success(channels=channels, truncated=True)
             cursor = (result.get("response_metadata") or {}).get("next_cursor")
             if not cursor:
                 break
-        return _success(channels=channels)
+        else:
+            # MAX_PAGES exhausted with a cursor still pending.
+            truncated = bool(cursor)
+        return _success(channels=channels, truncated=truncated)
     except Exception as e:
         logger.error(f"Error listing Slack channels: {e}")
         return _error(str(e))
@@ -111,14 +175,15 @@ def slack_list_channels(exclude_archived: bool = True) -> str:
 def slack_post_message(channel: str, text: str) -> str:
     """
     Post a message to a Slack channel.
-    channel: a channel id (e.g. "C0123456789") or name (e.g. "#incidents" or "incidents").
+    channel: a channel id (e.g. "C0123456789") or name (e.g. "#incidents" or
+    "incidents" — a bare name is normalized to "#incidents").
     text: the message body (plain text or Slack mrkdwn).
     """
     try:
         result = _request(
             "POST",
             "chat.postMessage",
-            json_data={"channel": channel, "text": text},
+            json_data={"channel": _normalize_channel(channel), "text": text},
         )
         return _success(channel=result.get("channel"), ts=result.get("ts"))
     except Exception as e:

@@ -33,11 +33,6 @@ FULL_OAUTH_PROVIDERS_TABLE = sa.table(
     sa.column("default_scopes", sa.JSON),
 )
 
-OAUTH_PROVIDERS_TABLE = sa.table(
-    "oauth_providers",
-    sa.column("provider_name", sa.String),
-)
-
 PUBLIC_MCP_APPS_TABLE = sa.table(
     "public_mcp_apps",
     sa.column("app_id", sa.String),
@@ -111,7 +106,9 @@ def upgrade() -> None:
             column["name"] for column in inspector.get_columns("oauth_providers")
         }
         existing_provider_names = set(
-            bind.execute(sa.select(OAUTH_PROVIDERS_TABLE.c.provider_name)).scalars()
+            bind.execute(
+                sa.select(FULL_OAUTH_PROVIDERS_TABLE.c.provider_name)
+            ).scalars()
         )
         if "slack" not in existing_provider_names:
             bind.execute(
@@ -160,20 +157,13 @@ def downgrade() -> None:
         if remaining_slack_apps:
             return
 
-    # Only delete the provider row when it still matches the static shape this
-    # migration seeded, so an admin-created "slack" provider (via
-    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
-    # env-dependent and intentionally not part of the guard.
-    provider_columns = {
-        column["name"] for column in inspector.get_columns("oauth_providers")
-    }
-    seeded_provider = _slack_provider_row()
-    delete_stmt = sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
-        FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "slack"
+    # Delete unconditionally by provider_name, matching the sibling seed
+    # migrations (meta, google-maps). A shape-matching guard would protect
+    # the wrong thing: an admin recreating the *real* Slack provider enters
+    # Slack's canonical URLs, which would match the guard and be deleted
+    # anyway — only a differently-shaped row would survive.
+    bind.execute(
+        sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
+            FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "slack"
+        )
     )
-    for column in ("name", "auth_url", "token_url"):
-        if column in provider_columns:
-            delete_stmt = delete_stmt.where(
-                FULL_OAUTH_PROVIDERS_TABLE.c[column] == seeded_provider[column]
-            )
-    bind.execute(delete_stmt)

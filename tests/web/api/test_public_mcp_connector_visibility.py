@@ -740,6 +740,10 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
             "xagent.web.tools.mcp.instagram",
             {"META_ACCESS_TOKEN": "access_token"},
         ),
+        "slack": (
+            "xagent.web.tools.mcp.slack",
+            {"SLACK_ACCESS_TOKEN": "access_token"},
+        ),
     }
     rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
 

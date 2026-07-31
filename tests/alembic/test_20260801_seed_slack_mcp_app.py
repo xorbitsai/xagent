@@ -119,7 +119,7 @@ def test_upgrade_is_idempotent(tmp_path):
         assert provider_count == 1
 
 
-def test_seed_rows_match_registry(tmp_path):
+def test_seed_rows_match_registry():
     """The migration snapshot and the runtime registry must define the same
     slack rows (the migration is a frozen copy; this catches drift)."""
     from xagent.web.builtin_mcp_registry import (
@@ -171,9 +171,11 @@ def test_downgrade_keeps_provider_when_custom_slack_app_exists(tmp_path):
         assert "slack" in _provider_names(connection)
 
 
-def test_downgrade_preserves_admin_created_slack_provider(tmp_path):
-    """A pre-existing admin-created "slack" provider (different shape than the
-    seeded row) must survive downgrade even when no slack apps remain."""
+def test_downgrade_deletes_provider_unconditionally_by_name(tmp_path):
+    """The downgrade deletes the slack provider row by provider_name alone,
+    matching the sibling seed migrations (meta, google-maps): a shape-matching
+    guard would protect the wrong thing, since an admin recreating the real
+    Slack provider would enter the canonical URLs and match the guard anyway."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -191,7 +193,7 @@ def test_downgrade_preserves_admin_created_slack_provider(tmp_path):
             migration.upgrade()
             migration.downgrade()
         assert "slack" not in _app_ids(connection)
-        assert "slack" in _provider_names(connection)
+        assert "slack" not in _provider_names(connection)
 
 
 def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):

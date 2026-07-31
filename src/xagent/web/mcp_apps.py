@@ -79,13 +79,6 @@ def restrict_to_app_scoped_oauth_grant(
 
 
 # Transports for a genuine remote MCP server the platform talks to directly
-# (as opposed to "oauth", which here means a static-provider redirect wrapping
-# our own stdio module — see classify_app_auth). Mirrors HTTP_MCP_TRANSPORTS
-# in services/mcp_runtime.py and the runtime check in
-# core/tools/core/mcp/manager/db.py's _requires_runtime_mcp_oauth.
-_REMOTE_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
-
-
 def classify_app_auth(transport: Any, launch_config: Any) -> str:
     """Single source of truth for how a catalog app is connected.
 
@@ -98,6 +91,13 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
           static client_id is configured) — /api/mcp/apps/{id}/oauth/connect
         - "unconnectable": none of the above
     """
+    # Reuses the runtime's notion of which transports are remote ("oauth"
+    # here instead means a static-provider redirect wrapping our own stdio
+    # module). Lowercased like the builtin_oauth check above: an admin PATCH
+    # can store a mixed-case transport, and the two halves of this feature
+    # must not disagree about the same row.
+    from .services.mcp_runtime import HTTP_MCP_TRANSPORTS
+
     if str(transport or "").lower() == "oauth":
         return "builtin_oauth"
     launch = launch_config if isinstance(launch_config, dict) else {}
@@ -105,7 +105,7 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
         return "api_key"
     auth = launch.get("auth")
     if (
-        str(transport or "") in _REMOTE_MCP_TRANSPORTS
+        str(transport or "").lower() in HTTP_MCP_TRANSPORTS
         and launch.get("url")
         and isinstance(auth, dict)
         and auth.get("type") == "mcp_oauth"

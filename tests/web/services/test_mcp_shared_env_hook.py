@@ -98,6 +98,17 @@ def test_caller_id_env_empty_without_user_id():
     assert mcp_runtime.caller_id_env(None) == {}
 
 
+def test_caller_id_env_var_name_matches_aws_connector_literal():
+    """CALLER_ID_ENV_VAR is duplicated as an independent literal in
+    xagent.web.tools.mcp.aws (a standalone subprocess entrypoint that can't
+    import this module), with no other check tying the two together. A
+    rename on either side would silently degrade attribution back to the
+    un-attributed default without failing any other test."""
+    from xagent.web.tools.mcp import aws
+
+    assert aws.CALLER_ID_ENV_VAR == mcp_runtime.CALLER_ID_ENV_VAR
+
+
 class _FakeStdioServer:
     """Minimal stand-in for MCPServer: just enough for the stdio branch of
     build_mcp_runtime_connection (transport check + auth decrypt call)."""
@@ -138,8 +149,12 @@ def test_build_mcp_runtime_connection_omits_caller_id_without_user():
 
 
 def test_build_mcp_runtime_connection_caller_id_wins_over_user_overrides():
-    """Overrides still apply, but the caller-id layer is merged in last so it
-    can never be shadowed by a stale/forged XAGENT_MCP_CALLER_ID override."""
+    """When a real user_id is present, overrides still apply, but the
+    caller-id layer is merged in last so it can never be shadowed by a
+    stale/forged XAGENT_MCP_CALLER_ID override. This guarantee is
+    conditional on user_id being set — see the user_id=None test below,
+    where caller_id_env contributes nothing and a forged override passes
+    through unchanged."""
     server = _FakeStdioServer({"transport": "stdio", "env": {"FOO": "global"}})
 
     build = asyncio.run(
@@ -152,3 +167,22 @@ def test_build_mcp_runtime_connection_caller_id_wins_over_user_overrides():
     )
 
     assert build.connection["env"]["XAGENT_MCP_CALLER_ID"] == "42"
+
+
+def test_build_mcp_runtime_connection_without_user_id_does_not_scrub_forged_override():
+    """Without a user_id, caller_id_env returns {} and contributes nothing —
+    a pre-existing or forged XAGENT_MCP_CALLER_ID override passes through to
+    the subprocess env unchanged. The "can never be shadowed" guarantee in
+    the test above only holds once user_id is set."""
+    server = _FakeStdioServer({"transport": "stdio", "env": {"FOO": "global"}})
+
+    build = asyncio.run(
+        mcp_runtime.build_mcp_runtime_connection(
+            db=None,
+            server=server,
+            user_id=None,
+            user_env_overrides={5: {"XAGENT_MCP_CALLER_ID": "spoofed"}},
+        )
+    )
+
+    assert build.connection["env"]["XAGENT_MCP_CALLER_ID"] == "spoofed"

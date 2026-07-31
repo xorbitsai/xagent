@@ -67,7 +67,14 @@ def _role_session_name() -> str:
     xagent user who triggered it, so the target account's CloudTrail can tell
     different users' cross-account reads apart. Falls back to the bare
     connector name if the caller id wasn't threaded through (e.g. a manual
-    `python -m xagent.web.tools.mcp.aws` invocation outside the platform)."""
+    `python -m xagent.web.tools.mcp.aws` invocation outside the platform).
+
+    This only covers the role_arn (cross-account) path — see _client. A call
+    without role_arn goes straight through the connector's own base
+    credentials, one shared IAM principal with no per-call session name, so
+    same-account calls remain indistinguishable from each other in
+    CloudTrail.
+    """
     caller_id = os.environ.get(CALLER_ID_ENV_VAR)
     if not caller_id:
         return ASSUME_ROLE_SESSION_NAME
@@ -75,7 +82,7 @@ def _role_session_name() -> str:
     return f"{ASSUME_ROLE_SESSION_NAME}-{sanitized}"[:64]
 
 
-def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str]:
+def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str | None]:
     # No caching: each MCP tool call runs in its own short-lived subprocess
     # (see _execute_mcp_call in mcp_adapter.py, which opens and tears down a
     # fresh stdio session per call), so a module-level cache never survives
@@ -84,11 +91,11 @@ def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str]:
         "sts", region_name=region, config=DEFAULT_CLIENT_CONFIG
     )
     response = sts.assume_role(RoleArn=role_arn, RoleSessionName=_role_session_name())
-    creds = response["Credentials"]
+    creds = response.get("Credentials") or {}
     return {
-        "aws_access_key_id": creds["AccessKeyId"],
-        "aws_secret_access_key": creds["SecretAccessKey"],
-        "aws_session_token": creds["SessionToken"],
+        "aws_access_key_id": creds.get("AccessKeyId"),
+        "aws_secret_access_key": creds.get("SecretAccessKey"),
+        "aws_session_token": creds.get("SessionToken"),
     }
 
 
@@ -104,9 +111,9 @@ def _client(
     would be dead code.
 
     A fresh boto3.Session per call, rather than the module-level
-    boto3.client shortcut: the default shared session is documented as not
-    thread-safe for concurrent client creation, and FastMCP runs sync tools
-    in a thread pool.
+    boto3.client shortcut: boto3 Sessions are documented as not safe to
+    share across concurrent client creation, so a fresh one per call is a
+    low-cost precaution regardless of how this module happens to be invoked.
     """
     _require_base_credentials()
     resolved_region = _resolve_region(region)
@@ -164,6 +171,8 @@ def aws_cloudwatch_describe_alarms(
 ) -> str:
     """
     List CloudWatch alarms — the triage entry point for "what is wrong right now".
+    Returns both metric alarms and composite alarms (account-level rollups
+    aggregating other alarms) separately.
     state: optional filter, one of "ALARM", "OK", "INSUFFICIENT_DATA".
     alarm_name_prefix: optional name prefix filter.
     """
@@ -188,7 +197,26 @@ def aws_cloudwatch_describe_alarms(
             }
             for alarm in (result.get("MetricAlarms") or [])
         ]
-        return _success(alarms=alarms, truncated="NextToken" in result)
+        # DescribeAlarms returns composite alarms (account-level "is the
+        # service healthy" rollups aggregating leaf alarms) in a separate
+        # top-level field sharing the same MaxRecords budget. Omitting them
+        # would let this triage tool report "nothing is wrong" while the
+        # account's top rollup alarm is firing.
+        composite_alarms = [
+            {
+                "name": alarm.get("AlarmName"),
+                "state": alarm.get("StateValue"),
+                "state_reason": alarm.get("StateReason"),
+                "state_updated": alarm.get("StateUpdatedTimestamp"),
+                "alarm_rule": alarm.get("AlarmRule"),
+            }
+            for alarm in (result.get("CompositeAlarms") or [])
+        ]
+        return _success(
+            alarms=alarms,
+            composite_alarms=composite_alarms,
+            truncated="NextToken" in result,
+        )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing CloudWatch alarms: {e}")
         return _error(_aws_error_message(e))

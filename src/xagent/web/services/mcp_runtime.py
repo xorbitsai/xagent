@@ -110,7 +110,7 @@ def caller_id_env(user_id: int | None) -> dict[str, str]:
     AssumeRole session name) to a specific user in the target system's own
     audit trail, instead of every user's calls being indistinguishable.
     """
-    if user_id is None:
+    if not isinstance(user_id, int):
         return {}
     return {CALLER_ID_ENV_VAR: str(user_id)}
 
@@ -148,6 +148,12 @@ def resolve_stdio_env(
 
     The stored own key is never deleted when another source is picked — it is
     simply not merged — so switching back to "own" needs no re-entry.
+
+    This governs only the shared/own/global layers above. The caller-id layer
+    (see caller_id_env, applied in build_mcp_runtime_connection after this
+    function returns) is appended unconditionally for every stdio server
+    regardless of env_source — it identifies the calling user, not a
+    connector-owned credential, so it is not subject to this precedence.
     """
     if env_source == "platform":
         return global_env
@@ -190,6 +196,10 @@ async def build_mcp_runtime_connection(
                 )
                 if merged:
                     connection["env"] = merged
+        # Applied to every stdio server unconditionally — including
+        # arbitrary third-party stdio commands a user registers directly via
+        # create_mcp_server, not just catalog connectors — since the value
+        # is only an opaque internal xagent user id, not a credential or PII.
         caller_env = caller_id_env(user_id)
         if caller_env:
             connection["env"] = {**(connection.get("env") or {}), **caller_env}

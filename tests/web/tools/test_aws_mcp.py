@@ -1,5 +1,4 @@
 import json
-from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import pytest
@@ -95,6 +94,35 @@ def test_describe_alarms_flags_truncated_when_next_token_present(monkeypatch):
     result = json.loads(aws.aws_cloudwatch_describe_alarms())
 
     assert result["truncated"] is True
+
+
+def test_describe_alarms_surfaces_composite_alarms(monkeypatch):
+    """DescribeAlarms returns composite (rollup) alarms in a separate
+    top-level field from MetricAlarms; a firing composite alarm must not be
+    silently dropped from this triage tool's output."""
+    cloudwatch = Mock()
+    cloudwatch.describe_alarms.return_value = {
+        "MetricAlarms": [],
+        "CompositeAlarms": [
+            {
+                "AlarmName": "service-health-rollup",
+                "StateValue": "ALARM",
+                "StateReason": "1 out of 3 alarms in ALARM",
+                "AlarmRule": "ALARM(high-cpu) OR ALARM(high-latency)",
+            }
+        ],
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=cloudwatch))
+
+    result = json.loads(aws.aws_cloudwatch_describe_alarms())
+
+    assert result["status"] == "success"
+    assert result["alarms"] == []
+    assert result["composite_alarms"][0]["name"] == "service-health-rollup"
+    assert result["composite_alarms"][0]["state"] == "ALARM"
+    assert result["composite_alarms"][0]["alarm_rule"] == (
+        "ALARM(high-cpu) OR ALARM(high-latency)"
+    )
 
 
 def test_describe_alarms_omits_filters_when_not_given(monkeypatch):
@@ -403,15 +431,13 @@ def test_sqs_get_queue_attributes_requests_all(monkeypatch):
 # --- assume-role plumbing -------------------------------------------------
 
 
-def _sts_with_assume_role(expires_in_seconds: int) -> Mock:
+def _sts_with_assume_role() -> Mock:
     sts = Mock()
     sts.assume_role.return_value = {
         "Credentials": {
             "AccessKeyId": "ASIA-temp",
             "SecretAccessKey": "temp-secret",
             "SessionToken": "temp-token",
-            "Expiration": datetime.now(timezone.utc)
-            + timedelta(seconds=expires_in_seconds),
         }
     }
     return sts
@@ -431,7 +457,7 @@ def test_client_with_role_arn_assumes_role_on_every_call(monkeypatch):
     """Each MCP tool call runs in its own short-lived subprocess, so there is
     no in-process caching layer to test — every _client() call with a
     role_arn must exchange it for fresh temporary credentials."""
-    sts = _sts_with_assume_role(expires_in_seconds=3600)
+    sts = _sts_with_assume_role()
     service_client = Mock()
     session_client = _patch_boto3_session(
         monkeypatch,
@@ -484,7 +510,7 @@ def test_role_session_name_truncates_to_64_chars(monkeypatch):
 
 def test_assume_role_credentials_uses_caller_attributed_session_name(monkeypatch):
     monkeypatch.setenv(aws.CALLER_ID_ENV_VAR, "7")
-    sts = _sts_with_assume_role(expires_in_seconds=3600)
+    sts = _sts_with_assume_role()
     _patch_boto3_session(monkeypatch, lambda service, **kwargs: sts)
 
     aws._assume_role_credentials("arn:aws:iam::2:role/read", "us-east-1")
@@ -518,6 +544,44 @@ def test_client_creates_a_fresh_session_per_call(monkeypatch):
     aws._client("sqs")
 
     assert session_factory.call_count == 2
+
+
+def test_client_creates_independent_sessions_for_sts_and_service_on_role_arn_path(
+    monkeypatch,
+):
+    """On the role_arn (cross-account) path, a single _client() call must
+    create two independent boto3.Session objects -- one for the STS
+    assume_role exchange (inside _assume_role_credentials), one for the
+    final service client -- neither reused from the other.
+    test_client_creates_a_fresh_session_per_call never passes role_arn, and
+    _patch_boto3_session's shared-Session mock can't tell "one Session
+    reused across both calls" from "two independent Sessions"."""
+    sessions: list[Mock] = []
+
+    def make_client(service: str, **kwargs) -> Mock:
+        client = Mock()
+        if service == "sts":
+            client.assume_role.return_value = {
+                "Credentials": {
+                    "AccessKeyId": "ASIA-temp",
+                    "SecretAccessKey": "temp-secret",
+                    "SessionToken": "temp-token",
+                }
+            }
+        return client
+
+    def session_factory() -> Mock:
+        session = Mock()
+        session.client = Mock(side_effect=make_client)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(aws.boto3, "Session", Mock(side_effect=session_factory))
+
+    aws._client("cloudwatch", role_arn="arn:aws:iam::2:role/read")
+
+    assert len(sessions) == 2
+    assert sessions[0] is not sessions[1]
 
 
 def test_filter_log_events_clamps_non_positive_limit(monkeypatch):

@@ -28,9 +28,11 @@ from xagent.web.api.mcp import (
     connect_mcp_oauth,
     connect_mcp_oauth_app,
     delete_mcp_oauth_grant,
+    delete_mcp_server,
     discover_mcp_oauth,
     get_mcp_oauth_status,
     get_mcp_server_tools,
+    list_mcp_apps,
     mcp_oauth_callback,
     update_mcp_server,
 )
@@ -1537,6 +1539,268 @@ async def test_connect_app_rejects_unknown_app_id(db_session):
 
 
 @pytest.mark.asyncio
+async def test_connect_app_rejects_hijacked_server_with_foreign_url(db_session):
+    """A pre-existing row under the catalog id with a different remote URL must
+    not be reused — otherwise a victim's DCR/PKCE flow talks to an attacker's
+    MCP server. Mirrors the stdio hijack guard test in test_mcp_apps_connect.py;
+    this shape was previously untested (D1)."""
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+    db.add(
+        MCPServer(
+            name="granola",
+            managed="external",
+            transport="streamable_http",
+            url="https://evil.example.com/mcp",
+        )
+    )
+    db.commit()
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await connect_mcp_oauth_app(
+            "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        )
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_connect_app_rejects_user_owned_server_even_with_matching_config(
+    db_session,
+):
+    """A row under the catalog id that a user OWNS is a custom server squatting
+    the id. Even with a config that matches the official launch, it must not be
+    adopted as the shared row (D1's guard, previously untested for mcp_oauth)."""
+    db, user, other_user = db_session
+    _add_remote_oauth_catalog_app(db)
+    server = MCPServer(
+        name="granola",
+        managed="external",
+        transport="streamable_http",
+        url="https://mcp.example.com/mcp",
+        auth={"type": "mcp_oauth"},
+    )
+    db.add(server)
+    db.commit()
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id, mcpserver_id=server.id, is_owner=True, can_edit=True
+        )
+    )
+    db.commit()
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await connect_mcp_oauth_app(
+            "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        )
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_connect_app_json_accept_returns_authorization_url_in_body(
+    db_session, monkeypatch
+):
+    """The Accept: application/json branch is what the actual frontend popup
+    flow uses; every other test here exercises the 303-redirect branch instead
+    (accept=None)."""
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dynamic-client-123",
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+            )
+        ),
+    )
+
+    response = await connect_mcp_oauth_app(
+        "granola",
+        MCPOAuthConnectRequest(redirect_after="/mcp"),
+        user,
+        db,
+        accept="application/json, text/plain, */*",
+    )
+
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert "authorization_url" in body
+    query = parse_qs(urlparse(body["authorization_url"]).query)
+    assert query["client_id"] == ["dynamic-client-123"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_app_not_connected_until_grant_completes(
+    db_session, monkeypatch
+):
+    """M1: the UserMCPServer association is created before the user ever
+    reaches the consent screen, so it alone must not mean "connected" — an
+    abandoned/denied/failed authorization must not render as Connected."""
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dynamic-client-123",
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+            )
+        ),
+    )
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+
+    apps_before_grant = list_mcp_apps(current_user=user, db=db)
+    granola_before = next(a for a in apps_before_grant if a["id"] == "granola")
+    assert granola_before["is_connected"] is False
+
+    # The DCR flow already registered a client during connect_mcp_oauth_app
+    # above; reuse it rather than registering a second one under the same
+    # (server, issuer) pair, which would trip the unique lookup_hash.
+    client = (
+        db.query(MCPOAuthClient).filter(MCPOAuthClient.mcp_server_id == server.id).one()
+    )
+    db.add(
+        MCPOAuthGrant(
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=f"xagent:user:{user.id}",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="",
+            access_token=encrypt_value("granola-access-token"),
+            status="active",
+        )
+    )
+    db.commit()
+
+    apps_after_grant = list_mcp_apps(current_user=user, db=db)
+    granola_after = next(a for a in apps_after_grant if a["id"] == "granola")
+    assert granola_after["is_connected"] is True
+    assert granola_after["server_id"] == server.id
+
+
+@pytest.mark.asyncio
+async def test_delete_mcp_server_revokes_only_the_disconnecting_users_grant(
+    db_session, monkeypatch
+):
+    """M3: disconnecting a shared mcp_oauth catalog server must revoke the
+    disconnecting user's own grant immediately, not merely wait for the row to
+    cascade away once the last associated user disconnects — and must leave a
+    still-connected sibling user's grant untouched."""
+    db, user, other_user = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dynamic-client-123",
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+            )
+        ),
+    )
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), other_user, db
+    )
+    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    # Both connects register against the same (server, issuer) pair, so DCR
+    # reuses a single client row (see register_mcp_oauth_public_client).
+    client = (
+        db.query(MCPOAuthClient).filter(MCPOAuthClient.mcp_server_id == server.id).one()
+    )
+
+    own_grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="",
+        access_token=encrypt_value("own-access-token"),
+        status="active",
+    )
+    sibling_grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=other_user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{other_user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="",
+        access_token=encrypt_value("sibling-access-token"),
+        status="active",
+    )
+    db.add_all([own_grant, sibling_grant])
+    db.commit()
+    db.refresh(own_grant)
+    db.refresh(sibling_grant)
+
+    delete_mcp_server(server.id, current_user=user, db=db)
+
+    db.refresh(own_grant)
+    db.refresh(sibling_grant)
+    assert own_grant.status == "revoked"
+    assert own_grant.revoked_at is not None
+    assert sibling_grant.status == "active"
+
+    # The shared row survives (other_user is still associated); only the
+    # disconnecting user's association and grant are gone.
+    assert (
+        db.query(MCPServer).filter(MCPServer.id == server.id).one_or_none() is not None
+    )
+    assert (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id, UserMCPServer.mcpserver_id == server.id
+        )
+        .one_or_none()
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_callback_exchanges_code_and_stores_encrypted_grant(
     db_session, monkeypatch
 ):
@@ -1596,7 +1860,13 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     )
 
     assert response.status_code == 307
-    assert response.headers["location"] == "https://app.example.com/mcp"
+    # mcp_oauth_success=1 is the explicit positive signal the connect popup's
+    # self-close effect keys on (N5) instead of inferring success from the
+    # absence of error params.
+    assert (
+        response.headers["location"]
+        == "https://app.example.com/mcp?mcp_oauth_success=1"
+    )
     grant = db.query(MCPOAuthGrant).one()
     assert grant.resource_owner_key == "resource-owner-a"
     assert grant.access_token != "plain-access-token"

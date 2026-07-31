@@ -21,14 +21,15 @@ mcp = FastMCP("zoom-mcp")
 ZOOM_BASE_URL = "https://api.zoom.us/v2"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-# Documented `type` values for GET /users/{userId}/meetings. "previous_meetings"
-# matters most here: past meetings are the only ones that can have a transcript.
+# Documented `type` values for GET /users/{userId}/meetings. Zoom staff have
+# confirmed this endpoint only ever returns scheduled/live/upcoming meetings —
+# there is no "previous_meetings" type; past meetings require the separate
+# Reports API (a different OAuth scope this connector doesn't request). See
+# https://devforum.zoom.us/t/get-users-meetings-meetings-past-instances-and-past-meeting-instances-participants/37995
 MEETING_LIST_TYPES = (
     "scheduled",
     "live",
     "upcoming",
-    "upcoming_meetings",
-    "previous_meetings",
 )
 
 _VTT_TIMESTAMP_LINE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:")
@@ -127,21 +128,24 @@ def _is_not_found(exc: Exception) -> bool:
 
 
 def _download_text(download_url: str) -> str:
-    response = requests.get(
-        download_url,
-        headers=_headers(),
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-    )
+    # The request itself (not just a bad status) must stay inside the
+    # try/except: requests.RequestException subclasses like ConnectionError
+    # and Timeout embed the full request URL — including any access_token
+    # query param — in str(exc), so a connection failure must be sanitized
+    # exactly like an HTTP error status is below.
     try:
+        response = requests.get(
+            download_url,
+            headers=_headers(),
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
         response.raise_for_status()
     except requests.HTTPError as exc:
-        # Never let the raw HTTPError escape: str(HTTPError) embeds the full
-        # request URL including its query string, and Zoom download URLs can
-        # carry access tokens as query params — keep them out of logs and the
-        # LLM-visible tool response.
         raise RuntimeError(
-            f"Transcript download failed with HTTP {response.status_code}"
+            f"Transcript download failed with HTTP {exc.response.status_code}"
         ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Transcript download failed: {type(exc).__name__}") from exc
     # Decode explicitly as UTF-8: for a text/* content type without a charset
     # (a plausible header for a VTT download), requests falls back to
     # ISO-8859-1, which corrupts non-ASCII (e.g. Chinese) transcripts.
@@ -174,10 +178,12 @@ def _find_transcript_file(recording_files: list[Any]) -> dict[str, Any] | None:
 def zoom_list_meetings(meeting_type: str = "scheduled", page_token: str = "") -> str:
     """
     List meetings for the connected Zoom user.
-    meeting_type: one of "scheduled" (default, unexpired previous + upcoming),
-    "live", "upcoming", "upcoming_meetings", or "previous_meetings".
-    Use "previous_meetings" when looking for a meeting that already happened —
-    e.g. to fetch its transcript ("summarize my latest call").
+    meeting_type: one of "scheduled" (default, unexpired scheduled meetings),
+    "live", or "upcoming". This endpoint never returns meetings that have
+    already ended — Zoom's List Meetings API only covers scheduled/live/
+    upcoming meetings, not history. To look up a meeting that already
+    happened, ask the user for its meeting id or UUID and call
+    zoom_get_meeting / zoom_get_meeting_transcript directly.
     page_token: pass the next_page_token from a previous response to fetch the
     next page when the result was truncated.
     """

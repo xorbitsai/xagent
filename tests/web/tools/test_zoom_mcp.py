@@ -117,20 +117,34 @@ def test_list_meetings_returns_meetings_and_page_token(monkeypatch):
     assert result["next_page_token"] == "tok-2"
 
 
-def test_list_meetings_accepts_previous_meetings_and_page_token(monkeypatch):
+def test_list_meetings_accepts_upcoming_and_page_token(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"meetings": [], "next_page_token": ""})
     )
     monkeypatch.setattr(zoom.requests, "request", mock_request)
 
     result = json.loads(
-        zoom.zoom_list_meetings(meeting_type="previous_meetings", page_token="tok-2")
+        zoom.zoom_list_meetings(meeting_type="upcoming", page_token="tok-2")
     )
 
     assert result["status"] == "success"
     params = mock_request.call_args.kwargs["params"]
-    assert params["type"] == "previous_meetings"
+    assert params["type"] == "upcoming"
     assert params["next_page_token"] == "tok-2"
+
+
+def test_list_meetings_rejects_previous_meetings_as_unsupported(monkeypatch):
+    """List Meetings never returns past meetings — Zoom staff have confirmed
+    the endpoint only accepts scheduled/live/upcoming; there is no
+    "previous_meetings" type. Reject it instead of forwarding it to Zoom."""
+    mock_request = Mock()
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    result = json.loads(zoom.zoom_list_meetings(meeting_type="previous_meetings"))
+
+    assert result["status"] == "error"
+    assert "scheduled" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_list_meetings_rejects_unknown_meeting_type(monkeypatch):
@@ -140,7 +154,7 @@ def test_list_meetings_rejects_unknown_meeting_type(monkeypatch):
     result = json.loads(zoom.zoom_list_meetings(meeting_type="past"))
 
     assert result["status"] == "error"
-    assert "previous_meetings" in result["message"]
+    assert "scheduled" in result["message"]
     mock_request.assert_not_called()
 
 
@@ -392,6 +406,49 @@ def test_get_meeting_transcript_download_failure_leaks_no_url(monkeypatch):
     assert "401" in result["message"]
     assert "http" not in result["message"]
     assert "SECRET" not in result["message"]
+
+
+def test_get_meeting_transcript_download_connection_error_leaks_no_url(monkeypatch):
+    """A raw connection failure (no HTTP response at all) must not leak the
+    download URL either — requests.ConnectionError embeds the full request
+    URL, including any access_token query param, in str(exc)."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "download_url": "https://download.zoom.us/rec/x?access_token=SECRET"
+            }
+        )
+    )
+    mock_get = Mock(
+        side_effect=requests.ConnectionError(
+            "HTTPSConnectionPool: Failed to establish a new connection "
+            "to https://download.zoom.us/rec/x?access_token=SECRET"
+        )
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+    monkeypatch.setattr(zoom.requests, "get", mock_get)
+
+    result = json.loads(zoom.zoom_get_meeting_transcript("123"))
+
+    assert result["status"] == "error"
+    assert "http" not in result["message"]
+    assert "SECRET" not in result["message"]
+    assert "ConnectionError" in result["message"]
+
+
+def test_download_text_wraps_connection_error_without_leaking_url(monkeypatch):
+    monkeypatch.setattr(
+        zoom.requests,
+        "get",
+        Mock(
+            side_effect=requests.Timeout("Read timed out for https://x/t?token=SECRET")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Timeout") as excinfo:
+        zoom._download_text("https://x/t?token=SECRET")
+    assert "SECRET" not in str(excinfo.value)
+    assert "http" not in str(excinfo.value)
 
 
 def test_download_text_decodes_utf8_regardless_of_headers(monkeypatch):

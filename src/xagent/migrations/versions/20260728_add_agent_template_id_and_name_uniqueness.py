@@ -1,4 +1,4 @@
-"""Add agents.template_id and a per-user unique name constraint.
+"""Add agents.template_id and per-user unique-name / quick-access constraints.
 
 ``template_id`` lets the create-or-reuse-from-template flow key off a
 stable id instead of the user-editable display name. The unique index on
@@ -11,8 +11,17 @@ strictly per-``user_id`` - when a SaaS team-scope hook is installed,
 mirror (see the docstring on ``agent_team_scope.owned_agent_clause`` and
 the comment on ``Agent.__table_args__``).
 
+A second partial unique index on (user_id, template_id), scoped to the
+``template_quick_access`` origin, backs the /task template quick-access
+resolve flow's get-or-create atomicity (PR review findings B1/B2/D2/D3): a
+plain ``origin != 'template_quick_access'`` create (e.g. the
+workforce-builder UI's ``POST /from-template``, which deliberately mints
+multiple named instances of one template) is untouched by it. No rows carry
+this origin before this migration ships, so unlike the name index above,
+this one needs no pre-index dedupe pass.
+
 Existing duplicate (user_id, name) rows (if any) are renamed before the
-index is created so this migration cannot fail on already-messy data.
+name index is created so this migration cannot fail on already-messy data.
 Renaming is a one-way, best-effort disambiguation: ``downgrade()`` drops the
 column/indexes but does not attempt to restore the original colliding
 names, since which row "owned" the pre-migration name is no longer
@@ -20,13 +29,13 @@ recoverable once other rows have shifted around it.
 
 The dedupe pass and index creation both run inside this migration's single
 transaction, so any lock the database takes for either (e.g. a table-level
-lock while building the partial index, on backends that need one) is held
-for the combined duration of both steps, not just the index build. Expected
-to be negligible for typical agent-table sizes; revisit if this ever runs
+lock while building a partial index, on backends that need one) is held for
+the combined duration of both steps, not just the index build. Expected to
+be negligible for typical agent-table sizes; revisit if this ever runs
 against a very large, highly-contended ``agents`` table in production.
 
 Revision ID: 20260728_add_agent_template_id_and_name_uniqueness
-Revises: 20260724_add_upload_source_to_uploaded_files
+Revises: 20260730_seed_zoom_mcp_app
 Create Date: 2026-07-28
 """
 
@@ -40,7 +49,7 @@ from sqlalchemy.engine.reflection import Inspector
 logger = logging.getLogger(__name__)
 
 revision: str = "20260728_add_agent_template_id_and_name_uniqueness"
-down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
+down_revision: Union[str, None] = "20260730_seed_zoom_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -48,15 +57,19 @@ TABLE = "agents"
 TEMPLATE_ID_COLUMN = "template_id"
 TEMPLATE_ID_INDEX = "ix_agents_template_id"
 NAME_UNIQUE_INDEX = "uq_agents_user_id_name_active"
+TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX = "uq_agents_user_id_template_id_quick_access"
 WORKFORCE_MANAGER_ORIGIN = "workforce_generated_manager"
+QUICK_ACCESS_ORIGIN = "template_quick_access"
 # Agent.name is String(200) - renamed candidates must fit within that.
 MAX_NAME_LENGTH = 200
-# Matches Agent.__table_args__'s _NON_WORKFORCE_MANAGER_CLAUSE (agent.py):
-# built once at module scope rather than re-interpolated per call, so this
-# migrations directory doesn't pick up per-call f-string DDL predicates as a
-# pattern (WORKFORCE_MANAGER_ORIGIN is a fixed module constant, not user
-# input, so this was never an injection risk).
+# Matches Agent.__table_args__'s _NON_WORKFORCE_MANAGER_CLAUSE /
+# _QUICK_ACCESS_ORIGIN_CLAUSE (agent.py): built once at module scope rather
+# than re-interpolated per call, so this migrations directory doesn't pick
+# up per-call f-string DDL predicates as a pattern (both origin constants
+# are fixed module constants, not user input, so this was never an
+# injection risk).
 NAME_UNIQUE_INDEX_WHERE_CLAUSE = sa.text(f"origin != '{WORKFORCE_MANAGER_ORIGIN}'")
+TEMPLATE_QUICK_ACCESS_WHERE_CLAUSE = sa.text(f"origin = '{QUICK_ACCESS_ORIGIN}'")
 
 
 def _table_names() -> set[str]:
@@ -196,6 +209,18 @@ def upgrade() -> None:
             postgresql_where=NAME_UNIQUE_INDEX_WHERE_CLAUSE,
         )
 
+    if TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX not in _index_names(TABLE):
+        # No dedupe pass needed here: the quick-access origin is brand new
+        # as of this migration, so no pre-existing row can carry it.
+        op.create_index(
+            TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX,
+            TABLE,
+            ["user_id", "template_id"],
+            unique=True,
+            sqlite_where=TEMPLATE_QUICK_ACCESS_WHERE_CLAUSE,
+            postgresql_where=TEMPLATE_QUICK_ACCESS_WHERE_CLAUSE,
+        )
+
 
 def downgrade() -> None:
     if TABLE not in _table_names():
@@ -203,6 +228,9 @@ def downgrade() -> None:
 
     if NAME_UNIQUE_INDEX in _index_names(TABLE):
         op.drop_index(NAME_UNIQUE_INDEX, table_name=TABLE)
+
+    if TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX in _index_names(TABLE):
+        op.drop_index(TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX, table_name=TABLE)
 
     if TEMPLATE_ID_INDEX in _index_names(TABLE):
         op.drop_index(TEMPLATE_ID_INDEX, table_name=TABLE)

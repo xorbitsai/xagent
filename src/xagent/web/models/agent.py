@@ -29,6 +29,15 @@ _NON_WORKFORCE_MANAGER_CLAUSE = text("origin != 'workforce_generated_manager'")
 # IntegrityError (e.g. a widget_key collision or an unrelated FK failure).
 AGENT_NAME_UNIQUE_INDEX = "uq_agents_user_id_name_active"
 
+# Scopes the (user_id, template_id) uniqueness below to agents created by the
+# /task template quick-access resolve flow specifically - the plain
+# POST /from-template create path (workforce-builder UI) deliberately mints
+# multiple named instances of one template and must not be constrained by
+# it. Also shared with agent_management.py's IntegrityError matching.
+_QUICK_ACCESS_ORIGIN = "template_quick_access"
+_QUICK_ACCESS_ORIGIN_CLAUSE = text(f"origin = '{_QUICK_ACCESS_ORIGIN}'")
+AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX = "uq_agents_user_id_template_id_quick_access"
+
 
 class AgentStatus(enum.Enum):
     """Agent status enumeration"""
@@ -43,6 +52,12 @@ class AgentOrigin(enum.Enum):
 
     USER = "user"
     WORKFORCE_GENERATED_MANAGER = "workforce_generated_manager"
+    # The /task template quick-access get-or-create flow
+    # (AgentManagementService.resolve_agent_from_template). Distinct from
+    # USER so its (user_id, template_id) reuse query can't adopt an
+    # unrelated agent the workforce-builder UI created from the same
+    # template under a user-chosen name (PR review finding B4).
+    TEMPLATE_QUICK_ACCESS = _QUICK_ACCESS_ORIGIN
 
 
 class ExecutionMode(enum.Enum):
@@ -136,6 +151,20 @@ class Agent(Base):  # type: ignore
             unique=True,
             sqlite_where=_NON_WORKFORCE_MANAGER_CLAUSE,
             postgresql_where=_NON_WORKFORCE_MANAGER_CLAUSE,
+        ),
+        # Backs the /task template quick-access resolve flow's atomicity:
+        # scoped to TEMPLATE_QUICK_ACCESS origin only, so a workforce-builder
+        # agent built from the same template (a deliberate, user-named,
+        # possibly-multiple instance) never collides with it. See
+        # AgentManagementService._resolve_agent_from_template_sync and PR
+        # review findings B1/B2/D2/D3.
+        Index(
+            AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX,
+            "user_id",
+            "template_id",
+            unique=True,
+            sqlite_where=_QUICK_ACCESS_ORIGIN_CLAUSE,
+            postgresql_where=_QUICK_ACCESS_ORIGIN_CLAUSE,
         ),
     )
 

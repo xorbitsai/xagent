@@ -1,7 +1,7 @@
 """seed built-in Slack (OAuth) MCP connector
 
 Revision ID: 20260801_seed_slack_mcp_app
-Revises: 20260724_add_upload_source_to_uploaded_files
+Revises: 20260728_add_facebook_pages_read_user_content_scope
 Create Date: 2026-08-01 00:00:00.000000
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260801_seed_slack_mcp_app"
-down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
+down_revision: Union[str, None] = "20260728_add_facebook_pages_read_user_content_scope"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

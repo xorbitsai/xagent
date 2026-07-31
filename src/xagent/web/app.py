@@ -15,6 +15,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import (
     get_agent_runtime,
+    get_background_job_sweep_interval_seconds,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
@@ -214,6 +215,11 @@ async def _run_trigger_dispatcher(
         dispatch_pending_trigger_runs,
         scan_due_scheduled_triggers,
     )
+    from .services.workforce_runtime import (
+        WorkforceRunPauseTarget,
+        pause_workforce_tasks_after_archive,
+        reap_stale_preview_workforce_runs,
+    )
 
     def _scan_due_scheduled_triggers_tick() -> int:
         # Scan in-process so scheduled triggers fire without a Celery
@@ -223,6 +229,19 @@ async def _run_trigger_dispatcher(
         db = SessionLocal()
         try:
             return len(scan_due_scheduled_triggers(db))
+        finally:
+            db.close()
+
+    def _reap_stale_preview_workforce_runs_tick() -> list[WorkforceRunPauseTarget]:
+        # This is the third of three trigger-scan entrypoints (alongside the
+        # Celery Beat and BackgroundJob-driven variants) -- runs in-process
+        # for the same reason _scan_due_scheduled_triggers_tick does: a
+        # deployment without Celery Beat must still reap abandoned
+        # workforce-builder preview runs, not silently skip it.
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            return reap_stale_preview_workforce_runs(db)
         finally:
             db.close()
 
@@ -249,6 +268,7 @@ async def _run_trigger_dispatcher(
 
     loop = asyncio.get_running_loop()
     next_gmail_watch_scan_at = 0.0
+    next_preview_run_reap_at = 0.0
     while True:
         try:
             now = loop.time()
@@ -279,6 +299,31 @@ async def _run_trigger_dispatcher(
                 logger.info(
                     "Trigger dispatcher processed %s due schedule(s)", processed
                 )
+
+            # Gated on its own, much coarser timer (matching the Gmail
+            # watch-renewal gating above): the staleness threshold this
+            # sweep acts on is hours-scale (get_workforce_preview_run_stale_
+            # seconds, default 7200s), so checking on every dispatcher tick
+            # (as low as a few seconds, get_trigger_dispatcher_interval_
+            # seconds) is unnecessary load with no corresponding benefit.
+            if now >= next_preview_run_reap_at:
+                try:
+                    reaped_pause_targets = await asyncio.to_thread(
+                        _reap_stale_preview_workforce_runs_tick
+                    )
+                    if reaped_pause_targets:
+                        await pause_workforce_tasks_after_archive(
+                            reaped_pause_targets, reason="preview-reap"
+                        )
+                        logger.info(
+                            "Trigger dispatcher paused %s orphaned preview "
+                            "workforce run(s)",
+                            len(reaped_pause_targets),
+                        )
+                finally:
+                    next_preview_run_reap_at = (
+                        now + get_background_job_sweep_interval_seconds()
+                    )
 
             SessionLocal = get_session_local()
             db = SessionLocal()

@@ -229,6 +229,10 @@ _TURN_REJECTION_MESSAGES = {
         "This workforce conversation is no longer available; please start "
         "a new conversation."
     ),
+    "workforce_run_not_active": (
+        "This workforce conversation was cancelled and can no longer accept "
+        "new messages; please start a new conversation."
+    ),
 }
 
 

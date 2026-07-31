@@ -27,8 +27,10 @@ from xagent.web.services.task_orchestrator import (
     TurnKind,
 )
 from xagent.web.services.workforce_runtime import (
+    WorkforceRunPauseTarget,
     WorkforceTurnRejectedError,
     ensure_workforce_turn_allowed,
+    pause_workforce_tasks_after_archive,
     sync_workforce_run_status,
 )
 from xagent.web.services.workforce_snapshot import (
@@ -129,6 +131,11 @@ def _create_workforce_task_and_run(
     snapshot: dict[str, Any],
     task_status: TaskStatus = TaskStatus.COMPLETED,
     is_preview: bool = False,
+    # "completed" is the realistic default: it's a workforce conversation's
+    # resting state between turns (see ensure_workforce_turn_allowed's
+    # "cancelled" check, PR #1060 review F2), not a rejection. Callers
+    # testing something status-specific (e.g. an actually-cancelled run)
+    # override this explicitly.
     run_status: str = "completed",
 ) -> tuple[int, int]:
     db = _direct_db_session()
@@ -244,6 +251,95 @@ def test_turn_guard_rejects_missing_run_row() -> None:
                 db, task_id=task_id, task_owner_user_id=_user_id()
             )
         assert excinfo.value.reason == "workforce_run_not_found"
+    finally:
+        db.close()
+
+
+def test_turn_guard_rejects_cancelled_run() -> None:
+    """PR #1060 review, F2: a run cancelled by the archive path or the
+    stale-preview-run reaper flips WorkforceRun.status to "cancelled" but
+    that alone enforces nothing -- before this fix, a RESUME (or any new
+    turn) on an already-cancelled run would proceed indefinitely since no
+    turn-entry check inspected the run's own status."""
+    workforce_id = _create_active_workforce("Cancelled Run Guard Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    task_id, run_id = _create_workforce_task_and_run(workforce_id, snapshot=snapshot)
+
+    db = _direct_db_session()
+    try:
+        db.query(WorkforceRun).filter(WorkforceRun.id == run_id).update(
+            {"status": "cancelled"}
+        )
+        db.commit()
+        with pytest.raises(WorkforceTurnRejectedError) as excinfo:
+            ensure_workforce_turn_allowed(
+                db, task_id=task_id, task_owner_user_id=_user_id()
+            )
+        assert excinfo.value.reason == "workforce_run_not_active"
+    finally:
+        db.close()
+
+
+def test_turn_guard_allows_a_normal_completed_run_to_continue() -> None:
+    """Self-review follow-up on F2: the "cancelled" check must NOT reject
+    "completed"/"failed" -- that's the run's ordinary resting state between
+    turns (every turn ends by projecting WorkforceRun.status to "completed"
+    or "failed", see sync_workforce_run_status / task_orchestrator.py's
+    _APPENDABLE_STATUSES), not evidence of a cancellation. An earlier,
+    broader version of this check (rejecting anything not in
+    ACTIVE_WORKFORCE_RUN_STATUSES) would have broken every second-and-later
+    message in every workforce conversation."""
+    workforce_id = _create_active_workforce("Completed Run Continues Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    task_id, run_id = _create_workforce_task_and_run(
+        workforce_id, snapshot=snapshot, run_status="completed"
+    )
+
+    db = _direct_db_session()
+    try:
+        # No exception: a completed run must be allowed to continue.
+        ensure_workforce_turn_allowed(
+            db, task_id=task_id, task_owner_user_id=_user_id()
+        )
+
+        db.query(WorkforceRun).filter(WorkforceRun.id == run_id).update(
+            {"status": "failed"}
+        )
+        db.commit()
+        ensure_workforce_turn_allowed(
+            db, task_id=task_id, task_owner_user_id=_user_id()
+        )
+    finally:
+        db.close()
+
+
+def test_turn_guard_prefers_archived_reason_over_cancelled_when_both_apply() -> None:
+    """Self-review follow-up on F2: the real archive endpoint cancels every
+    in-flight run of a workforce in the SAME transaction it flips
+    Workforce.status to "archived" (see cancel_active_workforce_runs), so
+    this exact combination -- a cancelled run whose workforce is also
+    archived -- is the primary real-world case the "cancelled" check must
+    handle. The more specific, already-established "workforce_archived"
+    reason (its own stable v1 error code/WS message) must still win, not
+    the newer, less specific "workforce_run_not_active"."""
+    workforce_id = _create_active_workforce("Archived And Cancelled Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    task_id, run_id = _create_workforce_task_and_run(workforce_id, snapshot=snapshot)
+
+    db = _direct_db_session()
+    try:
+        db.query(Workforce).filter(Workforce.id == workforce_id).update(
+            {"status": "archived"}
+        )
+        db.query(WorkforceRun).filter(WorkforceRun.id == run_id).update(
+            {"status": "cancelled"}
+        )
+        db.commit()
+        with pytest.raises(WorkforceTurnRejectedError) as excinfo:
+            ensure_workforce_turn_allowed(
+                db, task_id=task_id, task_owner_user_id=_user_id()
+            )
+        assert excinfo.value.reason == "workforce_archived"
     finally:
         db.close()
 
@@ -520,13 +616,16 @@ def test_archive_cancels_active_runs_and_keeps_terminal_ones() -> None:
         )
         assert completed_run.status == "completed"
 
-        # The live task received a durable PAUSE command.
+        # The live task received a durable PAUSE command. Keyed on run_id
+        # alone (not the "archive" reason) so that a concurrent reap-sweep
+        # dispatch for the same run would collide with this one instead of
+        # creating a second, independent PAUSE command -- see
+        # pause_workforce_tasks_after_archive's command_id docstring.
         command = (
             db.query(TaskExecutionCommand)
             .filter(
                 TaskExecutionCommand.task_id == running_task_id,
-                TaskExecutionCommand.command_id
-                == f"workforce-archive-{running_run_id}",
+                TaskExecutionCommand.command_id == f"workforce-pause-{running_run_id}",
             )
             .first()
         )
@@ -539,6 +638,59 @@ def test_archive_cancels_active_runs_and_keeps_terminal_ones() -> None:
         assert sync_workforce_run_status(db, task, TaskStatus.PAUSED) is False
         db.refresh(running_run)
         assert running_run.status == "cancelled"
+    finally:
+        db.close()
+
+
+async def test_pause_dispatch_dedupes_when_archive_and_reap_race_the_same_run() -> None:
+    """Self-review follow-up on F5: widening the stale-preview-run reaper's
+    filter to ``is_preview IS TRUE`` means it can now select an edit-mode
+    preview run of an already-saved, currently-being-archived workforce --
+    the same row the archive endpoint's own cancel-and-pause path just
+    handled. Neither path locks the row, so both can independently build a
+    PAUSE dispatch for it. The command_id is deliberately keyed on run_id
+    alone (not the "archive"/"preview-reap" reason label) so that
+    enqueue_task_command's own (task_id, command_id) idempotency collapses
+    the second dispatch into a no-op instead of creating a second,
+    independent PAUSE command."""
+    workforce_id = _create_active_workforce("Racing Pause Dispatch Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    running_task_id, running_run_id = _create_workforce_task_and_run(
+        workforce_id,
+        snapshot=snapshot,
+        task_status=TaskStatus.RUNNING,
+        run_status="running",
+    )
+
+    archived = client.delete(
+        f"/api/workforces/{workforce_id}", headers=_admin_headers()
+    )
+    assert archived.status_code == 200, archived.text
+
+    # Simulate the reap sweep independently building its own pause target
+    # for the SAME run, as if it raced the archive above (its own selection
+    # query would find the run before the archive's cancellation commits).
+    await pause_workforce_tasks_after_archive(
+        [
+            WorkforceRunPauseTarget(
+                run_id=running_run_id,
+                task_id=running_task_id,
+                actor_user_id=_user_id(),
+            )
+        ],
+        reason="preview-reap",
+    )
+
+    db = _direct_db_session()
+    try:
+        commands = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.task_id == running_task_id)
+            .all()
+        )
+        pause_commands = [c for c in commands if str(c.kind) == "pause"]
+        assert len(pause_commands) == 1
+        assert pause_commands[0].command_id == f"workforce-pause-{running_run_id}"
     finally:
         db.close()
 

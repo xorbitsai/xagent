@@ -210,6 +210,10 @@ _TURN_REJECTION_CODES: dict[str, tuple[V1ErrorCode, int]] = {
     # The run row backing this conversation is gone; from the SDK's
     # perspective the task is simply no longer available.
     "workforce_run_not_found": (V1ErrorCode.TASK_NOT_FOUND, 404),
+    # The run itself was cancelled (archive path or the stale-preview-run
+    # reaper) -- same "conversation no longer available" outcome as
+    # workforce_run_not_found from the SDK's perspective.
+    "workforce_run_not_active": (V1ErrorCode.TASK_NOT_FOUND, 404),
 }
 
 

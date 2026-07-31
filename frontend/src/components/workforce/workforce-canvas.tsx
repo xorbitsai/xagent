@@ -264,7 +264,12 @@ function WorkforceCanvasInner({
         name,
         description,
         onSave: (data: { name: string; description: string }) => {
-          void onSaveDetails(data)
+          // handleSaveDetails already toasts and sets the error state on
+          // failure, then re-throws so callers that need to react (the
+          // config-panel's edit view stays open) can -- this call site
+          // doesn't need to, so swallow it here rather than leaving an
+          // unhandled promise rejection.
+          onSaveDetails(data).catch(() => {})
         },
       } satisfies DetailsNodeData,
     })

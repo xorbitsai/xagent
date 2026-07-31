@@ -73,11 +73,19 @@ export function WorkforceConfigPanel({
   }, [editingDetails])
 
   const handleSaveDetails = async () => {
-    await onSaveDetails({
-      name: detailsName.trim(),
-      description: detailsDescription.trim(),
-    })
-    setEditingDetails(false)
+    try {
+      await onSaveDetails({
+        name: detailsName.trim(),
+        description: detailsDescription.trim(),
+      })
+      setEditingDetails(false)
+    } catch {
+      // onSaveDetails (workforce-builder.tsx) already toasts and sets the
+      // error state on failure, then re-throws so the edit view can stay
+      // open (setEditingDetails is skipped above) -- swallow it here
+      // rather than leaving this onClick-bound async function's rejection
+      // unhandled.
+    }
   }
 
   const sortedWorkers = workers
@@ -284,13 +292,4 @@ export function WorkforceConfigPanel({
       </section>
     </div>
   )
-}
-
-
-export function normalizeWorkerSortOrder(
-  value: string,
-  fallback: number | null | undefined,
-): number {
-  const parsed = /^\d+$/.test(value.trim()) ? Number.parseInt(value.trim(), 10) : NaN
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : (fallback ?? 1)
 }

@@ -830,11 +830,7 @@ async def archive_workforce(
     # RUNNING tasks happens after the commit (best-effort, own sessions).
     pause_targets = cancel_active_workforce_runs(db, workforce_id_value)
     db.commit()
-    await pause_workforce_tasks_after_archive(
-        pause_targets,
-        workforce_id=workforce_id_value,
-        actor_user_id=int(user.id),
-    )
+    await pause_workforce_tasks_after_archive(pause_targets)
     return {"id": workforce.id, "status": workforce.status}
 
 

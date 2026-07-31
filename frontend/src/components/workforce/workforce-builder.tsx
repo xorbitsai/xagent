@@ -31,7 +31,6 @@ import type {
     WorkforceWorkerDraft,
 } from "@/types/workforce"
 import {
-    normalizeWorkerSortOrder,
     WorkforceCanvas,
     WorkforceConfigPanel,
     WorkforceEditDialogs,
@@ -345,7 +344,13 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                 alias: edit.alias.trim() || null,
                 assignment_instructions: edit.assignment_instructions.trim(),
                 enabled: edit.enabled,
-                sort_order: normalizeWorkerSortOrder(edit.sort_order, worker.sort_order),
+                // normalizeWorkerSortOrder previously parsed edit.sort_order
+                // back out of a form field, but that field was removed and
+                // edit.sort_order (workforce-edit-dialogs.tsx) is always
+                // seeded from worker.sort_order verbatim -- this send is
+                // never actually a change, just a round-trip of the
+                // existing value.
+                sort_order: worker.sort_order ?? 1,
             })
             setWorkforce((current) =>
                 current

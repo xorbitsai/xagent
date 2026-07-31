@@ -164,7 +164,8 @@ def test_leaves_terminal_preview_run_untouched(db_session) -> None:
 
 
 def test_does_not_reap_active_runs_belonging_to_a_saved_workforce(db_session) -> None:
-    """Guards the ``workforce_id IS NULL`` filter -- must never touch real runs."""
+    """Guards the ``is_preview IS TRUE`` filter -- must never touch a real
+    (non-preview) run, even one belonging to a saved workforce."""
     from xagent.web.models.workforce import Workforce
 
     user_id = _make_user(db_session)
@@ -214,3 +215,167 @@ def test_does_not_reap_active_runs_belonging_to_a_saved_workforce(db_session) ->
     assert pause_targets == []
     run = db_session.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
     assert run.status == "running"
+
+
+def test_reaps_stale_edit_mode_preview_run_of_a_saved_workforce(db_session) -> None:
+    """PR #1060 review, F5: filtering on ``workforce_id IS NULL`` alone
+    missed edit-mode preview runs -- a test message sent against an
+    already-saved workforce has a real, non-null workforce_id with
+    is_preview True, and had no cleanup path at all before this fix
+    (cancel_active_workforce_runs is only reachable from the archive
+    endpoint). Arguably the more common leak, since editing an existing
+    workforce is the primary post-launch workflow."""
+    from xagent.web.models.workforce import Workforce
+
+    user_id = _make_user(db_session)
+    agent_id = _make_agent(db_session, user_id)
+    workforce = Workforce(
+        owner_user_id=user_id,
+        scope_type="user",
+        scope_id=str(user_id),
+        name="Real Workforce",
+        description="d",
+        manager_agent_id=agent_id,
+        status="active",
+    )
+    db_session.add(workforce)
+    db_session.commit()
+    db_session.refresh(workforce)
+
+    stale_created_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    task = Task(
+        user_id=user_id,
+        title="edit-mode preview",
+        description="hi",
+        status=TaskStatus.RUNNING,
+        agent_id=agent_id,
+        source="internal",
+    )
+    db_session.add(task)
+    db_session.flush()
+    run = WorkforceRun(
+        workforce_id=int(workforce.id),
+        task_id=int(task.id),
+        user_id=user_id,
+        status="running",
+        is_preview=True,
+        snapshot={},
+    )
+    db_session.add(run)
+    db_session.flush()
+    run.created_at = stale_created_at
+    db_session.commit()
+    run_id = int(run.id)
+    task_id = int(task.id)
+
+    pause_targets = reap_stale_preview_workforce_runs(
+        db_session, stale_after_seconds=7200
+    )
+
+    assert len(pause_targets) == 1
+    assert pause_targets[0].run_id == run_id
+    assert pause_targets[0].task_id == task_id
+    # PR #1060 review, F1: actor_user_id is carried per-target from the
+    # run's own owner (WorkforceRun.user_id is nullable=False).
+    assert pause_targets[0].actor_user_id == user_id
+
+    run = db_session.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
+    assert run.status == "cancelled"
+
+
+def test_reaps_stale_run_whose_task_already_finished_without_a_pause_target(
+    db_session,
+) -> None:
+    """PR #1060 review (test quality): the negative half of the
+    pause-target gate. A stale run stuck in an ACTIVE status (e.g.
+    "pending") whose Task already reached a terminal state must still be
+    cancelled, but with no PAUSE dispatch -- only a still-RUNNING task
+    needs one."""
+    user_id = _make_user(db_session)
+    agent_id = _make_agent(db_session, user_id)
+    stale_created_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    _task_id, run_id = _make_preview_run(
+        db_session,
+        user_id=user_id,
+        agent_id=agent_id,
+        task_status=TaskStatus.COMPLETED,
+        run_status="pending",
+        created_at=stale_created_at,
+    )
+
+    pause_targets = reap_stale_preview_workforce_runs(
+        db_session, stale_after_seconds=7200
+    )
+
+    assert pause_targets == []
+    run = db_session.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
+    assert run.status == "cancelled"
+    assert run.completed_at is not None
+
+
+def test_limit_caps_the_number_of_runs_reaped_per_call(db_session) -> None:
+    """PR #1060 review (test quality): ``limit`` was never exercised."""
+    user_id = _make_user(db_session)
+    agent_id = _make_agent(db_session, user_id)
+    stale_created_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    run_ids = []
+    for _ in range(3):
+        _task_id, run_id = _make_preview_run(
+            db_session,
+            user_id=user_id,
+            agent_id=agent_id,
+            task_status=TaskStatus.RUNNING,
+            run_status="running",
+            created_at=stale_created_at,
+        )
+        run_ids.append(run_id)
+
+    pause_targets = reap_stale_preview_workforce_runs(
+        db_session, stale_after_seconds=7200, limit=2
+    )
+
+    assert len(pause_targets) == 2
+    reaped_ids = {target.run_id for target in pause_targets}
+    remaining = (
+        db_session.query(WorkforceRun).filter(WorkforceRun.status == "running").all()
+    )
+    assert len(remaining) == 1
+    assert {run.id for run in remaining} | reaped_ids == set(run_ids)
+
+
+def test_reap_commits_so_a_fresh_session_sees_the_cancellation(
+    db_session, tmp_path
+) -> None:
+    """PR #1060 review (test quality): every other test here asserts through
+    the same session that made the change -- a missing internal
+    ``db.commit()`` in ``reap_stale_preview_workforce_runs`` would still
+    pass those. This function is called from a Celery task on a session
+    that gets closed afterward, so the commit is load-bearing in
+    production; verify durability via an independent session against the
+    same on-disk database instead of the session under test."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    user_id = _make_user(db_session)
+    agent_id = _make_agent(db_session, user_id)
+    stale_created_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    _task_id, run_id = _make_preview_run(
+        db_session,
+        user_id=user_id,
+        agent_id=agent_id,
+        task_status=TaskStatus.RUNNING,
+        run_status="running",
+        created_at=stale_created_at,
+    )
+
+    reap_stale_preview_workforce_runs(db_session, stale_after_seconds=7200)
+
+    fresh_engine = create_engine(f"sqlite:///{tmp_path / 'preview_reap.db'}")
+    FreshSessionLocal = sessionmaker(bind=fresh_engine)
+    fresh_db = FreshSessionLocal()
+    try:
+        run = fresh_db.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
+        assert run.status == "cancelled"
+    finally:
+        fresh_db.close()
+        fresh_engine.dispose()

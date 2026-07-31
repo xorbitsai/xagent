@@ -407,6 +407,67 @@ async def test_cancel_command_does_not_require_persisted_actor(db_session) -> No
 
 
 @pytest.mark.asyncio
+async def test_pause_command_with_no_actor_fails_the_way_f1_identified(
+    db_session,
+) -> None:
+    """PR #1060 review, F1: unlike CANCEL (see the sibling test above),
+    PAUSE DOES require a persisted actor -- _load_command_actor(None)
+    raises. This is exactly the failure the stale-preview-run reaper's
+    dispatch hit before the fix: it called
+    pause_workforce_tasks_after_archive with actor_user_id=None for every
+    reaped run, so every reaped run's "cancel" never actually paused the
+    running task."""
+    _user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=None,
+        command_id="pause-with-no-actor",
+        kind=TaskCommandKind.PAUSE,
+        payload={},
+        target_run_id=None,
+        attempt_count=1,
+    )
+
+    with pytest.raises(ValueError, match="Task command has no actor"):
+        await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
+async def test_pause_command_with_a_real_actor_gets_past_the_actor_check(
+    db_session,
+) -> None:
+    """PR #1060 review, F1 fix: WorkforceRunPauseTarget now carries the
+    run's own owner (WorkforceRun.user_id, nullable=False) as
+    actor_user_id, so the reaper's PAUSE dispatch no longer hits the
+    failure above. Whatever _handle_pause_task_unserialized does next is
+    exercised by other PAUSE tests; the only thing under test here is
+    getting past the actor-loading gate without F1's specific failure."""
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=2,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="pause-with-real-actor",
+        kind=TaskCommandKind.PAUSE,
+        payload={},
+        target_run_id=None,
+        attempt_count=1,
+    )
+
+    try:
+        await execute_durable_task_command(command)
+    except Exception as exc:
+        assert "Task command has no actor" not in str(exc)
+
+
+@pytest.mark.asyncio
 async def test_only_terminal_command_failure_is_broadcast(db_session) -> None:
     _user, task = _create_running_task(db_session)
     task.runner_id = None

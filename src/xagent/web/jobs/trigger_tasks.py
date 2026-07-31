@@ -23,6 +23,28 @@ from .celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
+def _reap_and_pause_stale_preview_runs(db: Session) -> int:
+    """Reap abandoned workforce-builder preview runs and dispatch PAUSE for
+    any that were still RUNNING. Shared by both sync trigger-scan
+    entrypoints below (the async in-process dispatcher in app.py inlines
+    the same two steps itself, since it already runs inside an event loop
+    and splits the reap/dispatch across an asyncio.to_thread call and a
+    plain await) so this sequence only has to be gotten right once here.
+
+    Returns the number of runs that needed a PAUSE dispatch (not the total
+    number reaped).
+    """
+    reaped_pause_targets = reap_stale_preview_workforce_runs(db)
+    if reaped_pause_targets:
+        asyncio.run(
+            pause_workforce_tasks_after_archive(
+                reaped_pause_targets,
+                reason="preview-reap",
+            )
+        )
+    return len(reaped_pause_targets)
+
+
 def handle_trigger_event(db: Session, job: BackgroundJob) -> dict[str, Any]:
     """Persisted trigger-event processing hook.
 
@@ -75,11 +97,17 @@ def handle_trigger_scan(db: Session, job: BackgroundJob) -> dict[str, Any]:
     update_job_progress(db, job, message="Scanning scheduled triggers")
     requeued_jobs = requeue_stale_background_jobs(db)
     runs = scan_due_scheduled_triggers(db)
+    # This is the BackgroundJob-driven variant of the same scan
+    # `scan_due_triggers` below runs for Celery Beat -- the reaper must run
+    # here too, or any deployment relying on this path instead of Beat gets
+    # zero preview-run reaping (see reap_stale_preview_workforce_runs).
+    reaped_preview_run_pause_dispatches = _reap_and_pause_stale_preview_runs(db)
     return {
         "status": "scanned",
         "scan_scope": payload.get("scope", "all"),
         "requeued_stale_jobs": len(requeued_jobs),
         "trigger_runs_created": len(runs),
+        "reaped_preview_run_pause_dispatches": reaped_preview_run_pause_dispatches,
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -104,25 +132,14 @@ def scan_due_triggers() -> dict[str, Any]:
     try:
         requeued_jobs = requeue_stale_background_jobs(db)
         runs = scan_due_scheduled_triggers(db)
-        reaped_pause_targets = reap_stale_preview_workforce_runs(db)
-        if reaped_pause_targets:
-            asyncio.run(
-                pause_workforce_tasks_after_archive(
-                    reaped_pause_targets,
-                    # Preview runs have no workforce_id; only used for the
-                    # log message on a failed dispatch.
-                    workforce_id=0,
-                    actor_user_id=None,
-                    reason="preview-reap",
-                )
-            )
+        # Only counts reaped runs whose Task was still RUNNING (i.e. that
+        # needed an explicit PAUSE dispatch), not every reaped run.
+        reaped_preview_run_pause_dispatches = _reap_and_pause_stale_preview_runs(db)
         return {
             "status": "ok",
             "requeued_stale_jobs": len(requeued_jobs),
             "trigger_runs_created": len(runs),
-            # Only counts reaped runs whose Task was still RUNNING (i.e. that
-            # needed an explicit PAUSE dispatch), not every reaped run.
-            "reaped_preview_run_pause_dispatches": len(reaped_pause_targets),
+            "reaped_preview_run_pause_dispatches": reaped_preview_run_pause_dispatches,
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
     finally:

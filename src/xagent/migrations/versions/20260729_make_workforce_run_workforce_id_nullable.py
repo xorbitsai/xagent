@@ -7,7 +7,7 @@ preview persists a hidden Task), but there is no Workforce row to point
 ``workforce_id`` at, so the column must accept NULL.
 
 Revision ID: 20260729_make_workforce_run_workforce_id_nullable
-Revises: 20260724_add_upload_source_to_uploaded_files
+Revises: 20260730_seed_zoom_mcp_app
 Create Date: 2026-07-29
 
 """
@@ -19,7 +19,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260729_make_workforce_run_workforce_id_nullable"
-down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
+down_revision: Union[str, None] = "20260730_seed_zoom_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -60,20 +60,17 @@ def downgrade() -> None:
         return
 
     # Ephemeral preview runs have no Workforce to backfill; they cannot
-    # survive the NOT NULL restore, so drop them first -- and their paired
-    # hidden Task rows too, or those become orphans (nothing else references
-    # them once the owning WorkforceRun row is gone). ``tasks`` is never
-    # created by a tracked migration (it predates Alembic in this repo), so
-    # a migration-only database built from base has no such table at all --
-    # guard it the same way TABLE is guarded above, or a full downgrade-to-
-    # base run fails with "relation tasks does not exist".
-    if "tasks" in inspector.get_table_names():
-        bind.execute(
-            sa.text(
-                f"DELETE FROM tasks WHERE id IN "
-                f"(SELECT task_id FROM {TABLE} WHERE {COLUMN} IS NULL AND task_id IS NOT NULL)"
-            )
-        )
+    # survive the NOT NULL restore, so drop them. Their paired hidden Task
+    # rows are deliberately left as orphans rather than deleted here: four
+    # child tables (DAGExecution, TraceEvent, TraceMessageBlob,
+    # TraceCheckpointBlob -- see src/xagent/web/models/task.py) reference
+    # tasks.id with NO ``ondelete`` clause, so a direct DELETE FROM tasks
+    # raises a Postgres FK violation for any preview that executed even one
+    # turn (the common case, not an edge case -- every turn writes a
+    # TraceEvent). Cascade-deleting those four tables safely, in dependency
+    # order, is out of scope for a nullable-column migration; a hidden
+    # (``is_visible=False``) orphaned preview Task is harmless data debris,
+    # not a functional issue.
     bind.execute(sa.text(f"DELETE FROM {TABLE} WHERE {COLUMN} IS NULL"))
 
     if _column_nullable(inspector, TABLE, COLUMN) is not False:

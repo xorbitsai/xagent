@@ -73,6 +73,12 @@ def _create_schema_without_tasks_table(connection) -> None:
     empty database through the whole revision history with no ORM
     ``create_all()`` step. No migration in this repo actually creates
     ``tasks`` (it predates Alembic), so on that harness it never exists.
+
+    ``task_id`` still declares ``REFERENCES tasks(id)`` even though ``tasks``
+    doesn't exist -- SQLite allows creating the constraint regardless (unlike
+    Postgres) -- so this fixture actually reproduces the dangling-FK-target
+    shape ``BATCH_REFLECT_KWARGS`` exists for. Without it, this test would
+    pass identically whether or not ``resolve_fks=False`` were removed.
     """
     connection.exec_driver_sql("CREATE TABLE workforces (id INTEGER PRIMARY KEY)")
     connection.exec_driver_sql("CREATE TABLE users (id INTEGER PRIMARY KEY)")
@@ -81,7 +87,7 @@ def _create_schema_without_tasks_table(connection) -> None:
         CREATE TABLE {TABLE} (
             id INTEGER PRIMARY KEY,
             workforce_id INTEGER NOT NULL REFERENCES workforces(id) ON DELETE CASCADE,
-            task_id INTEGER UNIQUE,
+            task_id INTEGER UNIQUE REFERENCES tasks(id) ON DELETE SET NULL,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             status VARCHAR(20) NOT NULL DEFAULT 'pending',
             is_preview BOOLEAN NOT NULL DEFAULT 0,
@@ -168,7 +174,14 @@ def test_upgrade_is_idempotent() -> None:
         assert columns[COLUMN]["nullable"] is True
 
 
-def test_downgrade_drops_preview_runs_and_their_orphaned_tasks() -> None:
+def test_downgrade_drops_preview_runs_and_leaves_their_tasks_as_orphans() -> None:
+    """PR #1060 review, F3: an earlier version of this migration deleted the
+    preview run's paired Task row directly, which raises a Postgres FK
+    violation for any preview that executed even one turn (DAGExecution,
+    TraceEvent, TraceMessageBlob, TraceCheckpointBlob all reference tasks.id
+    with no ondelete clause). The fix leaves the hidden orphaned Task row in
+    place -- harmless data debris, not a functional issue -- rather than
+    trying to cascade-delete its children from a migration."""
     migration = _load_migration_module()
     engine = sa.create_engine("sqlite:///:memory:")
 
@@ -197,12 +210,13 @@ def test_downgrade_drops_preview_runs_and_their_orphaned_tasks() -> None:
         ).fetchall()
         assert [row[0] for row in remaining_runs] == [1]
 
-        # Task 101 was only referenced by the deleted preview run (task 100
-        # stays -- it belongs to the surviving, real workforce run).
+        # Both tasks survive: 100 belongs to the surviving real workforce
+        # run, and 101 -- the deleted preview run's Task -- is now a
+        # deliberately-left orphan rather than a deleted row.
         remaining_tasks = connection.execute(
             sa.text("SELECT id FROM tasks ORDER BY id")
         ).fetchall()
-        assert [row[0] for row in remaining_tasks] == [100]
+        assert [row[0] for row in remaining_tasks] == [100, 101]
 
 
 def test_downgrade_restores_not_null_when_tasks_table_is_missing() -> None:

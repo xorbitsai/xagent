@@ -742,15 +742,20 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
 def get_workforce_preview_run_stale_seconds() -> int:
     """Age after which an abandoned builder preview run is GC-eligible.
 
-    Preview runs (workforce builder "test before save", ``workforce_id`` NULL)
-    are only invalidated client-side when the draft changes; a closed tab,
-    crashed browser, or network drop leaves the run (and its hidden Task)
-    active server-side forever with no owner left to invalidate it. Rows
-    still non-terminal past this age are reaped by the scheduled sweep.
+    Preview runs (workforce builder "test before save", ``is_preview`` true —
+    either an ephemeral create-mode draft or an edit-mode test against an
+    already-saved workforce) are only invalidated client-side when the draft
+    changes; a closed tab, crashed browser, or network drop leaves the run
+    (and its hidden Task) active server-side forever with no owner left to
+    invalidate it. Rows still non-terminal past this age are reaped by the
+    scheduled sweep.
 
     Priority:
         1. XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS environment variable
         2. Default 7200 (2 hours)
+
+    Clamped to a minimum of 300 seconds (5 minutes), so a misconfigured tiny
+    value can't reap a preview run that is still genuinely in progress.
     """
     return _get_positive_int_env(WORKFORCE_PREVIEW_RUN_STALE_SECONDS, 7200, minimum=300)
 

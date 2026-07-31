@@ -414,11 +414,25 @@ def test_append_message_through_workforce_key():
     task_id = run["task_id"]
 
     # Drive the task to a terminal state so append is allowed (append
-    # requires COMPLETED/FAILED; RUNNING/PENDING both 409).
+    # requires COMPLETED/FAILED; RUNNING/PENDING both 409). Also project the
+    # same terminal status onto WorkforceRun.status, matching what
+    # sync_workforce_run_status does in production at the end of a real
+    # turn (task_orchestrator.py) -- leaving it at its creation-time value
+    # would make this test pass regardless of whether
+    # ensure_workforce_turn_allowed's own run-status check is correct, since
+    # a "pending"/"running" run never exercises that check either way.
+    from xagent.web.models.workforce import WorkforceRun
+
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).one()
         task.status = TaskStatus.COMPLETED
+        agent_config = dict(task.agent_config or {})
+        workforce_run_id = agent_config.get("workforce_run_id")
+        if isinstance(workforce_run_id, int):
+            db.query(WorkforceRun).filter(WorkforceRun.id == workforce_run_id).update(
+                {"status": "completed"}
+            )
         db.commit()
     finally:
         db.close()

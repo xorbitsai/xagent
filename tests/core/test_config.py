@@ -1784,6 +1784,37 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestWorkforcePreviewRunReapConfig:
+    """PR #1060 review: get_workforce_preview_run_stale_seconds() had no
+    test, unlike its sibling TTL config functions above."""
+
+    def test_default(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        monkeypatch.delenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", raising=False)
+        assert get_workforce_preview_run_stale_seconds() == 7200
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        monkeypatch.setenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", "3600")
+        assert get_workforce_preview_run_stale_seconds() == 3600
+
+    def test_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        # Below the 300s floor -> default (guards against reaping a preview
+        # run that is still genuinely in progress).
+        monkeypatch.setenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", "5")
+        assert get_workforce_preview_run_stale_seconds() == 7200
+
+    def test_invalid_value_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        monkeypatch.setenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", "not-a-number")
+        assert get_workforce_preview_run_stale_seconds() == 7200
+
+
 class TestGmailPubSubProvisioningConfig:
     """Config for per-mailbox Gmail Pub/Sub provisioning."""
 

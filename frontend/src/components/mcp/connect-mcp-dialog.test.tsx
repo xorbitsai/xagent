@@ -390,7 +390,13 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       await waitFor(() => {
         expect(popup.location.href).toBe("https://auth.granola.ai/authorize?client_id=dyn-1")
       })
-      expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank")
+      // A features string must be passed: without one, browsers open a full
+      // new tab instead of the small centered popup the builtin flow uses.
+      expect(openSpy).toHaveBeenCalledWith(
+        "about:blank",
+        "mcp-oauth",
+        expect.stringContaining("width=600,height=700"),
+      )
       expect(popup.close).not.toHaveBeenCalled()
       expect(toastErrorMock).not.toHaveBeenCalled()
     } finally {

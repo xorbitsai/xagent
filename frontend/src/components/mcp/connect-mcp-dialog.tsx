@@ -527,7 +527,17 @@ export function ConnectMcpDialog({
     setLoadingApp(app.id)
     // Open the popup synchronously on the click, before any await — popup
     // blockers reject windows opened outside direct user-gesture handling.
-    const popup = window.open("about:blank", "_blank")
+    // The window-features string matters: without it, browsers open a full
+    // new tab instead of the small centered popup the builtin OAuth flow uses.
+    const width = 600
+    const height = 700
+    const left = window.screenX + (window.outerWidth - width) / 2
+    const top = window.screenY + (window.outerHeight - height) / 2
+    const popup = window.open(
+      "about:blank",
+      "mcp-oauth",
+      `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`,
+    )
     if (!popup) {
       toast.error("Popup blocked. Please allow popups for this site to connect.")
       setLoadingApp(null)

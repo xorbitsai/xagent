@@ -739,11 +739,7 @@ def _compensate_failed_task_extension_create(
     """Remove a just-created task after provider binding setup failed."""
 
     db.rollback()
-    deleted = purge_task_rows(
-        db,
-        task_id=task_id,
-        preserve_uploaded_files=True,
-    )
+    deleted = purge_task_rows(db, task_id=task_id)
     db.commit()
     if deleted:
         invalidate_task_cache(task_id)
@@ -786,11 +782,7 @@ def _delete_task_sync(*, task_id: int) -> bool:
     session_factory = get_session_local()
     delete_db = session_factory()
     try:
-        deleted = purge_task_rows(
-            delete_db,
-            task_id=task_id,
-            preserve_uploaded_files=False,
-        )
+        deleted = purge_task_rows(delete_db, task_id=task_id)
         if not deleted:
             delete_db.rollback()
             return False

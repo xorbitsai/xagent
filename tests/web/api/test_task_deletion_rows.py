@@ -15,12 +15,14 @@ from .conftest import _admin_headers, _direct_db_session, _register_second_user
 pytestmark = pytest.mark.usefixtures("_test_db")
 
 
-def test_purge_task_rows_preserves_uploaded_files_by_detaching_them() -> None:
-    """The create-failure compensation branch must keep the user's uploads.
+def test_purge_task_rows_detaches_uploaded_files_instead_of_deleting_them() -> None:
+    """Purging a task must leave its uploads behind, detached from the task.
 
-    ``preserve_uploaded_files=True`` is the compensation path used after a
-    runtime-extension binding failure: the just-created task row goes away but
-    the files the request already stored must survive, detached from the task.
+    ``Task.uploaded_files`` is a relationship without a cascade, so the ORM
+    ``db.delete(task)`` nulls ``UploadedFile.task_id`` on its own. Both callers
+    -- the create-failure compensation path and ordinary task deletion -- rely
+    on this: the task row goes away while the files the request already stored
+    survive.
     """
 
     _admin_headers()
@@ -47,9 +49,7 @@ def test_purge_task_rows_preserves_uploaded_files_by_detaching_them() -> None:
         )
         db.commit()
 
-        assert (
-            purge_task_rows(db, task_id=task_id, preserve_uploaded_files=True) is True
-        )
+        assert purge_task_rows(db, task_id=task_id) is True
         db.commit()
 
         assert db.query(Task).filter(Task.id == task_id).count() == 0
@@ -63,43 +63,12 @@ def test_purge_task_rows_preserves_uploaded_files_by_detaching_them() -> None:
         db.close()
 
 
-def test_purge_task_rows_without_preservation_also_detaches_uploaded_files() -> None:
-    """Characterise the ``preserve_uploaded_files=False`` branch.
-
-    ``Task.uploaded_files`` is a relationship without a cascade, so the ORM
-    ``db.delete(task)`` nulls ``UploadedFile.task_id`` on its own. Both flag
-    values therefore leave the rows detached rather than deleted; the flag only
-    controls whether an extra bulk UPDATE runs first.
-    """
+def test_purge_task_rows_returns_false_for_a_missing_task() -> None:
+    """A purge for an already-deleted task is a no-op, not an error."""
 
     _admin_headers()
-    _register_second_user("purge-owner-2", "purgepass1")
     db = _direct_db_session()
     try:
-        db.execute(text("PRAGMA foreign_keys = ON"))
-        owner = db.query(User).filter(User.username == "purge-owner-2").one()
-        task = Task(user_id=int(owner.id), title="deleted", description="")
-        db.add(task)
-        db.flush()
-        task_id = int(task.id)
-        db.add(
-            UploadedFile(
-                user_id=int(owner.id),
-                task_id=task_id,
-                filename="detached.txt",
-                storage_path="/tmp/detached.txt",
-                file_size=1,
-            )
-        )
-        db.commit()
-
-        assert (
-            purge_task_rows(db, task_id=task_id, preserve_uploaded_files=False) is True
-        )
-        db.commit()
-
-        assert db.query(Task).filter(Task.id == task_id).count() == 0
-        rows = db.query(UploadedFile).filter(UploadedFile.user_id == owner.id).all()
-        assert [row.task_id for row in rows] == [None]
+        assert purge_task_rows(db, task_id=987654321) is False
     finally:
         db.close()

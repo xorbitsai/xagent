@@ -1409,6 +1409,103 @@ async def test_connect_app_reactivates_a_previously_disconnected_association(
 
 
 @pytest.mark.asyncio
+async def test_connect_app_syncs_auth_when_catalog_auth_changes(
+    db_session, monkeypatch
+):
+    """The catalog is the source of truth for the shared row's auth config:
+    a registry change (e.g. adding a scope hint) must propagate to the
+    already-provisioned server row on the next connect, not persist stale."""
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dynamic-client-123",
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+            )
+        ),
+    )
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+
+    app_row = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "granola").one()
+    app_row.launch_config = {
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "mcp_oauth", "scope": "meetings.read"},
+    }
+    db.commit()
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+
+    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    assert server.auth == {"type": "mcp_oauth", "scope": "meetings.read"}
+
+
+@pytest.mark.asyncio
+async def test_connect_app_does_not_rewrite_unchanged_auth_with_secret(
+    db_session, monkeypatch
+):
+    """Auth drift is detected on the DECRYPTED stored value: sensitive auth
+    fields are encrypted at rest, so a raw stored-vs-catalog comparison would
+    spuriously differ on every connect and rewrite the row each time. Fernet
+    ciphertext changes on re-encryption, so an unchanged ciphertext across
+    two connects proves no rewrite happened."""
+    db, user, _ = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="granola",
+            name="Granola",
+            transport="streamable_http",
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {
+                    "type": "mcp_oauth",
+                    "client_id": "static-client",
+                    "client_secret": "static-secret",
+                },
+            },
+        )
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    stored_secret_ciphertext = server.auth["client_secret"]
+    assert stored_secret_ciphertext != "static-secret"  # encrypted at rest
+    assert decrypt_value(stored_secret_ciphertext) == "static-secret"
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+
+    db.refresh(server)
+    assert server.auth["client_secret"] == stored_secret_ciphertext
+
+
+@pytest.mark.asyncio
 async def test_connect_app_rejects_non_mcp_oauth_catalog_app(db_session):
     db, user, _ = db_session
     db.add(

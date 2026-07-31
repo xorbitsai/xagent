@@ -475,6 +475,26 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "env_mapping": {"SLACK_ACCESS_TOKEN": "access_token"},
             },
         },
+        {
+            "app_id": "granola",
+            "name": "Granola",
+            "description": "Connect to Granola to search and read your meeting notes, transcripts and action items through Granola's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=granola.ai&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth): Granola hosts the MCP server itself and
+            # exposes its own tools — there is no local module to launch. Users
+            # connect via POST /api/mcp/apps/{id}/oauth/connect (per-user OAuth
+            # Authorization Code + PKCE); Granola issues no static client
+            # credentials, so the flow relies on Dynamic Client Registration.
+            "launch_config": {
+                "url": "https://mcp.granola.ai/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        },
     ]
 
 

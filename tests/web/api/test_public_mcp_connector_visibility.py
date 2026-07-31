@@ -764,6 +764,24 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
         "required_env": ["GOOGLE_MAPS_API_KEY"],
     }
 
+    # Remote MCP (no local command at all): Granola hosts the server itself.
+    assert rows_by_app_id["granola"]["transport"] == "streamable_http"
+    assert rows_by_app_id["granola"]["launch_config"] == {
+        "url": "https://mcp.granola.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+
+def test_builtin_registry_classifies_granola_as_mcp_oauth() -> None:
+    """The registry shape must classify as mcp_oauth — anything else means the
+    catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps
+    and generic_oauth_login rejects non-"oauth" transports)."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+    from xagent.web.mcp_apps import classify_app_auth
+
+    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "granola")
+    assert classify_app_auth(row["transport"], row["launch_config"]) == "mcp_oauth"
+
 
 def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() -> None:
     from xagent.web.builtin_mcp_registry import (

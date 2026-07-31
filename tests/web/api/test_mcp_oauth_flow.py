@@ -1237,10 +1237,15 @@ async def test_oauth_routes_reject_inactive_user_mcp_server(db_session, monkeypa
     assert exc.value.status_code == 404
 
 
-def _add_remote_oauth_catalog_app(db, *, app_id: str = "granola") -> None:
+def _add_remote_oauth_catalog_app(db, *, app_id: str = "remote-notes") -> None:
     """A built-in catalog row shaped like a real remote-MCP-OAuth connector:
     only a URL and auth.type — no static client_id, matching a DCR-only
-    provider (e.g. Granola) that never hands out pre-registered credentials."""
+    provider (e.g. Granola) that never hands out pre-registered credentials.
+
+    The synthetic app_id must NOT match a real builtin registry entry: the
+    builtin execution overlay (get_builtin_execution_fields) replaces a DB
+    row's execution fields with the canonical registry values for matching
+    app_ids, which would silently override this fixture's url/auth."""
     db.add(
         PublicMCPApp(
             app_id=app_id,
@@ -1289,7 +1294,7 @@ async def test_connect_app_creates_server_and_association_then_starts_dcr_flow(
     )
 
     response = await connect_mcp_oauth_app(
-        "granola",
+        "remote-notes",
         MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
         user,
         db,
@@ -1300,7 +1305,7 @@ async def test_connect_app_creates_server_and_association_then_starts_dcr_flow(
     assert query["client_id"] == ["dynamic-client-123"]
     assert len(registration_requests) == 1
 
-    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    server = db.query(MCPServer).filter(MCPServer.name == "remote-notes").one()
     assert server.transport == "streamable_http"
     assert server.url == "https://mcp.example.com/mcp"
     assert server.auth["type"] == "mcp_oauth"
@@ -1347,17 +1352,17 @@ async def test_connect_app_is_idempotent_across_repeated_connects(
     )
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
 
-    assert db.query(MCPServer).filter(MCPServer.name == "granola").count() == 1
+    assert db.query(MCPServer).filter(MCPServer.name == "remote-notes").count() == 1
     assert (
         db.query(UserMCPServer)
         .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-        .filter(MCPServer.name == "granola", UserMCPServer.user_id == user.id)
+        .filter(MCPServer.name == "remote-notes", UserMCPServer.user_id == user.id)
         .count()
         == 1
     )
@@ -1391,13 +1396,13 @@ async def test_connect_app_reactivates_a_previously_disconnected_association(
     )
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
-    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    server = db.query(MCPServer).filter(MCPServer.name == "remote-notes").one()
     _set_user_mcp_active(db, user, server, False)
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
 
     assoc = (
@@ -1441,10 +1446,10 @@ async def test_connect_app_syncs_auth_when_catalog_auth_changes(
     )
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
 
-    app_row = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "granola").one()
+    app_row = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "remote-notes").one()
     app_row.launch_config = {
         "url": "https://mcp.example.com/mcp",
         "auth": {"type": "mcp_oauth", "scope": "meetings.read"},
@@ -1452,10 +1457,10 @@ async def test_connect_app_syncs_auth_when_catalog_auth_changes(
     db.commit()
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
 
-    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    server = db.query(MCPServer).filter(MCPServer.name == "remote-notes").one()
     assert server.auth == {"type": "mcp_oauth", "scope": "meetings.read"}
 
 
@@ -1491,10 +1496,10 @@ async def test_connect_app_auth_sync_tolerates_a_malformed_sensitive_field(
     )
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
 
-    app_row = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "granola").one()
+    app_row = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "remote-notes").one()
     app_row.launch_config = {
         "url": "https://mcp.example.com/mcp",
         "auth": {"type": "mcp_oauth", "client_secret": {"nested": "not-a-string"}},
@@ -1503,10 +1508,10 @@ async def test_connect_app_auth_sync_tolerates_a_malformed_sensitive_field(
 
     # Must not raise — the malformed field is left as-is rather than crashing.
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
 
-    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    server = db.query(MCPServer).filter(MCPServer.name == "remote-notes").one()
     assert server.auth["client_secret"] == {"nested": "not-a-string"}
 
 
@@ -1522,8 +1527,8 @@ async def test_connect_app_does_not_rewrite_unchanged_auth_with_secret(
     db, user, _ = db_session
     db.add(
         PublicMCPApp(
-            app_id="granola",
-            name="Granola",
+            app_id="remote-notes",
+            name="Remote Notes",
             transport="streamable_http",
             launch_config={
                 "url": "https://mcp.example.com/mcp",
@@ -1543,15 +1548,15 @@ async def test_connect_app_does_not_rewrite_unchanged_auth_with_secret(
     monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
-    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    server = db.query(MCPServer).filter(MCPServer.name == "remote-notes").one()
     stored_secret_ciphertext = server.auth["client_secret"]
     assert stored_secret_ciphertext != "static-secret"  # encrypted at rest
     assert decrypt_value(stored_secret_ciphertext) == "static-secret"
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
 
     db.refresh(server)
@@ -1599,7 +1604,7 @@ async def test_connect_app_rejects_hijacked_server_with_foreign_url(db_session):
     _add_remote_oauth_catalog_app(db)
     db.add(
         MCPServer(
-            name="granola",
+            name="remote-notes",
             managed="external",
             transport="streamable_http",
             url="https://evil.example.com/mcp",
@@ -1609,7 +1614,7 @@ async def test_connect_app_rejects_hijacked_server_with_foreign_url(db_session):
 
     with pytest.raises(mcp_api.HTTPException) as exc:
         await connect_mcp_oauth_app(
-            "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+            "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
         )
     assert exc.value.status_code == 409
 
@@ -1624,7 +1629,7 @@ async def test_connect_app_rejects_user_owned_server_even_with_matching_config(
     db, user, other_user = db_session
     _add_remote_oauth_catalog_app(db)
     server = MCPServer(
-        name="granola",
+        name="remote-notes",
         managed="external",
         transport="streamable_http",
         url="https://mcp.example.com/mcp",
@@ -1641,7 +1646,7 @@ async def test_connect_app_rejects_user_owned_server_even_with_matching_config(
 
     with pytest.raises(mcp_api.HTTPException) as exc:
         await connect_mcp_oauth_app(
-            "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+            "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
         )
     assert exc.value.status_code == 409
 
@@ -1677,7 +1682,7 @@ async def test_connect_app_json_accept_returns_authorization_url_in_body(
     )
 
     response = await connect_mcp_oauth_app(
-        "granola",
+        "remote-notes",
         MCPOAuthConnectRequest(redirect_after="/mcp"),
         user,
         db,
@@ -1722,13 +1727,15 @@ async def test_mcp_oauth_app_not_connected_until_grant_completes(
     )
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
-    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    server = db.query(MCPServer).filter(MCPServer.name == "remote-notes").one()
 
     apps_before_grant = list_mcp_apps(current_user=user, db=db)
-    granola_before = next(a for a in apps_before_grant if a["id"] == "granola")
-    assert granola_before["is_connected"] is False
+    remote_notes_before = next(
+        a for a in apps_before_grant if a["id"] == "remote-notes"
+    )
+    assert remote_notes_before["is_connected"] is False
 
     # The DCR flow already registered a client during connect_mcp_oauth_app
     # above; reuse it rather than registering a second one under the same
@@ -1745,16 +1752,16 @@ async def test_mcp_oauth_app_not_connected_until_grant_completes(
             issuer="https://auth.example.com",
             resource="https://mcp.example.com/mcp",
             scope="",
-            access_token=encrypt_value("granola-access-token"),
+            access_token=encrypt_value("remote-notes-access-token"),
             status="active",
         )
     )
     db.commit()
 
     apps_after_grant = list_mcp_apps(current_user=user, db=db)
-    granola_after = next(a for a in apps_after_grant if a["id"] == "granola")
-    assert granola_after["is_connected"] is True
-    assert granola_after["server_id"] == server.id
+    remote_notes_after = next(a for a in apps_after_grant if a["id"] == "remote-notes")
+    assert remote_notes_after["is_connected"] is True
+    assert remote_notes_after["server_id"] == server.id
 
 
 @pytest.mark.asyncio
@@ -1827,12 +1834,12 @@ async def test_delete_mcp_server_revokes_only_the_disconnecting_users_grant(
     )
 
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
     )
     await connect_mcp_oauth_app(
-        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), other_user, db
+        "remote-notes", MCPOAuthConnectRequest(redirect_after="/mcp"), other_user, db
     )
-    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    server = db.query(MCPServer).filter(MCPServer.name == "remote-notes").one()
     # Both connects register against the same (server, issuer) pair, so DCR
     # reuses a single client row (see register_mcp_oauth_public_client).
     client = (

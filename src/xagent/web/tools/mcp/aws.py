@@ -252,6 +252,9 @@ def aws_cloudwatch_describe_log_groups(
     discover where a service's logs live before searching them.
     """
     try:
+        # 50, not 100 like the other list-style tools: DescribeLogGroups'
+        # `limit` has a hard server-side max of 50 (unlike, e.g., MaxRecords
+        # on describe_alarms), so 100 here would fail remotely.
         kwargs: dict[str, Any] = {"limit": 50}
         if name_prefix:
             kwargs["logGroupNamePrefix"] = name_prefix

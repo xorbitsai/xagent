@@ -57,7 +57,36 @@ _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 # extension names one task actually bound to. Reusing the existing JSON column
 # keeps the per-task binding record migration-free.
 TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
+# Keys in ``tasks.agent_config`` that only the server may write. Task-create
+# request bodies carry a free-form ``agent_config`` dict that endpoints copy
+# wholesale, so anything the server later reads back as authoritative has to be
+# stripped from that copy first -- otherwise a client can pre-seed it.
+#
+# Only the binding record is listed today. Other reserved keys on this column
+# (``execution_scope``, ``a2a_context_id``, ``auth_mode``, ``guest_id``) are
+# pass-through by long-standing behavior and are tracked separately; add them
+# here once that change is in scope and every boundary picks it up at once.
+CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
+    {TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY}
+)
 logger = logging.getLogger(__name__)
+
+
+def sanitize_client_agent_config(agent_config: Any) -> dict[str, Any]:
+    """Copy a client-supplied ``agent_config``, dropping server-owned keys.
+
+    Every endpoint that seeds ``Task.agent_config`` from a request body must
+    pass the client dict through here *before* layering server-owned values on
+    top, so sanitizing can never drop a server-assigned value.
+    """
+
+    if not isinstance(agent_config, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in agent_config.items()
+        if key not in CLIENT_RESERVED_AGENT_CONFIG_KEYS
+    }
 
 
 class _ProviderHookRaised:

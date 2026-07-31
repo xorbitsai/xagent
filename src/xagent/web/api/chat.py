@@ -117,6 +117,7 @@ from ..services.task_runtime import (
     delete_task_extensions,
     get_task_runtime_public_metadata,
     registered_task_extensions,
+    sanitize_client_agent_config,
     task_extension_bindings_from_agent_config,
     validate_task_extension_requests,
 )
@@ -155,10 +156,10 @@ def _build_task_agent_config(
     selected_file_ids: list[str],
 ) -> Optional[Dict[str, Any]]:
     """Build task agent_config with server-owned selected file ids."""
-    task_agent_config: Dict[str, Any] = {}
-    if isinstance(request_agent_config, dict):
-        task_agent_config.update(request_agent_config)
-        task_agent_config.pop("selected_file_ids", None)
+    task_agent_config: Dict[str, Any] = sanitize_client_agent_config(
+        request_agent_config
+    )
+    task_agent_config.pop("selected_file_ids", None)
     if selected_file_ids:
         task_agent_config["selected_file_ids"] = selected_file_ids
     return task_agent_config or None

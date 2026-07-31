@@ -8,11 +8,18 @@ import threading
 import pytest
 from sqlalchemy import event, text
 
+from xagent.core.task_runtime import TaskRuntimeContribution
+from xagent.web.api import admin_users as admin_users_module
 from xagent.web.api.admin_users import delete_user
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import DAGExecution, DAGExecutionPhase, Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services.task_runtime import (
+    agent_config_with_task_extension_bindings,
+    register_task_extension,
+    unregister_task_extension,
+)
 
 from .conftest import _admin_headers, _direct_db_session, _register_second_user
 
@@ -157,4 +164,96 @@ async def test_admin_user_delete_is_fk_safe_under_enforced_foreign_keys() -> Non
         )
     finally:
         event.remove(engine, "connect", _enable_fk)
+        db.close()
+
+
+class _NoopDeleteProvider:
+    async def on_task_created(self, context, configuration) -> None:
+        return None
+
+    async def build_runtime(self, context) -> TaskRuntimeContribution:
+        return TaskRuntimeContribution()
+
+    async def public_metadata(self, context) -> dict:
+        return {}
+
+    async def on_task_deleted(self, context) -> None:
+        return None
+
+
+def _is_keyset_task_page_select(normalized: str) -> bool:
+    """Match only the runtime-cleanup keyset page SELECT, nothing else."""
+
+    return (
+        normalized.startswith("select tasks.id as tasks_id")
+        and "tasks.agent_config as tasks_agent_config" in normalized
+        and " from tasks " in normalized
+        and "tasks.id > " in normalized
+        and "order by tasks.id" in normalized
+        and " limit " in normalized
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_user_delete_runs_keyset_pages_off_the_event_loop(
+    monkeypatch,
+) -> None:
+    """The runtime-cleanup keyset pagination must not query on the loop thread.
+
+    With a registered task extension the deletion walks ``tasks`` in keyset
+    pages. That loop is unbounded in page count, so every page SELECT has to
+    run in a worker thread just like the purge does.
+    """
+
+    _admin_headers()
+    _register_second_user("keyset-user", "keysetpass1")
+    register_task_extension("keyset_delete_observer", _NoopDeleteProvider())
+    monkeypatch.setattr(admin_users_module, "_TASK_RUNTIME_DELETE_PAGE_SIZE", 2)
+    db = _direct_db_session()
+    engine = get_engine()
+    loop_thread_ident = threading.get_ident()
+    page_threads: list[int] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany) -> None:
+        normalized = " ".join(statement.split()).lower()
+        if _is_keyset_task_page_select(normalized):
+            page_threads.append(threading.get_ident())
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "keyset-user").one()
+        target_id = int(target.id)
+        bound = agent_config_with_task_extension_bindings(
+            {}, ["keyset_delete_observer"]
+        )
+        db.add_all(
+            [
+                Task(
+                    user_id=target_id,
+                    title=f"keyset task {index}",
+                    description="",
+                    agent_config=dict(bound),
+                )
+                for index in range(5)
+            ]
+        )
+        db.commit()
+
+        assert asyncio.get_running_loop() is not None
+
+        response = await delete_user(target_id, admin, db)
+
+        assert response == {"message": "User deleted successfully"}
+        # 5 tasks / page size 2 -> 3 full pages plus the terminating empty page.
+        assert len(page_threads) == 4, page_threads
+        on_loop = [ident for ident in page_threads if ident == loop_thread_ident]
+        assert not on_loop, (
+            f"{len(on_loop)} of {len(page_threads)} keyset page SELECTs ran on "
+            "the event loop thread"
+        )
+        assert db.query(User).filter(User.id == target_id).count() == 0
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+        unregister_task_extension("keyset_delete_observer")
         db.close()

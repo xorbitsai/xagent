@@ -9,10 +9,12 @@ from fastapi import HTTPException
 
 from xagent.core.task_runtime import TaskRuntimeContribution
 from xagent.web.api.admin_users import delete_user
-from xagent.web.api.chat import delete_task
+from xagent.web.api.chat import create_task, delete_task
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
+from xagent.web.schemas.chat import TaskCreateRequest
 from xagent.web.services.task_runtime import (
+    TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     agent_config_with_task_extension_bindings,
     register_task_extension,
     task_extension_bindings_from_agent_config,
@@ -62,6 +64,100 @@ def _register(name: str, provider: _Provider, registered: list[str]) -> _Provide
     register_task_extension(name, provider)
     registered.append(name)
     return provider
+
+
+# ===== the binding record is server-owned, never client-supplied =====
+
+
+@pytest.mark.asyncio
+async def test_task_create_drops_a_client_forged_binding_record(
+    registered: list[str],
+) -> None:
+    """``agent_config`` is a free-form client dict; the binding record is not.
+
+    A user who posts ``runtime_extension_bindings`` in the request body while
+    requesting *no* runtime extensions would otherwise persist a binding the
+    task never made. Deletion dispatches by that record, so a forged entry
+    naming a broken provider makes the task permanently undeletable by its
+    owner -- the record is persisted, so every retry replays it.
+    """
+
+    _admin_headers()
+    _register_second_user("forging-owner", "forgepass1")
+    victim = _register("victim_ext", _Provider(fail_delete=True), registered)
+    db = _direct_db_session()
+    try:
+        owner = db.query(User).filter(User.username == "forging-owner").one()
+        created = await create_task(
+            TaskCreateRequest(
+                title="forged binding",
+                description="forged binding",
+                agent_config={
+                    TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY: ["victim_ext"],
+                    "keep_me": "client value",
+                },
+            ),
+            db=db,
+            user=owner,
+        )
+        task_id = int(created.task_id)
+
+        db.expire_all()
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task_extension_bindings_from_agent_config(task.agent_config) == ()
+        # Only the reserved key is stripped; ordinary client config survives.
+        assert task.agent_config.get("keep_me") == "client value"
+        # The task genuinely never bound: no provider hook ever ran.
+        assert victim.deleted_task_ids == []
+
+        result = await delete_task(task_id, db=db, user=owner)
+
+        assert result["success"] is True
+        assert victim.deleted_task_ids == []
+        assert db.query(Task).filter(Task.id == task_id).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_task_create_binding_record_ignores_forged_entries(
+    registered: list[str],
+) -> None:
+    """Override-drift guard for the legitimate case.
+
+    A request that really does bind ``victim_ext`` while smuggling a forged
+    record naming ``other_ext`` must record exactly what the server bound.
+    """
+
+    _admin_headers()
+    _register_second_user("mixed-owner", "mixedpass1")
+    _register("victim_ext", _Provider(), registered)
+    other = _register("other_ext", _Provider(fail_delete=True), registered)
+    db = _direct_db_session()
+    try:
+        owner = db.query(User).filter(User.username == "mixed-owner").one()
+        created = await create_task(
+            TaskCreateRequest(
+                title="mixed binding",
+                description="mixed binding",
+                agent_config={
+                    TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY: ["other_ext"],
+                },
+                runtime_extensions={"victim_ext": {}},
+            ),
+            db=db,
+            user=owner,
+        )
+        task_id = int(created.task_id)
+
+        db.expire_all()
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task_extension_bindings_from_agent_config(task.agent_config) == (
+            "victim_ext",
+        )
+        assert other.deleted_task_ids == []
+    finally:
+        db.close()
 
 
 # ===== single-task endpoint =====

@@ -10,11 +10,13 @@ import pytest
 
 from xagent.core.task_runtime import TaskRuntimeContext, TaskRuntimeContribution
 from xagent.web.services.task_runtime import (
+    CLIENT_RESERVED_AGENT_CONFIG_KEYS,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     TaskRuntimeExtensionError,
     agent_config_with_task_extension_bindings,
     delete_task_extensions,
     register_task_extension,
+    sanitize_client_agent_config,
     task_extension_bindings_from_agent_config,
     unregister_task_extension,
 )
@@ -94,6 +96,37 @@ def test_bindings_encode_drops_the_key_when_empty() -> None:
     )
 
     assert encoded == {"keep": 2}
+
+
+# ----- client input sanitizing -----
+
+
+def test_sanitize_drops_reserved_keys_and_keeps_client_keys() -> None:
+    """Every reserved key is stripped from a client dict, in one place, so a
+    future addition to the reserved set covers all task-create boundaries."""
+    sanitized = sanitize_client_agent_config(
+        {
+            "keep": 1,
+            **{key: ["forged"] for key in CLIENT_RESERVED_AGENT_CONFIG_KEYS},
+        }
+    )
+
+    assert sanitized == {"keep": 1}
+    assert TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY in CLIENT_RESERVED_AGENT_CONFIG_KEYS
+
+
+@pytest.mark.parametrize("agent_config", [None, {}, "not-a-mapping", 7])
+def test_sanitize_returns_a_fresh_dict_for_non_mappings(agent_config: Any) -> None:
+    assert sanitize_client_agent_config(agent_config) == {}
+
+
+def test_sanitize_does_not_mutate_the_caller_dict() -> None:
+    original = {TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY: ["forged"], "keep": 1}
+
+    sanitized = sanitize_client_agent_config(original)
+
+    assert sanitized == {"keep": 1}
+    assert original == {TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY: ["forged"], "keep": 1}
 
 
 # ----- dispatch filtering -----

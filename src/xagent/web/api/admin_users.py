@@ -98,6 +98,39 @@ def _purge_user_task_rows(db: Session, *, user_id: int) -> None:
     db.query(Task).filter(Task.user_id == user_id).delete(synchronize_session=False)
 
 
+def _load_task_page_sync(
+    *,
+    user_id: int,
+    last_seen_task_id: int,
+    page_size: int,
+) -> list[tuple[int, int, str | None, object]]:
+    """Read one keyset page of a user's tasks in an operation-local session.
+
+    The page count grows with the user's task count and is unbounded, so this
+    read cannot run on the event loop. It selects scalar columns and returns
+    plain tuples, so nothing session-bound crosses the thread boundary.
+    """
+
+    session_factory = get_session_local()
+    page_db = session_factory()
+    try:
+        return [
+            (int(task_id), int(task_user_id), source, agent_config)
+            for task_id, task_user_id, source, agent_config in page_db.query(
+                Task.id, Task.user_id, Task.source, Task.agent_config
+            )
+            .filter(
+                Task.user_id == user_id,
+                Task.id > last_seen_task_id,
+            )
+            .order_by(Task.id)
+            .limit(page_size)
+            .all()
+        ]
+    finally:
+        page_db.close()
+
+
 def _record_settled_bindings_sync(
     *,
     settled: list[tuple[int, tuple[str, ...]]],
@@ -247,15 +280,12 @@ async def delete_user(
         # next page after provider cleanup awaits external systems.
         last_seen_task_id = 0
         while True:
-            task_rows = (
-                db.query(Task.id, Task.user_id, Task.source, Task.agent_config)
-                .filter(
-                    Task.user_id == user_id,
-                    Task.id > last_seen_task_id,
-                )
-                .order_by(Task.id)
-                .limit(_TASK_RUNTIME_DELETE_PAGE_SIZE)
-                .all()
+            release_db_connection_if_clean(db)
+            task_rows = await asyncio.to_thread(
+                _load_task_page_sync,
+                user_id=user_id,
+                last_seen_task_id=last_seen_task_id,
+                page_size=_TASK_RUNTIME_DELETE_PAGE_SIZE,
             )
             if not task_rows:
                 break

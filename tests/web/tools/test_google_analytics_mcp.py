@@ -248,12 +248,30 @@ def test_list_properties_returns_error_payload_on_failure(monkeypatch):
     assert "insufficient permissions" in result["message"]
 
 
-def test_get_metadata_returns_dimensions_and_metrics(monkeypatch):
+def test_get_metadata_projects_entries_to_name_fields(monkeypatch):
+    """The full GA4 metadata document (with descriptions) can exceed the
+    platform output filter's truncation threshold; only the name-picking
+    fields survive the projection."""
     mock_request = Mock(
         return_value=MockResponse(
             json_data={
-                "dimensions": [{"apiName": "country"}],
-                "metrics": [{"apiName": "sessions"}],
+                "dimensions": [
+                    {
+                        "apiName": "country",
+                        "uiName": "Country",
+                        "category": "Geography",
+                        "description": "x" * 500,
+                        "customDefinition": False,
+                    }
+                ],
+                "metrics": [
+                    {
+                        "apiName": "sessions",
+                        "uiName": "Sessions",
+                        "category": "Session",
+                        "description": "y" * 500,
+                    }
+                ],
             }
         )
     )
@@ -262,9 +280,39 @@ def test_get_metadata_returns_dimensions_and_metrics(monkeypatch):
     result = json.loads(google_analytics.google_analytics_get_metadata("properties/42"))
 
     assert result["status"] == "success"
-    assert result["dimensions"] == [{"apiName": "country"}]
-    assert result["metrics"] == [{"apiName": "sessions"}]
+    assert result["dimensions"] == [
+        {"apiName": "country", "uiName": "Country", "category": "Geography"}
+    ]
+    assert result["metrics"] == [
+        {"apiName": "sessions", "uiName": "Sessions", "category": "Session"}
+    ]
     assert mock_request.call_args.kwargs["url"].endswith("/properties/42/metadata")
+
+
+def test_get_metadata_search_filters_by_name(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "dimensions": [
+                    {"apiName": "country", "uiName": "Country"},
+                    {"apiName": "sessionSource", "uiName": "Session source"},
+                ],
+                "metrics": [
+                    {"apiName": "sessions", "uiName": "Sessions"},
+                    {"apiName": "totalRevenue", "uiName": "Total revenue"},
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_get_metadata("42", search="SESSION")
+    )
+
+    assert result["status"] == "success"
+    assert [d["apiName"] for d in result["dimensions"]] == ["sessionSource"]
+    assert [m["apiName"] for m in result["metrics"]] == ["sessions"]
 
 
 def test_get_metadata_rejects_invalid_property_id(monkeypatch):
@@ -363,6 +411,119 @@ def test_run_report_passes_through_filter_and_order(monkeypatch):
     assert body["dimensionFilter"] == dimension_filter
     assert body["orderBys"] == order_bys
     assert body["dateRanges"] == [{"startDate": "7daysAgo", "endDate": "today"}]
+
+
+def test_run_report_sends_default_limit_and_omits_zero_offset(monkeypatch):
+    """GA4's own default returns up to 10k rows; the tool must always send an
+    explicit limit."""
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    google_analytics.google_analytics_run_report(
+        "42",
+        metrics=["sessions"],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["limit"] == "1000"
+    assert "offset" not in body
+
+
+def test_run_report_passes_metric_filter_and_offset(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    metric_filter = {
+        "filter": {
+            "fieldName": "sessions",
+            "numericFilter": {
+                "operation": "GREATER_THAN",
+                "value": {"int64Value": "100"},
+            },
+        }
+    }
+
+    google_analytics.google_analytics_run_report(
+        "42",
+        metrics=["sessions"],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        metric_filter=metric_filter,
+        offset=1000,
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["metricFilter"] == metric_filter
+    assert body["offset"] == "1000"
+
+
+@pytest.mark.parametrize(
+    ("bad_ranges", "expected_fragment"),
+    [
+        ([], "at least one"),
+        (
+            [{"start_date": "7daysAgo", "end_date": "today"}] * 5,
+            "at most 4",
+        ),
+    ],
+)
+def test_run_report_rejects_bad_date_range_counts(
+    monkeypatch, bad_ranges, expected_fragment
+):
+    mock_request = Mock()
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42", metrics=["sessions"], date_ranges=bad_ranges
+        )
+    )
+
+    assert result["status"] == "error"
+    assert expected_fragment in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_properties_flags_truncation_when_pages_run_out(monkeypatch):
+    monkeypatch.setattr(google_analytics, "MAX_ACCOUNT_SUMMARY_PAGES", 1)
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "accountSummaries": [
+                        {
+                            "displayName": "Acme Inc",
+                            "propertySummaries": [
+                                {"property": "properties/111", "displayName": "Site A"}
+                            ],
+                        }
+                    ],
+                    "nextPageToken": "page-2",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(google_analytics.google_analytics_list_properties())
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_request_caps_unstructured_error_body(monkeypatch):
+    monkeypatch.setattr(
+        google_analytics.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=502, text="x" * 5000)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        google_analytics._request(
+            "GET", f"{google_analytics.ADMIN_API_BASE_URL}/accountSummaries"
+        )
+    assert len(str(excinfo.value)) < 1200
 
 
 def test_run_report_rejects_date_range_missing_required_keys(monkeypatch):

@@ -100,7 +100,10 @@ def _request(
         message = str(exc)
         detail = _extract_error_detail(response)
         if detail is None:
-            detail = response.text.strip()
+            # Cap the raw-body fallback: an upstream HTML error page can be
+            # hundreds of KB and would otherwise be embedded whole into the
+            # error message.
+            detail = response.text.strip()[:1000]
         if detail:
             message = f"{message} - {detail}"
         raise RuntimeError(message) from exc
@@ -111,6 +114,10 @@ def _request(
 
 
 def _require_dict_result(result: Any) -> dict[str, Any]:
+    """Guard against a non-dict payload (e.g. a list or string) before
+    calling dict methods on it. A dict that's merely empty (zero properties,
+    zero report rows) is a normal, valid response and must not be rejected
+    here."""
     if not isinstance(result, dict):
         raise ValueError("Unexpected response format from Google Analytics API")
     return result
@@ -178,18 +185,47 @@ def google_analytics_list_properties() -> str:
             page_token = result.get("nextPageToken")
             if not page_token:
                 break
-        return _success(properties=properties)
+        # page_token still set here means MAX_ACCOUNT_SUMMARY_PAGES ran out
+        # with more pages pending — tell the caller the list is incomplete.
+        return _success(properties=properties, truncated=bool(page_token))
     except Exception as e:
         logger.error(f"Error listing Google Analytics properties: {e}")
         return _error(str(e))
 
 
+def _project_metadata_entries(entries: list[Any], search: str) -> list[dict[str, Any]]:
+    """Project metadata entries down to the fields the LLM needs to pick a
+    name (apiName/uiName/category), optionally filtered by a case-insensitive
+    substring. The full GA4 metadata document (200-350+ entries with
+    descriptions) serializes to 50-140KB, which would be hard-truncated by
+    the platform output filter into broken JSON."""
+    needle = search.strip().lower()
+    projected = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        api_name = str(entry.get("apiName") or "")
+        ui_name = str(entry.get("uiName") or "")
+        if needle and needle not in api_name.lower() and needle not in ui_name.lower():
+            continue
+        projected.append(
+            {
+                "apiName": api_name,
+                "uiName": ui_name,
+                "category": entry.get("category"),
+            }
+        )
+    return projected
+
+
 @mcp.tool()
-def google_analytics_get_metadata(property_id: str) -> str:
+def google_analytics_get_metadata(property_id: str, search: str = "") -> str:
     """
-    List the dimensions and metrics available to query for a GA4 property.
-    Use this before google_analytics_run_report if you're unsure which
-    dimension/metric names are valid for this property.
+    List the dimension and metric names available to query for a GA4 property
+    (apiName, uiName, category). Use this before google_analytics_run_report
+    if you're unsure which dimension/metric names are valid for this property.
+    search: optional case-insensitive substring filter on the name, e.g.
+    "session" or "conversion" — prefer it over listing everything.
     """
     try:
         normalized_property_id = _normalize_property_id(property_id)
@@ -200,11 +236,15 @@ def google_analytics_get_metadata(property_id: str) -> str:
             )
         )
         return _success(
-            dimensions=result.get("dimensions") or [],
-            metrics=result.get("metrics") or [],
+            dimensions=_project_metadata_entries(
+                result.get("dimensions") or [], search
+            ),
+            metrics=_project_metadata_entries(result.get("metrics") or [], search),
         )
     except Exception as e:
-        logger.error(f"Error getting Google Analytics metadata for {property_id}: {e}")
+        logger.error(
+            f"Error getting Google Analytics metadata for {property_id!r}: {e}"
+        )
         return _error(str(e))
 
 
@@ -215,8 +255,10 @@ def google_analytics_run_report(
     date_ranges: list[dict[str, str]],
     dimensions: list[str] | None = None,
     dimension_filter: dict[str, Any] | None = None,
+    metric_filter: dict[str, Any] | None = None,
     order_bys: list[dict[str, Any]] | None = None,
-    limit: int | None = None,
+    limit: int = 1000,
+    offset: int = 0,
 ) -> str:
     """
     Run a GA4 report: quantify performance by any combination of dimensions
@@ -224,33 +266,47 @@ def google_analytics_run_report(
     ranges.
 
     metrics: metric names, e.g. ["sessions", "conversions", "totalRevenue"].
-    date_ranges: one dict per period to compare, each with "start_date" and
-      "end_date" (YYYY-MM-DD, or GA4 relative terms like "7daysAgo"/"today"),
-      and an optional "name" to label the period (e.g. "current", "previous")
-      — pass two date_ranges to compare a period against a prior one in a
-      single call; the response's rows are tagged with the matching name.
+    date_ranges: one dict per period to compare (max 4), each with
+      "start_date" and "end_date" (YYYY-MM-DD, or GA4 relative terms like
+      "7daysAgo"/"today"), and an optional "name" to label the period
+      (e.g. "current", "previous") — pass two date_ranges to compare a
+      period against a prior one in a single call; the response's rows are
+      tagged with the matching name.
     dimensions: dimension names, e.g. ["sessionDefaultChannelGroup",
       "landingPagePlusQueryString"]. Use google_analytics_get_metadata to
       discover valid names for this property.
     dimension_filter: a raw GA4 FilterExpression dict, for narrowing results
       (e.g. to one campaign or landing page). Optional.
+    metric_filter: a raw GA4 FilterExpression dict applied to metric values
+      (e.g. "sessions > 100"). Optional.
     order_bys: a raw GA4 OrderBy list, e.g. to sort by a metric descending.
-    limit: max rows to return.
+    limit: max rows to return (default 1000).
+    offset: row offset for paging — if row_count in the response exceeds
+      limit, call again with offset=limit, then offset=2*limit, and so on.
     """
     try:
         normalized_property_id = _normalize_property_id(property_id)
+        if not date_ranges:
+            raise ValueError("date_ranges must contain at least one date range")
+        if len(date_ranges) > 4:
+            raise ValueError("GA4 allows at most 4 date_ranges per report")
         body: dict[str, Any] = {
             "metrics": [{"name": m} for m in metrics],
             "dateRanges": [_date_range_body(dr) for dr in date_ranges],
+            # Always sent explicitly: GA4's default would otherwise return up
+            # to 10k rows in one response.
+            "limit": str(max(1, limit)),
         }
         if dimensions:
             body["dimensions"] = [{"name": d} for d in dimensions]
         if dimension_filter:
             body["dimensionFilter"] = dimension_filter
+        if metric_filter:
+            body["metricFilter"] = metric_filter
         if order_bys:
             body["orderBys"] = order_bys
-        if limit is not None:
-            body["limit"] = str(limit)
+        if offset > 0:
+            body["offset"] = str(offset)
 
         result = _require_dict_result(
             _request(
@@ -266,7 +322,9 @@ def google_analytics_run_report(
             row_count=result.get("rowCount") or 0,
         )
     except Exception as e:
-        logger.error(f"Error running Google Analytics report for {property_id}: {e}")
+        # !r escapes embedded newlines, keeping a crafted property_id from
+        # injecting fake log lines.
+        logger.error(f"Error running Google Analytics report for {property_id!r}: {e}")
         return _error(str(e))
 
 

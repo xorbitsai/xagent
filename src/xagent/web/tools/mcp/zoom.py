@@ -20,6 +20,15 @@ mcp = FastMCP("zoom-mcp")
 
 ZOOM_BASE_URL = "https://api.zoom.us/v2"
 DEFAULT_TIMEOUT_SECONDS = 30
+# Matches meta_graph.py's convention: an error body that isn't the expected
+# {"message": ...} shape (e.g. an HTML gateway error page) must not be
+# forwarded to the LLM/logs verbatim and unbounded.
+MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
+# download_url is a Zoom-supplied field, not user input, but _download_text
+# attaches the live Zoom bearer token to it — assert the host before sending
+# credentials as defense-in-depth, since this is the only connector in the
+# package that downloads from a URL rather than a fixed first-party path.
+_ZOOM_DOWNLOAD_HOST_SUFFIX = ".zoom.us"
 
 # Documented `type` values for GET /users/{userId}/meetings. Zoom staff have
 # confirmed this endpoint only ever returns scheduled/live/upcoming meetings —
@@ -114,6 +123,8 @@ def _request(
         detail = _extract_error_detail(response)
         if detail is None:
             detail = response.text.strip()
+            if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+                detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
         if detail:
             message = f"{message} - {detail}"
         raise _ZoomApiError(message, status_code=response.status_code) from exc
@@ -128,11 +139,16 @@ def _is_not_found(exc: Exception) -> bool:
 
 
 def _download_text(download_url: str) -> str:
+    host = urllib.parse.urlparse(download_url).hostname or ""
+    if host != "zoom.us" and not host.endswith(_ZOOM_DOWNLOAD_HOST_SUFFIX):
+        raise RuntimeError("Refusing to send Zoom credentials to an unexpected host")
     # The request itself (not just a bad status) must stay inside the
-    # try/except: requests.RequestException subclasses like ConnectionError
-    # and Timeout embed the full request URL — including any access_token
-    # query param — in str(exc), so a connection failure must be sanitized
-    # exactly like an HTTP error status is below.
+    # try/except: requests.ConnectionError embeds the full request URL —
+    # including any access_token query param — in str(exc), so a connection
+    # failure must be sanitized exactly like an HTTP error status is below.
+    # The broader RequestException handler also covers Timeout and other
+    # request-layer failures defensively, even though a plain read timeout's
+    # message ("Read timed out...") doesn't itself carry the URL.
     try:
         response = requests.get(
             download_url,
@@ -146,22 +162,34 @@ def _download_text(download_url: str) -> str:
         ) from exc
     except requests.RequestException as exc:
         raise RuntimeError(f"Transcript download failed: {type(exc).__name__}") from exc
-    # Decode explicitly as UTF-8: for a text/* content type without a charset
-    # (a plausible header for a VTT download), requests falls back to
-    # ISO-8859-1, which corrupts non-ASCII (e.g. Chinese) transcripts.
-    return response.content.decode("utf-8", errors="replace")
+    # Decode as utf-8-sig rather than plain utf-8: for a text/* content type
+    # without a charset (a plausible header for a VTT download), requests
+    # falls back to ISO-8859-1, which corrupts non-ASCII (e.g. Chinese)
+    # transcripts, and a BOM-prefixed file would otherwise leak into the
+    # first line and fail the "WEBVTT" header check in _vtt_to_text.
+    return response.content.decode("utf-8-sig", errors="replace")
 
 
 def _vtt_to_text(vtt_text: str) -> str:
     """Strip WebVTT scaffolding (header, cue numbers, timestamp lines) and
     return only the spoken lines. Cue timing rarely matters for summarization
     and roughly doubles the token count of the payload handed to the LLM."""
+    raw_lines = [raw_line.strip() for raw_line in vtt_text.splitlines()]
     lines: list[str] = []
-    for raw_line in vtt_text.splitlines():
-        line = raw_line.strip()
-        if not line or line == "WEBVTT" or line.isdigit():
+    for index, line in enumerate(raw_lines):
+        if not line or line == "WEBVTT":
             continue
         if _VTT_TIMESTAMP_LINE.match(line):
+            continue
+        # A cue-index line is digit-only *and* immediately followed by a
+        # timestamp line — checking structure, not just line.isdigit(),
+        # keeps a genuinely spoken digit-only line (a PIN, an order number, a
+        # year read aloud) in the transcript instead of silently dropping it.
+        if (
+            line.isdigit()
+            and index + 1 < len(raw_lines)
+            and _VTT_TIMESTAMP_LINE.match(raw_lines[index + 1])
+        ):
             continue
         lines.append(line)
     return "\n".join(lines)
@@ -232,6 +260,8 @@ def zoom_get_meeting(meeting_id: str) -> str:
                         "and past meetings)"
                     )
                 raise
+        if not result:
+            return _error(f"Meeting {meeting_id} returned no data")
         return _success(meeting=result)
     except Exception as e:
         logger.error(f"Error getting Zoom meeting {meeting_id}: {e}")
@@ -266,11 +296,13 @@ def zoom_get_meeting_transcript(meeting_id: str) -> str:
     encoded_id = _encode_meeting_id(meeting_id)
     try:
         restriction_reason: str | None = None
+        can_download: Any = None
         try:
             transcript = _request("GET", f"/meetings/{encoded_id}/transcript")
             if isinstance(transcript, dict):
                 download_url = transcript.get("download_url")
                 restriction_reason = transcript.get("download_restriction_reason")
+                can_download = transcript.get("can_download")
             else:
                 download_url = None
         except Exception as exc:
@@ -279,7 +311,19 @@ def zoom_get_meeting_transcript(meeting_id: str) -> str:
             download_url = None
 
         if not download_url and restriction_reason:
+            # NOT_READY means the transcript is still processing — a
+            # retry-later condition, not a restriction like DELETED_OR_TRASHED
+            # or UNSUPPORTED. Calling it "restricted" would push the agent to
+            # the paste/upload fallback when waiting would have worked.
+            if restriction_reason == "NOT_READY":
+                return _error(
+                    "Transcript is still processing on Zoom's side; try again "
+                    "in a few minutes."
+                )
             return _error(f"Transcript download is restricted: {restriction_reason}")
+
+        if not download_url and can_download is False:
+            return _error("Transcript download is restricted")
 
         if not download_url:
             try:
@@ -319,6 +363,8 @@ def zoom_get_current_user() -> str:
     """
     try:
         result = _request("GET", "/users/me")
+        if not result:
+            return _error("Zoom returned no user data")
         return _success(user=result)
     except Exception as e:
         logger.error(f"Error getting Zoom current user: {e}")

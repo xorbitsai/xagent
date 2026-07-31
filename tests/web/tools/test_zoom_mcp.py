@@ -82,6 +82,24 @@ def test_request_falls_back_to_raw_text_for_unstructured_error_body(monkeypatch)
         zoom._request("GET", "/users/me/meetings")
 
 
+def test_request_truncates_long_unstructured_error_body(monkeypatch):
+    """An HTML gateway error page (or similar) landing in an unstructured
+    error body must not be forwarded to the LLM/logs verbatim and
+    unbounded."""
+    long_body = "x" * 5000
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text=long_body)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zoom._request("GET", "/users/me/meetings")
+
+    assert "[truncated]" in str(excinfo.value)
+    assert len(str(excinfo.value)) < len(long_body)
+
+
 def test_vtt_to_text_strips_scaffolding():
     vtt = (
         "WEBVTT\n"
@@ -97,6 +115,24 @@ def test_vtt_to_text_strips_scaffolding():
     assert zoom._vtt_to_text(vtt) == (
         "Alice: Let's start the meeting.\nBob: 我们先过一下上周的行动项。"
     )
+
+
+def test_vtt_to_text_keeps_spoken_digit_only_line():
+    """A cue-index line is digit-only AND immediately followed by a
+    timestamp line; a spoken line that happens to be all digits (a PIN, an
+    order number, a year read aloud) is not, and must survive."""
+    vtt = (
+        "WEBVTT\n"
+        "\n"
+        "1\n"
+        "00:00:01.000 --> 00:00:04.000\n"
+        "2024\n"
+        "\n"
+        "2\n"
+        "00:00:05.000 --> 00:00:09.000\n"
+        "Thanks for confirming the year.\n"
+    )
+    assert zoom._vtt_to_text(vtt) == ("2024\nThanks for confirming the year.")
 
 
 def test_list_meetings_returns_meetings_and_page_token(monkeypatch):
@@ -310,6 +346,42 @@ def test_get_meeting_transcript_surfaces_restriction_reason(monkeypatch):
     mock_request.assert_called_once()
 
 
+def test_get_meeting_transcript_reports_not_ready_instead_of_restricted(monkeypatch):
+    """NOT_READY means the transcript is still processing — a retry-later
+    condition — and must not be reported as "restricted" like a genuine
+    restriction (DELETED_OR_TRASHED, UNSUPPORTED)."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "download_restriction_reason": "NOT_READY",
+                "can_download": False,
+            }
+        )
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    result = json.loads(zoom.zoom_get_meeting_transcript("123"))
+
+    assert result["status"] == "error"
+    assert "processing" in result["message"].lower()
+    assert "restricted" not in result["message"].lower()
+
+
+def test_get_meeting_transcript_respects_can_download_false_without_reason(
+    monkeypatch,
+):
+    """can_download is the authoritative Zoom signal and must be consulted
+    even when download_restriction_reason is absent."""
+    mock_request = Mock(return_value=MockResponse(json_data={"can_download": False}))
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    result = json.loads(zoom.zoom_get_meeting_transcript("123"))
+
+    assert result["status"] == "error"
+    assert "restricted" in result["message"].lower()
+    mock_request.assert_called_once()
+
+
 def test_get_meeting_transcript_falls_back_to_recording_files_on_404(monkeypatch):
     mock_request = Mock(
         side_effect=[
@@ -320,7 +392,7 @@ def test_get_meeting_transcript_falls_back_to_recording_files_on_404(monkeypatch
                         {"file_type": "MP4", "download_url": "https://x/video.mp4"},
                         {
                             "file_type": "TRANSCRIPT",
-                            "download_url": "https://x/transcript.vtt",
+                            "download_url": "https://download.zoom.us/transcript.vtt",
                         },
                     ]
                 }
@@ -342,6 +414,46 @@ def test_get_meeting_transcript_falls_back_to_recording_files_on_404(monkeypatch
     assert mock_get.call_args.kwargs["headers"] == {
         "Authorization": "Bearer access-token"
     }
+
+
+def test_get_meeting_transcript_falls_back_to_recordings_on_empty_success_response(
+    monkeypatch,
+):
+    """A 200 transcript response with neither download_url nor
+    download_restriction_reason (not a 404) must still fall through to the
+    recordings lookup — only the 404-triggered entry into that same
+    fallback was previously covered."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={}),
+            MockResponse(
+                json_data={
+                    "recording_files": [
+                        {
+                            "file_type": "TRANSCRIPT",
+                            "download_url": "https://download.zoom.us/transcript.vtt",
+                        },
+                    ]
+                }
+            ),
+        ]
+    )
+    mock_get = Mock(
+        return_value=MockResponse(
+            text="WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nfallback transcript\n"
+        )
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+    monkeypatch.setattr(zoom.requests, "get", mock_get)
+
+    result = json.loads(zoom.zoom_get_meeting_transcript("123"))
+
+    assert result["status"] == "success"
+    assert result["transcript"] == "fallback transcript"
+    assert mock_request.call_count == 2
+    first_call, second_call = mock_request.call_args_list
+    assert first_call.kwargs["url"].endswith("/meetings/123/transcript")
+    assert second_call.kwargs["url"].endswith("/meetings/123/recordings")
 
 
 def test_get_meeting_transcript_reports_not_found_when_both_legs_404(monkeypatch):
@@ -404,7 +516,7 @@ def test_get_meeting_transcript_download_failure_leaks_no_url(monkeypatch):
 
     assert result["status"] == "error"
     assert "401" in result["message"]
-    assert "http" not in result["message"]
+    assert "download.zoom.us" not in result["message"]
     assert "SECRET" not in result["message"]
 
 
@@ -431,7 +543,7 @@ def test_get_meeting_transcript_download_connection_error_leaks_no_url(monkeypat
     result = json.loads(zoom.zoom_get_meeting_transcript("123"))
 
     assert result["status"] == "error"
-    assert "http" not in result["message"]
+    assert "download.zoom.us" not in result["message"]
     assert "SECRET" not in result["message"]
     assert "ConnectionError" in result["message"]
 
@@ -441,14 +553,16 @@ def test_download_text_wraps_connection_error_without_leaking_url(monkeypatch):
         zoom.requests,
         "get",
         Mock(
-            side_effect=requests.Timeout("Read timed out for https://x/t?token=SECRET")
+            side_effect=requests.Timeout(
+                "Read timed out for https://download.zoom.us/t?token=SECRET"
+            )
         ),
     )
 
     with pytest.raises(RuntimeError, match="Timeout") as excinfo:
-        zoom._download_text("https://x/t?token=SECRET")
+        zoom._download_text("https://download.zoom.us/t?token=SECRET")
     assert "SECRET" not in str(excinfo.value)
-    assert "http" not in str(excinfo.value)
+    assert "download.zoom.us" not in str(excinfo.value)
 
 
 def test_download_text_decodes_utf8_regardless_of_headers(monkeypatch):
@@ -458,7 +572,36 @@ def test_download_text_decodes_utf8_regardless_of_headers(monkeypatch):
     response.content = "会议纪要：讨论了下季度目标".encode("utf-8")
     monkeypatch.setattr(zoom.requests, "get", Mock(return_value=response))
 
-    assert zoom._download_text("https://x/t.vtt") == "会议纪要：讨论了下季度目标"
+    assert (
+        zoom._download_text("https://download.zoom.us/t.vtt")
+        == "会议纪要：讨论了下季度目标"
+    )
+
+
+def test_download_text_strips_utf8_bom(monkeypatch):
+    """A BOM-prefixed VTT download must decode without leaking the BOM into
+    the first line, or it fails _vtt_to_text's "WEBVTT" header check."""
+    response = MockResponse()
+    response.content = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nhi\n".encode(
+        "utf-8-sig"
+    )
+    monkeypatch.setattr(zoom.requests, "get", Mock(return_value=response))
+
+    text = zoom._download_text("https://download.zoom.us/t.vtt")
+
+    assert text.startswith("WEBVTT")
+    assert zoom._vtt_to_text(text) == "hi"
+
+
+def test_download_text_rejects_non_zoom_host(monkeypatch):
+    """The Zoom bearer token must never be attached to a request for a
+    download_url pointing somewhere other than Zoom's own domain."""
+    mock_get = Mock()
+    monkeypatch.setattr(zoom.requests, "get", mock_get)
+
+    with pytest.raises(RuntimeError, match="unexpected host"):
+        zoom._download_text("https://evil.example.com/t.vtt?token=SECRET")
+    mock_get.assert_not_called()
 
 
 def test_get_current_user_returns_profile(monkeypatch):
@@ -485,3 +628,45 @@ def test_get_current_user_returns_error_payload_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "expired" in result["message"]
+
+
+def test_get_current_user_reports_error_on_empty_payload(monkeypatch):
+    """A 200/204 with no body is a data problem, not a found-empty-profile
+    success — surfacing it as status=success with an empty user object would
+    mislead the agent into thinking a profile was found."""
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=204)),
+    )
+
+    result = json.loads(zoom.zoom_get_current_user())
+
+    assert result["status"] == "error"
+
+
+def test_get_meeting_reports_error_on_empty_payload(monkeypatch):
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=204)),
+    )
+
+    result = json.loads(zoom.zoom_get_meeting("123"))
+
+    assert result["status"] == "error"
+    assert "no data" in result["message"].lower()
+
+
+def test_zoom_app_registry_requests_past_meeting_scope():
+    """zoom_get_meeting falls back to /past_meetings/{id} whenever
+    /meetings/{id} 404s — the normal outcome for any already-ended meeting,
+    and the primary path now that list-based past-meeting discovery has been
+    removed. That fallback requires meeting:read:past_meeting; without it,
+    the fallback surfaces a raw scope error instead of degrading."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    zoom_app = next(
+        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "zoom"
+    )
+    assert "meeting:read:past_meeting" in zoom_app["oauth_scopes"]

@@ -277,3 +277,151 @@ async def test_zoom_expired_token_refresh_uses_http_basic_auth(db_session, monke
     }
     auth = kwargs["auth"]
     assert isinstance(auth, tool_config.httpx.BasicAuth)
+    expected_auth = tool_config.httpx.BasicAuth("zoom-client-id", "zoom-client-secret")
+    assert auth._auth_header == expected_auth._auth_header
+
+
+@pytest.mark.asyncio
+async def test_zoom_expired_token_refresh_uses_http_basic_auth_with_capitalized_name(
+    db_session, monkeypatch
+):
+    """An admin-created provider row named "Zoom" (capitalized, e.g. via
+    POST /admin/mcp/providers) must take the same Basic-Auth branch as the
+    lowercase "zoom" — the branch check normalizes case exactly once rather
+    than comparing provider_name verbatim."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="Zoom",
+            name="Zoom",
+            client_id=encrypt_value("zoom-client-id"),
+            client_secret=encrypt_value("zoom-client-secret"),
+            auth_url="https://zoom.us/oauth/authorize",
+            token_url="https://zoom.us/oauth/token",
+            redirect_uri="https://app.example.com/api/auth/zoom/callback",
+            userinfo_url="https://api.zoom.us/v2/users/me",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=["meeting:read:meeting"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="Zoom",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="zoom-user-1",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    captured_requests = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured_requests.append((url, kwargs))
+            return MockResponse(
+                {
+                    "access_token": "new-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                },
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "Zoom")
+        is True
+    )
+
+    assert len(captured_requests) == 1
+    _, kwargs = captured_requests[0]
+    assert isinstance(kwargs["auth"], tool_config.httpx.BasicAuth)
+    assert "client_id" not in kwargs["data"]
+    assert "client_secret" not in kwargs["data"]
+
+
+@pytest.mark.asyncio
+async def test_generic_provider_refresh_sends_client_id_and_secret_in_body(
+    db_session, monkeypatch
+):
+    """The non-special-cased branch of refresh_oauth_token_if_needed (no
+    meta/zoom/linkedin carve-out) must send client_id/client_secret in the
+    POST body on the success path — the existing coverage for this branch
+    only asserted that secrets aren't logged on *failure*."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            redirect_uri="https://app.example.com/api/auth/google/callback",
+            userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
+            user_id_path="sub",
+            email_path="email",
+            default_scopes=["https://www.googleapis.com/auth/gmail.modify"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="google",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="google-user-1",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    captured_requests = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured_requests.append((url, kwargs))
+            return MockResponse(
+                {
+                    "access_token": "new-token",
+                    "refresh_token": "new-refresh",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                },
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "google")
+        is True
+    )
+
+    assert oauth_account.access_token == "new-token"
+    assert oauth_account.refresh_token == "new-refresh"
+    assert len(captured_requests) == 1
+    url, kwargs = captured_requests[0]
+    assert url == "https://oauth2.googleapis.com/token"
+    assert "auth" not in kwargs
+    assert kwargs["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "old-refresh",
+        "client_id": "google-client-id",
+        "client_secret": "google-client-secret",
+    }

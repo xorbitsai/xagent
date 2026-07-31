@@ -141,13 +141,13 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "userinfo_url": "https://api.zoom.us/v2/users/me",
             "user_id_path": "id",
             "email_path": "email",
-            "default_scopes": [
-                "meeting:read:meeting",
-                "meeting:read:list_meetings",
-                "cloud_recording:read:list_recording_files",
-                "cloud_recording:read:meeting_transcript",
-                "user:read:user",
-            ],
+            # Identity-only, matching the other providers here (google:
+            # userinfo.email, meta: public_profile) — the functional scopes
+            # this connector actually calls live on the app row's
+            # oauth_scopes below and are merged in at authorize time by
+            # _merge_oauth_scopes, so listing them here too would just be a
+            # second place scope changes have to be kept in sync.
+            "default_scopes": ["user:read:user"],
         },
     ]
 
@@ -426,6 +426,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": [
                 "meeting:read:meeting",
                 "meeting:read:list_meetings",
+                "meeting:read:past_meeting",
                 "cloud_recording:read:list_recording_files",
                 "cloud_recording:read:meeting_transcript",
                 "user:read:user",

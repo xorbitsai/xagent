@@ -57,10 +57,16 @@ APP_ID = "zoom"
 ZOOM_SCOPES = [
     "meeting:read:meeting",
     "meeting:read:list_meetings",
+    "meeting:read:past_meeting",
     "cloud_recording:read:list_recording_files",
     "cloud_recording:read:meeting_transcript",
     "user:read:user",
 ]
+
+# Identity-only, matching the other seeded providers — the functional scopes
+# above live on the app row (_zoom_app_row) and are merged in at authorize
+# time, so the provider row doesn't need to duplicate the full list.
+ZOOM_PROVIDER_DEFAULT_SCOPES = ["user:read:user"]
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
@@ -79,7 +85,7 @@ def _zoom_provider_row() -> dict[str, object]:
         "userinfo_url": "https://api.zoom.us/v2/users/me",
         "user_id_path": "id",
         "email_path": "email",
-        "default_scopes": ZOOM_SCOPES,
+        "default_scopes": ZOOM_PROVIDER_DEFAULT_SCOPES,
     }
 
 

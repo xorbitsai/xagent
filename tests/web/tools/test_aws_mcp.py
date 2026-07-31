@@ -84,6 +84,19 @@ def test_describe_alarms_passes_state_filter_and_shapes_output(monkeypatch):
     assert cloudwatch.describe_alarms.call_args.kwargs["StateValue"] == "ALARM"
 
 
+def test_describe_alarms_flags_truncated_when_next_token_present(monkeypatch):
+    cloudwatch = Mock()
+    cloudwatch.describe_alarms.return_value = {
+        "MetricAlarms": [{"AlarmName": "high-cpu"}],
+        "NextToken": "more",
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=cloudwatch))
+
+    result = json.loads(aws.aws_cloudwatch_describe_alarms())
+
+    assert result["truncated"] is True
+
+
 def test_describe_alarms_omits_filters_when_not_given(monkeypatch):
     cloudwatch = Mock()
     cloudwatch.describe_alarms.return_value = {"MetricAlarms": []}
@@ -252,6 +265,18 @@ def test_filter_log_events_caps_limit_and_passes_window(monkeypatch):
     assert kwargs["startTime"] == 1753890000000
 
 
+def test_filter_log_events_not_truncated_without_next_token(monkeypatch):
+    logs = Mock()
+    logs.filter_log_events.return_value = {"events": []}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(
+        aws.aws_cloudwatch_filter_log_events(log_group_name="/app/prod")
+    )
+
+    assert result["truncated"] is False
+
+
 def test_describe_log_groups_filters_by_prefix(monkeypatch):
     logs = Mock()
     logs.describe_log_groups.return_value = {
@@ -263,7 +288,21 @@ def test_describe_log_groups_filters_by_prefix(monkeypatch):
 
     assert result["status"] == "success"
     assert result["log_groups"][0]["name"] == "/app/prod"
+    assert result["truncated"] is False
     assert logs.describe_log_groups.call_args.kwargs["logGroupNamePrefix"] == "/app"
+
+
+def test_describe_log_groups_flags_truncated_when_next_token_present(monkeypatch):
+    logs = Mock()
+    logs.describe_log_groups.return_value = {
+        "logGroups": [{"logGroupName": "/app/prod"}],
+        "nextToken": "more",
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(aws.aws_cloudwatch_describe_log_groups())
+
+    assert result["truncated"] is True
 
 
 def test_dynamodb_list_tables(monkeypatch):
@@ -279,6 +318,16 @@ def test_dynamodb_list_tables(monkeypatch):
     assert result["status"] == "success"
     assert result["tables"] == ["orders", "users"]
     assert result["truncated"] is True
+
+
+def test_dynamodb_list_tables_not_truncated_without_last_evaluated_key(monkeypatch):
+    dynamodb = Mock()
+    dynamodb.list_tables.return_value = {"TableNames": ["orders"]}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=dynamodb))
+
+    result = json.loads(aws.aws_dynamodb_list_tables())
+
+    assert result["truncated"] is False
 
 
 def test_dynamodb_describe_table_shapes_health_fields(monkeypatch):
@@ -318,7 +367,21 @@ def test_sqs_list_queues_passes_prefix(monkeypatch):
 
     assert result["status"] == "success"
     assert result["queue_urls"] == ["https://sqs.us-east-1.amazonaws.com/1/jobs"]
+    assert result["truncated"] is False
     assert sqs.list_queues.call_args.kwargs["QueueNamePrefix"] == "jobs"
+
+
+def test_sqs_list_queues_flags_truncated_when_next_token_present(monkeypatch):
+    sqs = Mock()
+    sqs.list_queues.return_value = {
+        "QueueUrls": ["https://sqs.us-east-1.amazonaws.com/1/jobs"],
+        "NextToken": "more",
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=sqs))
+
+    result = json.loads(aws.aws_sqs_list_queues())
+
+    assert result["truncated"] is True
 
 
 def test_sqs_get_queue_attributes_requests_all(monkeypatch):
@@ -386,6 +449,50 @@ def test_client_with_role_arn_assumes_role_on_every_call(monkeypatch):
     assert sqs_calls[0].kwargs["config"] == aws.DEFAULT_CLIENT_CONFIG
     sts_calls = [c for c in session_client.call_args_list if c.args[0] == "sts"]
     assert sts_calls[0].kwargs["config"] == aws.DEFAULT_CLIENT_CONFIG
+
+
+def test_role_session_name_falls_back_without_caller_id(monkeypatch):
+    monkeypatch.delenv(aws.CALLER_ID_ENV_VAR, raising=False)
+
+    assert aws._role_session_name() == aws.ASSUME_ROLE_SESSION_NAME
+
+
+def test_role_session_name_includes_sanitized_caller_id(monkeypatch):
+    monkeypatch.setenv(aws.CALLER_ID_ENV_VAR, "42")
+
+    assert aws._role_session_name() == f"{aws.ASSUME_ROLE_SESSION_NAME}-42"
+
+
+def test_role_session_name_sanitizes_unsafe_characters(monkeypatch):
+    """RoleSessionName's allowed charset is [\\w+=,.@-]; anything else (e.g. a
+    slash or space) would make sts.assume_role reject the call outright."""
+    monkeypatch.setenv(aws.CALLER_ID_ENV_VAR, "weird/id with space")
+
+    name = aws._role_session_name()
+
+    assert "/" not in name and " " not in name
+    assert name.startswith(f"{aws.ASSUME_ROLE_SESSION_NAME}-")
+
+
+def test_role_session_name_truncates_to_64_chars(monkeypatch):
+    monkeypatch.setenv(aws.CALLER_ID_ENV_VAR, "x" * 100)
+
+    name = aws._role_session_name()
+
+    assert len(name) == 64
+
+
+def test_assume_role_credentials_uses_caller_attributed_session_name(monkeypatch):
+    monkeypatch.setenv(aws.CALLER_ID_ENV_VAR, "7")
+    sts = _sts_with_assume_role(expires_in_seconds=3600)
+    _patch_boto3_session(monkeypatch, lambda service, **kwargs: sts)
+
+    aws._assume_role_credentials("arn:aws:iam::2:role/read", "us-east-1")
+
+    assert (
+        sts.assume_role.call_args.kwargs["RoleSessionName"]
+        == f"{aws.ASSUME_ROLE_SESSION_NAME}-7"
+    )
 
 
 def test_client_without_role_arn_uses_env_credentials(monkeypatch):

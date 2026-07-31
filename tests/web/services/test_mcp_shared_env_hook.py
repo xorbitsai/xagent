@@ -1,5 +1,7 @@
 """Tests for the shared (app-injected) MCP env hook and layered merge."""
 
+import asyncio
+
 from xagent.web.services import mcp_runtime
 
 
@@ -86,3 +88,67 @@ def test_shared_env_hook_failure_degrades_to_empty():
         assert mcp_runtime.load_shared_env_overrides("db", 7) == {}
     finally:
         mcp_runtime.set_mcp_shared_env_hook(None)
+
+
+def test_caller_id_env_returns_user_id_keyed_var():
+    assert mcp_runtime.caller_id_env(42) == {"XAGENT_MCP_CALLER_ID": "42"}
+
+
+def test_caller_id_env_empty_without_user_id():
+    assert mcp_runtime.caller_id_env(None) == {}
+
+
+class _FakeStdioServer:
+    """Minimal stand-in for MCPServer: just enough for the stdio branch of
+    build_mcp_runtime_connection (transport check + auth decrypt call)."""
+
+    def __init__(self, connection, server_id=5):
+        self._connection = connection
+        self.id = server_id
+        self.transport = connection.get("transport")
+
+    def to_connection_dict(self):
+        return dict(self._connection)
+
+    def _decrypt_auth_config(self, auth):
+        return {}
+
+
+def test_build_mcp_runtime_connection_injects_caller_id_for_stdio():
+    """Every stdio connection gets the caller's user id, even with no other
+    env overrides present — this is what lets a connector like the AWS MCP
+    module attribute its own external calls to a specific xagent user."""
+    server = _FakeStdioServer({"transport": "stdio", "env": {"FOO": "bar"}})
+
+    build = asyncio.run(
+        mcp_runtime.build_mcp_runtime_connection(db=None, server=server, user_id=42)
+    )
+
+    assert build.connection["env"] == {"FOO": "bar", "XAGENT_MCP_CALLER_ID": "42"}
+
+
+def test_build_mcp_runtime_connection_omits_caller_id_without_user():
+    server = _FakeStdioServer({"transport": "stdio", "env": {"FOO": "bar"}})
+
+    build = asyncio.run(
+        mcp_runtime.build_mcp_runtime_connection(db=None, server=server, user_id=None)
+    )
+
+    assert build.connection["env"] == {"FOO": "bar"}
+
+
+def test_build_mcp_runtime_connection_caller_id_wins_over_user_overrides():
+    """Overrides still apply, but the caller-id layer is merged in last so it
+    can never be shadowed by a stale/forged XAGENT_MCP_CALLER_ID override."""
+    server = _FakeStdioServer({"transport": "stdio", "env": {"FOO": "global"}})
+
+    build = asyncio.run(
+        mcp_runtime.build_mcp_runtime_connection(
+            db=None,
+            server=server,
+            user_id=42,
+            user_env_overrides={5: {"XAGENT_MCP_CALLER_ID": "spoofed"}},
+        )
+    )
+
+    assert build.connection["env"]["XAGENT_MCP_CALLER_ID"] == "42"

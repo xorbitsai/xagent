@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import boto3
@@ -19,6 +20,12 @@ setup_proxy_env()
 mcp = FastMCP("aws-mcp")
 
 ASSUME_ROLE_SESSION_NAME = "xagent-aws-mcp"
+# Set by xagent.web.services.mcp_runtime.caller_id_env for every stdio MCP
+# connector — kept as a literal here (not imported) since this module runs as
+# a standalone subprocess entrypoint.
+CALLER_ID_ENV_VAR = "XAGENT_MCP_CALLER_ID"
+# RoleSessionName's allowed charset per AWS STS: [\w+=,.@-], max 64 chars.
+_SESSION_NAME_UNSAFE_CHARS = re.compile(r"[^\w+=,.@-]")
 MAX_LOG_EVENTS = 100
 # CloudWatch's own server-side default (100,800) is far more than an LLM
 # needs handed back in one response; cap to roughly a day of 1-minute data.
@@ -55,6 +62,19 @@ def _resolve_region(region: str | None) -> str:
     return region or os.environ.get("AWS_REGION", "")
 
 
+def _role_session_name() -> str:
+    """Build a RoleSessionName that attributes an AssumeRole call to the
+    xagent user who triggered it, so the target account's CloudTrail can tell
+    different users' cross-account reads apart. Falls back to the bare
+    connector name if the caller id wasn't threaded through (e.g. a manual
+    `python -m xagent.web.tools.mcp.aws` invocation outside the platform)."""
+    caller_id = os.environ.get(CALLER_ID_ENV_VAR)
+    if not caller_id:
+        return ASSUME_ROLE_SESSION_NAME
+    sanitized = _SESSION_NAME_UNSAFE_CHARS.sub("_", caller_id)
+    return f"{ASSUME_ROLE_SESSION_NAME}-{sanitized}"[:64]
+
+
 def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str]:
     # No caching: each MCP tool call runs in its own short-lived subprocess
     # (see _execute_mcp_call in mcp_adapter.py, which opens and tears down a
@@ -63,9 +83,7 @@ def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str]:
     sts = boto3.Session().client(
         "sts", region_name=region, config=DEFAULT_CLIENT_CONFIG
     )
-    response = sts.assume_role(
-        RoleArn=role_arn, RoleSessionName=ASSUME_ROLE_SESSION_NAME
-    )
+    response = sts.assume_role(RoleArn=role_arn, RoleSessionName=_role_session_name())
     creds = response["Credentials"]
     return {
         "aws_access_key_id": creds["AccessKeyId"],

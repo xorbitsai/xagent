@@ -98,6 +98,23 @@ def load_shared_env_overrides(db: Any, user_id: int | None) -> dict[int, dict]:
         return {}
 
 
+CALLER_ID_ENV_VAR = "XAGENT_MCP_CALLER_ID"
+
+
+def caller_id_env(user_id: int | None) -> dict[str, str]:
+    """Env layer identifying which xagent user triggered this stdio MCP call.
+
+    A stdio connector runs as a short-lived per-call subprocess with no other
+    way to learn who invoked it. Exposing the caller's user id lets a
+    connector attribute its own external API calls (e.g. an AWS STS
+    AssumeRole session name) to a specific user in the target system's own
+    audit trail, instead of every user's calls being indistinguishable.
+    """
+    if user_id is None:
+        return {}
+    return {CALLER_ID_ENV_VAR: str(user_id)}
+
+
 def merge_stdio_env(
     global_env: dict[str, Any] | None,
     *layers: dict[str, Any] | None,
@@ -161,19 +178,21 @@ async def build_mcp_runtime_connection(
     # Resolve which env layer to apply for this user, per their env_source pick
     # (stdio only; global env is the fallback). Overrides are prefetched by the
     # caller (see load_user_env_overrides / load_user_env_sources) to avoid N+1.
-    if connection.get("transport") == "stdio" and (
-        user_env_overrides or shared_env_overrides or env_source_overrides
-    ):
-        server_id = getattr(server, "id", None)
-        if isinstance(server_id, int):
-            merged = resolve_stdio_env(
-                (env_source_overrides or {}).get(server_id),
-                connection.get("env"),
-                (shared_env_overrides or {}).get(server_id),
-                (user_env_overrides or {}).get(server_id),
-            )
-            if merged:
-                connection["env"] = merged
+    if connection.get("transport") == "stdio":
+        if user_env_overrides or shared_env_overrides or env_source_overrides:
+            server_id = getattr(server, "id", None)
+            if isinstance(server_id, int):
+                merged = resolve_stdio_env(
+                    (env_source_overrides or {}).get(server_id),
+                    connection.get("env"),
+                    (shared_env_overrides or {}).get(server_id),
+                    (user_env_overrides or {}).get(server_id),
+                )
+                if merged:
+                    connection["env"] = merged
+        caller_env = caller_id_env(user_id)
+        if caller_env:
+            connection["env"] = {**(connection.get("env") or {}), **caller_env}
 
     auth_config = server._decrypt_auth_config(getattr(server, "auth", None))
     if not _is_mcp_oauth_http_server(server, auth_config):

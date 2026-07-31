@@ -3123,7 +3123,7 @@ class WebToolConfig(BaseToolConfig):
                 transport_config["args"] = server.args
             # Decrypt global env and merge per-user override (user wins).
             from ...core.utils.encryption import decrypt_env_dict
-            from ..services.mcp_runtime import resolve_stdio_env
+            from ..services.mcp_runtime import caller_id_env, resolve_stdio_env
 
             merged_env = resolve_stdio_env(
                 env_source_by_id.get(server.id),
@@ -3131,8 +3131,9 @@ class WebToolConfig(BaseToolConfig):
                 shared_env_by_id.get(server.id),
                 user_env_by_id.get(server.id),
             )
-            if merged_env:
-                transport_config["env"] = merged_env
+            combined_env = {**(merged_env or {}), **caller_id_env(self._user_id)}
+            if combined_env:
+                transport_config["env"] = combined_env
             if server.cwd:
                 transport_config["cwd"] = server.cwd
 

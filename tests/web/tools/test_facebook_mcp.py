@@ -207,6 +207,35 @@ def test_list_page_posts_falls_back_without_engagement_on_permission_error(
     assert len(feed_calls) == 2
 
 
+def test_list_page_posts_does_not_mask_non_permission_errors(monkeypatch):
+    """Only a permission/OAuth-scope error should trigger the engagement
+    fallback. A transient or rate-limit failure on the first request must
+    surface as a genuine error instead of being silently reported as
+    engagement_available=False.
+    """
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    feed_calls = []
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {"data": [{"id": "page-1", "access_token": "page-token"}]}
+            )
+        assert url == "https://graph.facebook.com/v25.0/page-1/feed"
+        feed_calls.append(kwargs["params"]["fields"])
+        return MockResponse(
+            {"error": {"message": "rate limited", "code": 4}},
+            status_code=400,
+        )
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(facebook.facebook_list_page_posts("page-1", limit=5))
+
+    assert result["status"] == "error"
+    assert len(feed_calls) == 1
+
+
 def test_list_post_comments_uses_page_access_token(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
 

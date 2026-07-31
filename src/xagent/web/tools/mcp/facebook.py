@@ -38,6 +38,22 @@ _POST_FIELDS_WITH_ENGAGEMENT = (
 )
 
 
+def _is_permission_error(error: GraphAPIError) -> bool:
+    """Whether a GraphAPIError indicates a missing OAuth permission/scope.
+
+    Used to decide whether the engagement-fields fallback in
+    facebook_list_page_posts should mask the error as
+    engagement_available=False, versus letting a non-permission error (e.g. a
+    transient failure or rate limit) surface as a genuine failure instead of
+    being silently reported as "no engagement data".
+    """
+    details = error.details
+    error_body = details.get("error") if isinstance(details, dict) else None
+    if not isinstance(error_body, dict):
+        return False
+    return error_body.get("type") == "OAuthException" or error_body.get("code") == 10
+
+
 def _normalize_page(page: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": page.get("id"),
@@ -127,6 +143,8 @@ def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
                 params={"fields": _POST_FIELDS_WITH_ENGAGEMENT, "limit": bounded_limit},
             )
         except GraphAPIError as engagement_error:
+            if not _is_permission_error(engagement_error):
+                raise
             logger.warning(
                 "Falling back to Facebook posts without engagement counts for "
                 "page %s: %s",

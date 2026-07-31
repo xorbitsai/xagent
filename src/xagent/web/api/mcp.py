@@ -2861,10 +2861,11 @@ def delete_mcp_server(
                         )
                         .all()
                     )
+                    normalized_provider = _normalize_app_key(provider)
                     sibling_still_connected = any(
                         (sibling_app := get_app_for_mcp_server(db, other_server))
-                        is not None
-                        and sibling_app.get("provider") == provider
+                        and _normalize_app_key(sibling_app.get("provider"))
+                        == normalized_provider
                         for other_server in other_servers
                     )
                     if not sibling_still_connected:

@@ -62,13 +62,18 @@ def downgrade() -> None:
     # Ephemeral preview runs have no Workforce to backfill; they cannot
     # survive the NOT NULL restore, so drop them first -- and their paired
     # hidden Task rows too, or those become orphans (nothing else references
-    # them once the owning WorkforceRun row is gone).
-    bind.execute(
-        sa.text(
-            f"DELETE FROM tasks WHERE id IN "
-            f"(SELECT task_id FROM {TABLE} WHERE {COLUMN} IS NULL AND task_id IS NOT NULL)"
+    # them once the owning WorkforceRun row is gone). ``tasks`` is never
+    # created by a tracked migration (it predates Alembic in this repo), so
+    # a migration-only database built from base has no such table at all --
+    # guard it the same way TABLE is guarded above, or a full downgrade-to-
+    # base run fails with "relation tasks does not exist".
+    if "tasks" in inspector.get_table_names():
+        bind.execute(
+            sa.text(
+                f"DELETE FROM tasks WHERE id IN "
+                f"(SELECT task_id FROM {TABLE} WHERE {COLUMN} IS NULL AND task_id IS NOT NULL)"
+            )
         )
-    )
     bind.execute(sa.text(f"DELETE FROM {TABLE} WHERE {COLUMN} IS NULL"))
 
     if _column_nullable(inspector, TABLE, COLUMN) is not False:

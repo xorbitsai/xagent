@@ -67,6 +67,44 @@ def _create_legacy_schema(connection) -> None:
     )
 
 
+def _create_schema_without_tasks_table(connection) -> None:
+    """Same shape as ``_create_legacy_schema`` but omits ``tasks`` entirely --
+    reproducing the CI migration-integration harness, which upgrades a truly
+    empty database through the whole revision history with no ORM
+    ``create_all()`` step. No migration in this repo actually creates
+    ``tasks`` (it predates Alembic), so on that harness it never exists.
+    """
+    connection.exec_driver_sql("CREATE TABLE workforces (id INTEGER PRIMARY KEY)")
+    connection.exec_driver_sql("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+    connection.exec_driver_sql(
+        f"""
+        CREATE TABLE {TABLE} (
+            id INTEGER PRIMARY KEY,
+            workforce_id INTEGER NOT NULL REFERENCES workforces(id) ON DELETE CASCADE,
+            task_id INTEGER UNIQUE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            is_preview BOOLEAN NOT NULL DEFAULT 0,
+            idempotency_key VARCHAR(128),
+            snapshot JSON NOT NULL
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        f"CREATE UNIQUE INDEX uq_workforce_run_idempotency "
+        f"ON {TABLE} (workforce_id, idempotency_key)"
+    )
+    connection.execute(sa.text("INSERT INTO workforces (id) VALUES (7)"))
+    connection.execute(sa.text("INSERT INTO users (id) VALUES (1)"))
+    connection.execute(
+        sa.text(
+            f"INSERT INTO {TABLE} "
+            "(id, workforce_id, task_id, user_id, status, is_preview, snapshot) "
+            "VALUES (1, 7, 100, 1, 'completed', 0, '{}')"
+        )
+    )
+
+
 def _columns(connection) -> dict[str, dict]:
     return {
         column["name"]: column for column in sa.inspect(connection).get_columns(TABLE)
@@ -165,6 +203,41 @@ def test_downgrade_drops_preview_runs_and_their_orphaned_tasks() -> None:
             sa.text("SELECT id FROM tasks ORDER BY id")
         ).fetchall()
         assert [row[0] for row in remaining_tasks] == [100]
+
+
+def test_downgrade_restores_not_null_when_tasks_table_is_missing() -> None:
+    """Regression: a real CI run downgrading the full migration history from
+    an empty database (never ORM-``create_all``'d) has no ``tasks`` table at
+    all, since no migration creates it -- the raw DELETE against ``tasks``
+    must not blow up with "relation tasks does not exist".
+    """
+    migration = _load_migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    with engine.begin() as connection:
+        _create_schema_without_tasks_table(connection)
+        operations = _operations(connection)
+        with Operations.context(operations.get_context()):
+            migration.upgrade()
+
+        connection.execute(
+            sa.text(
+                f"INSERT INTO {TABLE} "
+                "(id, workforce_id, task_id, user_id, status, is_preview, snapshot) "
+                "VALUES (2, NULL, 101, 1, 'pending', 1, '{}')"
+            )
+        )
+
+        with Operations.context(operations.get_context()):
+            migration.downgrade()
+
+        columns = _columns(connection)
+        assert columns[COLUMN]["nullable"] is False
+
+        remaining_runs = connection.execute(
+            sa.text(f"SELECT id FROM {TABLE} ORDER BY id")
+        ).fetchall()
+        assert [row[0] for row in remaining_runs] == [1]
 
 
 def test_upgrade_and_downgrade_skip_when_table_missing() -> None:

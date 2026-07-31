@@ -7,6 +7,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -21,9 +22,13 @@ DATA_API_BASE_URL = "https://analyticsdata.googleapis.com/v1beta"
 ADMIN_API_BASE_URL = "https://analyticsadmin.googleapis.com/v1beta"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_ACCOUNT_SUMMARY_PAGES = 20
-# A 5-dimension + 5-metric row serializes to ~275 chars through _success(); at
-# RUN_REPORT_MAX_LIMIT rows that's comfortably under the platform's 51200-char
-# MCP output truncation threshold even for wide reports.
+# The limit bounds row *count*, not bytes: a 5-dimension + 5-metric row with
+# short (~11-char) values serializes to ~275 chars through _success(), which
+# keeps RUN_REPORT_MAX_LIMIT rows comfortably under the platform's 51200-char
+# MCP output truncation threshold — but several long-valued dimensions (e.g.
+# full URLs) at once can still cross it. google_analytics_run_report guards
+# the actual serialized size and trims rows if needed, same as
+# google_analytics_list_properties does for its own response.
 RUN_REPORT_DEFAULT_LIMIT = 100
 RUN_REPORT_MAX_LIMIT = 150
 
@@ -331,12 +336,41 @@ def google_analytics_run_report(
                 body=body,
             )
         )
-        return _success(
-            dimension_headers=result.get("dimensionHeaders") or [],
-            metric_headers=result.get("metricHeaders") or [],
-            rows=result.get("rows") or [],
-            row_count=result.get("rowCount") or 0,
+        dimension_headers = result.get("dimensionHeaders") or []
+        metric_headers = result.get("metricHeaders") or []
+        rows = result.get("rows") or []
+        row_count = result.get("rowCount") or 0
+
+        # RUN_REPORT_MAX_LIMIT bounds row count, not bytes: several long
+        # dimension values (e.g. full URLs) at once can still cross the
+        # platform's output truncation threshold. Halve the returned rows
+        # until the serialized response fits, mirroring the truncated-flag
+        # pattern in google_analytics_list_properties.
+        max_output_length = get_tool_max_output_length()
+        original_row_count = len(rows)
+        response = _success(
+            dimension_headers=dimension_headers,
+            metric_headers=metric_headers,
+            rows=rows,
+            row_count=row_count,
+            truncated=False,
         )
+        while len(response) > max_output_length and len(rows) > 1:
+            rows = rows[: len(rows) // 2]
+            response = _success(
+                dimension_headers=dimension_headers,
+                metric_headers=metric_headers,
+                rows=rows,
+                row_count=row_count,
+                truncated=True,
+            )
+        if len(rows) < original_row_count:
+            logger.warning(
+                f"Google Analytics run_report response trimmed from "
+                f"{original_row_count} to {len(rows)} rows to stay under "
+                f"the {max_output_length}-char output limit"
+            )
+        return response
     except Exception as e:
         # !r escapes embedded newlines, keeping a crafted property_id from
         # injecting fake log lines.

@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 import requests
 
+from xagent.config import get_tool_max_output_length
 from xagent.web.tools.mcp import google_analytics
 
 
@@ -475,7 +476,7 @@ def test_run_report_rejects_empty_metrics(monkeypatch):
 
 @pytest.mark.parametrize(
     "bad_limit",
-    [0, -1, google_analytics.RUN_REPORT_MAX_LIMIT + 1],
+    [0, google_analytics.RUN_REPORT_MAX_LIMIT + 1],
 )
 def test_run_report_rejects_out_of_range_limit(monkeypatch, bad_limit):
     mock_request = Mock()
@@ -513,18 +514,25 @@ def test_run_report_rejects_negative_offset(monkeypatch):
     mock_request.assert_not_called()
 
 
-def test_run_report_default_limit_keeps_serialized_response_under_truncation_threshold(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "limit",
+    [google_analytics.RUN_REPORT_DEFAULT_LIMIT, google_analytics.RUN_REPORT_MAX_LIMIT],
+)
+def test_run_report_keeps_serialized_response_under_truncation_threshold(
+    monkeypatch, limit
 ):
-    """Regression for the sizing bug: a realistic 5-dimension + 5-metric report
-    at the tool's own default limit must serialize to well under the 51200-char
-    MCP output truncation threshold enforced by
-    src/xagent/core/tools/adapters/vibe/output_filter.py."""
+    """Regression for the sizing bug: a report at both the tool's default and
+    max row limit must serialize to under the MCP output truncation threshold
+    enforced by src/xagent/core/tools/adapters/vibe/output_filter.py, even
+    with dimension values wide enough (~30-40 chars, e.g. a landing-page path)
+    to actually stress the boundary — not just the narrow 11-char case."""
     row = {
-        "dimensionValues": [{"value": f"dim-value-{i}"} for i in range(5)],
+        "dimensionValues": [
+            {"value": f"dim-value-{i:02d}".ljust(35, "x")} for i in range(5)
+        ],
         "metricValues": [{"value": str(1000 + i)} for i in range(5)],
     }
-    rows = [row] * google_analytics.RUN_REPORT_DEFAULT_LIMIT
+    rows = [row] * limit
     mock_request = Mock(
         return_value=MockResponse(
             json_data={
@@ -542,11 +550,52 @@ def test_run_report_default_limit_keeps_serialized_response_under_truncation_thr
         metrics=[f"metric{i}" for i in range(5)],
         date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
         dimensions=[f"dim{i}" for i in range(5)],
+        limit=limit,
     )
 
     result = json.loads(response)
     assert result["status"] == "success"
-    assert len(response) < 51200
+    assert len(response) < get_tool_max_output_length()
+
+
+def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkeypatch):
+    """Several long-valued dimensions at once (all 5 padded to 35 chars) at
+    RUN_REPORT_MAX_LIMIT rows crosses the output threshold even after the
+    default/max regression test's mix stays under it. The tool must trim
+    rows and set truncated=True rather than return an oversized payload that
+    the platform would hard-truncate into invalid JSON."""
+    row = {
+        "dimensionValues": [
+            {"value": f"dim-value-{i:02d}".ljust(35, "x")} for i in range(5)
+        ],
+        "metricValues": [{"value": str(1000 + i)} for i in range(5)],
+    }
+    rows = [row] * google_analytics.RUN_REPORT_MAX_LIMIT
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "dimensionHeaders": [{"name": f"dim{i}"} for i in range(5)],
+                "metricHeaders": [{"name": f"metric{i}"} for i in range(5)],
+                "rows": rows,
+                "rowCount": len(rows),
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    response = google_analytics.google_analytics_run_report(
+        "42",
+        metrics=[f"metric{i}" for i in range(5)],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        dimensions=[f"dim{i}" for i in range(5)],
+        limit=google_analytics.RUN_REPORT_MAX_LIMIT,
+    )
+
+    result = json.loads(response)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["rows"]) < google_analytics.RUN_REPORT_MAX_LIMIT
+    assert len(response) < get_tool_max_output_length()
 
 
 def test_run_report_passes_metric_filter_and_offset(monkeypatch):

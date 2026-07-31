@@ -872,6 +872,14 @@ class ToolFactory:
             return None
 
     @staticmethod
+    def _create_workspace(
+        workspace_config: dict[str, Any] | None,
+    ) -> TaskWorkspace | None:
+        """Backward-compatible alias for callers on older core revisions."""
+
+        return ToolFactory.create_workspace(workspace_config)
+
+    @staticmethod
     def _create_unavailable_mcp_tool(
         *,
         server_name: object,

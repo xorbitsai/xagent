@@ -1412,6 +1412,71 @@ def test_collect_gmail_pubsub_events_wildcard_label_excludes_non_incoming_mail()
         db.close()
 
 
+def test_collect_gmail_pubsub_events_specific_label_also_excludes_non_incoming_mail() -> (
+    None
+):
+    # PR #1051 review, F10: the SENT/DRAFT/SPAM/TRASH exclusion previously
+    # guarded only the wildcard branch. A message can carry a custom label
+    # AND "SENT" at once (e.g. a user manually labels a sent message) — the
+    # specific-label branch must exclude it too, not just literally-everything
+    # watch labels.
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-specific-label-excludes-sent-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(db, user, config={"watch_label": "Support"})
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme18@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [
+                    {
+                        "messagesAdded": [
+                            {"message": {"id": "msg-sent-labeled"}},
+                            {"message": {"id": "msg-incoming-labeled"}},
+                        ]
+                    }
+                ]
+            },
+            messages={
+                "msg-sent-labeled": _gmail_message(
+                    "msg-sent-labeled", label_ids=["SENT", "Support"]
+                ),
+                "msg-incoming-labeled": _gmail_message(
+                    "msg-incoming-labeled", label_ids=["INBOX", "Support"]
+                ),
+            },
+        )
+
+        result = asyncio.run(
+            collect_gmail_pubsub_events(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme18@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-specific-label",
+                ),
+                state=state,
+                service_factory=lambda _db, _oauth: fake_service,
+            )
+        )
+
+        assert [event.source_event_id for event in result.events] == [
+            "gmail:msg-incoming-labeled"
+        ]
+        assert result.events[0].trigger_id == int(trigger.id)
+        assert result.skipped == 1
+    finally:
+        db.close()
+
+
 def test_collect_gmail_pubsub_events_whitespace_only_label_falls_back_to_inbox() -> (
     None
 ):

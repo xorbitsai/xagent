@@ -1402,6 +1402,54 @@ describe("AgentTriggersDialog", () => {
     })
     expect(watchInput).toHaveValue("Edited but unsaved")
   })
+
+  it("does not silently re-enable a trigger disabled via the header switch when Save is pressed afterward", async () => {
+    // PR #1051 review, F9: the editor's form.enabled is captured once at
+    // beginEdit and never re-synced (the sync effect is gated by a
+    // same-trigger-id guard that doesn't fire on an external enabled-state
+    // change). Toggling the header switch off PATCHes enabled:false
+    // immediately, but a subsequent Save used to resend the stale captured
+    // form.enabled === true, silently re-enabling the trigger with no
+    // visual cue (the editor has no enabled control of its own).
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    const watchInput = await screen.findByLabelText("triggers.form.watchLabel")
+    fireEvent.change(watchInput, { target: { value: "Edited but unsaved" } })
+
+    const [headerSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(headerSwitch)
+    await waitFor(() => {
+      expect(headerSwitch).toHaveAttribute("aria-checked", "false")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSettings" }))
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/agents/42/triggers/9",
+        expect.objectContaining({
+          method: "PATCH",
+          body: expect.stringContaining('"watch_label":"Edited but unsaved"'),
+        }),
+      )
+    })
+    const saveCall = apiRequestMock.mock.calls.find(
+      ([url, init]) =>
+        url === "http://api.local/api/agents/42/triggers/9" &&
+        init?.method === "PATCH" &&
+        (init as { body?: string }).body?.includes("Edited but unsaved"),
+    )
+    const body = JSON.parse((saveCall![1] as { body: string }).body)
+    expect(body.enabled).toBe(false)
+  })
 })
 
 describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
@@ -2206,6 +2254,71 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     }
   })
 
+  it("falls back to the browser's timezone, not hardcoded UTC, when an hourly trigger is switched to a calendar recurrence", async () => {
+    // PR #1051 review, F2: scheduleFieldsFromConfig's hourly/custom branch
+    // hardcoded timezone: configString(config, "timezone") || "UTC". Since
+    // hourly/custom configs can never carry a stored timezone (the backend
+    // schema rejects it for them), this always evaluated to "UTC". The bug
+    // only becomes externally observable once the trigger is switched to a
+    // calendar recurrence (buildConfig omits timezone entirely for hourly/
+    // custom, so a chip round-trip that stays on an interval recurrence
+    // can't surface it) — reopening an hourly trigger, switching to daily,
+    // and saving must use the browser's own zone, not UTC.
+    const trigger = makeTrigger({
+      id: 95,
+      type: "scheduled",
+      config: {
+        recurrence: "hourly",
+        interval_seconds: 3600,
+        next_run_at: "2026-01-01T09:00:00+00:00",
+      },
+    })
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string; body?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([trigger]))
+      }
+      if (url === `${TRIGGERS_URL}/95/runs`) return Promise.resolve(jsonResponse([]))
+      if (url === `${TRIGGERS_URL}/95` && init?.method === "PATCH") {
+        return Promise.resolve(jsonResponse(trigger))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    const RealDateTimeFormat = Intl.DateTimeFormat
+    const dtfSpy = vi
+      .spyOn(Intl, "DateTimeFormat")
+      .mockImplementation((...args: ConstructorParameters<typeof Intl.DateTimeFormat>) => {
+        if (args.length === 0) {
+          return { resolvedOptions: () => ({ timeZone: "America/New_York" }) } as Intl.DateTimeFormat
+        }
+        return new RealDateTimeFormat(...args)
+      })
+    try {
+      render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+      fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+      fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+      await screen.findByText("triggers.schedule.recurrenceLabel")
+
+      fireEvent.click(screen.getByText("triggers.schedule.daily"))
+      fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+
+      await waitFor(() => {
+        expect(apiRequestMock).toHaveBeenCalledWith(
+          `${TRIGGERS_URL}/95`,
+          expect.objectContaining({ method: "PATCH" }),
+        )
+      })
+      const patchCall = apiRequestMock.mock.calls.find(
+        ([url, init]) => url === `${TRIGGERS_URL}/95` && init?.method === "PATCH",
+      )
+      const body = JSON.parse((patchCall![1] as { body: string }).body)
+      expect(body.config.timezone).toBe("America/New_York")
+    } finally {
+      dtfSpy.mockRestore()
+    }
+  })
+
   it("reconstructs timeOfDay/startDate when reopening an existing trigger, including a legacy config with only an anchor", async () => {
     // PR #1051 review: the timeOfDay-derivation fix (anchor-derived, not a
     // hardcoded "09:00") was previously only exercised via the create path.
@@ -2274,6 +2387,51 @@ describe("AgentTriggersDialog schedule recurrence", () => {
       localTimeOfDay(anchorDate),
     )
     expect(document.getElementById("schedule-start-date")).toHaveValue(localIsoDate(anchorDate))
+  })
+
+  it("defaults the start date to today when reopening a calendar trigger with no stored start_at", async () => {
+    // PR #1051 review, F5: start_at is genuinely optional for daily/weekly/
+    // monthly at the backend schema level, but buildConfig requires a
+    // startDate to save at all. Without a fallback, a calendar trigger
+    // created via the API with no start_at would reconstruct with a blank
+    // startDate and become permanently uneditable in this dialog — Save
+    // would always throw triggers.validation.startDate.
+    const noStartAt = makeTrigger({
+      id: 94,
+      type: "scheduled",
+      config: { recurrence: "daily", time_of_day: "09:00", timezone: "UTC" },
+    })
+    apiRequestMock.mockImplementation((url: string, init?: { method?: string; body?: string }) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+      if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+        return Promise.resolve(jsonResponse([noStartAt]))
+      }
+      if (url === `${TRIGGERS_URL}/94/runs`) return Promise.resolve(jsonResponse([]))
+      if (url === `${TRIGGERS_URL}/94` && init?.method === "PATCH") {
+        return Promise.resolve(jsonResponse(noStartAt))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    await screen.findByText("triggers.schedule.recurrenceLabel")
+
+    expect(document.getElementById("schedule-start-date")).toHaveValue(localIsoDate(new Date()))
+
+    // And Save (unrelated no-op edit) must succeed rather than throwing the
+    // "start date is required" validation error. Clear prior call history
+    // first: an earlier test in this file legitimately triggers this same
+    // toast message, so only calls from THIS Save click matter here.
+    toastMocks.error.mockClear()
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.saveSchedule" }))
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        `${TRIGGERS_URL}/94`,
+        expect.objectContaining({ method: "PATCH" }),
+      )
+    })
+    expect(toastMocks.error).not.toHaveBeenCalled()
   })
 
   it("shows a legacy one-shot config (next_run_at only, no interval_seconds) as custom, not hourly", async () => {

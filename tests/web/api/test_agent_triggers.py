@@ -1131,6 +1131,152 @@ def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
     assert released == [first_account_id]
 
 
+def test_gmail_trigger_update_still_provisions_new_binding_when_previous_unregister_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR #1051 review, F8: the new binding is committed BEFORE the previous
+    # one is torn down, with no rollback. An unguarded raise from that
+    # teardown (e.g. a DB error in release_gmail_mailbox_if_unused's own
+    # unprotected lookups) used to propagate out of the whole update,
+    # skipping registration of the NEW binding entirely — leaving the
+    # trigger pointing at its new config with no working watch on either
+    # account. The fix must still register the new binding and return a
+    # clean response instead of a 500.
+    provisioned: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        provisioned.append(int(trigger.config["oauth_account_id"]))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        raise RuntimeError("simulated DB failure releasing the previous mailbox")
+
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    first_account_id = _connect_gmail_account(email="first-f8@gmail.example")
+    second_account_id = _connect_gmail_account(email="second-f8@gmail.example")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": first_account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+        json={
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": second_account_id,
+            }
+        },
+    )
+
+    assert patched.status_code == 200, patched.text
+    # The new binding was still registered despite the teardown failure.
+    assert provisioned == [first_account_id, second_account_id]
+    assert patched.json()["provisioning_status"] == "active"
+    # Self-review follow-up: a clean "active" status would otherwise
+    # silently erase all trace of the teardown failure — the residual leak
+    # (the old mailbox's watch was never released) must stay visible in
+    # provisioning_error even though the trigger itself is genuinely usable.
+    assert "releasing the previous binding failed" in (
+        patched.json()["provisioning_error"] or ""
+    )
+
+
+def test_gmail_trigger_update_rolls_back_session_before_persisting_teardown_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Self-review follow-up on F8: the except block must call db.rollback()
+    # before reusing the session for its own commit. Without it, a genuine
+    # DB-level failure (as opposed to the plain RuntimeError this test
+    # injects, which never touches the session) would leave the session's
+    # transaction unusable on Postgres, and the except block's own commit
+    # would itself raise — defeating the fix's entire purpose. This test
+    # verifies the code actually calls rollback(), independent of whether
+    # the injected failure happens to need it.
+    from sqlalchemy.orm import Session as SASession
+
+    rollback_calls: list[int] = []
+    original_rollback = SASession.rollback
+
+    def spying_rollback(self, *args, **kwargs):
+        rollback_calls.append(1)
+        return original_rollback(self, *args, **kwargs)
+
+    monkeypatch.setattr(SASession, "rollback", spying_rollback)
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        raise RuntimeError("simulated DB failure releasing the previous mailbox")
+
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    first_account_id = _connect_gmail_account(email="first-rollback@gmail.example")
+    second_account_id = _connect_gmail_account(email="second-rollback@gmail.example")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": first_account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+    rollback_calls.clear()
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+        json={
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": second_account_id,
+            }
+        },
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert len(rollback_calls) >= 1
+
+
 def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1182,6 +1328,60 @@ def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
     assert deleted.status_code == 200, deleted.text
     assert provisioned == [account_id]
     assert released == [account_id]
+
+
+def test_gmail_trigger_delete_still_succeeds_when_unregister_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Self-review follow-up: _delete_trigger calls _unregister_trigger_binding
+    # AFTER the trigger row is already deleted and committed, with no guard —
+    # the same pattern _apply_trigger_updates was fixed to protect against.
+    # An unguarded raise here would report a failed delete to the client even
+    # though the trigger was actually removed.
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        raise RuntimeError("simulated DB failure releasing the mailbox")
+
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account(email="delete-teardown-fails@gmail.example")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    deleted = client.delete(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+    )
+
+    assert deleted.status_code == 200, deleted.text
+    listed = client.get(f"/api/agents/{agent_id}/triggers", headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert all(trigger["id"] != trigger_id for trigger in listed.json())
 
 
 def test_trigger_crud_dispatches_through_provider_protocol() -> None:
@@ -1566,17 +1766,20 @@ def test_scheduled_explicit_anchor_is_honored_verbatim_past_or_future() -> None:
     assert future == datetime(2026, 1, 3, 9, 0, tzinfo=timezone.utc)
 
 
-def test_scheduled_explicit_anchor_clamps_to_now_when_past_explicit_disallowed() -> (
+def test_scheduled_explicit_anchor_realigns_to_interval_when_past_explicit_disallowed() -> (
     None
 ):
-    # PR #1051 review: allow_past_explicit=True (the default) is only
-    # correct for a trigger's first-ever computation (create, or
+    # PR #1051 review (round 4, F1): allow_past_explicit=True (the default)
+    # is only correct for a trigger's first-ever computation (create, or
     # re-enabling one with no prior armed schedule). _apply_trigger_updates
     # passes allow_past_explicit=False when recomputing because the
     # schedule was intentionally edited on an ALREADY-armed trigger, since
     # the resubmitted config still carries the untouched creation-time
-    # anchor — honoring it verbatim would rewind next_run_at into the past
-    # on every such edit, not just the first one.
+    # anchor. Clamping straight to `now` (the prior behavior) armed
+    # next_run_at to exactly `now`, which the next scan tick treats as
+    # already due — firing an unwanted extra execution on every no-op
+    # schedule resend. The fix realigns to the next interval-aligned
+    # instant from the stale anchor instead.
     now = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc)
     config = {"interval_seconds": 120, "next_run_at": "2020-01-01T00:00:00+00:00"}
 
@@ -1584,13 +1787,32 @@ def test_scheduled_explicit_anchor_clamps_to_now_when_past_explicit_disallowed()
     assert verbatim == datetime(2020, 1, 1, tzinfo=timezone.utc)
 
     clamped = _compute_next_run_at(config, from_time=now, allow_past_explicit=False)
-    assert clamped == now
+    assert clamped > now
+    assert clamped == datetime(2026, 1, 1, 15, 32, tzinfo=timezone.utc)
+    # Interval-aligned from the stale anchor, not an arbitrary future instant.
+    assert (
+        clamped - datetime(2020, 1, 1, tzinfo=timezone.utc)
+    ).total_seconds() % 120 == 0
 
     # A future explicit anchor is unaffected either way — nothing to clamp.
     future_config = {**config, "next_run_at": "2026-02-01T00:00:00+00:00"}
     assert _compute_next_run_at(
         future_config, from_time=now, allow_past_explicit=False
     ) == datetime(2026, 2, 1, tzinfo=timezone.utc)
+
+
+def test_scheduled_explicit_anchor_clamps_to_now_when_no_interval_and_past_explicit_disallowed() -> (
+    None
+):
+    # A genuine one-shot (bare next_run_at, no interval_seconds — see
+    # test_scheduled_scan_disables_one_shot_trigger) has no interval to
+    # align to, so it keeps the original "catch up once" clamp-to-now
+    # behavior when its stale anchor is resubmitted on an edit.
+    now = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc)
+    config = {"next_run_at": "2020-01-01T00:00:00+00:00"}
+
+    clamped = _compute_next_run_at(config, from_time=now, allow_past_explicit=False)
+    assert clamped == now
 
 
 def test_scheduled_weekly_respects_schedule_timezone() -> None:
@@ -1705,6 +1927,27 @@ def test_scheduled_config_validation_requires_time_of_day_for_calendar_recurrenc
         "scheduled", {"recurrence": "daily", "time_of_day": "09:00:00"}
     )
     assert daily.time_of_day == "09:00"
+
+
+def test_scheduled_config_validation_rejects_blank_time_of_day_for_calendar_recurrences() -> (
+    None
+):
+    # PR #1051 review, F6: the field validator used to canonicalize a blank
+    # string to "00:00" BEFORE the model validator's required-check ran
+    # (field validators run first), so time_of_day: "" silently satisfied
+    # the "requires time_of_day" check as midnight instead of being rejected
+    # as missing, for daily/weekly/monthly.
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"recurrence": "daily", "time_of_day": ""})
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {"recurrence": "weekly", "weekdays": [0], "time_of_day": "   "},
+        )
 
 
 def test_scheduled_config_validation_rejects_interval_seconds_for_calendar_recurrences() -> (
@@ -2128,6 +2371,80 @@ def test_scheduled_signature_ignores_unpadded_time_of_day_and_weekday_order(
                 "weekdays": [0, 2],  # sorted, same set
             },
         },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["next_run_at"] == original_next_run_at
+
+
+def test_scheduled_signature_ignores_start_at_date_vs_datetime_form(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, F7: _schedule_signature normalized time_of_day and
+    # weekdays but left start_at raw, so a bare "YYYY-MM-DD" and an
+    # equivalent midnight-instant ISO string for the SAME date registered as
+    # a schedule "change" — _compute_next_run_at only ever reads the
+    # calendar DATE of start_at, so they mean the same schedule.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Daily with start_at",
+            "config": {
+                "recurrence": "daily",
+                "time_of_day": "09:00",
+                "start_at": "2026-01-01",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+    original_next_run_at = created.json()["next_run_at"]
+    assert original_next_run_at is not None
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "daily",
+                "time_of_day": "09:00",
+                "start_at": "2026-01-01T00:00:00",  # same calendar date, full ISO
+            },
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["next_run_at"] == original_next_run_at
+
+
+def test_scheduled_signature_ignores_interval_seconds_string_vs_int_form(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, F7: interval_seconds may arrive as an int or a
+    # numeral string; comparing them raw registered "3600" vs 3600 as a
+    # schedule "change" even though int(value) is identical either way.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Hourly",
+            "config": {"recurrence": "hourly", "interval_seconds": 3600},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+    original_next_run_at = created.json()["next_run_at"]
+    assert original_next_run_at is not None
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={"config": {"recurrence": "hourly", "interval_seconds": "3600"}},
     )
     assert patched.status_code == 200, patched.text
     assert patched.json()["next_run_at"] == original_next_run_at
@@ -2803,6 +3120,89 @@ def test_scheduled_scan_disables_one_shot_trigger(mock_bg_scheduler) -> None:
         db.close()
 
     assert mock_bg_scheduler.call_count == 0
+
+
+def test_scheduled_scan_disables_trigger_with_unrecomputable_config_instead_of_wedging(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, F3: scan_due_scheduled_triggers queries due triggers
+    # ordered by next_run_at ASC. An unguarded _compute_next_run_at raise for
+    # one trigger (e.g. config drift after this PR's schema tightening) used
+    # to propagate out of the whole scan call, leaving that trigger's
+    # next_run_at unadvanced — permanently first in line — and blocking every
+    # trigger ordered after it on every subsequent tick. The fix disables the
+    # unrecomputable trigger instead and keeps scanning the rest of the batch.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    poisoned = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Poisoned weekly",
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0],
+            },
+        },
+    )
+    assert poisoned.status_code == 200, poisoned.text
+    poisoned_id = poisoned.json()["id"]
+
+    healthy = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Every minute",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert healthy.status_code == 200, healthy.text
+    healthy_id = healthy.json()["id"]
+
+    now = datetime.now(timezone.utc)
+    db = _direct_db_session()
+    try:
+        poisoned_trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == poisoned_id).one()
+        )
+        # Corrupt the stored config directly (bypassing API validation, like
+        # config drift or a manual DB edit would) so recompute raises:
+        # weekdays is now empty, which normalize_weekdays rejects.
+        poisoned_trigger.config = {
+            "recurrence": "weekly",
+            "time_of_day": "09:00",
+            "weekdays": [],
+        }
+        # Ordered first: an earlier next_run_at than the healthy trigger.
+        poisoned_trigger.next_run_at = now - timedelta(minutes=10)
+        db.add(poisoned_trigger)
+
+        healthy_trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == healthy_id).one()
+        )
+        healthy_trigger.next_run_at = now - timedelta(seconds=5)
+        db.add(healthy_trigger)
+        db.commit()
+
+        runs = scan_due_scheduled_triggers(db, now=now)
+        assert len(runs) == 2
+
+        db.refresh(poisoned_trigger)
+        assert poisoned_trigger.enabled is False
+        assert poisoned_trigger.next_run_at is None
+
+        db.refresh(healthy_trigger)
+        assert healthy_trigger.enabled is True
+        assert healthy_trigger.next_run_at is not None
+        healthy_next_run_at = healthy_trigger.next_run_at
+        if healthy_next_run_at.tzinfo is None:
+            healthy_next_run_at = healthy_next_run_at.replace(tzinfo=timezone.utc)
+        assert healthy_next_run_at > now
+    finally:
+        db.close()
 
 
 def test_finish_turn_syncs_trigger_run_status() -> None:

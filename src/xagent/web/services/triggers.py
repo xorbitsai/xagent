@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import secrets
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
@@ -26,7 +26,13 @@ from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..models.agent import Agent, AgentOrigin, is_workforce_generated_manager_agent
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
-from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
+from ..models.trigger import (
+    AgentTrigger,
+    TriggerProvisioningStatus,
+    TriggerRun,
+    TriggerRunStatus,
+    TriggerType,
+)
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..models.workforce import Workforce
@@ -257,23 +263,11 @@ def _normalize_trigger_name(name: str | None, *, default: str | None = None) -> 
     return value
 
 
-def _parse_time_of_day(value: Any) -> time:
+def _wrap_schedule_error(normalize_fn: Callable[[Any], Any], value: Any) -> Any:
+    """Run a normalize_* schedule field function, wrapping its ValueError as
+    the service-layer TriggerServiceError."""
     try:
-        return normalize_time_of_day(value)
-    except ValueError as exc:
-        raise TriggerServiceError(str(exc)) from exc
-
-
-def _weekday_set(config: dict[str, Any]) -> set[int]:
-    try:
-        return normalize_weekdays(config.get("weekdays"))
-    except ValueError as exc:
-        raise TriggerServiceError(str(exc)) from exc
-
-
-def _day_of_month(config: dict[str, Any]) -> int:
-    try:
-        return normalize_day_of_month(config.get("day_of_month"))
+        return normalize_fn(value)
     except ValueError as exc:
         raise TriggerServiceError(str(exc)) from exc
 
@@ -324,15 +318,16 @@ def _next_weekly_occurrence(
     `weekdays` (0=Mon..6=Sun) with `time_of_day`, both interpreted in `tz`
     (the user's schedule timezone). Returned as UTC."""
     local_base = base.astimezone(tz)
-    for offset in range(9):
+    for offset in range(8):
         candidate_date = local_base.date() + timedelta(days=offset)
         if candidate_date.weekday() not in weekdays:
             continue
         candidate = _localize(datetime.combine(candidate_date, time_of_day), tz)
         if candidate > base:
             return candidate.astimezone(timezone.utc)
-    # Unreachable: a full week (7 days) always contains every weekday at
-    # least once, so offset 0..8 always yields a match strictly after base.
+    # Unreachable: offset 7 always recurs on the same weekday as offset 0,
+    # 7 days later — guaranteed strictly after base — so offset 0..7 always
+    # yields a match.
     raise TriggerServiceError("Unable to compute next weekly occurrence")
 
 
@@ -366,13 +361,14 @@ def _compute_next_run_at(
     allow_past_explicit: bool = True,
 ) -> datetime | None:
     """Compute the next scheduled fire time for the supported MVP config."""
-    base = _coerce_utc(previous_due_at) or from_time or _now()
-    base = _coerce_utc(base) or _now()
+    base = _coerce_utc(previous_due_at) or _coerce_utc(from_time) or _now()
     now = _coerce_utc(from_time) or _now()
 
     recurrence = config.get("recurrence")
     if recurrence in ("daily", "weekly", "monthly"):
-        time_of_day = _parse_time_of_day(config.get("time_of_day"))
+        time_of_day = _wrap_schedule_error(
+            normalize_time_of_day, config.get("time_of_day")
+        )
         tz = _schedule_tzinfo(config)
         # Only the first computation (no previous fire yet) may be pushed out
         # by an explicit start_at; subsequent recomputations always advance
@@ -406,11 +402,13 @@ def _compute_next_run_at(
         # without ever re-arming a past instant.
         base = max(base, now)
         if recurrence == "weekly":
-            return _next_weekly_occurrence(base, _weekday_set(config), time_of_day, tz)
+            weekdays = _wrap_schedule_error(normalize_weekdays, config.get("weekdays"))
+            return _next_weekly_occurrence(base, weekdays, time_of_day, tz)
         if recurrence == "monthly":
-            return _next_monthly_occurrence(
-                base, _day_of_month(config), time_of_day, tz
+            day_of_month = _wrap_schedule_error(
+                normalize_day_of_month, config.get("day_of_month")
             )
+            return _next_monthly_occurrence(base, day_of_month, time_of_day, tz)
         # "daily" is "weekly on every day" — _next_weekly_occurrence with the
         # full weekday set produces byte-identical results (including every
         # DST edge case) with no separate implementation to keep in sync.
@@ -424,7 +422,7 @@ def _compute_next_run_at(
             except ValueError as exc:
                 raise TriggerServiceError("Invalid next_run_at") from exc
             if explicit is not None:
-                if allow_past_explicit:
+                if allow_past_explicit or explicit > now:
                     # Honored verbatim, whether in the future (a genuine
                     # start anchor) or the past (the trigger is already due
                     # and the next scan should catch it up once — the same
@@ -436,11 +434,18 @@ def _compute_next_run_at(
                 # A recompute triggered by an intentional schedule EDIT on an
                 # already-armed trigger: the resubmitted config still carries
                 # the ORIGINAL creation-time next_run_at (it's never advanced
-                # by scans, only the DB column is), so honoring it verbatim
-                # here would re-arm the trigger to that stale instant on
-                # every such edit. Clamp to `now` instead — same "catch up
-                # once, don't burst" semantics as an interval recompute.
-                return max(explicit, now)
+                # by scans, only the DB column is). For the interval
+                # mechanism, arm the next interval-aligned instant from that
+                # stale anchor instead of clamping to `now` verbatim —
+                # clamping to exactly `now` is treated as already-due by the
+                # next scan tick (`next_run_at <= scan_time`), firing an
+                # unwanted extra execution on every no-op schedule resend. A
+                # genuine one-shot (no interval_seconds to align to) has
+                # nothing to fall back on, so it keeps the original "catch up
+                # once" clamp.
+                if config.get("interval_seconds") is None:
+                    return now
+                base = explicit
 
     interval = config.get("interval_seconds")
     if interval is None:
@@ -483,13 +488,16 @@ def _schedule_signature(config: dict[str, Any]) -> tuple[Any, ...]:
     prompt_template, event_types, ...) never differs here, so only a real
     schedule edit trips the recompute path.
 
-    Two normalizations matter in practice: `_validate_config` persists the
+    Several normalizations matter in practice: `_validate_config` persists the
     caller-provided config verbatim (never rewrites stored JSON — see its
     docstring), so an un-padded `time_of_day` ("9:5") is never canonicalized
-    at rest; and `weekdays` is a set of days with no meaningful order, so
-    `[0, 2]` and `[2, 0]` must compare equal. Both would otherwise register
-    as a schedule "change" for reasons that have nothing to do with the
-    schedule actually differing.
+    at rest; `weekdays` is a set of days with no meaningful order, so
+    `[0, 2]` and `[2, 0]` must compare equal; `start_at`'s calendar DATE is
+    the only part `_compute_next_run_at` reads, so a bare date and a
+    midnight-instant ISO string for that same date must compare equal; and
+    `interval_seconds` may arrive as an int or a numeral string. All would
+    otherwise register as a schedule "change" for reasons that have nothing
+    to do with the schedule actually differing.
     """
     normalized: list[Any] = []
     for field in _SCHEDULE_RELEVANT_CONFIG_FIELDS:
@@ -503,6 +511,21 @@ def _schedule_signature(config: dict[str, Any]) -> tuple[Any, ...]:
             try:
                 value = sorted(normalize_weekdays(value))
             except ValueError:
+                pass
+        elif field == "start_at" and isinstance(value, str) and value.strip():
+            # _compute_next_run_at only ever looks at the calendar DATE of
+            # start_at (see its docstring) — "2026-01-01" and
+            # "2026-01-01T00:00:00" must compare equal here too, or resaving
+            # an un-normalized stored value through the new UI would
+            # misfire a recompute for a schedule that hasn't actually changed.
+            try:
+                value = datetime.fromisoformat(value).date().isoformat()
+            except ValueError:
+                pass
+        elif field == "interval_seconds" and value is not None:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
                 pass
         normalized.append(value)
     return tuple(normalized)
@@ -980,11 +1003,63 @@ def _apply_trigger_updates(
     # unregister is reference-counted teardown, so it no-ops while the
     # (possibly unchanged) binding is still referenced by an enabled trigger.
     new_config = dict(trigger.config or {})
+    unregister_failed = False
     if old_enabled and (not bool(trigger.enabled) or old_config != new_config):
-        _unregister_trigger_binding(
-            db, trigger, trigger_type=old_type, config=old_config
-        )
+        try:
+            _unregister_trigger_binding(
+                db, trigger, trigger_type=old_type, config=old_config
+            )
+        except Exception:
+            # The new binding above is already committed. Letting a teardown
+            # failure (e.g. a DB error in the reference-counted release
+            # lookup) propagate here would skip _register_trigger_with_provider
+            # below entirely, leaving the trigger pointing at its new config
+            # with no working watch on either the old or the new binding — a
+            # silent "never fires again" state. Surface it on the trigger
+            # instead of hiding it, and still attempt to register the new
+            # binding.
+            logger.exception(
+                "Failed to unregister previous binding for trigger %s while "
+                "updating it; continuing to register the new binding",
+                trigger.id,
+            )
+            unregister_failed = True
+            # A genuine DB-level failure (as opposed to a plain external-API
+            # error, which release_gmail_mailbox_if_unused already catches
+            # and warns on internally) leaves this session's transaction
+            # unusable until rolled back — without this, the commit just
+            # below can itself raise and defeat the whole point of this
+            # except block.
+            db.rollback()
+            setattr(
+                trigger, "provisioning_status", TriggerProvisioningStatus.FAILED.value
+            )
+            setattr(
+                trigger,
+                "provisioning_error",
+                "Failed to release the previous trigger binding; verify manually.",
+            )
+            db.add(trigger)
+            db.commit()
     _register_trigger_with_provider(db, trigger)
+    if (
+        unregister_failed
+        and trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+    ):
+        # The new binding just registered fine, which would otherwise
+        # silently erase the FAILED marker set above — this trigger is
+        # genuinely usable now, but the OLD binding may still be an orphaned
+        # leak (its teardown failed). Keep that visible in
+        # provisioning_error instead of letting a clean "active" status hide
+        # it entirely.
+        setattr(
+            trigger,
+            "provisioning_error",
+            "New binding is active, but releasing the previous binding failed; "
+            "verify it manually.",
+        )
+        db.add(trigger)
+        db.commit()
     return trigger, plain_secret
 
 
@@ -1020,12 +1095,25 @@ def delete_workforce_trigger(
 
 def _delete_trigger(db: Session, trigger: AgentTrigger) -> None:
     trigger_type = str(trigger.type)
+    trigger_id = trigger.id
     binding_config = dict(trigger.config or {})
     db.delete(trigger)
     db.commit()
-    _unregister_trigger_binding(
-        db, trigger, trigger_type=trigger_type, config=binding_config
-    )
+    try:
+        _unregister_trigger_binding(
+            db, trigger, trigger_type=trigger_type, config=binding_config
+        )
+    except Exception:
+        # The delete itself already succeeded and is committed above — a
+        # teardown failure here (same DB-error mode _apply_trigger_updates
+        # guards against) must not surface as a failed delete to the caller,
+        # or the client is told the delete failed when it actually worked.
+        logger.exception(
+            "Failed to unregister binding for deleted trigger %s; the "
+            "trigger row is gone but its provider-side binding may be leaked",
+            trigger_id,
+        )
+        db.rollback()
 
 
 def render_trigger_prompt(
@@ -1767,12 +1855,25 @@ def scan_due_scheduled_triggers(
             run = exc.run
 
         config = dict(trigger.config or {})
-        next_run_at = _compute_next_run_at(
-            config,
-            from_time=scan_time,
-            previous_due_at=due_at,
-            include_explicit=False,
-        )
+        try:
+            next_run_at = _compute_next_run_at(
+                config,
+                from_time=scan_time,
+                previous_due_at=due_at,
+                include_explicit=False,
+            )
+        except TriggerServiceError:
+            # Triggers are scanned in next_run_at ASC order, so an unguarded
+            # raise here would leave this trigger's next_run_at unadvanced
+            # and permanently first in line — wedging every trigger ordered
+            # after it on every subsequent scan. Disable it instead, the same
+            # way an unschedulable (next_run_at is None) trigger already is
+            # just below.
+            logger.exception(
+                "Failed to recompute next_run_at for trigger %s; disabling it",
+                trigger.id,
+            )
+            next_run_at = None
         setattr(trigger, "next_run_at", next_run_at)
         if next_run_at is None:
             setattr(trigger, "enabled", False)

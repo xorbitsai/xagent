@@ -110,6 +110,9 @@ interface TriggerFormState extends ScheduleFieldsValue {
 }
 
 const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled", "gmail"]
+// The plain "YYYY-MM-DD" shape buildConfig sends for daily/weekly/monthly's
+// start_at — zone-agnostic on purpose (see buildConfig / scheduleFieldsFromConfig).
+const CALENDAR_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
 // Field labels follow the design refresh: small, semibold, muted.
 const FIELD_LABEL_CLASS = "text-xs font-semibold text-muted-foreground"
 // Sent as-is by the one-click "Test trigger" button; the backend stamps a
@@ -244,7 +247,7 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
   const startAtRaw = configString(config, "start_at") || configString(config, "next_run_at")
   let startDate = ""
   let anchorTimeOfDay: string | null = null
-  if (/^\d{4}-\d{2}-\d{2}$/.test(startAtRaw)) {
+  if (CALENDAR_DATE_PATTERN.test(startAtRaw)) {
     // The plain "YYYY-MM-DD" shape buildConfig now sends for daily/weekly/
     // monthly (see buildConfig) — already zone-agnostic, nothing to convert.
     startDate = startAtRaw
@@ -267,6 +270,24 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
       }
     }
   }
+  if (!startDate) {
+    // No stored start_at/next_run_at at all: the backend genuinely allows
+    // an unset start_at for daily/weekly/monthly (it's optional at the
+    // schema level), but buildConfig requires a startDate to save at all.
+    // Without this fallback, a calendar trigger created via the API with no
+    // start_at would reconstruct as permanently uneditable in this dialog —
+    // default to today. For a calendar recurrence, "today" must be computed
+    // in the trigger's OWN configured zone (configuredTimezone, already used
+    // a few lines above for the same reason) rather than defaults.startDate
+    // (the browser's local today) — otherwise an incidental Save from a
+    // browser whose local date disagrees with the trigger's zone silently
+    // sets start_at to the wrong calendar day. hourly/custom has no zone
+    // concept at all, so the browser-local default is correct there, same
+    // as a brand-new trigger draft (scheduleFieldsDefaults).
+    startDate = isCalendarRecurrence
+      ? zonedIsoDate(new Date(), configuredTimezone)
+      : defaults.startDate
+  }
   // A stored time_of_day is authoritative when present; otherwise fall back
   // to the REAL scheduled time carried by the anchor timestamp itself
   // (legacy configs, or any config saved before a recurrence used
@@ -288,7 +309,7 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
     let customAmount = defaults.customAmount
     let customUnit = defaults.customUnit
     if (recurrence === "custom") {
-      const interval = Number(configNumber(config, "interval_seconds"))
+      const interval = Number(configScalar(config, "interval_seconds"))
       if (Number.isFinite(interval) && interval > 0) {
         const inferred = inferCustomAmountUnit(interval)
         customAmount = inferred.amount
@@ -308,14 +329,25 @@ function scheduleFieldsFromConfig(config: Record<string, unknown>): ScheduleFiel
       // current zone. Preserving this (rather than re-deriving it fresh on
       // every Save) is what stops an incidental machine/zone difference
       // from silently relocating an already-armed schedule.
-      timezone: configString(config, "timezone") || "UTC",
+      //
+      // hourly/custom configs can never carry a stored timezone (the
+      // backend schema rejects it for those recurrences — it's a flat
+      // interval with no civil time-of-day for a zone to apply to), so
+      // `configString(...) || "UTC"` would always hit the "UTC" fallback
+      // for them, permanently overwriting whatever zone was showing before
+      // a chip switch. Fall back to the browser's own zone instead, same as
+      // the legacy/no-recurrence branch below and scheduleFieldsDefaults.
+      timezone:
+        recurrence === "hourly" || recurrence === "custom"
+          ? configString(config, "timezone") || defaults.timezone
+          : configString(config, "timezone") || "UTC",
     }
   }
 
   // Legacy config saved before `recurrence` existed: only interval_seconds /
   // next_run_at are present. `timeOfDay` still carries the anchor-derived
   // real time (not defaults.timeOfDay's hardcoded "09:00") from above.
-  const rawInterval = configNumber(config, "interval_seconds")
+  const rawInterval = configScalar(config, "interval_seconds")
   if (!rawInterval) {
     // No interval_seconds at all (only next_run_at) is a deliberate
     // backend-supported one-shot: it fires once and the scan loop disables
@@ -354,7 +386,10 @@ function formatDateTime(value: string | null): string {
   return date.toLocaleString()
 }
 
-function configNumber(config: Record<string, unknown>, key: string): string {
+/** Stringify a config field that may arrive as a number or a string
+ * (interval_seconds, oauth_account_id, ...); anything else (missing,
+ * object, boolean) is "not present". */
+function configScalar(config: Record<string, unknown>, key: string): string {
   const value = config[key]
   return typeof value === "number" || typeof value === "string" ? String(value) : ""
 }
@@ -362,11 +397,6 @@ function configNumber(config: Record<string, unknown>, key: string): string {
 function configString(config: Record<string, unknown>, key: string): string {
   const value = config[key]
   return typeof value === "string" ? value : ""
-}
-
-function configId(config: Record<string, unknown>, key: string): string {
-  const value = config[key]
-  return typeof value === "number" || typeof value === "string" ? String(value) : ""
 }
 
 function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
@@ -386,7 +416,7 @@ function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
     senderFilter: trigger.type === "gmail" ? configString(trigger.config, "sender_filter") : "",
     subjectKeyword: trigger.type === "gmail" ? configString(trigger.config, "subject_keyword") : "",
     oauthAccountId:
-      trigger.type === "gmail" ? configId(trigger.config, "oauth_account_id") : "",
+      trigger.type === "gmail" ? configScalar(trigger.config, "oauth_account_id") : "",
     ...scheduleFields,
   }
 }
@@ -467,9 +497,16 @@ export function AgentTriggersDialog({
   // gmailAccounts ever become reactive to something other than the current
   // one-shot per-open fetch. Reset alongside the other per-view state.
   const gmailAccountClearedByUserRef = useRef(false)
+  // Makes the auto-bind effect below fire at most once per draft, rather
+  // than depending on gmailAccounts staying referentially stable for the
+  // life of the draft. gmailAccountClearedByUserRef alone only protects the
+  // "user explicitly cleared it" case; this protects the general case of
+  // gmailAccounts ever being replaced with a new (even identical) array —
+  // today that only happens once per dialog-open, but nothing currently
+  // guarantees it stays that way. Reset alongside the other per-view state.
+  const gmailAutoBoundRef = useRef(false)
   const [gmailAccountsLoading, setGmailAccountsLoading] = useState(false)
   const selectedTriggerIdRef = useRef<number | null>(null)
-  const activeTypeRef = useRef<AgentTriggerType | null>(null)
   // Identity of the trigger the form was last synced from ("type:id", or
   // "type:new" for a creation form). The form-sync effect only resyncs when
   // this changes, so list refreshes that merely replace the selected
@@ -526,7 +563,6 @@ export function AgentTriggersDialog({
   }, [])
 
   const setActiveType = useCallback((type: AgentTriggerType | null) => {
-    activeTypeRef.current = type
     setActiveTypeState(type)
   }, [])
 
@@ -627,6 +663,7 @@ export function AgentTriggersDialog({
     setSecretGenerated(false)
     setGmailFiltersOpen(false)
     gmailAccountClearedByUserRef.current = false
+    gmailAutoBoundRef.current = false
     setRuns([])
     if (initialType) setForm(emptyForm(initialType))
     void loadTriggers(null)
@@ -654,12 +691,17 @@ export function AgentTriggersDialog({
 
   // With exactly one connected account, bind new Gmail triggers to it. With
   // several accounts the user must pick explicitly so the wrong mailbox is
-  // never chosen silently.
+  // never chosen silently. Fires at most once per draft (gmailAutoBoundRef)
+  // rather than depending on gmailAccounts staying the same array reference
+  // for the life of the draft — a future refetch that replaces it (even
+  // with identical data) must not re-run this and clobber a since-cleared
+  // or since-picked selection.
   useEffect(() => {
     if (!open || !editing || activeType !== "gmail" || selectedTrigger) return
-    if (gmailAccountClearedByUserRef.current) return
+    if (gmailAccountClearedByUserRef.current || gmailAutoBoundRef.current) return
     if (gmailAccounts?.length === 1) {
       const onlyAccountId = String(gmailAccounts[0].id)
+      gmailAutoBoundRef.current = true
       setForm((current) =>
         current.oauthAccountId ? current : { ...current, oauthAccountId: onlyAccountId },
       )
@@ -707,6 +749,7 @@ export function AgentTriggersDialog({
     setSecretGenerated(false)
     setGmailFiltersOpen(false)
     gmailAccountClearedByUserRef.current = false
+    gmailAutoBoundRef.current = false
     setForm(options.form)
     if (trigger) {
       void loadRunsFor(trigger)
@@ -782,7 +825,7 @@ export function AgentTriggersDialog({
       // stored `timezone` whenever they differ (e.g. editing from a
       // different machine than the trigger was created on) — the date
       // shifts by up to a day, or the schedule starts a full cycle late.
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(sourceForm.startDate)) {
+      if (!CALENDAR_DATE_PATTERN.test(sourceForm.startDate)) {
         throw new Error(t("triggers.validation.nextRunAt"))
       }
       const config: Record<string, unknown> = {
@@ -852,7 +895,7 @@ export function AgentTriggersDialog({
       sourceForm.type === "gmail" && selectedTrigger?.type === "gmail"
         ? ((gmailAccounts ?? []).find(
             (account) =>
-              String(account.id) === configId(selectedTrigger.config, "oauth_account_id"),
+              String(account.id) === configScalar(selectedTrigger.config, "oauth_account_id"),
           )?.email ?? null)
         : null
     const wasAutoNamed =
@@ -874,7 +917,19 @@ export function AgentTriggersDialog({
     return {
       type: sourceForm.type,
       name,
-      enabled: sourceForm.enabled,
+      // For an existing trigger, prefer the live server-known `enabled`
+      // over the form's captured snapshot: the type-level master switch and
+      // the per-card switch both PATCH `enabled` directly while an editor
+      // for that same trigger may already be open, and the form-sync effect
+      // is gated on a same-trigger-id key so it does not re-run just
+      // because `enabled` changed externally. Without this, editing an
+      // unrelated field after toggling the switch off (with the editor
+      // still open) would resend the stale `enabled: true` on Save and
+      // silently re-enable it — the editor has no `enabled` control of its
+      // own to make the discrepancy visible. A brand-new draft (no
+      // selectedTrigger) has no live value to prefer, so it keeps the
+      // form's own value, set explicitly by beginCreateForType.
+      enabled: selectedTrigger ? selectedTrigger.enabled : sourceForm.enabled,
       config: buildConfig(sourceForm),
       prompt_template: sourceForm.promptTemplate.trim() ? sourceForm.promptTemplate : null,
       secret: sourceForm.type === "webhook" && sourceForm.secret.trim() ? sourceForm.secret.trim() : null,
@@ -1421,7 +1476,7 @@ export function AgentTriggersDialog({
     if (trigger.type === "scheduled") {
       return summarizeSchedule(scheduleFieldsFromConfig(trigger.config), t, locale)
     }
-    const accountId = configId(trigger.config, "oauth_account_id")
+    const accountId = configScalar(trigger.config, "oauth_account_id")
     const email = gmailAccounts?.find((account) => String(account.id) === accountId)?.email
     // "*"/"all" are the backend's match-anything sentinels; a MISSING label
     // is INBOX (a legacy default the backend still applies), not wildcard —
@@ -1972,7 +2027,17 @@ export function AgentTriggersDialog({
             <Button type="button" variant="outline" onClick={handleCancel} disabled={busy}>
               {t("common.cancel")}
             </Button>
-            <Button type="button" onClick={handleSave} disabled={busy}>
+            <Button
+              type="button"
+              onClick={handleSave}
+              // Also gated on busyTypes: the type-level header switch above
+              // PATCHes `enabled` asynchronously and doesn't update
+              // selectedTrigger.enabled until that resolves — Save reads
+              // selectedTrigger.enabled synchronously (see buildPayload), so
+              // clicking Save while that PATCH is still in flight would race
+              // it with a stale enabled value.
+              disabled={busy || busyTypes.has(activeType)}
+            >
               {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {t(saveLabelKey as never)}
             </Button>

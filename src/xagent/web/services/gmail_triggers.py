@@ -433,10 +433,13 @@ def _trigger_matches_message(trigger: AgentTrigger, payload: dict[str, Any]) -> 
     # wildcard branch below nor a real label — silently disabling all
     # filtering instead of falling back to INBOX.
     watch_label = str(config.get("watch_label") or "").strip().lower() or "inbox"
-    if watch_label in {"*", "all"}:
-        if label_ids & _NON_INCOMING_LABELS:
-            return False
-    elif watch_label and watch_label not in label_ids:
+    # Gmail's own non-incoming categories are excluded regardless of which
+    # branch below matches — a custom label manually applied to an
+    # already-sent/draft/spam/trash message must not fire either, not just
+    # the wildcard "watch everything incoming" case.
+    if label_ids & _NON_INCOMING_LABELS:
+        return False
+    if watch_label not in {"*", "all"} and watch_label not in label_ids:
         return False
 
     sender_filter = str(config.get("sender_filter") or "").strip().lower()

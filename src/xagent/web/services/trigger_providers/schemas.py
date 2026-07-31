@@ -220,7 +220,15 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
     @field_validator("time_of_day")
     @classmethod
     def _valid_time_of_day(cls, value: str | None) -> str | None:
-        if value is None:
+        if value is None or not value.strip():
+            # Preserve blank as-is rather than canonicalizing to "00:00": the
+            # model validator below treats a blank time_of_day as MISSING for
+            # daily/weekly/monthly (which require it). normalize_time_of_day
+            # separately treats an absent value as defaulting to midnight,
+            # which is correct for hourly/custom (which don't use the field
+            # at all) but would let a blank string silently satisfy the
+            # required-check for the calendar recurrences instead of being
+            # rejected as missing.
             return value
         # Canonicalize to zero-padded "HH:MM" ("9:5" -> "09:05") so a value
         # that round-trips through validation is normalized, not just

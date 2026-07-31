@@ -56,7 +56,7 @@ def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str]:
     if cached and cached[1] - ASSUME_ROLE_EXPIRY_MARGIN_SECONDS > now:
         return cached[0]
 
-    sts = boto3.client("sts", region_name=region)
+    sts = boto3.Session().client("sts", region_name=region)
     response = sts.assume_role(
         RoleArn=role_arn, RoleSessionName=ASSUME_ROLE_SESSION_NAME
     )
@@ -80,13 +80,19 @@ def _client(
     assumed-role credentials first (cached per ARN until shortly before
     expiry) — this is how cross-account read access works without storing a
     second key set.
+
+    A fresh boto3.Session per call, rather than the module-level
+    boto3.client shortcut: the default shared session is documented as not
+    thread-safe for concurrent client creation, and FastMCP runs sync tools
+    in a thread pool.
     """
     _require_base_credentials()
     resolved_region = _resolve_region(region)
+    session = boto3.Session()
     if role_arn:
         credentials = _assume_role_credentials(role_arn, resolved_region)
-        return boto3.client(service, region_name=resolved_region, **credentials)
-    return boto3.client(service, region_name=resolved_region)
+        return session.client(service, region_name=resolved_region, **credentials)
+    return session.client(service, region_name=resolved_region)
 
 
 def _aws_error_message(exc: Exception) -> str:
@@ -263,7 +269,9 @@ def aws_cloudwatch_filter_log_events(
     try:
         kwargs: dict[str, Any] = {
             "logGroupName": log_group_name,
-            "limit": min(int(limit), MAX_LOG_EVENTS),
+            # Clamp to [1, MAX_LOG_EVENTS]: a zero/negative limit passes the
+            # int signature validation but AWS rejects it remotely.
+            "limit": max(1, min(int(limit), MAX_LOG_EVENTS)),
         }
         if filter_pattern:
             kwargs["filterPattern"] = filter_pattern

@@ -310,22 +310,30 @@ def _sts_with_assume_role(expires_in_seconds: int) -> Mock:
     return sts
 
 
+def _patch_boto3_session(monkeypatch, client_factory) -> Mock:
+    """Patch boto3.Session so every new session's .client() delegates to
+    client_factory; returns the shared client Mock for call assertions."""
+    session_client = Mock(side_effect=client_factory)
+    session = Mock()
+    session.client = session_client
+    monkeypatch.setattr(aws.boto3, "Session", Mock(return_value=session))
+    return session_client
+
+
 def test_client_with_role_arn_assumes_role_and_caches(monkeypatch):
     sts = _sts_with_assume_role(expires_in_seconds=3600)
     service_client = Mock()
-    boto3_client = Mock(
-        side_effect=lambda service, **kwargs: (
-            sts if service == "sts" else service_client
-        )
+    session_client = _patch_boto3_session(
+        monkeypatch,
+        lambda service, **kwargs: sts if service == "sts" else service_client,
     )
-    monkeypatch.setattr(aws.boto3, "client", boto3_client)
 
     first = aws._client("sqs", role_arn="arn:aws:iam::2:role/read")
     second = aws._client("sqs", role_arn="arn:aws:iam::2:role/read")
 
     assert first is service_client and second is service_client
     assert sts.assume_role.call_count == 1  # cached on second call
-    sqs_calls = [c for c in boto3_client.call_args_list if c.args[0] == "sqs"]
+    sqs_calls = [c for c in session_client.call_args_list if c.args[0] == "sqs"]
     assert sqs_calls[0].kwargs["aws_access_key_id"] == "ASIA-temp"
     assert sqs_calls[0].kwargs["aws_session_token"] == "temp-token"
 
@@ -334,10 +342,9 @@ def test_client_with_role_arn_refreshes_near_expiry(monkeypatch):
     sts = _sts_with_assume_role(
         expires_in_seconds=aws.ASSUME_ROLE_EXPIRY_MARGIN_SECONDS - 10
     )
-    boto3_client = Mock(
-        side_effect=lambda service, **kwargs: sts if service == "sts" else Mock()
+    _patch_boto3_session(
+        monkeypatch, lambda service, **kwargs: sts if service == "sts" else Mock()
     )
-    monkeypatch.setattr(aws.boto3, "client", boto3_client)
 
     aws._client("sqs", role_arn="arn:aws:iam::2:role/read")
     aws._client("sqs", role_arn="arn:aws:iam::2:role/read")
@@ -346,10 +353,34 @@ def test_client_with_role_arn_refreshes_near_expiry(monkeypatch):
 
 
 def test_client_without_role_arn_uses_env_credentials(monkeypatch):
-    boto3_client = Mock(return_value=Mock())
-    monkeypatch.setattr(aws.boto3, "client", boto3_client)
+    session_client = _patch_boto3_session(monkeypatch, lambda service, **kwargs: Mock())
 
     aws._client("cloudwatch")
 
-    kwargs = boto3_client.call_args.kwargs
+    kwargs = session_client.call_args.kwargs
     assert kwargs == {"region_name": "us-east-1"}  # no explicit creds → env chain
+
+
+def test_client_creates_a_fresh_session_per_call(monkeypatch):
+    """The default shared boto3 session is not thread-safe for concurrent
+    client creation; each _client call must build its own Session."""
+    session_factory = Mock(side_effect=lambda: Mock(client=Mock(return_value=Mock())))
+    monkeypatch.setattr(aws.boto3, "Session", session_factory)
+
+    aws._client("cloudwatch")
+    aws._client("sqs")
+
+    assert session_factory.call_count == 2
+
+
+def test_filter_log_events_clamps_non_positive_limit(monkeypatch):
+    logs = Mock()
+    logs.filter_log_events.return_value = {"events": []}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(
+        aws.aws_cloudwatch_filter_log_events(log_group_name="/app/prod", limit=0)
+    )
+
+    assert result["status"] == "success"
+    assert logs.filter_log_events.call_args.kwargs["limit"] == 1

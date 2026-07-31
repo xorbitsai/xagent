@@ -195,6 +195,22 @@ function ToolsPageContent() {
   }, [router, searchParams])
 
   useEffect(() => {
+    // The MCP OAuth callback redirects the connect popup here after a
+    // successful authorization. The popup was opened under this window name
+    // by the connect flows; self-close it so the opener's popup-closed poll
+    // refreshes connection state, instead of showing the whole app in the
+    // popup. On error, stay open so the toast above is readable.
+    if (
+      typeof window !== "undefined" &&
+      window.name === "mcp-oauth" &&
+      !searchParams.get("mcp_oauth_error") &&
+      !searchParams.get("mcp_oauth_error_message")
+    ) {
+      window.close()
+    }
+  }, [searchParams])
+
+  useEffect(() => {
     loadTools()
     loadMCPServers()
   }, [])

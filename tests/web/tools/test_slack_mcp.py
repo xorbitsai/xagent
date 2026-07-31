@@ -206,6 +206,37 @@ def test_list_channels_stops_at_limit_and_flags_truncation(monkeypatch):
     assert result["truncated"] is True
 
 
+def test_list_channels_limit_matching_last_item_of_last_page_is_not_truncated(
+    monkeypatch,
+):
+    """Hitting the limit exactly on the last channel of the last page (no
+    more raw results in this page, no next_cursor) means there is nothing
+    left — truncated must be False, not a false positive from the limit
+    check alone."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "ok": True,
+                    "channels": [
+                        {"id": f"C{i}", "name": f"chan-{i}", "is_archived": False}
+                        for i in range(3)
+                    ],
+                    "response_metadata": {"next_cursor": ""},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(slack.slack_list_channels(limit=3))
+
+    assert result["status"] == "success"
+    assert len(result["channels"]) == 3
+    assert result["truncated"] is False
+
+
 def test_list_channels_follows_pagination(monkeypatch):
     mock_request = Mock(
         side_effect=[
@@ -260,6 +291,36 @@ def test_list_channels_returns_partial_results_when_a_later_page_fails(monkeypat
 
     assert result["status"] == "success"
     assert [c["id"] for c in result["channels"]] == ["C1"]
+    assert result["truncated"] is True
+    assert "ratelimited" in result["error"]
+
+
+def test_list_channels_returns_partial_results_when_filter_matched_nothing_yet(
+    monkeypatch,
+):
+    """A name_contains filter that matched nothing on page 1 must not be
+    confused with "no page fetched yet": a page-2 failure should still
+    return the (empty) partial result rather than raising."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "channels": [{"id": "C1", "name": "general", "is_archived": False}],
+                    "response_metadata": {"next_cursor": "page-2"},
+                }
+            ),
+            MockResponse({"ok": False, "error": "ratelimited"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(
+        slack.slack_list_channels(name_contains="no-such-channel-matches")
+    )
+
+    assert result["status"] == "success"
+    assert result["channels"] == []
     assert result["truncated"] is True
     assert "ratelimited" in result["error"]
 
@@ -342,7 +403,7 @@ def test_post_message_returns_error_payload_on_slack_error(monkeypatch, error_co
         Mock(return_value=MockResponse({"ok": False, "error": error_code})),
     )
 
-    result = json.loads(slack.slack_post_message("C0123", "hi"))
+    result = json.loads(slack.slack_post_message("C0123456789", "hi"))
 
     assert result["status"] == "error"
     assert error_code in result["message"]
@@ -355,7 +416,7 @@ def test_post_message_reports_http_error_through_the_tool(monkeypatch):
         Mock(return_value=MockResponse({}, status_code=500)),
     )
 
-    result = json.loads(slack.slack_post_message("C0123", "hi"))
+    result = json.loads(slack.slack_post_message("C0123456789", "hi"))
 
     assert result["status"] == "error"
     assert "500" in result["message"]
@@ -364,7 +425,7 @@ def test_post_message_reports_http_error_through_the_tool(monkeypatch):
 def test_post_message_reports_missing_token_through_the_tool(monkeypatch):
     monkeypatch.delenv("SLACK_ACCESS_TOKEN")
 
-    result = json.loads(slack.slack_post_message("C0123", "hi"))
+    result = json.loads(slack.slack_post_message("C0123456789", "hi"))
 
     assert result["status"] == "error"
     assert "SLACK_ACCESS_TOKEN" in result["message"]

@@ -124,8 +124,9 @@ def slack_list_channels(
     max_channels = max(1, min(int(limit), MAX_CHANNELS))
     cursor: str | None = None
     truncated = False
+    pages_scanned = 0
     try:
-        for page_index in range(MAX_PAGES):
+        for _ in range(MAX_PAGES):
             params: dict[str, Any] = {
                 "types": "public_channel",
                 # Slack expects a lowercase "true"/"false" string; requests
@@ -139,14 +140,18 @@ def slack_list_channels(
             try:
                 result = _request("GET", "conversations.list", params=params)
             except Exception as page_exc:
-                if not channels:
+                if not pages_scanned:
                     raise
                 # A mid-pagination failure (e.g. a rate limit that outlived
                 # the single retry) must not discard the pages already
                 # fetched — return the partial list with a marker instead.
+                # This can legitimately be an empty list when name_contains
+                # filtered out everything scanned so far.
                 logger.warning(f"Slack channel pagination stopped early: {page_exc}")
                 return _success(channels=channels, truncated=True, error=str(page_exc))
-            for channel in result.get("channels") or []:
+            pages_scanned += 1
+            raw_channels = result.get("channels") or []
+            for index, channel in enumerate(raw_channels):
                 name = str(channel.get("name") or "")
                 if needle and needle not in name.lower():
                     continue
@@ -158,7 +163,17 @@ def slack_list_channels(
                     }
                 )
                 if len(channels) >= max_channels:
-                    return _success(channels=channels, truncated=True)
+                    # Only truncated if there is actually more data: more raw
+                    # results left in this page, or another page pending —
+                    # hitting the limit on the very last item of the very
+                    # last page is not truncation.
+                    more_in_page = index + 1 < len(raw_channels)
+                    more_pages = bool(
+                        (result.get("response_metadata") or {}).get("next_cursor")
+                    )
+                    return _success(
+                        channels=channels, truncated=more_in_page or more_pages
+                    )
             cursor = (result.get("response_metadata") or {}).get("next_cursor")
             if not cursor:
                 break

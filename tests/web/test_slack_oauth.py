@@ -89,20 +89,17 @@ def _callback_request(db, user) -> SimpleNamespace:
 
 def test_slack_callback_persists_workspace_identity(db_session, monkeypatch):
     db, user = db_session
-    monkeypatch.setattr(
-        auth_api.requests,
-        "post",
-        Mock(
-            return_value=MockResponse(
-                {
-                    "ok": True,
-                    "access_token": "xoxb-token",
-                    "token_type": "bot",
-                    "scope": "chat:write,chat:write.public,channels:read",
-                }
-            )
-        ),
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "ok": True,
+                "access_token": "xoxb-token",
+                "token_type": "bot",
+                "scope": "chat:write,chat:write.public,channels:read",
+            }
+        )
     )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
     monkeypatch.setattr(
         auth_api.requests,
         "get",
@@ -126,6 +123,19 @@ def test_slack_callback_persists_workspace_identity(db_session, monkeypatch):
     assert oauth_account.access_token == "xoxb-token"
     assert oauth_account.provider_user_id == "T0123"
     assert oauth_account.email == "acme-workspace"
+
+    # Slack (unlike some OAuth providers) accepts client_id/client_secret in
+    # the token-exchange POST body rather than requiring HTTP Basic auth —
+    # this PR relies on that to avoid a Slack-specific token-exchange path,
+    # so pin the request shape rather than leaving it unverified.
+    assert mock_post.call_args.args[0] == "https://slack.com/api/oauth.v2.access"
+    assert mock_post.call_args.kwargs["data"] == {
+        "grant_type": "authorization_code",
+        "code": "slack-code",
+        "client_id": "slack-client-id",
+        "client_secret": "slack-client-secret",
+        "redirect_uri": "https://app.example.com/api/auth/slack/callback",
+    }
 
 
 def test_slack_callback_fails_when_auth_test_reports_ok_false(db_session, monkeypatch):

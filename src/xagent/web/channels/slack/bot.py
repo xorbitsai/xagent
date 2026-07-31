@@ -70,10 +70,30 @@ _CONTROL_START_COMMANDS = {"/start", "start"}
 _CONTROL_NEW_COMMANDS = {"/new", "new", "new task"}
 _MAX_FILE_DOWNLOAD_REDIRECTS = 5
 _MAX_RECENT_EVENT_IDS = 1000
+# Slack rejects message text over 4000 characters. Chunk the source below that
+# and clamp again after conversion, since entity escaping can expand text.
+_MAX_SOURCE_CHUNK_CHARS = 3500
+_MAX_MESSAGE_CHARS = 3900
 
 
 class SlackFileDownloadError(RuntimeError):
     """Slack supplied attachments but none could be registered for the turn."""
+
+
+def _payload_team_id(payload: dict[str, Any]) -> str | None:
+    """Resolve the workspace a Socket Mode payload belongs to."""
+    team_id = payload.get("team_id")
+    if team_id:
+        return str(team_id)
+    event = payload.get("event")
+    if isinstance(event, dict) and event.get("team"):
+        return str(event["team"])
+    authorizations = payload.get("authorizations")
+    if isinstance(authorizations, list):
+        for authorization in authorizations:
+            if isinstance(authorization, dict) and authorization.get("team_id"):
+                return str(authorization["team_id"])
+    return None
 
 
 class SlackBotInstance:
@@ -475,30 +495,29 @@ class SlackBotInstance:
                     raise SlackFileDownloadError(
                         "Slack attachments could not be downloaded"
                     )
-                if uploaded_info:
-                    persisted_attachments = normalize_attachments_for_persistence(
-                        uploaded_info
+                persisted_attachments = normalize_attachments_for_persistence(
+                    uploaded_info
+                )
+                if not display_message:
+                    names = ", ".join(str(item["name"]) for item in uploaded_info)
+                    display_message = f"Attached file(s): {names}"
+                execution_text = append_uploaded_files_context(
+                    prompt_text,
+                    build_uploaded_files_context(uploaded_info),
+                )
+                if is_new_task:
+                    await update_channel_task_fields(
+                        task_id=task_id,
+                        user_id=owner_user_id,
+                        description=display_message,
                     )
-                    if not display_message:
-                        names = ", ".join(str(item["name"]) for item in uploaded_info)
-                        display_message = f"Attached file(s): {names}"
-                    execution_text = append_uploaded_files_context(
-                        prompt_text,
-                        build_uploaded_files_context(uploaded_info),
-                    )
-                    if is_new_task:
-                        await update_channel_task_fields(
-                            task_id=task_id,
-                            user_id=owner_user_id,
-                            description=display_message,
-                        )
-                    context["state"] = {"file_info": uploaded_info}
-                    context["file_info"] = uploaded_info
-                    context["uploaded_files"] = [
-                        str(item["path"]) for item in uploaded_info
-                    ]
-                    context["files"] = persisted_attachments
-                    context["display_message"] = display_message
+                context["state"] = {"file_info": uploaded_info}
+                context["file_info"] = uploaded_info
+                context["uploaded_files"] = [
+                    str(item["path"]) for item in uploaded_info
+                ]
+                context["files"] = persisted_attachments
+                context["display_message"] = display_message
 
             await persist_channel_user_message(
                 task_id=task_id,
@@ -845,7 +864,14 @@ class SlackBotInstance:
         loading_ts: str | None,
         text: str,
     ) -> None:
-        chunks = self._split_message(markdown_to_slack(text))
+        # Split the source text and convert each chunk, never the other way
+        # round: splitting converted mrkdwn can bisect a <url|label> token or
+        # an escaped entity and emit visibly broken output. Entity escaping can
+        # still expand a chunk past Slack's limit, so clamp after converting.
+        chunks = [
+            markdown_to_slack(chunk)[:_MAX_MESSAGE_CHARS]
+            for chunk in self._split_message(text, max_length=_MAX_SOURCE_CHUNK_CHARS)
+        ]
         if loading_ts:
             await self._update_mrkdwn(channel_id, loading_ts, chunks[0])
         else:
@@ -1016,21 +1042,6 @@ class SlackOAuthSocketGateway:
         self._accepting = True
         self._run_forever = asyncio.Event()
 
-    @staticmethod
-    def _payload_team_id(payload: dict[str, Any]) -> str | None:
-        team_id = payload.get("team_id")
-        if team_id:
-            return str(team_id)
-        event = payload.get("event")
-        if isinstance(event, dict) and event.get("team"):
-            return str(event["team"])
-        authorizations = payload.get("authorizations")
-        if isinstance(authorizations, list):
-            for authorization in authorizations:
-                if isinstance(authorization, dict) and authorization.get("team_id"):
-                    return str(authorization["team_id"])
-        return None
-
     async def _handle_socket_request(
         self,
         client: AsyncBaseSocketModeClient,
@@ -1047,40 +1058,46 @@ class SlackOAuthSocketGateway:
         if bot is None:
             logger.warning(
                 "Ignoring Slack OAuth event for unknown workspace %s",
-                self._payload_team_id(payload) or "unknown",
+                _payload_team_id(payload) or "unknown",
             )
             return
         await bot.handle_events_api_payload(payload)
 
     async def start(self) -> None:
-        while self._accepting:
-            try:
-                self.socket_client = SocketModeClient(
-                    app_token=self.app_token,
-                    web_client=AsyncWebClient(),
-                )
-                self.socket_client.socket_mode_request_listeners.append(
-                    self._handle_socket_request
-                )
-                logger.info("Starting shared Slack OAuth Socket Mode gateway")
-                await self.socket_client.connect()
-                await self._run_forever.wait()
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Shared Slack OAuth Socket Mode connection failed; retrying",
-                    exc_info=True,
-                )
-                if self.socket_client is not None:
-                    with suppress(Exception):
-                        await self.socket_client.close()
-                    self.socket_client = None
-                await asyncio.sleep(10)
-        if self.socket_client is not None:
-            await self.socket_client.close()
-            self.socket_client = None
+        # The socket is closed in finally so a normal return or a cancellation
+        # cannot leak an open websocket, which would let a restarted gateway
+        # race a still-connected one for the same app token.
+        try:
+            while self._accepting:
+                try:
+                    self.socket_client = SocketModeClient(
+                        app_token=self.app_token,
+                        web_client=AsyncWebClient(),
+                    )
+                    self.socket_client.socket_mode_request_listeners.append(
+                        self._handle_socket_request
+                    )
+                    logger.info("Starting shared Slack OAuth Socket Mode gateway")
+                    await self.socket_client.connect()
+                    await self._run_forever.wait()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Shared Slack OAuth Socket Mode connection failed; retrying",
+                        exc_info=True,
+                    )
+                    if self.socket_client is not None:
+                        with suppress(Exception):
+                            await self.socket_client.close()
+                        self.socket_client = None
+                    await asyncio.sleep(10)
+        finally:
+            if self.socket_client is not None:
+                with suppress(Exception):
+                    await self.socket_client.close()
+                self.socket_client = None
 
     async def stop(self) -> None:
         self._accepting = False
@@ -1273,7 +1290,7 @@ class SlackChannelManager:
         self,
         payload: dict[str, Any],
     ) -> SlackBotInstance | None:
-        team_id = SlackOAuthSocketGateway._payload_team_id(payload)
+        team_id = _payload_team_id(payload)
         return self.oauth_bots.get(team_id) if team_id else None
 
     async def _ensure_oauth_gateway(self, app_token: str) -> None:

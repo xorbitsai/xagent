@@ -39,7 +39,7 @@ class UserChannelResponse(UserChannelBase):
         so the UI never needs to read a secret back.
         """
         public_config = dict(config)
-        for field in ("bot_token", "app_secret", "app_token", "refresh_token"):
+        for field in ("bot_token", "app_secret", "app_token"):
             if public_config.pop(field, None):
                 public_config[f"{field}_configured"] = True
         return public_config

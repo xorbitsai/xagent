@@ -653,14 +653,41 @@ def create_user_channel(
     db: Session = Depends(get_db),
 ) -> Any:
     """Create a new channel configuration."""
-    if (
-        channel_in.channel_type == "slack"
-        and channel_in.config.get("installation_mode") == "oauth"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Slack OAuth channels must be created through the authorization flow",
+    if channel_in.channel_type == "slack":
+        if channel_in.config.get("installation_mode") == "oauth":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Slack OAuth channels must be created through the "
+                    "authorization flow"
+                ),
+            )
+        # Same allowlist the update path enforces: workspace identity is only
+        # ever written by the OAuth callback. Accepting it here would let a
+        # manual row carry an attacker-chosen team_id, which is inert today
+        # only because every read site gates on installation_mode first.
+        forbidden = sorted(
+            key
+            for key in channel_in.config
+            if key in _SLACK_SERVER_MANAGED_CONFIG_KEYS and key != "installation_mode"
         )
+        if forbidden:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Slack config field(s) {', '.join(forbidden)} are managed "
+                    "by the authorization flow and cannot be set"
+                ),
+            )
+        # Socket Mode needs both tokens; _sync_manual_bots skips a row that is
+        # missing either, so without this the row would silently never start.
+        if not (
+            channel_in.config.get("bot_token") and channel_in.config.get("app_token")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Slack manual setup requires both a bot token and an app token",
+            )
 
     # Auto-fetch channel name if not provided
     channel_name = channel_in.channel_name

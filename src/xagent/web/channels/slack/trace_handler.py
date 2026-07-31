@@ -10,6 +10,13 @@ from .utils import markdown_to_slack, strip_slack_file_refs
 
 logger = logging.getLogger(__name__)
 
+# Slack rejects a chat.update text over 4000 characters. Truncate the source
+# first so a cut never lands inside a converted mrkdwn token, then clamp the
+# result: entity escaping can expand text up to ~5x ("&" -> "&amp;"), so the
+# source limit alone is not a bound on the converted length.
+_MAX_STATUS_SOURCE_CHARS = 3500
+_MAX_STATUS_MRKDWN_CHARS = 3900
+
 
 class SlackTraceHandler(TraceHandler):
     """Project coarse execution progress into one editable Slack message."""
@@ -92,7 +99,12 @@ class SlackTraceHandler(TraceHandler):
 
     async def _update_message(self, text: str) -> None:
         visible_text, _ = strip_slack_file_refs(text)
-        display_text = markdown_to_slack(visible_text)[:3900]
+        # Truncate the source, then convert: slicing converted mrkdwn can cut
+        # a <url|label> token or an escaped entity in half. The post-conversion
+        # clamp is the actual API-limit guard (see the constants above).
+        display_text = markdown_to_slack(visible_text[:_MAX_STATUS_SOURCE_CHARS])[
+            :_MAX_STATUS_MRKDWN_CHARS
+        ]
         if not display_text or display_text == self.current_text:
             return
         self.current_text = display_text

@@ -98,6 +98,35 @@ def test_markdown_link_cannot_inject_mrkdwn_control_tokens(
     assert converted.count(">") == 1
 
 
+@pytest.mark.asyncio
+async def test_final_text_chunks_never_split_a_mrkdwn_token() -> None:
+    bot = make_bot()
+    sent: list[str] = []
+
+    async def fake_send(channel_id: str, text: str, *, thread_ts: str | None) -> None:
+        sent.append(text)
+
+    bot._send_mrkdwn = fake_send  # type: ignore[method-assign]
+
+    # A long body whose links sit near every chunk boundary; converting after
+    # splitting keeps each <url|label> token intact.
+    link = "[docs](https://example.com/a?x=1&y=2)"
+    body = "\n".join(f"line {i} {link}" for i in range(400))
+
+    await bot._send_final_text(
+        channel_id="C1", thread_ts=None, loading_ts=None, text=body
+    )
+
+    assert len(sent) > 1
+    for chunk in sent:
+        assert len(chunk) <= 3900
+        # Balanced tokens: no chunk ends mid-<url|label>.
+        assert chunk.count("<") == chunk.count(">")
+        # Every link in the chunk is a complete, converted mrkdwn token.
+        assert "[docs](" not in chunk
+        assert chunk.count("<https://example.com/a?x=1&y=2|docs>") == chunk.count("<")
+
+
 def test_markdown_bare_broadcast_text_stays_inert() -> None:
     assert markdown_to_slack("ping <!channel> now") == "ping &lt;!channel&gt; now"
 
@@ -156,6 +185,55 @@ def test_slack_oauth_channel_cannot_be_created_through_manual_api() -> None:
                     "installation_mode": "oauth",
                     "bot_token": "xoxb-not-from-callback",
                 },
+                is_active=True,
+            ),
+            BackgroundTasks(),
+            SimpleNamespace(id=1),
+            None,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "hostile_key",
+    ["team_id", "bot_user_id", "slack_app_id", "enterprise_id", "scope"],
+)
+def test_create_slack_channel_rejects_server_managed_config(hostile_key: str) -> None:
+    # The update path already refuses these; POST must match, or a manual row
+    # could be created carrying an attacker-chosen workspace identity.
+    with pytest.raises(HTTPException, match="managed by the authorization flow"):
+        create_user_channel(
+            UserChannelCreate(
+                channel_type="slack",
+                channel_name="Forged",
+                config={
+                    "bot_token": "xoxb-x",
+                    "app_token": "xapp-x",
+                    hostile_key: "injected",
+                },
+                is_active=True,
+            ),
+            BackgroundTasks(),
+            SimpleNamespace(id=1),
+            None,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"bot_token": "xoxb-only"},
+        {"app_token": "xapp-only"},
+    ],
+)
+def test_create_slack_channel_requires_both_tokens(config: dict[str, Any]) -> None:
+    # _sync_manual_bots skips rows missing either token, so such a row would be
+    # written active and then silently never start.
+    with pytest.raises(HTTPException, match="bot token and an app token"):
+        create_user_channel(
+            UserChannelCreate(
+                channel_type="slack",
+                channel_name="Half configured",
+                config=config,
                 is_active=True,
             ),
             BackgroundTasks(),

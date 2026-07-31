@@ -289,6 +289,30 @@ def test_get_metadata_projects_entries_to_name_fields(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/properties/42/metadata")
 
 
+def test_get_metadata_skips_entries_without_usable_api_name(monkeypatch):
+    """An entry with no apiName (or a non-string one) can't be passed back into
+    run_report's metrics/dimensions, so it must be dropped rather than
+    projected with an empty name."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "dimensions": [
+                    {"apiName": None, "uiName": "broken"},
+                    {"uiName": "also broken"},
+                    {"apiName": "country", "uiName": "Country"},
+                ],
+                "metrics": [],
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(google_analytics.google_analytics_get_metadata("42"))
+
+    assert result["status"] == "success"
+    assert [d["apiName"] for d in result["dimensions"]] == ["country"]
+
+
 def test_get_metadata_search_filters_by_name(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -415,7 +439,9 @@ def test_run_report_passes_through_filter_and_order(monkeypatch):
 
 def test_run_report_sends_default_limit_and_omits_zero_offset(monkeypatch):
     """GA4's own default returns up to 10k rows; the tool must always send an
-    explicit limit."""
+    explicit limit, and the default itself must stay small enough that a wide
+    report's serialized response doesn't cross the MCP output truncation
+    threshold."""
     mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
     monkeypatch.setattr(google_analytics.requests, "request", mock_request)
 
@@ -426,8 +452,101 @@ def test_run_report_sends_default_limit_and_omits_zero_offset(monkeypatch):
     )
 
     body = mock_request.call_args.kwargs["json"]
-    assert body["limit"] == "1000"
+    assert body["limit"] == str(google_analytics.RUN_REPORT_DEFAULT_LIMIT)
     assert "offset" not in body
+
+
+def test_run_report_rejects_empty_metrics(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=[],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "metrics" in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "bad_limit",
+    [0, -1, google_analytics.RUN_REPORT_MAX_LIMIT + 1],
+)
+def test_run_report_rejects_out_of_range_limit(monkeypatch, bad_limit):
+    mock_request = Mock()
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            limit=bad_limit,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "limit" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_run_report_rejects_negative_offset(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+            offset=-1,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "offset" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_run_report_default_limit_keeps_serialized_response_under_truncation_threshold(
+    monkeypatch,
+):
+    """Regression for the sizing bug: a realistic 5-dimension + 5-metric report
+    at the tool's own default limit must serialize to well under the 51200-char
+    MCP output truncation threshold enforced by
+    src/xagent/core/tools/adapters/vibe/output_filter.py."""
+    row = {
+        "dimensionValues": [{"value": f"dim-value-{i}"} for i in range(5)],
+        "metricValues": [{"value": str(1000 + i)} for i in range(5)],
+    }
+    rows = [row] * google_analytics.RUN_REPORT_DEFAULT_LIMIT
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "dimensionHeaders": [{"name": f"dim{i}"} for i in range(5)],
+                "metricHeaders": [{"name": f"metric{i}"} for i in range(5)],
+                "rows": rows,
+                "rowCount": len(rows),
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    response = google_analytics.google_analytics_run_report(
+        "42",
+        metrics=[f"metric{i}" for i in range(5)],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "today"}],
+        dimensions=[f"dim{i}" for i in range(5)],
+    )
+
+    result = json.loads(response)
+    assert result["status"] == "success"
+    assert len(response) < 51200
 
 
 def test_run_report_passes_metric_filter_and_offset(monkeypatch):

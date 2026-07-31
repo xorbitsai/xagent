@@ -21,6 +21,11 @@ DATA_API_BASE_URL = "https://analyticsdata.googleapis.com/v1beta"
 ADMIN_API_BASE_URL = "https://analyticsadmin.googleapis.com/v1beta"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_ACCOUNT_SUMMARY_PAGES = 20
+# A 5-dimension + 5-metric row serializes to ~275 chars through _success(); at
+# RUN_REPORT_MAX_LIMIT rows that's comfortably under the platform's 51200-char
+# MCP output truncation threshold even for wide reports.
+RUN_REPORT_DEFAULT_LIMIT = 100
+RUN_REPORT_MAX_LIMIT = 150
 
 _PROPERTY_ID_PATTERN = re.compile(r"^[0-9]+\Z")
 
@@ -204,7 +209,11 @@ def _project_metadata_entries(entries: list[Any], search: str) -> list[dict[str,
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        api_name = str(entry.get("apiName") or "")
+        api_name = entry.get("apiName")
+        if not isinstance(api_name, str) or not api_name:
+            # No usable apiName -> nothing for the LLM to pass back into
+            # run_report; skip rather than emitting a garbage empty name.
+            continue
         ui_name = str(entry.get("uiName") or "")
         if needle and needle not in api_name.lower() and needle not in ui_name.lower():
             continue
@@ -257,7 +266,7 @@ def google_analytics_run_report(
     dimension_filter: dict[str, Any] | None = None,
     metric_filter: dict[str, Any] | None = None,
     order_bys: list[dict[str, Any]] | None = None,
-    limit: int = 1000,
+    limit: int = RUN_REPORT_DEFAULT_LIMIT,
     offset: int = 0,
 ) -> str:
     """
@@ -280,22 +289,29 @@ def google_analytics_run_report(
     metric_filter: a raw GA4 FilterExpression dict applied to metric values
       (e.g. "sessions > 100"). Optional.
     order_bys: a raw GA4 OrderBy list, e.g. to sort by a metric descending.
-    limit: max rows to return (default 1000).
+    limit: max rows to return (default 100, max 150 — keeps a wide report's
+      serialized response under the MCP output size limit).
     offset: row offset for paging — if row_count in the response exceeds
       limit, call again with offset=limit, then offset=2*limit, and so on.
     """
     try:
         normalized_property_id = _normalize_property_id(property_id)
+        if not metrics:
+            raise ValueError("metrics must contain at least one metric name")
         if not date_ranges:
             raise ValueError("date_ranges must contain at least one date range")
         if len(date_ranges) > 4:
             raise ValueError("GA4 allows at most 4 date_ranges per report")
+        if limit < 1 or limit > RUN_REPORT_MAX_LIMIT:
+            raise ValueError(f"limit must be between 1 and {RUN_REPORT_MAX_LIMIT}")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
         body: dict[str, Any] = {
             "metrics": [{"name": m} for m in metrics],
             "dateRanges": [_date_range_body(dr) for dr in date_ranges],
             # Always sent explicitly: GA4's default would otherwise return up
             # to 10k rows in one response.
-            "limit": str(max(1, limit)),
+            "limit": str(limit),
         }
         if dimensions:
             body["dimensions"] = [{"name": d} for d in dimensions]

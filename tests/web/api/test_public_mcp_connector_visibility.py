@@ -716,6 +716,10 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
             "xagent.web.tools.mcp.google_slides",
             {"GOOGLE_ACCESS_TOKEN": "access_token"},
         ),
+        "google-analytics": (
+            "xagent.web.tools.mcp.google_analytics",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
         "hubspot": (
             "xagent.web.tools.mcp.hubspot",
             {"HUBSPOT_ACCESS_TOKEN": "access_token"},

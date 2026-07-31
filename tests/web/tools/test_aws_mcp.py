@@ -13,7 +13,6 @@ def _credentials(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-test")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
-    aws._assumed_role_cache.clear()
 
 
 def _client_error(code: str, message: str, operation: str = "Op") -> ClientError:
@@ -107,6 +106,7 @@ def test_get_metric_data_builds_query_and_returns_series(monkeypatch):
                 "Label": "CPUUtilization",
                 "Timestamps": ["2026-07-30T00:00:00Z"],
                 "Values": [42.5],
+                "StatusCode": "Complete",
             }
         ]
     }
@@ -125,11 +125,17 @@ def test_get_metric_data_builds_query_and_returns_series(monkeypatch):
 
     assert result["status"] == "success"
     assert result["values"] == [42.5]
+    assert result["status_code"] == "Complete"
+    assert result["partial"] is False
     query = cloudwatch.get_metric_data.call_args.kwargs["MetricDataQueries"][0]
     assert query["MetricStat"]["Stat"] == "Maximum"
     assert query["MetricStat"]["Metric"]["Dimensions"] == [
         {"Name": "InstanceId", "Value": "i-123"}
     ]
+    assert (
+        cloudwatch.get_metric_data.call_args.kwargs["MaxDatapoints"]
+        == aws.MAX_METRIC_DATAPOINTS
+    )
 
 
 def test_get_metric_data_handles_empty_series(monkeypatch):
@@ -149,6 +155,44 @@ def test_get_metric_data_handles_empty_series(monkeypatch):
     assert result["status"] == "success"
     assert result["timestamps"] == []
     assert result["values"] == []
+    assert result["partial"] is False
+
+
+def test_get_metric_data_flags_partial_data_and_surfaces_messages(monkeypatch):
+    """StatusCode other than "Complete" (PartialData/InternalError) means
+    CloudWatch could not fully answer the query — this must be distinguishable
+    from a clean "no data in this range" result."""
+    cloudwatch = Mock()
+    cloudwatch.get_metric_data.return_value = {
+        "MetricDataResults": [
+            {
+                "Label": "CPUUtilization",
+                "Timestamps": [],
+                "Values": [],
+                "StatusCode": "PartialData",
+            }
+        ],
+        "Messages": [{"Code": "PartialData", "Value": "Some data unavailable"}],
+        "NextToken": "next-page",
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=cloudwatch))
+
+    result = json.loads(
+        aws.aws_cloudwatch_get_metric_data(
+            namespace="AWS/EC2",
+            metric_name="CPUUtilization",
+            start_time="2026-07-30T00:00:00Z",
+            end_time="2026-07-30T01:00:00Z",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["status_code"] == "PartialData"
+    assert result["partial"] is True
+    assert result["messages"] == [
+        {"Code": "PartialData", "Value": "Some data unavailable"}
+    ]
+    assert result["truncated"] is True
 
 
 def test_tools_tolerate_explicit_none_values_in_responses(monkeypatch):
@@ -320,7 +364,10 @@ def _patch_boto3_session(monkeypatch, client_factory) -> Mock:
     return session_client
 
 
-def test_client_with_role_arn_assumes_role_and_caches(monkeypatch):
+def test_client_with_role_arn_assumes_role_on_every_call(monkeypatch):
+    """Each MCP tool call runs in its own short-lived subprocess, so there is
+    no in-process caching layer to test — every _client() call with a
+    role_arn must exchange it for fresh temporary credentials."""
     sts = _sts_with_assume_role(expires_in_seconds=3600)
     service_client = Mock()
     session_client = _patch_boto3_session(
@@ -332,24 +379,13 @@ def test_client_with_role_arn_assumes_role_and_caches(monkeypatch):
     second = aws._client("sqs", role_arn="arn:aws:iam::2:role/read")
 
     assert first is service_client and second is service_client
-    assert sts.assume_role.call_count == 1  # cached on second call
+    assert sts.assume_role.call_count == 2
     sqs_calls = [c for c in session_client.call_args_list if c.args[0] == "sqs"]
     assert sqs_calls[0].kwargs["aws_access_key_id"] == "ASIA-temp"
     assert sqs_calls[0].kwargs["aws_session_token"] == "temp-token"
-
-
-def test_client_with_role_arn_refreshes_near_expiry(monkeypatch):
-    sts = _sts_with_assume_role(
-        expires_in_seconds=aws.ASSUME_ROLE_EXPIRY_MARGIN_SECONDS - 10
-    )
-    _patch_boto3_session(
-        monkeypatch, lambda service, **kwargs: sts if service == "sts" else Mock()
-    )
-
-    aws._client("sqs", role_arn="arn:aws:iam::2:role/read")
-    aws._client("sqs", role_arn="arn:aws:iam::2:role/read")
-
-    assert sts.assume_role.call_count == 2  # inside margin → refreshed
+    assert sqs_calls[0].kwargs["config"] == aws.DEFAULT_CLIENT_CONFIG
+    sts_calls = [c for c in session_client.call_args_list if c.args[0] == "sts"]
+    assert sts_calls[0].kwargs["config"] == aws.DEFAULT_CLIENT_CONFIG
 
 
 def test_client_without_role_arn_uses_env_credentials(monkeypatch):
@@ -358,7 +394,11 @@ def test_client_without_role_arn_uses_env_credentials(monkeypatch):
     aws._client("cloudwatch")
 
     kwargs = session_client.call_args.kwargs
-    assert kwargs == {"region_name": "us-east-1"}  # no explicit creds → env chain
+    # no explicit creds → env chain; a timeout/retry config is still applied
+    assert kwargs == {
+        "region_name": "us-east-1",
+        "config": aws.DEFAULT_CLIENT_CONFIG,
+    }
 
 
 def test_client_creates_a_fresh_session_per_call(monkeypatch):

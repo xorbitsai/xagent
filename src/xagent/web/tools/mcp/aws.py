@@ -1,10 +1,10 @@
 import json
 import logging
 import os
-import time
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from mcp.server.fastmcp import FastMCP
 
@@ -18,14 +18,19 @@ setup_proxy_env()
 
 mcp = FastMCP("aws-mcp")
 
-# Refresh assumed-role credentials this many seconds before they expire, so a
-# long-running tool call never starts with credentials about to lapse.
-ASSUME_ROLE_EXPIRY_MARGIN_SECONDS = 300
 ASSUME_ROLE_SESSION_NAME = "xagent-aws-mcp"
 MAX_LOG_EVENTS = 100
+# CloudWatch's own server-side default (100,800) is far more than an LLM
+# needs handed back in one response; cap to roughly a day of 1-minute data.
+MAX_METRIC_DATAPOINTS = 1440
 
-# role_arn -> (credentials dict, unix expiry timestamp)
-_assumed_role_cache: dict[str, tuple[dict[str, str], float]] = {}
+# boto3 defaults (60s connect/read timeout, up to 5 legacy retries) are too
+# generous for a synchronous tool call the LLM is waiting on.
+DEFAULT_CLIENT_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=30,
+    retries={"max_attempts": 3, "mode": "standard"},
+)
 
 
 def _success(**payload: Any) -> str:
@@ -51,24 +56,22 @@ def _resolve_region(region: str | None) -> str:
 
 
 def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str]:
-    cached = _assumed_role_cache.get(role_arn)
-    now = time.time()
-    if cached and cached[1] - ASSUME_ROLE_EXPIRY_MARGIN_SECONDS > now:
-        return cached[0]
-
-    sts = boto3.Session().client("sts", region_name=region)
+    # No caching: each MCP tool call runs in its own short-lived subprocess
+    # (see _execute_mcp_call in mcp_adapter.py, which opens and tears down a
+    # fresh stdio session per call), so a module-level cache never survives
+    # past the single call that populated it.
+    sts = boto3.Session().client(
+        "sts", region_name=region, config=DEFAULT_CLIENT_CONFIG
+    )
     response = sts.assume_role(
         RoleArn=role_arn, RoleSessionName=ASSUME_ROLE_SESSION_NAME
     )
     creds = response["Credentials"]
-    credentials = {
+    return {
         "aws_access_key_id": creds["AccessKeyId"],
         "aws_secret_access_key": creds["SecretAccessKey"],
         "aws_session_token": creds["SessionToken"],
     }
-    expiry = creds["Expiration"].timestamp()
-    _assumed_role_cache[role_arn] = (credentials, expiry)
-    return credentials
 
 
 def _client(
@@ -77,9 +80,10 @@ def _client(
     """Build a boto3 client from the connector's env credentials.
 
     With role_arn set, base credentials are exchanged for temporary
-    assumed-role credentials first (cached per ARN until shortly before
-    expiry) — this is how cross-account read access works without storing a
-    second key set.
+    assumed-role credentials first — this is how cross-account read access
+    works without storing a second key set. The exchange happens on every
+    call: see the comment on _assume_role_credentials for why caching it
+    would be dead code.
 
     A fresh boto3.Session per call, rather than the module-level
     boto3.client shortcut: the default shared session is documented as not
@@ -91,8 +95,15 @@ def _client(
     session = boto3.Session()
     if role_arn:
         credentials = _assume_role_credentials(role_arn, resolved_region)
-        return session.client(service, region_name=resolved_region, **credentials)
-    return session.client(service, region_name=resolved_region)
+        return session.client(
+            service,
+            region_name=resolved_region,
+            config=DEFAULT_CLIENT_CONFIG,
+            **credentials,
+        )
+    return session.client(
+        service, region_name=resolved_region, config=DEFAULT_CLIENT_CONFIG
+    )
 
 
 def _aws_error_message(exc: Exception) -> str:
@@ -184,6 +195,8 @@ def aws_cloudwatch_get_metric_data(
     start_time / end_time: ISO 8601 timestamps, e.g. "2026-07-30T00:00:00Z".
     stat: one of "Average", "Sum", "Minimum", "Maximum", "SampleCount".
     dimensions: e.g. [{"Name": "QueueName", "Value": "my-queue"}].
+    Returns at most 1440 datapoints — narrow the time range or widen
+    period_seconds rather than expecting more in one call.
     """
     try:
         metric: dict[str, Any] = {"Namespace": namespace, "MetricName": metric_name}
@@ -207,13 +220,21 @@ def aws_cloudwatch_get_metric_data(
             # here would only narrow the accepted formats.
             StartTime=start_time,
             EndTime=end_time,
+            MaxDatapoints=MAX_METRIC_DATAPOINTS,
         )
         series = result.get("MetricDataResults") or []
         first = (series[0] or {}) if series else {}
+        status_code = first.get("StatusCode")
         return _success(
             timestamps=first.get("Timestamps", []),
             values=first.get("Values", []),
             label=first.get("Label"),
+            status_code=status_code,
+            # PartialData/InternalError mean CloudWatch could not fully
+            # answer this query — surface that distinctly from "no data".
+            partial=status_code is not None and status_code != "Complete",
+            messages=result.get("Messages") or [],
+            truncated="NextToken" in result,
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error getting CloudWatch metric data: {e}")

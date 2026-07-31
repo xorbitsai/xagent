@@ -97,19 +97,28 @@ class PublicMCPAppCreate(PublicMCPAppBase):
     def _enforce_auth_classification(self) -> "PublicMCPAppCreate":
         # Reuse the single source of truth (classify_app_auth) rather than
         # re-deriving the rule here. Reject an entry that declares a partial
-        # launch_config (command or required_env) yet still classifies as
-        # "unconnectable" — the write-time constraint issue #764 asked for. This
-        # covers both asymmetric shapes: command-without-required_env and
-        # required_env-without-command.
+        # launch_config (either the key-based or the remote-OAuth shape) yet
+        # still classifies as "unconnectable" — the write-time constraint
+        # issue #764 asked for. Covers four asymmetric shapes:
+        # command-without-required_env, required_env-without-command,
+        # url-without-auth.type=mcp_oauth, and auth.type=mcp_oauth-without-url.
         from ..mcp_apps import classify_app_auth
 
         launch = self.launch_config or {}
-        if (launch.get("command") or launch.get("required_env")) and (
+        declares_key_shape = bool(launch.get("command") or launch.get("required_env"))
+        auth = launch.get("auth")
+        declares_remote_oauth_shape = bool(launch.get("url")) or (
+            isinstance(auth, dict) and auth.get("type") == "mcp_oauth"
+        )
+        if (declares_key_shape or declares_remote_oauth_shape) and (
             classify_app_auth(self.transport, self.launch_config) == "unconnectable"
         ):
             raise ValueError(
                 "A key-based catalog app must declare both launch_config.command "
-                "and launch_config.required_env, otherwise it cannot be connected."
+                "and launch_config.required_env; a remote-OAuth catalog app must "
+                "declare both launch_config.url and launch_config.auth.type == "
+                "'mcp_oauth' (with transport one of sse/websocket/streamable_http), "
+                "otherwise it cannot be connected."
             )
         return self
 

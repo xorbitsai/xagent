@@ -2302,6 +2302,97 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     return server, app_info
 
 
+def _ensure_catalog_mcp_oauth_server(
+    db: Session, app_id: str
+) -> tuple[MCPServer, dict]:
+    """Idempotently ensure the shared server row for a remote-MCP OAuth
+    (DCR-capable) catalog app exists, without creating any per-user
+    association. Returns (server, app_info). Mirrors
+    _ensure_catalog_app_server's hijack guards, but for a streamable_http/
+    sse/websocket server row instead of a stdio one.
+    """
+    from ..mcp_apps import get_app_by_id
+
+    app_info = get_app_by_id(db, app_id)
+    if not app_info:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
+        )
+    if app_info.get("auth_type") != "mcp_oauth":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This app is not a remote-OAuth connector",
+        )
+    launch = app_info.get("launch_config") or {}
+    url = launch.get("url")
+    auth = launch.get("auth") or {}
+    transport = str(app_info["transport"])
+    server_name = str(app_info["id"])
+
+    server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    # Same reasoning as _ensure_catalog_app_server: a row under this catalog id
+    # may be a hijack (a custom server someone created with a different remote
+    # URL), so only reuse it if it matches the official configuration.
+    if server:
+        if (
+            str(server.transport or "").lower() != transport.lower()
+            or server.url != url
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A server with this name already exists with a different configuration",
+            )
+        owned = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.mcpserver_id == server.id,
+                UserMCPServer.is_owner.is_(True),
+            )
+            .first()
+        )
+        if owned is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A user-owned server already exists under this catalog id",
+            )
+    if not server:
+        try:
+            config = _build_server_config(
+                MCPServerCreate(
+                    name=server_name,
+                    transport=transport,
+                    description=app_info.get("description"),
+                    config={"url": url, "auth": auth},
+                )
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid app configuration: {str(e)}",
+            )
+        manager = DatabaseMCPServerManager(db)
+        add_error: Exception | None = None
+        try:
+            manager.add_server(config)
+        except (ValueError, IntegrityError) as exc:
+            # A concurrent first-provision loses to the other request, same
+            # recovery as _ensure_catalog_app_server.
+            db.rollback()
+            add_error = exc
+        server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+        if not server:
+            if add_error is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid app configuration: {add_error}",
+                ) from add_error
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create server",
+            )
+    return server, app_info
+
+
 @mcp_router.post("/apps/{app_id}/connect", response_model=MCPServerResponse)
 def connect_mcp_app(
     app_id: str,
@@ -2433,6 +2524,72 @@ def connect_mcp_app(
         manager,
         app_id=str(app_info["id"]),
         is_admin=getattr(current_user, "is_admin", False),
+    )
+
+
+@mcp_router.post("/apps/{app_id}/oauth/connect", response_model=None)
+async def connect_mcp_oauth_app(
+    app_id: str,
+    request_data: MCPOAuthConnectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    accept: Annotated[str | None, Header()] = None,
+) -> RedirectResponse | JSONResponse:
+    """Connect a remote-MCP OAuth (DCR-capable) catalog app for the current user.
+
+    Ensures the shared server row and this user's association exist, then
+    delegates to connect_mcp_oauth's Authorization Code + PKCE flow — the
+    per-user DCR/token machinery is identical to a self-added custom MCP
+    server; only the server row's origin (catalog vs. a user-typed URL)
+    differs.
+    """
+    server, app_info = _ensure_catalog_mcp_oauth_server(db, app_id)
+
+    assoc: Any = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == current_user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .first()
+    )
+    if assoc is None:
+        assoc = UserMCPServer(
+            user_id=current_user.id,
+            mcpserver_id=server.id,
+            is_active=True,
+            is_owner=False,
+            can_edit=False,
+            can_delete=True,
+        )
+        db.add(assoc)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Concurrent same-user connect (double-click/client retry): another
+            # request already inserted the (user_id, mcpserver_id) association.
+            db.rollback()
+            assoc = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == current_user.id,
+                    UserMCPServer.mcpserver_id == server.id,
+                )
+                .first()
+            )
+            if assoc is None:
+                raise
+    elif not assoc.is_active:
+        # A reconnect after the user previously disconnected their own
+        # association — re-activate it rather than leaving it dormant.
+        assoc.is_active = True
+        db.commit()
+
+    logger.info(
+        f"User {current_user.id} starting OAuth connect for MCP app '{app_info['id']}'"
+    )
+    return await connect_mcp_oauth(
+        cast(int, server.id), request_data, current_user, db, accept
     )
 
 

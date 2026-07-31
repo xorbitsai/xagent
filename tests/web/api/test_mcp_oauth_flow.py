@@ -26,6 +26,7 @@ from xagent.web.api.mcp import (
     MCPOAuthStatusResponse,
     MCPServerUpdate,
     connect_mcp_oauth,
+    connect_mcp_oauth_app,
     delete_mcp_oauth_grant,
     discover_mcp_oauth,
     get_mcp_oauth_status,
@@ -37,6 +38,7 @@ from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import mcp_oauth_client_registration_lookup_hash
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
@@ -1230,6 +1232,210 @@ async def test_oauth_routes_reject_inactive_user_mcp_server(db_session, monkeypa
 
     with pytest.raises(mcp_api.HTTPException) as exc:
         await delete_mcp_oauth_grant(server.id, grant.id, user, db)
+    assert exc.value.status_code == 404
+
+
+def _add_remote_oauth_catalog_app(db, *, app_id: str = "granola") -> None:
+    """A built-in catalog row shaped like a real remote-MCP-OAuth connector:
+    only a URL and auth.type — no static client_id, matching a DCR-only
+    provider (e.g. Granola) that never hands out pre-registered credentials."""
+    db.add(
+        PublicMCPApp(
+            app_id=app_id,
+            name=app_id.title(),
+            transport="streamable_http",
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+    )
+    db.commit()
+
+
+@pytest.mark.asyncio
+async def test_connect_app_creates_server_and_association_then_starts_dcr_flow(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    registration_requests: list[httpx.Request] = []
+
+    def registration_handler(request: httpx.Request) -> httpx.Response:
+        registration_requests.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client-123",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    registration_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(registration_handler)
+    )
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: registration_client,
+    )
+
+    response = await connect_mcp_oauth_app(
+        "granola",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    assert response.status_code == 303
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["dynamic-client-123"]
+    assert len(registration_requests) == 1
+
+    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    assert server.transport == "streamable_http"
+    assert server.url == "https://mcp.example.com/mcp"
+    assert server.auth["type"] == "mcp_oauth"
+
+    assoc = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id, UserMCPServer.mcpserver_id == server.id
+        )
+        .one()
+    )
+    assert assoc.is_active is True
+    assert assoc.is_owner is False
+
+
+@pytest.mark.asyncio
+async def test_connect_app_is_idempotent_across_repeated_connects(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    def registration_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client-123",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    registration_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(registration_handler)
+    )
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: registration_client,
+    )
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+
+    assert db.query(MCPServer).filter(MCPServer.name == "granola").count() == 1
+    assert (
+        db.query(UserMCPServer)
+        .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(MCPServer.name == "granola", UserMCPServer.user_id == user.id)
+        .count()
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_connect_app_reactivates_a_previously_disconnected_association(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dynamic-client-123",
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+            )
+        ),
+    )
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    _set_user_mcp_active(db, user, server, False)
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+
+    assoc = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id, UserMCPServer.mcpserver_id == server.id
+        )
+        .one()
+    )
+    assert assoc.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_connect_app_rejects_non_mcp_oauth_catalog_app(db_session):
+    db, user, _ = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-maps",
+            name="Google Maps",
+            transport="stdio",
+            launch_config={"command": "npx", "required_env": ["GOOGLE_MAPS_API_KEY"]},
+        )
+    )
+    db.commit()
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await connect_mcp_oauth_app(
+            "google-maps", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_connect_app_rejects_unknown_app_id(db_session):
+    db, user, _ = db_session
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await connect_mcp_oauth_app(
+            "no-such-app", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+        )
     assert exc.value.status_code == 404
 
 

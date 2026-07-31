@@ -1175,6 +1175,82 @@ def test_admin_create_app_rejects_keyless_command_entry() -> None:
             pass
 
 
+def test_admin_create_app_rejects_partial_remote_oauth_entry() -> None:
+    """Same write-time constraint (#764), for the remote-MCP-OAuth shape: a
+    streamable_http/sse/websocket entry needs BOTH launch_config.url and
+    launch_config.auth.type == "mcp_oauth", or it classifies as
+    "unconnectable" and must be rejected rather than silently persisted."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        # Shape 1: url without auth.type=mcp_oauth.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-auth-type",
+                "name": "BadNoAuthType",
+                "transport": "streamable_http",
+                "launch_config": {"url": "https://mcp.example.com/mcp"},
+            },
+        )
+        assert resp.status_code == 422
+
+        # Shape 2 (the reverse asymmetric shape): auth.type=mcp_oauth without url.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-url",
+                "name": "BadNoUrl",
+                "transport": "streamable_http",
+                "launch_config": {"auth": {"type": "mcp_oauth"}},
+            },
+        )
+        assert resp.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_accepts_full_remote_oauth_entry() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "good-remote-oauth",
+                "name": "GoodRemoteOAuth",
+                "transport": "streamable_http",
+                "launch_config": {
+                    "url": "https://mcp.example.com/mcp",
+                    "auth": {"type": "mcp_oauth"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["launch_config"]["url"] == "https://mcp.example.com/mcp"
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_admin_update_app_enforces_auth_classification() -> None:
     """The write-time constraint fires on PUT too, not just POST (both use the
     same PublicMCPAppCreate model)."""

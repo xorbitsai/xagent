@@ -1,7 +1,7 @@
 """seed built-in Google Analytics (OAuth) MCP connector
 
 Revision ID: 20260730_seed_google_analytics_mcp_app
-Revises: 20260724_add_upload_source_to_uploaded_files
+Revises: 20260801_seed_slack_mcp_app
 Create Date: 2026-07-30 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260730_seed_google_analytics_mcp_app"
-down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
+down_revision: Union[str, None] = "20260801_seed_slack_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

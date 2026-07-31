@@ -47,6 +47,15 @@ DEFAULT_USER_FILE_LIST_LIMIT = 50
 # Context variable for auto-registration mode
 _auto_register = contextvars.ContextVar("_auto_register", default=False)
 
+# Runtime scratch files must remain resolvable across equivalent TaskWorkspace
+# instances in one process without becoming user-visible UploadedFile records.
+# The canonical workspace root is part of every key, preventing a file ID from
+# crossing task/workspace boundaries.
+_internal_file_registry: Dict[Tuple[str, str], Path] = {}
+_internal_path_registry: Dict[Tuple[str, str], str] = {}
+_internal_file_registry_lock = RLock()
+_INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
+
 
 def scoped_user_root(
     base_dir: Union[str, Path, None],
@@ -220,6 +229,132 @@ class TaskWorkspace:
 
         self.__dict__.update(state)
         self._registration_lock = RLock()
+
+    @property
+    def internal_temp_dir(self) -> Path:
+        """Return the reserved root for process-local runtime scratch data."""
+
+        return self.temp_dir / _INTERNAL_TEMP_DIR_NAME
+
+    def register_internal_file(
+        self,
+        file_path: str,
+    ) -> str:
+        """Register workspace scratch data without creating a file record.
+
+        Internal registrations are process-local by design and are not
+        available in sandbox subprocesses reconstructed from a serialized
+        workspace. A checkpoint may retain the safe FileRef after its scratch
+        bytes expire; model input then degrades to the reference's text fallback
+        instead of resurrecting a user-visible artifact.
+        """
+
+        resolved_path = Path(file_path).resolve(strict=True)
+        workspace_root = self.workspace_dir.resolve()
+        temp_root = self.temp_dir.resolve()
+        if not resolved_path.is_file() or not resolved_path.is_relative_to(temp_root):
+            raise ValueError("internal files must be regular workspace temp files")
+
+        workspace_key = str(workspace_root)
+        path_key = (workspace_key, str(resolved_path))
+        with _internal_file_registry_lock:
+            existing_file_id = _internal_path_registry.get(path_key)
+            if existing_file_id is not None:
+                registered_path = _internal_file_registry.get(
+                    (workspace_key, existing_file_id)
+                )
+                if registered_path == resolved_path:
+                    final_file_id = existing_file_id
+                else:
+                    _internal_path_registry.pop(path_key, None)
+                    final_file_id = f"internal-{uuid4()}"
+            else:
+                final_file_id = f"internal-{uuid4()}"
+
+            file_key = (workspace_key, final_file_id)
+            occupied_path = _internal_file_registry.get(file_key)
+            if occupied_path is not None and occupied_path != resolved_path:
+                raise ValueError("internal file_id is already registered")
+            _internal_file_registry[file_key] = resolved_path
+            _internal_path_registry[path_key] = final_file_id
+
+        return final_file_id
+
+    def _resolve_internal_file_id(self, file_id: str) -> Optional[Path]:
+        workspace_key = str(self.workspace_dir.resolve())
+        file_key = (workspace_key, file_id)
+        with _internal_file_registry_lock:
+            registered_path = _internal_file_registry.get(file_key)
+            if registered_path is None:
+                return None
+            if (
+                not registered_path.exists()
+                or not registered_path.is_file()
+                or not registered_path.resolve().is_relative_to(self.temp_dir.resolve())
+            ):
+                _internal_file_registry.pop(file_key, None)
+                _internal_path_registry.pop(
+                    (workspace_key, str(registered_path)),
+                    None,
+                )
+                return None
+
+        return registered_path
+
+    def unregister_internal_file(self, file_path: str) -> Optional[str]:
+        """Forget one process-local scratch file registration by path."""
+
+        resolved_path = Path(file_path).resolve()
+        workspace_key = str(self.workspace_dir.resolve())
+        if not resolved_path.is_relative_to(self.temp_dir.resolve()):
+            raise ValueError("internal files must be regular workspace temp files")
+        path_key = (workspace_key, str(resolved_path))
+        with _internal_file_registry_lock:
+            file_id = _internal_path_registry.pop(path_key, None)
+            if file_id is not None:
+                _internal_file_registry.pop((workspace_key, file_id), None)
+        return file_id
+
+    def _get_internal_file_id_from_path(self, file_path: Path) -> Optional[str]:
+        workspace_key = str(self.workspace_dir.resolve())
+        path_key = (workspace_key, str(file_path))
+        with _internal_file_registry_lock:
+            file_id = _internal_path_registry.get(path_key)
+            if file_id is None:
+                return None
+            registered_path = _internal_file_registry.get((workspace_key, file_id))
+            if (
+                registered_path != file_path
+                or not file_path.exists()
+                or not file_path.is_file()
+                or not file_path.resolve().is_relative_to(self.temp_dir.resolve())
+            ):
+                _internal_path_registry.pop(path_key, None)
+                _internal_file_registry.pop((workspace_key, file_id), None)
+                return None
+            return file_id
+
+    def _is_internal_workspace_path(self, file_path: Path) -> bool:
+        """Return whether a path is reserved or registered runtime scratch data."""
+
+        resolved_path = file_path.resolve()
+        reserved_root = self.internal_temp_dir.resolve()
+        if resolved_path.is_relative_to(reserved_root):
+            return True
+        return self._get_internal_file_id_from_path(resolved_path) is not None
+
+    def _forget_internal_files(self) -> None:
+        workspace_key = str(self.workspace_dir.resolve())
+        with _internal_file_registry_lock:
+            file_keys = [
+                key for key in _internal_file_registry if key[0] == workspace_key
+            ]
+            for key in file_keys:
+                registered_path = _internal_file_registry.pop(key)
+                _internal_path_registry.pop(
+                    (workspace_key, str(registered_path)),
+                    None,
+                )
 
     def register_file(
         self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
@@ -1023,6 +1158,22 @@ class TaskWorkspace:
                     if self._file_id_to_path.get(file_id) == cached_path:
                         self._file_id_to_path.pop(file_id, None)
 
+        internal_path = self._resolve_internal_file_id(file_id)
+        if internal_path is not None:
+            logger.debug(
+                "resolve_file_id: Found workspace-internal file: %s -> %s",
+                file_id,
+                internal_path,
+            )
+            return internal_path
+        if file_id.startswith("internal-"):
+            logger.warning(
+                "resolve_file_id: Process-local internal file is unavailable in "
+                "this process or has expired: %s",
+                file_id,
+            )
+            return None
+
         # Query from database
         from .storage.manager import create_db_session
 
@@ -1439,26 +1590,26 @@ class TaskWorkspace:
 
         # Scan input directory
         for file_path in self.input_dir.rglob("*"):
-            if file_path.is_file():
+            if file_path.is_file() and not self._is_internal_workspace_path(file_path):
                 result["input"].append(self._get_file_info(file_path, "input"))
 
         # Scan output directory
         for file_path in self.output_dir.rglob("*"):
-            if file_path.is_file():
+            if file_path.is_file() and not self._is_internal_workspace_path(file_path):
                 result["output"].append(self._get_file_info(file_path, "output"))
 
         # Scan temp directory
         for file_path in self.temp_dir.rglob("*"):
-            if file_path.is_file():
+            if file_path.is_file() and not self._is_internal_workspace_path(file_path):
                 result["temp"].append(self._get_file_info(file_path, "temp"))
 
         # Scan workspace root (excluding subdirs)
         for file_path in self.workspace_dir.iterdir():
-            if file_path.is_file() and file_path.name not in [
-                "input",
-                "output",
-                "temp",
-            ]:
+            if (
+                file_path.is_file()
+                and not self._is_internal_workspace_path(file_path)
+                and file_path.name not in ["input", "output", "temp"]
+            ):
                 result["workspace"].append(self._get_file_info(file_path, "workspace"))
 
         return result
@@ -1491,12 +1642,19 @@ class TaskWorkspace:
         for file_path in self.temp_dir.rglob("*"):
             if file_path.is_file():
                 try:
-                    file_path.unlink()
-                except OSError:
-                    pass
+                    registered_path = file_path.resolve()
+                    file_path.unlink(missing_ok=True)
+                    self.unregister_internal_file(str(registered_path))
+                except (OSError, ValueError):
+                    logger.debug(
+                        "Could not remove temporary workspace file %s",
+                        file_path,
+                        exc_info=True,
+                    )
 
     def cleanup(self) -> None:
         """Clean up the entire workspace"""
+        self._forget_internal_files()
         if self.workspace_dir.exists():
             logger.info(f"Removing workspace directory: {self.workspace_dir}")
             shutil.rmtree(self.workspace_dir)
@@ -1601,6 +1759,8 @@ class TaskWorkspace:
                     or "node_modules" in file_path.parts
                 ):
                     continue
+                if self._is_internal_workspace_path(file_path):
+                    continue
                 files.add(file_path)
         return files
 
@@ -1623,6 +1783,10 @@ class TaskWorkspace:
                     f"get_file_id_from_path: Found in cache: {cache_snapshot[resolved_str]}"
                 )
                 return cache_snapshot[resolved_str]
+
+            internal_file_id = self._get_internal_file_id_from_path(resolved_path)
+            if internal_file_id is not None:
+                return internal_file_id
 
             # Also try the original path (not resolved)
             if file_path in cache_snapshot:

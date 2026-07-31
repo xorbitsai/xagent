@@ -12,6 +12,7 @@ When mentioning a generated or uploaded file that has a file_id, render it as a 
 Do not mention only the filename when a file_id or markdown_link is available. Prefer an existing markdown_link value when one is present.
 
 File delivery integrity:
+- Internal FileRefs (`internal: true`) are runtime context only. Never render or expose a `file:` link for them.
 - Never invent, guess, or construct a file_id or `file:` link. Use only a trusted FileRef supplied for an existing input/attachment, or the exact FileRef or markdown_link returned by a successful tool result. A link mentioned only in prior assistant prose is not provenance.
 - When the user requests a new file or file-based artifact, it is not delivered until a successful tool result returns its registered FileRef or markdown_link.
 - Do not call final_answer claiming that a file was created or delivered unless that result exists."""
@@ -92,6 +93,7 @@ def build_file_ref(
     filename: str,
     mime_type: str | None = None,
     size: int | None = None,
+    internal: bool = False,
 ) -> dict[str, Any]:
     """Build the model/API-facing file reference for a registered file."""
     resolved_mime_type = mime_type or guess_mime_type(filename)
@@ -102,8 +104,10 @@ def build_file_ref(
     }
     if size is not None:
         result["size"] = int(size)
+    if internal:
+        result["internal"] = True
 
-    if file_id:
+    if file_id and not internal:
         encoded_file_id = quote(file_id, safe="")
         result.update(
             {
@@ -129,17 +133,29 @@ def build_workspace_file_ref(
     file_path: str | Path,
     file_id: str | None = None,
     mime_type: str | None = None,
+    internal: bool = False,
 ) -> dict[str, Any]:
-    """Register a workspace file and build the model/API-facing FileRef."""
+    """Register a workspace file and build the model/API-facing FileRef.
+
+    ``internal`` keeps execution scratch data resolvable by ``file_id`` without
+    creating a user-visible or durably uploaded file record. It fails closed
+    when the workspace does not support internal registration.
+    """
     resolved_path = Path(file_path).resolve()
     if not resolved_path.exists() or not resolved_path.is_file():
         raise FileNotFoundError(f"File not found for FileRef: {file_path}")
     if not hasattr(workspace, "workspace_dir"):
         raise ValueError("Workspace does not expose workspace_dir")
 
-    final_file_id = file_id or workspace.get_file_id_from_path(str(resolved_path))
-    if not final_file_id:
-        final_file_id = workspace.register_file(str(resolved_path))
+    if internal:
+        register_internal = getattr(workspace, "register_internal_file", None)
+        if not callable(register_internal):
+            raise TypeError("workspace does not support internal file registration")
+        final_file_id = register_internal(str(resolved_path))
+    else:
+        final_file_id = file_id or workspace.get_file_id_from_path(str(resolved_path))
+        if not final_file_id:
+            final_file_id = workspace.register_file(str(resolved_path))
 
     workspace_root = workspace.workspace_dir.resolve()
     file_ref = build_file_ref(
@@ -147,17 +163,19 @@ def build_workspace_file_ref(
         filename=resolved_path.name,
         mime_type=mime_type,
         size=resolved_path.stat().st_size,
+        internal=internal,
     )
-    try:
-        relative_path = str(resolved_path.relative_to(workspace_root))
-    except ValueError:
-        relative_path = str(resolved_path)
-
-    return {
+    result = {
         **file_ref,
-        "relative_path": relative_path,
         "file_path": str(resolved_path),
     }
+    if not internal:
+        try:
+            relative_path = str(resolved_path.relative_to(workspace_root))
+        except ValueError:
+            relative_path = str(resolved_path)
+        result["relative_path"] = relative_path
+    return result
 
 
 def sanitize_file_ref_for_context(file_ref: dict[str, Any]) -> dict[str, Any]:
@@ -181,14 +199,16 @@ def sanitize_file_ref_for_context(file_ref: dict[str, Any]) -> dict[str, Any]:
     size = int(raw_size) if raw_size is not None else None
     if size is not None and size < 0:
         raise ValueError("FileRef size must not be negative")
+    internal = file_ref.get("internal") is True
     result = build_file_ref(
         file_id=file_id,
         filename=filename,
         mime_type=mime_type,
         size=size,
+        internal=internal,
     )
     relative_path = file_ref.get("relative_path")
-    if relative_path is not None:
+    if not internal and relative_path is not None:
         raw_relative = str(relative_path).strip()
         windows_relative = PureWindowsPath(raw_relative)
         relative = Path(raw_relative.replace("\\", "/"))

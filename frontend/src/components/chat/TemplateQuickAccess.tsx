@@ -74,6 +74,9 @@ export interface TemplateQuickAccessProps {
   onCategoryChange: (category: string) => void;
   selectedPromptKey: string | null;
   onPromptSelect: (template: Template, prompt: SamplePrompt, index: number) => void;
+  isLoading?: boolean;
+  loadError?: boolean;
+  onRetryLoad?: () => void;
 }
 
 export function TemplateQuickAccess({
@@ -82,6 +85,9 @@ export function TemplateQuickAccess({
   onCategoryChange,
   selectedPromptKey,
   onPromptSelect,
+  isLoading = false,
+  loadError = false,
+  onRetryLoad,
 }: TemplateQuickAccessProps) {
   const { t } = useI18n();
 
@@ -89,6 +95,38 @@ export function TemplateQuickAccess({
     () => getOrderedCategoriesWithCounts(templates),
     [templates]
   );
+
+  // While the initial fetch is in flight or has failed, `templates` is still
+  // `[]` and categoryTabs would be empty too - without this, the grid area
+  // just renders nothing with no sign anything is loading or broke (see PR
+  // review finding F8). Once templates has actually loaded (even to a
+  // legitimately empty result), fall through to the normal empty-state below.
+  if (templates.length === 0 && (isLoading || loadError)) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border py-8 text-center">
+        {isLoading ? (
+          <p className="text-[13px] text-muted-foreground">
+            {t("chatPage.templateQuickAccess.loading")}
+          </p>
+        ) : (
+          <>
+            <p className="text-[13px] text-muted-foreground">
+              {t("chatPage.templateQuickAccess.loadError")}
+            </p>
+            {onRetryLoad && (
+              <button
+                type="button"
+                onClick={onRetryLoad}
+                className={cn("text-[13px] font-medium hover:underline", ACCENT_TEXT_CLASS)}
+              >
+                {t("chatPage.templateQuickAccess.retry")}
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    );
+  }
 
   // The parent may hand us a selectedCategory (e.g. the "Featured" default)
   // that no longer has a matching tab - a deployment with no featured
@@ -99,7 +137,7 @@ export function TemplateQuickAccess({
     : categoryTabs[0]?.id ?? selectedCategory;
 
   const cards = useMemo(
-    () => getTemplatesForCategory(templates, activeCategory, 4),
+    () => getTemplatesForCategory(templates, activeCategory),
     [templates, activeCategory]
   );
 

@@ -21,7 +21,6 @@ vi.mock("@/lib/utils", async () => {
 });
 
 import {
-  DUPLICATE_AGENT_NAME_DETAIL,
   findExistingAgentForTemplate,
   resolveAgentForTemplate,
   toAgentId,
@@ -45,6 +44,9 @@ describe("toAgentId", () => {
     expect(toAgentId(null)).toBeNull();
     expect(toAgentId(undefined)).toBeNull();
     expect(toAgentId({ id: "not-a-number" })).toBeNull();
+    expect(toAgentId({ id: null })).toBeNull();
+    expect(toAgentId({ id: 0 })).toBeNull();
+    expect(toAgentId({ id: -3 })).toBeNull();
   });
 });
 
@@ -68,131 +70,63 @@ describe("resolveAgentForTemplate", () => {
   it("reuses a known agent without any network calls", async () => {
     const known = [{ id: 7, name: "Inbox Manager", template_id: "support-inbox-manager", status: "published" }];
 
-    const result = await resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", known);
+    const result = await resolveAgentForTemplate("support-inbox-manager", known);
 
     expect(result).toEqual({ agent: known[0], created: false });
     expect(apiRequestMock).not.toHaveBeenCalled();
   });
 
-  it("creates and publishes a new agent when none exists locally", async () => {
-    apiRequestMock
-      .mockResolvedValueOnce(jsonResponse({ id: 10, name: "Inbox Manager", template_id: "support-inbox-manager" }))
-      .mockResolvedValueOnce(jsonResponse({ message: "ok" }));
+  it("asks the server's resolve endpoint when no known agent matches", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        agent: { id: 10, name: "Inbox Manager", template_id: "support-inbox-manager", status: "published" },
+        created: true,
+      })
+    );
 
-    const result = await resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", []);
+    const result = await resolveAgentForTemplate("support-inbox-manager", []);
 
     expect(result.created).toBe(true);
     expect(result.agent).toMatchObject({ id: 10, status: "published" });
-    expect(apiRequestMock).toHaveBeenNthCalledWith(
-      1,
-      "http://api.local/api/agents/from-template",
+    expect(apiRequestMock).toHaveBeenCalledTimes(1);
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/agents/from-template/resolve",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ template_id: "support-inbox-manager" }),
       })
     );
-    expect(apiRequestMock).toHaveBeenNthCalledWith(
-      2,
-      "http://api.local/api/agents/10/publish",
-      expect.objectContaining({ method: "POST" })
-    );
   });
 
-  it("reuses (and publishes) an agent from this template found only via the 400 lookup", async () => {
-    apiRequestMock
-      .mockResolvedValueOnce(
-        jsonResponse({ detail: DUPLICATE_AGENT_NAME_DETAIL }, { status: 400 })
-      )
-      .mockResolvedValueOnce(
-        jsonResponse([{ id: 11, name: "Inbox Manager", template_id: "support-inbox-manager", status: "draft" }])
-      )
-      .mockResolvedValueOnce(jsonResponse({ message: "ok" }));
-
-    const result = await resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", []);
-
-    expect(result.created).toBe(false);
-    expect(result.agent).toMatchObject({ id: 11, status: "published" });
-    expect(apiRequestMock).toHaveBeenNthCalledWith(
-      3,
-      "http://api.local/api/agents/11/publish",
-      expect.objectContaining({ method: "POST" })
-    );
-  });
-
-  it("retries with a disambiguated name when the 400 collides with an unrelated agent", async () => {
-    apiRequestMock
-      .mockResolvedValueOnce(
-        jsonResponse({ detail: DUPLICATE_AGENT_NAME_DETAIL }, { status: 400 })
-      )
-      .mockResolvedValueOnce(
-        jsonResponse([{ id: 12, name: "Inbox Manager", template_id: null, status: "published" }])
-      )
-      .mockResolvedValueOnce(jsonResponse({ id: 13, name: "Inbox Manager (12345)" }))
-      .mockResolvedValueOnce(jsonResponse({ message: "ok" }));
-
-    const result = await resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", []);
-
-    expect(result.created).toBe(true);
-    expect(result.agent).toMatchObject({ id: 13, status: "published" });
-    expect(apiRequestMock).toHaveBeenNthCalledWith(
-      3,
-      "http://api.local/api/agents/from-template",
-      expect.objectContaining({
-        method: "POST",
-        body: expect.stringContaining('"template_id":"support-inbox-manager"'),
+  it("reports created=false when the server reused an existing agent", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        agent: { id: 11, name: "Inbox Manager", template_id: "support-inbox-manager", status: "published" },
+        created: false,
       })
     );
+
+    const result = await resolveAgentForTemplate("support-inbox-manager", []);
+
+    expect(result.created).toBe(false);
+    expect(result.agent).toMatchObject({ id: 11 });
   });
 
-  it("throws on a 400 whose detail does not match the duplicate-name contract", async () => {
+  it("throws on a non-ok resolve response", async () => {
     apiRequestMock.mockResolvedValueOnce(
-      jsonResponse({ detail: "Something else went wrong" }, { status: 400 })
+      jsonResponse({ detail: "boom" }, { status: 500 })
     );
 
-    await expect(resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", [])).rejects.toThrow();
-    expect(apiRequestMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("rolls back the draft agent when publish fails after a fresh create", async () => {
-    apiRequestMock
-      .mockResolvedValueOnce(jsonResponse({ id: 14, name: "Inbox Manager", template_id: "support-inbox-manager" }))
-      .mockResolvedValueOnce(jsonResponse({ detail: "publish failed" }, { status: 500 }))
-      .mockResolvedValueOnce(jsonResponse({ message: "deleted" }));
-
-    await expect(resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", [])).rejects.toThrow(
-      "Failed to publish agent"
-    );
-
-    expect(apiRequestMock).toHaveBeenNthCalledWith(
-      3,
-      "http://api.local/api/agents/14",
-      expect.objectContaining({ method: "DELETE" })
+    await expect(resolveAgentForTemplate("support-inbox-manager", [])).rejects.toThrow(
+      "Failed to resolve agent from template (500)"
     );
   });
 
-  it("does not delete an agent reused via the 400 lookup when its publish fails", async () => {
-    // Regression test for F1: an agent found via the template_id lookup was
-    // not created by this call - it may belong to a teammate (default
-    // visibility is "team") - so a failed publish must never delete it.
-    apiRequestMock
-      .mockResolvedValueOnce(
-        jsonResponse({ detail: DUPLICATE_AGENT_NAME_DETAIL }, { status: 400 })
-      )
-      .mockResolvedValueOnce(
-        jsonResponse([{ id: 15, name: "Inbox Manager", template_id: "support-inbox-manager", status: "draft" }])
-      )
-      .mockResolvedValueOnce(jsonResponse({ detail: "publish failed" }, { status: 500 }));
+  it("throws on a malformed resolve response body", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ created: true }));
 
-    await expect(resolveAgentForTemplate("support-inbox-manager", "Inbox Manager", [])).rejects.toThrow(
-      "Failed to publish agent"
+    await expect(resolveAgentForTemplate("support-inbox-manager", [])).rejects.toThrow(
+      "Malformed resolve response"
     );
-
-    expect(apiRequestMock).toHaveBeenCalledTimes(3);
-    expect(apiRequestMock).not.toHaveBeenNthCalledWith(
-      4,
-      "http://api.local/api/agents/15",
-      expect.objectContaining({ method: "DELETE" })
-    );
-    expect(apiRequestMock.mock.calls.some(([, opts]) => opts?.method === "DELETE")).toBe(false);
   });
 });

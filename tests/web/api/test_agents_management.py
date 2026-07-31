@@ -207,6 +207,269 @@ def test_create_from_template_persists_template_id(
     assert detail_response.json()["template_id"] == "linked-template-id"
 
 
+def test_create_from_template_duplicate_name_returns_400_with_stable_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The frontend's create-or-reuse flow
+    (template-agent-resolution.ts) branches its entire reuse-vs-duplicate
+    logic on this exact detail string from POST /api/agents/from-template
+    specifically - a different endpoint's exception handling from the plain
+    POST /api/agents duplicate-name test above. See PR review finding F2:
+    without this test, a refactor could change this endpoint's exception
+    mapping while every other test (DB-pool release, the clean-transaction
+    500 guard, template_id persistence) stayed green.
+    """
+
+    headers = _admin_headers()
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            return {
+                "id": template_id,
+                "name": "Duplicate Name Agent",
+                "descriptions": {"en": "Created from a template"},
+                "agent_config": {
+                    "instructions": "Follow the template.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state, "template_manager", TemplateManagerStub(), raising=False
+    )
+
+    first_response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "dup-name-template"},
+    )
+    assert first_response.status_code == 200, first_response.text
+
+    second_response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "dup-name-template-2"},
+    )
+    assert second_response.status_code == 400
+    assert second_response.json()["detail"] == "Agent with this name already exists"
+
+
+class _ResolveTemplateManagerStub:
+    """Minimal template manager for the resolve-flow tests."""
+
+    def __init__(self, name: str = "Resolve Flow Agent") -> None:
+        self.name = name
+
+    async def get_template(self, template_id: str) -> dict[str, Any]:
+        return {
+            "id": template_id,
+            "name": self.name,
+            "descriptions": {"en": "Created by the resolve flow"},
+            "agent_config": {
+                "instructions": "Follow the template.",
+                "execution_mode": "balanced",
+            },
+        }
+
+
+def _install_resolve_template_stub(
+    monkeypatch: pytest.MonkeyPatch, name: str = "Resolve Flow Agent"
+) -> None:
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        _ResolveTemplateManagerStub(name),
+        raising=False,
+    )
+
+
+def test_resolve_from_template_creates_and_publishes_on_first_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    response = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] is True
+    assert body["agent"]["template_id"] == "resolve-template"
+    assert body["agent"]["status"] == "published"
+    assert body["agent"]["name"] == "Resolve Flow Agent"
+
+
+def test_resolve_from_template_reuses_the_same_agent_on_repeat_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point of the resolve endpoint (PR review D1): repeat sends
+    must converge on one agent per (user, template), enforced server-side
+    rather than by client-side reconciliation."""
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert second.json()["agent"]["id"] == first.json()["agent"]["id"]
+
+    listed = client.get("/api/agents", headers=headers).json()
+    matching = [a for a in listed if a.get("template_id") == "resolve-template"]
+    assert len(matching) == 1
+
+
+def test_resolve_from_template_publishes_the_callers_own_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    created = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["status"] == "draft"
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is False
+    assert resolved.json()["agent"]["id"] == created.json()["id"]
+    assert resolved.json()["agent"]["status"] == "published"
+
+
+def test_resolve_from_template_never_touches_another_users_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding F1: resolving a template must
+    only ever consider the caller's own agents - another user's draft from
+    the same template stays untouched (not reused, not published)."""
+
+    _install_resolve_template_stub(monkeypatch)
+
+    # Bootstrap the admin (first user) before the public register endpoint
+    # will accept a second account.
+    headers = _admin_headers()
+
+    other_headers = _register_second_user(username="resolveother")
+    other_draft = client.post(
+        "/api/agents/from-template",
+        headers=other_headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert other_draft.status_code == 200, other_draft.text
+    other_agent_id = other_draft.json()["id"]
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is True
+    assert resolved.json()["agent"]["id"] != other_agent_id
+    assert resolved.json()["agent"]["status"] == "published"
+
+    other_view = client.get(f"/api/agents/{other_agent_id}", headers=other_headers)
+    assert other_view.status_code == 200, other_view.text
+    assert other_view.json()["status"] == "draft"
+
+
+def test_resolve_from_template_disambiguates_a_colliding_default_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated agent already holding the template's default name must
+    not fail the resolve - the server picks a free name itself instead of
+    surfacing the duplicate-name 400 the plain create path returns."""
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+    _create_agent(headers, name="Resolve Flow Agent")
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    body = resolved.json()
+    assert body["created"] is True
+    assert body["agent"]["name"] != "Resolve Flow Agent"
+    assert body["agent"]["name"].startswith("Resolve Flow Agent")
+    assert body["agent"]["status"] == "published"
+
+
+def test_resolve_from_template_converges_when_a_racing_insert_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding F3: if a concurrent request
+    creates this template's agent between our select and our insert, the
+    retry loop must re-select and reuse that row instead of erroring or
+    minting a duplicate."""
+
+    from xagent.web.services import agent_management as management_module
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    real_resolve_name = management_module.resolve_unique_agent_name
+    racing_agent_id: dict[str, int] = {}
+
+    def race_then_delegate(db: Any, *, user_id: int, name: str) -> str:
+        # Simulate a concurrent request winning the race: insert this
+        # template's agent (as the same user) after resolve's select missed
+        # but before its own insert, then hand back the template's default
+        # name so the insert collides on the unique index.
+        if not racing_agent_id:
+            store = AgentStore(db)
+            racing = store.create_agent(
+                user_id=user_id,
+                name=name,
+                description="raced in first",
+                instructions="Follow the template.",
+                execution_mode="balanced",
+                template_id="resolve-template",
+            )
+            db.commit()
+            racing_agent_id["id"] = int(racing.id)
+            return name
+        return real_resolve_name(db, user_id=user_id, name=name)
+
+    monkeypatch.setattr(
+        management_module, "resolve_unique_agent_name", race_then_delegate
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is False
+    assert resolved.json()["agent"]["id"] == racing_agent_id["id"]
+
+
 def test_manually_created_agent_has_no_template_id() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers, name="Hand-built agent")

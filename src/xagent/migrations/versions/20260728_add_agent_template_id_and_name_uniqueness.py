@@ -30,11 +30,14 @@ Revises: 20260724_add_upload_source_to_uploaded_files
 Create Date: 2026-07-28
 """
 
+import logging
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.engine.reflection import Inspector
+
+logger = logging.getLogger(__name__)
 
 revision: str = "20260728_add_agent_template_id_and_name_uniqueness"
 down_revision: Union[str, None] = "20260724_add_upload_source_to_uploaded_files"
@@ -46,6 +49,14 @@ TEMPLATE_ID_COLUMN = "template_id"
 TEMPLATE_ID_INDEX = "ix_agents_template_id"
 NAME_UNIQUE_INDEX = "uq_agents_user_id_name_active"
 WORKFORCE_MANAGER_ORIGIN = "workforce_generated_manager"
+# Agent.name is String(200) - renamed candidates must fit within that.
+MAX_NAME_LENGTH = 200
+# Matches Agent.__table_args__'s _NON_WORKFORCE_MANAGER_CLAUSE (agent.py):
+# built once at module scope rather than re-interpolated per call, so this
+# migrations directory doesn't pick up per-call f-string DDL predicates as a
+# pattern (WORKFORCE_MANAGER_ORIGIN is a fixed module constant, not user
+# input, so this was never an injection risk).
+NAME_UNIQUE_INDEX_WHERE_CLAUSE = sa.text(f"origin != '{WORKFORCE_MANAGER_ORIGIN}'")
 
 
 def _table_names() -> set[str]:
@@ -64,6 +75,21 @@ def _index_names(table_name: str) -> set[str]:
         for item in inspector.get_indexes(table_name)
         if (name := item.get("name")) is not None
     }
+
+
+def _fit_to_column(base: str, suffix: str) -> str:
+    """Truncate ``base`` so ``base + suffix`` fits ``Agent.name``'s
+    String(200) column. A long pre-existing name plus the rename suffix
+    could otherwise overflow and abort the migration on backends (e.g.
+    Postgres) that enforce column length at insert/update time - the exact
+    data this migration exists to survive.
+    """
+    available = MAX_NAME_LENGTH - len(suffix)
+    if available <= 0:
+        # Pathological (suffix alone doesn't fit) - truncate the suffix
+        # itself as a last resort rather than raise a negative-slice error.
+        return suffix[:MAX_NAME_LENGTH]
+    return base[:available] + suffix
 
 
 def _dedupe_agent_names() -> None:
@@ -94,6 +120,23 @@ def _dedupe_agent_names() -> None:
         .having(sa.func.count(agents.c.id) > 1)
     ).fetchall()
 
+    # Each affected user's existing names are fetched once and kept updated
+    # locally as renames are chosen, instead of issuing one SELECT per
+    # candidate-suffix attempt (this also catches a collision against another
+    # duplicate group for the same user, not just the current group).
+    taken_names_by_user: dict[int, set[str]] = {}
+
+    def _taken_names(user_id: int) -> set[str]:
+        if user_id not in taken_names_by_user:
+            rows = bind.execute(
+                sa.select(agents.c.name).where(
+                    agents.c.user_id == user_id,
+                    agents.c.origin != WORKFORCE_MANAGER_ORIGIN,
+                )
+            ).fetchall()
+            taken_names_by_user[user_id] = {row[0] for row in rows}
+        return taken_names_by_user[user_id]
+
     for user_id, name in duplicate_groups:
         rows = bind.execute(
             sa.select(agents.c.id)
@@ -105,26 +148,30 @@ def _dedupe_agent_names() -> None:
             .order_by(agents.c.id)
         ).fetchall()
 
+        taken = _taken_names(user_id)
+
         for (agent_id,) in rows[1:]:
-            candidate = f"{name} ({agent_id})"
+            candidate = _fit_to_column(name, f" ({agent_id})")
             suffix = 2
-            while (
-                bind.execute(
-                    sa.select(agents.c.id).where(
-                        agents.c.user_id == user_id,
-                        agents.c.name == candidate,
-                        agents.c.origin != WORKFORCE_MANAGER_ORIGIN,
-                        agents.c.id != agent_id,
-                    )
-                ).first()
-                is not None
-            ):
-                candidate = f"{name} ({agent_id}-{suffix})"
+            while candidate in taken:
+                candidate = _fit_to_column(name, f" ({agent_id}-{suffix})")
                 suffix += 1
 
+            # The rename is one-way (downgrade doesn't restore it - see the
+            # module docstring), so leave an audit trail of exactly which
+            # rows were mutated instead of renaming silently.
+            logger.warning(
+                "Deduplicating agent name before unique-index creation: "
+                "agent id=%s (user_id=%s) renamed %r -> %r",
+                agent_id,
+                user_id,
+                name,
+                candidate,
+            )
             bind.execute(
                 sa.update(agents).where(agents.c.id == agent_id).values(name=candidate)
             )
+            taken.add(candidate)
 
 
 def upgrade() -> None:
@@ -140,14 +187,13 @@ def upgrade() -> None:
 
     if NAME_UNIQUE_INDEX not in _index_names(TABLE):
         _dedupe_agent_names()
-        where_clause = sa.text(f"origin != '{WORKFORCE_MANAGER_ORIGIN}'")
         op.create_index(
             NAME_UNIQUE_INDEX,
             TABLE,
             ["user_id", "name"],
             unique=True,
-            sqlite_where=where_clause,
-            postgresql_where=where_clause,
+            sqlite_where=NAME_UNIQUE_INDEX_WHERE_CLAUSE,
+            postgresql_where=NAME_UNIQUE_INDEX_WHERE_CLAUSE,
         )
 
 

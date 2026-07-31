@@ -47,12 +47,18 @@ type TemplateQuickAccessSlotProps =
       selectedCategory?: string;
       onCategoryChange?: (category: string) => void;
       onTemplatePromptSelect?: (template: Template, prompt: SamplePrompt, index: number) => void;
+      templatesLoading?: boolean;
+      templatesError?: boolean;
+      onRetryTemplates?: () => void;
     }
   | {
       templates: Template[];
       selectedCategory?: string;
       onCategoryChange: (category: string) => void;
       onTemplatePromptSelect: (template: Template, prompt: SamplePrompt, index: number) => void;
+      templatesLoading?: boolean;
+      templatesError?: boolean;
+      onRetryTemplates?: () => void;
     };
 
 type ChatStartScreenProps = {
@@ -121,6 +127,9 @@ export function ChatStartScreen({
   onRemoveSelectedTemplate,
   selectedPromptKey,
   onTemplatePromptSelect,
+  templatesLoading = false,
+  templatesError = false,
+  onRetryTemplates,
 }: ChatStartScreenProps) {
   const { t } = useI18n();
   const enabledFiles = filesDisabled ? [] : files;
@@ -181,6 +190,9 @@ export function ChatStartScreen({
             onCategoryChange={onCategoryChange}
             selectedPromptKey={selectedPromptKey ?? null}
             onPromptSelect={onTemplatePromptSelect}
+            isLoading={templatesLoading}
+            loadError={templatesError}
+            onRetryLoad={onRetryTemplates}
           />
         ) : prompts && prompts.length > 0 && (
           <div className="space-y-3">

@@ -284,6 +284,31 @@ class TestDedupeRenamesLosingDuplicates:
         assert len(set(names.values())) == 3
         engine.dispose()
 
+    def test_rename_candidate_is_truncated_to_fit_the_name_column(
+        self, db_url: str, config_at_parent_revision: Config
+    ) -> None:
+        """Regression test for F5: a pre-existing name at or near
+        Agent.name's String(200) limit must not overflow once the rename
+        suffix is appended - that would raise StringDataRightTruncation on
+        backends (e.g. Postgres) that enforce column length, aborting the
+        exact migration written to survive messy data.
+        """
+        long_name = "x" * 200
+        with create_engine(db_url).begin() as conn:
+            _insert_user(conn, 1)
+            _insert_agent(conn, agent_id=40, user_id=1, name=long_name)
+            _insert_agent(conn, agent_id=41, user_id=1, name=long_name)
+
+        command.upgrade(config_at_parent_revision, TARGET_REVISION)
+
+        engine = create_engine(db_url)
+        names = _agent_names_by_id(engine)
+        assert names[40] == long_name
+        assert len(names[41]) <= 200
+        assert names[41] != long_name
+        assert names[41].endswith("(41)")
+        engine.dispose()
+
 
 class TestDowngrade:
     def test_downgrade_removes_column_and_indexes_but_keeps_renamed_names(

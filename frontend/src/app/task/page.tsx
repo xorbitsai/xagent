@@ -35,6 +35,8 @@ function TaskHomePageContent() {
     executionMode?: "flash" | "balanced" | "think";
   }>();
   const [templates, setTemplates] = useState<Template[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [templatesError, setTemplatesError] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string>(FEATURED_CATEGORY_ID);
   const [selectedTemplate, setSelectedTemplate] = useState<{ id: string; name: string } | null>(null);
   const [selectedPromptKey, setSelectedPromptKey] = useState<string | null>(null);
@@ -71,19 +73,28 @@ function TaskHomePageContent() {
   }, []);
 
   // Fetch templates on mount (and when locale changes) for the quick-access grid
-  useEffect(() => {
-    const fetchTemplates = async () => {
-      try {
-        const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
-        if (response.ok) {
-          const data = await response.json();
-          setTemplates(Array.isArray(data) ? data : []);
-        }
-      } catch (error) {
-        console.error("Failed to fetch templates:", error);
+  const fetchTemplates = async () => {
+    setTemplatesLoading(true);
+    setTemplatesError(false);
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
+      if (response.ok) {
+        const data = await response.json();
+        setTemplates(Array.isArray(data) ? data : []);
+      } else {
+        setTemplatesError(true);
       }
-    };
+    } catch (error) {
+      console.error("Failed to fetch templates:", error);
+      setTemplatesError(true);
+    } finally {
+      setTemplatesLoading(false);
+    }
+  };
+
+  useEffect(() => {
     fetchTemplates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locale]);
 
   useEffect(() => {
@@ -182,7 +193,7 @@ function TaskHomePageContent() {
     if (agentId === null && selectedTemplate) {
       let result: { agent: AgentCard; created: boolean };
       try {
-        result = await resolveAgentForTemplate(selectedTemplate.id, selectedTemplate.name, agents);
+        result = await resolveAgentForTemplate(selectedTemplate.id, agents);
       } catch (error) {
         console.error("Failed to create agent from template:", error);
         // Rethrow (translated) rather than swallowing: ChatInput's own
@@ -306,6 +317,9 @@ function TaskHomePageContent() {
             autoFocus={true}
             inputMinHeightClass="min-h-[200px]"
             templates={templates}
+            templatesLoading={templatesLoading}
+            templatesError={templatesError}
+            onRetryTemplates={fetchTemplates}
             selectedCategory={selectedCategory}
             onCategoryChange={setSelectedCategory}
             selectedTemplate={selectedTemplate}

@@ -217,11 +217,6 @@ const zh = {
       startingPrompts: "快捷指令",
       chatWithAgents: "与智能体聊天",
     },
-    agents: {
-      researcher: "研究助手",
-      poster: "海报设计师",
-      linkedin: "LinkedIn 发帖助手",
-    },
     templateQuickAccess: {
       featuredLabel: "推荐",
       categoryHeading: "{category} 智能体",
@@ -230,6 +225,9 @@ const zh = {
       agentCreatedToast: "已根据模板创建智能体 \"{name}\"",
       viewInAgents: "在智能体中查看",
       createAgentError: "无法根据该模板创建智能体，请重试。",
+      loading: "正在加载模板...",
+      loadError: "模板加载失败。",
+      retry: "重试",
     },
     input: {
       placeholder: "描述您的任务...",

@@ -21,7 +21,7 @@ from ...core.utils.api_key import (
     generate_api_key,
 )
 from ...templates.manager import TemplateManager
-from ..models.agent import AGENT_NAME_UNIQUE_INDEX, Agent
+from ..models.agent import AGENT_NAME_UNIQUE_INDEX, Agent, AgentStatus
 from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.model import Model as DBModel
@@ -45,6 +45,7 @@ from .db_runtime import (
 )
 from .workforce_access import can_edit_workforce, filter_visible_workforces
 from .workforce_lifecycle import is_workforce_manager_discard_safe
+from .workforce_names import resolve_unique_agent_name
 
 logger = logging.getLogger(__name__)
 _RuntimeKeyResultT = TypeVar("_RuntimeKeyResultT")
@@ -52,6 +53,11 @@ _RuntimeKeyResultT = TypeVar("_RuntimeKeyResultT")
 # Agent-builder tool category that gates knowledge-base access. A KB
 # selection is only valid when this category is also enabled.
 KNOWLEDGE_TOOL_CATEGORY = "knowledge"
+
+# Select-then-insert retries for resolve_agent_from_template: each retry
+# re-selects, so a concurrent insert of this same template's agent converges
+# to reuse and an unrelated name race picks a fresh candidate name.
+TEMPLATE_RESOLVE_RACE_RETRIES = 3
 
 
 class DuplicateAgentNameError(ValueError):
@@ -1162,11 +1168,9 @@ class AgentManagementRuntime:
             traceback=error.__traceback__,
         )
 
-    async def create_agent_from_template(
+    async def _spec_from_template(
         self,
         *,
-        user_id: int,
-        is_admin: bool,
         template_id: str,
         name: str | None,
         description: str | None,
@@ -1178,7 +1182,8 @@ class AgentManagementRuntime:
         tool_categories: list[str] | None,
         suggested_prompts: list[str] | None,
         generate_runtime_key: bool,
-    ) -> AgentCreateSnapshot:
+    ) -> AgentCreateSpec:
+        """Resolve a template (async I/O) into a detached create spec."""
         if self.template_manager is None:
             raise TemplateNotFoundError(template_id)
         template = await self.template_manager.get_template(template_id)
@@ -1194,7 +1199,7 @@ class AgentManagementRuntime:
             elif isinstance(descriptions, str):
                 final_description = descriptions
 
-        spec = AgentCreateSpec.from_values(
+        return AgentCreateSpec.from_values(
             name=name or template.get("name") or template_id,
             description=final_description,
             template_id=template_id,
@@ -1223,11 +1228,173 @@ class AgentManagementRuntime:
             ),
             generate_runtime_key=generate_runtime_key,
         )
+
+    async def create_agent_from_template(
+        self,
+        *,
+        user_id: int,
+        is_admin: bool,
+        template_id: str,
+        name: str | None,
+        description: str | None,
+        instructions: str | None,
+        execution_mode: str | None,
+        models: dict[str, Any] | None,
+        knowledge_bases: list[str] | None,
+        skills: list[str] | None,
+        tool_categories: list[str] | None,
+        suggested_prompts: list[str] | None,
+        generate_runtime_key: bool,
+    ) -> AgentCreateSnapshot:
+        spec = await self._spec_from_template(
+            template_id=template_id,
+            name=name,
+            description=description,
+            instructions=instructions,
+            execution_mode=execution_mode,
+            models=models,
+            knowledge_bases=knowledge_bases,
+            skills=skills,
+            tool_categories=tool_categories,
+            suggested_prompts=suggested_prompts,
+            generate_runtime_key=generate_runtime_key,
+        )
         return await self.create_agent(
             user_id=user_id,
             is_admin=is_admin,
             spec=spec,
         )
+
+    async def resolve_agent_from_template(
+        self,
+        *,
+        user_id: int,
+        is_admin: bool,
+        template_id: str,
+        name: str | None = None,
+    ) -> tuple[AgentResponseSnapshot, bool]:
+        """Atomic server-side get-or-create keyed on (user_id, template_id).
+
+        Backs flows with reuse semantics (the /task template quick-access):
+        return the caller's own existing agent for this template - publishing
+        it first if it is still a draft - or create and publish a fresh one.
+        Unlike the plain create path this never raises on a duplicate default
+        name; it disambiguates server-side instead.
+
+        Contrast with :meth:`create_agent_from_template`, which is a pure
+        create used by flows that deliberately mint multiple instances of one
+        template under user-chosen names (workforce workers); a DB-level
+        uniqueness constraint on (user_id, template_id) would break those, so
+        idempotency for the reuse flow lives here instead.
+
+        Returns the detached agent snapshot and whether it was newly created.
+        """
+        spec = await self._spec_from_template(
+            template_id=template_id,
+            name=name,
+            description=None,
+            instructions=None,
+            execution_mode=None,
+            models=None,
+            knowledge_bases=None,
+            skills=None,
+            tool_categories=None,
+            suggested_prompts=None,
+            # The quick-access flow talks to the agent through the normal
+            # chat session, never through a runtime API key.
+            generate_runtime_key=False,
+        )
+        await _validate_agent_knowledge_bases(
+            knowledge_bases=spec.knowledge_bases,
+            tool_categories=spec.tool_categories,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        return await run_db_io_cancellation_safe(
+            lambda: self._resolve_agent_from_template_sync(
+                user_id=user_id,
+                template_id=template_id,
+                spec=spec,
+            )
+        )
+
+    @staticmethod
+    def _resolve_agent_from_template_sync(
+        *,
+        user_id: int,
+        template_id: str,
+        spec: AgentCreateSpec,
+    ) -> tuple[AgentResponseSnapshot, bool]:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            service = AgentManagementService(db)
+            for _ in range(TEMPLATE_RESOLVE_RACE_RETRIES):
+                # Strictly the caller's own rows (user_id filter, not the
+                # team-wide owned_agent_clause): this path may publish what it
+                # finds, and publishing a teammate's in-progress draft on this
+                # user's behalf is exactly the bug this server-side resolve
+                # exists to prevent (PR review finding F1). Lowest id wins so
+                # concurrent duplicates resolve deterministically (F3).
+                existing = (
+                    db.query(Agent)
+                    .filter(
+                        Agent.user_id == user_id,
+                        Agent.template_id == template_id,
+                    )
+                    .order_by(Agent.id)
+                    .first()
+                )
+                if existing is not None:
+                    if existing.status != AgentStatus.PUBLISHED:
+                        existing = (
+                            service.store.publish_agent(user_id, int(existing.id))
+                            or existing
+                        )
+                    return (
+                        _agent_response_snapshot(
+                            service.store.agent_to_response_dict(existing)
+                        ),
+                        False,
+                    )
+
+                candidate_name = resolve_unique_agent_name(
+                    db, user_id=user_id, name=spec.name
+                )
+                try:
+                    agent, _ = service.create_agent_with_optional_key(
+                        user_id=user_id,
+                        name=candidate_name,
+                        description=spec.description,
+                        instructions=spec.instructions,
+                        execution_mode=spec.execution_mode,
+                        models=spec.model_mapping(),
+                        knowledge_bases=list(spec.knowledge_bases),
+                        skills=list(spec.skills),
+                        tool_categories=list(spec.tool_categories),
+                        suggested_prompts=list(spec.suggested_prompts),
+                        generate_runtime_key=False,
+                        template_id=template_id,
+                    )
+                except DuplicateAgentNameError:
+                    # A concurrent request inserted between our select and our
+                    # insert (the unique name we picked, or this same template's
+                    # agent). Re-select: if it was this template we reuse it,
+                    # otherwise resolve_unique_agent_name picks a fresh name.
+                    db.rollback()
+                    continue
+
+                # Publish in a second commit. If this fails the create still
+                # stands, and the next resolve call finds the draft and
+                # publishes it - the flow self-heals instead of needing the
+                # client-side delete-on-failure rollback it replaced.
+                agent = service.store.publish_agent(user_id, int(agent.id)) or agent
+                return (
+                    _agent_response_snapshot(
+                        service.store.agent_to_response_dict(agent)
+                    ),
+                    True,
+                )
+            raise DuplicateAgentNameError(spec.name)
 
     async def rotate_agent_runtime_key(
         self,

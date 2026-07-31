@@ -217,11 +217,6 @@ const en = {
       startingPrompts: "STARTING PROMPTS",
       chatWithAgents: "CHAT WITH AGENTS",
     },
-    agents: {
-      researcher: "Researcher Agent",
-      poster: "Poster Maker",
-      linkedin: "LinkedIn Post Creator",
-    },
     templateQuickAccess: {
       featuredLabel: "Featured",
       categoryHeading: "{category} AI Agents",
@@ -230,6 +225,9 @@ const en = {
       agentCreatedToast: "Agent \"{name}\" created from template",
       viewInAgents: "View in Agents",
       createAgentError: "Couldn't create the agent from this template. Please try again.",
+      loading: "Loading templates...",
+      loadError: "Couldn't load templates.",
+      retry: "Retry",
     },
     input: {
       placeholder: "Describe your task...",

@@ -512,6 +512,62 @@ class AgentFromTemplateRequest(BaseModel):
     name: Optional[str] = None
 
 
+class ResolvedTemplateAgentResponse(BaseModel):
+    """Result of the get-or-create resolve flow for a template's agent."""
+
+    agent: AgentResponse
+    # True when this call minted (and published) a fresh agent; False when an
+    # existing agent for this template was reused.
+    created: bool
+
+
+@router.post("/from-template/resolve", response_model=ResolvedTemplateAgentResponse)
+async def resolve_agent_from_template(
+    data: AgentFromTemplateRequest,
+    fastapi_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ResolvedTemplateAgentResponse:
+    """Get-or-create the caller's agent for a template, atomically.
+
+    Reuses the caller's own existing agent for this template (publishing it
+    if still a draft) or creates and publishes a new one, disambiguating the
+    name server-side on collision. Unlike POST /from-template this is
+    idempotent per (user, template) - repeat calls return the same agent.
+    """
+    user_id = int(current_user.id)
+    is_admin = bool(current_user.is_admin)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creation requires a clean request database transaction",
+        )
+
+    template_manager = getattr(fastapi_request.app.state, "template_manager", None)
+    try:
+        snapshot, created = await AgentManagementRuntime(
+            template_manager=template_manager
+        ).resolve_agent_from_template(
+            user_id=user_id,
+            is_admin=is_admin,
+            template_id=data.template_id,
+            name=data.name,
+        )
+        return ResolvedTemplateAgentResponse(
+            agent=AgentResponse.model_validate(snapshot.to_response_dict()),
+            created=created,
+        )
+    except TemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    except DuplicateAgentNameError:
+        raise HTTPException(
+            status_code=400, detail="Agent with this name already exists"
+        )
+    except Exception as e:
+        logger.error(f"Failed to resolve agent from template: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/from-template", response_model=AgentResponse)
 async def create_agent_from_template(
     data: AgentFromTemplateRequest,

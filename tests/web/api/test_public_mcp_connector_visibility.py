@@ -789,7 +789,6 @@ def test_builtin_registry_classifies_granola_as_mcp_oauth() -> None:
     assert classify_app_auth(row["transport"], row["launch_config"]) == "mcp_oauth"
 
 
-
 def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() -> None:
     from xagent.web.builtin_mcp_registry import (
         get_builtin_execution_fields,

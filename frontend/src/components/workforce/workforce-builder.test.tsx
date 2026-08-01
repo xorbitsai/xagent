@@ -619,6 +619,143 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     confirmSpy.mockRestore()
   })
 
+  it("does not confirm on the back link when the create-mode draft is still untouched", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm")
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    const backLink = screen.getByRole("link")
+    expect(fireEvent.click(backLink)).toBe(true)
+    expect(confirmSpy).not.toHaveBeenCalled()
+
+    confirmSpy.mockRestore()
+  })
+
+  it("confirms before following the back link away from an unsaved create-mode draft", async () => {
+    // Regression test: nothing in a create-mode draft (name, manager,
+    // workers) hits the API until Create is clicked, so navigating away
+    // before then used to silently discard it with no warning at all.
+    const confirmSpy = vi.spyOn(window, "confirm")
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    // Commit a draft name via Configure -> Edit -> Save. This is local
+    // create-mode draft state, not an in-progress details *edit* - wait for
+    // the save (async, even in create mode) to resolve so isEditingDetails
+    // is back to false and doesn't short-circuit the check this test wants
+    // to exercise.
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Draft name" } })
+    fireEvent.click(screen.getByText("common.save"))
+    await waitFor(() => {
+      expect(screen.queryByText("common.save")).not.toBeInTheDocument()
+    })
+    // The DOM update above reflects the config panel's own local
+    // editingDetails state; it reports up to the parent's isEditingDetails
+    // via a passive effect that can run a tick later. Flush it explicitly
+    // so this test isn't racing that propagation.
+    await act(async () => {})
+
+    const backLink = screen.getByRole("link")
+
+    confirmSpy.mockReturnValueOnce(false)
+    expect(fireEvent.click(backLink)).toBe(false)
+    expect(confirmSpy).toHaveBeenCalledWith("workforces.create.discardDraftConfirm")
+
+    confirmSpy.mockReturnValueOnce(true)
+    expect(fireEvent.click(backLink)).toBe(true)
+
+    confirmSpy.mockRestore()
+  })
+
+  it("registers a beforeunload guard once the create-mode draft has content", async () => {
+    const addEventListenerSpy = vi.spyOn(window, "addEventListener")
+    const removeEventListenerSpy = vi.spyOn(window, "removeEventListener")
+
+    const { unmount } = render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    expect(addEventListenerSpy).not.toHaveBeenCalledWith("beforeunload", expect.any(Function))
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Draft name" } })
+    fireEvent.click(screen.getByText("common.save"))
+
+    await waitFor(() => {
+      expect(addEventListenerSpy).toHaveBeenCalledWith("beforeunload", expect.any(Function))
+    })
+
+    unmount()
+    expect(removeEventListenerSpy).toHaveBeenCalledWith("beforeunload", expect.any(Function))
+
+    addEventListenerSpy.mockRestore()
+    removeEventListenerSpy.mockRestore()
+  })
+
+  it("registers a beforeunload guard for an in-progress details edit, even with no committed draft yet", async () => {
+    // Regression test: hasUnsavedDraft alone (committed draftName/manager/
+    // workers) used to gate the beforeunload listener, so typing a name and
+    // hitting refresh *before* clicking Save was silently unprotected, even
+    // though the in-app back-link guard already covers that exact case via
+    // confirmDiscardDetailsEdit.
+    const addEventListenerSpy = vi.spyOn(window, "addEventListener")
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    expect(addEventListenerSpy).not.toHaveBeenCalledWith("beforeunload", expect.any(Function))
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Draft name" } })
+    // Deliberately not clicking Save - the edit is still in progress.
+
+    await waitFor(() => {
+      expect(addEventListenerSpy).toHaveBeenCalledWith("beforeunload", expect.any(Function))
+    })
+
+    addEventListenerSpy.mockRestore()
+  })
+
+  it("shows only one confirm dialog when both an in-progress details edit and a committed draft exist", async () => {
+    // Regression test: chaining confirmDiscardDetailsEdit() and
+    // confirmDiscardDraft() with || used to be able to pop two sequential
+    // native confirm() dialogs for one click.
+    const confirmSpy = vi.spyOn(window, "confirm")
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    // Commit a draft name first (hasUnsavedDraft becomes true)...
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Draft name" } })
+    fireEvent.click(screen.getByText("common.save"))
+    await waitFor(() => {
+      expect(screen.queryByText("common.save")).not.toBeInTheDocument()
+    })
+    await act(async () => {})
+
+    // ...then start a second, never-saved edit (isEditingDetails becomes
+    // true again, on top of the already-committed draft).
+    fireEvent.click(screen.getByText("common.edit"))
+    fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Second edit" } })
+
+    const backLink = screen.getByRole("link")
+    confirmSpy.mockReturnValueOnce(true)
+    fireEvent.click(backLink)
+
+    expect(confirmSpy).toHaveBeenCalledOnce()
+    expect(confirmSpy).toHaveBeenCalledWith("workforces.detail.discardEditConfirm")
+
+    confirmSpy.mockRestore()
+  })
+
   it("confirms before creating the workforce while a details edit is in progress", async () => {
     const confirmSpy = vi.spyOn(window, "confirm")
     const created = { id: 55, name: "Draft name", status: "draft" }

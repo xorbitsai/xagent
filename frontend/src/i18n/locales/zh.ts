@@ -4059,6 +4059,7 @@ const zh = {
     },
     create: {
       unsavedBadge: "未保存",
+      discardDraftConfirm: "这个 Workforce 还没有创建，现在离开会丢弃当前草稿，确定继续吗？",
       backToWorkforces: "返回 Workforces",
       backToCreate: "返回创建",
       title: "创建 Workforce",

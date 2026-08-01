@@ -4059,6 +4059,7 @@ Build when you need.`,
     },
     create: {
       unsavedBadge: "Unsaved",
+      discardDraftConfirm: "This workforce hasn't been created yet — leaving now will discard your draft. Continue?",
       backToWorkforces: "Back to Workforces",
       backToCreate: "Back to Create",
       title: "Create a Workforce",

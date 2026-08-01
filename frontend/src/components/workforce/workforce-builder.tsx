@@ -115,7 +115,15 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     }
 
     const handleBackLinkClick = (e: React.MouseEvent) => {
-        if (!confirmDiscardDetailsEdit()) {
+        // At most one confirm() per click: an in-progress (uncommitted)
+        // Details edit already implies leaving discards the whole draft, so
+        // don't also ask about hasUnsavedDraft separately -- two native
+        // confirm() popups for one navigation attempt reads as a glitch.
+        if (isEditingDetails) {
+            if (!confirmDiscardDetailsEdit()) e.preventDefault()
+            return
+        }
+        if (!confirmDiscardDraft()) {
             e.preventDefault()
         }
     }
@@ -125,6 +133,36 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const [draftDescription, setDraftDescription] = useState("")
     const [draftManagerAgentId, setDraftManagerAgentId] = useState("")
     const [draftWorkers, setDraftWorkers] = useState<WorkforceWorkerDraft[]>([])
+
+    // True once the user has put anything into an as-yet-uncreated draft.
+    // Nothing here has hit the API, so an in-app nav-away, a browser
+    // back/refresh, or a tab close all silently discard it with no recovery
+    // path (PR review: create-mode draft loss on navigate-away).
+    const hasUnsavedDraft =
+        !isEditMode &&
+        (draftName.trim() !== "" ||
+            draftDescription.trim() !== "" ||
+            draftManagerAgentId !== "" ||
+            draftWorkers.length > 0)
+
+    const confirmDiscardDraft = () =>
+        !hasUnsavedDraft || window.confirm(t("workforces.create.discardDraftConfirm"))
+
+    // Catches browser back/forward, refresh, and tab close — none of which
+    // go through handleBackLinkClick's in-app Link guard. Also covers an
+    // in-progress (uncommitted) Details edit, not just already-committed
+    // draft state -- otherwise typing a name and hitting refresh before
+    // clicking Save would silently lose it with no warning at all, even
+    // though the in-app back-link guard already protects that exact case.
+    useEffect(() => {
+        if (!hasUnsavedDraft && !isEditingDetails) return
+        const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+            e.preventDefault()
+            e.returnValue = ""
+        }
+        window.addEventListener("beforeunload", handleBeforeUnload)
+        return () => window.removeEventListener("beforeunload", handleBeforeUnload)
+    }, [hasUnsavedDraft, isEditingDetails])
 
     const previewTaskIdRef = useRef<number | null>(null)
     // Bumped whenever handleCreate resets the preview state, so an in-flight

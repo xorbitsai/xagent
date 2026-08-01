@@ -35,7 +35,7 @@ be negligible for typical agent-table sizes; revisit if this ever runs
 against a very large, highly-contended ``agents`` table in production.
 
 Revision ID: 20260728_add_agent_template_id_and_name_uniqueness
-Revises: 20260730_seed_zoom_mcp_app
+Revises: 20260801_add_trigger_consecutive_prepare_failures
 Create Date: 2026-07-28
 """
 
@@ -48,7 +48,7 @@ from alembic import op
 logger = logging.getLogger(__name__)
 
 revision: str = "20260728_add_agent_template_id_and_name_uniqueness"
-down_revision: Union[str, None] = "20260730_seed_zoom_mcp_app"
+down_revision: Union[str, None] = "20260801_add_trigger_consecutive_prepare_failures"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

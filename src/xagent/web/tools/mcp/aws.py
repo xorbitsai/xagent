@@ -30,6 +30,12 @@ MAX_LOG_EVENTS = 100
 # CloudWatch's own server-side default (100,800) is far more than an LLM
 # needs handed back in one response; cap to roughly a day of 1-minute data.
 MAX_METRIC_DATAPOINTS = 1440
+# CloudWatch log messages routinely carry a full stack trace or a serialized
+# payload; MAX_LOG_EVENTS bounds event *count* but not size, so up to 100
+# uncapped messages could still produce a multi-megabyte tool result that
+# blows out the model's context. ~4000 chars is generous for a log line
+# while keeping a full batch's worst case bounded.
+MAX_LOG_MESSAGE_CHARS = 4000
 
 # boto3 defaults (60s connect/read timeout, up to 5 legacy retries) are too
 # generous for a synchronous tool call the LLM is waiting on.
@@ -48,12 +54,18 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _require_base_credentials() -> None:
+def _require_base_credentials(resolved_region: str) -> None:
     missing = [
         name
-        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         if not os.environ.get(name)
     ]
+    # AWS_REGION is only required when the caller didn't already supply an
+    # explicit region= argument - resolved_region already reflects that
+    # override (see _resolve_region), so checking the env var directly here
+    # would make an explicit region unable to satisfy the requirement.
+    if not resolved_region:
+        missing.append("AWS_REGION")
     if missing:
         raise ValueError(f"Missing environment variable(s): {', '.join(missing)}")
 
@@ -92,10 +104,27 @@ def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str | None
     )
     response = sts.assume_role(RoleArn=role_arn, RoleSessionName=_role_session_name())
     creds = response.get("Credentials") or {}
+    access_key_id = creds.get("AccessKeyId")
+    secret_access_key = creds.get("SecretAccessKey")
+    session_token = creds.get("SessionToken")
+    # A 200 response with Credentials present but AccessKeyId/SecretAccessKey
+    # both absent would otherwise spread as **{..., "aws_access_key_id": None,
+    # "aws_secret_access_key": None, ...} into session.client(), which
+    # botocore treats as "no explicit credentials supplied" and silently
+    # falls back to the connector's own base/ambient credentials -- a
+    # cross-account call would then run under the wrong identity with no
+    # error at all. AWS's documented AssumeRole contract says this can't
+    # happen on a 200, but failing loudly here costs nothing and closes the
+    # gap if it ever does (a partial response, e.g. only one field missing,
+    # already raises botocore's own PartialCredentialsError upstream).
+    if not access_key_id or not secret_access_key or not session_token:
+        raise ValueError(
+            f"AssumeRole for {role_arn!r} returned an incomplete credential set"
+        )
     return {
-        "aws_access_key_id": creds.get("AccessKeyId"),
-        "aws_secret_access_key": creds.get("SecretAccessKey"),
-        "aws_session_token": creds.get("SessionToken"),
+        "aws_access_key_id": access_key_id,
+        "aws_secret_access_key": secret_access_key,
+        "aws_session_token": session_token,
     }
 
 
@@ -115,8 +144,8 @@ def _client(
     share across concurrent client creation, so a fresh one per call is a
     low-cost precaution regardless of how this module happens to be invoked.
     """
-    _require_base_credentials()
     resolved_region = _resolve_region(region)
+    _require_base_credentials(resolved_region)
     session = boto3.Session()
     if role_arn:
         credentials = _assume_role_credentials(role_arn, resolved_region)
@@ -141,6 +170,17 @@ def _aws_error_message(exc: Exception) -> str:
     return str(exc)
 
 
+def _truncate_message(
+    message: str | None, max_chars: int = MAX_LOG_MESSAGE_CHARS
+) -> str | None:
+    # CloudWatch Logs documents `message` as always a string, but guard the
+    # type anyway rather than let a TypeError from `+` on a non-str value
+    # escape uncaught (the caller's except clause doesn't include TypeError).
+    if message is None or not isinstance(message, str) or len(message) <= max_chars:
+        return message
+    return message[:max_chars] + f"...[truncated, {len(message)} chars total]"
+
+
 @mcp.tool()
 def aws_get_caller_identity(
     region: str | None = None, role_arn: str | None = None
@@ -148,7 +188,10 @@ def aws_get_caller_identity(
     """
     Verify AWS connectivity and show which account/principal the connector is
     acting as. Use this first if any other AWS call fails with access errors.
-    Optional role_arn assumes that IAM role (cross-account) before the call.
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         result = _client("sts", region, role_arn).get_caller_identity()
@@ -175,6 +218,10 @@ def aws_cloudwatch_describe_alarms(
     aggregating other alarms) separately.
     state: optional filter, one of "ALARM", "OK", "INSUFFICIENT_DATA".
     alarm_name_prefix: optional name prefix filter.
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         kwargs: dict[str, Any] = {"MaxRecords": 100}
@@ -243,6 +290,10 @@ def aws_cloudwatch_get_metric_data(
     dimensions: e.g. [{"Name": "QueueName", "Value": "my-queue"}].
     Returns at most 1440 datapoints — narrow the time range or widen
     period_seconds rather than expecting more in one call.
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         metric: dict[str, Any] = {"Namespace": namespace, "MetricName": metric_name}
@@ -296,6 +347,10 @@ def aws_cloudwatch_describe_log_groups(
     """
     List CloudWatch Logs log groups (optionally filtered by name prefix), to
     discover where a service's logs live before searching them.
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         # 50, not 100 like the other list-style tools: DescribeLogGroups'
@@ -334,7 +389,12 @@ def aws_cloudwatch_filter_log_events(
     filter_pattern: CloudWatch filter syntax, e.g. "ERROR" or "{ $.level = \"error\" }".
     start_time_ms / end_time_ms: unix epoch milliseconds bounding the search window.
     Returns at most `limit` events (default 100) — narrow the window or pattern rather
-    than raising the limit.
+    than raising the limit. Each event's message is truncated past 4000 characters
+    (MAX_LOG_MESSAGE_CHARS).
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         kwargs: dict[str, Any] = {
@@ -354,7 +414,7 @@ def aws_cloudwatch_filter_log_events(
             {
                 "timestamp_ms": event.get("timestamp"),
                 "log_stream": event.get("logStreamName"),
-                "message": event.get("message"),
+                "message": _truncate_message(event.get("message")),
             }
             for event in (result.get("events") or [])
         ]
@@ -370,6 +430,10 @@ def aws_dynamodb_list_tables(
 ) -> str:
     """
     List DynamoDB table names in the region.
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         result = _client("dynamodb", region, role_arn).list_tables(Limit=100)
@@ -389,6 +453,10 @@ def aws_dynamodb_describe_table(
     """
     Get a DynamoDB table's status and health signals: state, item count, size,
     billing mode, and provisioned throughput (for throttling diagnostics).
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         result = _client("dynamodb", region, role_arn).describe_table(
@@ -427,6 +495,10 @@ def aws_sqs_list_queues(
 ) -> str:
     """
     List SQS queue URLs in the region (optionally filtered by name prefix).
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         kwargs: dict[str, Any] = {"MaxResults": 100}
@@ -450,6 +522,10 @@ def aws_sqs_get_queue_attributes(
     Get an SQS queue's attributes — most importantly backlog depth
     (ApproximateNumberOfMessages), in-flight count, oldest message age, and
     the redrive/DLQ policy — the key signals for "is this queue backed up".
+    region: optional AWS region override; defaults to the connector's
+    configured AWS_REGION.
+    role_arn: optional IAM role ARN to assume (cross-account access) before
+    the call.
     """
     try:
         result = _client("sqs", region, role_arn).get_queue_attributes(

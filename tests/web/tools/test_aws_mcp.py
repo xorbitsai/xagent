@@ -595,3 +595,186 @@ def test_filter_log_events_clamps_non_positive_limit(monkeypatch):
 
     assert result["status"] == "success"
     assert logs.filter_log_events.call_args.kwargs["limit"] == 1
+
+
+def test_filter_log_events_truncates_oversized_messages(monkeypatch):
+    """CloudWatch messages can carry a full stack trace or serialized
+    payload; MAX_LOG_EVENTS bounds count but not size, so an individual
+    message must still be capped to keep a full batch's worst case
+    bounded (PR review finding R3-m2)."""
+    long_message = "x" * (aws.MAX_LOG_MESSAGE_CHARS + 500)
+    logs = Mock()
+    logs.filter_log_events.return_value = {
+        "events": [{"timestamp": 1, "logStreamName": "s1", "message": long_message}]
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(
+        aws.aws_cloudwatch_filter_log_events(log_group_name="/app/prod")
+    )
+
+    message = result["events"][0]["message"]
+    assert len(message) < len(long_message)
+    assert message.startswith("x" * 100)
+    assert "truncated" in message
+
+
+def test_filter_log_events_leaves_short_messages_untouched(monkeypatch):
+    logs = Mock()
+    logs.filter_log_events.return_value = {
+        "events": [{"timestamp": 1, "logStreamName": "s1", "message": "short"}]
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(
+        aws.aws_cloudwatch_filter_log_events(log_group_name="/app/prod")
+    )
+
+    assert result["events"][0]["message"] == "short"
+
+
+def test_truncate_message_passes_through_non_str_without_raising():
+    """CloudWatch Logs documents `message` as always a string, but
+    _truncate_message must not raise TypeError on a non-str value - the
+    caller's except clause doesn't include TypeError, so an uncaught one
+    would crash the tool call instead of degrading gracefully."""
+    assert aws._truncate_message(None) is None
+    assert aws._truncate_message(12345) == 12345
+
+
+# --- server-side page-size caps (PR review finding R3-m6) -----------------
+
+
+def test_describe_log_groups_sends_the_50_item_hard_cap(monkeypatch):
+    logs = Mock()
+    logs.describe_log_groups.return_value = {"logGroups": []}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    aws.aws_cloudwatch_describe_log_groups()
+
+    assert logs.describe_log_groups.call_args.kwargs["limit"] == 50
+
+
+def test_describe_alarms_sends_the_100_record_cap(monkeypatch):
+    cloudwatch = Mock()
+    cloudwatch.describe_alarms.return_value = {"MetricAlarms": []}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=cloudwatch))
+
+    aws.aws_cloudwatch_describe_alarms()
+
+    assert cloudwatch.describe_alarms.call_args.kwargs["MaxRecords"] == 100
+
+
+def test_dynamodb_list_tables_sends_the_100_item_cap(monkeypatch):
+    dynamodb = Mock()
+    dynamodb.list_tables.return_value = {"TableNames": []}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=dynamodb))
+
+    aws.aws_dynamodb_list_tables()
+
+    assert dynamodb.list_tables.call_args.kwargs["Limit"] == 100
+
+
+def test_sqs_list_queues_sends_the_100_result_cap(monkeypatch):
+    sqs = Mock()
+    sqs.list_queues.return_value = {"QueueUrls": []}
+    monkeypatch.setattr(aws, "_client", Mock(return_value=sqs))
+
+    aws.aws_sqs_list_queues()
+
+    assert sqs.list_queues.call_args.kwargs["MaxResults"] == 100
+
+
+# --- explicit region= plumbing (PR review finding R3-m6) -------------------
+
+
+def test_client_passes_explicit_region_to_boto3(monkeypatch):
+    session_client = _patch_boto3_session(monkeypatch, lambda service, **kwargs: Mock())
+
+    aws._client("cloudwatch", region="eu-west-1")
+
+    assert session_client.call_args.kwargs["region_name"] == "eu-west-1"
+
+
+def test_tool_call_with_explicit_region_reaches_boto3(monkeypatch):
+    """Regression test for R3-m6: an explicit region= argument passed to a
+    real tool function (not just _client() directly) must reach the
+    eventual boto3 client call. The no-AWS_REGION-env case is covered
+    separately by
+    test_explicit_region_satisfies_the_region_requirement_without_env_var."""
+    dynamodb = Mock()
+    dynamodb.list_tables.return_value = {"TableNames": []}
+    session_client = _patch_boto3_session(
+        monkeypatch, lambda service, **kwargs: dynamodb
+    )
+
+    result = json.loads(aws.aws_dynamodb_list_tables(region="ap-southeast-2"))
+
+    assert result["status"] == "success"
+    assert session_client.call_args.kwargs["region_name"] == "ap-southeast-2"
+
+
+def test_explicit_region_satisfies_the_region_requirement_without_env_var(monkeypatch):
+    """Regression test for R3-m1: _require_base_credentials used to check
+    the AWS_REGION env var directly, so an explicit region= argument could
+    not satisfy it - _client would raise even though the caller supplied
+    everything it needed."""
+    monkeypatch.delenv("AWS_REGION")
+    _patch_boto3_session(monkeypatch, lambda service, **kwargs: Mock())
+
+    # Must not raise.
+    aws._client("sts", region="us-west-2")
+
+
+def test_missing_region_without_explicit_override_still_reported(monkeypatch):
+    monkeypatch.delenv("AWS_REGION")
+
+    result = json.loads(aws.aws_get_caller_identity())
+
+    assert result["status"] == "error"
+    assert "AWS_REGION" in result["message"]
+
+
+# --- malformed AssumeRole response (PR review finding R3-M1) ---------------
+
+
+def test_assume_role_credentials_rejects_null_credential_fields(monkeypatch):
+    """AWS's documented AssumeRole contract says a 200 always returns a
+    complete Credentials block, but if it ever didn't, spreading
+    {"aws_access_key_id": None, ...} into session.client() would make
+    botocore silently fall back to the connector's own base/ambient
+    credentials - a cross-account call would then run under the wrong
+    identity with no error at all. Must fail loudly instead."""
+    sts = Mock()
+    sts.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": None,
+            "SecretAccessKey": None,
+            "SessionToken": None,
+        }
+    }
+    _patch_boto3_session(monkeypatch, lambda service, **kwargs: sts)
+
+    with pytest.raises(ValueError, match="incomplete credential set"):
+        aws._assume_role_credentials("arn:aws:iam::2:role/read", "us-east-1")
+
+
+def test_client_with_role_arn_surfaces_null_credentials_as_a_clean_error(monkeypatch):
+    """End-to-end: a tool call must translate the malformed-response
+    ValueError into the standard error envelope, not an unhandled crash."""
+    sts = Mock()
+    sts.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": None,
+            "SecretAccessKey": "temp-secret",
+            "SessionToken": "temp-token",
+        }
+    }
+    _patch_boto3_session(monkeypatch, lambda service, **kwargs: sts)
+
+    result = json.loads(
+        aws.aws_get_caller_identity(role_arn="arn:aws:iam::2:role/read")
+    )
+
+    assert result["status"] == "error"
+    assert "incomplete credential set" in result["message"]

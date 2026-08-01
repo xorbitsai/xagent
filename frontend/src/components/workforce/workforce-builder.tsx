@@ -178,6 +178,15 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const previewRequestInFlightRef = useRef(false)
     const isArchived = workforce?.status === "archived"
 
+    // Set right before setLocalId on the create->save transition (handleCreate
+    // already has fresh data via setWorkforce(created)): without this, the
+    // [localId] mount effect below fires a non-silent load() on the very next
+    // render, and the isEditMode && loading guard further down does a
+    // top-level early return that unmounts the whole builder tree --
+    // including the test-chat panel, losing an unsent draft message and
+    // scroll position (PR review round 7, finding #1).
+    const suppressNextLoadEffectRef = useRef(false)
+
     const load = useCallback(async (options: LoadOptions = {}) => {
         if (!localId) return
         const { silent = false } = options
@@ -201,7 +210,9 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
 
     useEffect(() => {
         if (localId) {
-            void load()
+            const silent = suppressNextLoadEffectRef.current
+            suppressNextLoadEffectRef.current = false
+            void load({ silent })
         } else {
             listAgentOptions()
                 .then(setAgents)
@@ -492,9 +503,17 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const enabledDraftWorkers = draftWorkers.filter((worker) => worker.enabled)
     const canTestDraft = Boolean(draftManagerAgentId) && enabledDraftWorkers.length > 0
 
+    // `saving` state alone never disables the button in time for a fast
+    // double-click landing before the re-render commits (same hazard
+    // AgentPickerDialog's `selecting` comment documents), which would create
+    // a duplicate workforce row (PR review round 7, finding #7). Checked and
+    // set synchronously, unlike state.
+    const creatingRef = useRef(false)
+
     const handleCreate = async () => {
-        if (!canCreate || saving) return
+        if (!canCreate || saving || creatingRef.current) return
         if (!confirmDiscardDetailsEdit()) return
+        creatingRef.current = true
         try {
             beginMutation()
             const created = await createWorkforce({
@@ -510,6 +529,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             // ignore any config changes made after saving.
             invalidatePreviewRun()
             setWorkforce(created)
+            suppressNextLoadEffectRef.current = true
             setLocalId(String(created.id))
             router.replace(`/workforces/${created.id}`)
         } catch (err) {
@@ -518,6 +538,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             toast.error(nextError)
         } finally {
             setSaving(false)
+            creatingRef.current = false
         }
     }
 
@@ -579,6 +600,16 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                 setHasSentTestMessage(true)
             } else {
                 await sendMessage(content, { force: true, targetTaskId: taskId }, files)
+                if (previewGenerationRef.current !== generationAtStart) {
+                    // Mirrors the !taskId branch's check above: an
+                    // invalidatePreviewRun() (manager/worker/instructions
+                    // edit) fired while this send was in flight, so the
+                    // conversation this message just landed in is already
+                    // discarded. Don't mark the Get Started "test" step done
+                    // for a configuration that was invalidated out from
+                    // under it (PR review round 7, finding #2).
+                    return
+                }
                 setHasSentTestMessage(true)
             }
         } catch (err) {

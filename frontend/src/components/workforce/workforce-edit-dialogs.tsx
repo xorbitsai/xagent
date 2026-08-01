@@ -180,7 +180,13 @@ export function AgentPickerDialog({
     setPendingTemplate(null)
     setPendingName("")
     try {
-      await onSelectAgent(newAgent!.id, newAgent!.description || pendingTemplate.name)
+      // Passes the freshly created agent's own name (never its description
+      // -- see handleAddMember above) explicitly rather than relying on
+      // handleAddMember's `agents.find(...)` fallback: `agents` is the
+      // parent's already-fetched list, which this brand-new agent isn't in
+      // yet, so that lookup would miss and fall all the way through to the
+      // bare numeric agent id.
+      await onSelectAgent(newAgent!.id, newAgent!.name)
     } catch {
       // Same fire-and-forget rationale as handleSelect: the caller already
       // toasted its own error, nothing here to propagate to.
@@ -242,7 +248,7 @@ export function AgentPickerDialog({
                   <button
                     key={agent.id}
                     type="button"
-                    onClick={() => handleSelect(agent.id, agent.description || undefined)}
+                    onClick={() => handleSelect(agent.id)}
                     disabled={saving || selecting}
                     className="w-full flex items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-muted/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
                   >
@@ -396,25 +402,46 @@ export function useWorkforceEditDialogs({
 
   const handleSaveMember = async () => {
     if (!selectedWorker) return
-    await onSaveWorker(selectedWorker, {
-      alias: memberAlias,
-      assignment_instructions: memberInstructions,
-      enabled: selectedWorker.enabled,
-      sort_order: String(selectedWorker.sort_order ?? 1),
-    })
+    try {
+      await onSaveWorker(selectedWorker, {
+        alias: memberAlias,
+        assignment_instructions: memberInstructions,
+        enabled: selectedWorker.enabled,
+        sort_order: String(selectedWorker.sort_order ?? 1),
+      })
+    } catch {
+      // Same fire-and-forget rationale as handleSelect above: onSaveWorker
+      // (workforce-builder.tsx) already toasts the error and re-throws only
+      // so its own try/finally resets saving state; this onClick handler has
+      // no caller to propagate to, so swallow it here instead of leaving an
+      // unhandled promise rejection (PR review round 7, finding #8).
+      return
+    }
     closeMemberDetail()
   }
 
   const handleRemoveMember = async (worker?: WorkforceWorker) => {
     const target = worker ?? selectedWorker
     if (!target) return
-    await onRemoveWorker(target)
+    try {
+      await onRemoveWorker(target)
+    } catch {
+      // Same rationale as handleSaveMember above.
+      return
+    }
     closeMemberDetail()
   }
 
   const handleAddMember = async (agentId: number, description?: string) => {
     const agent = agents.find((a) => a.id === agentId)
-    const instructions = description || agent?.description || agent?.name || String(agentId)
+    // Never falls back to the agent's own description (PR review round 7,
+    // finding #4): that's a public-facing blurb the user never wrote as an
+    // instruction and never reviews before it becomes this member's live
+    // system prompt -- one click on the picker used to copy it verbatim.
+    // Callers no longer pass the agent's description through `description`
+    // (kept in the shared onSelectAgent signature for API-contract
+    // stability with handleChangeLead's implementation of the same prop).
+    const instructions = description || agent?.name || String(agentId)
     await onAddWorker(agentId, instructions)
     setAddMemberOpen(false)
   }

@@ -4190,6 +4190,10 @@ const zh = {
       archivedDisabled: "已归档的 Workforce 不能运行。",
       createToTest: "先选择 Manager 并添加至少一个 Worker 才能测试。"
     },
+    deploy: {
+      inactiveDisabled: "请先发布这个 Workforce 再部署。",
+      archivedDisabled: "已归档的 Workforce 不能部署。"
+    },
     runs: {
       title: "运行记录",
       loading: "正在加载运行记录...",

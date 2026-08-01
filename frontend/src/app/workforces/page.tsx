@@ -12,7 +12,7 @@ import { useRouter } from "next/navigation"
 import { listWorkforces } from "@/lib/workforces-api"
 import { formatTime } from "@/lib/time-utils"
 import type { WorkforceListItem } from "@/types/workforce"
-import { getRunDisabledReason } from "./workforce-ui-state"
+import { getDeployDisabledReason, getRunDisabledReason } from "./workforce-ui-state"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { toast } from "sonner"
 import { WorkforceCreateView } from "@/components/workforce/workforce-create-view"
@@ -163,6 +163,7 @@ export default function WorkforcesPage() {
               <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
                 {items.map((item) => {
                   const runDisabledReason = getRunDisabledReason(item.status, t)
+                  const deployDisabledReason = getDeployDisabledReason(item.status, t)
                   return (
                     <Card key={item.id} className="overflow-hidden flex flex-col h-full hover:shadow-md transition-shadow">
                       <CardContent className="flex flex-col h-full">
@@ -231,7 +232,8 @@ export default function WorkforcesPage() {
                               size="sm"
                               variant="outline"
                               className="h-8 w-8 rounded-md p-0"
-                              title={t("workforces.actions.deploy")}
+                              title={deployDisabledReason || t("workforces.actions.deploy")}
+                              disabled={Boolean(deployDisabledReason)}
                               onClick={() => {
                                 setDeployItem(item)
                                 setDeployView("options")

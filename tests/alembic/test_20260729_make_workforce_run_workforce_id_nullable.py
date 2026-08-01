@@ -254,6 +254,42 @@ def test_downgrade_restores_not_null_when_tasks_table_is_missing() -> None:
         assert [row[0] for row in remaining_runs] == [1]
 
 
+def test_downgrade_skips_the_alter_when_column_nullability_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #1060 round 7 review, finding #6: _column_nullable returns None
+    when the column can't be found in the reflected table (e.g. pre-existing
+    schema drift). upgrade()'s guard (`is False`) already treats None as
+    "don't touch it"; downgrade()'s guard used to read `is not False`, which
+    treats the same None as "go ahead and alter" -- surfacing a confusing
+    SQLAlchemy/Alembic error instead of a clean skip.
+
+    Patched directly rather than dropping the workforce_id column for real:
+    the earlier `DELETE FROM workforce_runs WHERE workforce_id IS NULL` in
+    downgrade() would itself crash with "no such column" first if the column
+    were genuinely absent, for a reason unrelated to this specific guard.
+    """
+    migration = _load_migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    with engine.begin() as connection:
+        _create_legacy_schema(connection)
+        operations = _operations(connection)
+        with Operations.context(operations.get_context()):
+            migration.upgrade()
+
+        monkeypatch.setattr(migration, "_column_nullable", lambda *a, **k: None)
+
+        with Operations.context(operations.get_context()):
+            migration.downgrade()
+
+        # Still nullable (from the earlier upgrade): downgrade's alter-to-
+        # NOT-NULL step was correctly skipped, not attempted against an
+        # unknown nullability state.
+        columns = _columns(connection)
+        assert columns[COLUMN]["nullable"] is True
+
+
 def test_upgrade_and_downgrade_skip_when_table_missing() -> None:
     migration = _load_migration_module()
     engine = sa.create_engine("sqlite:///:memory:")

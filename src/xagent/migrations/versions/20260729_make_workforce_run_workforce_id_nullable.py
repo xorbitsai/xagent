@@ -7,7 +7,7 @@ preview persists a hidden Task), but there is no Workforce row to point
 ``workforce_id`` at, so the column must accept NULL.
 
 Revision ID: 20260729_make_workforce_run_workforce_id_nullable
-Revises: 20260730_seed_zoom_mcp_app
+Revises: 20260728_add_agent_template_id_and_name_uniqueness
 Create Date: 2026-07-29
 
 """
@@ -19,7 +19,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260729_make_workforce_run_workforce_id_nullable"
-down_revision: Union[str, None] = "20260730_seed_zoom_mcp_app"
+down_revision: Union[str, None] = "20260728_add_agent_template_id_and_name_uniqueness"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -73,7 +73,7 @@ def downgrade() -> None:
     # not a functional issue.
     bind.execute(sa.text(f"DELETE FROM {TABLE} WHERE {COLUMN} IS NULL"))
 
-    if _column_nullable(inspector, TABLE, COLUMN) is not False:
+    if _column_nullable(inspector, TABLE, COLUMN) is True:
         with op.batch_alter_table(
             TABLE, reflect_kwargs=BATCH_REFLECT_KWARGS
         ) as batch_op:

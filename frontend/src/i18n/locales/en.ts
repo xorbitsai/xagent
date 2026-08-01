@@ -4190,6 +4190,10 @@ Build when you need.`,
       archivedDisabled: "Archived workforces cannot run.",
       createToTest: "Choose a manager and add at least one worker to test it."
     },
+    deploy: {
+      inactiveDisabled: "Publish this workforce before deploying it.",
+      archivedDisabled: "Archived workforces cannot be deployed."
+    },
     runs: {
       title: "Runs",
       loading: "Loading runs...",

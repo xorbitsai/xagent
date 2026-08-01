@@ -13,6 +13,7 @@ const routerReplaceMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const searchParamsMock = vi.hoisted(() => new URLSearchParams())
 const translateMock = vi.hoisted(() => (key: string) => key)
+const sendMessageMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({}),
@@ -32,7 +33,7 @@ vi.mock("@/contexts/i18n-context", () => ({
 
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
-    sendMessage: vi.fn(),
+    sendMessage: sendMessageMock,
     setTaskId: vi.fn(),
     closeFilePreview: vi.fn(),
     dispatch: vi.fn(),
@@ -96,6 +97,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     runWorkforcePreviewMock.mockReset()
     getWorkforceMock.mockReset()
     runWorkforceMock.mockReset()
+    sendMessageMock.mockReset().mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -155,7 +157,9 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
         name: undefined,
         description: undefined,
         manager_agent_id: 7,
-        workers: [{ agent_id: 8, alias: undefined, assignment_instructions: "Gathers the web" }],
+        // PR review round 7, finding #4: the picker no longer defaults a new
+        // member's instructions to the agent's own description.
+        workers: [{ agent_id: 8, alias: undefined, assignment_instructions: "Web Researcher" }],
         message: "test message",
         files: [],
       })
@@ -197,7 +201,9 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
         name: "Launch Team",
         description: undefined,
         manager_agent_id: 7,
-        workers: [expect.objectContaining({ agent_id: 8, assignment_instructions: "Gathers the web" })],
+        // PR review round 7, finding #4: no longer defaults to the agent's
+        // own description.
+        workers: [expect.objectContaining({ agent_id: 8, assignment_instructions: "Web Researcher" })],
       })
     })
     expect(routerReplaceMock).toHaveBeenCalledWith("/workforces/55")
@@ -299,6 +305,207 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
       )
     })
     expect(runWorkforcePreviewMock).toHaveBeenCalledOnce()
+  })
+
+  it("does not unmount the test panel on the create->save transition (PR review round 7, finding #1)", async () => {
+    // Regression test: setLocalId(created.id) used to flip isEditMode true
+    // and let the [localId] effect fire a non-silent load(), which set
+    // loading=true and hit the top-level `isEditMode && loading` early
+    // return -- unmounting the whole builder tree (including the test-chat
+    // panel) until the redundant getWorkforce call resolved. getWorkforce is
+    // held pending here so the window where loading=true would show is
+    // directly observable instead of racing real timers/microtasks.
+    const created = { id: 55, name: "Launch Team", status: "draft" }
+    createWorkforceMock.mockResolvedValueOnce(created)
+    let resolveGetWorkforce: (value: unknown) => void = () => {}
+    getWorkforceMock.mockImplementation(
+      () => new Promise((resolve) => { resolveGetWorkforce = resolve }),
+    )
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    const nameInput = screen.getAllByRole("textbox")[0]
+    fireEvent.change(nameInput, { target: { value: "Launch Team" } })
+    fireEvent.click(screen.getByText("common.save"))
+
+    const panelBeforeCreate = await screen.findByTestId("task-conversation-panel")
+
+    const createButton = screen.getByText("workforces.actions.createTeam")
+    await waitFor(() => expect(createButton).not.toBeDisabled())
+
+    await act(async () => {
+      fireEvent.click(createButton)
+      // Flush handleCreate's continuation (setWorkforce/setLocalId) and the
+      // [localId] effect's synchronous portion -- if load() isn't silent,
+      // setLoading(true) commits here, before getWorkforce's promise (held
+      // pending above) ever resolves.
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(getWorkforceMock).toHaveBeenCalledWith("55")
+    expect(screen.queryByText("workforces.loading.detail")).not.toBeInTheDocument()
+    expect(screen.getByTestId("task-conversation-panel")).toBe(panelBeforeCreate)
+
+    await act(async () => {
+      resolveGetWorkforce({
+        id: 55,
+        name: "Launch Team",
+        description: null,
+        status: "draft",
+        manager: {
+          id: 7,
+          name: "Project Coordinator",
+          description: "Coordinates the workforce",
+          logo_url: null,
+          status: "published",
+        },
+        workers: [
+          {
+            id: 1,
+            agent: {
+              id: 8,
+              name: "Web Researcher",
+              description: "Gathers the web",
+              logo_url: null,
+              status: "published",
+            },
+            alias: null,
+            assignment_instructions: "Gathers the web",
+            source_type: "existing",
+            template_id: null,
+            enabled: true,
+            sort_order: 1,
+            canvas_position: null,
+            created_at: null,
+            updated_at: null,
+          },
+        ],
+        canvas_layout: null,
+        scope_type: "user",
+        scope_id: "1",
+        owner_user_id: 1,
+        created_at: null,
+        updated_at: null,
+      })
+    })
+
+    expect(screen.getByTestId("task-conversation-panel")).toBe(panelBeforeCreate)
+  })
+
+  it("does not mark the test step done for a config invalidated while a continuation send is in flight (PR review round 7, finding #2)", async () => {
+    // Regression test: the !taskId branch re-checks previewGenerationRef
+    // after its await before touching state, but the else branch (continuing
+    // an already-pinned preview run via sendMessage) had no equivalent
+    // check, so an invalidatePreviewRun() firing mid-flight (e.g. editing
+    // the draft while a test message is in the air) still marked the Get
+    // Started "test" step done for the now-discarded configuration.
+    runWorkforcePreviewMock.mockResolvedValueOnce({
+      workforce_run_id: 1,
+      task_id: 42,
+      status: "running",
+      redirect_url: "/task/42",
+    })
+    let resolveSend: () => void = () => {}
+    sendMessageMock.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { resolveSend = resolve }),
+    )
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    // First send pins the preview run (task 42) and marks "test" done.
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => expect(runWorkforcePreviewMock).toHaveBeenCalledOnce())
+
+    // Expand the Get Started checklist so the "test" step's done state is
+    // visible via GetStartedChecklist's step rows, not just the badge count.
+    fireEvent.click(screen.getByText("workforces.getStarted.title"))
+    expect(screen.getByText("workforces.getStarted.steps.test")).toHaveClass("text-foreground")
+
+    // Second send reuses task 42 via the else/continuation branch. Its
+    // sendMessage call won't resolve until we say so below.
+    fireEvent.click(screen.getByText("Send Test"))
+
+    // Edit the still-unsaved draft while that send is in flight --
+    // invalidatePreviewRun() resets hasSentTestMessage synchronously.
+    fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+    fireEvent.click(await screen.findByText("Silent Analyst"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+    expect(screen.getByText("workforces.getStarted.steps.test")).toHaveClass("text-muted-foreground")
+
+    // Now let the stale send resolve. Without the fix, its unconditional
+    // setHasSentTestMessage(true) would re-mark "test" done for the config
+    // that was just invalidated.
+    await act(async () => {
+      resolveSend()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByText("workforces.getStarted.steps.test")).toHaveClass("text-muted-foreground")
+  })
+
+  it("does not permanently block Create after a failed attempt (creatingRef resets so a retry can proceed)", async () => {
+    // Regression coverage for the creatingRef guard added alongside the
+    // `saving` state check (PR review round 7, finding #7 -- see
+    // handleCreate): it must reset in the finally block on every path, not
+    // just success, or one failed Create would silently and permanently
+    // disable every future click without the `saving`/`!canCreate` UI ever
+    // reflecting why.
+    createWorkforceMock.mockRejectedValueOnce(new Error("boom"))
+    createWorkforceMock.mockResolvedValueOnce({ id: 55, name: "Launch Team", status: "draft" })
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("workforces.detail.configure"))
+    fireEvent.click(screen.getByText("common.edit"))
+    const nameInput = screen.getAllByRole("textbox")[0]
+    fireEvent.change(nameInput, { target: { value: "Launch Team" } })
+    fireEvent.click(screen.getByText("common.save"))
+
+    const createButton = screen.getByText("workforces.actions.createTeam")
+    await waitFor(() => expect(createButton).not.toBeDisabled())
+
+    fireEvent.click(createButton)
+    await waitFor(() => expect(createWorkforceMock).toHaveBeenCalledOnce())
+    await waitFor(() => expect(createButton).not.toBeDisabled())
+
+    fireEvent.click(createButton)
+    await waitFor(() => expect(createWorkforceMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(routerReplaceMock).toHaveBeenCalledWith("/workforces/55"))
   })
 
   it("starts a fresh preview run instead of continuing a stale one when the unsaved draft is edited", async () => {

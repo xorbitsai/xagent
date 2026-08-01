@@ -571,6 +571,36 @@ describe("workforce route entry points", () => {
     expect(screen.getByRole("button", { name: /workforces.actions.run/ })).toBeDisabled()
   })
 
+  it("gates the list Deploy button behind the same status check as Run (PR review round 7, finding #3)", async () => {
+    // Regression test: the Deploy hub button used to render unconditionally,
+    // regardless of workforce status -- a regression from the old detail
+    // page, which only ever rendered its equivalent Deploy button when
+    // status === "active". Restoring the gate means a user can no longer
+    // mint live REST API keys or configure webhook triggers against a draft
+    // or archived workforce with no warning.
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [
+        {
+          ...listResponse.items[0],
+          id: 43,
+          name: "Draft Workforce",
+          status: "draft",
+          last_run: null,
+        },
+      ],
+    })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Draft Workforce")).toBeInTheDocument()
+    // Deploy-specific wording, not Run's -- a disabled Deploy button reusing
+    // Run's tooltip text verbatim ("...before running it") would be
+    // confusing on a button that mints API keys / configures webhooks.
+    const deployButton = screen.getByTitle("workforces.deploy.inactiveDisabled")
+    expect(deployButton).toBeDisabled()
+  })
+
   it("runs an active workforce and opens the created task", async () => {
     getWorkforceMock.mockResolvedValueOnce(workforceDetail)
     runWorkforceMock.mockResolvedValueOnce({

@@ -1758,6 +1758,44 @@ async def test_mcp_oauth_app_not_connected_until_grant_completes(
 
 
 @pytest.mark.asyncio
+async def test_mcp_oauth_local_listing_also_requires_a_grant(db_session):
+    """F1: the location=local/all branch computed connection state via its
+    own name-based membership check and never consulted the active-grant
+    gate at all — a custom (non-catalog) mcp_oauth server the user abandoned
+    mid-consent rendered as connected there regardless of M1's fix to the
+    default/remote branch."""
+    db, user, _ = db_session
+    # _add_mcp_oauth_server creates a server named "records" with no matching
+    # catalog PublicMCPApp, so it falls into the local/all branch rather than
+    # being excluded as a known catalog app.
+    server = _add_mcp_oauth_server(db, user)
+
+    local_apps_before_grant = list_mcp_apps(location="local", current_user=user, db=db)
+    records_before = next(a for a in local_apps_before_grant if a["id"] == "records")
+    assert records_before["is_connected"] is False
+
+    client = _add_oauth_client(db, server)
+    db.add(
+        MCPOAuthGrant(
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=f"xagent:user:{user.id}",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="",
+            access_token=encrypt_value("records-access-token"),
+            status="active",
+        )
+    )
+    db.commit()
+
+    local_apps_after_grant = list_mcp_apps(location="local", current_user=user, db=db)
+    records_after = next(a for a in local_apps_after_grant if a["id"] == "records")
+    assert records_after["is_connected"] is True
+
+
+@pytest.mark.asyncio
 async def test_delete_mcp_server_revokes_only_the_disconnecting_users_grant(
     db_session, monkeypatch
 ):

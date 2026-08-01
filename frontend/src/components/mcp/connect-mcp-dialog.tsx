@@ -127,10 +127,18 @@ export function ConnectMcpDialog({
   const [customApiEditBaseline, setCustomApiEditBaseline] = useState<CustomApiDetail | null>(null)
   const [mcpEditBaseline, setMcpEditBaseline] = useState<McpServerDetail | null>(null)
   const connectorEditRequestRef = React.useRef(0)
-  // Popup-closed poll intervals for in-flight mcp_oauth connects, so they can
-  // be cleared on unmount instead of leaking (N3: the poll otherwise has no
-  // unmount cleanup, unlike custom-mcp-form's equivalent).
+  // Popup-closed poll intervals for in-flight mcp_oauth/builtin_oauth
+  // connects, so they can be cleared on unmount or dialog-close instead of
+  // leaking (N3: the poll otherwise has no unmount cleanup, unlike
+  // custom-mcp-form's equivalent).
   const mcpOauthPollTimersRef = React.useRef<Set<number>>(new Set())
+  // F5: this component instance is commonly kept mounted by the parent
+  // across dialog open/close (only the Radix Dialog's own content
+  // unmounts), so the unmount-only cleanup above never fires on an ordinary
+  // close. Checked after every await in handleConnectMcpOAuthApp so an
+  // in-flight connect POST that resolves after the dialog (or the whole
+  // component) is gone doesn't register a poll nothing will ever clear.
+  const isMountedRef = React.useRef(true)
 
   // Custom MCP Server state
   const [isSavingCustom, setIsSavingCustom] = useState(false)
@@ -242,11 +250,25 @@ export function ConnectMcpDialog({
       setShareChoice("private")
     } else {
       connectorEditRequestRef.current += 1
+      // F6: closing the dialog (not just unmounting it) must also stop any
+      // in-flight OAuth popup poll — otherwise it can later fire
+      // onSuccess/auto-select against a closed dialog, and leaves a stale
+      // spinner on the card if the dialog is reopened.
+      mcpOauthPollTimersRef.current.forEach((timer) => window.clearInterval(timer))
+      mcpOauthPollTimersRef.current.clear()
+      setLoadingApp(null)
     }
   }, [open, t, selectedMcpServers])
 
   useEffect(() => () => {
     connectorEditRequestRef.current += 1
+  }, [])
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+    }
   }, [])
 
   useEffect(() => () => {
@@ -586,6 +608,13 @@ export function ConnectMcpDialog({
       setLoadingApp(null)
       return
     }
+    // F5: if the dialog closed (or this component unmounted) while the
+    // connect POST was in flight, don't register a poll after the cleanup
+    // effects have already run — it would never get cleared. The popup
+    // itself is left navigating to the authorization URL either way; the
+    // user can still complete auth in it, and the next apps refresh (e.g.
+    // reopening the dialog) will reflect it.
+    if (!isMountedRef.current) return
 
     // The popup's opener link is severed (popup.opener = null), so unlike the
     // builtin flow there is no postMessage channel — and a closed popup can
@@ -679,6 +708,8 @@ export function ConnectMcpDialog({
       if (event.data?.type === 'oauth-success') {
         setLoadingApp(null)
         window.removeEventListener('message', handleMessage)
+        window.clearInterval(checkPopup)
+        mcpOauthPollTimersRef.current.delete(checkPopup)
 
         loadApps();
         if (onSuccess) onSuccess();
@@ -694,14 +725,21 @@ export function ConnectMcpDialog({
 
     window.addEventListener('message', handleMessage);
 
-    // Fallback: check if popup was closed without success message
-    const checkPopup = setInterval(() => {
-      if (popup?.closed) {
-        clearInterval(checkPopup);
-        window.removeEventListener('message', handleMessage);
-        setLoadingApp(null);
-      }
+    // Fallback: check if popup was closed without success message, or give up
+    // after a timeout (N3: this poll previously had neither an unmount-safe
+    // cleanup nor a timeout cap, unlike the mcp_oauth handler above and
+    // custom-mcp-form.tsx's equivalent flow).
+    const startedAt = Date.now()
+    const maxWaitMs = 5 * 60 * 1000
+    const checkPopup: number = window.setInterval(() => {
+      const expired = Date.now() - startedAt >= maxWaitMs
+      if (!popup?.closed && !expired) return
+      window.clearInterval(checkPopup);
+      mcpOauthPollTimersRef.current.delete(checkPopup)
+      window.removeEventListener('message', handleMessage);
+      setLoadingApp(null);
     }, 500);
+    mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
   const handleCardClick = (app: AppIntegration, isGloballyConnected: boolean) => {

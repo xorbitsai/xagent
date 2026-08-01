@@ -118,6 +118,9 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       <button type="button" onClick={() => onConnectStart(mcpOauthApp())}>
         connect-granola
       </button>
+      <button type="button" onClick={() => onConnectStart(builtinOauthApp())}>
+        connect-builtin
+      </button>
       <button type="button" onClick={() => onOpenChange(false)}>
         close-settings
       </button>
@@ -177,6 +180,20 @@ function mcpOauthApp() {
     is_connected: false,
     transport: "streamable_http",
     auth_type: "mcp_oauth",
+  }
+}
+
+// A static-provider builtin OAuth catalog app, e.g. Zoom/Gmail.
+function builtinOauthApp() {
+  return {
+    id: "zoom",
+    name: "Zoom",
+    description: "",
+    icon: "",
+    is_connected: false,
+    transport: "oauth",
+    auth_type: "builtin_oauth",
+    provider: "zoom",
   }
 }
 
@@ -583,6 +600,102 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       // The timeout path stops polling without ever issuing the
       // is-it-really-connected check the popup-closed path makes.
       expect(apiRequestMock.mock.calls.length).toBe(callsBeforeTimeout)
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("also times out the sibling builtin_oauth poll after 5 minutes (N3)", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn() }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      fireEvent.click(screen.getByRole("button", { name: "connect-builtin" }))
+
+      // Popup never closes; the builtin_oauth poll previously had no timeout
+      // cap at all (N3), unlike the mcp_oauth handler above.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 1000)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("clears the in-flight OAuth poll and loading state when the dialog closes, not just unmounts (F6)", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      const { rerender } = render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      const callsBeforeClose = apiRequestMock.mock.calls.length
+
+      // The parent typically keeps ConnectMcpDialog mounted and just flips
+      // `open` — only the dialog's own content unmounts, not this component,
+      // so the unmount-only cleanup effect alone would miss this (F6).
+      rerender(
+        <ConnectMcpDialog
+          open={false}
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+      // The poll was already cleared on close, so popup.closed flipping true
+      // afterward must not trigger the is-it-connected follow-up check.
+      expect(apiRequestMock.mock.calls.length).toBe(callsBeforeClose)
     } finally {
       openSpy.mockRestore()
       vi.useRealTimers()

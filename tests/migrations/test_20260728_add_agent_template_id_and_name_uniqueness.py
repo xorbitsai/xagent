@@ -28,7 +28,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
-PARENT_REVISION = "20260724_add_upload_source_to_uploaded_files"
+PARENT_REVISION = "20260730_seed_zoom_mcp_app"
 TARGET_REVISION = "20260728_add_agent_template_id_and_name_uniqueness"
 
 _CREATE_USERS_TABLE = """

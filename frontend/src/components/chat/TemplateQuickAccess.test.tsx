@@ -120,4 +120,68 @@ describe("TemplateQuickAccess", () => {
       screen.getByText("chatPage.templateQuickAccess.loading")
     ).toBeInTheDocument();
   });
+
+  it.each(["General", "Operations", "Marketing", "Sales", "Support"])(
+    "resolves a real label key for the shipped %s category, not the raw-id fallback",
+    (category) => {
+      // Regression test for PR review finding m7: CATEGORY_LABEL_KEYS used to
+      // be missing entries for two of the five shipped categories (General,
+      // Operations), so selecting them fell through to categoryLabel's raw
+      // categoryId fallback instead of a translated label. The mocked t()
+      // above echoes the key it's given, so a resolved key renders as
+      // "templates.categoryTitles.<x>" while a missed one renders as the
+      // untranslated category string itself.
+      render(
+        <TemplateQuickAccess
+          templates={[makeTemplate({ category, featured: false })]}
+          selectedCategory={category}
+          onCategoryChange={vi.fn()}
+          selectedPromptKey={null}
+          onPromptSelect={vi.fn()}
+        />
+      );
+
+      expect(screen.queryByText(category)).not.toBeInTheDocument();
+    }
+  );
+
+  it('links "All templates" back to the active category, not always the unscoped default', () => {
+    // Regression test for PR review finding FE-11/m11: this escape hatch
+    // used to be a bare /templates link with no category, so following it
+    // from e.g. the Support tab always landed back on "All" instead of
+    // Support.
+    render(
+      <TemplateQuickAccess
+        templates={[makeTemplate({ category: "Support", featured: false })]}
+        selectedCategory="Support"
+        onCategoryChange={vi.fn()}
+        selectedPromptKey={null}
+        onPromptSelect={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.templateQuickAccess.allTemplates")
+    ).toHaveAttribute("href", "/templates?category=Support");
+  });
+
+  it('links "All templates" to the unscoped /templates from the Featured tab', () => {
+    // /templates has no selectable "Featured" tab of its own - selecting
+    // "All" there is what surfaces its Featured section - so the Featured
+    // tab must not carry a category=Featured param /templates wouldn't
+    // recognize.
+    render(
+      <TemplateQuickAccess
+        templates={[makeTemplate({ category: "Support", featured: true })]}
+        selectedCategory={FEATURED_CATEGORY_ID}
+        onCategoryChange={vi.fn()}
+        selectedPromptKey={null}
+        onPromptSelect={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.templateQuickAccess.allTemplates")
+    ).toHaveAttribute("href", "/templates");
+  });
 });

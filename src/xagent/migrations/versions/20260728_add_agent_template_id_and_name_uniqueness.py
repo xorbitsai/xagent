@@ -44,7 +44,6 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.engine.reflection import Inspector
 
 logger = logging.getLogger(__name__)
 
@@ -73,16 +72,16 @@ TEMPLATE_QUICK_ACCESS_WHERE_CLAUSE = sa.text(f"origin = '{QUICK_ACCESS_ORIGIN}'"
 
 
 def _table_names() -> set[str]:
-    return set(Inspector.from_engine(op.get_bind()).get_table_names())
+    return set(sa.inspect(op.get_bind()).get_table_names())
 
 
 def _column_names(table_name: str) -> set[str]:
-    inspector = Inspector.from_engine(op.get_bind())
+    inspector = sa.inspect(op.get_bind())
     return {column["name"] for column in inspector.get_columns(table_name)}
 
 
 def _index_names(table_name: str) -> set[str]:
-    inspector = Inspector.from_engine(op.get_bind())
+    inspector = sa.inspect(op.get_bind())
     return {
         name
         for item in inspector.get_indexes(table_name)

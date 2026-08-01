@@ -1557,6 +1557,7 @@ const zh = {
     categoryTitles: {
       all: "全部",
       featured: "推荐模板",
+      general: "通用",
       sales: "销售",
       marketing: "营销",
       support: "支持",

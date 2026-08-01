@@ -541,6 +541,10 @@ async def resolve_agent_from_template(
     named instances of one template), repeat calls here return the same
     agent, backed by a DB-level unique index scoped to this flow's own
     origin marker.
+
+    ``name`` only seeds a freshly created agent; on reuse it is ignored and
+    the existing agent's own name is returned as-is (see
+    ``AgentManagementService.resolve_agent_from_template``).
     """
     user_id = int(current_user.id)
     is_admin = bool(current_user.is_admin)
@@ -581,8 +585,10 @@ async def resolve_agent_from_template(
             detail="Too many concurrent requests for this template; please retry",
         )
     except Exception as e:
-        logger.error(f"Failed to resolve agent from template: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Failed to resolve agent from template {data.template_id}")
+        raise HTTPException(
+            status_code=500, detail="Failed to resolve agent from template"
+        ) from e
 
 
 @router.post("/from-template", response_model=AgentResponse)
@@ -852,16 +858,29 @@ async def update_agent(
             updates["logo_url"] = logo_url
 
         if updates:
-            agent = (
-                store.update_agent_fields(
-                    user_id,
-                    agent_id,
-                    updates,
-                    team_scope=team_scope,
-                    agent=agent,
+            # agent_name_exists above is a fast-path pre-check, not the source
+            # of truth: uq_agents_user_id_name_active is what actually
+            # prevents a concurrent-rename race, so the write itself can
+            # still raise IntegrityError here (see the matching handling in
+            # create_agent above).
+            try:
+                agent = (
+                    store.update_agent_fields(
+                        user_id,
+                        agent_id,
+                        updates,
+                        team_scope=team_scope,
+                        agent=agent,
+                    )
+                    or agent
                 )
-                or agent
-            )
+            except IntegrityError as exc:
+                db.rollback()
+                if not is_agent_name_unique_violation(exc):
+                    raise
+                raise HTTPException(
+                    status_code=400, detail="Agent with this name already exists"
+                ) from exc
 
         logger.info(f"Updated agent {agent_id} for user {current_user.id}")
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))

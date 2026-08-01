@@ -1557,6 +1557,7 @@ Build when you need.`,
     categoryTitles: {
       featured: "Featured Templates",
       all: "All",
+      general: "General",
       sales: "Sales",
       marketing: "Marketing",
       support: "Support",

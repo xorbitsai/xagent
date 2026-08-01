@@ -45,7 +45,9 @@ const TEMPLATE_ICON_BY_ID: Record<string, IconComponent> = {
 // for the /templates library page's section heading, not this compact pill.
 const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   featured: "chatPage.templateQuickAccess.featuredLabel",
+  general: "templates.categoryTitles.general",
   marketing: "templates.categoryTitles.marketing",
+  operations: "templates.categoryTitles.operations",
   sales: "templates.categoryTitles.sales",
   support: "templates.categoryTitles.support",
 };
@@ -119,6 +121,16 @@ export function TemplateQuickAccess({
     const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(categoryId)];
     return key ? t(key) : categoryId;
   };
+
+  // /templates has no selectable "Featured" tab of its own - selecting "All"
+  // there is what surfaces its Featured section - so map this panel's
+  // Featured tab to that instead of a category id /templates wouldn't
+  // recognize (PR review finding FE-11/m11: the escape hatch used to always
+  // link to the unscoped default regardless of which tab was active here).
+  const allTemplatesHref =
+    activeCategory === FEATURED_CATEGORY_ID
+      ? "/templates"
+      : `/templates?category=${encodeURIComponent(activeCategory)}`;
 
   // While the initial fetch is in flight or has failed, `templates` is still
   // `[]` and categoryTabs would be empty too - without this, the grid area
@@ -199,7 +211,7 @@ export function TemplateQuickAccess({
               })}
             </h3>
             <Link
-              href="/templates"
+              href={allTemplatesHref}
               className={cn("text-[13px] font-medium hover:underline", ACCENT_TEXT_CLASS)}
             >
               {t("chatPage.templateQuickAccess.allTemplates")}

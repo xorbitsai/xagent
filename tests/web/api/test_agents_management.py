@@ -211,14 +211,17 @@ def test_create_from_template_persists_template_id(
 def test_create_from_template_duplicate_name_returns_400_with_stable_detail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The frontend's create-or-reuse flow
-    (template-agent-resolution.ts) branches its entire reuse-vs-duplicate
-    logic on this exact detail string from POST /api/agents/from-template
-    specifically - a different endpoint's exception handling from the plain
-    POST /api/agents duplicate-name test above. See PR review finding F2:
-    without this test, a refactor could change this endpoint's exception
-    mapping while every other test (DB-pool release, the clean-transaction
-    500 guard, template_id persistence) stayed green.
+    """Pins the exact 400 detail string POST /api/agents/from-template
+    returns on a name collision - a different endpoint's exception handling
+    from the plain POST /api/agents duplicate-name test above. See PR review
+    finding F2: without this test, a refactor could change this endpoint's
+    exception mapping while every other test (DB-pool release, the
+    clean-transaction 500 guard, template_id persistence) stayed green.
+
+    Note: template-agent-resolution.ts (the frontend's create-or-reuse
+    flow) does not itself branch on this string - it only checks
+    response.ok and surfaces the HTTP status. This test's value is the
+    stable API contract, not a cross-stack string dependency.
     """
 
     headers = _admin_headers()
@@ -612,6 +615,44 @@ def test_resolve_from_template_reports_409_when_retries_are_exhausted_by_race(
     assert "name" not in resolved.json()["detail"].lower()
 
 
+def test_resolve_from_template_reports_409_when_a_race_hit_precedes_final_name_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding m6: retry exhaustion must
+    report the quick-access race (409) whenever *any* attempt hit it, even
+    if the *last* attempt's collision happened to be a plain name collision
+    instead. Before this fix, only the last error's type was tracked, so
+    this exact interleaving (race, then name-collision, then name-collision)
+    surfaced a misleading 400 "Agent with this name already exists" - which
+    is wrong, since the caller never even chose a colliding name."""
+    from xagent.web.services import agent_management as management_module
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    attempts = {"n": 0}
+
+    def race_then_name_collisions(*args: Any, **kwargs: Any) -> Any:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise TemplateQuickAccessRaceError("resolve-template")
+        raise management_module.DuplicateAgentNameError("Resolve Flow Agent")
+
+    monkeypatch.setattr(
+        management_module.AgentManagementService,
+        "create_agent_with_optional_key",
+        race_then_name_collisions,
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 409, resolved.text
+    assert "name" not in resolved.json()["detail"].lower()
+
+
 def test_manually_created_agent_has_no_template_id() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers, name="Hand-built agent")
@@ -622,7 +663,9 @@ def test_manually_created_agent_has_no_template_id() -> None:
 
 
 def test_duplicate_agent_name_returns_400_with_stable_detail() -> None:
-    """The frontend keys retry logic off this exact detail string."""
+    """Pins the exact 400 detail string POST /api/agents returns on a name
+    collision, so a refactor of this endpoint's exception mapping doesn't
+    silently change the API contract."""
 
     headers = _admin_headers()
     _create_agent(headers, name="Duplicate Name Agent")
@@ -678,6 +721,32 @@ def test_db_constraint_catches_name_race_the_app_precheck_missed(
     )
     assert second.status_code == 400, second.text
     assert second.json()["detail"] == "Agent with this name already exists"
+
+
+def test_update_agent_translates_a_raced_rename_collision_to_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding R1-1: update_agent's
+    agent_name_exists precheck is a fast path, not the source of truth,
+    exactly like create_agent's - so a rename that races past it must still
+    surface the DB's uq_agents_user_id_name_active violation as a clean 400,
+    not an uncaught IntegrityError leaking as a 500 (update_agent had no
+    equivalent to create_agent's `except IntegrityError` handler)."""
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _create_agent(headers, name="Rename Race Target")
+    renamed_id = _create_agent(headers, name="Rename Race Source")
+
+    monkeypatch.setattr(AgentStore, "agent_name_exists", lambda self, *a, **k: False)
+
+    response = client.put(
+        f"/api/agents/{renamed_id}",
+        headers=headers,
+        json={"name": "Rename Race Target"},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "Agent with this name already exists"
 
 
 def _create_agent_row(

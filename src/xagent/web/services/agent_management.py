@@ -1340,6 +1340,14 @@ class AgentManagementRuntime:
         the constraint backing this method's idempotency is scoped to the
         quick-access origin specifically.
 
+        ``name`` is create-only: it seeds the name for a freshly minted
+        agent (disambiguated server-side on collision) but is not consulted
+        on the reuse path. A caller passing a different ``name`` on a repeat
+        call for a template it already has a quick-access agent for gets
+        that existing agent back under its original name, silently -- the
+        response's ``agent.name`` is the source of truth for what a caller
+        should reconcile against.
+
         Returns the detached agent snapshot and whether it was newly created.
         """
         spec = await self._spec_from_template(
@@ -1381,6 +1389,12 @@ class AgentManagementRuntime:
         SessionLocal = get_session_local()
         with SessionLocal() as db:
             service = AgentManagementService(db)
+            # Sticky: once a TemplateQuickAccessRaceError is seen, it is never
+            # overwritten by a later DuplicateAgentNameError - retry
+            # exhaustion must surface 409 even when a later attempt's
+            # collision happened to be a plain name collision instead,
+            # otherwise the two are indistinguishable to the caller (PR
+            # review finding m6).
             last_error: (
                 DuplicateAgentNameError | TemplateQuickAccessRaceError | None
             ) = None
@@ -1452,7 +1466,8 @@ class AgentManagementRuntime:
                     # review findings B1/B2). Either way, re-select: if it was
                     # this template's quick-access agent we reuse it, else
                     # resolve_unique_agent_name picks a fresh name next pass.
-                    last_error = exc
+                    if not isinstance(last_error, TemplateQuickAccessRaceError):
+                        last_error = exc
                     db.rollback()
                     continue
 

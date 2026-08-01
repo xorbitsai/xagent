@@ -1817,6 +1817,25 @@ def _connected_non_oauth_server_for_app(
     return cast(int, server.id)
 
 
+def _mcp_oauth_server_is_actually_connected(
+    server: MCPServer, active_grant_server_ids: set[int]
+) -> bool:
+    """An mcp_oauth-shaped server's UserMCPServer association can exist before
+    the user ever completes consent (see connect_mcp_oauth_app), so its mere
+    presence isn't proof of a working connection. Require an active
+    MCPOAuthGrant too, mirroring the check applied in list_mcp_apps' default
+    branch — shared so every code path that reports connection state for an
+    mcp_oauth server (including the location=local/all branch, which used to
+    bypass this check entirely) agrees (F1)."""
+    auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
+    if (
+        str(server.transport or "").lower() not in HTTP_MCP_TRANSPORTS
+        or auth.get("type") != "mcp_oauth"
+    ):
+        return True
+    return cast(int, server.id) in active_grant_server_ids
+
+
 @mcp_router.get("/apps", response_model=List[dict])
 def list_mcp_apps(
     search: Optional[str] = None,
@@ -1911,15 +1930,17 @@ def list_mcp_apps(
                 server_id = _connected_non_oauth_server_for_app(
                     app, non_oauth_server_lookup
                 )
-                if (
-                    app.get("auth_type") == "mcp_oauth"
-                    and server_id is not None
-                    and server_id not in active_grant_server_ids
-                ):
-                    server_id = None
                 connected_account = None
                 # Resolve the shared row once and reuse it for all key-source flags.
                 shared_server = _shared_server_for_app(app, server_by_key)
+                if (
+                    server_id is not None
+                    and shared_server is not None
+                    and not _mcp_oauth_server_is_actually_connected(
+                        shared_server, active_grant_server_ids
+                    )
+                ):
+                    server_id = None
                 app_shared_env = _app_shared_env_available(
                     app, shared_server, shared_env_by_id
                 )
@@ -1996,7 +2017,13 @@ def list_mcp_apps(
                     "icon": "",
                     "users": "1",
                     "transport": server.transport,
-                    "is_connected": True,
+                    # F1: this loop's own membership check above (name-based)
+                    # doesn't gate on a real grant, so a custom mcp_oauth
+                    # server the user abandoned mid-consent must not be
+                    # reported connected just because the row exists.
+                    "is_connected": _mcp_oauth_server_is_actually_connected(
+                        server, active_grant_server_ids
+                    ),
                     "provider": "custom",
                     "category": "Local",
                     "is_local": True,
@@ -2401,8 +2428,14 @@ def _ensure_catalog_mcp_oauth_server(
         if server._decrypt_auth_config(server.auth) != auth:
             encrypted_auth = dict(auth)
             for key in SENSITIVE_AUTH_FIELDS:
-                if key in encrypted_auth and encrypted_auth[key]:
-                    encrypted_auth[key] = encrypt_value(encrypted_auth[key])
+                value = encrypted_auth.get(key)
+                # A mis-authored non-string sensitive field (e.g. a nested
+                # object where a string is expected) must not crash this
+                # user-facing connect request — encrypt_value() calls
+                # .encode() unconditionally. Leave it as-is; that's an admin
+                # authoring bug to catch at write time, not here (F13).
+                if value and isinstance(value, str):
+                    encrypted_auth[key] = encrypt_value(value)
             cast(Any, server).auth = encrypted_auth
             db.commit()
     if not server:
@@ -2951,7 +2984,7 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
 
 
 @mcp_router.delete("/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_mcp_server(
+async def delete_mcp_server(
     server_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -3062,15 +3095,15 @@ def delete_mcp_server(
                             UserOAuth.provider == provider,
                         ).delete(synchronize_session=False)
 
-        # Revoke this user's MCP OAuth grants for the server. On a shared
-        # (multi-user) row the server outlives this disconnect, so without
-        # this the grant's refresh token would stay usable until the LAST
-        # user disconnects and the cascade finally removes it. Local
-        # revocation is sufficient for the runtime (it only resolves
-        # status == "active" grants); best-effort revocation at the external
-        # provider stays with the per-grant DELETE endpoint, which this sync
-        # handler cannot await.
-        revoked_at = _utc_now()
+        # Revoke and purge this user's MCP OAuth grants for the server. On a
+        # shared (multi-user) row the server outlives this disconnect, so
+        # without this the grant's refresh token would stay usable — and its
+        # row would stay stored — until the LAST user disconnects and the
+        # cascade finally removes it. Best-effort external revocation first
+        # (now awaitable, unlike the previous local-only status flip), then a
+        # hard delete rather than a "revoked" status flip: a revoked grant
+        # row is otherwise never swept, accumulating indefinitely as an
+        # inert but secret-bearing row (F10).
         for grant in (
             db.query(MCPOAuthGrant)
             .filter(
@@ -3080,8 +3113,20 @@ def delete_mcp_server(
             )
             .all()
         ):
-            setattr(grant, "status", "revoked")
-            setattr(grant, "revoked_at", revoked_at)
+            if isinstance(grant.oauth_client, MCPOAuthClient):
+                await _revoke_mcp_oauth_grant_externally(
+                    client=grant.oauth_client, grant=grant
+                )
+            db.delete(grant)
+
+        # This user's own flow-state rows (code_verifier etc.) are per-user,
+        # unlike MCPOAuthClient which a shared server's other users may still
+        # reference — safe to purge outright rather than only on server
+        # deletion's cascade.
+        db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.mcp_server_id == server_id,
+            MCPOAuthFlowState.user_id == user_id,
+        ).delete(synchronize_session=False)
 
         # Remove user-server association
         db.delete(user_mcp)

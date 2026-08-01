@@ -132,7 +132,7 @@ def test_reconnect_updates_own_key(test_db):
     assert decrypt_env_dict(assocs[0].env) == {"GOOGLE_MAPS_API_KEY": "new"}
 
 
-def test_disconnect_keeps_shared_server_for_other_users(test_db):
+async def test_disconnect_keeps_shared_server_for_other_users(test_db):
     """A connect user (non-owner) can disconnect their own association; the
     shared server row survives while another user is still connected, and is
     removed only when the last user leaves."""
@@ -159,7 +159,7 @@ def test_disconnect_keeps_shared_server_for_other_users(test_db):
     )
 
     # Alice (non-owner) disconnects — allowed via can_delete, row must survive.
-    delete_mcp_server(server_id, current_user=_user(test_db, 1), db=test_db)
+    await delete_mcp_server(server_id, current_user=_user(test_db, 1), db=test_db)
     assert (
         test_db.query(MCPServer).filter(MCPServer.id == server_id).first() is not None
     )
@@ -171,7 +171,7 @@ def test_disconnect_keeps_shared_server_for_other_users(test_db):
     )
 
     # Last user leaves — shared row is cleaned up.
-    delete_mcp_server(server_id, current_user=_user(test_db, 2), db=test_db)
+    await delete_mcp_server(server_id, current_user=_user(test_db, 2), db=test_db)
     assert test_db.query(MCPServer).filter(MCPServer.id == server_id).first() is None
 
 
@@ -529,7 +529,7 @@ def test_connect_rejects_unconnectable_app(test_db):
     assert exc.value.status_code == 400
 
 
-def test_last_disconnect_keeps_row_with_platform_key(test_db):
+async def test_last_disconnect_keeps_row_with_platform_key(test_db):
     """When a shared catalog row carries the admin's platform fallback key, the
     last user's disconnect must NOT hard-delete the row — that would silently
     wipe the platform key with no signal to the admin. (A row with no platform
@@ -555,7 +555,7 @@ def test_last_disconnect_keeps_row_with_platform_key(test_db):
     server_id = server.id
 
     # The last (only) connected user disconnects.
-    delete_mcp_server(server_id, current_user=_user(test_db, 1), db=test_db)
+    await delete_mcp_server(server_id, current_user=_user(test_db, 1), db=test_db)
 
     kept = test_db.query(MCPServer).filter(MCPServer.id == server_id).first()
     assert kept is not None  # row survives

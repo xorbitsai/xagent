@@ -78,7 +78,6 @@ def restrict_to_app_scoped_oauth_grant(
     ]
 
 
-# Transports for a genuine remote MCP server the platform talks to directly
 def classify_app_auth(transport: Any, launch_config: Any) -> str:
     """Single source of truth for how a catalog app is connected.
 

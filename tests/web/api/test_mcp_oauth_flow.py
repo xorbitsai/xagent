@@ -1460,6 +1460,57 @@ async def test_connect_app_syncs_auth_when_catalog_auth_changes(
 
 
 @pytest.mark.asyncio
+async def test_connect_app_auth_sync_tolerates_a_malformed_sensitive_field(
+    db_session, monkeypatch
+):
+    """F13: encrypt_value() calls .encode() unconditionally, so a mis-authored
+    non-string sensitive field (e.g. a nested object where client_secret
+    should be a string) must not crash this user-facing connect request —
+    it's an admin authoring bug to catch at write time, not here."""
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dynamic-client-123",
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+            )
+        ),
+    )
+
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+
+    app_row = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "granola").one()
+    app_row.launch_config = {
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "mcp_oauth", "client_secret": {"nested": "not-a-string"}},
+    }
+    db.commit()
+
+    # Must not raise — the malformed field is left as-is rather than crashing.
+    await connect_mcp_oauth_app(
+        "granola", MCPOAuthConnectRequest(redirect_after="/mcp"), user, db
+    )
+
+    server = db.query(MCPServer).filter(MCPServer.name == "granola").one()
+    assert server.auth["client_secret"] == {"nested": "not-a-string"}
+
+
+@pytest.mark.asyncio
 async def test_connect_app_does_not_rewrite_unchanged_auth_with_secret(
     db_session, monkeypatch
 ):
@@ -1777,12 +1828,16 @@ async def test_delete_mcp_server_revokes_only_the_disconnecting_users_grant(
     db.refresh(own_grant)
     db.refresh(sibling_grant)
 
-    delete_mcp_server(server.id, current_user=user, db=db)
+    own_grant_id = own_grant.id
+    await delete_mcp_server(server.id, current_user=user, db=db)
 
-    db.refresh(own_grant)
+    # F10: a disconnected grant must not just flip to "revoked" and linger —
+    # the row itself (still holding the encrypted access token) is purged.
+    assert (
+        db.query(MCPOAuthGrant).filter(MCPOAuthGrant.id == own_grant_id).one_or_none()
+        is None
+    )
     db.refresh(sibling_grant)
-    assert own_grant.status == "revoked"
-    assert own_grant.revoked_at is not None
     assert sibling_grant.status == "active"
 
     # The shared row survives (other_user is still associated); only the
@@ -2599,6 +2654,96 @@ async def test_delete_grant_revokes_external_tokens_when_endpoint_is_advertised(
     db.refresh(grant)
     assert grant.status == "revoked"
     assert grant.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_mcp_server_revokes_external_tokens_when_endpoint_is_advertised(
+    db_session, monkeypatch
+):
+    """M3's remaining half: disconnecting a server must actually reach the
+    provider's revocation_endpoint, not just flip local status (which was
+    already fixed in an earlier round but never called the external API)."""
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(
+        db,
+        server,
+        client_secret=encrypt_value("client-secret"),
+        token_endpoint_auth_method="client_secret_post",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=encrypt_value("access-token"),
+        refresh_token=encrypt_value("refresh-token"),
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    grant_id = grant.id
+    requests: list[dict[str, list[str]]] = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(parse_qs(request.content.decode()))
+        return httpx.Response(200)
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+
+    await delete_mcp_server(server.id, current_user=user, db=db)
+
+    assert [request["token"] for request in requests] == [
+        ["access-token"],
+        ["refresh-token"],
+    ]
+    # Purged outright rather than left as an inert "revoked" row (F10).
+    assert (
+        db.query(MCPOAuthGrant).filter(MCPOAuthGrant.id == grant_id).one_or_none()
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_mcp_server_purges_the_users_own_flow_state_rows(db_session):
+    """A leftover MCPOAuthFlowState (e.g. an abandoned/expired connect
+    attempt) carries a per-user code_verifier secret that nothing else
+    sweeps — disconnect must not leave it behind (F10)."""
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
+    flow_state = MCPOAuthFlowState(
+        state="leftover-state",
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        code_verifier=encrypt_value("verifier-123"),
+        expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+    )
+    db.add(flow_state)
+    db.commit()
+    flow_state_id = flow_state.id
+
+    await delete_mcp_server(server.id, current_user=user, db=db)
+
+    assert (
+        db.query(MCPOAuthFlowState)
+        .filter(MCPOAuthFlowState.id == flow_state_id)
+        .one_or_none()
+        is None
+    )
 
 
 @pytest.mark.asyncio

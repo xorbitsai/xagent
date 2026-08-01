@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from xagent.core.tools.adapters.vibe.config import (
     MCPUnavailableSummary,
@@ -2032,6 +2033,66 @@ def test_scheduled_config_validation_rejects_calendar_only_fields_on_flat_recurr
     parse_trigger_config("scheduled", base_hourly)
 
 
+def test_scheduled_config_validation_treats_blank_time_of_day_as_absent_for_flat_recurrences() -> (
+    None
+):
+    # PR #1051 review, F6 residual asymmetry: omitting time_of_day entirely
+    # for hourly/custom was already accepted (it's simply unused), but an
+    # EXPLICIT time_of_day: "" used to be rejected as "time_of_day is not
+    # used by hourly schedule" — "" is not None, so it tripped the stray-
+    # field check above even though it means the same thing as omitting the
+    # field. Blank must behave identically to absent here.
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    hourly = parse_trigger_config(
+        "scheduled",
+        {"recurrence": "hourly", "interval_seconds": 3600, "time_of_day": ""},
+    )
+    assert hourly.time_of_day == ""
+
+    custom = parse_trigger_config(
+        "scheduled",
+        {"recurrence": "custom", "interval_seconds": 120, "time_of_day": "   "},
+    )
+    assert custom.time_of_day == "   "
+
+    # A genuinely non-blank time_of_day on a flat recurrence is still
+    # rejected — only blank is tolerated as "effectively absent".
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {"recurrence": "hourly", "interval_seconds": 3600, "time_of_day": "09:00"},
+        )
+
+
+def test_scheduled_config_validation_caps_interval_seconds() -> None:
+    # PR #1051 review, N1: an unbounded interval_seconds (e.g. 10**18)
+    # overflows the alignment arithmetic in _compute_next_run_at with a bare
+    # OverflowError. Reject absurd values at write time instead of only
+    # coping with the fallout at scan time.
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import (
+        _MAX_INTERVAL_SECONDS,
+        parse_trigger_config,
+    )
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {"recurrence": "custom", "interval_seconds": _MAX_INTERVAL_SECONDS + 1},
+        )
+    with pytest.raises(ValidationError):
+        parse_trigger_config("scheduled", {"interval_seconds": 10**18})
+    # At the cap is still valid.
+    parse_trigger_config(
+        "scheduled",
+        {"recurrence": "custom", "interval_seconds": _MAX_INTERVAL_SECONDS},
+    )
+
+
 def test_scheduled_config_validation_requires_interval_seconds_for_custom() -> None:
     from pydantic import ValidationError
 
@@ -2073,6 +2134,133 @@ def test_scheduled_config_validation_rejects_stray_next_run_at_on_calendar_recur
                 "next_run_at": "2026-08-01T09:00:00+00:00",
             },
         )
+
+
+def test_scheduled_config_validation_rejects_unknown_fields() -> None:
+    # PR #1051 review, F4: unrecognized fields used to be silently ignored
+    # (pydantic's default), rather than rejected like a typo or a stale
+    # client field would deserve.
+    from pydantic import ValidationError
+
+    from xagent.web.services.trigger_providers.schemas import parse_trigger_config
+
+    with pytest.raises(ValidationError):
+        parse_trigger_config(
+            "scheduled",
+            {"interval_seconds": 60, "not_a_real_field": "oops"},
+        )
+
+
+def test_scheduled_config_update_tolerates_legacy_timezone_on_non_calendar_recurrence(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, N7: a pre-existing stored config combining a
+    # non-calendar recurrence (hourly/custom/a bare next_run_at) with a
+    # `timezone` field was allowed before this PR's schema validation
+    # existed. Round-tripping it through a direct API client (GET, then
+    # PATCH back the same config alongside an unrelated field) must not now
+    # 422 — the new dialog UI is unaffected since it never sends `timezone`
+    # for non-calendar recurrences (buildConfig). This leniency is narrowly
+    # scoped to a trigger whose OWN previously stored config already had
+    # this exact legacy shape; a fresh config making the same mistake is
+    # still rejected (see the second half of this test).
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Legacy hourly",
+            "config": {"recurrence": "hourly", "interval_seconds": 3600},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    # Mutate the stored config directly (bypassing API validation) to add
+    # the legacy `timezone` field, simulating a row that predates this PR's
+    # schema tightening.
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.config = {
+            "recurrence": "hourly",
+            "interval_seconds": 3600,
+            "timezone": "Asia/Shanghai",
+        }
+        db.add(trigger)
+        db.commit()
+    finally:
+        db.close()
+
+    # Resend the SAME legacy config unchanged, alongside an unrelated field
+    # (a real Save always resends the complete config) — must not 422.
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "hourly",
+                "interval_seconds": 3600,
+                "timezone": "Asia/Shanghai",
+            },
+            "prompt_template": "Say hi",
+        },
+    )
+    assert patched.status_code == 200, patched.text
+
+    # A BRAND NEW trigger making the same mistake (no prior legacy config to
+    # justify leniency) is still rejected strictly.
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Fresh hourly",
+            "config": {
+                "recurrence": "hourly",
+                "interval_seconds": 3600,
+                "timezone": "Asia/Shanghai",
+            },
+        },
+    )
+    assert created.status_code == 400, created.text
+
+    # Changing BOTH the recurrence AND the timezone value in the same PATCH
+    # must still 422 — the leniency checks the loose non-calendar-recurrence
+    # SHAPE on both sides, which this still satisfies (hourly -> custom is
+    # still non-calendar), but the underlying timezone VALUE also changed
+    # (Asia/Shanghai -> Pacific/Auckland). A client could otherwise keep
+    # "resending a legacy shape" indefinitely while freely swapping in a
+    # brand-new, never-before-stored timezone (PR #1051 review, N7 follow-up).
+    repatched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "custom",
+                "interval_seconds": 3600,
+                "timezone": "Pacific/Auckland",
+            },
+        },
+    )
+    assert repatched.status_code == 400, repatched.text
+
+    # Resending the exact same legacy pair unchanged (the actual case this
+    # leniency exists for) must still be tolerated after the above.
+    still_tolerated = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "hourly",
+                "interval_seconds": 3600,
+                "timezone": "Asia/Shanghai",
+            },
+        },
+    )
+    assert still_tolerated.status_code == 200, still_tolerated.text
 
 
 def test_normalize_weekdays_coerces_a_bare_scalar_to_a_single_day() -> None:
@@ -2294,6 +2482,151 @@ def test_scheduled_full_form_save_with_unchanged_config_does_not_reset_next_run_
     assert recomputed >= before_repatch
 
 
+def test_scheduled_start_at_backfill_alone_does_not_reset_next_run_at(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, N8: the editor's F5 fix defaults a reconstructed
+    # calendar trigger's startDate to today when no start_at is stored at
+    # all. Resaving with literally zero other user changes then resends
+    # start_at="<today>" where the stored config previously had none — a
+    # genuine diff by _schedule_signature's ordinary comparison, which would
+    # otherwise force a recompute from today and can move next_run_at
+    # EARLIER than its current, already-computed value purely as a side
+    # effect of what looks like a no-op Save. Only a start_at that's a REAL
+    # pre-existing value, or a date other than today, is a genuine edit.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Every day",
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+    original_next_run_at = _coerce_utc(
+        datetime.fromisoformat(created.json()["next_run_at"])
+    )
+    assert original_next_run_at is not None
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                "start_at": today,
+            },
+            "prompt_template": "Say hi",
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert (
+        _coerce_utc(datetime.fromisoformat(patched.json()["next_run_at"]))
+        == original_next_run_at
+    )
+
+    # A genuine schedule edit (a start_at other than "today") still forces a
+    # recompute.
+    two_days_out = (datetime.now(timezone.utc) + timedelta(days=2)).date().isoformat()
+    repatched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                "start_at": two_days_out,
+            }
+        },
+    )
+    assert repatched.status_code == 200, repatched.text
+    recomputed = _coerce_utc(datetime.fromisoformat(repatched.json()["next_run_at"]))
+    assert recomputed is not None
+    assert recomputed > original_next_run_at
+
+
+def test_scheduled_start_at_blank_string_backfill_alone_does_not_reset_next_run_at(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, N8 follow-up: _is_benign_start_at_backfill's "was the
+    # old start_at truly absent" check used a bare `is not None`, which misses
+    # a literal stored start_at="" (present key, blank value) — treated
+    # identically to a wholly-missing key by _compute_next_run_at and
+    # _schedule_signature themselves (both `.strip()` it away), but not by
+    # this heuristic's own check. A trigger stuck with start_at="" (e.g. an
+    # older client that always sent the key) must get the same no-op-Save
+    # protection as one with no start_at key at all.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Every day",
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+    original_next_run_at = _coerce_utc(
+        datetime.fromisoformat(created.json()["next_run_at"])
+    )
+    assert original_next_run_at is not None
+
+    # Directly store a literal blank start_at — simulating a client that
+    # always resends the key, unlike the dialog (which omits it entirely).
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.config = {
+            "recurrence": "weekly",
+            "time_of_day": "09:00",
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "start_at": "",
+        }
+        db.add(trigger)
+        db.commit()
+    finally:
+        db.close()
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                "start_at": today,
+            },
+            "prompt_template": "Say hi",
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert (
+        _coerce_utc(datetime.fromisoformat(patched.json()["next_run_at"]))
+        == original_next_run_at
+    )
+
+
 def test_scheduled_re_enable_clamps_a_stale_anchor_instead_of_rewinding(
     mock_bg_scheduler,
 ) -> None:
@@ -2445,6 +2778,47 @@ def test_scheduled_signature_ignores_interval_seconds_string_vs_int_form(
         f"/api/agents/{agent_id}/triggers/{trigger_id}",
         headers=headers,
         json={"config": {"recurrence": "hourly", "interval_seconds": "3600"}},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["next_run_at"] == original_next_run_at
+
+
+def test_scheduled_signature_ignores_blank_time_of_day_vs_absent_for_flat_recurrences(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, N follow-up: _schedule_signature only normalized
+    # time_of_day `if value is not None`, so a resent time_of_day="" (accepted
+    # for hourly/custom since the F6 fix — previously rejected) canonicalized
+    # to "00:00" while a stored config with NO time_of_day key at all stayed
+    # None — a spurious signature mismatch, and an unwanted recompute, for a
+    # direct API client resending "" where the stored config never had the
+    # key in the first place.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Custom interval",
+            "config": {"recurrence": "custom", "interval_seconds": 120},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+    original_next_run_at = created.json()["next_run_at"]
+    assert original_next_run_at is not None
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "custom",
+                "interval_seconds": 120,
+                "time_of_day": "",
+            },
+        },
     )
     assert patched.status_code == 200, patched.text
     assert patched.json()["next_run_at"] == original_next_run_at
@@ -3203,6 +3577,544 @@ def test_scheduled_scan_disables_trigger_with_unrecomputable_config_instead_of_w
         assert healthy_next_run_at > now
     finally:
         db.close()
+
+
+def test_scheduled_scan_disables_trigger_on_overflow_and_surfaces_a_reason(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, N1a/N6: an absurd interval_seconds (config drift, or
+    # data predating this PR's new upper-bound validator) overflows the
+    # alignment arithmetic in _compute_next_run_at with a bare OverflowError,
+    # not the service's own TriggerServiceError — the scan loop's recompute
+    # guard must catch that too (broadened to `except Exception`) or it
+    # wedges the whole batch, same as F3/N1's TriggerServiceError case. N6:
+    # the disabled trigger must also surface a reason via provisioning_error
+    # (the same field the Gmail provider uses), not just a server-side log.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Overflowing interval",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    now = datetime.now(timezone.utc)
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        # Bypass API validation (like a manual DB edit or pre-upper-bound
+        # data would) so the recompute genuinely overflows.
+        trigger.config = {"interval_seconds": 10**18}
+        trigger.next_run_at = now - timedelta(seconds=5)
+        db.add(trigger)
+        db.commit()
+
+        runs = scan_due_scheduled_triggers(db, now=now)
+        assert len(runs) == 1
+
+        db.refresh(trigger)
+        assert trigger.enabled is False
+        assert trigger.next_run_at is None
+        assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+        assert trigger.provisioning_error
+    finally:
+        db.close()
+
+
+def test_reenable_trigger_with_pathological_stored_config_returns_clean_error(
+    mock_bg_scheduler,
+) -> None:
+    # Third review round: a bare `{"enabled": true}` PATCH (no "config" key)
+    # skips _validate_config entirely (and with it, this PR's interval_seconds
+    # upper-bound check), so _apply_trigger_updates's re-enable branch calls
+    # _compute_next_run_at directly on the STALE, unvalidated stored config.
+    # If that config predates the cap (legacy data) and is pathological, the
+    # alignment arithmetic overflows with a bare OverflowError that used to
+    # propagate uncaught through the API route's generic exception handler as
+    # an ugly 500. This is a synchronous user-facing request (unlike the scan
+    # loop, which silently disables instead), so the fix wraps the call and
+    # raises a TriggerServiceError instead — which _handle_service_error maps
+    # to a clean 4xx with an actionable message.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Legacy pathological interval",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        # Bypass API validation (like legacy data predating the upper-bound
+        # cap would) and disable the trigger, so the stored config is both
+        # unvalidated and stale by the time the re-enable PATCH arrives.
+        trigger.config = {"interval_seconds": 10**18}
+        trigger.enabled = False
+        db.add(trigger)
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.patch(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={"enabled": True},
+    )
+    assert resp.status_code in (400, 422), resp.text
+    assert resp.status_code != 500
+    assert resp.json()["detail"]
+
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        # The failed re-enable must not have left the trigger in some
+        # half-updated state: still disabled, config untouched.
+        assert trigger.enabled is False
+        assert trigger.config == {"interval_seconds": 10**18}
+    finally:
+        db.close()
+
+
+def test_scheduled_scan_continues_batch_after_unexpected_prepare_failure(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, N1b: prepare_trigger_run's own _get_or_create_trigger_run
+    # can re-raise a bare IntegrityError (an insert race whose post-rollback
+    # lookup still misses the real duplicate row) instead of the service's
+    # own TriggerRunPreparationError. The scan loop's call-site guard used to
+    # only catch TriggerRunPreparationError, so this propagated out of
+    # scan_due_scheduled_triggers entirely, aborting the whole batch and
+    # wedging every trigger ordered after it — the same class of bug as
+    # N1a, at the other call site. Now it's caught, the session is rolled
+    # back, and the batch continues to the next due trigger untouched (left
+    # for the next scan tick to retry, since this is treated as transient,
+    # not a poisoned config).
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    poisoned = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Poisoned",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert poisoned.status_code == 200, poisoned.text
+    poisoned_id = poisoned.json()["id"]
+
+    healthy = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Healthy",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert healthy.status_code == 200, healthy.text
+    healthy_id = healthy.json()["id"]
+
+    now = datetime.now(timezone.utc)
+    poisoned_due_at = now - timedelta(minutes=10)
+    db = _direct_db_session()
+    try:
+        poisoned_trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == poisoned_id).one()
+        )
+        # Ordered first: an earlier next_run_at than the healthy trigger.
+        poisoned_trigger.next_run_at = poisoned_due_at
+        db.add(poisoned_trigger)
+
+        healthy_trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == healthy_id).one()
+        )
+        healthy_trigger.next_run_at = now - timedelta(seconds=5)
+        db.add(healthy_trigger)
+        db.commit()
+
+        from xagent.web.services import triggers as triggers_mod
+
+        real_prepare_trigger_run = triggers_mod.prepare_trigger_run
+
+        def flaky_prepare_trigger_run(db_arg, *, trigger, **kwargs):
+            if trigger.id == poisoned_id:
+                raise IntegrityError("insert", {}, Exception("duplicate key"))
+            return real_prepare_trigger_run(db_arg, trigger=trigger, **kwargs)
+
+        with patch.object(
+            triggers_mod, "prepare_trigger_run", side_effect=flaky_prepare_trigger_run
+        ):
+            runs = scan_due_scheduled_triggers(db, now=now)
+
+        # Only the healthy trigger produced a run; the poisoned one's
+        # unexpected failure was swallowed instead of aborting the batch.
+        assert len(runs) == 1
+
+        db.refresh(poisoned_trigger)
+        assert poisoned_trigger.enabled is True
+        assert _coerce_utc(poisoned_trigger.next_run_at) == poisoned_due_at
+
+        db.refresh(healthy_trigger)
+        assert healthy_trigger.enabled is True
+        assert healthy_trigger.next_run_at is not None
+    finally:
+        db.close()
+
+
+def test_scheduled_scan_continues_batch_after_encryption_key_failure(
+    mock_bg_scheduler,
+) -> None:
+    # Third review round: prepare_trigger_run -> _get_or_create_trigger_run ->
+    # _payload_snapshot -> encrypt_value -> _get_encryption_key raises a bare
+    # `ValueError` (not a TriggerServiceError) when ENCRYPTION_KEY is unset in
+    # a non-development environment and the trigger's config has
+    # `store_full_payload: true`. The scan loop's call-site guard used to only
+    # catch `TriggerServiceError`, so this different-but-related ValueError
+    # escaped scan_due_scheduled_triggers entirely, aborting the whole batch
+    # and wedging every trigger ordered after it — the same class of bug as
+    # the sibling IntegrityError-escape regression
+    # (test_scheduled_scan_continues_batch_after_unexpected_prepare_failure),
+    # just via a different exception type. Now it's caught, rolled back, and
+    # the batch continues to the next due trigger.
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    poisoned = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Poisoned by encryption failure",
+            "config": {"interval_seconds": 60, "store_full_payload": True},
+        },
+    )
+    assert poisoned.status_code == 200, poisoned.text
+    poisoned_id = poisoned.json()["id"]
+
+    healthy = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Healthy",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert healthy.status_code == 200, healthy.text
+    healthy_id = healthy.json()["id"]
+
+    now = datetime.now(timezone.utc)
+    poisoned_due_at = now - timedelta(minutes=10)
+    db = _direct_db_session()
+    try:
+        poisoned_trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == poisoned_id).one()
+        )
+        # Ordered first: an earlier next_run_at than the healthy trigger.
+        poisoned_trigger.next_run_at = poisoned_due_at
+        db.add(poisoned_trigger)
+
+        healthy_trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == healthy_id).one()
+        )
+        healthy_trigger.next_run_at = now - timedelta(seconds=5)
+        db.add(healthy_trigger)
+        db.commit()
+
+        from xagent.web.services import triggers as triggers_mod
+
+        def failing_encrypt_value(value: str) -> str:
+            raise ValueError(
+                "ENCRYPTION_KEY environment variable is not set in "
+                "non-development environment"
+            )
+
+        with patch.object(
+            triggers_mod, "encrypt_value", side_effect=failing_encrypt_value
+        ):
+            runs = scan_due_scheduled_triggers(db, now=now)
+
+        # Only the healthy trigger produced a run; the poisoned one's
+        # encryption-key failure was swallowed instead of aborting the batch.
+        assert len(runs) == 1
+
+        db.refresh(poisoned_trigger)
+        assert poisoned_trigger.enabled is True
+        assert _coerce_utc(poisoned_trigger.next_run_at) == poisoned_due_at
+
+        db.refresh(healthy_trigger)
+        assert healthy_trigger.enabled is True
+        assert healthy_trigger.next_run_at is not None
+    finally:
+        db.close()
+
+
+def test_scheduled_scan_surfaces_repeated_prepare_failures_without_disabling(
+    mock_bg_scheduler,
+) -> None:
+    # PR #1051 review, N follow-up: a single prepare_trigger_run failure is
+    # expected and silently retried (see
+    # test_scheduled_scan_continues_batch_after_unexpected_prepare_failure) —
+    # but a trigger that fails EVERY scan tick for a while is no longer just
+    # an unlucky race, and used to be retried forever with zero user-visible
+    # signal, unlike the sibling recompute-failure guard (which already sets
+    # provisioning_status/provisioning_error and disables the trigger).
+    # After _PREPARE_FAILURE_SURFACE_THRESHOLD consecutive failures for the
+    # SAME trigger, this guard now surfaces the same fields too — WITHOUT
+    # disabling the trigger (unlike the recompute guard): this failure mode
+    # is commonly a transient infrastructure issue, so it should stay
+    # visible-but-still-retried rather than silently killed. The counter
+    # itself is a column on the trigger row (not an in-process dict — see
+    # test_scheduled_scan_consecutive_prepare_failures_counter_is_shared_across_processes),
+    # so a fresh trigger created in this test starts with no prior state to
+    # reset.
+    from xagent.web.services import triggers as triggers_mod
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Always poisoned",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    real_prepare_trigger_run = triggers_mod.prepare_trigger_run
+
+    def always_fails(db_arg, *, trigger, **kwargs):
+        if trigger.id == trigger_id:
+            raise IntegrityError("insert", {}, Exception("duplicate key"))
+        return real_prepare_trigger_run(db_arg, trigger=trigger, **kwargs)
+
+    db = _direct_db_session()
+    try:
+        threshold = triggers_mod._PREPARE_FAILURE_SURFACE_THRESHOLD
+        with patch.object(
+            triggers_mod, "prepare_trigger_run", side_effect=always_fails
+        ):
+            for tick in range(threshold):
+                trigger = (
+                    db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+                )
+                trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+                db.add(trigger)
+                db.commit()
+
+                runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+                assert runs == []
+
+                db.refresh(trigger)
+                # Never disabled, and next_run_at is left untouched by this
+                # guard every tick, so the next scan keeps retrying it.
+                assert trigger.enabled is True
+
+                is_last_tick = tick == threshold - 1
+                if is_last_tick:
+                    assert (
+                        trigger.provisioning_status
+                        == TriggerProvisioningStatus.FAILED.value
+                    )
+                    assert trigger.provisioning_error
+                else:
+                    assert (
+                        trigger.provisioning_status
+                        != TriggerProvisioningStatus.FAILED.value
+                    )
+
+        # Recovering (prepare succeeds again) clears the stale failure
+        # signal instead of leaving a permanently "failed" badge on a
+        # trigger that's actually working again.
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        db.add(trigger)
+        db.commit()
+        runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+        assert len(runs) == 1
+        db.refresh(trigger)
+        assert trigger.provisioning_status != TriggerProvisioningStatus.FAILED.value
+        assert trigger.consecutive_prepare_failures is None
+    finally:
+        db.close()
+
+
+def test_scheduled_scan_trigger_run_preparation_error_does_not_clear_failure_badge(
+    mock_bg_scheduler,
+) -> None:
+    # Third review round: the `except TriggerRunPreparationError` branch
+    # intentionally does NOT `continue` (a TriggerRun record does exist even
+    # though its task failed to attach, so next_run_at still needs
+    # recomputing and the run still needs to be returned) — but it used to
+    # fall through into the "recovered, clear the counter/badge" cleanup
+    # block, which naively assumed "didn't hit the incrementing except clause
+    # this tick" meant "succeeded cleanly". A TriggerRunPreparationError on
+    # THIS tick means the trigger is still failing (a different failure mode,
+    # not a recovery), so it must not clear a previously-surfaced failed
+    # badge. Only a genuinely clean prepare_trigger_run call (no exception at
+    # all) should count as recovered — see the sibling
+    # ...surfaces_repeated_prepare_failures_without_disabling test for that
+    # genuine-recovery case.
+    from xagent.web.services import triggers as triggers_mod
+    from xagent.web.services.triggers import TriggerRunPreparationError
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Flaky then differently flaky",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    def always_integrity_error(db_arg, *, trigger, **kwargs):
+        raise IntegrityError("insert", {}, Exception("duplicate key"))
+
+    db = _direct_db_session()
+    try:
+        threshold = triggers_mod._PREPARE_FAILURE_SURFACE_THRESHOLD
+        with patch.object(
+            triggers_mod, "prepare_trigger_run", side_effect=always_integrity_error
+        ):
+            for _tick in range(threshold):
+                trigger = (
+                    db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+                )
+                trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+                db.add(trigger)
+                db.commit()
+                runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+                assert runs == []
+
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+        failed_provisioning_error = trigger.provisioning_error
+        assert failed_provisioning_error
+
+        # 6th tick: a DIFFERENT failure mode (TriggerRunPreparationError, not
+        # the IntegrityError-type failure the counter above tracks). This
+        # must NOT clear the badge set above, even though it doesn't go
+        # through the incrementing except clause either.
+        def raises_run_preparation_error(db_arg, *, trigger, **kwargs):
+            failed_run = TriggerRun(
+                trigger_id=int(trigger.id),
+                status=TriggerRunStatus.FAILED.value,
+                error_message="task attach failed",
+                idempotency_key=f"test-prep-error-{trigger.id}-{time.time()}",
+                payload_snapshot={},
+            )
+            db_arg.add(failed_run)
+            db_arg.commit()
+            db_arg.refresh(failed_run)
+            raise TriggerRunPreparationError("task attach failed", run=failed_run)
+
+        trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        db.add(trigger)
+        db.commit()
+        with patch.object(
+            triggers_mod,
+            "prepare_trigger_run",
+            side_effect=raises_run_preparation_error,
+        ):
+            runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+        # The TriggerRunPreparationError branch doesn't `continue`: the run
+        # is still returned and next_run_at still advances.
+        assert len(runs) == 1
+
+        db.refresh(trigger)
+        assert trigger.enabled is True
+        # The badge from the earlier IntegrityError-type failures must still
+        # be showing — a different failure mode this tick is not a recovery.
+        assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+        assert trigger.provisioning_error == failed_provisioning_error
+    finally:
+        db.close()
+
+
+def test_scheduled_scan_consecutive_prepare_failures_counter_is_shared_across_processes(
+    mock_bg_scheduler,
+) -> None:
+    # Third review round: _consecutive_prepare_failures used to be an
+    # in-process dict, but scan_due_scheduled_triggers runs from at least two
+    # genuinely separate OS processes concurrently in this deployment
+    # (backend's in-process asyncio dispatcher, and a separate Celery
+    # beat/worker scan). Simulate that with two independent DB sessions
+    # standing in for two processes: an increment from "process B" must be
+    # visible to "process A", proving the counter is now a persisted column
+    # on the trigger row (read/written via atomic SQL), not disjoint
+    # per-process state.
+    from xagent.web.services import triggers as triggers_mod
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Cross-process counter",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    process_a_db = _direct_db_session()
+    process_b_db = _direct_db_session()
+    try:
+        trigger_as_seen_by_a = (
+            process_a_db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        )
+        trigger_as_seen_by_b = (
+            process_b_db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        )
+
+        count_after_a = triggers_mod._increment_consecutive_prepare_failures(
+            process_a_db, trigger_as_seen_by_a
+        )
+        assert count_after_a == 1
+
+        count_after_b = triggers_mod._increment_consecutive_prepare_failures(
+            process_b_db, trigger_as_seen_by_b
+        )
+        # Process B's increment builds on process A's, not on its own
+        # independent zero-initialized counter — proving the state is
+        # shared, authoritative, and read/written atomically at the DB
+        # layer rather than split across two disjoint in-memory dicts.
+        assert count_after_b == 2
+
+        # A "recovery" observed by process A must see and clear the value
+        # process B most recently wrote, even though process A never
+        # incremented past 1 itself.
+        triggers_mod._clear_consecutive_prepare_failures_if_recovered(
+            process_a_db, trigger_as_seen_by_a
+        )
+        process_b_db.refresh(trigger_as_seen_by_b)
+        assert trigger_as_seen_by_b.consecutive_prepare_failures is None
+    finally:
+        process_a_db.close()
+        process_b_db.close()
 
 
 def test_finish_turn_syncs_trigger_run_status() -> None:

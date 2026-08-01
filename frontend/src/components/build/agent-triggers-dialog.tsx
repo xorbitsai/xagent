@@ -224,6 +224,71 @@ function unitSecondsFor(unit: ScheduleCustomUnit): number {
   return 60
 }
 
+/** Parses an hourly/custom schedule's anchor from the editor's startDate/
+ * timeOfDay fields into a concrete instant, or null when there's nothing
+ * parseable (blank date, or an unparsable combination). Only hourly/custom
+ * use this — daily/weekly/monthly send a bare calendar date the backend
+ * combines with its own timezone instead. Shared by scheduleWillFireImmediately
+ * and buildConfig (PR #1051 review, N10 cleanup) — they used to each
+ * independently recompute `new Date(...)` with the same NaN-guard; each call
+ * site still decides what null MEANS for its own purposes (a silent
+ * "don't warn" here, a thrown validation error in buildConfig). */
+function parseHourlyCustomAnchor(startDate: string, timeOfDay: string): Date | null {
+  if (!startDate) return null
+  const anchor = new Date(`${startDate}T${timeOfDay || "00:00"}:00`)
+  return Number.isNaN(anchor.getTime()) ? null : anchor
+}
+
+/** True when any field feeding into a schedule's actual fire-time computation
+ * differs between two ScheduleFieldsValue snapshots. Used to tell a genuine
+ * schedule edit apart from an unrelated field change (rename, prompt tweak) —
+ * mirrors the backend's _schedule_signature comparison closely enough for
+ * this UI-only warning's purposes (see scheduleWillFireImmediately); exact
+ * backend normalization details don't need to be replicated bit-for-bit. */
+function scheduleRelevantFieldsChanged(a: ScheduleFieldsValue, b: ScheduleFieldsValue): boolean {
+  return (
+    a.recurrence !== b.recurrence ||
+    a.startDate !== b.startDate ||
+    a.timeOfDay !== b.timeOfDay ||
+    a.timezone !== b.timezone ||
+    a.dayOfMonth !== b.dayOfMonth ||
+    a.customAmount !== b.customAmount ||
+    a.customUnit !== b.customUnit ||
+    a.weekdays.length !== b.weekdays.length ||
+    a.weekdays.some((day) => !b.weekdays.includes(day))
+  )
+}
+
+/** True when an hourly/custom schedule's picked start instant has already
+ * passed AND that instant is actually about to be (re)computed as a fresh
+ * anchor. UI-only signal (PR #1051 review, N2): the backend's documented
+ * cron semantics deliberately fire such a schedule on the very next scan
+ * tick rather than skipping ahead — this just lets the editor warn about
+ * that up front instead of surprising the user after Save. daily/weekly/
+ * monthly never "catch up" this way (the backend always computes a future
+ * occurrence for those), so this only applies to hourly/custom.
+ *
+ * `baseline` is the schedule fields as loaded from the trigger being edited
+ * (null when creating a brand-new trigger, which always gets a fresh anchor
+ * on save). Without checking it against a real edit, EVERY reopen of an
+ * already-fired hourly/custom trigger would warn: scheduleFieldsFromConfig
+ * derives startDate/timeOfDay from the trigger's stored config, which is
+ * frozen at creation time and never rewritten by the scan loop (only the
+ * next_run_at DB COLUMN is advanced) — so it reads as "in the past" on every
+ * edit, even though _apply_trigger_updates's own "did the schedule actually
+ * change" check (_schedule_signature) sees no diff and will NOT recompute
+ * next_run_at on an unrelated-field Save (PR #1051 review, N2 follow-up). */
+function scheduleWillFireImmediately(
+  form: ScheduleFieldsValue,
+  baseline: ScheduleFieldsValue | null,
+): boolean {
+  if (form.recurrence !== "hourly" && form.recurrence !== "custom") return false
+  if (baseline && !scheduleRelevantFieldsChanged(form, baseline)) return false
+  const anchor = parseHourlyCustomAnchor(form.startDate, form.timeOfDay)
+  if (!anchor) return false
+  return anchor.getTime() <= Date.now()
+}
+
 function inferCustomAmountUnit(intervalSeconds: number): { amount: string; unit: ScheduleCustomUnit } {
   if (intervalSeconds >= 86400 && intervalSeconds % 86400 === 0) {
     return { amount: String(intervalSeconds / 86400), unit: "days" }
@@ -497,14 +562,6 @@ export function AgentTriggersDialog({
   // gmailAccounts ever become reactive to something other than the current
   // one-shot per-open fetch. Reset alongside the other per-view state.
   const gmailAccountClearedByUserRef = useRef(false)
-  // Makes the auto-bind effect below fire at most once per draft, rather
-  // than depending on gmailAccounts staying referentially stable for the
-  // life of the draft. gmailAccountClearedByUserRef alone only protects the
-  // "user explicitly cleared it" case; this protects the general case of
-  // gmailAccounts ever being replaced with a new (even identical) array —
-  // today that only happens once per dialog-open, but nothing currently
-  // guarantees it stays that way. Reset alongside the other per-view state.
-  const gmailAutoBoundRef = useRef(false)
   const [gmailAccountsLoading, setGmailAccountsLoading] = useState(false)
   const selectedTriggerIdRef = useRef<number | null>(null)
   // Identity of the trigger the form was last synced from ("type:id", or
@@ -589,6 +646,18 @@ export function AgentTriggersDialog({
     return activeTypeTriggers.find((trigger) => trigger.id === selectedTriggerId) ?? null
   }, [activeType, activeTypeTriggers, selectedTriggerId])
 
+  // The schedule fields as originally loaded from the trigger being edited
+  // (null for a brand-new draft) — the baseline scheduleWillFireImmediately
+  // compares the live form against to tell a genuine schedule edit apart
+  // from an unrelated field change (PR #1051 review, N2 follow-up).
+  const loadedScheduleFields = useMemo(
+    () =>
+      selectedTrigger && selectedTrigger.type === "scheduled"
+        ? scheduleFieldsFromConfig(selectedTrigger.config)
+        : null,
+    [selectedTrigger],
+  )
+
   const selectedWebhookUrl = webhookUrl(selectedTrigger)
 
   const defaultNameForType = useCallback((type: AgentTriggerType) => {
@@ -663,7 +732,6 @@ export function AgentTriggersDialog({
     setSecretGenerated(false)
     setGmailFiltersOpen(false)
     gmailAccountClearedByUserRef.current = false
-    gmailAutoBoundRef.current = false
     setRuns([])
     if (initialType) setForm(emptyForm(initialType))
     void loadTriggers(null)
@@ -691,17 +759,18 @@ export function AgentTriggersDialog({
 
   // With exactly one connected account, bind new Gmail triggers to it. With
   // several accounts the user must pick explicitly so the wrong mailbox is
-  // never chosen silently. Fires at most once per draft (gmailAutoBoundRef)
-  // rather than depending on gmailAccounts staying the same array reference
-  // for the life of the draft — a future refetch that replaces it (even
-  // with identical data) must not re-run this and clobber a since-cleared
-  // or since-picked selection.
+  // never chosen silently. The setForm call is idempotent (a no-op once
+  // oauthAccountId is already set), and gmailAccounts is only ever replaced
+  // once per dialog-open (see the fetch effect above, gated on `[open]`
+  // alone) — so re-running this on every unrelated dependency change within
+  // the same open dialog never clobbers a since-picked selection; only an
+  // explicit "Change account" (gmailAccountClearedByUserRef) needs its own
+  // guard.
   useEffect(() => {
     if (!open || !editing || activeType !== "gmail" || selectedTrigger) return
-    if (gmailAccountClearedByUserRef.current || gmailAutoBoundRef.current) return
+    if (gmailAccountClearedByUserRef.current) return
     if (gmailAccounts?.length === 1) {
       const onlyAccountId = String(gmailAccounts[0].id)
-      gmailAutoBoundRef.current = true
       setForm((current) =>
         current.oauthAccountId ? current : { ...current, oauthAccountId: onlyAccountId },
       )
@@ -749,7 +818,6 @@ export function AgentTriggersDialog({
     setSecretGenerated(false)
     setGmailFiltersOpen(false)
     gmailAccountClearedByUserRef.current = false
-    gmailAutoBoundRef.current = false
     setForm(options.form)
     if (trigger) {
       void loadRunsFor(trigger)
@@ -857,8 +925,8 @@ export function AgentTriggersDialog({
     // just an absolute instant, so browser-local parsing is fine, and
     // self-consistent on every re-save since the editor always displays
     // this anchor back in the CURRENT browser's zone too (scheduleFieldsFromConfig).
-    const anchor = new Date(`${sourceForm.startDate}T${sourceForm.timeOfDay || "00:00"}:00`)
-    if (Number.isNaN(anchor.getTime())) {
+    const anchor = parseHourlyCustomAnchor(sourceForm.startDate, sourceForm.timeOfDay)
+    if (!anchor) {
       throw new Error(t("triggers.validation.nextRunAt"))
     }
     let intervalSeconds = 3600
@@ -966,7 +1034,19 @@ export function AgentTriggersDialog({
       beginCreateForType(type, { enabled: true })
       return
     }
+    // Prefer whichever trigger of this type is currently open in the editor
+    // (even if it's disabled) over the "first enabled, else first in list"
+    // heuristic — otherwise turning the type-level switch on while a
+    // different, currently-disabled trigger is open enables the wrong one,
+    // leaving the one the user is actually looking at still off (PR #1051
+    // review, N9; pre-existing, not introduced by this PR).
+    const openTriggerId = editing && activeType === type ? selectedTriggerId : null
+    const openTrigger =
+      openTriggerId !== null
+        ? typeTriggers.find((trigger) => trigger.id === openTriggerId)
+        : undefined
     const primary =
+      openTrigger ??
       typeTriggers.find((trigger) => trigger.enabled) ??
       typeTriggers[0] ??
       null
@@ -1508,6 +1588,21 @@ export function AgentTriggersDialog({
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13px] font-semibold">{trigger.name}</div>
         <div className="truncate text-xs text-muted-foreground">{triggerSummary(trigger)}</div>
+        {trigger.provisioning_status === "failed" && trigger.provisioning_error && (
+          // Surfaces the backend's provisioning_status/provisioning_error
+          // (PR #1051 review, N6) — otherwise a trigger that silently
+          // stopped firing (e.g. scan_due_scheduled_triggers disabling it
+          // after a recompute failure) shows no visible signal beyond the
+          // generic enabled/disabled state. `title` carries the full message
+          // as a native tooltip, same pattern as the edit/delete buttons below.
+          <div
+            className="mt-0.5 flex items-center gap-1 truncate text-xs text-destructive"
+            title={trigger.provisioning_error}
+          >
+            <AlertCircle className="h-3 w-3 shrink-0" />
+            <span className="truncate">{trigger.provisioning_error}</span>
+          </div>
+        )}
       </div>
       <Switch
         checked={trigger.enabled}
@@ -1900,6 +1995,11 @@ export function AgentTriggersDialog({
               <CalendarCheck className="h-4 w-4 shrink-0 text-primary" />
               <span>{summarizeSchedule(form, t, locale)}</span>
             </div>
+            {scheduleWillFireImmediately(form, loadedScheduleFields) && (
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                {t("triggers.schedule.runsImmediatelyHint")}
+              </p>
+            )}
           </>
         )}
 

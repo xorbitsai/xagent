@@ -11,13 +11,20 @@ from datetime import datetime, time, timezone
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ...models.trigger import TriggerProvisioningStatus, TriggerType
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Upper bound on interval_seconds: large enough for any legitimate hourly/
+# custom schedule, small enough to keep `_compute_next_run_at`'s alignment
+# arithmetic (`base + timedelta(seconds=steps * interval_seconds)`) from
+# overflowing on a pathological value (e.g. 10**18) — see PR #1051 review, N1.
+_MAX_INTERVAL_SECONDS = 366 * 24 * 60 * 60  # ~1 year
 
 
 class NormalizedEvent(BaseModel):
@@ -100,6 +107,13 @@ class BaseTriggerConfig(BaseModel):
     """Optional allow-list of normalized event types this trigger fires on."""
     store_full_payload: bool = False
     """Opt-in to encrypted full-payload snapshots on trigger runs."""
+    connector_runtime_context: list[dict[str, Any]] | None = None
+    """Per-invocation connector runtime payload (secrets/context overrides),
+    read directly from the raw config dict elsewhere (see
+    ``_trigger_connector_runtime_payload`` / ``connector_runtime.py``) rather
+    than through this typed field — declared here only so
+    ``ScheduledTriggerConfig``'s ``extra="forbid"`` (PR #1051 review, F4)
+    doesn't reject it as an unrecognized key."""
 
 
 # Shared normalization for schedule fields. Single source of truth used both
@@ -169,6 +183,8 @@ class WebhookTriggerConfig(BaseTriggerConfig):
 
 
 class ScheduledTriggerConfig(BaseTriggerConfig):
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["scheduled"] = "scheduled"
     interval_seconds: int | None = None
     next_run_at: str | None = None
@@ -201,6 +217,10 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
     def _positive_interval(cls, value: int | None) -> int | None:
         if value is not None and value <= 0:
             raise ValueError("interval_seconds must be positive")
+        if value is not None and value > _MAX_INTERVAL_SECONDS:
+            raise ValueError(
+                f"interval_seconds must be at most {_MAX_INTERVAL_SECONDS} (1 year)"
+            )
         return value
 
     @field_validator("weekdays")
@@ -289,7 +309,21 @@ class ScheduledTriggerConfig(BaseTriggerConfig):
             "start_at",
             "timezone",
         ):
-            if getattr(self, field_name) is not None:
+            value = getattr(self, field_name)
+            if (
+                field_name == "time_of_day"
+                and isinstance(value, str)
+                and not value.strip()
+            ):
+                # An explicit time_of_day: "" must behave exactly like
+                # omitting the field entirely for hourly/custom — it's
+                # already accepted when absent (None), so a blank string
+                # (which _valid_time_of_day deliberately leaves un-
+                # canonicalized, see its docstring) must not be rejected as
+                # "set" just because "" is not None (PR #1051 review, F6
+                # residual asymmetry).
+                continue
+            if value is not None:
                 label = self.recurrence or "a plain next_run_at"
                 raise ValueError(f"{field_name} is not used by {label} schedule")
         if self.recurrence == "custom" and self.interval_seconds is None:

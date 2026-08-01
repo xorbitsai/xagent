@@ -389,6 +389,45 @@ describe("AgentTriggersDialog", () => {
     expect(await screen.findByLabelText("triggers.form.watchLabel")).toHaveValue("INBOX")
   })
 
+  it("shows a visible provisioning error on a trigger's list row", async () => {
+    // PR #1051 review, N6: the backend sets provisioning_status/
+    // provisioning_error (e.g. scan_due_scheduled_triggers disabling a
+    // trigger after a recompute failure, or a Gmail provisioning failure) —
+    // before this, nothing in the dialog rendered them, so a trigger that
+    // silently stopped firing showed no visible signal beyond the generic
+    // enabled/disabled badge.
+    const failingTrigger = makeTrigger({
+      id: 11,
+      type: "gmail",
+      name: "Broken mailbox watcher",
+      config: { oauth_account_id: 7 },
+      provisioning_status: "failed",
+      provisioning_error: "Gmail watch registration failed: invalid_grant",
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([failingTrigger]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+
+    expect(
+      await screen.findByText("Gmail watch registration failed: invalid_grant"),
+    ).toBeInTheDocument()
+  })
+
   it("persists the detail header switch immediately without pressing save", async () => {
     render(
       <AgentTriggersDialog
@@ -1450,6 +1489,82 @@ describe("AgentTriggersDialog", () => {
     const body = JSON.parse((saveCall![1] as { body: string }).body)
     expect(body.enabled).toBe(false)
   })
+
+  it("prefers enabling the trigger open in the editor over the first-in-list heuristic", async () => {
+    // PR #1051 review, N9 (pre-existing, not introduced by this PR):
+    // toggling the type-level switch on while every trigger of that type is
+    // disabled used to always enable "the first already-enabled trigger,
+    // else the first in the list" — ignoring which trigger is actually open
+    // in the editor. Open the OLDER (not first-in-list) of two disabled
+    // scheduled triggers and confirm the switch enables THAT one, not the
+    // newer one the old heuristic would have picked.
+    const TRIGGERS_URL = "http://api.local/api/agents/42/triggers"
+    const triggers = [
+      makeTrigger({
+        id: 202,
+        type: "scheduled",
+        name: "Newer schedule",
+        enabled: false,
+        config: { interval_seconds: 3600 },
+      }),
+      makeTrigger({
+        id: 201,
+        type: "scheduled",
+        name: "Older schedule",
+        enabled: false,
+        config: { interval_seconds: 3600 },
+      }),
+    ]
+    let patchedId: number | null = null
+
+    apiRequestMock.mockImplementation(
+      (url: string, init?: { method?: string; body?: string }) => {
+        if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+        if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+          return Promise.resolve(jsonResponse(triggers))
+        }
+        if (url === `${TRIGGERS_URL}/201/runs` || url === `${TRIGGERS_URL}/202/runs`) {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (
+          (url === `${TRIGGERS_URL}/201` || url === `${TRIGGERS_URL}/202`) &&
+          init?.method === "PATCH"
+        ) {
+          patchedId = Number(url.split("/").pop())
+          const target = triggers.find((item) => item.id === patchedId)!
+          const patch = init.body ? JSON.parse(init.body) : {}
+          return Promise.resolve(jsonResponse({ ...target, ...patch }))
+        }
+        return Promise.resolve(jsonResponse([]))
+      },
+    )
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    // Manage list, newest first: [Newer schedule (202), Older schedule (201)].
+    await screen.findByText("Newer schedule")
+    const editButtons = screen.getAllByRole("button", { name: "triggers.actions.edit" })
+    // Open the OLDER (second-in-list) trigger's editor.
+    fireEvent.click(editButtons[1])
+    await screen.findByText("triggers.schedule.recurrenceLabel")
+
+    // Both triggers are disabled, so the derived header switch starts off.
+    const headerSwitch = screen.getByRole("switch")
+    expect(headerSwitch).toHaveAttribute("aria-checked", "false")
+    fireEvent.click(headerSwitch)
+
+    await waitFor(() => {
+      expect(patchedId).toBe(201)
+    })
+  })
 })
 
 describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
@@ -2128,6 +2243,145 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     })
   })
 
+  // PR #1051 review, N2: the backend's documented cron semantics fire an
+  // hourly/custom schedule immediately on the next scan tick when its picked
+  // start instant has already passed (its own test on the backend side) —
+  // this is UI-only, warning the user up front instead of surprising them
+  // after Save. daily/weekly/monthly never "catch up" that way, so the hint
+  // must not appear for them even with a past start date.
+  it("warns inline when an hourly schedule's picked start instant has already passed", async () => {
+    await openScheduleDraft()
+
+    // Default recurrence is hourly; set the start date far enough in the
+    // past that the anchor (start date + its own time input) is
+    // unambiguously behind "now".
+    fireEvent.change(document.getElementById("schedule-start-date") as HTMLInputElement, {
+      target: { value: "2020-01-01" },
+    })
+
+    expect(
+      await screen.findByText("triggers.schedule.runsImmediatelyHint"),
+    ).toBeInTheDocument()
+  })
+
+  it("does not warn when an hourly schedule's picked start instant is in the future", async () => {
+    await openScheduleDraft()
+
+    fireEvent.change(document.getElementById("schedule-start-date") as HTMLInputElement, {
+      target: { value: "2999-01-01" },
+    })
+
+    expect(
+      screen.queryByText("triggers.schedule.runsImmediatelyHint"),
+    ).not.toBeInTheDocument()
+  })
+
+  it("does not warn for a daily schedule even with a past start date", async () => {
+    await openScheduleDraft()
+    fireEvent.click(screen.getByText("triggers.schedule.daily"))
+
+    fireEvent.change(document.getElementById("schedule-start-date") as HTMLInputElement, {
+      target: { value: "2020-01-01" },
+    })
+
+    expect(
+      screen.queryByText("triggers.schedule.runsImmediatelyHint"),
+    ).not.toBeInTheDocument()
+  })
+
+  // PR #1051 review, N2 follow-up: scheduleFieldsFromConfig derives
+  // startDate/timeOfDay from the trigger's STORED config, which is frozen
+  // at creation time and never rewritten by the backend scan loop (only the
+  // next_run_at DB COLUMN is advanced — see triggers.py's
+  // _apply_trigger_updates). So any hourly/custom trigger that's already
+  // fired at least once reconstructs with a past startDate on every reopen,
+  // even though resaving with no schedule-relevant change will NOT actually
+  // recompute next_run_at server-side (_schedule_signature sees no diff) —
+  // the warning must only fire when a schedule-relevant field genuinely
+  // differs from what was loaded.
+  it("does not warn when reopening an already-fired hourly trigger with only an unrelated field changed", async () => {
+    const trigger = makeTrigger({
+      id: 96,
+      type: "scheduled",
+      name: "Old hourly",
+      config: {
+        recurrence: "hourly",
+        interval_seconds: 3600,
+        next_run_at: "2020-01-01T09:00:00+00:00",
+      },
+    })
+    apiRequestMock.mockImplementation(
+      (url: string, init?: { method?: string; body?: string }) => {
+        if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+        if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+          return Promise.resolve(jsonResponse([trigger]))
+        }
+        if (url === `${TRIGGERS_URL}/96/runs`) return Promise.resolve(jsonResponse([]))
+        return Promise.resolve(jsonResponse([]))
+      },
+    )
+    render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    await screen.findByText("triggers.schedule.recurrenceLabel")
+
+    // Reopening alone (no edits at all yet) must not warn.
+    expect(
+      screen.queryByText("triggers.schedule.runsImmediatelyHint"),
+    ).not.toBeInTheDocument()
+
+    // An edit to a field that has nothing to do with the schedule (the
+    // prompt) must not make the (still-unchanged) past anchor start warning.
+    const promptField = await screen.findByLabelText("triggers.form.schedulePrompt")
+    fireEvent.change(promptField, { target: { value: "Say hello" } })
+
+    expect(
+      screen.queryByText("triggers.schedule.runsImmediatelyHint"),
+    ).not.toBeInTheDocument()
+  })
+
+  it("still warns when an existing hourly trigger's schedule is genuinely edited into the past", async () => {
+    const trigger = makeTrigger({
+      id: 97,
+      type: "scheduled",
+      name: "Old hourly",
+      config: {
+        recurrence: "hourly",
+        interval_seconds: 3600,
+        next_run_at: "2999-01-01T09:00:00+00:00",
+      },
+    })
+    apiRequestMock.mockImplementation(
+      (url: string, init?: { method?: string; body?: string }) => {
+        if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse([]))
+        if (url === TRIGGERS_URL && (!init?.method || init.method === "GET")) {
+          return Promise.resolve(jsonResponse([trigger]))
+        }
+        if (url === `${TRIGGERS_URL}/97/runs`) return Promise.resolve(jsonResponse([]))
+        return Promise.resolve(jsonResponse([]))
+      },
+    )
+    render(<AgentTriggersDialog agentId={42} open onOpenChange={vi.fn()} />)
+    fireEvent.click(await screen.findByText("triggers.cards.scheduled.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    await screen.findByText("triggers.schedule.recurrenceLabel")
+
+    // No warning yet: the loaded anchor (2999) is in the future.
+    expect(
+      screen.queryByText("triggers.schedule.runsImmediatelyHint"),
+    ).not.toBeInTheDocument()
+
+    // A genuine schedule edit — moving the start date into the past —
+    // differs from what was loaded, so the warning must still fire.
+    fireEvent.change(document.getElementById("schedule-start-date") as HTMLInputElement, {
+      target: { value: "2020-01-01" },
+    })
+
+    expect(
+      await screen.findByText("triggers.schedule.runsImmediatelyHint"),
+    ).toBeInTheDocument()
+  })
+
   // One test per buildConfig validation-throw path: none of these were
   // exercised at all before, so a regression in any of them (e.g. a
   // guard silently removed) would ship undetected.
@@ -2417,7 +2671,15 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
     await screen.findByText("triggers.schedule.recurrenceLabel")
 
-    expect(document.getElementById("schedule-start-date")).toHaveValue(localIsoDate(new Date()))
+    // The fixture's configured timezone is "UTC" (see noStartAt above), and
+    // the code under test computes today's date via
+    // zonedIsoDate(new Date(), configuredTimezone) — asserting against
+    // localIsoDate(new Date()) (the TEST MACHINE's own local timezone)
+    // instead made this flaky: it only passed when the CI runner's local
+    // calendar date happened to match UTC's at the moment of the assertion.
+    expect(document.getElementById("schedule-start-date")).toHaveValue(
+      zonedIsoDate(new Date(), "UTC"),
+    )
 
     // And Save (unrelated no-op edit) must succeed rather than throwing the
     // "start date is required" validation error. Clear prior call history

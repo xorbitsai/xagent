@@ -3803,7 +3803,8 @@ Build when you need.`,
       summaryStartsOnly: "{base} - starts {date}",
       summaryStartsWithTime: "{base} - starts {date} at {time}",
       summaryWithTimezone: "{base} ({timezone})",
-      timezoneLabel: "Timezone: {timezone}"
+      timezoneLabel: "Timezone: {timezone}",
+      runsImmediatelyHint: "This will run immediately after saving, since the start time you picked has already passed."
     },
     secret: {
       title: "Copy this secret now. It is shown only once.",

@@ -3803,7 +3803,8 @@ const zh = {
       summaryStartsOnly: "{base}，从 {date} 开始",
       summaryStartsWithTime: "{base}，从 {date} {time} 开始",
       summaryWithTimezone: "{base}（{timezone}）",
-      timezoneLabel: "时区：{timezone}"
+      timezoneLabel: "时区：{timezone}",
+      runsImmediatelyHint: "由于所选的开始时间已过，保存后将立即运行一次。"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。",

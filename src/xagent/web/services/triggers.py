@@ -13,8 +13,8 @@ from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -503,10 +503,20 @@ def _schedule_signature(config: dict[str, Any]) -> tuple[Any, ...]:
     for field in _SCHEDULE_RELEVANT_CONFIG_FIELDS:
         value = config.get(field)
         if field == "time_of_day" and value is not None:
-            try:
-                value = normalize_time_of_day(value).strftime("%H:%M")
-            except ValueError:
-                pass  # Malformed values still compare (in)equal on the raw input.
+            if isinstance(value, str) and not value.strip():
+                # A present-but-blank time_of_day (accepted for hourly/custom
+                # since the F6 fix — see ScheduledTriggerConfig's model
+                # validator) must compare equal to an ABSENT time_of_day key,
+                # same as start_at's blank/missing handling just below —
+                # otherwise a direct API client resending "" where the stored
+                # config has no time_of_day at all trips a spurious signature
+                # mismatch and an unwanted recompute (PR #1051 review, N-follow-up).
+                value = None
+            else:
+                try:
+                    value = normalize_time_of_day(value).strftime("%H:%M")
+                except ValueError:
+                    pass  # Malformed values still compare (in)equal on the raw input.
         elif field == "weekdays" and isinstance(value, list):
             try:
                 value = sorted(normalize_weekdays(value))
@@ -529,6 +539,53 @@ def _schedule_signature(config: dict[str, Any]) -> tuple[Any, ...]:
                 pass
         normalized.append(value)
     return tuple(normalized)
+
+
+def _is_benign_start_at_backfill(
+    old_config: dict[str, Any], new_config: dict[str, Any]
+) -> bool:
+    """True when the only schedule-relevant difference between an existing
+    trigger's stored config and a freshly resubmitted one is that `start_at`
+    went from wholly absent to today's date (in the schedule's own
+    timezone) — the shape the editor's F5 default produces for a calendar
+    trigger with no stored anchor, even on a Save that touches nothing else
+    schedule-related.
+
+    Without this, _apply_trigger_updates's "did the schedule actually
+    change" check (comparing _schedule_signature) sees a genuine diff
+    (None -> a date) and recomputes next_run_at from today, which can move
+    it EARLIER than the schedule's already-computed next occurrence, purely
+    as a side effect of what looks like a no-op Save (PR #1051 review, N8).
+    """
+    old_signature = _schedule_signature(old_config)
+    new_signature = _schedule_signature(new_config)
+    if old_signature == new_signature:
+        return False  # not this case; the caller already treats it as unchanged
+    start_at_index = _SCHEDULE_RELEVANT_CONFIG_FIELDS.index("start_at")
+    old_start_at = old_signature[start_at_index]
+    # A stored start_at of "" (present key, blank value) must count as
+    # "wholly absent" here too, same as _compute_next_run_at's and
+    # _schedule_signature's own .strip() convention for this field — a bare
+    # `is not None` check misses a literal empty string, wrongly concluding a
+    # real anchor already existed and skipping the benign-backfill detection
+    # (PR #1051 review, N8 follow-up).
+    if old_start_at is not None and not (
+        isinstance(old_start_at, str) and not old_start_at.strip()
+    ):
+        return False  # a real anchor already existed; not the F5 backfill shape
+    if (
+        old_signature[:start_at_index] != new_signature[:start_at_index]
+        or old_signature[start_at_index + 1 :] != new_signature[start_at_index + 1 :]
+    ):
+        return False  # something else also changed; a genuine schedule edit
+    new_start_at = new_signature[start_at_index]
+    if not isinstance(new_start_at, str):
+        return False
+    try:
+        tz = _schedule_tzinfo(new_config)
+    except TriggerServiceError:
+        return False
+    return new_start_at == _now().astimezone(tz).date().isoformat()
 
 
 def _typed_config_error(trigger_type: str, exc: ValidationError) -> TriggerServiceError:
@@ -561,12 +618,65 @@ def _resolve_gmail_resource(
     return email
 
 
+def _is_legacy_non_calendar_timezone_config(config: dict[str, Any]) -> bool:
+    """True for a scheduled config combining a non-calendar recurrence
+    (hourly/custom/a bare next_run_at one-shot) with a `timezone` field —
+    allowed before this PR added schema validation, now rejected by
+    ScheduledTriggerConfig's model validator."""
+    if not isinstance(config, dict):
+        return False
+    recurrence = config.get("recurrence")
+    is_non_calendar = recurrence not in ("daily", "weekly", "monthly")
+    return is_non_calendar and config.get("timezone") is not None
+
+
+def _tolerate_legacy_timezone_field(
+    config: dict[str, Any], existing_config: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Drop a stray `timezone` from a non-calendar scheduled config before
+    strict typed validation — but only when this trigger's OWN previously
+    stored config already carried that exact legacy shape AND the same
+    `timezone` VALUE is being resent unchanged (PR #1051 review, N7). That
+    signal distinguishes a read-then-write round-trip of already-stored
+    legacy data (allowed before this PR's schema validation) from a client
+    freshly authoring a new, contradictory config: a brand-new trigger has no
+    `existing_config` and is always validated strictly, and an update whose
+    OLD config didn't already mix these fields is too — only a trigger that
+    already had both fields set gets the pass, and only for as long as it
+    keeps resending that same legacy shape.
+
+    Checking only the SHAPE (non-calendar recurrence + a timezone present)
+    on both sides isn't enough: it would let a trigger with genuine legacy
+    config `{recurrence: "hourly", timezone: "Asia/Shanghai"}` be resaved
+    with `{recurrence: "custom", timezone: "Pacific/Auckland"}` and still
+    slip through, since both configs independently satisfy the loose shape
+    even though the actual timezone value changed. Requiring the OLD and NEW
+    `timezone` values to match exactly closes that: a client can keep
+    resending its own already-stored legacy pair indefinitely, but can't use
+    the leniency to author a new, different one.
+
+    The stripped field is used for validation only; the caller's original
+    `config` (still carrying `timezone`) is what actually gets persisted,
+    consistent with this module never rewriting stored JSON.
+    """
+    if not _is_legacy_non_calendar_timezone_config(config):
+        return config
+    if not _is_legacy_non_calendar_timezone_config(existing_config or {}):
+        return config
+    if (existing_config or {}).get("timezone") != config.get("timezone"):
+        return config
+    tolerant = dict(config)
+    tolerant.pop("timezone", None)
+    return tolerant
+
+
 def _validate_config(
     db: Session,
     *,
     user_id: int,
     trigger_type: str,
     config: dict[str, Any],
+    existing_config: dict[str, Any] | None = None,
 ) -> str | None:
     """Validate config against the typed schema; return the resource identity.
 
@@ -575,15 +685,22 @@ def _validate_config(
     validate against the typed schema directly. The stored config keeps the
     caller-provided JSON shape; validation is performed on the typed model
     without normalizing persisted fields.
+
+    ``existing_config`` (an update's previous stored config, absent on
+    create) enables narrow backward-compat leniency for legacy scheduled
+    configs — see ``_tolerate_legacy_timezone_field``.
     """
     if not isinstance(config, dict):
         raise TriggerServiceError("config must be an object")
+    validated_config = config
+    if trigger_type == TriggerType.SCHEDULED.value:
+        validated_config = _tolerate_legacy_timezone_field(config, existing_config)
     provider = maybe_get_trigger_provider(trigger_type)
     try:
         if provider is not None:
-            typed = provider.validate_config(config)
+            typed = provider.validate_config(validated_config)
         else:
-            typed = parse_trigger_config(trigger_type, config)
+            typed = parse_trigger_config(trigger_type, validated_config)
     except TriggerConfigError as exc:
         cause = exc.__cause__
         if isinstance(cause, ValidationError):
@@ -931,6 +1048,7 @@ def _apply_trigger_updates(
             user_id=user_id,
             trigger_type=str(trigger.type),
             config=config,
+            existing_config=old_config,
         )
         setattr(trigger, "config", config)
         setattr(trigger, "resource_id", resource_id)
@@ -973,12 +1091,48 @@ def _apply_trigger_updates(
             # scan's idempotency key is derived from the due instant and
             # would collide with the already-consumed run). Clamp the same
             # way an intentional schedule edit does.
-            setattr(
-                trigger,
-                "next_run_at",
-                _compute_next_run_at(new_config, allow_past_explicit=False),
-            )
-        elif _schedule_signature(new_config) != _schedule_signature(old_config):
+            #
+            # A bare `{"enabled": true}` PATCH (no "config" key) reaches here
+            # WITHOUT ever going through `_validate_config` above — including
+            # its `interval_seconds` upper-bound check — so a stale stored
+            # config predating that cap (or otherwise malformed) can still
+            # make `_compute_next_run_at` raise here. Unlike the scheduled
+            # scan loop (an unattended background process, where the right
+            # move is to silently disable the trigger and keep going), this
+            # is a synchronous request a user is waiting on, so turn the
+            # failure into a clean, actionable `TriggerServiceError` — the
+            # API layer already maps that to a 4xx — instead of letting a
+            # bare ValueError/OverflowError escape as a generic 500 (PR
+            # #1051 review, third round).
+            try:
+                recomputed_next_run_at = _compute_next_run_at(
+                    new_config, allow_past_explicit=False
+                )
+            except (ValueError, ArithmeticError) as exc:
+                raise TriggerServiceError(
+                    "Cannot re-enable this trigger: its stored schedule "
+                    f"config is invalid ({exc}). Edit the schedule and try "
+                    "again."
+                ) from exc
+            setattr(trigger, "next_run_at", recomputed_next_run_at)
+        elif _schedule_signature(new_config) != _schedule_signature(
+            old_config
+        ) and not (
+            # The benign-backfill heuristic is specifically tuned to the
+            # agent-triggers dialog's F5 auto-fill default (see
+            # _is_benign_start_at_backfill's docstring) — it has no way to
+            # distinguish that from a workforce-trigger owner deliberately
+            # setting start_at to today via a real edit, since this function
+            # is shared by both update_agent_trigger and
+            # update_workforce_trigger. `trigger.workforce_id is None` is the
+            # same existing signal _apply_trigger_updates already uses just
+            # above (_reject_workforce_connector_runtime) to distinguish an
+            # agent-owned trigger from a workforce-owned one — reused here
+            # rather than threading a new parameter through both callers
+            # (PR #1051 review, N8 follow-up).
+            trigger.workforce_id is None
+            and _is_benign_start_at_backfill(old_config, new_config)
+        ):
             # The schedule was intentionally changed. Recompute, but don't
             # let a still-past explicit next_run_at — unchanged from a much
             # earlier creation, now stale — rewind an already-armed
@@ -989,12 +1143,14 @@ def _apply_trigger_updates(
                 "next_run_at",
                 _compute_next_run_at(new_config, allow_past_explicit=False),
             )
-        # else: already enabled, schedule fields unchanged — leave
-        # next_run_at as its current, possibly scan-advanced value. Blindly
-        # recomputing here on every edit that resends an unchanged schedule
-        # (rename, prompt tweak, secret rotation, or an incidental timezone
-        # re-derivation) would re-read the same stored explicit anchor and
-        # re-arm an already-progressed schedule back to a stale due time.
+        # else: already enabled, schedule fields unchanged (or the only
+        # change is _is_benign_start_at_backfill's harmless start_at
+        # backfill, see N8) — leave next_run_at as its current, possibly
+        # scan-advanced value. Blindly recomputing here on every edit that
+        # resends an unchanged schedule (rename, prompt tweak, secret
+        # rotation, or an incidental timezone re-derivation) would re-read
+        # the same stored explicit anchor and re-arm an already-progressed
+        # schedule back to a stale due time.
 
     db.add(trigger)
     db.commit()
@@ -1810,6 +1966,71 @@ async def dispatch_pending_trigger_runs(
     return started_count
 
 
+# Counter tracking consecutive prepare_trigger_run failures per trigger (PR
+# #1051 review, N follow-up; persisted per a later review round). A single
+# failure here is expected and routinely transient (see the except clause
+# below), so it must not disable the trigger or surface anything — but a
+# trigger that fails EVERY tick for a while is no longer just an unlucky
+# race, and was previously retried forever with zero user-visible signal.
+#
+# Persisted on AgentTrigger.consecutive_prepare_failures rather than an
+# in-process dict: this scan runs from at least two genuinely separate OS
+# processes concurrently in the documented deployment topology (the backend's
+# in-process asyncio dispatcher, see _run_trigger_dispatcher in web/app.py,
+# AND a separate Celery beat/worker scan, see web/jobs/trigger_tasks.py) —
+# a per-process dict can split one trigger's failures across processes such
+# that NEITHER ever reaches the threshold, and — worse — the recovery-clear
+# check only seeing its own process's dict means a later successful prepare
+# handled by a DIFFERENT process than the one that set the failed badge would
+# never clear it, permanently misleading the user. Reading/writing the
+# trigger's own row makes both the increment and the clear correct across
+# processes: the increment uses a single atomic `UPDATE ... SET
+# consecutive_prepare_failures = COALESCE(...) + 1` (not a Python
+# read-then-write) so a lost update between two concurrent processes is far
+# less likely than with the old per-process counter, and the clear reads the
+# row fresh (db.refresh) so it always sees the latest cross-process state.
+_PREPARE_FAILURE_SURFACE_THRESHOLD = 5
+
+
+def _increment_consecutive_prepare_failures(db: Session, trigger: AgentTrigger) -> int:
+    """Atomically bump the trigger's persisted failure counter; return the
+    new, authoritative value (shared across every process scanning this
+    trigger, not just this one)."""
+    db.execute(
+        update(AgentTrigger)
+        .where(AgentTrigger.id == trigger.id)
+        .values(
+            consecutive_prepare_failures=func.coalesce(
+                AgentTrigger.consecutive_prepare_failures, 0
+            )
+            + 1
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    db.refresh(trigger)
+    return int(trigger.consecutive_prepare_failures or 0)
+
+
+def _clear_consecutive_prepare_failures_if_recovered(
+    db: Session, trigger: AgentTrigger
+) -> None:
+    """After a genuinely clean prepare_trigger_run call this tick, clear the
+    persisted counter and any stale failed badge this same guard set on a
+    previous tick — reading the trigger's own row fresh (not an in-process
+    dict) so this is correct even when the failures being cleared were
+    accumulated by a different process than the one running this tick."""
+    db.refresh(trigger)
+    if trigger.consecutive_prepare_failures is None:
+        return
+    setattr(trigger, "consecutive_prepare_failures", None)
+    if trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value:
+        setattr(trigger, "provisioning_status", None)
+        setattr(trigger, "provisioning_error", None)
+    db.add(trigger)
+    db.commit()
+
+
 def scan_due_scheduled_triggers(
     db: Session,
     *,
@@ -1839,6 +2060,7 @@ def scan_due_scheduled_triggers(
             "due_at": due_at.isoformat(),
         }
         source_event_id = f"scheduled:{trigger.id}:{due_at.isoformat()}"
+        prepare_run_failed_this_tick = False
         try:
             run, _created = prepare_trigger_run(
                 db,
@@ -1852,9 +2074,85 @@ def scan_due_scheduled_triggers(
         except TriggerRunPreparationError as exc:
             # Scheduled events have no redelivery; the FAILED run is the
             # record. Keep advancing next_run_at so the schedule stays live.
+            # This is still a failure for THIS tick (just a different failure
+            # mode than the except clause below) — flagged so the
+            # recovered-so-clear-the-badge block further down doesn't mistake
+            # "didn't hit the other except clause" for "genuinely succeeded".
             run = exc.run
+            prepare_run_failed_this_tick = True
+        except (ValueError, IntegrityError, OperationalError):
+            # `TriggerServiceError` (a `ValueError` subclass) here is
+            # realistically either "Trigger is disabled" (prepare_trigger_run's
+            # own guard) — a legitimate race if another request disabled this
+            # trigger between this scan's due-triggers query and this call —
+            # or a bare `ValueError` raised by `_get_encryption_key` when
+            # `ENCRYPTION_KEY` is unset in a non-development environment and
+            # this trigger's config has `store_full_payload: true`
+            # (encrypt_value -> _payload_snapshot -> _get_or_create_trigger_run,
+            # see core/utils/encryption.py). `IntegrityError`/`OperationalError`
+            # cover a bare insert-conflict escaping _get_or_create_trigger_run's
+            # own retry, or a transient DB/connection hiccup on its commit.
+            # None of these have a TriggerRun to keep advancing. Triggers are
+            # scanned in next_run_at ASC order, so letting this propagate
+            # would abort the whole batch and starve every trigger ordered
+            # after this one — roll back and move on to the next due trigger
+            # instead; this one is retried on the next scan tick since its
+            # next_run_at is left untouched. Widened from just
+            # `TriggerServiceError` to bare `ValueError` (still meaningfully
+            # narrower than a bare `except Exception`, so a genuinely
+            # unexpected exception type — e.g. AttributeError/KeyError/TypeError
+            # from a real bug — still propagates and aborts the batch loudly
+            # instead of being silently absorbed) (PR #1051 review, N follow-up).
+            logger.exception(
+                "Failed to prepare trigger run for trigger %s; skipping it this tick",
+                trigger.id,
+            )
+            db.rollback()
+            failure_count = _increment_consecutive_prepare_failures(db, trigger)
+            if failure_count >= _PREPARE_FAILURE_SURFACE_THRESHOLD:
+                # A one-off failure above is expected and silently retried by
+                # design — but this many consecutive scan ticks failing for
+                # the SAME trigger is no longer just an unlucky race.
+                # Surface it (same field the Gmail provider and the
+                # recompute-failure guard below use) WITHOUT disabling the
+                # trigger: unlike a bad schedule config (permanent until
+                # edited), a run-preparation failure is commonly a transient
+                # infrastructure issue, so silently killing the schedule over
+                # something that may self-resolve would trade one silent
+                # failure mode for a worse one. It keeps retrying every tick;
+                # this is purely a visibility improvement.
+                logger.warning(
+                    "Trigger %s has failed to prepare a run %s times in a row",
+                    trigger.id,
+                    failure_count,
+                )
+                setattr(
+                    trigger,
+                    "provisioning_status",
+                    TriggerProvisioningStatus.FAILED.value,
+                )
+                setattr(
+                    trigger,
+                    "provisioning_error",
+                    "Repeated failures preparing a run "
+                    f"({failure_count} consecutive attempts); still "
+                    "retrying automatically.",
+                )
+                db.add(trigger)
+                db.commit()
+            continue
+
+        if not prepare_run_failed_this_tick:
+            # Only a genuinely clean prepare_trigger_run call this tick counts
+            # as "recovered" — a TriggerRunPreparationError above still means
+            # the trigger is failing (just via a different failure mode), so
+            # that branch sets prepare_run_failed_this_tick and must not let
+            # this cleanup fire despite not going through the except clause
+            # just above that increments the counter.
+            _clear_consecutive_prepare_failures_if_recovered(db, trigger)
 
         config = dict(trigger.config or {})
+        disable_reason: str | None = None
         try:
             next_run_at = _compute_next_run_at(
                 config,
@@ -1862,21 +2160,43 @@ def scan_due_scheduled_triggers(
                 previous_due_at=due_at,
                 include_explicit=False,
             )
-        except TriggerServiceError:
+        except (ValueError, ArithmeticError) as exc:
             # Triggers are scanned in next_run_at ASC order, so an unguarded
             # raise here would leave this trigger's next_run_at unadvanced
             # and permanently first in line — wedging every trigger ordered
             # after it on every subsequent scan. Disable it instead, the same
             # way an unschedulable (next_run_at is None) trigger already is
-            # just below.
+            # just below. `ValueError` covers TriggerServiceError (a
+            # ValueError subclass — every malformed-field case
+            # _compute_next_run_at itself raises) and `ArithmeticError`
+            # covers the bare OverflowError a pathological config (e.g. an
+            # absurd interval_seconds predating this PR's upper-bound cap)
+            # can raise out of the alignment arithmetic. Deliberately NOT a
+            # bare `except Exception`: that would also swallow a genuine,
+            # unrelated programming bug (e.g. a future AttributeError) as if
+            # it were just a bad config, silently disabling the trigger
+            # instead of surfacing the bug loudly (PR #1051 review, N follow-up).
             logger.exception(
                 "Failed to recompute next_run_at for trigger %s; disabling it",
                 trigger.id,
             )
             next_run_at = None
+            disable_reason = (
+                f"Disabled automatically: failed to compute the next run "
+                f"time ({type(exc).__name__}: {exc})."
+            )
         setattr(trigger, "next_run_at", next_run_at)
         if next_run_at is None:
             setattr(trigger, "enabled", False)
+        if disable_reason is not None:
+            # Surface the failure on the trigger itself (the same field the
+            # Gmail provider uses to report provisioning failures) — a plain
+            # logger.exception is invisible to the user, who otherwise just
+            # sees a schedule that silently stopped firing.
+            setattr(
+                trigger, "provisioning_status", TriggerProvisioningStatus.FAILED.value
+            )
+            setattr(trigger, "provisioning_error", disable_reason)
         db.add(trigger)
         db.commit()
         runs.append(run)

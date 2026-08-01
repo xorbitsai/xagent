@@ -471,6 +471,46 @@ def test_loader_one_bad_skill_does_not_poison_the_run(db_session) -> None:
     assert not report.ok
 
 
+def test_loader_reports_a_clear_error_for_a_legacy_interval_above_the_cap(
+    db_session,
+) -> None:
+    """A legacy schedule with a pathologically large interval_seconds (the
+    original N1 bug: unbounded, could overflow _compute_next_run_at's
+    alignment arithmetic at scan time) is now rejected by
+    ScheduledTriggerConfig's _MAX_INTERVAL_SECONDS cap during migration too,
+    instead of importing successfully and only failing much later at scan
+    time. This must be recorded in the migration report's errors with a
+    clear, actionable message (PR #1051 review, N1 follow-up) — not silently
+    vanish from the imported count, and not just a generic exception dump."""
+    from xagent.web.services.trigger_providers.schemas import _MAX_INTERVAL_SECONDS
+
+    user = _make_user(db_session)
+    bundle = MigrationBundle(source="hermes", source_root="x")
+    pathological_interval = _MAX_INTERVAL_SECONDS + 1
+    bundle.schedules = [
+        ScheduleItem(
+            name="ancient-heartbeat",
+            prompt="tick",
+            interval_seconds=pathological_interval,
+        ),
+        ScheduleItem(name="tick", prompt="tick", interval_seconds=60),
+    ]
+
+    report = MigrationLoader(db_session, user=user).load(bundle)
+
+    assert len(report.errors) == 1
+    assert "ancient-heartbeat" in report.errors[0]
+    # The underlying pydantic validation message, not just a bare exception
+    # class/repr — actionable enough that whoever reviews migration reports
+    # can tell what happened and why.
+    assert "interval_seconds" in report.errors[0]
+    assert str(_MAX_INTERVAL_SECONDS) in report.errors[0]
+    # The oversized schedule is skipped, but everything after it still
+    # imports — same "one bad item doesn't poison the run" guarantee as the
+    # skill-conflict path above.
+    assert report.schedules_imported == ["tick"]
+
+
 def test_loader_normalizes_skill_names_to_hub_rules(db_session) -> None:
     from xagent.web.models.skill import UserSkill
 

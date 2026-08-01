@@ -109,6 +109,15 @@ class AgentTrigger(Base):  # type: ignore
     secret_encrypted = Column(Text, nullable=True)
     provisioning_status = Column(String(32), nullable=True)
     provisioning_error = Column(Text, nullable=True)
+    # Persisted (not in-process) counter of consecutive prepare_trigger_run
+    # failures for this trigger's scheduled scan, so the "surface after N
+    # repeated failures" heuristic in scan_due_scheduled_triggers (and its
+    # recovery-clear counterpart) is correct across the two separate
+    # processes that call it concurrently (the backend's in-process asyncio
+    # dispatcher and the Celery beat/worker scan) rather than split across
+    # disjoint per-process dicts. None means "no failures currently tracked"
+    # (never failed, or cleared after a recovery); reset to None on success.
+    consecutive_prepare_failures = Column(Integer, nullable=True, default=None)
 
     next_run_at = Column(DateTime(timezone=True), nullable=True, index=True)
     last_run_at = Column(DateTime(timezone=True), nullable=True)

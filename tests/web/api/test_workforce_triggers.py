@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -557,6 +558,80 @@ def test_scheduled_workforce_trigger_scan_and_dispatch(mock_bg_scheduler) -> Non
         assert task.status == TaskStatus.RUNNING
     finally:
         db.close()
+
+
+def test_workforce_scheduled_trigger_start_at_backfill_is_not_treated_as_benign() -> (
+    None
+):
+    # PR #1051 review, N8 follow-up: _is_benign_start_at_backfill's "None ->
+    # today" heuristic (see test_scheduled_start_at_backfill_alone_does_not_reset_next_run_at
+    # in test_agent_triggers.py, which asserts the OPPOSITE outcome for an
+    # agent-owned trigger on the identical config diff) is tuned specifically
+    # to the agent-triggers dialog's F5 auto-fill default — but
+    # _apply_trigger_updates is shared by both update_agent_trigger and
+    # update_workforce_trigger. Without narrowing the suppression to
+    # agent-owned triggers, a workforce-trigger owner's genuine start_at edit
+    # (None -> today) would be silently swallowed the exact same way.
+    headers = _admin_headers()
+    workforce_id = _create_workforce(headers, publish=True)
+    created = client.post(
+        f"/api/workforces/{workforce_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Workforce weekly",
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    # Simulate "already advanced by a prior scan" with an unmistakable
+    # sentinel far in the future. _compute_next_run_at never reads the
+    # CURRENT next_run_at column when recomputing — it always derives a
+    # fresh value from config + now — so this sentinel is exactly what a
+    # wrongly-suppressed update would leave in place, and exactly what a
+    # genuine recompute overwrites. A fixed sentinel (rather than comparing
+    # against the creation-time value) avoids this test's correctness
+    # depending on the wall clock relative to "09:00" on the day it runs
+    # (the creation-time value and a fresh recompute would otherwise
+    # trivially agree whenever "now" is still before 09:00 UTC).
+    sentinel = datetime.now(timezone.utc) + timedelta(days=400)
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.next_run_at = sentinel
+        db.add(trigger)
+        db.commit()
+    finally:
+        db.close()
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    patched = client.patch(
+        f"/api/workforces/{workforce_id}/triggers/{trigger_id}",
+        headers=headers,
+        json={
+            "config": {
+                "recurrence": "weekly",
+                "time_of_day": "09:00",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                "start_at": today,
+            },
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    recomputed = datetime.fromisoformat(patched.json()["next_run_at"])
+    if recomputed.tzinfo is None:
+        recomputed = recomputed.replace(tzinfo=timezone.utc)
+    # For an agent-owned trigger, this exact diff is suppressed as a benign
+    # backfill and next_run_at is left untouched. A workforce-owned trigger
+    # gets no such leniency: the recompute happens and overwrites the
+    # sentinel with a near-term occurrence.
+    assert abs((recomputed - sentinel).total_seconds()) > 3600
 
 
 def test_workforce_reattach_is_idempotent_on_replay() -> None:

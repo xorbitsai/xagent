@@ -34,7 +34,7 @@ sample_prompts:
     highlights:
     - 监控导出数据
 connections:
-- name: AWSExpand commentComment on line R18Resolved
+- name: AWS
   logo: https://www.google.com/s2/favicons?domain=aws.amazon.com&sz=64
 - name: Slack
   logo: https://www.google.com/s2/favicons?domain=slack.com&sz=64

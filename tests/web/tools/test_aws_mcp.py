@@ -57,6 +57,49 @@ def test_client_error_surfaces_code_and_message(monkeypatch):
     assert "not authorized" in result["message"]
 
 
+def test_access_denied_via_role_arn_gets_a_disambiguating_hint():
+    """PR review finding m5: AccessDenied on a role_arn call could mean the
+    target role's own policy denies the action, OR that this connector's own
+    session policy (_READ_ONLY_SESSION_POLICY) doesn't include it - the raw
+    ClientError looks identical either way, so the role_arn path should name
+    the second possibility explicitly."""
+    exc = _client_error("AccessDenied", "User is not authorized")
+
+    assert "session" in aws._aws_error_message(exc, True).lower()
+
+
+def test_access_denied_without_role_arn_has_no_session_hint():
+    exc = _client_error("AccessDenied", "User is not authorized")
+
+    message = aws._aws_error_message(exc, False)
+
+    assert message == "AccessDenied: User is not authorized"
+
+
+def test_non_access_denied_error_via_role_arn_has_no_session_hint():
+    exc = _client_error("ThrottlingException", "Rate exceeded")
+
+    message = aws._aws_error_message(exc, True)
+
+    assert message == "ThrottlingException: Rate exceeded"
+
+
+def test_access_denied_on_assume_role_itself_has_no_session_hint():
+    """Adversarial-review catch: an AccessDenied raised by the AssumeRole
+    call itself (e.g. the target role's trust policy doesn't allow this
+    principal, or the base credentials lack sts:AssumeRole on that ARN)
+    happens before any session exists, so _READ_ONLY_SESSION_POLICY was
+    never in play. Appending the session-restriction hint here would
+    misdirect an operator toward the wrong fix."""
+    exc = _client_error(
+        "AccessDenied", "not authorized to perform: sts:AssumeRole", "AssumeRole"
+    )
+
+    message = aws._aws_error_message(exc, True)
+
+    assert message == "AccessDenied: not authorized to perform: sts:AssumeRole"
+
+
 def test_describe_alarms_passes_state_filter_and_shapes_output(monkeypatch):
     cloudwatch = Mock()
     cloudwatch.describe_alarms.return_value = {
@@ -522,6 +565,23 @@ def test_assume_role_credentials_uses_caller_attributed_session_name(monkeypatch
     )
 
 
+def test_assume_role_credentials_logs_caller_and_role_for_audit(monkeypatch, caplog):
+    """PR review finding m6: CloudTrail on the *target* account attributes an
+    AssumeRole call via RoleSessionName, but xagent's own logs otherwise have
+    no local record of which caller assumed which role_arn."""
+    monkeypatch.setenv(aws.CALLER_ID_ENV_VAR, "7")
+    sts = _sts_with_assume_role()
+    _patch_boto3_session(monkeypatch, lambda service, **kwargs: sts)
+
+    with caplog.at_level("INFO", logger=aws.logger.name):
+        aws._assume_role_credentials("arn:aws:iam::2:role/read", "us-east-1")
+
+    assert any(
+        "7" in record.message and "arn:aws:iam::2:role/read" in record.message
+        for record in caplog.records
+    )
+
+
 def test_assume_role_credentials_scopes_the_session_to_read_only_actions(monkeypatch):
     """PR review finding NEW-M1: role_arn is a model-supplied ARN with no
     operator-side allowlist, so the assumed session's actual permissions
@@ -535,9 +595,9 @@ def test_assume_role_credentials_scopes_the_session_to_read_only_actions(monkeyp
     aws._assume_role_credentials("arn:aws:iam::2:role/read", "us-east-1")
 
     policy = json.loads(sts.assume_role.call_args.kwargs["Policy"])
-    statement = policy["Statement"][0]
-    assert statement["Effect"] == "Allow"
-    assert statement["Resource"] == "*"
+    main_statement, kms_statement = policy["Statement"]
+    assert main_statement["Effect"] == "Allow"
+    assert main_statement["Resource"] == "*"
     # Exact equality, not just a subset check: a subset check alone would
     # still pass if a future tool's action were added to the connector's
     # boto3 calls but never added here, silently leaving that tool
@@ -554,12 +614,28 @@ def test_assume_role_credentials_scopes_the_session_to_read_only_actions(monkeyp
         "dynamodb:DescribeTable",
         "sqs:ListQueues",
         "sqs:GetQueueAttributes",
-        # Required alongside logs:FilterLogEvents to read from a log group
-        # encrypted with a customer-managed KMS key.
-        "kms:Decrypt",
-        "kms:DescribeKey",
     }
-    assert set(statement["Action"]) == expected_actions
+    assert set(main_statement["Action"]) == expected_actions
+
+    # PR review finding M2: kms:Decrypt/kms:DescribeKey (required alongside
+    # logs:FilterLogEvents to read from a log group encrypted with a
+    # customer-managed KMS key) live in their own statement, conditioned to
+    # only apply when the KMS call is made on CloudWatch Logs' behalf --
+    # otherwise this would be the one un-conditioned Resource: "*" grant in
+    # an otherwise tightly-scoped policy.
+    assert kms_statement["Effect"] == "Allow"
+    assert kms_statement["Resource"] == "*"
+    assert set(kms_statement["Action"]) == {"kms:Decrypt", "kms:DescribeKey"}
+    assert kms_statement["Condition"] == {
+        "StringLike": {"kms:ViaService": "logs.*.amazonaws.com"}
+    }
+
+
+def test_read_only_session_policy_stays_under_the_sts_inline_policy_limit():
+    """PR review finding n7: AssumeRole's Policy= parameter has a documented
+    ~2048-character limit; a regression guard here catches the policy
+    growing past it before a real AssumeRole call would reject it."""
+    assert len(aws._READ_ONLY_SESSION_POLICY) < 2048
 
 
 def test_client_without_role_arn_uses_env_credentials(monkeypatch):

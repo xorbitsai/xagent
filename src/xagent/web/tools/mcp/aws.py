@@ -62,17 +62,28 @@ _READ_ONLY_SESSION_POLICY = json.dumps(
                     "dynamodb:DescribeTable",
                     "sqs:ListQueues",
                     "sqs:GetQueueAttributes",
-                    # Reading from a CloudWatch Logs group encrypted with a
-                    # customer-managed KMS key requires these in addition to
-                    # logs:FilterLogEvents -- without them, this session
-                    # policy would regress an existing role_arn caller's
-                    # access to an encrypted log group even though the
-                    # target role's own permissions are unchanged.
+                ],
+                "Resource": "*",
+            },
+            {
+                # Reading from a CloudWatch Logs group encrypted with a
+                # customer-managed KMS key requires these in addition to
+                # logs:FilterLogEvents -- without them, this session policy
+                # would regress an existing role_arn caller's access to an
+                # encrypted log group even though the target role's own
+                # permissions are unchanged. Split into its own
+                # conditioned statement (rather than folded into the
+                # Resource: "*" statement above) so the grant only ever
+                # applies to a KMS call made on logs' behalf, not a bare
+                # kms:Decrypt/DescribeKey call against an unrelated key.
+                "Effect": "Allow",
+                "Action": [
                     "kms:Decrypt",
                     "kms:DescribeKey",
                 ],
                 "Resource": "*",
-            }
+                "Condition": {"StringLike": {"kms:ViaService": "logs.*.amazonaws.com"}},
+            },
         ],
     }
 )
@@ -165,6 +176,11 @@ def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str | None
         raise ValueError(
             f"AssumeRole for {role_arn!r} returned an incomplete credential set"
         )
+    # Local audit trail: CloudTrail on the *target* account already
+    # attributes the call via RoleSessionName, but xagent's own logs
+    # otherwise have no record of which caller assumed which role_arn.
+    caller_id = os.environ.get(CALLER_ID_ENV_VAR, "<unknown>")
+    logger.info(f"caller {caller_id} assumed role {role_arn}")
     return {
         "aws_access_key_id": access_key_id,
         "aws_secret_access_key": secret_access_key,
@@ -204,13 +220,39 @@ def _client(
     )
 
 
-def _aws_error_message(exc: Exception) -> str:
+def _aws_error_message(exc: Exception, used_role_arn: bool = False) -> str:
     if isinstance(exc, ClientError):
         error = exc.response.get("Error") or {}
         code = error.get("Code", "")
         message = error.get("Message", "")
         if code or message:
-            return f"{code}: {message}" if code else message
+            result = f"{code}: {message}" if code else message
+            # AccessDenied on a role_arn call's *downstream* service call
+            # (e.g. cloudwatch:DescribeAlarms) could mean the target role
+            # itself doesn't grant the action, OR that this connector's own
+            # inline session policy doesn't include it (see
+            # _READ_ONLY_SESSION_POLICY) -- the two look identical from the
+            # response alone, so name the second possibility explicitly
+            # rather than leaving it read as only a target-role problem.
+            # Excluded when the denial is on AssumeRole itself: at that
+            # point no session has been created yet, so there is nothing
+            # for the session policy to have restricted -- the actual cause
+            # is the target role's trust policy or the base credentials'
+            # own sts:AssumeRole permission, and the hint would misdirect
+            # the operator toward the wrong fix.
+            operation_name = getattr(exc, "operation_name", None)
+            if (
+                used_role_arn
+                and code == "AccessDenied"
+                and operation_name != "AssumeRole"
+            ):
+                result += (
+                    " (this connector's assumed session is restricted to its "
+                    "own read-only calls regardless of the target role's own "
+                    "permissions -- confirm the action is one of the ones "
+                    "this connector makes, not just permitted by role_arn)"
+                )
+            return result
     return str(exc)
 
 
@@ -249,7 +291,7 @@ def aws_get_caller_identity(
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error getting caller identity: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -316,7 +358,7 @@ def aws_cloudwatch_describe_alarms(
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing CloudWatch alarms: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -394,7 +436,7 @@ def aws_cloudwatch_get_metric_data(
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error getting CloudWatch metric data: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -433,7 +475,7 @@ def aws_cloudwatch_describe_log_groups(
         return _success(log_groups=groups, truncated="nextToken" in result)
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing log groups: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -486,7 +528,7 @@ def aws_cloudwatch_filter_log_events(
         return _success(events=events, truncated="nextToken" in result)
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error filtering log events: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -511,7 +553,7 @@ def aws_dynamodb_list_tables(
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing DynamoDB tables: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -555,7 +597,7 @@ def aws_dynamodb_describe_table(
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing DynamoDB table {table_name}: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -585,7 +627,7 @@ def aws_sqs_list_queues(
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing SQS queues: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 @mcp.tool()
@@ -611,7 +653,7 @@ def aws_sqs_get_queue_attributes(
         return _success(attributes=result.get("Attributes") or {})
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error getting SQS queue attributes for {queue_url}: {e}")
-        return _error(_aws_error_message(e))
+        return _error(_aws_error_message(e, bool(role_arn)))
 
 
 if __name__ == "__main__":

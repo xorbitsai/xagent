@@ -36,7 +36,7 @@ APP_ID = "aws"
 ROW = {
     "app_id": APP_ID,
     "name": "AWS",
-    "description": "Read-only for the credentials you provide — but the optional role_arn tool parameter lets the model assume ANY IAM role those credentials are permitted to assume, with no allowlist. Restrict sts:AssumeRole on your base principal's own policy if you don't want cross-account access; the assumed session itself is still capped to this connector's own read-only calls. Reads CloudWatch alarms/metrics/logs, DynamoDB table health, and SQS queue depth for diagnostics.",
+    "description": "Connect to AWS to check CloudWatch alarms/metrics, DynamoDB health, and SQS queue depth.",
     "icon": "https://www.google.com/s2/favicons?domain=aws.amazon.com&sz=128",
     "transport": "stdio",
     "provider_name": None,

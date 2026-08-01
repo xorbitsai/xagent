@@ -471,6 +471,7 @@ def test_client_with_role_arn_assumes_role_on_every_call(monkeypatch):
     assert sts.assume_role.call_count == 2
     sqs_calls = [c for c in session_client.call_args_list if c.args[0] == "sqs"]
     assert sqs_calls[0].kwargs["aws_access_key_id"] == "ASIA-temp"
+    assert sqs_calls[0].kwargs["aws_secret_access_key"] == "temp-secret"
     assert sqs_calls[0].kwargs["aws_session_token"] == "temp-token"
     assert sqs_calls[0].kwargs["config"] == aws.DEFAULT_CLIENT_CONFIG
     sts_calls = [c for c in session_client.call_args_list if c.args[0] == "sts"]
@@ -519,6 +520,46 @@ def test_assume_role_credentials_uses_caller_attributed_session_name(monkeypatch
         sts.assume_role.call_args.kwargs["RoleSessionName"]
         == f"{aws.ASSUME_ROLE_SESSION_NAME}-7"
     )
+
+
+def test_assume_role_credentials_scopes_the_session_to_read_only_actions(monkeypatch):
+    """PR review finding NEW-M1: role_arn is a model-supplied ARN with no
+    operator-side allowlist, so the assumed session's actual permissions
+    otherwise depend entirely on the target role's own policy - there's no
+    IAM-level guarantee it's read-only. The inline session policy must
+    scope the assumed session to exactly this module's read actions,
+    regardless of what the target role itself allows."""
+    sts = _sts_with_assume_role()
+    _patch_boto3_session(monkeypatch, lambda service, **kwargs: sts)
+
+    aws._assume_role_credentials("arn:aws:iam::2:role/read", "us-east-1")
+
+    policy = json.loads(sts.assume_role.call_args.kwargs["Policy"])
+    statement = policy["Statement"][0]
+    assert statement["Effect"] == "Allow"
+    assert statement["Resource"] == "*"
+    # Exact equality, not just a subset check: a subset check alone would
+    # still pass if a future tool's action were added to the connector's
+    # boto3 calls but never added here, silently leaving that tool
+    # unusable under role_arn. This still can't catch a 10th tool's action
+    # being omitted from *both* the implementation and this expected set
+    # at once, but it does catch drift in either alone.
+    expected_actions = {
+        "sts:GetCallerIdentity",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:GetMetricData",
+        "logs:DescribeLogGroups",
+        "logs:FilterLogEvents",
+        "dynamodb:ListTables",
+        "dynamodb:DescribeTable",
+        "sqs:ListQueues",
+        "sqs:GetQueueAttributes",
+        # Required alongside logs:FilterLogEvents to read from a log group
+        # encrypted with a customer-managed KMS key.
+        "kms:Decrypt",
+        "kms:DescribeKey",
+    }
+    assert set(statement["Action"]) == expected_actions
 
 
 def test_client_without_role_arn_uses_env_credentials(monkeypatch):

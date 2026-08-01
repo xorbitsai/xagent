@@ -37,6 +37,46 @@ MAX_METRIC_DATAPOINTS = 1440
 # while keeping a full batch's worst case bounded.
 MAX_LOG_MESSAGE_CHARS = 4000
 
+# role_arn is a model-supplied ARN with no operator-side allowlist, so an
+# assumed session's actual permissions could otherwise be as broad as
+# whatever policy the target role happens to carry -- there's no IAM-level
+# guarantee that role is itself read-only. An inline session policy caps
+# what the *assumed* session can do to exactly the API calls this module
+# makes, regardless of the target role's own permissions: read-only becomes
+# an enforced property of every role_arn call, not just a documentation
+# convention the operator has to trust. Session policies never grant more
+# than the target role's own policy already allows; they only narrow it.
+_READ_ONLY_SESSION_POLICY = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "sts:GetCallerIdentity",
+                    "cloudwatch:DescribeAlarms",
+                    "cloudwatch:GetMetricData",
+                    "logs:DescribeLogGroups",
+                    "logs:FilterLogEvents",
+                    "dynamodb:ListTables",
+                    "dynamodb:DescribeTable",
+                    "sqs:ListQueues",
+                    "sqs:GetQueueAttributes",
+                    # Reading from a CloudWatch Logs group encrypted with a
+                    # customer-managed KMS key requires these in addition to
+                    # logs:FilterLogEvents -- without them, this session
+                    # policy would regress an existing role_arn caller's
+                    # access to an encrypted log group even though the
+                    # target role's own permissions are unchanged.
+                    "kms:Decrypt",
+                    "kms:DescribeKey",
+                ],
+                "Resource": "*",
+            }
+        ],
+    }
+)
+
 # boto3 defaults (60s connect/read timeout, up to 5 legacy retries) are too
 # generous for a synchronous tool call the LLM is waiting on.
 DEFAULT_CLIENT_CONFIG = Config(
@@ -102,7 +142,11 @@ def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str | None
     sts = boto3.Session().client(
         "sts", region_name=region, config=DEFAULT_CLIENT_CONFIG
     )
-    response = sts.assume_role(RoleArn=role_arn, RoleSessionName=_role_session_name())
+    response = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName=_role_session_name(),
+        Policy=_READ_ONLY_SESSION_POLICY,
+    )
     creds = response.get("Credentials") or {}
     access_key_id = creds.get("AccessKeyId")
     secret_access_key = creds.get("SecretAccessKey")
@@ -191,7 +235,10 @@ def aws_get_caller_identity(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         result = _client("sts", region, role_arn).get_caller_identity()
@@ -221,7 +268,10 @@ def aws_cloudwatch_describe_alarms(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         kwargs: dict[str, Any] = {"MaxRecords": 100}
@@ -288,12 +338,21 @@ def aws_cloudwatch_get_metric_data(
     start_time / end_time: ISO 8601 timestamps, e.g. "2026-07-30T00:00:00Z".
     stat: one of "Average", "Sum", "Minimum", "Maximum", "SampleCount".
     dimensions: e.g. [{"Name": "QueueName", "Value": "my-queue"}].
+    period_seconds: CloudWatch's own retention tiers cap the resolution
+    actually available for older data regardless of this value -- 1-minute
+    for the last 15 days, 5-minute for 15-63 days, 1-hour beyond that --
+    and CloudWatch rounds start_time down to align with whichever tier
+    applies, so a small period_seconds for an old start_time won't add
+    resolution back that was never retained.
     Returns at most 1440 datapoints — narrow the time range or widen
     period_seconds rather than expecting more in one call.
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         metric: dict[str, Any] = {"Namespace": namespace, "MetricName": metric_name}
@@ -350,7 +409,10 @@ def aws_cloudwatch_describe_log_groups(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         # 50, not 100 like the other list-style tools: DescribeLogGroups'
@@ -394,7 +456,10 @@ def aws_cloudwatch_filter_log_events(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         kwargs: dict[str, Any] = {
@@ -433,7 +498,10 @@ def aws_dynamodb_list_tables(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         result = _client("dynamodb", region, role_arn).list_tables(Limit=100)
@@ -456,7 +524,10 @@ def aws_dynamodb_describe_table(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         result = _client("dynamodb", region, role_arn).describe_table(
@@ -498,7 +569,10 @@ def aws_sqs_list_queues(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         kwargs: dict[str, Any] = {"MaxResults": 100}
@@ -525,7 +599,10 @@ def aws_sqs_get_queue_attributes(
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
-    the call.
+    the call -- reachable with no operator-side allowlist if the base
+    credentials permit sts:AssumeRole, but the assumed session is scoped to
+    this connector's own read-only calls regardless of the target role's
+    own permissions.
     """
     try:
         result = _client("sqs", region, role_arn).get_queue_attributes(

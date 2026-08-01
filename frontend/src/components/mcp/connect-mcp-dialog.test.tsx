@@ -702,6 +702,49 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     }
   })
 
+  it("removes the builtin_oauth postMessage listener on dialog close, not just its interval (F6)", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const onSuccess = vi.fn()
+    const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window)
+    try {
+      const { rerender } = render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      fireEvent.click(screen.getByRole("button", { name: "connect-builtin" }))
+
+      // Close the dialog while the popup (and its postMessage listener) is
+      // still outstanding — only clearing the interval (and not this
+      // listener too) would let a real success message fired afterward
+      // still call onSuccess against a dialog the user already closed.
+      rerender(
+        <ConnectMcpDialog
+          open={false}
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+
+      window.dispatchEvent(
+        new MessageEvent("message", { data: { type: "oauth-success" } }),
+      )
+
+      expect(onSuccess).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
   it("keeps masked baseline entries in an MCP user-env replacement", async () => {
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
       if (url.includes("/api/mcp/apps?")) {

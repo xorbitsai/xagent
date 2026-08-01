@@ -1293,6 +1293,69 @@ def test_admin_update_app_enforces_auth_classification() -> None:
             pass
 
 
+def test_admin_update_grandfathers_a_preexisting_bad_shape_row_for_unrelated_edits() -> (
+    None
+):
+    """F4: a row already in an "unconnectable" partial shape (created directly,
+    simulating one that predates a shape rule tightening) must stay editable
+    for fields the shape check doesn't read — otherwise the write-time
+    constraint permanently locks out even an icon change on that row. A PUT
+    that also touches transport/launch_config must still be rejected."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-partial-oauth",
+                    name="LegacyPartialOAuth",
+                    icon="old-icon",
+                    transport="streamable_http",
+                    launch_config={"url": "https://mcp.example.com/mcp"},
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "legacy-partial-oauth")
+                .one()
+                .id
+            )
+        finally:
+            db.close()
+
+        unrelated_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"icon": "new-icon"},
+        )
+        assert unrelated_edit.status_code == 200
+        assert unrelated_edit.json()["icon"] == "new-icon"
+
+        shape_touching_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"launch_config": {"url": "https://mcp.example.com/mcp"}},
+        )
+        assert shape_touching_edit.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_admin_list_apps_does_not_500_on_partial_launch_config_row() -> None:
     """The write-time validator lives on the create model only, so listing must
     not re-validate on response serialization. A legacy/direct-DB row with a

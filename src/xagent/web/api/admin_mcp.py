@@ -222,9 +222,20 @@ def _public_mcp_app_response(app: PublicMCPApp) -> Dict[str, Any]:
     }
 
 
-def _validate_public_mcp_app_values(values: Dict[str, Any]) -> None:
+def _validate_public_mcp_app_values(
+    values: Dict[str, Any], *, enforce_connect_shape: bool = True
+) -> None:
+    # F4: PublicMCPAppCreate's _enforce_auth_classification rejects a
+    # connect-shape that classifies as "unconnectable" (see that validator's
+    # docstring). Applying it unconditionally on every edit would let a shape
+    # rule added after a row was created (or a row otherwise grandfathered
+    # in) permanently block that row's unrelated fields (e.g. icon) from ever
+    # being edited again. Skip that one check — via PublicMCPAppBase, which
+    # PublicMCPAppCreate extends with no other override — when this edit
+    # doesn't touch the fields the shape check reads (transport/launch_config).
+    model = PublicMCPAppCreate if enforce_connect_shape else PublicMCPAppBase
     try:
-        PublicMCPAppCreate.model_validate(values)
+        model.model_validate(values)
     except ValidationError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -235,6 +246,7 @@ def _validate_public_mcp_app_values(values: Dict[str, Any]) -> None:
 def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) -> None:
     canonical = get_builtin_public_mcp_app(db_app.app_id)
     persisted = _public_mcp_app_values(db_app)
+    enforce_connect_shape = bool({"transport", "launch_config"} & changes.keys())
 
     if canonical is not None:
         for field in _BUILTIN_PROTECTED_FIELDS.intersection(changes):
@@ -253,7 +265,9 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
             **writable_changes,
             **{field: canonical[field] for field in _BUILTIN_PROTECTED_FIELDS},
         }
-        _validate_public_mcp_app_values(merged)
+        _validate_public_mcp_app_values(
+            merged, enforce_connect_shape=enforce_connect_shape
+        )
     else:
         if "app_id" in changes and changes["app_id"] != db_app.app_id:
             raise HTTPException(
@@ -261,7 +275,9 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
                 detail="MCP app ID is immutable",
             )
         merged = {**persisted, **changes}
-        _validate_public_mcp_app_values(merged)
+        _validate_public_mcp_app_values(
+            merged, enforce_connect_shape=enforce_connect_shape
+        )
         writable_changes = {
             field: value for field, value in changes.items() if field != "app_id"
         }

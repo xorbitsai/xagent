@@ -6,8 +6,14 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from pydantic import TypeAdapter, ValidationError
+
 from ..tools.core.browser_use import BrowserSessionManager, get_browser_manager
-from .environment import ComputerEnvironment, ComputerTargetNotFoundError
+from .environment import (
+    ComputerEnvironment,
+    ComputerFrameMismatchError,
+    ComputerTargetNotFoundError,
+)
 from .schema import (
     ELEMENT_EXTRACTION_FAILED_KEY,
     ELEMENT_EXTRACTION_INCOMPLETE_KEY,
@@ -21,11 +27,14 @@ from .schema import (
     ComputerEnvironmentType,
     ComputerObservation,
     NormalizedPoint,
+    ObservedUrl,
     Viewport,
 )
 from .store import ObservationStore
 
 logger = logging.getLogger(__name__)
+
+_OBSERVED_URL_ADAPTER = TypeAdapter(ObservedUrl)
 
 _INTERACTIVE_ELEMENTS_SCRIPT = """
 (limit) => {
@@ -77,8 +86,7 @@ _INTERACTIVE_ELEMENTS_SCRIPT = """
       autocomplete === "webauthn" ||
       autocomplete.startsWith("cc-")
     );
-    const safeValue = sensitive ? "" : String(node.value || "");
-    const text = String(node.innerText || safeValue).trim().slice(0, 240);
+    const text = String(node.innerText || "").trim().slice(0, 240);
     const label = String(
       node.getAttribute("aria-label") ||
       node.getAttribute("title") ||
@@ -133,12 +141,25 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         self.headless = headless
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
+        self._manager_session_id = f"computer:{self.session_id}"
+        self._browser_session: Any | None = None
 
-    async def _get_page(self) -> Any:
+    async def _get_page(self, *, reject_recreated_session: bool) -> Any:
         session = await self.manager.get_or_create(
-            self.session_id,
+            self._manager_session_id,
             headless=self.headless,
         )
+        recreated = (
+            self._browser_session is not None and session is not self._browser_session
+        )
+        self._browser_session = session
+        if recreated:
+            self._invalidate_observation()
+            if reject_recreated_session:
+                raise ComputerFrameMismatchError(
+                    "browser session changed after the expected frame was captured; "
+                    "request a fresh screenshot before another action"
+                )
         page = await session.get_page()
         requested = {
             "width": self.viewport_width,
@@ -149,13 +170,16 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         return page
 
     async def _close(self) -> None:
-        await self.manager.close(self.session_id)
+        await self.manager.close(self._manager_session_id)
+        self._browser_session = None
 
     async def _observe(self) -> ComputerObservation:
-        return await self._capture_observation(await self._get_page())
+        return await self._capture_observation(
+            await self._get_page(reject_recreated_session=False)
+        )
 
     async def _execute(self, batch: ComputerActionBatch) -> ComputerObservation:
-        page = await self._get_page()
+        page = await self._get_page(reject_recreated_session=True)
         action = batch.actions[0]
         await self._execute_action(page, action)
         if action.type not in {
@@ -205,7 +229,13 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             # screenshot remains authoritative for cross-origin child frames.
             metadata[ELEMENT_EXTRACTION_INCOMPLETE_KEY] = True
 
-        active_url = str(getattr(page, "url", "") or "").strip() or None
+        raw_active_url = str(getattr(page, "url", "") or "").strip() or None
+        active_url: str | None = None
+        if raw_active_url is not None:
+            try:
+                active_url = _OBSERVED_URL_ADAPTER.validate_python(raw_active_url)
+            except ValidationError:
+                metadata["active_url_unavailable"] = True
         return ComputerObservation(
             session_id=self.session_id,
             frame_id=frame_id,
@@ -296,6 +326,18 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if action.type is ComputerActionType.REPLACE_TEXT:
             x, y = self._target_pixels(action)
             await page.mouse.click(x, y)
+            editable = await page.evaluate(
+                """() => {
+                  const node = document.activeElement;
+                  if (!node) return false;
+                  if (node.isContentEditable) return true;
+                  const tag = String(node.tagName || "").toLowerCase();
+                  return (tag === "input" || tag === "textarea") &&
+                    !node.disabled && !node.readOnly;
+                }"""
+            )
+            if not editable:
+                raise ValueError("replace_text target is not an editable element")
             modifier = "Meta" if sys.platform == "darwin" else "Control"
             await page.keyboard.press(f"{modifier}+A")
             await page.keyboard.insert_text(action.text or "")
@@ -404,4 +446,10 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             "SPACE": "Space",
             "TAB": "Tab",
         }
-        return "+".join(aliases.get(key.upper(), key) for key in keys)
+        normalized = [aliases.get(key.upper(), key) for key in keys]
+        modifiers = {"Alt", "Control", "Meta", "Shift"}
+        if len(normalized) > 1 and any(key not in modifiers for key in normalized[:-1]):
+            raise ValueError(
+                "keypress accepts one key chord; send sequential keys as separate actions"
+            )
+        return "+".join(normalized)

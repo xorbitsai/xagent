@@ -182,6 +182,27 @@ async def test_computer_tool_rejects_action_before_first_observation() -> None:
     assert factory.environments[0].current_observation is None
 
 
+@pytest.mark.asyncio
+async def test_computer_tool_returns_validation_error_with_current_frame() -> None:
+    factory = EnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    await tool.run_json_async({})
+
+    result = await tool.run_json_async(
+        {"actions": [{"type": "click", "target": {"point": {"x": 2, "y": 0}}}]}
+    )
+
+    assert result["success"] is False
+    assert result["session_id"] == "task-1"
+    assert result["frame_id"] == "frame-1"
+    assert "Invalid computer action" in result["error"]
+    assert len(factory.environments) == 1
+
+
 def test_computer_tool_accepts_only_one_action_per_observation() -> None:
     with pytest.raises(ValueError, match="at most 1"):
         ComputerTool(
@@ -237,6 +258,10 @@ def test_new_computer_observation_supersedes_stale_live_context() -> None:
 
     old_message, current_message = context.messages
     assert old_message.metadata["superseded"] is True
+    assert old_message.metadata["raw_result"] == {
+        "success": True,
+        "superseded": True,
+    }
     assert old_message.context_refs
     assert CONTEXT_REFS_KEY not in old_message.to_dict()
     assert old_message.context_refs_token_estimate() == 0

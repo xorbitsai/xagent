@@ -219,7 +219,7 @@ class ExecutionContext:
                 metadata={
                     **metadata,
                     "superseded": True,
-                    "raw_result": None,
+                    "raw_result": {"success": True, "superseded": True},
                 },
             )
 
@@ -1218,7 +1218,9 @@ class ExecutionContext:
                 )
             chunks.append(message.content)
             if message.context_refs:
-                chunks.append(message.context_refs_text())
+                context_refs_text = message.context_refs_text()
+                if context_refs_text:
+                    chunks.append(context_refs_text)
         return "\n".join(chunks)
 
     def _compact_response_text(self, response: Any) -> str:

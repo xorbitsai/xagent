@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ....computer.browser import BrowserComputerEnvironment
 from ....computer.environment import (
@@ -156,7 +156,6 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         # The session is an execution-scoped resource. Never let model output
         # select another task's browser, even if it invents a session_id field.
         raw_args.pop("session_id", None)
-        parsed = ComputerToolArgs.model_validate(raw_args)
         session_id = self._default_session_id(step_id)
         if not session_id:
             return self._error_result(
@@ -167,6 +166,16 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             return self._error_result(
                 session_id=session_id,
                 error="Computer tool requires a task workspace for observations.",
+            )
+        try:
+            parsed = ComputerToolArgs.model_validate(raw_args)
+        except ValidationError as exc:
+            environment = self._environments.get(session_id)
+            current = environment.current_observation if environment else None
+            return self._error_result(
+                session_id=session_id,
+                frame_id=current.frame_id if current else None,
+                error=f"Invalid computer action: {exc}",
             )
 
         environment = self._environments.get(session_id)

@@ -4,8 +4,14 @@ from typing import Any
 
 import pytest
 
-from xagent.core.computer.browser import BrowserComputerEnvironment
-from xagent.core.computer.environment import ComputerTargetNotFoundError
+from xagent.core.computer.browser import (
+    _INTERACTIVE_ELEMENTS_SCRIPT,
+    BrowserComputerEnvironment,
+)
+from xagent.core.computer.environment import (
+    ComputerFrameMismatchError,
+    ComputerTargetNotFoundError,
+)
 from xagent.core.computer.schema import (
     COMPUTER_FRAME_ID_METADATA_KEY,
     COMPUTER_SESSION_ID_METADATA_KEY,
@@ -80,6 +86,7 @@ class FakePage:
         self.keyboard = FakeKeyboard()
         self.goto_calls: list[tuple[str, str, int]] = []
         self.wait_calls: list[int] = []
+        self.active_element_editable = True
         self.element_payload: Any = {
             "elements": [
                 {
@@ -116,6 +123,8 @@ class FakePage:
             if isinstance(self.element_payload, BaseException):
                 raise self.element_payload
             return self.element_payload
+        if "document.activeElement" in script:
+            return self.active_element_editable
         raise AssertionError(f"unexpected evaluate script: {script}")
 
     async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
@@ -137,12 +146,13 @@ class FakeSession:
 class FakeManager:
     def __init__(self, page: FakePage) -> None:
         self.page = page
+        self.session = FakeSession(page)
         self.calls: list[tuple[str, bool]] = []
         self.closed: list[str] = []
 
     async def get_or_create(self, session_id: str, headless: bool) -> FakeSession:
         self.calls.append((session_id, headless))
-        return FakeSession(self.page)
+        return self.session
 
     async def close(self, session_id: str) -> None:
         self.closed.append(session_id)
@@ -185,6 +195,13 @@ async def test_browser_observation_captures_screenshot_and_dom_elements(
     assert store.calls[0]["image_bytes"] == b"browser-png"
     assert observation.metadata["browser_runtime_kind"] == "ephemeral_playwright"
     assert environment.current_observation == observation
+    assert environment.manager.calls == [  # type: ignore[attr-defined]
+        ("computer:browser-1", True)
+    ]
+
+
+def test_browser_element_script_never_reads_input_values() -> None:
+    assert "node.value" not in _INTERACTIVE_ELEMENTS_SCRIPT
 
 
 @pytest.mark.asyncio
@@ -299,6 +316,79 @@ async def test_browser_navigation_returns_new_observation(browser_environment) -
 
 
 @pytest.mark.asyncio
+async def test_browser_omits_unsupported_active_url(browser_environment) -> None:
+    environment, page, _store = browser_environment
+    page.url = "data:text/html,secret"
+
+    observation = await environment.observe()
+
+    assert observation.active_url is None
+    assert observation.metadata["active_url_unavailable"] is True
+
+
+@pytest.mark.asyncio
+async def test_browser_recreated_session_requires_fresh_frame(
+    browser_environment,
+) -> None:
+    environment, _page, _store = browser_environment
+    first = await environment.observe()
+    manager = environment.manager
+    replacement_page = FakePage()
+    manager.session = FakeSession(replacement_page)  # type: ignore[attr-defined]
+
+    with pytest.raises(ComputerFrameMismatchError, match="session changed"):
+        await environment.execute(
+            ComputerActionBatch(
+                session_id="browser-1",
+                expected_frame_id=first.frame_id,
+                actions=[
+                    ComputerAction(
+                        type=ComputerActionType.CLICK,
+                        target=ComputerTarget(point=NormalizedPoint(x=0.5, y=0.5)),
+                    )
+                ],
+            )
+        )
+
+    assert replacement_page.mouse.calls == []
+    assert environment.current_observation is None
+    refreshed = await environment.observe()
+    assert refreshed.frame_id != first.frame_id
+
+
+@pytest.mark.asyncio
+async def test_replace_text_rejects_non_editable_target(browser_environment) -> None:
+    environment, page, _store = browser_environment
+    first = await environment.observe()
+    page.active_element_editable = False
+
+    with pytest.raises(ValueError, match="not an editable element"):
+        await environment.execute(
+            ComputerActionBatch(
+                session_id="browser-1",
+                expected_frame_id=first.frame_id,
+                actions=[
+                    ComputerAction(
+                        type=ComputerActionType.REPLACE_TEXT,
+                        target=ComputerTarget(point=NormalizedPoint(x=0.5, y=0.5)),
+                        text="replacement",
+                    )
+                ],
+            )
+        )
+
+    assert page.keyboard.calls == []
+
+
+def test_keypress_rejects_non_modifier_sequences() -> None:
+    assert BrowserComputerEnvironment._playwright_key_chord(["CTRL", "A"]) == (
+        "Control+A"
+    )
+    with pytest.raises(ValueError, match="one key chord"):
+        BrowserComputerEnvironment._playwright_key_chord(["ArrowDown", "Enter"])
+
+
+@pytest.mark.asyncio
 async def test_browser_reports_incomplete_or_failed_element_extraction(
     browser_environment,
 ) -> None:
@@ -320,4 +410,6 @@ async def test_browser_environment_closes_its_session(browser_environment) -> No
 
     await environment.close()
 
-    assert environment.manager.closed == ["browser-1"]  # type: ignore[attr-defined]
+    assert environment.manager.closed == [  # type: ignore[attr-defined]
+        "computer:browser-1"
+    ]

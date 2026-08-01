@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from ..tools.core.browser_use import BrowserSessionManager, get_browser_manager
-from .environment import ComputerEnvironment
+from .environment import ComputerEnvironment, ComputerTargetNotFoundError
 from .schema import (
     ELEMENT_EXTRACTION_FAILED_KEY,
     ELEMENT_EXTRACTION_INCOMPLETE_KEY,
@@ -276,7 +276,8 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if action.type is ComputerActionType.SCREENSHOT:
             return
         if action.type is ComputerActionType.NAVIGATE:
-            assert action.url is not None
+            if action.url is None:
+                raise ValueError("navigate action requires a URL")
             await page.goto(
                 self._resolve_navigation_url(action.url),
                 wait_until="domcontentloaded",
@@ -307,7 +308,8 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             )
             return
         if action.type is ComputerActionType.DRAG:
-            assert action.start is not None and action.end is not None
+            if action.start is None or action.end is None:
+                raise ValueError("drag action requires start and end points")
             start_x, start_y = self._point_pixels(action.start)
             end_x, end_y = self._point_pixels(action.end)
             await page.mouse.move(start_x, start_y)
@@ -338,10 +340,17 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if target_id is None or observation is None:
             raise ValueError("element target requires a current observation")
         element = next(
-            element
-            for element in observation.elements
-            if element.element_id == target_id
+            (
+                element
+                for element in observation.elements
+                if element.element_id == target_id
+            ),
+            None,
         )
+        if element is None:
+            raise ComputerTargetNotFoundError(
+                f"element {target_id!r} is not present in the current observation"
+            )
         return self._point_pixels(
             NormalizedPoint(
                 x=element.bounds.x + element.bounds.width / 2,

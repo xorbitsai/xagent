@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from xagent.core.computer.browser import BrowserComputerEnvironment
+from xagent.core.computer.environment import ComputerTargetNotFoundError
 from xagent.core.computer.schema import (
     COMPUTER_FRAME_ID_METADATA_KEY,
     COMPUTER_SESSION_ID_METADATA_KEY,
@@ -258,6 +259,21 @@ async def test_browser_point_click_uses_normalized_viewport(
     )
 
     assert page.mouse.calls[0] == ("click", 640.0, 360.0)
+
+
+@pytest.mark.asyncio
+async def test_browser_element_lookup_fails_with_clear_target_error(
+    browser_environment,
+) -> None:
+    environment, _page, _store = browser_environment
+    await environment.observe()
+    action = ComputerAction(
+        type=ComputerActionType.CLICK,
+        target=ComputerTarget(element_id="missing-element"),
+    )
+
+    with pytest.raises(ComputerTargetNotFoundError, match="missing-element"):
+        environment._target_pixels(action)
 
 
 @pytest.mark.asyncio

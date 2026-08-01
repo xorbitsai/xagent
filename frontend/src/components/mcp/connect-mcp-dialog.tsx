@@ -132,6 +132,13 @@ export function ConnectMcpDialog({
   // leaking (N3: the poll otherwise has no unmount cleanup, unlike
   // custom-mcp-form's equivalent).
   const mcpOauthPollTimersRef = React.useRef<Set<number>>(new Set())
+  // The builtin_oauth flow's postMessage listener, tracked the same way so a
+  // dialog-close or unmount removes it too — otherwise a genuinely
+  // successful auth completed after the user closed the dialog would still
+  // fire onSuccess/auto-select via a listener nothing else was going to
+  // remove (its own interval, the only thing that used to remove it, is
+  // itself cleared by the same close/unmount cleanup).
+  const mcpOauthMessageListenersRef = React.useRef<Set<(event: MessageEvent) => void>>(new Set())
   // F5: this component instance is commonly kept mounted by the parent
   // across dialog open/close (only the Radix Dialog's own content
   // unmounts), so the unmount-only cleanup above never fires on an ordinary
@@ -231,6 +238,22 @@ export function ConnectMcpDialog({
     }
   }
 
+  // Shared by the dialog-close branch below and the unmount cleanup effect:
+  // stop any in-flight OAuth popup poll and remove the builtin_oauth flow's
+  // postMessage listener (F6) — leaving the listener attached would let a
+  // genuinely successful auth, completed after the user closed the dialog,
+  // still fire onSuccess/auto-select via a listener the (now-cleared)
+  // interval was the only thing that used to remove.
+  const clearMcpOauthPollState = () => {
+    mcpOauthPollTimersRef.current.forEach((timer) => window.clearInterval(timer))
+    mcpOauthPollTimersRef.current.clear()
+    mcpOauthMessageListenersRef.current.forEach((listener) =>
+      window.removeEventListener('message', listener)
+    )
+    mcpOauthMessageListenersRef.current.clear()
+    setLoadingApp(null)
+  }
+
   useEffect(() => {
     if (open) {
       setMcpFormData({
@@ -254,9 +277,7 @@ export function ConnectMcpDialog({
       // in-flight OAuth popup poll — otherwise it can later fire
       // onSuccess/auto-select against a closed dialog, and leaves a stale
       // spinner on the card if the dialog is reopened.
-      mcpOauthPollTimersRef.current.forEach((timer) => window.clearInterval(timer))
-      mcpOauthPollTimersRef.current.clear()
-      setLoadingApp(null)
+      clearMcpOauthPollState()
     }
   }, [open, t, selectedMcpServers])
 
@@ -272,8 +293,7 @@ export function ConnectMcpDialog({
   }, [])
 
   useEffect(() => () => {
-    mcpOauthPollTimersRef.current.forEach((timer) => window.clearInterval(timer))
-    mcpOauthPollTimersRef.current.clear()
+    clearMcpOauthPollState()
   }, [])
 
   useEffect(() => {
@@ -708,6 +728,7 @@ export function ConnectMcpDialog({
       if (event.data?.type === 'oauth-success') {
         setLoadingApp(null)
         window.removeEventListener('message', handleMessage)
+        mcpOauthMessageListenersRef.current.delete(handleMessage)
         window.clearInterval(checkPopup)
         mcpOauthPollTimersRef.current.delete(checkPopup)
 
@@ -724,6 +745,7 @@ export function ConnectMcpDialog({
     };
 
     window.addEventListener('message', handleMessage);
+    mcpOauthMessageListenersRef.current.add(handleMessage)
 
     // Fallback: check if popup was closed without success message, or give up
     // after a timeout (N3: this poll previously had neither an unmount-safe
@@ -737,6 +759,7 @@ export function ConnectMcpDialog({
       window.clearInterval(checkPopup);
       mcpOauthPollTimersRef.current.delete(checkPopup)
       window.removeEventListener('message', handleMessage);
+      mcpOauthMessageListenersRef.current.delete(handleMessage)
       setLoadingApp(null);
     }, 500);
     mcpOauthPollTimersRef.current.add(checkPopup)

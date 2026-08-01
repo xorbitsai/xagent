@@ -585,7 +585,7 @@ def test_bare_meta_login_skips_facebook_but_still_connects_instagram(
     assert "Facebook Pages" not in server_names
 
 
-def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(
+async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(
     db_session, monkeypatch
 ):
     """UserOAuth has no app_id column: a bare Meta grant (provider="meta")
@@ -671,14 +671,14 @@ def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(
     facebook_server = (
         db.query(MCPServer).filter(MCPServer.name == "Facebook Pages").one()
     )
-    delete_mcp_server(facebook_server.id, current_user=user, db=db)
+    await delete_mcp_server(facebook_server.id, current_user=user, db=db)
 
     assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
     # The shared bare grant Instagram still relies on must survive.
     assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
 
 
-def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_grant(
+async def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_grant(
     db_session,
 ):
     """Mirror of the previous test's opposite case: no Instagram connection
@@ -701,7 +701,7 @@ def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_grant(
 
     from xagent.web.api.mcp import delete_mcp_server
 
-    delete_mcp_server(server.id, current_user=user, db=db)
+    await delete_mcp_server(server.id, current_user=user, db=db)
 
     assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
     assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 0

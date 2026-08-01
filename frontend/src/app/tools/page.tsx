@@ -184,16 +184,26 @@ function ToolsPageContent() {
   const { getAppIcon } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
+  // F8: strip all three mcp_oauth redirect params in both effects below, not
+  // just the one each effect owns. The two backend redirects are mutually
+  // exclusive today (never both present at once), but if that ever changed,
+  // one effect's router.replace could otherwise undo the other's cleanup and
+  // cause a duplicate-toast loop.
+  const stripMcpOauthRedirectParams = (params: URLSearchParams) => {
+    const next = new URLSearchParams(params.toString())
+    next.delete("mcp_oauth_error")
+    next.delete("mcp_oauth_error_message")
+    next.delete(MCP_OAUTH_SUCCESS_PARAM)
+    const nextQuery = next.toString()
+    router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
+  }
+
   useEffect(() => {
     const oauthErrorMessage = searchParams.get("mcp_oauth_error_message")
     if (!oauthErrorMessage) return
 
     toast.error(oauthErrorMessage)
-    const nextParams = new URLSearchParams(searchParams.toString())
-    nextParams.delete("mcp_oauth_error")
-    nextParams.delete("mcp_oauth_error_message")
-    const nextQuery = nextParams.toString()
-    router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
+    stripMcpOauthRedirectParams(searchParams)
   }, [router, searchParams])
 
   useEffect(() => {
@@ -211,10 +221,7 @@ function ToolsPageContent() {
       return
     }
     // Not the popup (e.g. the flow ran in a full tab): just tidy the URL.
-    const nextParams = new URLSearchParams(searchParams.toString())
-    nextParams.delete(MCP_OAUTH_SUCCESS_PARAM)
-    const nextQuery = nextParams.toString()
-    router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
+    stripMcpOauthRedirectParams(searchParams)
   }, [router, searchParams])
 
   useEffect(() => {

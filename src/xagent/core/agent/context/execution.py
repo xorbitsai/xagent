@@ -12,6 +12,7 @@ from ...context_ref import (
     ContextReference,
     normalize_context_references,
     split_tool_result_context_references,
+    split_tool_result_supersedes_scope,
 )
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ...tools.artifacts import (
@@ -166,7 +167,10 @@ class ExecutionContext:
         *,
         context_refs: Any = (),
     ) -> Message:
-        public_result, embedded_refs = split_tool_result_context_references(result)
+        public_result, supersedes_scope = split_tool_result_supersedes_scope(result)
+        public_result, embedded_refs = split_tool_result_context_references(
+            public_result
+        )
         explicit_refs = normalize_context_references(context_refs)
         all_context_refs = []
         seen_context_refs: set[str] = set()
@@ -181,7 +185,7 @@ class ExecutionContext:
             tool_name, public_result
         )
         content = self._format_tool_result(tool_name, context_result)
-        metadata = {
+        metadata: dict[str, Any] = {
             "tool_name": tool_name,
             "raw_result": context_result,
             "workspace_id": self.workspace_id,
@@ -189,12 +193,58 @@ class ExecutionContext:
             "cwd": self.cwd,
             "memory_session_id": self.memory_session_id,
         }
+        if supersedes_scope:
+            metadata["supersedes_scope"] = supersedes_scope
+            self._compact_superseded_tool_messages(supersedes_scope)
         return self.add_message(
             "tool",
             content,
             tool_call_id=tool_call_id,
             metadata=metadata,
             context_refs=tuple(all_context_refs),
+        )
+
+    def _compact_superseded_tool_messages(self, scope: str) -> None:
+        """Keep stale observations durable while removing them from live prompts."""
+
+        for index, message in enumerate(self.messages):
+            metadata = message.metadata or {}
+            if metadata.get("supersedes_scope") != scope:
+                continue
+            if metadata.get("superseded"):
+                continue
+            self.messages[index] = replace(
+                message,
+                content=self._superseded_tool_summary(message),
+                metadata={
+                    **metadata,
+                    "superseded": True,
+                    "raw_result": None,
+                },
+            )
+
+    @staticmethod
+    def _superseded_tool_summary(message: Message) -> str:
+        metadata = message.metadata or {}
+        tool_name = str(metadata.get("tool_name") or "tool")
+        raw_result = metadata.get("raw_result")
+        details: list[str] = []
+        if isinstance(raw_result, dict):
+            observation = raw_result.get("observation")
+            for key in ("frame_id", "active_url", "title"):
+                value = raw_result.get(key)
+                if not value and isinstance(observation, dict):
+                    value = observation.get(key)
+                if value:
+                    details.append(f"{key}={value}")
+        if message.context_refs:
+            details.append(
+                "file_id=" + ",".join(ref.file_id for ref in message.context_refs)
+            )
+        suffix = f" ({', '.join(details)})" if details else ""
+        return (
+            f"[{tool_name} result superseded by a later observation{suffix}. "
+            "The page state it described no longer applies.]"
         )
 
     def attach_workspace(

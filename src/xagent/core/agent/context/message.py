@@ -60,7 +60,7 @@ class Message:
             result["tool_call_id"] = self.tool_call_id
         if self.hidden:
             result["hidden"] = True
-        if self.context_refs:
+        if self.context_refs and not self.metadata.get("superseded"):
             result[CONTEXT_REFS_KEY] = [
                 reference.durable_dict() for reference in self.context_refs
             ]
@@ -92,9 +92,13 @@ class Message:
         )
 
     def context_refs_text(self) -> str:
+        if self.metadata.get("superseded"):
+            return ""
         return "\n".join(reference.compact_text() for reference in self.context_refs)
 
     def context_refs_token_estimate(self) -> int:
+        if self.metadata.get("superseded"):
+            return 0
         return sum(reference.estimated_tokens() for reference in self.context_refs)
 
 

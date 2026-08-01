@@ -1547,6 +1547,42 @@ async def test_react_passes_runtime_step_to_browser_tool_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_react_passes_runtime_step_to_computer_tool_call() -> None:
+    class FakeComputerTool:
+        name = "computer"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(args)
+            return {"success": True}
+
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "inspect_browser"
+    tool = FakeComputerTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-computer",
+            "name": "computer",
+            "args": {"actions": [{"type": "screenshot"}]},
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [
+        {
+            "actions": [{"type": "screenshot"}],
+            "_xagent_step_id": "inspect_browser",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_react_interrupt_cancels_in_flight_tool() -> None:
     class SlowVisionTool:
         name = "understand_images"

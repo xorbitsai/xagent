@@ -3028,7 +3028,7 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         args = self._tool_call_args_dict(tool_call, require_mapping=True)
         tool_name = self._tool_name(tool)
-        if not tool_name.startswith("browser_"):
+        if not (tool_name.startswith("browser_") or tool_name == "computer"):
             return args
 
         step_id = tool_call.get("dag_step_id") or tool_call.get("step_id")

@@ -1135,7 +1135,10 @@ def create_browser_tools(
     Returns:
         List of browser tool instances
     """
+    from .computer import ComputerTool
+
     tools = [
+        ComputerTool(task_id=task_id, workspace=workspace),
         BrowserNavigateTool(task_id=task_id, workspace=workspace),
         BrowserClickTool(task_id=task_id),
         BrowserFillTool(task_id=task_id),

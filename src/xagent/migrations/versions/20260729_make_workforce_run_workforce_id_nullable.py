@@ -7,7 +7,7 @@ preview persists a hidden Task), but there is no Workforce row to point
 ``workforce_id`` at, so the column must accept NULL.
 
 Revision ID: 20260729_make_workforce_run_workforce_id_nullable
-Revises: 20260728_add_agent_template_id_and_name_uniqueness
+Revises: 20260731_seed_aws_mcp_app
 Create Date: 2026-07-29
 
 """
@@ -19,7 +19,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260729_make_workforce_run_workforce_id_nullable"
-down_revision: Union[str, None] = "20260728_add_agent_template_id_and_name_uniqueness"
+down_revision: Union[str, None] = "20260731_seed_aws_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

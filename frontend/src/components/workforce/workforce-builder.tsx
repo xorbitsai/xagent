@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link"
-import { useRouter, useSearchParams } from "next/navigation"
+import { useSearchParams } from "next/navigation"
 import { ArrowLeft, LayoutDashboard, MessageSquare, Webhook } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -81,7 +81,6 @@ function toFakeWorker(draft: WorkforceWorkerDraft, index: number, agents: Workfo
 
 export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
     const { t, locale } = useI18n()
-    const router = useRouter()
     const searchParams = useSearchParams()
     const { sendMessage, setTaskId, closeFilePreview, dispatch } = useApp()
 
@@ -531,7 +530,18 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             setWorkforce(created)
             suppressNextLoadEffectRef.current = true
             setLocalId(String(created.id))
-            router.replace(`/workforces/${created.id}`)
+            // router.replace/push would navigate across the /workforces/new
+            // -> /workforces/[id] route-segment boundary -- separate pages
+            // with no shared layout, so Next.js tears down this entire
+            // component instance and mounts a fresh one under [id], taking
+            // suppressNextLoadEffectRef and any in-flight test-chat state
+            // with it (PR review round 8, finding #1 REOPENED: the ref-based
+            // suppression above only works if this same instance survives).
+            // The History API updates the address bar (so refresh/copy-link
+            // still work) without invoking Next's router at all, keeping
+            // this instance mounted -- the same fix AgentBuilder already
+            // uses for the identical /build/new -> /build/[id] transition.
+            window.history.pushState({}, "", `/workforces/${created.id}`)
         } catch (err) {
             const nextError = err instanceof Error ? err.message : t("workforces.errors.create")
             setError(nextError)
@@ -808,6 +818,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                                     manager={manager}
                                     workers={workers}
                                     isArchived={!!isArchived}
+                                    saving={saving}
                                     dialogs={dialogs}
                                     getStartedSteps={getStartedSteps}
                                     getStartedCollapsed={getStartedCollapsed}

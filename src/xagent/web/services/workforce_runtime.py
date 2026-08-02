@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import case, func
+from sqlalchemy.orm import Session, contains_eager, selectinload
 
 from xagent.web.models.task import Task, TaskStatus
 
@@ -407,17 +408,50 @@ def reap_stale_preview_workforce_runs(
         else get_workforce_preview_run_stale_seconds()
     )
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+    # last_activity_at is bumped by sync_workforce_run_status on every turn
+    # (PR review round 8, F-NEW-1); created_at alone stays fixed for the run's
+    # whole lifetime, so keying staleness off it could reap a conversation
+    # that's genuinely still going. Falls back to created_at for the (should
+    # be unreachable given the column's server_default) case a row's
+    # last_activity_at is somehow NULL, rather than never reaping it at all.
+    run_activity_marker = func.coalesce(
+        WorkforceRun.last_activity_at, WorkforceRun.created_at
+    )
+    # sync_workforce_run_status only bumps last_activity_at at turn
+    # boundaries (start/end), so a single turn that runs longer than the
+    # stale window on its own -- e.g. one long tool-heavy execution -- would
+    # otherwise still look stale mid-execution. Task.last_heartbeat_at is
+    # refreshed roughly every ~20s for the whole duration of an active
+    # execution (task_lease_service's heartbeat loop) and is the more direct
+    # "is this actually still running right now" signal, so the newer of the
+    # two is what staleness is keyed off (self-review finding after round 8).
+    # A CASE expression, not func.max()/func.greatest(): SQLite's multi-arg
+    # max() returns NULL if *any* argument is NULL (unlike Postgres'
+    # GREATEST, which ignores NULLs), and Postgres has no scalar 2-arg
+    # max() at all -- this codebase supports both, so neither is portable
+    # here.
+    activity_marker = case(
+        (run_activity_marker.is_(None), Task.last_heartbeat_at),
+        (Task.last_heartbeat_at.is_(None), run_activity_marker),
+        (run_activity_marker >= Task.last_heartbeat_at, run_activity_marker),
+        else_=Task.last_heartbeat_at,
+    )
 
     runs = (
         db.query(WorkforceRun)
-        .options(selectinload(WorkforceRun.task))
+        .outerjoin(Task, WorkforceRun.task_id == Task.id)
+        .options(contains_eager(WorkforceRun.task))
         .filter(
             WorkforceRun.is_preview.is_(True),
             WorkforceRun.status.in_(ACTIVE_WORKFORCE_RUN_STATUSES),
-            WorkforceRun.created_at.is_not(None),
-            WorkforceRun.created_at <= cutoff,
+            # NULL-safe on its own: coalesce(NULL, NULL) <= cutoff is UNKNOWN,
+            # which the WHERE clause already excludes -- an explicit not-null
+            # guard on created_at specifically would be checking the wrong
+            # column now that the comparison runs against activity_marker,
+            # not created_at directly (self-review finding after round 8).
+            activity_marker <= cutoff,
         )
-        .order_by(WorkforceRun.created_at.asc())
+        .order_by(activity_marker.asc())
         .limit(max(1, min(limit, 500)))
         .all()
     )
@@ -562,6 +596,16 @@ def sync_workforce_run_status(
     elif run.completed_at is not None:
         setattr(run, "completed_at", None)
         changed = True
+
+    if changed:
+        # Explicit, not just relying on the column's own onupdate=func.now():
+        # this is the one signal the preview-run reaper trusts to tell a
+        # conversation that's genuinely still going from one that's simply
+        # been open a long time (PR review round 8, F-NEW-1). Only bumped
+        # alongside a real transition, so a no-op sync call (status/
+        # completed_at already correct) doesn't manufacture activity that
+        # didn't happen.
+        setattr(run, "last_activity_at", datetime.now(timezone.utc))
 
     return changed
 

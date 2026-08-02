@@ -143,6 +143,16 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     snapshot = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Bumped on every sync_workforce_run_status call (workforce_runtime.py)
+    # that actually changes this row, i.e. once per turn of an active
+    # conversation. created_at alone can't tell a genuinely-abandoned preview
+    # run from one that's mid-conversation but has simply been open a long
+    # time -- the preview-run reaper keys staleness off this column instead
+    # (PR review round 8, F-NEW-1: reaping off created_at could permanently
+    # cancel an actively-used preview session).
+    last_activity_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     workforce = relationship("Workforce", back_populates="runs")
     task = relationship("Task")

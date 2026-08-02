@@ -66,6 +66,8 @@ def _make_preview_run(
     task_status: TaskStatus,
     run_status: str,
     created_at: datetime,
+    last_activity_at: datetime | None = None,
+    task_heartbeat_at: datetime | None = None,
 ) -> tuple[int, int]:
     task = Task(
         user_id=user_id,
@@ -75,6 +77,8 @@ def _make_preview_run(
         agent_id=agent_id,
         source="internal",
     )
+    if task_heartbeat_at is not None:
+        task.last_heartbeat_at = task_heartbeat_at
     db.add(task)
     db.flush()
     run = WorkforceRun(
@@ -88,6 +92,14 @@ def _make_preview_run(
     db.add(run)
     db.flush()
     run.created_at = created_at
+    # Mirrors reality: a freshly created row's last_activity_at starts equal
+    # to created_at (both stamped "now" at row-creation time) and only
+    # diverges once a real turn bumps it via sync_workforce_run_status.
+    # Overridable so tests can simulate a conversation with real activity
+    # after an old created_at (PR review round 8, F-NEW-1).
+    run.last_activity_at = (
+        last_activity_at if last_activity_at is not None else created_at
+    )
     db.commit()
     return int(task.id), int(run.id)
 
@@ -138,6 +150,76 @@ def test_leaves_fresh_preview_run_untouched(db_session) -> None:
     assert pause_targets == []
     run = db_session.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
     assert run.status == "pending"
+    assert run.completed_at is None
+
+
+def test_leaves_an_old_but_actively_multi_turn_preview_run_untouched(
+    db_session,
+) -> None:
+    """PR #1060 review round 8, F-NEW-1: created_at alone can't distinguish a
+    genuinely-abandoned preview run from one that's mid-conversation but has
+    simply been open a long time. sync_workforce_run_status resets
+    status/completed_at every turn but never touched created_at (fixed by
+    also bumping last_activity_at, which the reaper now keys off instead).
+    This run's created_at is old enough to be stale on its own, but its
+    last_activity_at reflects a turn that just happened -- the reaper must
+    not reap it."""
+    user_id = _make_user(db_session)
+    agent_id = _make_agent(db_session, user_id)
+    stale_created_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    recent_activity = datetime.now(timezone.utc) - timedelta(minutes=1)
+    _task_id, run_id = _make_preview_run(
+        db_session,
+        user_id=user_id,
+        agent_id=agent_id,
+        task_status=TaskStatus.RUNNING,
+        run_status="running",
+        created_at=stale_created_at,
+        last_activity_at=recent_activity,
+    )
+
+    pause_targets = reap_stale_preview_workforce_runs(
+        db_session, stale_after_seconds=7200
+    )
+
+    assert pause_targets == []
+    run = db_session.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
+    assert run.status == "running"
+    assert run.completed_at is None
+
+
+def test_leaves_a_run_mid_single_long_turn_untouched(db_session) -> None:
+    """Self-review finding after PR #1060 round 8: sync_workforce_run_status
+    only bumps last_activity_at at turn boundaries (start/end), so a single
+    turn that runs longer than the stale window on its own -- one long,
+    tool-heavy execution with no status transition in between -- would leave
+    last_activity_at stale mid-execution even though the run is genuinely,
+    currently active. The reaper now also considers the task's own
+    last_heartbeat_at (refreshed every ~20s for the whole duration of an
+    active execution), which is the more direct "is this actually still
+    running right now" signal for exactly this case."""
+    user_id = _make_user(db_session)
+    agent_id = _make_agent(db_session, user_id)
+    stale_turn_start = datetime.now(timezone.utc) - timedelta(hours=3)
+    recent_heartbeat = datetime.now(timezone.utc) - timedelta(seconds=15)
+    _task_id, run_id = _make_preview_run(
+        db_session,
+        user_id=user_id,
+        agent_id=agent_id,
+        task_status=TaskStatus.RUNNING,
+        run_status="running",
+        created_at=stale_turn_start,
+        last_activity_at=stale_turn_start,
+        task_heartbeat_at=recent_heartbeat,
+    )
+
+    pause_targets = reap_stale_preview_workforce_runs(
+        db_session, stale_after_seconds=7200
+    )
+
+    assert pause_targets == []
+    run = db_session.query(WorkforceRun).filter(WorkforceRun.id == run_id).one()
+    assert run.status == "running"
     assert run.completed_at is None
 
 
@@ -264,6 +346,7 @@ def test_reaps_stale_edit_mode_preview_run_of_a_saved_workforce(db_session) -> N
     db_session.add(run)
     db_session.flush()
     run.created_at = stale_created_at
+    run.last_activity_at = stale_created_at
     db_session.commit()
     run_id = int(run.id)
     task_id = int(task.id)

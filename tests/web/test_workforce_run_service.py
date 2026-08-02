@@ -1,5 +1,6 @@
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1236,6 +1237,77 @@ def test_sync_workforce_run_status_tracks_task_lifecycle(db_session: Session) ->
     db_session.refresh(run)
     assert run.status == "completed"
     assert run.completed_at is not None
+
+
+def test_sync_workforce_run_status_bumps_last_activity_at_on_every_real_transition(
+    db_session: Session,
+) -> None:
+    """PR #1060 review round 8, F-NEW-1: the preview-run reaper keys
+    staleness off last_activity_at, not created_at, specifically because
+    created_at stays fixed for a run's whole lifetime while a multi-turn
+    conversation keeps transitioning status. This pins the mechanism the
+    reaper trusts: each real transition (a status/completed_at change, not a
+    no-op resync) must advance last_activity_at, simulating the
+    completed -> running -> completed shape of successive turns."""
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    task = Task(
+        user_id=user.id,
+        title="Workforce task",
+        description="Run workforce",
+        status=TaskStatus.PENDING,
+        agent_id=manager.id,
+        agent_config={},
+    )
+    db_session.add(task)
+    db_session.flush()
+    # Naive, matching what SQLite round-trips a DateTime(timezone=True)
+    # column as -- comparisons below stay in this same naive space
+    # throughout, rather than mixing it with datetime.now(timezone.utc).
+    old_activity = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=3)
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="pending",
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.flush()
+    run.last_activity_at = old_activity
+    task.agent_config = {"workforce_run_id": run.id}
+    db_session.commit()
+
+    # Turn 1 starts.
+    assert sync_workforce_run_status(db_session, task, TaskStatus.RUNNING) is True
+    db_session.commit()
+    db_session.refresh(run)
+    turn_1_start_activity = run.last_activity_at
+    assert turn_1_start_activity is not None
+    assert turn_1_start_activity > old_activity
+
+    # Turn 1 completes.
+    assert sync_workforce_run_status(db_session, task, TaskStatus.COMPLETED) is True
+    db_session.commit()
+    db_session.refresh(run)
+    assert run.last_activity_at >= turn_1_start_activity
+
+    # A second sync call with the SAME status is a no-op (already correct):
+    # must not manufacture activity that didn't happen.
+    turn_1_complete_activity = run.last_activity_at
+    assert sync_workforce_run_status(db_session, task, TaskStatus.COMPLETED) is False
+    db_session.commit()
+    db_session.refresh(run)
+    assert run.last_activity_at == turn_1_complete_activity
+
+    # Turn 2 starts -- the exact transition the reaper needs to see as fresh
+    # activity even though the run's created_at (unset here, but fixed at
+    # row-creation time in production) never changes.
+    assert sync_workforce_run_status(db_session, task, TaskStatus.RUNNING) is True
+    db_session.commit()
+    db_session.refresh(run)
+    assert run.last_activity_at >= turn_1_complete_activity
 
 
 def test_release_task_lease_with_workforce_sync_marks_run_failed(

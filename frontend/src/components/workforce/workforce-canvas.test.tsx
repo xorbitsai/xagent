@@ -89,6 +89,7 @@ function buildCanvasElement(props: Partial<React.ComponentProps<typeof Workforce
         manager={"manager" in props ? props.manager! : manager}
         workers={props.workers ?? [worker]}
         isArchived={props.isArchived ?? false}
+        saving={props.saving ?? false}
         dialogs={dialogs}
         getStartedSteps={props.getStartedSteps ?? []}
         getStartedCollapsed={props.getStartedCollapsed ?? false}
@@ -193,5 +194,85 @@ describe("WorkforceCanvas", () => {
 
     expect(onSaveDetails).not.toHaveBeenCalled()
     expect(screen.getByDisplayValue("Launch Workforce")).toBeInTheDocument()
+  })
+
+  it("disables the details node's name/description fields when archived (PR review round 8, F-NEW-2)", () => {
+    // Regression test: every other interactive canvas node (manager, worker,
+    // add-worker) was already gated on isArchived; the details node's own
+    // Input/Textarea were the one exception, letting a user edit an archived
+    // workforce's name/description on the canvas even though the backend
+    // rejects the resulting PATCH with a 409.
+    renderCanvas({
+      name: "Launch Workforce",
+      description: "Coordinate launch work",
+      isArchived: true,
+    })
+
+    expect(screen.getByDisplayValue("Launch Workforce")).toBeDisabled()
+    expect(screen.getByDisplayValue("Coordinate launch work")).toBeDisabled()
+  })
+
+  it("disables the details node's name/description fields while a save is in flight (PR review round 8, F-NEW-3)", () => {
+    // Regression test: WorkforceCanvas used to be invoked with no `saving`
+    // prop at all, unlike its Configure-panel sibling (which disables its
+    // equivalent fields via `disabled={saving}`). Without this, a save
+    // response landing after the user typed further changes could silently
+    // clobber those keystrokes via the data.name/data.description resync
+    // effects -- disabling the fields during the window closes that off by
+    // construction, since a disabled field can't receive further input.
+    renderCanvas({
+      name: "Launch Workforce",
+      description: "Coordinate launch work",
+      saving: true,
+    })
+
+    expect(screen.getByDisplayValue("Launch Workforce")).toBeDisabled()
+    expect(screen.getByDisplayValue("Coordinate launch work")).toBeDisabled()
+  })
+
+  it("re-enables the details node's fields once saving finishes", () => {
+    const { rerender } = renderCanvas({
+      name: "Launch Workforce",
+      description: "Coordinate launch work",
+      saving: true,
+    })
+    expect(screen.getByDisplayValue("Launch Workforce")).toBeDisabled()
+
+    rerender({ saving: false })
+
+    expect(screen.getByDisplayValue("Launch Workforce")).not.toBeDisabled()
+  })
+
+  it("does not fire a premature save when an unrelated mutation disables the field mid-edit (self-review finding after round 8)", () => {
+    // Regression test: `saving` is one flag shared by every mutation handler
+    // in workforce-builder.tsx (handleAddWorker, handlePublish, etc.), not
+    // just handleSaveDetails. A field becoming `disabled` while it still has
+    // focus forces the browser to blur it -- and this node commits on blur.
+    // Without a disabled-guard in commit(), an unrelated action saving
+    // elsewhere in the builder while the user is still mid-edit here would
+    // force a blur and silently save the half-typed value.
+    const { onSaveDetails, rerender } = renderCanvas({
+      name: "Launch Workforce",
+      description: "Coordinate launch work",
+      saving: false,
+    })
+
+    const nameInput = screen.getByDisplayValue("Launch Workforce")
+    fireEvent.change(nameInput, { target: { value: "Mid-edit unsaved title" } })
+
+    // An unrelated mutation elsewhere flips the shared `saving` flag.
+    rerender({ saving: true })
+    expect(nameInput).toBeDisabled()
+
+    // The forced blur a real browser would fire on disabling a focused
+    // field, simulated directly since jsdom does not reproduce that native
+    // behavior automatically.
+    fireEvent.blur(nameInput)
+
+    expect(onSaveDetails).not.toHaveBeenCalled()
+    // The unsaved edit isn't lost -- it's still sitting in local state,
+    // simply not disabled anymore once the unrelated save finishes.
+    rerender({ saving: false })
+    expect(screen.getByDisplayValue("Mid-edit unsaved title")).toBeInTheDocument()
   })
 })

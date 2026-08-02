@@ -15,6 +15,14 @@ const searchParamsMock = vi.hoisted(() => new URLSearchParams())
 const translateMock = vi.hoisted(() => (key: string) => key)
 const sendMessageMock = vi.hoisted(() => vi.fn())
 
+// Spied rather than mocked via vi.mock: handleCreate now updates the address
+// bar via the native History API instead of router.replace/push, precisely
+// to avoid the cross-route-segment remount that a Next.js navigation would
+// trigger (PR review round 8, finding #1 REOPENED). Real jsdom pushState
+// would also work, but no-opping it keeps this test's window.location
+// stable regardless of run order.
+const historyPushStateSpy = vi.spyOn(window.history, "pushState").mockImplementation(() => {})
+
 vi.mock("next/navigation", () => ({
   useParams: () => ({}),
   useRouter: () => ({ push: routerPushMock, replace: routerReplaceMock }),
@@ -98,6 +106,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     getWorkforceMock.mockReset()
     runWorkforceMock.mockReset()
     sendMessageMock.mockReset().mockResolvedValue(undefined)
+    historyPushStateSpy.mockClear()
   })
 
   afterEach(() => {
@@ -206,7 +215,10 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
         workers: [expect.objectContaining({ agent_id: 8, assignment_instructions: "Web Researcher" })],
       })
     })
-    expect(routerReplaceMock).toHaveBeenCalledWith("/workforces/55")
+    // History API, not router.replace/push (PR review round 8, finding #1
+    // REOPENED) -- see historyPushStateSpy's comment above.
+    expect(historyPushStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55")
+    expect(routerReplaceMock).not.toHaveBeenCalled()
   })
 
   it("starts a fresh run against the saved workforce after Create, instead of continuing the stale pre-save preview", async () => {
@@ -307,14 +319,29 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     expect(runWorkforcePreviewMock).toHaveBeenCalledOnce()
   })
 
-  it("does not unmount the test panel on the create->save transition (PR review round 7, finding #1)", async () => {
-    // Regression test: setLocalId(created.id) used to flip isEditMode true
-    // and let the [localId] effect fire a non-silent load(), which set
-    // loading=true and hit the top-level `isEditMode && loading` early
-    // return -- unmounting the whole builder tree (including the test-chat
-    // panel) until the redundant getWorkforce call resolved. getWorkforce is
-    // held pending here so the window where loading=true would show is
-    // directly observable instead of racing real timers/microtasks.
+  it("does not unmount the test panel on the create->save transition (PR review round 7 finding #1, reopened round 8)", async () => {
+    // Regression test, twice over. Round 7's fix (a ref-suppressed silent
+    // load()) only helps if THIS component instance survives Create -- but
+    // /workforces/new and /workforces/[id] are separate route segments with
+    // no shared layout, so a real router.replace/push there tears down this
+    // whole instance (taking the ref with it) and mounts a fresh one under
+    // [id], reopening the exact bug (PR review round 8, finding #1). A mocked
+    // router can't simulate that teardown, which is exactly why round 7's
+    // version of this test was a false green -- so this version additionally
+    // asserts router.replace/push are never called at all for this
+    // transition (the fix updates the URL via the native History API
+    // instead, verified via historyPushStateSpy below), which is the one
+    // invariant a mocked router *can* prove: if this ever regresses back to
+    // router.replace/push, this assertion catches it even though the mock
+    // can't simulate the resulting unmount.
+    //
+    // The rest of this test (the deferred getWorkforce + node-identity check)
+    // still guards the same-instance mechanism round 7 fixed: setLocalId used
+    // to let the [localId] effect fire a non-silent load(), setting
+    // loading=true and hitting the top-level `isEditMode && loading` early
+    // return -- unmounting the tree until the redundant getWorkforce call
+    // resolved. getWorkforce is held pending here so that window is directly
+    // observable instead of racing real timers/microtasks.
     const created = { id: 55, name: "Launch Team", status: "draft" }
     createWorkforceMock.mockResolvedValueOnce(created)
     let resolveGetWorkforce: (value: unknown) => void = () => {}
@@ -358,6 +385,9 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     expect(getWorkforceMock).toHaveBeenCalledWith("55")
     expect(screen.queryByText("workforces.loading.detail")).not.toBeInTheDocument()
     expect(screen.getByTestId("task-conversation-panel")).toBe(panelBeforeCreate)
+    expect(historyPushStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55")
+    expect(routerReplaceMock).not.toHaveBeenCalled()
+    expect(routerPushMock).not.toHaveBeenCalled()
 
     await act(async () => {
       resolveGetWorkforce({
@@ -505,7 +535,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
 
     fireEvent.click(createButton)
     await waitFor(() => expect(createWorkforceMock).toHaveBeenCalledTimes(2))
-    await waitFor(() => expect(routerReplaceMock).toHaveBeenCalledWith("/workforces/55"))
+    await waitFor(() => expect(historyPushStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55"))
   })
 
   it("starts a fresh preview run instead of continuing a stale one when the unsaved draft is edited", async () => {

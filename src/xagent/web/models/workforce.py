@@ -150,6 +150,15 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     # time -- the preview-run reaper keys staleness off this column instead
     # (PR review round 8, F-NEW-1: reaping off created_at could permanently
     # cancel an actively-used preview session).
+    #
+    # The precise "only on a real transition" semantics above come from
+    # sync_workforce_run_status's own `changed` check, which sets this
+    # column explicitly -- NOT from the onupdate=func.now() below, which is
+    # a blunter instrument: it fires on *any* UPDATE statement that touches
+    # this row, transition or not. That only lines up with the comment above
+    # today because sync_workforce_run_status is the only code path that
+    # updates WorkforceRun rows; it would stop lining up the moment another
+    # write path is added without the same guard.
     last_activity_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

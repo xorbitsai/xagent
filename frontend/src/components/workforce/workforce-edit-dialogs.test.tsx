@@ -210,4 +210,53 @@ describe("AgentPickerDialog — create-and-add from a built-in template", () => 
     await waitFor(() => expect(onSelectAgent).toHaveBeenCalledOnce())
     expect(onSelectAgent).toHaveBeenCalledWith(104, "New Researcher")
   })
+
+  it("reports the freshly created agent via onAgentCreated so a create-mode parent's stale agents list gets it (PR review round 9, NEW-F2)", async () => {
+    // Regression test: create mode fetches `agents` once on mount and never
+    // refreshes it, so a template-created agent used to be invisible to any
+    // by-id lookup against that list (toFakeWorker, manager resolution) --
+    // silently rendering a blank member card or leaving "Choose a lead"
+    // shown even though the manager was actually set.
+    apiRequestMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [{ id: "tmpl-1", name: "Researcher Template", description: "A template" }],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: 104, name: "New Researcher", description: "Some public blurb" }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({}) })
+
+    const onSelectAgent = vi.fn().mockResolvedValue(undefined)
+    const onAgentCreated = vi.fn()
+
+    render(
+      <AgentPickerDialog
+        open={true}
+        onOpenChange={vi.fn()}
+        title="Add member"
+        agents={[]}
+        onSelectAgent={onSelectAgent}
+        locale="en-US"
+        onAgentCreated={onAgentCreated}
+      />,
+    )
+
+    fireEvent.click(screen.getByText("workforces.workers.tabTemplates"))
+    fireEvent.click(await screen.findByText("Researcher Template"))
+
+    const nameInput = await screen.findByPlaceholderText("workforces.templates.agentNamePlaceholder")
+    fireEvent.change(nameInput, { target: { value: "New Researcher" } })
+    fireEvent.click(screen.getByText("workforces.templates.createAndAdd"))
+
+    await waitFor(() => expect(onSelectAgent).toHaveBeenCalledOnce())
+    expect(onAgentCreated).toHaveBeenCalledWith({
+      id: 104,
+      name: "New Researcher",
+      description: "Some public blurb",
+      logo_url: null,
+      status: "published",
+    })
+  })
 })

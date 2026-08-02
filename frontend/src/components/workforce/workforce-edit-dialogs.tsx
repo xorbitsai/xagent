@@ -60,6 +60,12 @@ export interface AgentPickerDialogProps {
   /** Locale for template API */
   locale: string
   saving?: boolean
+  /** Reports a template-created agent to the parent so it can be added to
+   * its own `agents` list immediately -- without this, create mode (whose
+   * list is fetched once on mount and never refreshed) resolves the new
+   * agent as a blank placeholder wherever it looks it up by id (PR review
+   * round 9, NEW-F2). */
+  onAgentCreated?: (agent: WorkforceAgentOption) => void
 }
 
 export function AgentPickerDialog({
@@ -70,6 +76,7 @@ export function AgentPickerDialog({
   onSelectAgent,
   locale,
   saving,
+  onAgentCreated,
 }: AgentPickerDialogProps) {
   const { t } = useI18n()
   const [tab, setTab] = useState<"my-agents" | "built-in">("my-agents")
@@ -150,7 +157,7 @@ export function AgentPickerDialog({
   const handleCreateFromTemplate = async () => {
     if (!pendingTemplate || !pendingName.trim()) return
     setCreatingId(pendingTemplate.id)
-    let newAgent: { id: number; name: string; description?: string } | null = null
+    let newAgent: { id: number; name: string; description?: string; logo_url?: string | null } | null = null
     try {
       const res = await apiRequest(`${getApiUrl()}/api/agents/from-template`, {
         method: "POST",
@@ -177,6 +184,17 @@ export function AgentPickerDialog({
       setCreatingId(null)
     }
     toast.success(t("workforces.templates.createSuccess", { name: newAgent!.name }))
+    // Reported before onSelectAgent below so a create-mode parent's `agents`
+    // list already contains this agent by the time onSelectAgent's own
+    // state updates (draftWorkers/draftManagerAgentId) trigger the re-render
+    // that looks it up.
+    onAgentCreated?.({
+      id: newAgent!.id,
+      name: newAgent!.name,
+      description: newAgent!.description ?? null,
+      logo_url: newAgent!.logo_url ?? null,
+      status: "published",
+    })
     setPendingTemplate(null)
     setPendingName("")
     try {
@@ -475,6 +493,7 @@ interface WorkforceEditDialogsProps {
   saving: boolean
   isArchived: boolean
   dialogs: WorkforceEditDialogsState
+  onAgentCreated?: (agent: WorkforceAgentOption) => void
 }
 
 export function WorkforceEditDialogs({
@@ -482,6 +501,7 @@ export function WorkforceEditDialogs({
   saving,
   isArchived,
   dialogs,
+  onAgentCreated,
 }: WorkforceEditDialogsProps) {
   const { t } = useI18n()
   const {
@@ -514,6 +534,7 @@ export function WorkforceEditDialogs({
         onSelectAgent={handleChangeLead}
         locale={locale}
         saving={saving}
+        onAgentCreated={onAgentCreated}
       />
 
       {/* Add Member Dialog */}
@@ -525,6 +546,7 @@ export function WorkforceEditDialogs({
         onSelectAgent={handleAddMember}
         locale={locale}
         saving={saving}
+        onAgentCreated={onAgentCreated}
       />
 
       {/* Member Detail Dialog */}

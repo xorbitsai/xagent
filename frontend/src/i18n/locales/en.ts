@@ -4294,7 +4294,8 @@ Build when you need.`,
       canvasUnavailable: "Canvas unavailable.",
       publish: "Failed to publish workforce",
       unpublish: "Failed to unpublish workforce",
-      archive: "Failed to archive workforce"
+      archive: "Failed to archive workforce",
+      editDiscardedByArchive: "Workforce was archived before this change could save, so it was discarded."
     }
   },
   adminMcp: {

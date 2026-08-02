@@ -1,14 +1,19 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const translateMock = vi.hoisted(() => (key: string) => key)
 const fitViewSpy = vi.hoisted(() => vi.fn())
+const toastErrorSpy = vi.hoisted(() => vi.fn())
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: translateMock }),
+}))
+
+vi.mock("sonner", () => ({
+  toast: { error: toastErrorSpy, success: vi.fn() },
 }))
 
 // Only useReactFlow's fitView is wrapped -- @xyflow/react's own initial
@@ -89,7 +94,6 @@ function buildCanvasElement(props: Partial<React.ComponentProps<typeof Workforce
         manager={"manager" in props ? props.manager! : manager}
         workers={props.workers ?? [worker]}
         isArchived={props.isArchived ?? false}
-        saving={props.saving ?? false}
         dialogs={dialogs}
         getStartedSteps={props.getStartedSteps ?? []}
         getStartedCollapsed={props.getStartedCollapsed ?? false}
@@ -116,6 +120,7 @@ describe("WorkforceCanvas", () => {
   afterEach(() => {
     cleanup()
     fitViewSpy.mockClear()
+    toastErrorSpy.mockClear()
   })
 
   it("re-fits the canvas when the Get Started checklist is expanded or collapsed after mount", () => {
@@ -212,67 +217,106 @@ describe("WorkforceCanvas", () => {
     expect(screen.getByDisplayValue("Coordinate launch work")).toBeDisabled()
   })
 
-  it("disables the details node's name/description fields while a save is in flight (PR review round 8, F-NEW-3)", () => {
-    // Regression test: WorkforceCanvas used to be invoked with no `saving`
-    // prop at all, unlike its Configure-panel sibling (which disables its
-    // equivalent fields via `disabled={saving}`). Without this, a save
-    // response landing after the user typed further changes could silently
-    // clobber those keystrokes via the data.name/data.description resync
-    // effects -- disabling the fields during the window closes that off by
-    // construction, since a disabled field can't receive further input.
-    renderCanvas({
-      name: "Launch Workforce",
-      description: "Coordinate launch work",
-      saving: true,
-    })
-
-    expect(screen.getByDisplayValue("Launch Workforce")).toBeDisabled()
-    expect(screen.getByDisplayValue("Coordinate launch work")).toBeDisabled()
-  })
-
-  it("re-enables the details node's fields once saving finishes", () => {
-    const { rerender } = renderCanvas({
-      name: "Launch Workforce",
-      description: "Coordinate launch work",
-      saving: true,
-    })
-    expect(screen.getByDisplayValue("Launch Workforce")).toBeDisabled()
-
-    rerender({ saving: false })
-
-    expect(screen.getByDisplayValue("Launch Workforce")).not.toBeDisabled()
-  })
-
-  it("does not fire a premature save when an unrelated mutation disables the field mid-edit (self-review finding after round 8)", () => {
-    // Regression test: `saving` is one flag shared by every mutation handler
-    // in workforce-builder.tsx (handleAddWorker, handlePublish, etc.), not
-    // just handleSaveDetails. A field becoming `disabled` while it still has
-    // focus forces the browser to blur it -- and this node commits on blur.
-    // Without a disabled-guard in commit(), an unrelated action saving
-    // elsewhere in the builder while the user is still mid-edit here would
-    // force a blur and silently save the half-typed value.
+  it("warns instead of silently dropping an in-progress edit when the workforce is archived mid-edit (PR review round 9, MINOR-3)", () => {
+    // Regression test: becoming archived while this node has an unsaved
+    // edit flips `disabled` (isArchived) to true, which forces a blur --
+    // commit()'s early return for the disabled case used to just discard
+    // the edit with no feedback that it never saved.
     const { onSaveDetails, rerender } = renderCanvas({
       name: "Launch Workforce",
       description: "Coordinate launch work",
-      saving: false,
+      isArchived: false,
     })
 
     const nameInput = screen.getByDisplayValue("Launch Workforce")
     fireEvent.change(nameInput, { target: { value: "Mid-edit unsaved title" } })
 
-    // An unrelated mutation elsewhere flips the shared `saving` flag.
-    rerender({ saving: true })
-    expect(nameInput).toBeDisabled()
-
-    // The forced blur a real browser would fire on disabling a focused
-    // field, simulated directly since jsdom does not reproduce that native
-    // behavior automatically.
+    rerender({ isArchived: true })
     fireEvent.blur(nameInput)
 
     expect(onSaveDetails).not.toHaveBeenCalled()
-    // The unsaved edit isn't lost -- it's still sitting in local state,
-    // simply not disabled anymore once the unrelated save finishes.
-    rerender({ saving: false })
-    expect(screen.getByDisplayValue("Mid-edit unsaved title")).toBeInTheDocument()
+    expect(toastErrorSpy).toHaveBeenCalledWith("workforces.errors.editDiscardedByArchive")
+  })
+
+  it("does not warn on an ordinary blur with no pending edit while archived", () => {
+    renderCanvas({
+      name: "Launch Workforce",
+      description: "Coordinate launch work",
+      isArchived: true,
+    })
+
+    fireEvent.blur(screen.getByDisplayValue("Launch Workforce"))
+
+    expect(toastErrorSpy).not.toHaveBeenCalled()
+  })
+
+  it("does not disable the sibling field when blurring one field triggers a save (PR review round 9, NEW-F1)", () => {
+    // Regression test: the details node used to gate on the builder's
+    // page-wide `saving` flag, which handleSaveDetails flips synchronously
+    // before its first await. Since blur is a discrete event, that disabled
+    // the description field before the browser finished moving focus into
+    // it on a blur-name-then-click-description sequence -- the single most
+    // common edit path -- silently swallowing keystrokes until the save
+    // resolved. The details node must never disable a field for save-in-
+    // flight reasons; only isArchived should.
+    const { onSaveDetails } = renderCanvas({ name: "Launch Workforce", description: "Coordinate launch work" })
+
+    const nameInput = screen.getByDisplayValue("Launch Workforce")
+    const descriptionInput = screen.getByDisplayValue("Coordinate launch work")
+
+    fireEvent.change(nameInput, { target: { value: "Renamed Workforce" } })
+    fireEvent.blur(nameInput)
+    expect(onSaveDetails).toHaveBeenCalledWith({ name: "Renamed Workforce", description: "Coordinate launch work" })
+
+    expect(descriptionInput).not.toBeDisabled()
+    fireEvent.focus(descriptionInput)
+    fireEvent.change(descriptionInput, { target: { value: "New description" } })
+    expect(descriptionInput).toHaveValue("New description")
+  })
+
+  it("serializes overlapping saves instead of firing a second one while the first is still in flight", async () => {
+    // Regression test: without disabling fields during a save, blurring one
+    // field then quickly editing and blurring the other can fire two
+    // concurrent onSaveDetails calls that could resolve out of order and
+    // clobber each other's result. The node must queue the newest payload
+    // and only send it once the in-flight save resolves.
+    let resolveFirst: (() => void) | undefined
+    const onSaveDetails = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { resolveFirst = resolve }),
+    )
+    renderCanvas({ name: "Launch Workforce", description: "Coordinate launch work", onSaveDetails })
+
+    const nameInput = screen.getByDisplayValue("Launch Workforce")
+    const descriptionInput = screen.getByDisplayValue("Coordinate launch work")
+
+    fireEvent.change(nameInput, { target: { value: "Renamed Workforce" } })
+    fireEvent.blur(nameInput)
+    expect(onSaveDetails).toHaveBeenCalledTimes(1)
+
+    fireEvent.focus(descriptionInput)
+    fireEvent.change(descriptionInput, { target: { value: "New description" } })
+    fireEvent.blur(descriptionInput)
+    expect(onSaveDetails).toHaveBeenCalledTimes(1)
+
+    resolveFirst?.()
+    await waitFor(() => expect(onSaveDetails).toHaveBeenCalledTimes(2))
+    expect(onSaveDetails).toHaveBeenLastCalledWith({ name: "Renamed Workforce", description: "New description" })
+  })
+
+  it("does not clobber an in-progress edit when a prop update lands while the field is focused", () => {
+    // Regression test: the resync effects that keep local state in step with
+    // data.name/data.description used to run unconditionally, so a save
+    // response landing (updating the `name`/`description` props) while the
+    // user was still typing into that same, still-focused field would wipe
+    // their unsaved keystrokes.
+    const { rerender } = renderCanvas({ name: "Launch Workforce", description: "Coordinate launch work" })
+
+    const nameInput = screen.getByDisplayValue("Launch Workforce")
+    fireEvent.focus(nameInput)
+    fireEvent.change(nameInput, { target: { value: "Typing a new name" } })
+
+    rerender({ name: "Renamed From Server" })
+
+    expect(nameInput).toHaveValue("Typing a new name")
   })
 })

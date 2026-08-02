@@ -540,8 +540,14 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
             // The History API updates the address bar (so refresh/copy-link
             // still work) without invoking Next's router at all, keeping
             // this instance mounted -- the same fix AgentBuilder already
-            // uses for the identical /build/new -> /build/[id] transition.
-            window.history.pushState({}, "", `/workforces/${created.id}`)
+            // uses for the identical /build/new -> /build/[id] transition
+            // (agent-builder-chat.tsx's replaceState call). replaceState
+            // rather than pushState: this is a one-time create->save
+            // transition, not a new history entry the user would ever want
+            // to land back on -- pushState would leave /workforces/new on
+            // the back-stack, so Back after a successful create would
+            // return here instead of leaving the detail page.
+            window.history.replaceState({}, "", `/workforces/${created.id}`)
         } catch (err) {
             const nextError = err instanceof Error ? err.message : t("workforces.errors.create")
             setError(nextError)
@@ -675,6 +681,16 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         },
     ]
 
+    // Lets AgentPickerDialog's create-from-template flow add the brand-new
+    // agent straight into local state -- `agents` is otherwise only fetched
+    // once (create mode has no [localId] to key a refetch off of), so any
+    // by-id lookup against it (toFakeWorker, manager resolution below) would
+    // miss a just-created agent and silently fall back to a blank/null
+    // placeholder (PR review round 9, NEW-F2).
+    const handleAgentCreated = useCallback((agent: WorkforceAgentOption) => {
+        setAgents((current) => (current.some((a) => a.id === agent.id) ? current : [...current, agent]))
+    }, [])
+
     const dialogs = useWorkforceEditDialogs({
         manager,
         workers,
@@ -783,6 +799,7 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                 saving={saving}
                 isArchived={!!isArchived}
                 dialogs={dialogs}
+                onAgentCreated={handleAgentCreated}
             />
 
             {/* Body: main view + test panel */}
@@ -818,7 +835,6 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                                     manager={manager}
                                     workers={workers}
                                     isArchived={!!isArchived}
-                                    saving={saving}
                                     dialogs={dialogs}
                                     getStartedSteps={getStartedSteps}
                                     getStartedCollapsed={getStartedCollapsed}

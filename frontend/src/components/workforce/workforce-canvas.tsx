@@ -17,6 +17,7 @@ import {
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
 import { Crown, Plus, Settings } from "lucide-react"
+import { toast } from "sonner"
 import { useI18n } from "@/contexts/i18n-context"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -31,13 +32,6 @@ interface WorkforceCanvasProps {
   manager: WorkforceAgentSummary | null
   workers: WorkforceWorker[]
   isArchived?: boolean
-  // Mirrors WorkforceConfigPanel's identically-named prop (workforce-config-
-  // panel.tsx:128, 139): disables the details node's Input/Textarea while a
-  // save is in flight, the same way its Configure-panel sibling already
-  // does. Without this, the unconditional data.name/data.description resync
-  // effects below can silently clobber a keystroke typed during that window
-  // with the save response that just landed (PR review round 8, F-NEW-3).
-  saving?: boolean
   dialogs: WorkforceEditDialogsState
   getStartedSteps: GetStartedStep[]
   getStartedCollapsed: boolean
@@ -56,35 +50,68 @@ export interface NodeData {
 interface DetailsNodeData {
   name: string
   description: string
-  onSave: (data: { name: string; description: string }) => void
-  // See WorkforceCanvasProps.isArchived / .saving above (PR review round 8,
-  // F-NEW-2 / F-NEW-3): every other interactive canvas node (manager,
-  // worker, add-worker) is already gated on isArchived, and the equivalent
-  // Configure-panel editor gates on both -- this node was the one exception.
+  onSave: (data: { name: string; description: string }) => Promise<void>
+  // Every other interactive canvas node (manager, worker, add-worker) is
+  // already gated on isArchived, and the equivalent Configure-panel editor
+  // gates on it too -- this node was the one exception (PR review round 8,
+  // F-NEW-2).
   isArchived: boolean
-  saving: boolean
 }
 
 export function DetailsNode({ data }: { data: DetailsNodeData }) {
   const { t } = useI18n()
   const [name, setName] = useState(data.name)
   const [description, setDescription] = useState(data.description)
-  const disabled = data.isArchived || data.saving
+  const disabled = data.isArchived
 
-  useEffect(() => setName(data.name), [data.name])
-  useEffect(() => setDescription(data.description), [data.description])
+  // Skip the prop resync while a field is focused: a save response landing
+  // while the user is still actively editing that same field (see
+  // savingRef/pendingRef below) would otherwise silently overwrite whatever
+  // they've typed since.
+  const nameFocusedRef = useRef(false)
+  const descriptionFocusedRef = useRef(false)
+
+  useEffect(() => {
+    if (!nameFocusedRef.current) setName(data.name)
+  }, [data.name])
+  useEffect(() => {
+    if (!descriptionFocusedRef.current) setDescription(data.description)
+  }, [data.description])
+
+  // Serializes this node's own saves instead of disabling the fields while
+  // one is in flight. Disabling on blur used to force a synchronous
+  // re-render mid-click, which un-focused whichever field the user was
+  // clicking into next (e.g. blur name -> click description) before the
+  // browser finished moving focus there -- a disabled element can't receive
+  // focus (PR review round 9, NEW-F1). Queuing the latest values here keeps
+  // both fields interactive at all times while still guaranteeing saves
+  // land in order rather than racing each other.
+  const savingRef = useRef(false)
+  const pendingRef = useRef<{ name: string; description: string } | null>(null)
+
+  const runSave = (payload: { name: string; description: string }) => {
+    savingRef.current = true
+    data.onSave(payload).finally(() => {
+      savingRef.current = false
+      const queued = pendingRef.current
+      pendingRef.current = null
+      if (queued) runSave(queued)
+    })
+  }
 
   const commit = () => {
-    // Unlike the Configure panel (which commits via an explicit Save button
-    // that is itself disabled during isArchived/saving), this node commits
-    // on blur -- and setting `disabled` on a focused input forces the
-    // browser to blur it immediately. Without this guard, an unrelated
-    // mutation elsewhere in the builder (they share one `saving` flag) could
-    // flip this field to disabled while the user is still mid-edit, forcing
-    // a blur that fires a premature save of a half-typed value. The local
-    // name/description state (and the user's unsaved edit) isn't lost by
-    // this early return -- it stays put and re-enables once saving clears.
-    if (disabled) return
+    if (disabled) {
+      // The workforce can be archived out from under an in-progress edit
+      // here (the header's Archive button, unrelated to this node), which
+      // forces a blur via the `disabled` attribute flipping true. There's
+      // nothing to retry with -- an archived workforce's PATCH is rejected
+      // either way -- but the edit used to simply vanish with no
+      // indication it was never saved (PR review round 9, MINOR-3).
+      if (name.trim() !== data.name || description.trim() !== data.description) {
+        toast.error(t("workforces.errors.editDiscardedByArchive"))
+      }
+      return
+    }
     // Mirror the Configure panel's save button, which is disabled while the
     // trimmed name is empty: don't fire an empty-name save (a 422 in edit
     // mode, or a silently-blanked draft name with no explanation in create
@@ -95,9 +122,13 @@ export function DetailsNode({ data }: { data: DetailsNodeData }) {
     }
     const trimmedName = name.trim()
     const trimmedDescription = description.trim()
-    if (trimmedName !== data.name || trimmedDescription !== data.description) {
-      data.onSave({ name: trimmedName, description: trimmedDescription })
+    if (trimmedName === data.name && trimmedDescription === data.description) return
+    const payload = { name: trimmedName, description: trimmedDescription }
+    if (savingRef.current) {
+      pendingRef.current = payload
+      return
     }
+    runSave(payload)
   }
 
   return (
@@ -108,7 +139,8 @@ export function DetailsNode({ data }: { data: DetailsNodeData }) {
       <Input
         value={name}
         onChange={(e) => setName(e.target.value)}
-        onBlur={commit}
+        onFocus={() => { nameFocusedRef.current = true }}
+        onBlur={() => { nameFocusedRef.current = false; commit() }}
         disabled={disabled}
         placeholder={t("workforces.create.placeholders.name")}
         className="nodrag border-none bg-transparent px-0 text-base font-semibold shadow-none focus-visible:ring-0"
@@ -116,7 +148,8 @@ export function DetailsNode({ data }: { data: DetailsNodeData }) {
       <Textarea
         value={description}
         onChange={(e) => setDescription(e.target.value)}
-        onBlur={commit}
+        onFocus={() => { descriptionFocusedRef.current = true }}
+        onBlur={() => { descriptionFocusedRef.current = false; commit() }}
         disabled={disabled}
         placeholder={t("workforces.create.placeholders.description")}
         rows={1}
@@ -253,7 +286,6 @@ function WorkforceCanvasInner({
   manager,
   workers,
   isArchived = false,
-  saving = false,
   dialogs,
   getStartedSteps,
   getStartedCollapsed,
@@ -290,16 +322,15 @@ function WorkforceCanvasInner({
       data: {
         name,
         description,
-        onSave: (data: { name: string; description: string }) => {
+        onSave: (data: { name: string; description: string }) =>
           // handleSaveDetails already toasts and sets the error state on
           // failure, then re-throws so callers that need to react (the
           // config-panel's edit view stays open) can -- this call site
           // doesn't need to, so swallow it here rather than leaving an
-          // unhandled promise rejection.
-          onSaveDetails(data).catch(() => {})
-        },
+          // unhandled promise rejection. Still returned (not fire-and-
+          // forget) so DetailsNode's own save-serialization can await it.
+          onSaveDetails(data).catch(() => {}),
         isArchived,
-        saving,
       } satisfies DetailsNodeData,
     })
 
@@ -412,7 +443,7 @@ function WorkforceCanvasInner({
     }
 
     return { nodes: newNodes, edges: newEdges }
-  }, [name, description, onSaveDetails, manager, workers, isArchived, saving, t])
+  }, [name, description, onSaveDetails, manager, workers, isArchived, t])
 
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node) => {

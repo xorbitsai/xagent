@@ -4294,7 +4294,8 @@ const zh = {
       canvasUnavailable: "画布不可用。",
       publish: "发布 Workforce 失败",
       unpublish: "取消发布 Workforce 失败",
-      archive: "归档 Workforce 失败"
+      archive: "归档 Workforce 失败",
+      editDiscardedByArchive: "该修改尚未保存时 Workforce 已被归档,修改已被丢弃。"
     }
   },
   adminMcp: {

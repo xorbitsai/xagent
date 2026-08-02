@@ -18,10 +18,12 @@ const sendMessageMock = vi.hoisted(() => vi.fn())
 // Spied rather than mocked via vi.mock: handleCreate now updates the address
 // bar via the native History API instead of router.replace/push, precisely
 // to avoid the cross-route-segment remount that a Next.js navigation would
-// trigger (PR review round 8, finding #1 REOPENED). Real jsdom pushState
+// trigger (PR review round 8, finding #1 REOPENED). Real jsdom replaceState
 // would also work, but no-opping it keeps this test's window.location
-// stable regardless of run order.
-const historyPushStateSpy = vi.spyOn(window.history, "pushState").mockImplementation(() => {})
+// stable regardless of run order. replaceState, not pushState (PR review
+// round 9, MINOR-1): this is a one-time create->save transition, not a new
+// history entry the user would ever want Back to land on.
+const historyReplaceStateSpy = vi.spyOn(window.history, "replaceState").mockImplementation(() => {})
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({}),
@@ -106,7 +108,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     getWorkforceMock.mockReset()
     runWorkforceMock.mockReset()
     sendMessageMock.mockReset().mockResolvedValue(undefined)
-    historyPushStateSpy.mockClear()
+    historyReplaceStateSpy.mockClear()
   })
 
   afterEach(() => {
@@ -216,8 +218,8 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
       })
     })
     // History API, not router.replace/push (PR review round 8, finding #1
-    // REOPENED) -- see historyPushStateSpy's comment above.
-    expect(historyPushStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55")
+    // REOPENED) -- see historyReplaceStateSpy's comment above.
+    expect(historyReplaceStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55")
     expect(routerReplaceMock).not.toHaveBeenCalled()
   })
 
@@ -330,7 +332,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     // version of this test was a false green -- so this version additionally
     // asserts router.replace/push are never called at all for this
     // transition (the fix updates the URL via the native History API
-    // instead, verified via historyPushStateSpy below), which is the one
+    // instead, verified via historyReplaceStateSpy below), which is the one
     // invariant a mocked router *can* prove: if this ever regresses back to
     // router.replace/push, this assertion catches it even though the mock
     // can't simulate the resulting unmount.
@@ -385,7 +387,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     expect(getWorkforceMock).toHaveBeenCalledWith("55")
     expect(screen.queryByText("workforces.loading.detail")).not.toBeInTheDocument()
     expect(screen.getByTestId("task-conversation-panel")).toBe(panelBeforeCreate)
-    expect(historyPushStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55")
+    expect(historyReplaceStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55")
     expect(routerReplaceMock).not.toHaveBeenCalled()
     expect(routerPushMock).not.toHaveBeenCalled()
 
@@ -535,7 +537,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
 
     fireEvent.click(createButton)
     await waitFor(() => expect(createWorkforceMock).toHaveBeenCalledTimes(2))
-    await waitFor(() => expect(historyPushStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55"))
+    await waitFor(() => expect(historyReplaceStateSpy).toHaveBeenCalledWith({}, "", "/workforces/55"))
   })
 
   it("starts a fresh preview run instead of continuing a stale one when the unsaved draft is edited", async () => {

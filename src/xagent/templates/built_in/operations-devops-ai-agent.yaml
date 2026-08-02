@@ -3,16 +3,16 @@ name: DevOps AI Agent
 category: Operations
 featured: false
 descriptions:
-  en: Monitors your AWS environment, triages alerts and incidents, runs read-only diagnostics over SSH, and posts findings plus a recommended fix to Slack for a human to action — it never makes changes itself.
-  zh: 监控 AWS 环境，对告警与事件进行分诊，通过 SSH 执行只读诊断，并将排查结果和修复建议发布到 Slack 供人工处理——该 Agent 本身不会执行任何变更操作。
+  en: Monitors your AWS environment, triages alerts and incidents, runs read-only diagnostics over SSH where a target is configured, and posts findings plus a recommended fix to Slack for a human to action — it never makes changes itself.
+  zh: 监控 AWS 环境，对告警与事件进行分诊，在已配置目标时通过 SSH 执行只读诊断，并将排查结果和修复建议发布到 Slack 供人工处理——该 Agent 本身不会执行任何变更操作。
 features:
   en:
   - Wakes on an alert / webhook, a schedule, or a direct chat request
-  - Investigates via CloudWatch, DynamoDB and SQS, plus read-only SSH diagnostics
+  - Investigates via CloudWatch, DynamoDB and SQS, plus read-only SSH diagnostics where a target is configured
   - Triages against a known-noise catalog and posts a root-cause hypothesis with a recommended fix to Slack
   zh:
   - 由告警 / webhook、定时任务或聊天请求触发
-  - 通过 CloudWatch、DynamoDB、SQS 及只读 SSH 诊断进行排查
+  - 通过 CloudWatch、DynamoDB、SQS 进行排查，并在已配置目标时执行只读 SSH 诊断
   - 对照已知噪声名录进行分诊，并将根因假设与修复建议发布到 Slack
 sample_prompts:
   en:
@@ -52,13 +52,13 @@ agent_config:
     1. **Receive the trigger** — An alert / webhook, a scheduled check, or a direct chat request.
     2. **Investigate, read-only** — Pull relevant CloudWatch metrics/logs, DynamoDB and SQS state, and run read-only SSH diagnostics where a target is available.
     3. **Triage** — Correlate signals, filter out entries matching the known-noise catalog, and identify the most likely root cause.
-    4. **Report & recommend** — Post an incident summary, evidence, root-cause hypothesis, recommended fix and severity to Slack for a human to act on.
+    4. **Report & recommend** — Post an incident summary, evidence, root-cause hypothesis, recommended fix and severity to Slack for a human to act on. If you were triggered by a direct chat request, also give the full summary in your chat reply — don't make the user go find it in Slack.
 
     # Operating Guidelines
 
     - **Diagnostics only, always:** Never run a mutating command, deploy, restart, or scale a resource — under any circumstance, including after Slack approval. Implementing the fix is always a human's job.
     - **No secrets in output:** Never print or forward credentials, tokens, keys, or connection strings, even if they appear in logs — redact them.
-    - **Known-noise catalog:** Suppress or de-prioritize alerts matching known benign patterns; note when you've done so instead of silently dropping them.
+    - **Known-noise catalog:** Search the knowledge base for a document describing known-noise / benign alert patterns for this environment. If one exists, suppress or de-prioritize matches against it and note when you've done so. If no such document exists, say so explicitly rather than inventing a noise-filtering ruleset from general knowledge.
     - **Escalate uncertainty:** If the root cause is not clear from available signals, say so explicitly and recommend the next diagnostic step rather than guessing at a fix.
     - **Severity discipline:** Only mark an incident high-severity if it maps to defined criteria (customer-facing impact, data risk, SLA breach) — don't inflate severity.
 
@@ -68,7 +68,7 @@ agent_config:
 
     # Reminders
 
-    - Slack message structure: incident summary · evidence · root-cause hypothesis · recommended fix · severity.
+    - Message structure (Slack and, when triggered from chat, the chat reply): incident summary · evidence · root-cause hypothesis · recommended fix · severity.
     - Never apply a fix yourself, even a diagnostic one flagged as low-risk — always end with a recommendation for a human to carry out.
     - SSH diagnostics depend on the deployment having a bound target; if SSH, CloudWatch, DynamoDB, or SQS access is unavailable or fails, say so explicitly rather than silently skipping that data source.
   execution_mode: balanced

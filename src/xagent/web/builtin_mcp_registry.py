@@ -498,7 +498,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "aws",
             "name": "AWS",
-            "description": "Connect to AWS to check CloudWatch alarms/metrics, DynamoDB health, and SQS queue depth.",
+            "description": "Connect to AWS to check CloudWatch alarms/metrics/logs, DynamoDB health, and SQS queue depth.",
             "icon": "https://www.google.com/s2/favicons?domain=aws.amazon.com&sz=128",
             "transport": "stdio",
             "provider_name": None,

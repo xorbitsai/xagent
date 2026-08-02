@@ -26,6 +26,14 @@ ASSUME_ROLE_SESSION_NAME = "xagent-aws-mcp"
 CALLER_ID_ENV_VAR = "XAGENT_MCP_CALLER_ID"
 # RoleSessionName's allowed charset per AWS STS: [\w+=,.@-], max 64 chars.
 _SESSION_NAME_UNSAFE_CHARS = re.compile(r"[^\w+=,.@-]")
+# Bounded pagination cap for the list/describe tools below -- mirrors the
+# same pattern already used by slack.py's channel listing. Each of these
+# AWS list/describe APIs can return a page that's partially full (or even
+# empty) with more matching data on a later page, so fetching exactly one
+# page and reporting `truncated` with no way to continue can silently miss
+# data (worst case: a log search during an incident reporting "no errors
+# found" when errors exist past the first page).
+MAX_PAGES = 20
 MAX_LOG_EVENTS = 100
 # CloudWatch's own server-side default (100,800) is far more than an LLM
 # needs handed back in one response; cap to roughly a day of 1-minute data.
@@ -36,6 +44,30 @@ MAX_METRIC_DATAPOINTS = 1440
 # blows out the model's context. ~4000 chars is generous for a log line
 # while keeping a full batch's worst case bounded.
 MAX_LOG_MESSAGE_CHARS = 4000
+
+# AttributeNames=["All"] on GetQueueAttributes also returns the queue's
+# resource Policy document (account IDs, principal ARNs, cross-account
+# trust conditions) and KmsMasterKeyId -- neither is a diagnostic signal
+# this tool's docstring promises, and IAM can't restrict which
+# AttributeNames come back, so this connector enumerates only the
+# diagnostic attributes itself instead of asking for everything.
+SQS_DIAGNOSTIC_ATTRIBUTES = [
+    "ApproximateNumberOfMessages",
+    "ApproximateNumberOfMessagesNotVisible",
+    "ApproximateNumberOfMessagesDelayed",
+    "CreatedTimestamp",
+    "LastModifiedTimestamp",
+    "VisibilityTimeout",
+    "MaximumMessageSize",
+    "MessageRetentionPeriod",
+    "DelaySeconds",
+    "ReceiveMessageWaitTimeSeconds",
+    "RedrivePolicy",
+    "RedriveAllowPolicy",
+    "QueueArn",
+    "FifoQueue",
+    "ContentBasedDeduplication",
+]
 
 # role_arn is a model-supplied ARN with no operator-side allowlist, so an
 # assumed session's actual permissions could otherwise be as broad as
@@ -150,8 +182,17 @@ def _assume_role_credentials(role_arn: str, region: str) -> dict[str, str | None
     # (see _execute_mcp_call in mcp_adapter.py, which opens and tears down a
     # fresh stdio session per call), so a module-level cache never survives
     # past the single call that populated it.
+    #
+    # Explicit credentials here too (see the matching comment in _client):
+    # this is the cross-account AssumeRole call, the most sensitive path in
+    # the module, so it shouldn't be the one place still leaning on boto3's
+    # ambient provider chain instead of the connector's own env credentials.
     sts = boto3.Session().client(
-        "sts", region_name=region, config=DEFAULT_CLIENT_CONFIG
+        "sts",
+        region_name=region,
+        config=DEFAULT_CLIENT_CONFIG,
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
     response = sts.assume_role(
         RoleArn=role_arn,
@@ -215,8 +256,19 @@ def _client(
             config=DEFAULT_CLIENT_CONFIG,
             **credentials,
         )
+    # Pass the connector's own credentials explicitly rather than letting
+    # boto3's ambient provider chain pick them up: _require_base_credentials
+    # above already guarantees these two env vars are set and boto3's chain
+    # would resolve the same values today, but naming them here removes any
+    # dependency on that chain ever consulting a ~/.aws/credentials file at
+    # all -- reachable via the inherited HOME env var -- as a fallback,
+    # rather than trusting it never will.
     return session.client(
-        service, region_name=resolved_region, config=DEFAULT_CLIENT_CONFIG
+        service,
+        region_name=resolved_region,
+        config=DEFAULT_CLIENT_CONFIG,
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
 
 
@@ -321,7 +373,28 @@ def aws_cloudwatch_describe_alarms(
             kwargs["StateValue"] = state
         if alarm_name_prefix:
             kwargs["AlarmNamePrefix"] = alarm_name_prefix
-        result = _client("cloudwatch", region, role_arn).describe_alarms(**kwargs)
+        client = _client("cloudwatch", region, role_arn)
+        # Bounded pagination (MAX_PAGES): a single DescribeAlarms page can
+        # come back with NextToken set even when this page alone answered
+        # "nothing is wrong" -- fetching only one page could hide a firing
+        # alarm sitting on the next one.
+        raw_alarms: list[dict[str, Any]] = []
+        raw_composite_alarms: list[dict[str, Any]] = []
+        next_token: str | None = None
+        for _ in range(MAX_PAGES):
+            if next_token:
+                kwargs["NextToken"] = next_token
+            result = client.describe_alarms(**kwargs)
+            raw_alarms.extend(result.get("MetricAlarms") or [])
+            # DescribeAlarms returns composite alarms (account-level "is the
+            # service healthy" rollups aggregating leaf alarms) in a separate
+            # top-level field sharing the same page/cursor. Omitting them
+            # would let this triage tool report "nothing is wrong" while the
+            # account's top rollup alarm is firing.
+            raw_composite_alarms.extend(result.get("CompositeAlarms") or [])
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
         alarms = [
             {
                 "name": alarm.get("AlarmName"),
@@ -334,13 +407,8 @@ def aws_cloudwatch_describe_alarms(
                 "threshold": alarm.get("Threshold"),
                 "comparison": alarm.get("ComparisonOperator"),
             }
-            for alarm in (result.get("MetricAlarms") or [])
+            for alarm in raw_alarms
         ]
-        # DescribeAlarms returns composite alarms (account-level "is the
-        # service healthy" rollups aggregating leaf alarms) in a separate
-        # top-level field sharing the same MaxRecords budget. Omitting them
-        # would let this triage tool report "nothing is wrong" while the
-        # account's top rollup alarm is firing.
         composite_alarms = [
             {
                 "name": alarm.get("AlarmName"),
@@ -349,12 +417,12 @@ def aws_cloudwatch_describe_alarms(
                 "state_updated": alarm.get("StateUpdatedTimestamp"),
                 "alarm_rule": alarm.get("AlarmRule"),
             }
-            for alarm in (result.get("CompositeAlarms") or [])
+            for alarm in raw_composite_alarms
         ]
         return _success(
             alarms=alarms,
             composite_alarms=composite_alarms,
-            truncated="NextToken" in result,
+            truncated=bool(next_token),
         )
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing CloudWatch alarms: {e}")
@@ -463,16 +531,26 @@ def aws_cloudwatch_describe_log_groups(
         kwargs: dict[str, Any] = {"limit": 50}
         if name_prefix:
             kwargs["logGroupNamePrefix"] = name_prefix
-        result = _client("logs", region, role_arn).describe_log_groups(**kwargs)
+        client = _client("logs", region, role_arn)
+        raw_groups: list[dict[str, Any]] = []
+        next_token: str | None = None
+        for _ in range(MAX_PAGES):
+            if next_token:
+                kwargs["nextToken"] = next_token
+            result = client.describe_log_groups(**kwargs)
+            raw_groups.extend(result.get("logGroups") or [])
+            next_token = result.get("nextToken")
+            if not next_token:
+                break
         groups = [
             {
                 "name": group.get("logGroupName"),
                 "stored_bytes": group.get("storedBytes"),
                 "retention_days": group.get("retentionInDays"),
             }
-            for group in (result.get("logGroups") or [])
+            for group in raw_groups
         ]
-        return _success(log_groups=groups, truncated="nextToken" in result)
+        return _success(log_groups=groups, truncated=bool(next_token))
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error describing log groups: {e}")
         return _error(_aws_error_message(e, bool(role_arn)))
@@ -504,11 +582,12 @@ def aws_cloudwatch_filter_log_events(
     own permissions.
     """
     try:
+        max_events = max(1, min(int(limit), MAX_LOG_EVENTS))
         kwargs: dict[str, Any] = {
             "logGroupName": log_group_name,
             # Clamp to [1, MAX_LOG_EVENTS]: a zero/negative limit passes the
             # int signature validation but AWS rejects it remotely.
-            "limit": max(1, min(int(limit), MAX_LOG_EVENTS)),
+            "limit": max_events,
         }
         if filter_pattern:
             kwargs["filterPattern"] = filter_pattern
@@ -516,16 +595,36 @@ def aws_cloudwatch_filter_log_events(
             kwargs["startTime"] = int(start_time_ms)
         if end_time_ms is not None:
             kwargs["endTime"] = int(end_time_ms)
-        result = _client("logs", region, role_arn).filter_log_events(**kwargs)
+        client = _client("logs", region, role_arn)
+        # Bounded pagination (MAX_PAGES): FilterLogEvents can come back with
+        # a partially-full (or even empty) page and nextToken still set, so
+        # stopping after one page could report "no matches" during an
+        # incident while matching events sit on a later page.
+        raw_events: list[dict[str, Any]] = []
+        next_token: str | None = None
+        for _ in range(MAX_PAGES):
+            if next_token:
+                kwargs["nextToken"] = next_token
+            # Shrink the per-page request to the remaining budget: without
+            # this, a page could return more than what's left toward
+            # max_events, requiring the surplus to be discarded below and
+            # muddying "truncated" into a len(raw_events) > max_events check
+            # instead of simply "is there still a next_token".
+            kwargs["limit"] = max_events - len(raw_events)
+            result = client.filter_log_events(**kwargs)
+            raw_events.extend(result.get("events") or [])
+            next_token = result.get("nextToken")
+            if len(raw_events) >= max_events or not next_token:
+                break
         events = [
             {
                 "timestamp_ms": event.get("timestamp"),
                 "log_stream": event.get("logStreamName"),
                 "message": _truncate_message(event.get("message")),
             }
-            for event in (result.get("events") or [])
+            for event in raw_events
         ]
-        return _success(events=events, truncated="nextToken" in result)
+        return _success(events=events, truncated=bool(next_token))
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error filtering log events: {e}")
         return _error(_aws_error_message(e, bool(role_arn)))
@@ -546,11 +645,22 @@ def aws_dynamodb_list_tables(
     own permissions.
     """
     try:
-        result = _client("dynamodb", region, role_arn).list_tables(Limit=100)
-        return _success(
-            tables=result.get("TableNames") or [],
-            truncated="LastEvaluatedTableName" in result,
-        )
+        client = _client("dynamodb", region, role_arn)
+        kwargs: dict[str, Any] = {"Limit": 100}
+        raw_tables: list[str] = []
+        # ListTables' own pagination cursor: ExclusiveStartTableName on the
+        # request, LastEvaluatedTableName on the response (unlike the
+        # NextToken/nextToken name shared by every other tool here).
+        next_token: str | None = None
+        for _ in range(MAX_PAGES):
+            if next_token:
+                kwargs["ExclusiveStartTableName"] = next_token
+            result = client.list_tables(**kwargs)
+            raw_tables.extend(result.get("TableNames") or [])
+            next_token = result.get("LastEvaluatedTableName")
+            if not next_token:
+                break
+        return _success(tables=raw_tables, truncated=bool(next_token))
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing DynamoDB tables: {e}")
         return _error(_aws_error_message(e, bool(role_arn)))
@@ -617,14 +727,21 @@ def aws_sqs_list_queues(
     own permissions.
     """
     try:
+        client = _client("sqs", region, role_arn)
         kwargs: dict[str, Any] = {"MaxResults": 100}
         if name_prefix:
             kwargs["QueueNamePrefix"] = name_prefix
-        result = _client("sqs", region, role_arn).list_queues(**kwargs)
-        return _success(
-            queue_urls=result.get("QueueUrls") or [],
-            truncated="NextToken" in result,
-        )
+        raw_queue_urls: list[str] = []
+        next_token: str | None = None
+        for _ in range(MAX_PAGES):
+            if next_token:
+                kwargs["NextToken"] = next_token
+            result = client.list_queues(**kwargs)
+            raw_queue_urls.extend(result.get("QueueUrls") or [])
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
+        return _success(queue_urls=raw_queue_urls, truncated=bool(next_token))
     except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Error listing SQS queues: {e}")
         return _error(_aws_error_message(e, bool(role_arn)))
@@ -636,8 +753,11 @@ def aws_sqs_get_queue_attributes(
 ) -> str:
     """
     Get an SQS queue's attributes — most importantly backlog depth
-    (ApproximateNumberOfMessages), in-flight count, oldest message age, and
-    the redrive/DLQ policy — the key signals for "is this queue backed up".
+    (ApproximateNumberOfMessages), in-flight count, and the redrive/DLQ
+    policy — the key signals for "is this queue backed up". For oldest
+    message age (not one of GetQueueAttributes' own attributes), use
+    aws_cloudwatch_get_metric_data with namespace "AWS/SQS" and metric_name
+    "ApproximateAgeOfOldestMessage" instead.
     region: optional AWS region override; defaults to the connector's
     configured AWS_REGION.
     role_arn: optional IAM role ARN to assume (cross-account access) before
@@ -648,7 +768,7 @@ def aws_sqs_get_queue_attributes(
     """
     try:
         result = _client("sqs", region, role_arn).get_queue_attributes(
-            QueueUrl=queue_url, AttributeNames=["All"]
+            QueueUrl=queue_url, AttributeNames=SQS_DIAGNOSTIC_ATTRIBUTES
         )
         return _success(attributes=result.get("Attributes") or {})
     except (ClientError, BotoCoreError, ValueError) as e:

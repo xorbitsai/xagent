@@ -978,6 +978,12 @@ export function ConnectMcpDialog({
                     >
                       <BarChart3 className="h-4 w-4" /> Analytics
                     </button>
+                    <button
+                      className={`w-full flex items-center gap-3 px-2 py-1.5 text-sm font-medium rounded-md ${activeCategory === 'Operations' ? 'bg-blue-100/50 text-blue-700' : 'text-slate-600 hover:bg-slate-100'}`}
+                      onClick={() => setActiveCategory('Operations')}
+                    >
+                      <Settings className="h-4 w-4" /> Operations
+                    </button>
                   </div>
                 </div>
               </div>

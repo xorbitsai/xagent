@@ -127,6 +127,9 @@ def test_describe_alarms_passes_state_filter_and_shapes_output(monkeypatch):
 
 
 def test_describe_alarms_flags_truncated_when_next_token_present(monkeypatch):
+    """A cursor that never runs out must not spin forever -- MAX_PAGES caps
+    it, and the result is still reported truncated=True since data was left
+    on the table."""
     cloudwatch = Mock()
     cloudwatch.describe_alarms.return_value = {
         "MetricAlarms": [{"AlarmName": "high-cpu"}],
@@ -137,6 +140,42 @@ def test_describe_alarms_flags_truncated_when_next_token_present(monkeypatch):
     result = json.loads(aws.aws_cloudwatch_describe_alarms())
 
     assert result["truncated"] is True
+    assert cloudwatch.describe_alarms.call_count == aws.MAX_PAGES
+
+
+def test_describe_alarms_paginates_across_pages(monkeypatch):
+    """PR review finding (round 6, major): DescribeAlarms fetching exactly
+    one page and reporting `truncated` with no way to continue could let
+    this triage tool report "nothing is wrong" while a firing alarm sits on
+    a later page. Both MetricAlarms and CompositeAlarms share the same
+    NextToken cursor and must both accumulate across pages."""
+    cloudwatch = Mock()
+    cloudwatch.describe_alarms.side_effect = [
+        {
+            "MetricAlarms": [{"AlarmName": "high-cpu"}],
+            "CompositeAlarms": [{"AlarmName": "rollup-1"}],
+            "NextToken": "page2",
+        },
+        {
+            "MetricAlarms": [{"AlarmName": "high-latency"}],
+            "CompositeAlarms": [{"AlarmName": "rollup-2"}],
+        },
+    ]
+    client_factory = Mock(return_value=cloudwatch)
+    monkeypatch.setattr(aws, "_client", client_factory)
+
+    result = json.loads(
+        aws.aws_cloudwatch_describe_alarms(role_arn="arn:aws:iam::2:role/read")
+    )
+
+    assert [a["name"] for a in result["alarms"]] == ["high-cpu", "high-latency"]
+    assert [a["name"] for a in result["composite_alarms"]] == ["rollup-1", "rollup-2"]
+    assert result["truncated"] is False
+    assert cloudwatch.describe_alarms.call_args_list[1].kwargs["NextToken"] == "page2"
+    # The client (and, under role_arn, its one-time AssumeRole exchange) must
+    # be built once per tool call, not once per page -- otherwise pagination
+    # would multiply STS AssumeRole calls by the number of pages fetched.
+    assert client_factory.call_count == 1
 
 
 def test_describe_alarms_surfaces_composite_alarms(monkeypatch):
@@ -308,6 +347,9 @@ def test_tools_tolerate_explicit_none_values_in_responses(monkeypatch):
 
 
 def test_filter_log_events_caps_limit_and_passes_window(monkeypatch):
+    """A cursor that never runs out (and never reaches max_events, since
+    each page only carries one event) must not spin forever -- MAX_PAGES
+    caps it, and the result is still reported truncated=True."""
     logs = Mock()
     logs.filter_log_events.return_value = {
         "events": [
@@ -330,10 +372,72 @@ def test_filter_log_events_caps_limit_and_passes_window(monkeypatch):
     assert result["status"] == "success"
     assert result["events"][0]["message"] == "ERROR boom"
     assert result["truncated"] is True
-    kwargs = logs.filter_log_events.call_args.kwargs
-    assert kwargs["limit"] == aws.MAX_LOG_EVENTS  # capped, not 5000
-    assert kwargs["filterPattern"] == "ERROR"
-    assert kwargs["startTime"] == 1753890000000
+    assert logs.filter_log_events.call_count == aws.MAX_PAGES
+    first_call_kwargs = logs.filter_log_events.call_args_list[0].kwargs
+    assert first_call_kwargs["limit"] == aws.MAX_LOG_EVENTS  # capped, not 5000
+    assert first_call_kwargs["filterPattern"] == "ERROR"
+    assert first_call_kwargs["startTime"] == 1753890000000
+    # The per-page limit shrinks to the remaining budget on later pages
+    # (one event accumulated per page here) rather than staying fixed.
+    assert (
+        logs.filter_log_events.call_args_list[1].kwargs["limit"]
+        == aws.MAX_LOG_EVENTS - 1
+    )
+
+
+def test_filter_log_events_follows_an_empty_page_to_find_matches(monkeypatch):
+    """PR review finding (round 6, major, worst case): botocore's own
+    FilterLogEvents docs say a page can be partially full or even empty
+    while more matching events exist on a later page -- fetching exactly
+    one page and stopping would report "no errors found" during an
+    incident when errors actually exist past that first, empty page."""
+    logs = Mock()
+    logs.filter_log_events.side_effect = [
+        {"events": [], "nextToken": "page2"},
+        {"events": [{"timestamp": 1, "logStreamName": "s1", "message": "ERROR boom"}]},
+    ]
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(
+        aws.aws_cloudwatch_filter_log_events(log_group_name="/app/prod")
+    )
+
+    assert result["events"] == [
+        {"timestamp_ms": 1, "log_stream": "s1", "message": "ERROR boom"}
+    ]
+    assert result["truncated"] is False
+    assert logs.filter_log_events.call_count == 2
+
+
+def test_filter_log_events_stops_once_limit_reached_across_pages(monkeypatch):
+    """Pagination must stop as soon as `limit` events are gathered, not
+    keep fetching pages the caller didn't ask for."""
+    logs = Mock()
+    logs.filter_log_events.side_effect = [
+        {
+            "events": [
+                {"timestamp": 1, "logStreamName": "s1", "message": "one"},
+                {"timestamp": 2, "logStreamName": "s1", "message": "two"},
+            ],
+            "nextToken": "page2",
+        },
+        {
+            "events": [{"timestamp": 3, "logStreamName": "s1", "message": "three"}],
+            "nextToken": "page3",
+        },
+    ]
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(
+        aws.aws_cloudwatch_filter_log_events(log_group_name="/app/prod", limit=3)
+    )
+
+    assert [e["message"] for e in result["events"]] == ["one", "two", "three"]
+    assert result["truncated"] is True  # page3 still pending beyond the 3 requested
+    assert logs.filter_log_events.call_count == 2
+    # Page 2 asks for only the remaining budget (3 - 2 already fetched = 1),
+    # not the full limit again.
+    assert logs.filter_log_events.call_args_list[1].kwargs["limit"] == 1
 
 
 def test_filter_log_events_not_truncated_without_next_token(monkeypatch):
@@ -364,6 +468,9 @@ def test_describe_log_groups_filters_by_prefix(monkeypatch):
 
 
 def test_describe_log_groups_flags_truncated_when_next_token_present(monkeypatch):
+    """A cursor that never runs out must not spin forever -- MAX_PAGES caps
+    it, and the result is still reported truncated=True since data was left
+    on the table."""
     logs = Mock()
     logs.describe_log_groups.return_value = {
         "logGroups": [{"logGroupName": "/app/prod"}],
@@ -374,21 +481,70 @@ def test_describe_log_groups_flags_truncated_when_next_token_present(monkeypatch
     result = json.loads(aws.aws_cloudwatch_describe_log_groups())
 
     assert result["truncated"] is True
+    assert logs.describe_log_groups.call_count == aws.MAX_PAGES
+
+
+def test_describe_log_groups_paginates_across_pages(monkeypatch):
+    """PR review finding (round 6, major): DescribeLogGroups fetching
+    exactly one page and reporting `truncated` with no way to continue
+    could hide a log group living past the first page."""
+    logs = Mock()
+    logs.describe_log_groups.side_effect = [
+        {"logGroups": [{"logGroupName": "/app/prod"}], "nextToken": "page2"},
+        {"logGroups": [{"logGroupName": "/app/staging"}]},
+    ]
+    monkeypatch.setattr(aws, "_client", Mock(return_value=logs))
+
+    result = json.loads(aws.aws_cloudwatch_describe_log_groups())
+
+    assert [g["name"] for g in result["log_groups"]] == ["/app/prod", "/app/staging"]
+    assert result["truncated"] is False
+    assert logs.describe_log_groups.call_args_list[1].kwargs["nextToken"] == "page2"
 
 
 def test_dynamodb_list_tables(monkeypatch):
+    """PR review finding (round 6, major): a single ListTables page fetched
+    with no way to continue could silently under-report the table list.
+    ListTables' own cursor names differ request-vs-response
+    (ExclusiveStartTableName / LastEvaluatedTableName), unlike every other
+    tool here sharing a single NextToken/nextToken name — covered here
+    specifically since a wrong field name would silently stop pagination
+    after page one."""
     dynamodb = Mock()
-    dynamodb.list_tables.return_value = {
-        "TableNames": ["orders", "users"],
-        "LastEvaluatedTableName": "users",
-    }
+    dynamodb.list_tables.side_effect = [
+        {"TableNames": ["orders"], "LastEvaluatedTableName": "orders"},
+        {"TableNames": ["users"]},
+    ]
     monkeypatch.setattr(aws, "_client", Mock(return_value=dynamodb))
 
     result = json.loads(aws.aws_dynamodb_list_tables())
 
     assert result["status"] == "success"
     assert result["tables"] == ["orders", "users"]
+    assert result["truncated"] is False
+    assert dynamodb.list_tables.call_count == 2
+    assert (
+        dynamodb.list_tables.call_args_list[1].kwargs["ExclusiveStartTableName"]
+        == "orders"
+    )
+
+
+def test_dynamodb_list_tables_stops_at_max_pages_with_token_still_pending(monkeypatch):
+    """Bounded pagination guard: a cursor that never runs out (e.g. an API
+    quirk or a bug in this loop) must not spin forever -- MAX_PAGES caps it,
+    and the result is still reported truncated=True since data was left on
+    the table."""
+    dynamodb = Mock()
+    dynamodb.list_tables.return_value = {
+        "TableNames": ["orders"],
+        "LastEvaluatedTableName": "orders",
+    }
+    monkeypatch.setattr(aws, "_client", Mock(return_value=dynamodb))
+
+    result = json.loads(aws.aws_dynamodb_list_tables())
+
     assert result["truncated"] is True
+    assert dynamodb.list_tables.call_count == aws.MAX_PAGES
 
 
 def test_dynamodb_list_tables_not_truncated_without_last_evaluated_key(monkeypatch):
@@ -443,6 +599,9 @@ def test_sqs_list_queues_passes_prefix(monkeypatch):
 
 
 def test_sqs_list_queues_flags_truncated_when_next_token_present(monkeypatch):
+    """A cursor that never runs out must not spin forever -- MAX_PAGES caps
+    it, and the result is still reported truncated=True since data was left
+    on the table."""
     sqs = Mock()
     sqs.list_queues.return_value = {
         "QueueUrls": ["https://sqs.us-east-1.amazonaws.com/1/jobs"],
@@ -453,9 +612,40 @@ def test_sqs_list_queues_flags_truncated_when_next_token_present(monkeypatch):
     result = json.loads(aws.aws_sqs_list_queues())
 
     assert result["truncated"] is True
+    assert sqs.list_queues.call_count == aws.MAX_PAGES
 
 
-def test_sqs_get_queue_attributes_requests_all(monkeypatch):
+def test_sqs_list_queues_paginates_across_pages(monkeypatch):
+    """PR review finding (round 6, major): ListQueues fetching exactly one
+    page and reporting `truncated` with no way to continue could hide a
+    queue living past the first page."""
+    sqs = Mock()
+    sqs.list_queues.side_effect = [
+        {
+            "QueueUrls": ["https://sqs.us-east-1.amazonaws.com/1/a"],
+            "NextToken": "page2",
+        },
+        {"QueueUrls": ["https://sqs.us-east-1.amazonaws.com/1/b"]},
+    ]
+    monkeypatch.setattr(aws, "_client", Mock(return_value=sqs))
+
+    result = json.loads(aws.aws_sqs_list_queues())
+
+    assert result["queue_urls"] == [
+        "https://sqs.us-east-1.amazonaws.com/1/a",
+        "https://sqs.us-east-1.amazonaws.com/1/b",
+    ]
+    assert result["truncated"] is False
+    assert sqs.list_queues.call_args_list[1].kwargs["NextToken"] == "page2"
+
+
+def test_sqs_get_queue_attributes_requests_only_diagnostic_attributes(monkeypatch):
+    """PR review finding (round 6, minor): AttributeNames=["All"] also
+    returns the queue's resource Policy document (account IDs, principal
+    ARNs, cross-account trust conditions) and KmsMasterKeyId, neither of
+    which this tool's docstring promises - IAM can't restrict which
+    AttributeNames come back, so this connector must enumerate only the
+    diagnostic attributes itself instead of asking for everything."""
     sqs = Mock()
     sqs.get_queue_attributes.return_value = {
         "Attributes": {"ApproximateNumberOfMessages": "42"}
@@ -468,7 +658,21 @@ def test_sqs_get_queue_attributes_requests_all(monkeypatch):
 
     assert result["status"] == "success"
     assert result["attributes"]["ApproximateNumberOfMessages"] == "42"
-    assert sqs.get_queue_attributes.call_args.kwargs["AttributeNames"] == ["All"]
+    requested = sqs.get_queue_attributes.call_args.kwargs["AttributeNames"]
+    assert requested == aws.SQS_DIAGNOSTIC_ATTRIBUTES
+    assert "Policy" not in requested
+    assert "KmsMasterKeyId" not in requested
+    assert "All" not in requested
+    # Comparing only against the constant itself can't catch the constant
+    # being wrong/incomplete relative to what the docstring promises -- this
+    # asserts the actual attributes the docstring claims are present.
+    for promised in (
+        "ApproximateNumberOfMessages",
+        "ApproximateNumberOfMessagesNotVisible",
+        "RedrivePolicy",
+        "RedriveAllowPolicy",
+    ):
+        assert promised in requested
 
 
 # --- assume-role plumbing -------------------------------------------------
@@ -519,6 +723,11 @@ def test_client_with_role_arn_assumes_role_on_every_call(monkeypatch):
     assert sqs_calls[0].kwargs["config"] == aws.DEFAULT_CLIENT_CONFIG
     sts_calls = [c for c in session_client.call_args_list if c.args[0] == "sts"]
     assert sts_calls[0].kwargs["config"] == aws.DEFAULT_CLIENT_CONFIG
+    # PR review finding (round 6, minor): the AssumeRole call itself must
+    # not lean on boto3's ambient credential chain either -- it's the most
+    # sensitive (cross-account) path in the module.
+    assert sts_calls[0].kwargs["aws_access_key_id"] == "AKIA-test"
+    assert sts_calls[0].kwargs["aws_secret_access_key"] == "secret-test"
 
 
 def test_role_session_name_falls_back_without_caller_id(monkeypatch):
@@ -639,15 +848,22 @@ def test_read_only_session_policy_stays_under_the_sts_inline_policy_limit():
 
 
 def test_client_without_role_arn_uses_env_credentials(monkeypatch):
+    """PR review finding (round 6, minor): pass the connector's own
+    credentials explicitly instead of leaning on boto3's ambient provider
+    chain, which could otherwise fall back to a ~/.aws/credentials file
+    (reachable via the inherited HOME env var) -- naming the credentials
+    here removes any dependency on that chain never doing so, rather than
+    trusting it won't."""
     session_client = _patch_boto3_session(monkeypatch, lambda service, **kwargs: Mock())
 
     aws._client("cloudwatch")
 
     kwargs = session_client.call_args.kwargs
-    # no explicit creds → env chain; a timeout/retry config is still applied
     assert kwargs == {
         "region_name": "us-east-1",
         "config": aws.DEFAULT_CLIENT_CONFIG,
+        "aws_access_key_id": "AKIA-test",
+        "aws_secret_access_key": "secret-test",
     }
 
 

@@ -776,4 +776,24 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       })
     })
   })
+
+  it("filters by the Operations category sidebar entry (PR review: AWS connector had no way to be found except via All)", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalled())
+    apiRequestMock.mockClear()
+
+    fireEvent.click(screen.getByRole("button", { name: "Operations" }))
+
+    await waitFor(() => {
+      const url = apiRequestMock.mock.calls.at(-1)?.[0] as string
+      expect(new URLSearchParams(url.split("?")[1]).get("category")).toBe("Operations")
+    })
+  })
 })

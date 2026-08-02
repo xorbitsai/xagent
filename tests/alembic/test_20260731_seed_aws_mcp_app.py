@@ -86,7 +86,7 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
-def test_seed_row_matches_registry(tmp_path):
+def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
     aws row (the migration is a frozen copy; this catches drift)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows

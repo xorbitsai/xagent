@@ -828,6 +828,7 @@ export default function AdminMcpPage() {
                               <SelectItem value="Scheduling">Scheduling</SelectItem>
                               <SelectItem value="Payments">Payments</SelectItem>
                               <SelectItem value="Analytics">Analytics</SelectItem>
+                              <SelectItem value="Operations">Operations</SelectItem>
                               <SelectItem value="Other">Other</SelectItem>
                             </SelectContent>
                           </Select>

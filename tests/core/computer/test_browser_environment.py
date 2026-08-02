@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from xagent.core.computer.browser import (
+    _EDITABLE_ACTIVE_ELEMENT_SCRIPT,
     _INTERACTIVE_ELEMENTS_SCRIPT,
     BrowserComputerEnvironment,
 )
@@ -123,7 +124,7 @@ class FakePage:
             if isinstance(self.element_payload, BaseException):
                 raise self.element_payload
             return self.element_payload
-        if "document.activeElement" in script:
+        if "currentDocument.activeElement" in script:
             return self.active_element_editable
         raise AssertionError(f"unexpected evaluate script: {script}")
 
@@ -196,12 +197,16 @@ async def test_browser_observation_captures_screenshot_and_dom_elements(
     assert observation.metadata["browser_runtime_kind"] == "ephemeral_playwright"
     assert environment.current_observation == observation
     assert environment.manager.calls == [  # type: ignore[attr-defined]
-        ("computer:browser-1", True)
+        ("browser-1:computer", True)
     ]
 
 
 def test_browser_element_script_never_reads_input_values() -> None:
     assert "node.value" not in _INTERACTIVE_ELEMENTS_SCRIPT
+
+
+def test_editable_check_descends_into_same_origin_frames() -> None:
+    assert "node.contentDocument" in _EDITABLE_ACTIVE_ELEMENT_SCRIPT
 
 
 @pytest.mark.asyncio
@@ -411,5 +416,5 @@ async def test_browser_environment_closes_its_session(browser_environment) -> No
     await environment.close()
 
     assert environment.manager.closed == [  # type: ignore[attr-defined]
-        "computer:browser-1"
+        "browser-1:computer"
     ]

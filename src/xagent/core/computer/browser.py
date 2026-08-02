@@ -36,6 +36,28 @@ logger = logging.getLogger(__name__)
 
 _OBSERVED_URL_ADAPTER = TypeAdapter(ObservedUrl)
 
+_EDITABLE_ACTIVE_ELEMENT_SCRIPT = """() => {
+  let currentDocument = document;
+  const visited = new Set();
+  while (currentDocument && !visited.has(currentDocument)) {
+    visited.add(currentDocument);
+    const node = currentDocument.activeElement;
+    if (!node) return false;
+    if (node.isContentEditable) return true;
+    const tag = String(node.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea") {
+      return !node.disabled && !node.readOnly;
+    }
+    if (tag !== "iframe" && tag !== "frame") return false;
+    try {
+      currentDocument = node.contentDocument;
+    } catch (_) {
+      return false;
+    }
+  }
+  return false;
+}"""
+
 _INTERACTIVE_ELEMENTS_SCRIPT = """
 (limit) => {
   const selector = [
@@ -141,7 +163,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         self.headless = headless
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
-        self._manager_session_id = f"computer:{self.session_id}"
+        self._manager_session_id = f"{self.session_id}:computer"
         self._browser_session: Any | None = None
 
     async def _get_page(self, *, reject_recreated_session: bool) -> Any:
@@ -326,16 +348,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if action.type is ComputerActionType.REPLACE_TEXT:
             x, y = self._target_pixels(action)
             await page.mouse.click(x, y)
-            editable = await page.evaluate(
-                """() => {
-                  const node = document.activeElement;
-                  if (!node) return false;
-                  if (node.isContentEditable) return true;
-                  const tag = String(node.tagName || "").toLowerCase();
-                  return (tag === "input" || tag === "textarea") &&
-                    !node.disabled && !node.readOnly;
-                }"""
-            )
+            editable = await page.evaluate(_EDITABLE_ACTIVE_ELEMENT_SCRIPT)
             if not editable:
                 raise ValueError("replace_text target is not an editable element")
             modifier = "Meta" if sys.platform == "darwin" else "Control"

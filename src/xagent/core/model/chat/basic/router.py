@@ -77,8 +77,8 @@ def _should_retry_with_thinking(
     *,
     thinking: dict[str, Any] | None,
 ) -> bool:
-    if thinking is None or not (
-        thinking.get("type") == "disabled" or thinking.get("enable") is False
+    if isinstance(thinking, dict) and (
+        thinking.get("type") == "enabled" or thinking.get("enable") is True
     ):
         return False
 

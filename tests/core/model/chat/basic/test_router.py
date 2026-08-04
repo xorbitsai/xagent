@@ -636,6 +636,27 @@ async def test_router_chat_enables_thinking_when_selected_model_requires_it(
 
 
 @pytest.mark.asyncio
+async def test_router_chat_enables_thinking_when_request_omits_preference(
+    monkeypatch,
+):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    result = await router.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=[_tool_schema()],
+        tool_choice="required",
+    )
+
+    assert result == "ok"
+    assert llm.thinking_values == [
+        None,
+        {"type": "enabled", "enable": True},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_router_stream_enables_thinking_when_selected_model_requires_it(
     monkeypatch,
 ):

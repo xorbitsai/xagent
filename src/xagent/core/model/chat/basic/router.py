@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
+# Normalized intents translated into OpenRouter's reasoning/thinking request body.
 _DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
 _ENABLE_DOWNSTREAM_THINKING = {"type": "enabled", "enable": True}
 _CONTENT_PART_MODALITIES = {

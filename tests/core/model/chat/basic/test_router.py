@@ -668,7 +668,13 @@ async def test_router_stream_enables_thinking_when_selected_model_requires_it(
 
 @pytest.mark.asyncio
 async def test_router_does_not_repeat_mandatory_reasoning_retry(monkeypatch):
-    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR, _MANDATORY_REASONING_ERROR])
+    llm = _ScriptedChatLLM(
+        [
+            _MANDATORY_REASONING_ERROR,
+            _THINKING_TOOL_CHOICE_ERROR,
+            _MANDATORY_REASONING_ERROR,
+        ]
+    )
     router = RouterLLM(downstream_resolver=lambda _model_id: llm)
     monkeypatch.setattr(router, "_select_model", _select_glm)
 
@@ -683,7 +689,9 @@ async def test_router_does_not_repeat_mandatory_reasoning_retry(monkeypatch):
     assert llm.thinking_values == [
         {"type": "disabled", "enable": False},
         {"type": "enabled", "enable": True},
+        {"type": "disabled", "enable": False},
     ]
+    assert llm.tool_choices == ["required", "required", "required"]
 
 
 @pytest.mark.asyncio

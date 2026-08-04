@@ -15,9 +15,11 @@ from xagent.web.api.templates import (
     increment_template_likes,
 )
 from xagent.web.api.templates import router as templates_router
+from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.template_stats import TemplateStats, UserTemplateRelation
 from xagent.web.models.user import User
+from xagent.web.models.workforce import Workforce, WorkforceAgent
 
 
 def override_get_db():
@@ -194,6 +196,101 @@ def mock_app_state(template_manager):
     # Create mock app state
     mock_state = MagicMock()
     mock_state.template_manager = template_manager
+    return mock_state
+
+
+@pytest.fixture(scope="function")
+def workforce_templates_dir(tmp_path):
+    """A separate templates directory (not shared with `templates_dir`,
+    whose exact template count other tests assert on) holding a
+    workforce-type template plus the two single-agent templates its
+    `workforce_config.agents[].template_id` entries reference.
+    """
+    templates_dir = tmp_path / "workforce_templates"
+    templates_dir.mkdir()
+
+    (templates_dir / "ga_analyzer.yaml").write_text(
+        """
+id: ga_analyzer
+name: GA Analyzer
+category: Marketing
+descriptions:
+  en: Explains GA4 trends.
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are the GA Analyzer.
+  skills: []
+  tool_categories: []
+"""
+    )
+    (templates_dir / "ads_recommendation.yaml").write_text(
+        """
+id: ads_recommendation
+name: Ads Recommendation
+category: Marketing
+descriptions:
+  en: Recommends ad optimizations.
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are the Ads Recommendation agent.
+  skills: []
+  tool_categories: []
+"""
+    )
+    (templates_dir / "growth_workforce.yaml").write_text(
+        """
+id: growth_workforce
+name: Growth Marketing Workforce
+category: Marketing
+type: workforce
+descriptions:
+  en: Orchestrates GA Analyzer and Ads Recommendation.
+author: Xagent
+version: "1.0"
+
+workforce_config:
+  manager:
+    name: Growth Marketing Manager
+    description: Orchestrates the workforce.
+    instructions: |
+      You are the Growth Marketing Manager.
+  agents:
+  - template_id: ga_analyzer
+    name: GA Analyzer
+    alias: GA Analyzer
+    assignment_instructions: Produce a Signals for Ads table.
+  - template_id: ads_recommendation
+    name: Ads Recommendation
+    alias: Ads Recommendation
+    assignment_instructions: Recommend ad changes using the Signals for Ads table.
+"""
+    )
+    return templates_dir
+
+
+@pytest.fixture(scope="function")
+def workforce_template_manager(workforce_templates_dir):
+    """Create a TemplateManager fixture over `workforce_templates_dir`"""
+    from xagent.templates.manager import TemplateManager
+
+    return TemplateManager(templates_root=workforce_templates_dir)
+
+
+@pytest.fixture(scope="function")
+def workforce_mock_app_state(workforce_template_manager):
+    """Mock app.state.template_manager backed by the workforce templates dir"""
+    import asyncio
+
+    asyncio.run(workforce_template_manager.initialize())
+
+    mock_state = MagicMock()
+    mock_state.template_manager = workforce_template_manager
     return mock_state
 
 
@@ -604,3 +701,135 @@ class TestTemplatesAPI:
             ]
             for field in required_fields:
                 assert field in template, f"Missing field: {field}"
+
+
+class TestUseTemplateAsWorkforce:
+    """测试 POST /api/templates/{id}/use-as-workforce"""
+
+    def test_rejects_non_workforce_template(self, mock_app_state, admin_headers):
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.post(
+                "/api/templates/customer_support/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert response.status_code == 400
+
+    def test_rejects_unknown_template(self, mock_app_state, admin_headers):
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.post(
+                "/api/templates/nonexistent/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert response.status_code == 404
+
+    def test_creates_manager_and_worker_agents(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert response.status_code == 200, response.text
+            payload = response.json()
+            assert payload["template_id"] == "growth_workforce"
+            workforce_id = payload["workforce_id"]
+
+            db = next(get_db())
+            try:
+                workforce = db.get(Workforce, workforce_id)
+                assert workforce is not None
+
+                manager = db.get(Agent, workforce.manager_agent_id)
+                assert manager is not None
+                assert manager.origin == AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+                assert manager.status == AgentStatus.PUBLISHED
+                assert "Growth Marketing Manager" in manager.instructions
+
+                workers = (
+                    db.query(WorkforceAgent)
+                    .filter(WorkforceAgent.workforce_id == workforce_id)
+                    .all()
+                )
+                assert len(workers) == 2
+                worker_agent_ids = {w.agent_id for w in workers}
+                worker_agents = (
+                    db.query(Agent).filter(Agent.id.in_(worker_agent_ids)).all()
+                )
+                assert len(worker_agents) == 2
+                assert all(
+                    agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value
+                    for agent in worker_agents
+                )
+                assert all(
+                    agent.status == AgentStatus.PUBLISHED for agent in worker_agents
+                )
+                assert {agent.template_id for agent in worker_agents} == {
+                    "ga_analyzer",
+                    "ads_recommendation",
+                }
+            finally:
+                db.close()
+
+            # Usage is recorded, same as the single-agent /use endpoint.
+            detail = client.get(
+                "/api/templates/growth_workforce", headers=admin_headers
+            ).json()
+            assert detail["used_count"] == 1
+
+    def test_reuses_worker_agents_across_two_instantiations(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        """Instantiating the same workforce template twice must mint a new
+        manager + Workforce each time (each run gets its own orchestrator)
+        but must NOT mint duplicate worker agents - the second call should
+        reuse the first call's quick-access GA Analyzer / Ads Recommendation
+        agents (see AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX)."""
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            first = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert first.status_code == 200, first.text
+            second = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert second.status_code == 200, second.text
+
+            first_workforce_id = first.json()["workforce_id"]
+            second_workforce_id = second.json()["workforce_id"]
+            assert first_workforce_id != second_workforce_id
+
+            db = next(get_db())
+            try:
+                first_workforce = db.get(Workforce, first_workforce_id)
+                second_workforce = db.get(Workforce, second_workforce_id)
+                # Two distinct, freshly-minted managers.
+                assert (
+                    first_workforce.manager_agent_id
+                    != second_workforce.manager_agent_id
+                )
+
+                first_worker_ids = {
+                    w.agent_id
+                    for w in db.query(WorkforceAgent).filter(
+                        WorkforceAgent.workforce_id == first_workforce_id
+                    )
+                }
+                second_worker_ids = {
+                    w.agent_id
+                    for w in db.query(WorkforceAgent).filter(
+                        WorkforceAgent.workforce_id == second_workforce_id
+                    )
+                }
+                assert first_worker_ids == second_worker_ids
+
+                quick_access_count = (
+                    db.query(Agent)
+                    .filter(Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value)
+                    .count()
+                )
+                assert quick_access_count == 2
+            finally:
+                db.close()

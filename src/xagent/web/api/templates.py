@@ -16,6 +16,7 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.template_stats import TemplateStats, UserTemplateRelation
 from ..models.user import User
+from ..services.workforce_creator import create_workforce_from_template
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +114,33 @@ class TemplateInfo(BaseModel):
     is_liked: bool = Field(
         default=False, description="Whether the current user liked this template"
     )
+    type: str = Field(
+        default="agent",
+        description="'agent' for a single-agent template, 'workforce' for a "
+        "manager + worker-agents template",
+    )
+    workforce_agents: list[str] = Field(
+        default_factory=list,
+        description="Display names of the manager + worker agents this "
+        "workforce template creates, in orchestration order (manager first). "
+        "Empty for 'agent'-type templates.",
+    )
 
 
 class TemplateDetail(TemplateInfo):
     """Detailed template response including agent configuration"""
 
-    agent_config: dict[str, Any] = Field(..., description="Agent configuration")
+    agent_config: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Agent configuration for an 'agent'-type template. None "
+        "for a 'workforce'-type template, which is configured via "
+        "`workforce_config` instead.",
+    )
+    workforce_config: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Manager + worker agent configuration for a 'workforce'-type "
+        "template. None for 'agent'-type templates.",
+    )
 
 
 class LikeResponse(BaseModel):
@@ -226,6 +248,26 @@ def increment_template_likes(db: Session, template_id: str) -> None:
     )
 
 
+def get_workforce_agent_names(template: dict[str, Any]) -> list[str]:
+    """Manager + worker display names for a workforce-type template, in
+    orchestration order (manager first). Derived entirely from static YAML
+    fields (no per-agent template lookups), since this runs for every
+    template on every `GET /api/templates/` page load.
+    """
+    workforce_config = template.get("workforce_config")
+    if not isinstance(workforce_config, dict):
+        return []
+
+    names: list[str] = []
+    manager = workforce_config.get("manager")
+    if isinstance(manager, dict) and manager.get("name"):
+        names.append(str(manager["name"]))
+    for agent in workforce_config.get("agents") or []:
+        if isinstance(agent, dict) and agent.get("name"):
+            names.append(str(agent["name"]))
+    return names
+
+
 # ===== Endpoints =====
 
 
@@ -288,6 +330,8 @@ async def list_templates(
                 likes=stats.likes,
                 used_count=stats.used_count,
                 is_liked=template_id in liked_template_ids,
+                type=template.get("type", "agent"),
+                workforce_agents=get_workforce_agent_names(template),
             )
         )
 
@@ -355,14 +399,21 @@ async def get_template(
         likes=stats.likes,
         used_count=stats.used_count,
         is_liked=is_template_liked(db, int(current_user.id), template_id),
-        agent_config={
-            "instructions": template["agent_config"].get("instructions", ""),
-            "skills": template["agent_config"].get("skills", []),
-            "tool_categories": template["agent_config"].get("tool_categories", []),
-            "execution_mode": template["agent_config"].get(
-                "execution_mode", "balanced"
-            ),
-        },
+        type=template.get("type", "agent"),
+        workforce_agents=get_workforce_agent_names(template),
+        agent_config=(
+            {
+                "instructions": template["agent_config"].get("instructions", ""),
+                "skills": template["agent_config"].get("skills", []),
+                "tool_categories": template["agent_config"].get("tool_categories", []),
+                "execution_mode": template["agent_config"].get(
+                    "execution_mode", "balanced"
+                ),
+            }
+            if template.get("type", "agent") == "agent"
+            else None
+        ),
+        workforce_config=template.get("workforce_config"),
     )
 
 
@@ -468,4 +519,51 @@ async def use_template(
         "message": "Template usage recorded",
         "template_id": template_id,
         "used_count": stats.used_count,
+    }
+
+
+@router.post("/{template_id}/use-as-workforce")
+async def use_template_as_workforce(
+    template_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Instantiate a 'workforce'-type template: creates the manager agent plus
+    one worker agent per template.workforce_config.agents entry (reusing an
+    existing quick-access instance per-worker-template if the user already
+    has one), assembles them into a new Workforce, and records usage.
+
+    Args:
+        template_id: ID of the workforce template to instantiate
+
+    Returns:
+        The new workforce's id, for the frontend to navigate to its canvas
+
+    Raises:
+        HTTPException: If template not found or is not a workforce template
+    """
+    template_manager = request.app.state.template_manager
+    template = await template_manager.get_template(template_id)
+
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    if template.get("type") != "workforce":
+        raise HTTPException(
+            status_code=400, detail="Template is not a workforce template"
+        )
+
+    workforce = await create_workforce_from_template(
+        db, current_user, template_manager, template
+    )
+
+    stats = get_or_create_template_stats(db, template_id)
+    stats.used_count += 1
+    db.commit()
+
+    return {
+        "message": "Workforce created from template",
+        "template_id": template_id,
+        "workforce_id": workforce.id,
     }

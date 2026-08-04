@@ -81,7 +81,33 @@ class TemplateManager:
             except Exception as e:
                 logger.error(f"  ✗ Error loading {yaml_file.name}: {e}", exc_info=True)
 
+        self._warn_on_dangling_workforce_references()
+
         logger.info(f"Total templates loaded: {len(self._templates_cache)}")
+
+    def _warn_on_dangling_workforce_references(self) -> None:
+        """A workforce template's `workforce_config.agents[].template_id`
+        values are only checked at parse time for being non-empty strings
+        (per-file validation can't know about other files yet). Once every
+        template is loaded, cross-check each one against the full cache so a
+        typo'd reference is logged loudly at startup instead of only
+        surfacing as a 400 the first time a user clicks "Use" on that
+        template.
+        """
+        for template in self._templates_cache.values():
+            if template.get("type") != "workforce":
+                continue
+            workforce_config = template.get("workforce_config") or {}
+            for agent in workforce_config.get("agents") or []:
+                referenced_id = agent.get("template_id")
+                if referenced_id and referenced_id not in self._templates_cache:
+                    logger.error(
+                        "Workforce template %r references unknown template_id "
+                        "%r in workforce_config.agents - instantiating it will "
+                        "fail until this is fixed",
+                        template.get("id"),
+                        referenced_id,
+                    )
 
     def _parse_yaml_file(self, yaml_file: Path) -> Dict[str, Any]:
         """Parse a single YAML file"""
@@ -127,7 +153,63 @@ class TemplateManager:
         agent_config.setdefault("tool_categories", [])
         agent_config.setdefault("execution_mode", "balanced")
 
+        # type distinguishes a single-agent template (default) from a
+        # workforce template, which is instantiated as a manager agent plus
+        # N worker agents rather than a single agent.
+        data.setdefault("type", "agent")
+        if data["type"] not in ("agent", "workforce"):
+            raise ValueError(
+                f"'type' must be 'agent' or 'workforce', got {data['type']!r}"
+            )
+        data.setdefault("workforce_config", None)
+        if data["type"] == "workforce":
+            self._validate_workforce_config(data["workforce_config"])
+
         return data
+
+    def _validate_workforce_config(self, workforce_config: Any) -> None:
+        """Validate the shape of `workforce_config` for a workforce-type
+        template. A workforce template is instantiated as a fresh manager
+        agent (defined inline via `manager.instructions`) plus one worker
+        agent per `agents[]` entry, each reused/created from an existing
+        template id (`agents[].template_id`) - see
+        `create_workforce_from_template` in
+        `xagent.web.services.workforce_creator`.
+        """
+        if not isinstance(workforce_config, dict):
+            raise ValueError(
+                "'workforce_config' is required and must be a mapping when 'type' is 'workforce'"
+            )
+
+        manager = workforce_config.get("manager")
+        if (
+            not isinstance(manager, dict)
+            or not str(manager.get("instructions") or "").strip()
+        ):
+            raise ValueError(
+                "'workforce_config.manager.instructions' must be a non-empty string"
+            )
+        if not str(manager.get("name") or "").strip():
+            raise ValueError(
+                "'workforce_config.manager.name' must be a non-empty string"
+            )
+
+        agents = workforce_config.get("agents")
+        if not isinstance(agents, list) or not agents:
+            raise ValueError("'workforce_config.agents' must be a non-empty list")
+        for index, agent in enumerate(agents):
+            if not isinstance(agent, dict):
+                raise ValueError(
+                    f"'workforce_config.agents[{index}]' must be a mapping"
+                )
+            if not str(agent.get("template_id") or "").strip():
+                raise ValueError(
+                    f"'workforce_config.agents[{index}].template_id' must be a non-empty string"
+                )
+            if not str(agent.get("assignment_instructions") or "").strip():
+                raise ValueError(
+                    f"'workforce_config.agents[{index}].assignment_instructions' must be a non-empty string"
+                )
 
     def _validate_sample_prompts(self, sample_prompts: Any) -> None:
         """Validate the (optional) sample_prompts shape at parse time, the
@@ -214,6 +296,8 @@ class TemplateManager:
             "author": template.get("author", ""),
             "version": template.get("version", ""),
             "agent_config": agent_config_dict,
+            "type": template.get("type", "agent"),
+            "workforce_config": template.get("workforce_config"),
         }
 
     async def list_templates(self) -> List[Dict]:

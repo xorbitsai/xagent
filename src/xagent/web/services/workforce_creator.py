@@ -5,10 +5,12 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_management import TEMPLATE_RESOLVE_RACE_RETRIES
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
 from ..models.workforce import Workforce, WorkforceBuilderMessage
@@ -265,6 +267,229 @@ def _create_manager_agent_from_plan(
         widget_enabled=False,
         allowed_domains=[],
     )
+
+
+def _find_quick_access_worker_agent(
+    db: Session, *, user_id: int, template_id: str
+) -> Agent | None:
+    return (
+        db.query(Agent)
+        .filter(
+            Agent.user_id == user_id,
+            Agent.template_id == template_id,
+            Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        .order_by(Agent.id)
+        .first()
+    )
+
+
+async def _get_or_create_quick_access_worker_agent(
+    db: Session,
+    template_manager: Any,
+    *,
+    user_id: int,
+    template_id: str,
+) -> Agent:
+    """Reuse the caller's existing quick-access instance of `template_id` if
+    one exists, else create+publish a new one. Mirrors the get-or-create
+    query `AgentManagementService.resolve_agent_from_template` uses for the
+    /task quick-access flow, so instantiating the same workforce template
+    twice does not mint duplicate worker agents.
+
+    A plain select-then-insert here would race: two concurrent calls (e.g. a
+    double-clicked "Use") can both miss the SELECT and then collide on
+    `uq_agents_user_id_template_id_quick_access` at INSERT. Each insert
+    attempt therefore runs in its own SAVEPOINT (`db.begin_nested()`) so a
+    collision only unwinds that attempt - not the manager agent / Workforce
+    already staged in the caller's outer transaction - and we retry by
+    re-reading the row the winning concurrent request just committed.
+    Mirrors `AgentManagementService._resolve_agent_from_template_sync`'s
+    retry loop, which hardens the same (user_id, template_id, quick-access
+    origin) uniqueness for the /task quick-access flow.
+    """
+    existing = _find_quick_access_worker_agent(
+        db, user_id=user_id, template_id=template_id
+    )
+    if existing is not None:
+        return existing
+
+    worker_template = await template_manager.get_template(template_id)
+    if not worker_template:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Workforce template references an unknown template: {template_id}",
+        )
+    agent_config = worker_template.get("agent_config", {})
+
+    for attempt in range(TEMPLATE_RESOLVE_RACE_RETRIES):
+        try:
+            with db.begin_nested():
+                agent = AgentStore(db).add_agent(
+                    user_id=user_id,
+                    name=resolve_unique_agent_name(
+                        db,
+                        user_id=user_id,
+                        name=str(worker_template.get("name") or template_id),
+                    ),
+                    description=None,
+                    instructions=agent_config.get("instructions", ""),
+                    execution_mode=agent_config.get("execution_mode", "balanced"),
+                    models=None,
+                    knowledge_bases=[],
+                    skills=agent_config.get("skills", []),
+                    tool_categories=agent_config.get("tool_categories", []),
+                    suggested_prompts=[],
+                    origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                    status=AgentStatus.PUBLISHED,
+                    widget_enabled=False,
+                    allowed_domains=[],
+                    template_id=template_id,
+                )
+            return agent
+        except IntegrityError:
+            # The savepoint rollback above already discarded our failed
+            # insert; a concurrent request won the race, so its row should
+            # now be visible.
+            existing = _find_quick_access_worker_agent(
+                db, user_id=user_id, template_id=template_id
+            )
+            if existing is not None:
+                return existing
+            logger.warning(
+                "Quick-access worker agent insert collided without a "
+                "resolvable row (attempt %s/%s) for template_id=%s",
+                attempt + 1,
+                TEMPLATE_RESOLVE_RACE_RETRIES,
+                template_id,
+            )
+
+    raise HTTPException(
+        status_code=409,
+        detail="Could not create the workforce's worker agents due to a "
+        "concurrent request; please try again.",
+    )
+
+
+async def create_workforce_from_template(
+    db: Session,
+    user: User,
+    template_manager: Any,
+    template: dict[str, Any],
+) -> Workforce:
+    """Instantiate a workforce-type template: a fresh manager agent (from
+    `workforce_config.manager`) plus one worker agent per
+    `workforce_config.agents[]` entry, reused/created from that entry's own
+    `template_id` (see `_get_or_create_quick_access_worker_agent`), then
+    assembled into a new `Workforce`. Mirrors the transaction shape of
+    `create_workforce_from_prompt` above: everything commits together, or
+    rolls back together.
+    """
+    workforce_config = template.get("workforce_config") or {}
+    manager_spec = cast(dict[str, Any], workforce_config.get("manager") or {})
+    agent_specs = cast(list[dict[str, Any]], workforce_config.get("agents") or [])
+    if not manager_spec.get("instructions") or not agent_specs:
+        raise HTTPException(
+            status_code=400, detail="Template is missing workforce configuration"
+        )
+
+    scope_type, scope_id = resolve_create_scope(db, user)
+    if not can_create_workforce(db, user, scope_type, scope_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    owner_user_id = int(user.id)
+    try:
+        name = resolve_unique_workforce_name(
+            db,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            name=str(template.get("name") or "Workforce"),
+        )
+        manager_agent = AgentStore(db).add_agent(
+            user_id=owner_user_id,
+            name=resolve_unique_agent_name(
+                db,
+                user_id=owner_user_id,
+                name=str(manager_spec.get("name") or f"{name} Manager"),
+            ),
+            description=normalize_text(
+                cast(str | None, manager_spec.get("description")), "description"
+            ),
+            instructions=str(manager_spec["instructions"]),
+            execution_mode=str(manager_spec.get("execution_mode") or "think"),
+            models=None,
+            knowledge_bases=[],
+            skills=cast(list[str], manager_spec.get("skills") or []),
+            tool_categories=cast(list[str], manager_spec.get("tool_categories") or []),
+            suggested_prompts=[],
+            origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            status=AgentStatus.PUBLISHED,
+            widget_enabled=False,
+            allowed_domains=[],
+        )
+
+        workforce = Workforce(
+            owner_user_id=owner_user_id,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            name=name,
+            description=normalize_text(
+                cast(str | None, get_localized_description(template)), "description"
+            ),
+            manager_agent_id=int(manager_agent.id),
+            status="draft",
+        )
+        db.add(workforce)
+        db.flush()
+
+        for index, agent_spec in enumerate(agent_specs):
+            worker_agent = await _get_or_create_quick_access_worker_agent(
+                db,
+                template_manager,
+                user_id=owner_user_id,
+                template_id=str(agent_spec["template_id"]),
+            )
+            create_workforce_worker(
+                db,
+                workforce,
+                user,
+                source_type="existing",
+                agent_id=int(worker_agent.id),
+                alias=cast(str | None, agent_spec.get("alias")),
+                assignment_instructions=str(agent_spec["assignment_instructions"]),
+                enabled=True,
+                sort_order=index + 1,
+            )
+
+        manager_agent_id = int(manager_agent.id)
+        workforce_id = int(workforce.id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    else:
+        invalidate_workforce_creation_cache(
+            owner_user_id=owner_user_id,
+            manager_agent_id=manager_agent_id,
+            workforce_id=workforce_id,
+        )
+    db.refresh(workforce)
+    return workforce
+
+
+def get_localized_description(template: dict[str, Any]) -> str | None:
+    """Best-effort English description for a newly created Workforce's
+    `description` column, which - unlike the template gallery response - is
+    not locale-aware. `descriptions` is the same {en, zh, ...} dict shape
+    validated by `TemplateManager._parse_yaml_file`.
+    """
+    descriptions = template.get("descriptions")
+    if isinstance(descriptions, dict):
+        value = descriptions.get("en")
+        return str(value) if value else None
+    if isinstance(descriptions, str):
+        return descriptions
+    return None
 
 
 def invalidate_workforce_creation_cache(

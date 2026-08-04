@@ -1572,6 +1572,18 @@ const zh = {
       knowledge: "知识与研究",
       sales: "销售与外联"
     },
+    typeFilter: {
+      all: "全部类型",
+      agent: "智能体",
+      workforce: "工作组"
+    },
+    workforceBadge: "工作组",
+    agentsCountOne: "{count} 个智能体",
+    agentsCountOther: "{count} 个智能体",
+    creatingWorkforce: "创建中…",
+    errors: {
+      useWorkforceFailed: "从该模版创建工作组失败，请重试。"
+    }
   },
   sidebar: {
     tasks: {

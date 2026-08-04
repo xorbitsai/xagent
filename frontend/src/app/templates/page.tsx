@@ -6,6 +6,7 @@ import { Suspense, useState, useEffect, useMemo } from "react";
 import { getApiUrl } from "@/lib/utils";
 import { useRouter, useSearchParams } from "next/navigation";
 import { apiRequest } from "@/lib/api-wrapper";
+import { toast } from "sonner";
 import { SearchInput } from "@/components/ui/search-input";
 import { PageHeader } from "@/components/ui/page-header";
 import { SegmentedTabs } from "@/components/ui/segmented-tabs";
@@ -58,6 +59,8 @@ function TemplatesPageContent() {
   const [selectedCategory, setSelectedCategory] = useState(
     () => searchParams.get("category") || "All"
   );
+  const [selectedType, setSelectedType] = useState("All");
+  const [creatingWorkforceId, setCreatingWorkforceId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
@@ -86,6 +89,11 @@ function TemplatesPageContent() {
     return key ? t(key) : formatFallbackLabel(c);
   };
 
+  const formatAgentsCount = (count: number) =>
+    count === 1
+      ? t("templates.agentsCountOne", { count })
+      : t("templates.agentsCountOther", { count });
+
   const categories = useMemo(() => {
     const preferred = ["Sales", "Marketing", "Support", "Research", "Productivity"];
     const dynamic = Array.from(new Set(templates.map((template) => template.category).filter(Boolean)));
@@ -100,6 +108,15 @@ function TemplatesPageContent() {
     ];
   }, [t, templates]);
 
+  const typeTabs = useMemo(
+    () => [
+      { id: "All", label: t("templates.typeFilter.all") },
+      { id: "agent", label: t("templates.typeFilter.agent") },
+      { id: "workforce", label: t("templates.typeFilter.workforce") },
+    ],
+    [t]
+  );
+
   const featuredTemplates = useMemo(
     () => templates.filter((template) => template.featured),
     [templates]
@@ -109,19 +126,22 @@ function TemplatesPageContent() {
     () =>
       templates.filter((template) => {
         const matchesCategory = selectedCategory === "All" || template.category === selectedCategory;
+        const matchesType =
+          selectedType === "All" || (template.type || "agent") === selectedType;
         const matchesSearch =
           !searchQuery ||
           template.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
           template.description.toLowerCase().includes(searchQuery.toLowerCase());
-        return matchesCategory && matchesSearch;
+        return matchesCategory && matchesType && matchesSearch;
       }),
-    [searchQuery, selectedCategory, templates]
+    [searchQuery, selectedCategory, selectedType, templates]
   );
 
   const sections = useMemo(() => {
     const grouped: Record<string, Template[]> = {};
     const featuredIds = new Set(featuredTemplates.map((template) => template.id));
-    const shouldHideFeaturedFromSections = selectedCategory === "All" && !searchQuery;
+    const shouldHideFeaturedFromSections =
+      selectedCategory === "All" && selectedType === "All" && !searchQuery;
 
     filteredTemplates.forEach((template) => {
       if (shouldHideFeaturedFromSections && featuredIds.has(template.id)) {
@@ -155,9 +175,38 @@ function TemplatesPageContent() {
     });
 
     return orderedSections;
-  }, [categories, featuredTemplates, filteredTemplates, searchQuery, selectedCategory]);
+  }, [categories, featuredTemplates, filteredTemplates, searchQuery, selectedCategory, selectedType]);
 
   const handleUseTemplate = async (templateId: string) => {
+    const template = templates.find((item) => item.id === templateId);
+    if (template?.type === "workforce") {
+      // Guards against a repeat click firing a second creation request while
+      // the first is still in flight (the card also disables itself via
+      // creatingWorkforceId, but that state update isn't synchronous).
+      if (creatingWorkforceId) return;
+      setCreatingWorkforceId(templateId);
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use-as-workforce`, {
+          method: "POST",
+        });
+        if (response.ok) {
+          const data = await response.json();
+          router.push(`/workforces/${data.workforce_id}?view=canvas`);
+          return;
+        }
+        let message = t("templates.errors.useWorkforceFailed");
+        try {
+          const body = await response.json();
+          if (typeof body?.detail === "string" && body.detail) message = body.detail;
+        } catch { }
+        toast.error(message);
+      } catch {
+        toast.error(t("templates.errors.useWorkforceFailed"));
+      } finally {
+        setCreatingWorkforceId(null);
+      }
+      return;
+    }
     try {
       await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use`, { method: "POST" });
     } catch { }
@@ -191,17 +240,28 @@ function TemplatesPageContent() {
       />
 
       <div className="px-6 py-6 md:px-8">
-      {/* Segmented category filter */}
+      {/* Segmented category + type filters */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
-        <SegmentedTabs
-          items={categories}
-          value={selectedCategory}
-          onValueChange={setSelectedCategory}
-          listClassName="gap-0.5 rounded-[13px] bg-muted p-1"
-          triggerClassName="rounded-[10px] px-4 py-2 text-sm duration-300"
-          activeTriggerClassName="bg-background font-semibold text-foreground shadow-sm"
-          inactiveTriggerClassName="font-medium text-muted-foreground hover:text-foreground"
-        />
+        <div className="flex flex-wrap items-center gap-3">
+          <SegmentedTabs
+            items={categories}
+            value={selectedCategory}
+            onValueChange={setSelectedCategory}
+            listClassName="gap-0.5 rounded-[13px] bg-muted p-1"
+            triggerClassName="rounded-[10px] px-4 py-2 text-sm duration-300"
+            activeTriggerClassName="bg-background font-semibold text-foreground shadow-sm"
+            inactiveTriggerClassName="font-medium text-muted-foreground hover:text-foreground"
+          />
+          <SegmentedTabs
+            items={typeTabs}
+            value={selectedType}
+            onValueChange={setSelectedType}
+            listClassName="gap-0.5 rounded-[13px] bg-muted p-1"
+            triggerClassName="rounded-[10px] px-4 py-2 text-sm duration-300"
+            activeTriggerClassName="bg-background font-semibold text-foreground shadow-sm"
+            inactiveTriggerClassName="font-medium text-muted-foreground hover:text-foreground"
+          />
+        </div>
         <span className="rounded-full bg-muted px-3 py-1.5 text-[13px] font-medium text-muted-foreground">
           {filteredTemplates.length === 1
             ? t("templates.countOne", { count: filteredTemplates.length })
@@ -217,7 +277,7 @@ function TemplatesPageContent() {
       ) : (
         <div className="flex flex-col gap-12">
           {/* Featured section */}
-          {selectedCategory === "All" && !searchQuery && featuredTemplates.length > 0 && (
+          {selectedCategory === "All" && selectedType === "All" && !searchQuery && featuredTemplates.length > 0 && (
             <TemplateSection
               title={t("templates.categoryTitles.featured")}
               count={featuredTemplates.length}
@@ -225,6 +285,10 @@ function TemplatesPageContent() {
               categoryLabel={categoryLabel}
               useLabel={t("templates.useTemplate")}
               defaultSetupTime={t("templates.defaultSetupTime")}
+              workforceBadgeLabel={t("templates.workforceBadge")}
+              formatAgentsCount={formatAgentsCount}
+              creatingWorkforceId={creatingWorkforceId}
+              busyLabel={t("templates.creatingWorkforce")}
               onUse={handleUseTemplate}
               onLike={handleLikeTemplate}
             />
@@ -240,6 +304,10 @@ function TemplatesPageContent() {
               categoryLabel={categoryLabel}
               useLabel={t("templates.useTemplate")}
               defaultSetupTime={t("templates.defaultSetupTime")}
+              workforceBadgeLabel={t("templates.workforceBadge")}
+              formatAgentsCount={formatAgentsCount}
+              creatingWorkforceId={creatingWorkforceId}
+              busyLabel={t("templates.creatingWorkforce")}
               onUse={handleUseTemplate}
               onLike={handleLikeTemplate}
             />
@@ -264,6 +332,10 @@ interface TemplateSectionProps {
   categoryLabel: (category: string) => string;
   useLabel: string;
   defaultSetupTime: string;
+  workforceBadgeLabel: string;
+  formatAgentsCount: (count: number) => string;
+  creatingWorkforceId: string | null;
+  busyLabel: string;
   onUse: (templateId: string) => void;
   onLike: (templateId: string, event: React.MouseEvent<HTMLButtonElement>) => void;
 }
@@ -275,6 +347,10 @@ function TemplateSection({
   categoryLabel,
   useLabel,
   defaultSetupTime,
+  workforceBadgeLabel,
+  formatAgentsCount,
+  creatingWorkforceId,
+  busyLabel,
   onUse,
   onLike,
 }: TemplateSectionProps) {
@@ -295,6 +371,10 @@ function TemplateSection({
             categoryLabel={categoryLabel(template.category)}
             useLabel={useLabel}
             defaultSetupTime={defaultSetupTime}
+            workforceBadgeLabel={workforceBadgeLabel}
+            formatAgentsCount={formatAgentsCount}
+            isBusy={creatingWorkforceId === template.id}
+            busyLabel={busyLabel}
             onUse={onUse}
             onLike={onLike}
           />

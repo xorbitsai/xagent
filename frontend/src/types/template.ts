@@ -18,6 +18,8 @@ export interface SamplePrompt {
   highlights?: string[];
 }
 
+export type TemplateType = "agent" | "workforce";
+
 export interface Template {
   id: string;
   name: string;
@@ -35,10 +37,17 @@ export interface Template {
   likes: number;
   used_count: number;
   is_liked?: boolean;
+  /** "agent" (default) for a single-agent template, "workforce" for a manager + worker-agents template. */
+  type?: TemplateType;
+  /** Manager + worker agent display names, manager first. Empty for "agent"-type templates. */
+  workforce_agents?: string[];
 }
 
 export interface TemplateDetail extends Template {
-  agent_config: AgentConfig;
+  /** Populated for an "agent"-type template. Null/absent for "workforce"-type templates,
+   * which are configured via `workforce_config` instead. */
+  agent_config?: AgentConfig | null;
+  workforce_config?: Record<string, unknown> | null;
 }
 
 export type TemplateWithStats = Template;

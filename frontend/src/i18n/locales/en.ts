@@ -1572,6 +1572,18 @@ Build when you need.`,
       knowledge: "Knowledge & Research",
       sales: "Sales & Outreach"
     },
+    typeFilter: {
+      all: "All types",
+      agent: "Agent",
+      workforce: "Workforce"
+    },
+    workforceBadge: "Workforce",
+    agentsCountOne: "{count} agent",
+    agentsCountOther: "{count} agents",
+    creatingWorkforce: "Creating...",
+    errors: {
+      useWorkforceFailed: "Couldn't create the workforce from this template. Please try again."
+    }
   },
   sidebar: {
     tasks: {

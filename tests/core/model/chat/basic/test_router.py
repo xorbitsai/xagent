@@ -613,9 +613,14 @@ async def test_router_chat_propagates_non_matching_errors_without_retry(monkeypa
     assert llm.tool_choices == ["required"]
 
 
+@pytest.mark.parametrize(
+    "thinking",
+    [None, {"type": "disabled", "enable": False}],
+    ids=["unspecified", "disabled"],
+)
 @pytest.mark.asyncio
 async def test_router_chat_enables_thinking_when_selected_model_requires_it(
-    monkeypatch,
+    monkeypatch, thinking
 ):
     llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
     router = RouterLLM(downstream_resolver=lambda _model_id: llm)
@@ -625,35 +630,15 @@ async def test_router_chat_enables_thinking_when_selected_model_requires_it(
         [{"role": "user", "content": "score?"}],
         tools=[_tool_schema()],
         tool_choice="required",
-        thinking={"type": "disabled", "enable": False},
+        thinking=thinking,
     )
 
     assert result == "ok"
     assert llm.thinking_values == [
-        {"type": "disabled", "enable": False},
+        thinking,
         {"type": "enabled", "enable": True},
     ]
-
-
-@pytest.mark.asyncio
-async def test_router_chat_enables_thinking_when_request_omits_preference(
-    monkeypatch,
-):
-    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-    monkeypatch.setattr(router, "_select_model", _select_glm)
-
-    result = await router.chat(
-        [{"role": "user", "content": "score?"}],
-        tools=[_tool_schema()],
-        tool_choice="required",
-    )
-
-    assert result == "ok"
-    assert llm.thinking_values == [
-        None,
-        {"type": "enabled", "enable": True},
-    ]
+    assert llm.tool_choices == ["required", "required"]
 
 
 @pytest.mark.asyncio
@@ -699,6 +684,26 @@ async def test_router_does_not_repeat_mandatory_reasoning_retry(monkeypatch):
         {"type": "disabled", "enable": False},
         {"type": "enabled", "enable": True},
     ]
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_retry_mandatory_reasoning_when_already_enabled(
+    monkeypatch,
+):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    with pytest.raises(RuntimeError, match="Reasoning is mandatory"):
+        await router.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=[_tool_schema()],
+            tool_choice="required",
+            thinking={"type": "enabled", "enable": True},
+        )
+
+    assert llm.thinking_values == [{"type": "enabled", "enable": True}]
+    assert llm.tool_choices == ["required"]
 
 
 @pytest.mark.asyncio

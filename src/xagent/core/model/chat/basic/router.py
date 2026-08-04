@@ -77,6 +77,8 @@ def _should_retry_with_thinking(
     *,
     thinking: dict[str, Any] | None,
 ) -> bool:
+    # This is the primary stop condition after a retry swaps in enabled thinking;
+    # retry-action tracking remains defense in depth for the shared retry loop.
     if isinstance(thinking, dict) and (
         thinking.get("type") == "enabled" or thinking.get("enable") is True
     ):
@@ -85,6 +87,7 @@ def _should_retry_with_thinking(
     # OpenRouter currently exposes this provider constraint only through an
     # untyped 400 response. Retry the same selected model once with reasoning
     # enabled instead of repeating the rejected payload or rerouting.
+    # Replace string matching with typed provider errors when available.
     exc_msg = str(exc).lower()
     return "reasoning is mandatory" in exc_msg and "cannot be disabled" in exc_msg
 

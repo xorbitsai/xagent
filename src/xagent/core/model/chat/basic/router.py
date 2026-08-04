@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
 _DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
+_ENABLE_DOWNSTREAM_THINKING = {"type": "enabled", "enable": True}
 _CONTENT_PART_MODALITIES = {
     "audio": "audio",
     "audio_url": "audio",
@@ -69,6 +70,23 @@ _MODALITY_ABILITIES = {
 
 class RouterModalityRoutingError(RuntimeError):
     """The installed router cannot enforce required input modalities."""
+
+
+def _should_retry_with_thinking(
+    exc: Exception,
+    *,
+    thinking: dict[str, Any] | None,
+) -> bool:
+    if thinking is None or not (
+        thinking.get("type") == "disabled" or thinking.get("enable") is False
+    ):
+        return False
+
+    # OpenRouter currently exposes this provider constraint only through an
+    # untyped 400 response. Retry the same selected model once with reasoning
+    # enabled instead of repeating the rejected payload or rerouting.
+    exc_msg = str(exc).lower()
+    return "reasoning is mandatory" in exc_msg and "cannot be disabled" in exc_msg
 
 
 def _should_retry_without_thinking(
@@ -114,6 +132,14 @@ def _next_retry_state(
     thinking: dict[str, Any] | None,
     tool_choice: str | dict[str, Any] | None,
 ) -> tuple[str | dict[str, Any] | None, dict[str, Any] | None, str, str] | None:
+    if _should_retry_with_thinking(exc, thinking=thinking):
+        return (
+            tool_choice,
+            _ENABLE_DOWNSTREAM_THINKING,
+            "selected model requires reasoning; retrying with thinking enabled",
+            "enable_thinking",
+        )
+
     if _should_retry_without_thinking(exc, thinking=thinking, tool_choice=tool_choice):
         return (
             tool_choice,

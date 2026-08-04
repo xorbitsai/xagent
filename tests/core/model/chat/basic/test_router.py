@@ -21,6 +21,10 @@ _OPENROUTER_TOOL_CHOICE_ERROR = (
 _THINKING_TOOL_CHOICE_ERROR = (
     "OpenAI bad request (400): Thinking mode does not support this tool_choice"
 )
+_MANDATORY_REASONING_ERROR = (
+    "OpenAI bad request (400): Reasoning is mandatory for this endpoint "
+    "and cannot be disabled."
+)
 
 
 def _tool_schema() -> dict[str, Any]:
@@ -127,6 +131,26 @@ class _ScriptedChatLLM(BaseLLM):
         if self.errors:
             raise RuntimeError(self.errors.pop(0))
         return "ok"
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        del messages, temperature, max_tokens, tools, response_format
+        del output_config, kwargs
+        self.tool_choices.append(tool_choice)
+        self.thinking_values.append(thinking)
+        if self.errors:
+            raise RuntimeError(self.errors.pop(0))
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
 
 
 async def _select_glm(_prompt: str) -> str:
@@ -587,6 +611,73 @@ async def test_router_chat_propagates_non_matching_errors_without_retry(monkeypa
         )
 
     assert llm.tool_choices == ["required"]
+
+
+@pytest.mark.asyncio
+async def test_router_chat_enables_thinking_when_selected_model_requires_it(
+    monkeypatch,
+):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    result = await router.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=[_tool_schema()],
+        tool_choice="required",
+        thinking={"type": "disabled", "enable": False},
+    )
+
+    assert result == "ok"
+    assert llm.thinking_values == [
+        {"type": "disabled", "enable": False},
+        {"type": "enabled", "enable": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_router_stream_enables_thinking_when_selected_model_requires_it(
+    monkeypatch,
+):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    chunks = [
+        chunk
+        async for chunk in router.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tools=[_tool_schema()],
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert llm.thinking_values == [
+        {"type": "disabled", "enable": False},
+        {"type": "enabled", "enable": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_repeat_mandatory_reasoning_retry(monkeypatch):
+    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR, _MANDATORY_REASONING_ERROR])
+    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    monkeypatch.setattr(router, "_select_model", _select_glm)
+
+    with pytest.raises(RuntimeError, match="Reasoning is mandatory"):
+        await router.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=[_tool_schema()],
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        )
+
+    assert llm.thinking_values == [
+        {"type": "disabled", "enable": False},
+        {"type": "enabled", "enable": True},
+    ]
 
 
 @pytest.mark.asyncio

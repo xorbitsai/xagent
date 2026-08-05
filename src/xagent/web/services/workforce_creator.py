@@ -530,17 +530,25 @@ async def create_workforce_from_template(
 
 
 def get_localized_description(template: dict[str, Any]) -> str | None:
-    """Best-effort English description for a newly created Workforce's
+    """Best-effort description for a newly created Workforce's
     `description` column, which - unlike the template gallery response - is
     not locale-aware. `descriptions` is always a {en, zh, ...} dict here -
     `TemplateManager._parse_yaml_file` raises ValueError for any other
     shape, so a template dict reaching this function can't carry a plain
-    string instead.
+    string instead. Prefers English but falls back to any other populated
+    locale rather than leaving the Workforce's description empty - the key
+    check in `_parse_yaml_file` only requires an 'en' key to be present, not
+    a non-empty value.
     """
     descriptions = template.get("descriptions")
-    if isinstance(descriptions, dict):
-        value = descriptions.get("en")
-        return str(value) if value else None
+    if not isinstance(descriptions, dict):
+        return None
+    value = descriptions.get("en")
+    if value:
+        return str(value)
+    for other_value in descriptions.values():
+        if other_value:
+            return str(other_value)
     return None
 
 

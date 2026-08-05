@@ -39,8 +39,10 @@ export interface Template {
   is_liked?: boolean;
   /** "agent" (default) for a single-agent template, "workforce" for a manager + worker-agents template. */
   type?: TemplateType;
-  /** Manager + worker agent display names, manager first. Empty for "agent"-type templates. */
-  workforce_agents?: string[];
+  /** Display name of the manager agent. Null/absent for "agent"-type templates. */
+  manager_name?: string | null;
+  /** Display names of the worker agents. Empty for "agent"-type templates. */
+  worker_names?: string[];
 }
 
 export interface TemplateDetail extends Template {

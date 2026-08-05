@@ -10,7 +10,11 @@ from sqlalchemy.orm import Session
 
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.user import User
-from xagent.web.services.agent_management import TEMPLATE_RESOLVE_RACE_RETRIES
+from xagent.web.services.agent_management import (
+    TEMPLATE_RESOLVE_RACE_RETRIES,
+    is_agent_name_unique_violation,
+    is_agent_template_quick_access_unique_violation,
+)
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
 from ..models.workforce import Workforce, WorkforceBuilderMessage
@@ -303,10 +307,21 @@ async def _get_or_create_quick_access_worker_agent(
     attempt therefore runs in its own SAVEPOINT (`db.begin_nested()`) so a
     collision only unwinds that attempt - not the manager agent / Workforce
     already staged in the caller's outer transaction - and we retry by
-    re-reading the row the winning concurrent request just committed.
-    Mirrors `AgentManagementService._resolve_agent_from_template_sync`'s
-    retry loop, which hardens the same (user_id, template_id, quick-access
-    origin) uniqueness for the /task quick-access flow.
+    re-reading the row the winning concurrent request just committed - which
+    depends on the connection's isolation level being READ COMMITTED (the
+    default for both SQLite and PostgreSQL here; nothing in this codebase
+    overrides it). Under REPEATABLE READ the re-select could still miss the
+    just-committed row and this would exhaust its retries.
+
+    Same intent as `AgentManagementService._resolve_agent_from_template_sync`,
+    which hardens the same (user_id, template_id, quick-access origin)
+    uniqueness for the /task quick-access flow, but not the same mechanism:
+    that resolver does a full `db.rollback()` per attempt (it owns its own
+    session), while this one uses a SAVEPOINT (`db.begin_nested()`) so a
+    collision only unwinds this attempt - not the manager agent / Workforce
+    already staged in the caller's outer transaction. Both discriminate the
+    same two constraints via `is_agent_template_quick_access_unique_violation`
+    / `is_agent_name_unique_violation` before deciding how to retry.
     """
     existing = _find_quick_access_worker_agent(
         db, user_id=user_id, template_id=template_id
@@ -320,7 +335,18 @@ async def _get_or_create_quick_access_worker_agent(
             status_code=400,
             detail=f"Workforce template references an unknown template: {template_id}",
         )
-    agent_config = worker_template.get("agent_config", {})
+    if worker_template.get("type", "agent") != "agent":
+        # A workforce template's agents[] must reference single-agent
+        # templates. TemplateManager._enrich_template nulls agent_config for
+        # any non-agent template, so without this check a workforce
+        # referencing another workforce would crash below on
+        # `None.get(...)` instead of failing with a clear message.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Workforce template references a non-agent template as a "
+            f"worker: {template_id}",
+        )
+    agent_config = worker_template.get("agent_config") or {}
 
     for attempt in range(TEMPLATE_RESOLVE_RACE_RETRIES):
         try:
@@ -347,22 +373,47 @@ async def _get_or_create_quick_access_worker_agent(
                     template_id=template_id,
                 )
             return agent
-        except IntegrityError:
+        except IntegrityError as exc:
             # The savepoint rollback above already discarded our failed
-            # insert; a concurrent request won the race, so its row should
-            # now be visible.
-            existing = _find_quick_access_worker_agent(
-                db, user_id=user_id, template_id=template_id
-            )
-            if existing is not None:
-                return existing
-            logger.warning(
-                "Quick-access worker agent insert collided without a "
-                "resolvable row (attempt %s/%s) for template_id=%s",
-                attempt + 1,
-                TEMPLATE_RESOLVE_RACE_RETRIES,
-                template_id,
-            )
+            # insert. Which constraint fired determines what a retry should
+            # even do - conflating them previously misdiagnosed a genuine
+            # name collision as this template's quick-access race, which
+            # burns every retry on a re-select that can never find a row
+            # (nothing else raced for *this* template_id) and returns a
+            # misleading 409 (PR #1127 review).
+            if is_agent_template_quick_access_unique_violation(exc):
+                # A concurrent request won the (user_id, template_id)
+                # quick-access race; its row should now be visible.
+                existing = _find_quick_access_worker_agent(
+                    db, user_id=user_id, template_id=template_id
+                )
+                if existing is not None:
+                    return existing
+                logger.warning(
+                    "Quick-access worker agent insert collided on the "
+                    "quick-access index without a resolvable row (attempt "
+                    "%s/%s) for template_id=%s",
+                    attempt + 1,
+                    TEMPLATE_RESOLVE_RACE_RETRIES,
+                    template_id,
+                )
+            elif is_agent_name_unique_violation(exc):
+                # resolve_unique_agent_name's own check-then-insert lost a
+                # race for the name it picked - not a quick-access race at
+                # all. Retrying picks a fresh name via the next iteration's
+                # resolve_unique_agent_name call.
+                logger.warning(
+                    "Quick-access worker agent name collided (attempt "
+                    "%s/%s) for template_id=%s; retrying with a new name",
+                    attempt + 1,
+                    TEMPLATE_RESOLVE_RACE_RETRIES,
+                    template_id,
+                )
+            else:
+                # An unrecognized constraint (e.g. a widget_key collision or
+                # an unrelated FK failure) - don't misdiagnose it as either
+                # race above.
+                raise
 
     raise HTTPException(
         status_code=409,
@@ -459,6 +510,7 @@ async def create_workforce_from_template(
                 assignment_instructions=str(agent_spec["assignment_instructions"]),
                 enabled=True,
                 sort_order=index + 1,
+                template_id=str(agent_spec["template_id"]),
             )
 
         manager_agent_id = int(manager_agent.id)
@@ -480,15 +532,15 @@ async def create_workforce_from_template(
 def get_localized_description(template: dict[str, Any]) -> str | None:
     """Best-effort English description for a newly created Workforce's
     `description` column, which - unlike the template gallery response - is
-    not locale-aware. `descriptions` is the same {en, zh, ...} dict shape
-    validated by `TemplateManager._parse_yaml_file`.
+    not locale-aware. `descriptions` is always a {en, zh, ...} dict here -
+    `TemplateManager._parse_yaml_file` raises ValueError for any other
+    shape, so a template dict reaching this function can't carry a plain
+    string instead.
     """
     descriptions = template.get("descriptions")
     if isinstance(descriptions, dict):
         value = descriptions.get("en")
         return str(value) if value else None
-    if isinstance(descriptions, str):
-        return descriptions
     return None
 
 

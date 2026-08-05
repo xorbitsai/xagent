@@ -1,6 +1,6 @@
 "use client";
 
-import { type KeyboardEvent, type MouseEvent } from "react";
+import React, { type KeyboardEvent, type MouseEvent } from "react";
 import { Clock, Heart, Loader2, Play, Users } from "lucide-react";
 import type { Template } from "@/types/template";
 import { cn } from "@/lib/utils";
@@ -19,6 +19,13 @@ interface LibraryTemplateCardProps {
    * so a slow request can't be re-triggered by an impatient repeat click. */
   isBusy?: boolean;
   busyLabel?: string;
+  /** True when a *different* workforce template is currently being created
+   * (creatingWorkforceId is a single global lock, not per-card - see
+   * templates/page.tsx). Blocks activation like isBusy, but without
+   * claiming this card itself is the one in flight: no spinner, no label
+   * swap, just a visibly disabled state instead of a click that silently
+   * does nothing. */
+  disabled?: boolean;
   onUse: (templateId: string) => void;
   onLike?: (templateId: string, event: MouseEvent<HTMLButtonElement>) => void;
   className?: string;
@@ -91,18 +98,18 @@ export function LibraryTemplateCard({
   formatAgentsCount,
   isBusy,
   busyLabel,
+  disabled,
   onUse,
   onLike,
   className,
 }: LibraryTemplateCardProps) {
+  const isBlocked = isBusy || disabled;
   const handleActivate = () => {
-    if (isBusy) return;
+    if (isBlocked) return;
     onUse(template.id);
   };
   const isWorkforce = template.type === "workforce";
-  // First entry is the manager (see get_workforce_agent_names on the
-  // backend); the rest are the workers this workforce actually runs.
-  const workerCount = Math.max((template.workforce_agents?.length || 0) - 1, 0);
+  const workerCount = template.worker_names?.length || 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (isNestedInteractiveElement(event.target, event.currentTarget)) {
@@ -122,13 +129,14 @@ export function LibraryTemplateCard({
     <div
       role="button"
       tabIndex={0}
-      aria-disabled={isBusy || undefined}
+      aria-disabled={isBlocked || undefined}
       aria-busy={isBusy || undefined}
       onClick={handleActivate}
       onKeyDown={handleKeyDown}
       className={cn(
         "group flex h-full cursor-pointer flex-col rounded-[18px] border border-border bg-card p-5 shadow-sm transition-all duration-300 ease-out hover:-translate-y-1 hover:border-transparent hover:shadow-[0_16px_40px_rgba(0,0,0,0.11)]",
         isBusy && "cursor-wait opacity-70",
+        disabled && !isBusy && "cursor-not-allowed opacity-50",
         className
       )}
     >
@@ -207,8 +215,11 @@ export function LibraryTemplateCard({
 
       <button
         type="button"
-        disabled={isBusy}
-        className="mt-4 flex h-[38px] items-center justify-center gap-1.5 rounded-[10px] bg-primary/10 text-[13.5px] font-semibold text-primary transition-all duration-300 hover:bg-primary hover:text-primary-foreground active:scale-[0.98] disabled:cursor-wait disabled:opacity-70 disabled:hover:bg-primary/10 disabled:hover:text-primary"
+        disabled={isBlocked}
+        className={cn(
+          "mt-4 flex h-[38px] items-center justify-center gap-1.5 rounded-[10px] bg-primary/10 text-[13.5px] font-semibold text-primary transition-all duration-300 hover:bg-primary hover:text-primary-foreground active:scale-[0.98] disabled:opacity-70 disabled:hover:bg-primary/10 disabled:hover:text-primary",
+          isBusy ? "disabled:cursor-wait" : "disabled:cursor-not-allowed"
+        )}
         onClick={(event) => {
           event.stopPropagation();
           handleActivate();

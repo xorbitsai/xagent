@@ -5,7 +5,7 @@ import { Loader2 } from "lucide-react";
 import { Suspense, useState, useEffect, useMemo } from "react";
 import { getApiUrl } from "@/lib/utils";
 import { useRouter, useSearchParams } from "next/navigation";
-import { apiRequest } from "@/lib/api-wrapper";
+import { apiRequest, getApiErrorMessage, parseApiResponse } from "@/lib/api-wrapper";
 import { toast } from "sonner";
 import { SearchInput } from "@/components/ui/search-input";
 import { PageHeader } from "@/components/ui/page-header";
@@ -41,6 +41,17 @@ const formatFallbackLabel = (category: string) =>
     .replace(/_/g, " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
 
+// The backend's HTTPException `detail` strings are English-only and not
+// meant to be shown as-is to a zh-locale user. Only the exact, static
+// messages we control are mapped to a translated string; anything else
+// (including the dynamic template-id messages) falls back to the generic
+// translated error below rather than leaking raw English (PR #1127 review).
+const WORKFORCE_USE_ERROR_KEYS: Record<string, TranslationKey> = {
+  "Access denied": "templates.errors.useWorkforceAccessDenied",
+  "Could not create the workforce's worker agents due to a concurrent request; please try again.":
+    "templates.errors.useWorkforceRetry",
+};
+
 export default function TemplatesPage() {
   return (
     <Suspense fallback={null}>
@@ -59,7 +70,13 @@ function TemplatesPageContent() {
   const [selectedCategory, setSelectedCategory] = useState(
     () => searchParams.get("category") || "All"
   );
-  const [selectedType, setSelectedType] = useState("All");
+  // Same one-way seeding as selectedCategory above, for a ?type=<id> link.
+  // Neither is written back to the URL on change today, so - like
+  // selectedCategory - the current filter combination still isn't
+  // shareable via the address bar once the user changes it in-page.
+  const [selectedType, setSelectedType] = useState(
+    () => searchParams.get("type") || "All"
+  );
   const [creatingWorkforceId, setCreatingWorkforceId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -194,12 +211,10 @@ function TemplatesPageContent() {
           router.push(`/workforces/${data.workforce_id}?view=canvas`);
           return;
         }
-        let message = t("templates.errors.useWorkforceFailed");
-        try {
-          const body = await response.json();
-          if (typeof body?.detail === "string" && body.detail) message = body.detail;
-        } catch { }
-        toast.error(message);
+        const parsed = await parseApiResponse(response);
+        const rawDetail = getApiErrorMessage(response, parsed, "");
+        const messageKey = rawDetail ? WORKFORCE_USE_ERROR_KEYS[rawDetail] : undefined;
+        toast.error(messageKey ? t(messageKey) : t("templates.errors.useWorkforceFailed"));
       } catch {
         toast.error(t("templates.errors.useWorkforceFailed"));
       } finally {
@@ -375,6 +390,11 @@ function TemplateSection({
             formatAgentsCount={formatAgentsCount}
             isBusy={creatingWorkforceId === template.id}
             busyLabel={busyLabel}
+            disabled={
+              template.type === "workforce" &&
+              creatingWorkforceId !== null &&
+              creatingWorkforceId !== template.id
+            }
             onUse={onUse}
             onLike={onLike}
           />

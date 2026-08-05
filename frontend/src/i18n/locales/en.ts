@@ -1582,7 +1582,9 @@ Build when you need.`,
     agentsCountOther: "{count} agents",
     creatingWorkforce: "Creating...",
     errors: {
-      useWorkforceFailed: "Couldn't create the workforce from this template. Please try again."
+      useWorkforceFailed: "Couldn't create the workforce from this template. Please try again.",
+      useWorkforceAccessDenied: "You don't have permission to create a workforce.",
+      useWorkforceRetry: "Too many concurrent requests for this template. Please try again."
     }
   },
   sidebar: {
@@ -2464,6 +2466,7 @@ Build when you need.`,
         unknown: "An unknown error occurred",
         notFound: "Agent not found",
         notFoundDesc: "The agent you are looking for does not exist or has been deleted.",
+        templateIsWorkforce: "This template creates a workforce, not a single agent. Use it from the Templates page instead.",
       },
       kbToolWarning: {
         title: "Knowledge Tools Required",

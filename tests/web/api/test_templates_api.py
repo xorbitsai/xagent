@@ -752,6 +752,13 @@ class TestUseTemplateAsWorkforce:
                     .all()
                 )
                 assert len(workers) == 2
+                # WorkforceAgent.template_id records provenance - which
+                # template's workforce_config.agents[] entry created this
+                # worker link (PR #1127 review: previously always NULL).
+                assert {w.template_id for w in workers} == {
+                    "ga_analyzer",
+                    "ads_recommendation",
+                }
                 worker_agent_ids = {w.agent_id for w in workers}
                 worker_agents = (
                     db.query(Agent).filter(Agent.id.in_(worker_agent_ids)).all()
@@ -831,5 +838,79 @@ class TestUseTemplateAsWorkforce:
                     .count()
                 )
                 assert quick_access_count == 2
+            finally:
+                db.close()
+
+    def test_rejects_when_workforce_creation_is_not_allowed(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        """403 when the workforce access policy (can_create_workforce)
+        denies the request - not covered before this test (PR #1127
+        review)."""
+        with (
+            patch.object(client.app, "state", workforce_mock_app_state),
+            patch(
+                "xagent.web.services.workforce_creator.can_create_workforce",
+                return_value=False,
+            ),
+        ):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert response.status_code == 403
+
+    def test_rejects_unknown_worker_template_at_use_time(self, tmp_path, admin_headers):
+        """workforce_config.agents[].template_id is only checked for being a
+        non-empty string at load time (cross-file references can't be
+        validated per-file) - a dangling reference must surface as a clean
+        400 when the template is actually used, not an unhandled crash
+        (PR #1127 review)."""
+        import asyncio
+
+        from xagent.templates.manager import TemplateManager
+
+        templates_dir = tmp_path / "dangling_workforce_templates"
+        templates_dir.mkdir()
+        (templates_dir / "dangling_workforce.yaml").write_text(
+            """
+id: dangling_workforce
+name: Dangling Workforce
+category: Marketing
+type: workforce
+descriptions:
+  en: References a worker template that does not exist.
+author: Xagent
+version: "1.0"
+
+workforce_config:
+  manager:
+    name: Dangling Manager
+    instructions: |
+      You are the manager.
+  agents:
+  - template_id: ghost_agent
+    name: Ghost Worker
+    assignment_instructions: Do the thing.
+"""
+        )
+        template_manager = TemplateManager(templates_root=templates_dir)
+        asyncio.run(template_manager.initialize())
+        mock_state = MagicMock()
+        mock_state.template_manager = template_manager
+
+        with patch.object(client.app, "state", mock_state):
+            response = client.post(
+                "/api/templates/dangling_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert response.status_code == 400
+
+            db = next(get_db())
+            try:
+                # The failed attempt must not have left a partial
+                # manager/Workforce behind.
+                assert db.query(Workforce).count() == 0
+                assert db.query(Agent).count() == 0
             finally:
                 db.close()

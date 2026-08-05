@@ -119,11 +119,15 @@ class TemplateInfo(BaseModel):
         description="'agent' for a single-agent template, 'workforce' for a "
         "manager + worker-agents template",
     )
-    workforce_agents: list[str] = Field(
+    manager_name: Optional[str] = Field(
+        default=None,
+        description="Display name of the manager agent a 'workforce'-type "
+        "template creates. None for 'agent'-type templates.",
+    )
+    worker_names: list[str] = Field(
         default_factory=list,
-        description="Display names of the manager + worker agents this "
-        "workforce template creates, in orchestration order (manager first). "
-        "Empty for 'agent'-type templates.",
+        description="Display names of the worker agents a 'workforce'-type "
+        "template creates. Empty for 'agent'-type templates.",
     )
 
 
@@ -148,6 +152,14 @@ class LikeResponse(BaseModel):
 
     liked: bool = Field(..., description="Whether the template is liked")
     likes: int = Field(..., description="Total number of likes")
+
+
+class UseAsWorkforceResponse(BaseModel):
+    """Response for POST /{template_id}/use-as-workforce"""
+
+    message: str = Field(..., description="Human-readable confirmation")
+    template_id: str = Field(..., description="ID of the template that was used")
+    workforce_id: int = Field(..., description="ID of the newly created workforce")
 
 
 # ===== Router =====
@@ -248,24 +260,35 @@ def increment_template_likes(db: Session, template_id: str) -> None:
     )
 
 
-def get_workforce_agent_names(template: dict[str, Any]) -> list[str]:
-    """Manager + worker display names for a workforce-type template, in
-    orchestration order (manager first). Derived entirely from static YAML
-    fields (no per-agent template lookups), since this runs for every
-    template on every `GET /api/templates/` page load.
+def get_workforce_agent_names(
+    template: dict[str, Any],
+) -> tuple[Optional[str], list[str]]:
+    """(manager_name, worker_names) for a workforce-type template. Split
+    into two fields rather than one flat list so "which one is the manager"
+    is structural, not "index 0 by convention" - and a worker with no name
+    would previously be silently dropped from a single list rather than
+    visibly changing the count (PR #1127 review; template loading now
+    rejects a missing agents[].name outright, but this stays defensive).
+    Derived entirely from static YAML fields (no per-agent template
+    lookups), since this runs for every template on every
+    `GET /api/templates/` page load.
     """
     workforce_config = template.get("workforce_config")
     if not isinstance(workforce_config, dict):
-        return []
+        return None, []
 
-    names: list[str] = []
     manager = workforce_config.get("manager")
-    if isinstance(manager, dict) and manager.get("name"):
-        names.append(str(manager["name"]))
-    for agent in workforce_config.get("agents") or []:
-        if isinstance(agent, dict) and agent.get("name"):
-            names.append(str(agent["name"]))
-    return names
+    manager_name = (
+        str(manager["name"])
+        if isinstance(manager, dict) and manager.get("name")
+        else None
+    )
+    worker_names = [
+        str(agent["name"])
+        for agent in workforce_config.get("agents") or []
+        if isinstance(agent, dict) and agent.get("name")
+    ]
+    return manager_name, worker_names
 
 
 # ===== Endpoints =====
@@ -311,6 +334,7 @@ async def list_templates(
         )
         connections = template.get("connections", [])
         tags = get_localized_value(template.get("tags", {}), lang, [])
+        manager_name, worker_names = get_workforce_agent_names(template)
 
         result.append(
             TemplateInfo(
@@ -331,7 +355,8 @@ async def list_templates(
                 used_count=stats.used_count,
                 is_liked=template_id in liked_template_ids,
                 type=template.get("type", "agent"),
-                workforce_agents=get_workforce_agent_names(template),
+                manager_name=manager_name,
+                worker_names=worker_names,
             )
         )
 
@@ -381,6 +406,7 @@ async def get_template(
     )
     connections = template.get("connections", [])
     tags = get_localized_value(template.get("tags", {}), lang, [])
+    manager_name, worker_names = get_workforce_agent_names(template)
 
     return TemplateDetail(
         id=template["id"],
@@ -400,7 +426,8 @@ async def get_template(
         used_count=stats.used_count,
         is_liked=is_template_liked(db, int(current_user.id), template_id),
         type=template.get("type", "agent"),
-        workforce_agents=get_workforce_agent_names(template),
+        manager_name=manager_name,
+        worker_names=worker_names,
         agent_config=(
             {
                 "instructions": template["agent_config"].get("instructions", ""),
@@ -522,13 +549,13 @@ async def use_template(
     }
 
 
-@router.post("/{template_id}/use-as-workforce")
+@router.post("/{template_id}/use-as-workforce", response_model=UseAsWorkforceResponse)
 async def use_template_as_workforce(
     template_id: str,
     request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict:
+) -> UseAsWorkforceResponse:
     """
     Instantiate a 'workforce'-type template: creates the manager agent plus
     one worker agent per template.workforce_config.agents entry (reusing an
@@ -558,12 +585,26 @@ async def use_template_as_workforce(
         db, current_user, template_manager, template
     )
 
-    stats = get_or_create_template_stats(db, template_id)
-    stats.used_count += 1
-    db.commit()
+    # The workforce (and its manager/worker agents) is already committed at
+    # this point. This is purely an analytics counter, so a failure here
+    # must be logged, not surfaced as a request failure - the caller would
+    # otherwise see a 500 for an operation that actually already succeeded,
+    # with no way to discover the workforce it already created.
+    try:
+        stats = get_or_create_template_stats(db, template_id)
+        stats.used_count += 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to record used_count for template_id=%s after "
+            "successfully creating workforce_id=%s",
+            template_id,
+            workforce.id,
+        )
 
-    return {
-        "message": "Workforce created from template",
-        "template_id": template_id,
-        "workforce_id": workforce.id,
-    }
+    return UseAsWorkforceResponse(
+        message="Workforce created from template",
+        template_id=template_id,
+        workforce_id=workforce.id,
+    )

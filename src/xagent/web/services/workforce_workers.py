@@ -45,6 +45,7 @@ def create_workforce_worker(
     enabled: bool = True,
     sort_order: int | None = None,
     canvas_position: dict[str, Any] | None = None,
+    template_id: str | None = None,
 ) -> WorkforceAgent:
     workforce = ensure_workforce_access(db, user, workforce, action="edit")
     ensure_supported_source_type(source_type)
@@ -98,6 +99,7 @@ def create_workforce_worker(
         if sort_order is not None
         else next_worker_sort_order(db, workforce_id),
         canvas_position=canvas_position,
+        template_id=template_id,
     )
     db.add(worker)
     db.flush()

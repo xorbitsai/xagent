@@ -34,6 +34,11 @@ sample_prompts:
     prompt: 我已经按照你上次的建议调整了广告——重新运行 GA Analyzer 来测量效果。
     highlights:
     - 重新运行 GA Analyzer
+# Display-only for this workforce template: the connection icons shown on
+# its Templates gallery card. Unlike an 'agent'-type template, these are
+# NOT merged into any agent's tool_categories - the manager's own tools
+# come from workforce_config.manager.tool_categories below, and its
+# workers' tools come from their own referenced single-agent templates.
 connections:
 - name: Google Analytics
   logo: https://www.google.com/s2/favicons?domain=analytics.google.com&sz=64

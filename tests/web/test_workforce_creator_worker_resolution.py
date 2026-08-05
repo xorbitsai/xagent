@@ -15,12 +15,14 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from xagent.web.models import Agent, Base, User
 from xagent.web.models.agent import AgentOrigin, AgentStatus
 from xagent.web.services import workforce_creator
+from xagent.web.services.agent_store import AgentStore
 from xagent.web.services.workforce_creator import (
     _find_quick_access_worker_agent,
     _get_or_create_quick_access_worker_agent,
@@ -111,6 +113,14 @@ def test_race_retry_reuses_row_committed_by_concurrent_winner(db_session) -> Non
     committed yet), then the real INSERT collides with a row that a
     concurrent winner already committed - the resolver must recover by
     re-reading that row rather than raising IntegrityError.
+
+    Also stages a stand-in for the manager agent / Workforce that
+    `create_workforce_from_template` flushes into the *same* session before
+    ever calling this resolver, and asserts it survives the retry. The
+    resolver recovers via a SAVEPOINT (`db.begin_nested()`) specifically so
+    a collision only unwinds its own failed insert; a regression to a
+    plain `db.rollback()` would pass every other assertion in this test
+    while silently discarding that staged-but-uncommitted outer row too.
     """
     user = _create_user(db_session)
 
@@ -125,6 +135,22 @@ def test_race_retry_reuses_row_committed_by_concurrent_winner(db_session) -> Non
     )
     db_session.add(competitor)
     db_session.commit()
+
+    # Stand-in for the manager agent create_workforce_from_template flushes
+    # into its outer transaction before resolving any worker agents -
+    # staged (flushed) but deliberately never committed here, matching the
+    # caller's real sequencing.
+    outer_manager = Agent(
+        user_id=user.id,
+        name="Growth Marketing Manager",
+        instructions="orchestrator",
+        execution_mode="think",
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        status=AgentStatus.PUBLISHED,
+    )
+    db_session.add(outer_manager)
+    db_session.flush()
+    outer_manager_id = outer_manager.id
 
     call_count = {"n": 0}
 
@@ -154,6 +180,75 @@ def test_race_retry_reuses_row_committed_by_concurrent_winner(db_session) -> Non
     # One missed pre-check, one successful retry lookup after the real
     # INSERT hit the real unique-constraint violation.
     assert call_count["n"] == 2
+    assert (
+        db_session.query(Agent)
+        .filter(Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value)
+        .count()
+        == 1
+    )
+
+    # The staged outer row must still be visible in-session after the
+    # SAVEPOINT recovery, and must still be there once the caller's outer
+    # transaction actually commits.
+    assert (
+        db_session.query(Agent).filter(Agent.id == outer_manager_id).first() is not None
+    )
+    db_session.commit()
+    assert (
+        db_session.query(Agent).filter(Agent.id == outer_manager_id).first() is not None
+    )
+
+
+def test_race_retry_recovers_from_a_genuine_name_collision(db_session) -> None:
+    """A concurrent, unrelated agent create (different origin, no
+    template_id) can win a race for the exact name
+    resolve_unique_agent_name just certified as free, in the window
+    between that check and our own INSERT - a real (user_id, name)
+    collision, not this template's (user_id, template_id) quick-access
+    race. The resolver must recognize this via is_agent_name_unique_violation
+    and retry (the next resolve_unique_agent_name call picks a fresh name),
+    not misdiagnose it as the quick-access race - whose re-select would
+    find nothing here and burn every retry on a 409 that retrying can
+    never fix.
+
+    A first attempt at this test tried to simulate the collision by
+    inserting the competing row from inside the mocked
+    resolve_unique_agent_name call - but that call happens *inside* the
+    resolver's own `db.begin_nested()`, so the SAVEPOINT rollback undid
+    that competing row right along with the failed insert, and the retry
+    then succeeded with the original, undisambiguated name (proving the
+    retry mechanism works, but not testing this branch's classification
+    at all). Raising a pre-built IntegrityError directly is the reliable
+    way to exercise the classification logic without depending on
+    SAVEPOINT/rollback timing.
+    """
+    user = _create_user(db_session)
+    real_add_agent = AgentStore.add_agent
+    call_count = {"n": 0}
+
+    def _fail_once_with_name_violation(self, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise IntegrityError(
+                "INSERT INTO agents (...)",
+                {},
+                Exception("UNIQUE constraint failed: agents.user_id, agents.name"),
+            )
+        return real_add_agent(self, **kwargs)
+
+    with patch.object(AgentStore, "add_agent", _fail_once_with_name_violation):
+        resolved = asyncio.run(
+            _get_or_create_quick_access_worker_agent(
+                db_session,
+                _FakeTemplateManager(),
+                user_id=user.id,
+                template_id="ga_analyzer",
+            )
+        )
+
+    assert call_count["n"] == 2
+    assert resolved.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value
+    assert resolved.template_id == "ga_analyzer"
     assert (
         db_session.query(Agent)
         .filter(Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value)

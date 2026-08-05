@@ -1582,7 +1582,9 @@ const zh = {
     agentsCountOther: "{count} 个智能体",
     creatingWorkforce: "创建中…",
     errors: {
-      useWorkforceFailed: "从该模版创建工作组失败，请重试。"
+      useWorkforceFailed: "从该模版创建工作组失败，请重试。",
+      useWorkforceAccessDenied: "你没有权限创建工作组。",
+      useWorkforceRetry: "该模版当前并发请求过多，请重试。"
     }
   },
   sidebar: {
@@ -2464,6 +2466,7 @@ const zh = {
         unknown: "发生未知错误",
         notFound: "Agent 不存在",
         notFoundDesc: "该 Agent 不存在或已被删除",
+        templateIsWorkforce: "该模版会创建一个工作组，而不是单个智能体，请在 Templates 页面使用它。",
       },
       kbToolWarning: {
         title: "需要启用知识库工具",

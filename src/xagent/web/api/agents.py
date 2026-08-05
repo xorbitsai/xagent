@@ -39,6 +39,7 @@ from ..services.agent_management import (
     DuplicateAgentNameError,
     TemplateNotFoundError,
     TemplateQuickAccessRaceError,
+    WorkforceTemplateNotSupportedError,
     is_agent_name_unique_violation,
 )
 from ..services.agent_store import (
@@ -570,6 +571,12 @@ async def resolve_agent_from_template(
         )
     except TemplateNotFoundError:
         raise HTTPException(status_code=404, detail="Template not found")
+    except WorkforceTemplateNotSupportedError:
+        raise HTTPException(
+            status_code=400,
+            detail="This template creates a workforce, not a single agent; "
+            "use it from the Templates page instead",
+        )
     except DuplicateAgentNameError:
         raise HTTPException(
             status_code=400, detail="Agent with this name already exists"
@@ -629,6 +636,12 @@ async def create_agent_from_template(
         return AgentResponse.model_validate(result.agent.to_response_dict())
     except TemplateNotFoundError:
         raise HTTPException(status_code=404, detail="Template not found")
+    except WorkforceTemplateNotSupportedError:
+        raise HTTPException(
+            status_code=400,
+            detail="This template creates a workforce, not a single agent; "
+            "use it from the Templates page instead",
+        )
     except DuplicateAgentNameError:
         raise HTTPException(
             status_code=400, detail="Agent with this name already exists"

@@ -88,11 +88,14 @@ class TemplateManager:
     def _warn_on_dangling_workforce_references(self) -> None:
         """A workforce template's `workforce_config.agents[].template_id`
         values are only checked at parse time for being non-empty strings
-        (per-file validation can't know about other files yet). Once every
-        template is loaded, cross-check each one against the full cache so a
-        typo'd reference is logged loudly at startup instead of only
+        (per-file validation can't know about other files yet, and can't
+        know the referenced template's own `type`). Once every template is
+        loaded, cross-check each one against the full cache so a typo'd or
+        wrongly-typed reference is logged loudly at startup instead of only
         surfacing as a 400 the first time a user clicks "Use" on that
-        template.
+        template. Logged at `warning`, not `error`: this is a template
+        authoring problem the process can fully continue past, not a
+        request-time failure.
         """
         for template in self._templates_cache.values():
             if template.get("type") != "workforce":
@@ -100,13 +103,31 @@ class TemplateManager:
             workforce_config = template.get("workforce_config") or {}
             for agent in workforce_config.get("agents") or []:
                 referenced_id = agent.get("template_id")
-                if referenced_id and referenced_id not in self._templates_cache:
-                    logger.error(
+                if not referenced_id:
+                    continue
+                referenced_template = self._templates_cache.get(referenced_id)
+                if referenced_template is None:
+                    logger.warning(
                         "Workforce template %r references unknown template_id "
                         "%r in workforce_config.agents - instantiating it will "
                         "fail until this is fixed",
                         template.get("id"),
                         referenced_id,
+                    )
+                elif referenced_template.get("type", "agent") != "agent":
+                    # A worker must resolve to a single-agent template - see
+                    # the matching runtime guard in
+                    # workforce_creator._get_or_create_quick_access_worker_agent,
+                    # which would otherwise try to read a null agent_config
+                    # off the referenced (workforce-type) template.
+                    logger.warning(
+                        "Workforce template %r references template_id %r in "
+                        "workforce_config.agents, but that template's type is "
+                        "%r, not 'agent' - instantiating it will fail until "
+                        "this is fixed",
+                        template.get("id"),
+                        referenced_id,
+                        referenced_template.get("type"),
                     )
 
     def _parse_yaml_file(self, yaml_file: Path) -> Dict[str, Any]:
@@ -197,14 +218,35 @@ class TemplateManager:
         agents = workforce_config.get("agents")
         if not isinstance(agents, list) or not agents:
             raise ValueError("'workforce_config.agents' must be a non-empty list")
+        seen_template_ids: set[str] = set()
         for index, agent in enumerate(agents):
             if not isinstance(agent, dict):
                 raise ValueError(
                     f"'workforce_config.agents[{index}]' must be a mapping"
                 )
-            if not str(agent.get("template_id") or "").strip():
+            template_id = str(agent.get("template_id") or "").strip()
+            if not template_id:
                 raise ValueError(
                     f"'workforce_config.agents[{index}].template_id' must be a non-empty string"
+                )
+            if template_id in seen_template_ids:
+                # Two agents[] entries resolving to the same quick-access
+                # worker agent make the template permanently unusable: the
+                # second create_workforce_worker() call 409s on the
+                # (workforce_id, agent_id) unique constraint every time this
+                # template is instantiated (PR #1127 review).
+                raise ValueError(
+                    f"'workforce_config.agents' has a duplicate template_id: "
+                    f"{template_id!r}"
+                )
+            seen_template_ids.add(template_id)
+            if not str(agent.get("name") or "").strip():
+                # Required so every worker has a stable display name -
+                # `get_workforce_agent_names` used to silently omit a
+                # nameless worker rather than surface the gap, which
+                # undercounted the card's agent-count badge.
+                raise ValueError(
+                    f"'workforce_config.agents[{index}].name' must be a non-empty string"
                 )
             if not str(agent.get("assignment_instructions") or "").strip():
                 raise ValueError(
@@ -255,8 +297,44 @@ class TemplateManager:
                     )
 
     def _enrich_template(self, template: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge connections into agent_config.tool_categories"""
+        """Merge connections into agent_config.tool_categories.
+
+        `agent_config` is only meaningful for an 'agent'-type template; a
+        'workforce'-type template's real configuration lives in
+        `workforce_config` instead (its own top-level `agent_config` is an
+        unused parse-time placeholder - see `_parse_yaml_file`). Nulling it
+        out here, rather than in each caller, is deliberate: every consumer
+        of a template dict (the Templates API, the home page feed, the
+        /task quick-access resolver, the v1 SDK API, and anything added
+        later) reads this same enriched dict, and a non-agent template
+        must fail safe by construction rather than by every caller
+        remembering to check `type` first - a workforce template's
+        `agent_config` used to leak real (if useless) `instructions`/
+        `tool_categories` here, which is exactly what silently produced a
+        published, empty-instruction agent on every un-gated path (PR
+        #1127 review).
+        """
         connections = template.get("connections", [])
+        template_type = template.get("type", "agent")
+
+        if template_type != "agent":
+            return {
+                "id": template["id"],
+                "name": template["name"],
+                "category": template.get("category", ""),
+                "featured": template.get("featured", False),
+                "descriptions": template.get("descriptions", {}),
+                "features": template.get("features", {}),
+                "sample_prompts": template.get("sample_prompts", {}),
+                "connections": connections,
+                "setup_time": template.get("setup_time", "5 min setup"),
+                "tags": template.get("tags", {}),
+                "author": template.get("author", ""),
+                "version": template.get("version", ""),
+                "agent_config": None,
+                "type": template_type,
+                "workforce_config": template.get("workforce_config"),
+            }
 
         # The agent_config could be an AgentConfig pydantic model or a dict
         agent_config = template.get("agent_config", {})
@@ -296,7 +374,7 @@ class TemplateManager:
             "author": template.get("author", ""),
             "version": template.get("version", ""),
             "agent_config": agent_config_dict,
-            "type": template.get("type", "agent"),
+            "type": template_type,
             "workforce_config": template.get("workforce_config"),
         }
 

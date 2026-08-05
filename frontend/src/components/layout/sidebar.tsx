@@ -242,10 +242,14 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const [isExpanded, setIsExpanded] = useState(false)
   const [expandedMenus, setExpandedMenus] = useState<string[]>(["/agent"]) // Use href as a stable key
   const [groupCollapseOverrides, setGroupCollapseOverrides] = useState<Record<string, boolean>>({})
-  const toggleGroupCollapse = useCallback((title: string, defaultCollapsed?: boolean) => {
+  // Flip from the collapsed state currently rendered (which may come from the default,
+  // an active-route auto-expand, or a previous toggle) so a click always changes what
+  // the user sees — recomputing from defaultCollapsed here would make the first click
+  // a no-op whenever the group was auto-expanded by the active route.
+  const toggleGroupCollapse = useCallback((title: string, currentCollapsed: boolean) => {
     setGroupCollapseOverrides(prev => ({
       ...prev,
-      [title]: !(title in prev ? prev[title] : !!defaultCollapsed),
+      [title]: !currentCollapsed,
     }))
   }, [])
   const [showUserMenu, setShowUserMenu] = useState(false)
@@ -528,6 +532,8 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       }, 100)
       return () => clearTimeout(timer)
     }
+    // groupCollapseOverrides isn't read above — it's a re-measure trigger: toggling a group
+    // changes contentScrollRef's scrollHeight, so this effect must re-run to re-check the fill.
   }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded, groupCollapseOverrides])
 
   useEffect(() => {
@@ -731,105 +737,108 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         >
           {/* Groups */}
           {navigationGroups.map((group, groupIndex) => {
+            // An active route overrides only the *default* collapsed state, so the current
+            // page is never hidden inside a collapsed group on first load — but an explicit
+            // user toggle always wins over that, so the group can still be collapsed manually.
             const isGroupCollapsed = group.title in groupCollapseOverrides
               ? groupCollapseOverrides[group.title]
-              : !!group.defaultCollapsed
+              : !!group.defaultCollapsed && !group.items.some(isItemActive)
             return (
-            <div key={group.title} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
-              <div
-                role="button"
-                tabIndex={0}
-                aria-expanded={!isGroupCollapsed}
-                className="px-2 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between cursor-pointer select-none outline-none"
-                onClick={() => toggleGroupCollapse(group.title, group.defaultCollapsed)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault()
-                    toggleGroupCollapse(group.title, group.defaultCollapsed)
-                  }
-                }}
-              >
-                <span>{group.titleKey ? t(group.titleKey) : group.title}</span>
-                {isGroupCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-              </div>
-              {!isGroupCollapsed && (
-              <div className="space-y-0.5">
-                {group.items.map((item: NavigationItem) => {
-                  const isActive = isItemActive(item)
-                  const hasChildren = item.children && item.children.length > 0
-                  const isExpanded = isMenuExpanded(item.href)
+              <div key={group.title} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
+                <div
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={!isGroupCollapsed}
+                  className="px-2 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between cursor-pointer select-none rounded transition-colors hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => toggleGroupCollapse(group.title, isGroupCollapsed)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault()
+                      toggleGroupCollapse(group.title, isGroupCollapsed)
+                    }
+                  }}
+                >
+                  <span>{group.titleKey ? t(group.titleKey) : group.title}</span>
+                  {isGroupCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                </div>
+                {!isGroupCollapsed && (
+                  <div className="space-y-0.5">
+                    {group.items.map((item: NavigationItem) => {
+                      const isActive = isItemActive(item)
+                      const hasChildren = item.children && item.children.length > 0
+                      const isExpanded = isMenuExpanded(item.href)
 
-                  const activeStyle = "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))] font-semibold rounded-[7px]"
-                  const inactiveStyle = "text-muted-foreground hover:bg-accent hover:text-foreground rounded-[7px]"
+                      const activeStyle = "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))] font-semibold rounded-[7px]"
+                      const inactiveStyle = "text-muted-foreground hover:bg-accent hover:text-foreground rounded-[7px]"
 
-                  if (hasChildren) {
-                    return (
-                      <Popover key={item.name} open={isExpanded} onOpenChange={() => toggleMenu(item.href)}>
-                        <PopoverTrigger asChild>
-                          <button
-                            className={cn(
-                              "group flex items-center justify-between px-2.5 py-2 text-[13.5px] transition-colors relative w-full",
-                              isActive ? activeStyle : inactiveStyle
+                      if (hasChildren) {
+                        return (
+                          <Popover key={item.name} open={isExpanded} onOpenChange={() => toggleMenu(item.href)}>
+                            <PopoverTrigger asChild>
+                              <button
+                                className={cn(
+                                  "group flex items-center justify-between px-2.5 py-2 text-[13.5px] transition-colors relative w-full",
+                                  isActive ? activeStyle : inactiveStyle
+                                )}
+                              >
+                                <div className="flex items-center gap-2.5">
+                                  <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
+                                  {item.nameKey ? t(item.nameKey) : item.name}
+                                </div>
+                                <ChevronRight className="h-3 w-3 opacity-50" />
+                              </button>
+                            </PopoverTrigger>
+                            {item.children && (
+                              <PopoverContent
+                                side="right"
+                                align="start"
+                                sideOffset={8}
+                                className="w-56 rounded-xl border border-border bg-popover p-2 shadow-lg"
+                              >
+                                <div className="space-y-0.5">
+                                  {item.children.map((child: NavigationItem) => {
+                                    const isChildActive = pathname === child.href
+                                    return (
+                                      <Link
+                                        key={child.href}
+                                        href={child.href}
+                                        onClick={() => toggleMenu(item.href)}
+                                        className={cn(
+                                          "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors",
+                                          isChildActive
+                                            ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
+                                            : "text-foreground hover:bg-accent"
+                                        )}
+                                      >
+                                        <child.icon className="h-4 w-4 text-muted-foreground" />
+                                        {child.nameKey ? t(child.nameKey) : child.name}
+                                      </Link>
+                                    )
+                                  })}
+                                </div>
+                              </PopoverContent>
                             )}
-                          >
-                            <div className="flex items-center gap-2.5">
-                              <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
-                              {item.nameKey ? t(item.nameKey) : item.name}
-                            </div>
-                            <ChevronRight className="h-3 w-3 opacity-50" />
-                          </button>
-                        </PopoverTrigger>
-                        {item.children && (
-                          <PopoverContent
-                            side="right"
-                            align="start"
-                            sideOffset={8}
-                            className="w-56 rounded-xl border border-border bg-popover p-2 shadow-lg"
-                          >
-                            <div className="space-y-0.5">
-                              {item.children.map((child: NavigationItem) => {
-                                const isChildActive = pathname === child.href
-                                return (
-                                  <Link
-                                    key={child.href}
-                                    href={child.href}
-                                    onClick={() => toggleMenu(item.href)}
-                                    className={cn(
-                                      "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors",
-                                      isChildActive
-                                        ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
-                                        : "text-foreground hover:bg-accent"
-                                    )}
-                                  >
-                                    <child.icon className="h-4 w-4 text-muted-foreground" />
-                                    {child.nameKey ? t(child.nameKey) : child.name}
-                                  </Link>
-                                )
-                              })}
-                            </div>
-                          </PopoverContent>
-                        )}
-                      </Popover>
-                    )
-                  }
+                          </Popover>
+                        )
+                      }
 
-                  return (
-                    <Link
-                      key={item.name}
-                      href={item.href}
-                      className={cn(
-                        "group flex items-center px-2.5 py-2 text-[13.5px] font-medium transition-colors",
-                        isActive ? activeStyle : inactiveStyle
-                      )}
-                    >
-                      <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
-                      {item.nameKey ? t(item.nameKey) : item.name}
-                    </Link>
-                  )
-                })}
+                      return (
+                        <Link
+                          key={item.name}
+                          href={item.href}
+                          className={cn(
+                            "group flex items-center px-2.5 py-2 text-[13.5px] font-medium transition-colors",
+                            isActive ? activeStyle : inactiveStyle
+                          )}
+                        >
+                          <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
+                          {item.nameKey ? t(item.nameKey) : item.name}
+                        </Link>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
-              )}
-            </div>
             )
           })}
         </nav>

@@ -13,6 +13,12 @@ const branding = getBrandingFromEnv();
 export const metadata: Metadata = {
   title: branding.appName,
   description: branding.description,
+  applicationName: branding.appName,
+  openGraph: {
+    siteName: branding.appName,
+    title: branding.appName,
+    description: branding.description,
+  },
   icons: {
     icon: branding.logoPath,
     apple: branding.logoPath,

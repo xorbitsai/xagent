@@ -5,6 +5,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { isAuthPublicPath } from "@/lib/auth-pages"
 import { useRouter, usePathname } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
+import { getBrandingFromEnv } from "@/lib/branding"
 
 interface AuthGuardProps {
   children: React.ReactNode
@@ -87,6 +88,26 @@ export function AuthGuard({ children }: AuthGuardProps) {
 
   const { t } = useI18n()
   if (isLoading) {
+    // The home route's loading state is also what static export (SSG) freezes
+    // into out/index.html, since auth can only resolve client-side. Anonymous
+    // crawlers (incl. Google OAuth brand verification) only ever see this
+    // markup, so it carries real copy about what the app does instead of a
+    // bare spinner.
+    if (pathname === "/") {
+      const branding = getBrandingFromEnv()
+      return (
+        <div className="min-h-screen bg-[#0D1117] flex items-center justify-center px-6">
+          <div className="text-center max-w-xl">
+            <h1 className="text-white text-2xl font-bold mb-3">
+              {t('home.hero.title', { appName: branding.appName })}
+            </h1>
+            <p className="text-[#8B949E] mb-6">{t('home.hero.subtitle')}</p>
+            <div className="w-8 h-8 border-2 border-[#8B949E] border-t-transparent rounded-full animate-spin mx-auto"></div>
+          </div>
+        </div>
+      )
+    }
+
     return (
       <div className="min-h-screen bg-[#0D1117] flex items-center justify-center">
         <div className="text-center">

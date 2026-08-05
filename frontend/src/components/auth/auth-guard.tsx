@@ -1,11 +1,13 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import React, { useEffect, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { isAuthPublicPath } from "@/lib/auth-pages"
 import { useRouter, usePathname } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
 import { getBrandingFromEnv } from "@/lib/branding"
+
+const branding = getBrandingFromEnv()
 
 interface AuthGuardProps {
   children: React.ReactNode
@@ -88,16 +90,21 @@ export function AuthGuard({ children }: AuthGuardProps) {
 
   const { t } = useI18n()
   if (isLoading) {
-    // The home route's loading state is also what static export (SSG) freezes
-    // into out/index.html, since auth can only resolve client-side. Anonymous
-    // crawlers (incl. Google OAuth brand verification) only ever see this
-    // markup, so it carries real copy about what the app does instead of a
-    // bare spinner.
+    // Auth only resolves client-side, so static export (next build) freezes
+    // this branch's JSX into out/index.html for the home route. Non-JS
+    // fetchers of that frozen HTML — including automated brand-verification
+    // crawlers — see only this markup, so it carries real copy about what
+    // the app does instead of a bare spinner. A JS-executing crawler that
+    // runs the redirect effect above will move past it once auth resolves.
     if (pathname === "/") {
-      const branding = getBrandingFromEnv()
       return (
         <div className="min-h-screen bg-[#0D1117] flex items-center justify-center px-6">
           <div className="text-center max-w-xl">
+            <img
+              src={branding.whiteLogoPath}
+              alt={branding.appName}
+              className="w-12 h-12 mb-4 object-contain rounded-[14px] mx-auto"
+            />
             <h1 className="text-white text-2xl font-bold mb-3">
               {t('home.hero.title', { appName: branding.appName })}
             </h1>

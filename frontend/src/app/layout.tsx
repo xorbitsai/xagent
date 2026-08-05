@@ -11,6 +11,7 @@ import { Toaster } from "@/components/ui/sonner";
 const branding = getBrandingFromEnv();
 
 export const metadata: Metadata = {
+  metadataBase: new URL(branding.siteUrl),
   title: branding.appName,
   description: branding.description,
   applicationName: branding.appName,
@@ -18,6 +19,12 @@ export const metadata: Metadata = {
     siteName: branding.appName,
     title: branding.appName,
     description: branding.description,
+    images: [
+      {
+        url: branding.logoPath,
+        alt: branding.logoAlt,
+      },
+    ],
   },
   icons: {
     icon: branding.logoPath,

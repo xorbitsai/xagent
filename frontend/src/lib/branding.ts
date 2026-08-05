@@ -9,6 +9,7 @@ export interface BrandingConfig {
   gradientFrom: string
   gradientVia: string
   gradientTo: string
+  siteUrl: string
 }
 
 export const defaultBranding: BrandingConfig = {
@@ -22,6 +23,7 @@ export const defaultBranding: BrandingConfig = {
   gradientFrom: 'blue-400',
   gradientVia: 'blue-500',
   gradientTo: 'indigo-500',
+  siteUrl: 'https://cloud.xagent.co',
 }
 
 export function getBrandingFromEnv(): BrandingConfig {
@@ -36,5 +38,6 @@ export function getBrandingFromEnv(): BrandingConfig {
     gradientFrom: process.env.NEXT_PUBLIC_GRADIENT_FROM || defaultBranding.gradientFrom,
     gradientVia: process.env.NEXT_PUBLIC_GRADIENT_VIA || defaultBranding.gradientVia,
     gradientTo: process.env.NEXT_PUBLIC_GRADIENT_TO || defaultBranding.gradientTo,
+    siteUrl: process.env.NEXT_PUBLIC_SITE_URL || defaultBranding.siteUrl,
   }
 }

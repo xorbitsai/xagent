@@ -241,6 +241,20 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
   const [isExpanded, setIsExpanded] = useState(false)
   const [expandedMenus, setExpandedMenus] = useState<string[]>(["/agent"]) // Use href as a stable key
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
+    () => new Set(navigationGroups.filter(g => g.defaultCollapsed).map(g => g.title))
+  )
+  const toggleGroupCollapse = useCallback((title: string) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev)
+      if (next.has(title)) {
+        next.delete(title)
+      } else {
+        next.add(title)
+      }
+      return next
+    })
+  }, [])
   const [showUserMenu, setShowUserMenu] = useState(false)
   const [isAboutOpen, setIsAboutOpen] = useState(false)
   const sidebarRef = useRef<HTMLDivElement | null>(null)
@@ -521,7 +535,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       }, 100)
       return () => clearTimeout(timer)
     }
-  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded])
+  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded, collapsedGroups])
 
   useEffect(() => {
     if (isHistoryExpanded) {
@@ -723,11 +737,18 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           className="z-10 bg-transparent py-1"
         >
           {/* Groups */}
-          {navigationGroups.map((group, groupIndex) => (
+          {navigationGroups.map((group, groupIndex) => {
+            const isGroupCollapsed = collapsedGroups.has(group.title)
+            return (
             <div key={group.title} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
-              <div className="px-2 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em]">
-                {group.titleKey ? t(group.titleKey) : group.title}
+              <div
+                className="px-2 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between cursor-pointer select-none"
+                onClick={() => toggleGroupCollapse(group.title)}
+              >
+                <span>{group.titleKey ? t(group.titleKey) : group.title}</span>
+                {isGroupCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
               </div>
+              {!isGroupCollapsed && (
               <div className="space-y-0.5">
                 {group.items.map((item: NavigationItem) => {
                   const isActive = isItemActive(item)
@@ -803,8 +824,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
                   )
                 })}
               </div>
+              )}
             </div>
-          ))}
+            )
+          })}
         </nav>
 
         {/* History Section */}

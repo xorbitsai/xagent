@@ -39,6 +39,8 @@ export interface NavigationGroup {
     title: string
     titleKey?: TranslationKey
     items: NavigationItem[]
+    /** Whether this group's items are hidden behind a collapse toggle by default. */
+    defaultCollapsed?: boolean
 }
 
 const baseMoreResourceItems: NavigationItem[] = [
@@ -140,6 +142,7 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
     {
         title: "Resources",
         titleKey: "nav.sections.resources",
+        defaultCollapsed: true,
         items: [
             {
                 name: "Knowledge Base",

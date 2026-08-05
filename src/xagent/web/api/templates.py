@@ -555,6 +555,7 @@ async def use_template_as_workforce(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    lang: Optional[str] = Query(None, description="Language code (e.g., 'en', 'zh')"),
 ) -> UseAsWorkforceResponse:
     """
     Instantiate a 'workforce'-type template: creates the manager agent plus
@@ -564,6 +565,7 @@ async def use_template_as_workforce(
 
     Args:
         template_id: ID of the workforce template to instantiate
+        lang: Optional language code for the new Workforce's description
 
     Returns:
         The new workforce's id, for the frontend to navigate to its canvas
@@ -582,7 +584,7 @@ async def use_template_as_workforce(
         )
 
     workforce = await create_workforce_from_template(
-        db, current_user, template_manager, template
+        db, current_user, template_manager, template, lang=lang
     )
 
     # The workforce (and its manager/worker agents) is already committed at

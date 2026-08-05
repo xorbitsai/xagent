@@ -251,6 +251,7 @@ category: Marketing
 type: workforce
 descriptions:
   en: Orchestrates GA Analyzer and Ads Recommendation.
+  zh: 编排 GA Analyzer 和 Ads Recommendation。
 author: Xagent
 version: "1.0"
 
@@ -667,12 +668,22 @@ class TestTemplatesAPI:
             assert response.json()["views"] == 2
 
     def test_unauthorized_access(self, mock_app_state):
-        """Test unauthorized access returns 403"""
+        """Test unauthorized access is rejected"""
         with patch.object(client.app, "state", mock_app_state):
             response = client.get("/api/templates/")
 
-            # Unauthorized access returns 403 Forbidden
-            assert response.status_code == 403
+            # A request with no Authorization header is rejected by
+            # HTTPBearer's own dependency resolution before get_current_user
+            # ever runs. Which status it gets depends on the installed
+            # FastAPI: older versions raised 403 for a missing header, newer
+            # ones raise 401 "Not authenticated" (corrected for RFC 6750
+            # compliance; 0.135.1 returns 401 - verified via a standalone
+            # HTTPBearer repro, not test ordering/pollution). pyproject only
+            # pins `fastapi >= 0.35.0`, so both behaviors are legitimately
+            # installable; hardcoding either status just fails on the other
+            # side of the version line. What this test actually protects is
+            # "no auth header never reaches the handler".
+            assert response.status_code in (401, 403)
 
     def test_template_data_structure(self, mock_app_state, admin_headers):
         """测试模板数据结构完整性"""
@@ -784,6 +795,31 @@ class TestUseTemplateAsWorkforce:
             ).json()
             assert detail["used_count"] == 1
 
+    def test_lang_query_param_localizes_the_new_workforces_description(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        """Every sibling GET endpoint accepts ?lang= and localizes through
+        get_localized_value; this endpoint previously had no way to know
+        the caller's locale at all, so a zh-locale user's new Workforce
+        always got the English description regardless (PR #1127
+        re-review, F4)."""
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce?lang=zh",
+                headers=admin_headers,
+            )
+            assert response.status_code == 200, response.text
+            workforce_id = response.json()["workforce_id"]
+
+            db = next(get_db())
+            try:
+                workforce = db.get(Workforce, workforce_id)
+                assert (
+                    workforce.description == "编排 GA Analyzer 和 Ads Recommendation。"
+                )
+            finally:
+                db.close()
+
     def test_reuses_worker_agents_across_two_instantiations(
         self, workforce_mock_app_state, admin_headers
     ):
@@ -791,7 +827,15 @@ class TestUseTemplateAsWorkforce:
         manager + Workforce each time (each run gets its own orchestrator)
         but must NOT mint duplicate worker agents - the second call should
         reuse the first call's quick-access GA Analyzer / Ads Recommendation
-        agents (see AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX)."""
+        agents (see AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX).
+
+        This is deliberate, not an oversight: there is no server-side
+        idempotency on the Workforce + manager themselves, only on workers.
+        A double-click or a retried request will leave a duplicate draft
+        Workforce plus a stray published manager agent - the client-side
+        `creatingWorkforceId` lock is the only guard, and it isn't atomic
+        against network retries or two tabs. Flagged as a product question
+        in the PR #1127 re-review (F5), not changed here."""
         with patch.object(client.app, "state", workforce_mock_app_state):
             first = client.post(
                 "/api/templates/growth_workforce/use-as-workforce",
@@ -912,5 +956,55 @@ workforce_config:
                 # manager/Workforce behind.
                 assert db.query(Workforce).count() == 0
                 assert db.query(Agent).count() == 0
+            finally:
+                db.close()
+
+    def test_rejects_with_actionable_message_when_worker_agent_is_unpublished(
+        self, workforce_mock_app_state, admin_headers, admin_user
+    ):
+        """A user who separately unpublished their quick-access GA Analyzer
+        agent must get a specific, actionable 400 - not the generic
+        "please try again" a retry can never resolve - and the failed
+        attempt must not leave a stray manager/Workforce behind
+        (PR #1127 re-review, F1)."""
+        from xagent.web.models.agent import AgentOrigin, AgentStatus
+        from xagent.web.services.workforce_creator import (
+            UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX,
+        )
+
+        db = next(get_db())
+        try:
+            db.add(
+                Agent(
+                    user_id=admin_user["id"],
+                    name="GA Analyzer",
+                    instructions="You are the GA Analyzer.",
+                    execution_mode="balanced",
+                    template_id="ga_analyzer",
+                    origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                    status=AgentStatus.DRAFT,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith(
+                UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX
+            )
+            assert "GA Analyzer" in response.json()["detail"]
+
+            db = next(get_db())
+            try:
+                assert db.query(Workforce).count() == 0
+                # Only the pre-existing draft agent - no manager, no
+                # duplicate worker created for the failed attempt.
+                assert db.query(Agent).count() == 1
             finally:
                 db.close()

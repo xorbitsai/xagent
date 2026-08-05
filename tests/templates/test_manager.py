@@ -529,7 +529,13 @@ sample_prompts:
     @staticmethod
     def _valid_workforce_config():
         return {
-            "manager": {"name": "Growth Manager", "instructions": "Orchestrate."},
+            "manager": {
+                "name": "Growth Manager",
+                "instructions": "Orchestrate.",
+                "execution_mode": "think",
+                "tool_categories": ["basic"],
+                "skills": [],
+            },
             "agents": [
                 {
                     "template_id": "ga-analyzer",
@@ -588,6 +594,24 @@ sample_prompts:
                     ],
                 },
                 "duplicate template_id",
+            ),
+            (
+                lambda c: {
+                    **c,
+                    "manager": {**c["manager"], "execution_mode": "sonic"},
+                },
+                "manager.execution_mode",
+            ),
+            (
+                lambda c: {
+                    **c,
+                    "manager": {**c["manager"], "tool_categories": "basic"},
+                },
+                "manager.tool_categories",
+            ),
+            (
+                lambda c: {**c, "manager": {**c["manager"], "skills": [123]}},
+                "manager.skills",
             ),
         ],
     )

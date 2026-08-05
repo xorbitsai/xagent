@@ -288,6 +288,40 @@ def _find_quick_access_worker_agent(
     )
 
 
+# Stable English prefix the frontend matches on to render a translated,
+# agent-name-specific message (see WORKFORCE_USE_ERROR_KEYS in
+# templates/page.tsx) - the variable part (the agent's name) is
+# deliberately appended as its own sentence after it, not interpolated
+# into the middle of the fixed text, so that prefix match stays exact
+# regardless of the name's contents.
+UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX = (
+    "This workforce needs an agent that is currently unpublished: "
+)
+
+
+def _ensure_published_quick_access_agent(agent: Agent) -> Agent:
+    """A quick-access worker agent the caller separately unpublished (a
+    supported, deliberate user action - see
+    `AgentManagementService._resolve_agent_from_template_sync`'s B3
+    rationale for why the /task quick-access flow never auto-republishes a
+    found draft either) must not be silently reused as-is: it would pass
+    this check, then fail downstream in `create_workforce_worker`'s
+    `ensure_agent_access(..., require_published=True)` with a generic 400
+    the frontend can only render as "please retry" - which can never
+    succeed, since retrying resolves to the same unpublished agent every
+    time (PR #1127 re-review, F1). Raise here instead, with a message
+    specific enough to actually be actionable.
+    """
+    if agent.status != AgentStatus.PUBLISHED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX}{agent.name}. "
+            "Republish it from your Agents list, then try this workforce "
+            "template again.",
+        )
+    return agent
+
+
 async def _get_or_create_quick_access_worker_agent(
     db: Session,
     template_manager: Any,
@@ -327,7 +361,7 @@ async def _get_or_create_quick_access_worker_agent(
         db, user_id=user_id, template_id=template_id
     )
     if existing is not None:
-        return existing
+        return _ensure_published_quick_access_agent(existing)
 
     worker_template = await template_manager.get_template(template_id)
     if not worker_template:
@@ -347,6 +381,24 @@ async def _get_or_create_quick_access_worker_agent(
             f"worker: {template_id}",
         )
     agent_config = worker_template.get("agent_config") or {}
+    # Populate the same fields the /task quick-access resolver
+    # (`AgentManagementRuntime._spec_from_template`) does for a freshly
+    # minted quick-access agent - both write the same (user_id, template_id,
+    # quick-access-origin) row, so leaving these hardcoded to empty here
+    # would silently strand them the first time this path (rather than
+    # /task) happens to create the row first (PR #1127 re-review, F2).
+    # Deliberate exception: `knowledge_bases` stays empty. KB ids are
+    # user-scoped runtime entities the /task path validates per-user via
+    # `_validate_agent_knowledge_bases` (rejecting the template with a 400
+    # if they don't resolve) - this path has no equivalent check, so
+    # passing them through raw would silently create an agent with
+    # dangling KB references instead. No built-in template declares
+    # knowledge_bases today; if one ever does, this path needs the same
+    # validation before it may forward them.
+    worker_descriptions = worker_template.get("descriptions") or {}
+    worker_description = (
+        worker_descriptions.get("en") if isinstance(worker_descriptions, dict) else None
+    )
 
     for attempt in range(TEMPLATE_RESOLVE_RACE_RETRIES):
         try:
@@ -358,14 +410,14 @@ async def _get_or_create_quick_access_worker_agent(
                         user_id=user_id,
                         name=str(worker_template.get("name") or template_id),
                     ),
-                    description=None,
+                    description=worker_description,
                     instructions=agent_config.get("instructions", ""),
                     execution_mode=agent_config.get("execution_mode", "balanced"),
-                    models=None,
+                    models=agent_config.get("models"),
                     knowledge_bases=[],
                     skills=agent_config.get("skills", []),
                     tool_categories=agent_config.get("tool_categories", []),
-                    suggested_prompts=[],
+                    suggested_prompts=agent_config.get("suggested_prompts") or [],
                     origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
                     status=AgentStatus.PUBLISHED,
                     widget_enabled=False,
@@ -388,7 +440,7 @@ async def _get_or_create_quick_access_worker_agent(
                     db, user_id=user_id, template_id=template_id
                 )
                 if existing is not None:
-                    return existing
+                    return _ensure_published_quick_access_agent(existing)
                 logger.warning(
                     "Quick-access worker agent insert collided on the "
                     "quick-access index without a resolvable row (attempt "
@@ -427,6 +479,7 @@ async def create_workforce_from_template(
     user: User,
     template_manager: Any,
     template: dict[str, Any],
+    lang: str | None = None,
 ) -> Workforce:
     """Instantiate a workforce-type template: a fresh manager agent (from
     `workforce_config.manager`) plus one worker agent per
@@ -456,6 +509,19 @@ async def create_workforce_from_template(
             scope_id=scope_id,
             name=str(template.get("name") or "Workforce"),
         )
+        # Unlike the worker-resolution loop below, this insert is NOT
+        # wrapped in its own `db.begin_nested()` - a concurrent collision
+        # here would propagate straight out of the outer `try`, rolling
+        # back the whole workforce creation instead of just this insert.
+        # That is safe only because `uq_agents_user_id_name_active`
+        # (`AGENT_NAME_UNIQUE_INDEX` in `xagent/web/models/agent.py`) is a
+        # partial index whose predicate excludes
+        # `origin='workforce_generated_manager'` rows entirely, so two
+        # concurrent managers can even share a name without ever hitting a
+        # unique-constraint collision in the first place. If that predicate
+        # ever changes, concurrent workforce instantiation would need the
+        # same SAVEPOINT-retry treatment as the worker path (PR #1127
+        # re-review, F11).
         manager_agent = AgentStore(db).add_agent(
             user_id=owner_user_id,
             name=resolve_unique_agent_name(
@@ -485,7 +551,8 @@ async def create_workforce_from_template(
             scope_id=scope_id,
             name=name,
             description=normalize_text(
-                cast(str | None, get_localized_description(template)), "description"
+                cast(str | None, get_localized_description(template, lang)),
+                "description",
             ),
             manager_agent_id=int(manager_agent.id),
             status="draft",
@@ -529,20 +596,30 @@ async def create_workforce_from_template(
     return workforce
 
 
-def get_localized_description(template: dict[str, Any]) -> str | None:
+def get_localized_description(
+    template: dict[str, Any], lang: str | None = None
+) -> str | None:
     """Best-effort description for a newly created Workforce's
-    `description` column, which - unlike the template gallery response - is
-    not locale-aware. `descriptions` is always a {en, zh, ...} dict here -
-    `TemplateManager._parse_yaml_file` raises ValueError for any other
-    shape, so a template dict reaching this function can't carry a plain
-    string instead. Prefers English but falls back to any other populated
-    locale rather than leaving the Workforce's description empty - the key
-    check in `_parse_yaml_file` only requires an 'en' key to be present, not
-    a non-empty value.
+    `description` column. Unlike the template gallery response, this was
+    never locale-aware at all - `create_workforce_from_template` had no way
+    to know the caller's locale, so every Workforce got its English
+    description regardless of the creating user's UI language (PR #1127
+    re-review, F4). `lang` threads the same query param the sibling GET
+    endpoints already accept. `descriptions` is always a {en, zh, ...} dict
+    here - `TemplateManager._parse_yaml_file` raises ValueError for any
+    other shape, so a template dict reaching this function can't carry a
+    plain string instead.
+
+    Preference order: the caller's `lang` if populated, else English, else
+    any other populated locale rather than leaving the Workforce's
+    description empty - the key check in `_parse_yaml_file` only requires
+    an 'en' key to be *present*, not a non-empty value.
     """
     descriptions = template.get("descriptions")
     if not isinstance(descriptions, dict):
         return None
+    if lang and descriptions.get(lang):
+        return str(descriptions[lang])
     value = descriptions.get("en")
     if value:
         return str(value)

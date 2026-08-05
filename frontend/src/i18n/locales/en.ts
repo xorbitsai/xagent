@@ -1584,7 +1584,8 @@ Build when you need.`,
     errors: {
       useWorkforceFailed: "Couldn't create the workforce from this template. Please try again.",
       useWorkforceAccessDenied: "You don't have permission to create a workforce.",
-      useWorkforceRetry: "Too many concurrent requests for this template. Please try again."
+      useWorkforceRetry: "Too many concurrent requests for this template. Please try again.",
+      useWorkforceUnpublishedAgent: "The \"{agentName}\" agent this workforce needs is currently unpublished. Republish it from your Agents list, then try again."
     }
   },
   sidebar: {

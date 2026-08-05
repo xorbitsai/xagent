@@ -1584,7 +1584,8 @@ const zh = {
     errors: {
       useWorkforceFailed: "从该模版创建工作组失败，请重试。",
       useWorkforceAccessDenied: "你没有权限创建工作组。",
-      useWorkforceRetry: "该模版当前并发请求过多，请重试。"
+      useWorkforceRetry: "该模版当前并发请求过多，请重试。",
+      useWorkforceUnpublishedAgent: "该工作组需要的智能体「{agentName}」当前未发布，请在你的智能体列表中重新发布它，然后再试一次。"
     }
   },
   sidebar: {

@@ -36,12 +36,20 @@ sample_prompts:
     - 重新运行 GA Analyzer
 # Display-only for this workforce template: the connection icons shown on
 # its Templates gallery card. Unlike an 'agent'-type template, these are
-# NOT merged into any agent's tool_categories - the manager's own tools
-# come from workforce_config.manager.tool_categories below, and its
-# workers' tools come from their own referenced single-agent templates.
+# NOT merged into any agent's tool_categories - GET /{id} nulls agent_config
+# for a workforce type, the manager's own tools come from
+# workforce_config.manager.tool_categories below, and its workers' tools
+# come from their own referenced single-agent templates. Kept as the union
+# of what marketing-google-analytics-analyzer and
+# marketing-google-ads-recommendation actually declare under their own
+# `connections:`, so the card doesn't advertise an integration this
+# workforce doesn't have (PR #1127 re-review, F7: this previously listed
+# "Google Analytics", which neither sub-template connects to at all).
 connections:
-- name: Google Analytics
-  logo: https://www.google.com/s2/favicons?domain=analytics.google.com&sz=64
+- name: Google Docs
+  logo: https://www.google.com/s2/favicons?domain=docs.google.com&sz=64
+- name: Google Slides
+  logo: https://www.google.com/s2/favicons?domain=slides.google.com&sz=64
 - name: Google Ads
   logo: https://www.google.com/s2/favicons?domain=ads.google.com&sz=64
 setup_time:

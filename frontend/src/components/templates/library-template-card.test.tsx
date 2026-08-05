@@ -41,7 +41,10 @@ describe("LibraryTemplateCard", () => {
     expect(screen.queryByText("Workforce")).not.toBeInTheDocument();
   });
 
-  it("shows the workforce badge with the worker count for a workforce template", () => {
+  it("shows the workforce badge with the total agent count (manager + workers)", () => {
+    // The badge label reads "N agents" - the count must include the
+    // manager, or it undercounts against what "Use" actually creates
+    // (PR #1127 re-review, F6a).
     render(
       <LibraryTemplateCard
         template={makeTemplate({
@@ -58,7 +61,7 @@ describe("LibraryTemplateCard", () => {
     );
 
     expect(screen.getByText(/Workforce/)).toBeInTheDocument();
-    expect(screen.getByText(/2 agents/)).toBeInTheDocument();
+    expect(screen.getByText(/3 agents/)).toBeInTheDocument();
   });
 
   it("calls onUse when the card is clicked", () => {

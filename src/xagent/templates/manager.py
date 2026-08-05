@@ -11,6 +11,11 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Mirrors xagent.web.models.agent.ExecutionMode's values. Not imported
+# directly to avoid pulling the SQLAlchemy-backed web.models layer into
+# this DB-agnostic YAML loader for one small, stable set of literals.
+_VALID_EXECUTION_MODES = frozenset({"flash", "balanced", "think", "auto"})
+
 
 class TemplateManager:
     """Core manager for the Template system"""
@@ -214,6 +219,26 @@ class TemplateManager:
             raise ValueError(
                 "'workforce_config.manager.name' must be a non-empty string"
             )
+        execution_mode = manager.get("execution_mode")
+        if execution_mode is not None and execution_mode not in _VALID_EXECUTION_MODES:
+            # Passed straight into AgentStore.add_agent with no further
+            # validation - a typo here would only surface as a broken
+            # manager agent at instantiation time, out of step with how
+            # carefully the rest of workforce_config is checked at load
+            # time (PR #1127 re-review, F10).
+            raise ValueError(
+                "'workforce_config.manager.execution_mode' must be one of "
+                f"{sorted(_VALID_EXECUTION_MODES)}, got {execution_mode!r}"
+            )
+        for list_field in ("tool_categories", "skills"):
+            value = manager.get(list_field)
+            if value is not None and (
+                not isinstance(value, list)
+                or not all(isinstance(v, str) for v in value)
+            ):
+                raise ValueError(
+                    f"'workforce_config.manager.{list_field}' must be a list of strings"
+                )
 
         agents = workforce_config.get("agents")
         if not isinstance(agents, list) or not agents:

@@ -107,6 +107,109 @@ def test_repeat_call_reuses_the_same_agent(db_session) -> None:
     )
 
 
+def test_creates_agent_with_description_and_models_from_template(db_session) -> None:
+    """The /task quick-access resolver (`_spec_from_template`) populates
+    description/models/suggested_prompts from the template; this resolver
+    used to hardcode them all to empty even though it writes the exact same
+    (user_id, template_id, quick-access-origin) row - so whichever flow ran
+    first silently won, permanently, for every field the other flow would
+    have set (PR #1127 re-review, F2).
+
+    `knowledge_bases` is the deliberate exception: the /task path validates
+    template KBs per-user (`_validate_agent_knowledge_bases`) before
+    attaching them, and this path has no equivalent check - so it must NOT
+    forward them raw (that would silently attach dangling KB ids instead of
+    failing loudly the way /task does)."""
+
+    class _RichFakeTemplateManager:
+        async def get_template(self, template_id: str) -> dict:
+            return {
+                "name": "GA Analyzer",
+                "descriptions": {"en": "Explains GA4 trends."},
+                "agent_config": {
+                    "instructions": "You are the GA Analyzer.",
+                    "execution_mode": "balanced",
+                    "skills": [],
+                    "tool_categories": [],
+                    "models": {"general": "gpt-4o"},
+                    "knowledge_bases": ["kb-1"],
+                    "suggested_prompts": ["Summarize this week's traffic"],
+                },
+            }
+
+    user = _create_user(db_session)
+
+    resolved = asyncio.run(
+        _get_or_create_quick_access_worker_agent(
+            db_session,
+            _RichFakeTemplateManager(),
+            user_id=user.id,
+            template_id="ga_analyzer",
+        )
+    )
+
+    assert resolved.description == "Explains GA4 trends."
+    assert resolved.models == {"general": "gpt-4o"}
+    assert resolved.suggested_prompts == ["Summarize this week's traffic"]
+    # Never forwarded without per-user validation - see docstring.
+    assert resolved.knowledge_bases == []
+
+
+def test_reuse_raises_specific_error_when_existing_agent_is_unpublished(
+    db_session,
+) -> None:
+    """A user can unpublish their quick-access agent for a template a
+    workforce also depends on (a normal, supported action). Reusing it
+    as-is would pass this resolver only to fail downstream in
+    create_workforce_worker's require_published=True check with a generic
+    400 that the frontend renders as "please retry" - which can never
+    succeed, since every retry resolves to the same unpublished agent
+    (PR #1127 re-review, F1). The resolver must raise a specific,
+    actionable error instead of returning the unpublished agent.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.services.workforce_creator import (
+        UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX,
+    )
+
+    user = _create_user(db_session)
+    unpublished = Agent(
+        user_id=user.id,
+        name="GA Analyzer",
+        instructions="You are the GA Analyzer.",
+        execution_mode="balanced",
+        template_id="ga_analyzer",
+        origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        status=AgentStatus.DRAFT,
+    )
+    db_session.add(unpublished)
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _get_or_create_quick_access_worker_agent(
+                db_session,
+                _FakeTemplateManager(),
+                user_id=user.id,
+                template_id="ga_analyzer",
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail.startswith(UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX)
+    assert "GA Analyzer" in exc_info.value.detail
+    # Never silently republished or replaced.
+    db_session.refresh(unpublished)
+    assert unpublished.status == AgentStatus.DRAFT
+    assert (
+        db_session.query(Agent)
+        .filter(Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value)
+        .count()
+        == 1
+    )
+
+
 def test_race_retry_reuses_row_committed_by_concurrent_winner(db_session) -> None:
     """Simulates the exact TOCTOU window a double-clicked "Use" can hit:
     the initial SELECT misses the row (as if a concurrent request hadn't

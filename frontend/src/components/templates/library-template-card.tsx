@@ -109,7 +109,11 @@ export function LibraryTemplateCard({
     onUse(template.id);
   };
   const isWorkforce = template.type === "workforce";
-  const workerCount = template.worker_names?.length || 0;
+  // Manager + workers - the badge label reads "N agents", so the count
+  // must include the manager too, or it undercounts by one against what
+  // "Use" actually creates (PR #1127 re-review, F6a).
+  const totalAgentCount =
+    (template.worker_names?.length || 0) + (template.manager_name ? 1 : 0);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (isNestedInteractiveElement(event.target, event.currentTarget)) {
@@ -156,7 +160,7 @@ export function LibraryTemplateCard({
             <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-[9px] py-1 text-[11.5px] font-semibold text-teal-700 dark:bg-teal-950/50 dark:text-teal-300">
               <Users className="h-3 w-3 flex-shrink-0" />
               {workforceBadgeLabel}
-              {workerCount > 0 && formatAgentsCount ? ` · ${formatAgentsCount(workerCount)}` : ""}
+              {totalAgentCount > 0 && formatAgentsCount ? ` · ${formatAgentsCount(totalAgentCount)}` : ""}
             </span>
           ) : null}
         </div>

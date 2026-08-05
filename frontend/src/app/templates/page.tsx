@@ -52,6 +52,16 @@ const WORKFORCE_USE_ERROR_KEYS: Record<string, TranslationKey> = {
     "templates.errors.useWorkforceRetry",
 };
 
+// Must match UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX in
+// src/xagent/web/services/workforce_creator.py exactly - a stable marker
+// for a message whose remainder (the agent's name) is too dynamic to be a
+// WORKFORCE_USE_ERROR_KEYS key. Unlike that map's generic 409, this error
+// can never be resolved by retrying, so it needs its own specific,
+// translated message rather than falling back to the generic one
+// (PR #1127 re-review, F1).
+const UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX =
+  "This workforce needs an agent that is currently unpublished: ";
+
 export default function TemplatesPage() {
   return (
     <Suspense fallback={null}>
@@ -203,7 +213,7 @@ function TemplatesPageContent() {
       if (creatingWorkforceId) return;
       setCreatingWorkforceId(templateId);
       try {
-        const response = await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use-as-workforce`, {
+        const response = await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use-as-workforce?lang=${locale}`, {
           method: "POST",
         });
         if (response.ok) {
@@ -213,8 +223,20 @@ function TemplatesPageContent() {
         }
         const parsed = await parseApiResponse(response);
         const rawDetail = getApiErrorMessage(response, parsed, "");
-        const messageKey = rawDetail ? WORKFORCE_USE_ERROR_KEYS[rawDetail] : undefined;
-        toast.error(messageKey ? t(messageKey) : t("templates.errors.useWorkforceFailed"));
+        if (rawDetail.startsWith(UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX)) {
+          // The backend appends a fixed ". Republish it..." sentence after
+          // the agent's name; strip it by locating that known suffix from
+          // the END rather than splitting on the first ". " - an agent
+          // named e.g. "Mr. Smith Analyzer" must not be truncated to "Mr".
+          // Falls back to the whole remainder if the suffix ever changes.
+          const remainder = rawDetail.slice(UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX.length);
+          const suffixStart = remainder.lastIndexOf(". Republish it");
+          const agentName = suffixStart > 0 ? remainder.slice(0, suffixStart) : remainder;
+          toast.error(t("templates.errors.useWorkforceUnpublishedAgent", { agentName }));
+        } else {
+          const messageKey = rawDetail ? WORKFORCE_USE_ERROR_KEYS[rawDetail] : undefined;
+          toast.error(messageKey ? t(messageKey) : t("templates.errors.useWorkforceFailed"));
+        }
       } catch {
         toast.error(t("templates.errors.useWorkforceFailed"));
       } finally {

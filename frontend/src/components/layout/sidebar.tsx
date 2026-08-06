@@ -246,12 +246,12 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   // an active-route auto-expand, or a previous toggle) so a click always changes what
   // the user sees — recomputing from defaultCollapsed here would make the first click
   // a no-op whenever the group was auto-expanded by the active route.
-  const toggleGroupCollapse = useCallback((title: string, currentCollapsed: boolean) => {
+  const toggleGroupCollapse = (key: string, currentCollapsed: boolean) => {
     setGroupCollapseOverrides(prev => ({
       ...prev,
-      [title]: !currentCollapsed,
+      [key]: !currentCollapsed,
     }))
-  }, [])
+  }
   const [showUserMenu, setShowUserMenu] = useState(false)
   const [isAboutOpen, setIsAboutOpen] = useState(false)
   const sidebarRef = useRef<HTMLDivElement | null>(null)
@@ -532,9 +532,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       }, 100)
       return () => clearTimeout(timer)
     }
-    // groupCollapseOverrides isn't read above — it's a re-measure trigger: toggling a group
+    // groupCollapseOverrides and pathname aren't read above — they're re-measure triggers:
+    // toggling a group, or navigating to/from a route that auto-expands/collapses a group,
     // changes contentScrollRef's scrollHeight, so this effect must re-run to re-check the fill.
-  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded, groupCollapseOverrides])
+  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded, groupCollapseOverrides, pathname])
 
   useEffect(() => {
     if (isHistoryExpanded) {
@@ -737,30 +738,26 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         >
           {/* Groups */}
           {navigationGroups.map((group, groupIndex) => {
+            // Groups without a stable `id` (e.g. extra-nav overlays) fall back to `title` —
+            // matches the pre-`id` behavior for anything that hasn't opted in yet.
+            const groupKey = group.id ?? group.title
             // An active route overrides only the *default* collapsed state, so the current
             // page is never hidden inside a collapsed group on first load — but an explicit
             // user toggle always wins over that, so the group can still be collapsed manually.
-            const isGroupCollapsed = group.title in groupCollapseOverrides
-              ? groupCollapseOverrides[group.title]
+            const isGroupCollapsed = groupKey in groupCollapseOverrides
+              ? groupCollapseOverrides[groupKey]
               : !!group.defaultCollapsed && !group.items.some(isItemActive)
             return (
-              <div key={group.title} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
-                <div
-                  role="button"
-                  tabIndex={0}
+              <div key={groupKey} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
+                <button
+                  type="button"
                   aria-expanded={!isGroupCollapsed}
-                  className="px-2 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between cursor-pointer select-none rounded transition-colors hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => toggleGroupCollapse(group.title, isGroupCollapsed)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault()
-                      toggleGroupCollapse(group.title, isGroupCollapsed)
-                    }
-                  }}
+                  className="w-full px-2 py-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between text-left cursor-pointer select-none rounded transition-colors hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => toggleGroupCollapse(groupKey, isGroupCollapsed)}
                 >
                   <span>{group.titleKey ? t(group.titleKey) : group.title}</span>
                   {isGroupCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-                </div>
+                </button>
                 {!isGroupCollapsed && (
                   <div className="space-y-0.5">
                     {group.items.map((item: NavigationItem) => {

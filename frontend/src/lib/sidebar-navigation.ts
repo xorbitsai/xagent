@@ -41,6 +41,12 @@ export interface NavigationGroup {
     items: NavigationItem[]
     /** Whether this group's items are hidden behind a collapse toggle by default. */
     defaultCollapsed?: boolean
+    /**
+     * Stable identity for this group, used instead of `title` for React keys and collapse
+     * state so a downstream-injected group (e.g. via extra-nav) sharing a display title
+     * doesn't collide with a built-in group's identity. Falls back to `title` when unset.
+     */
+    id?: string
 }
 
 const baseMoreResourceItems: NavigationItem[] = [
@@ -88,14 +94,14 @@ const getMoreResourceItemsForUser = (user?: SidebarUser | null): NavigationItem[
         items.push({
             name: "User Management",
             nameKey: "nav.userManagement",
-            href: "/users/",
+            href: "/users",
             icon: Users,
             color: "text-blue-400"
         })
         items.push({
             name: "Public MCP Apps",
             nameKey: "nav.adminMcp",
-            href: "/admin-mcp/",
+            href: "/admin-mcp",
             icon: Server,
             color: "text-blue-400"
         })
@@ -106,6 +112,7 @@ const getMoreResourceItemsForUser = (user?: SidebarUser | null): NavigationItem[
 
 export const getNavigationGroupsForUser = (user?: SidebarUser | null): NavigationGroup[] => [
     {
+        id: "agent-development",
         title: "Agent Development",
         titleKey: "nav.sections.agentDevelopment",
         items: [
@@ -140,6 +147,7 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
         ]
     },
     {
+        id: "resources",
         title: "Resources",
         titleKey: "nav.sections.resources",
         defaultCollapsed: true,

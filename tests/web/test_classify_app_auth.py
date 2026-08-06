@@ -2,7 +2,8 @@
 
 `classify_app_auth` is the one place backend + both frontend dialogs read from,
 so its edge cases matter: oauth wins over any launch_config, key-based needs
-BOTH required_env and command, everything else is unconnectable.
+BOTH required_env and command, a stdio command with no required_env is keyless,
+everything else is unconnectable.
 """
 
 import pytest
@@ -96,11 +97,31 @@ def test_mcp_oauth_shape_requires_a_remote_transport():
     )
 
 
+def test_keyless_is_a_stdio_command_with_no_required_env():
+    # e.g. the Chrome connector: a launchable local module with no secrets.
+    assert classify_app_auth("stdio", {"command": "npx"}) == "keyless"
+    assert (
+        classify_app_auth(
+            "stdio", {"command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"]}
+        )
+        == "keyless"
+    )
+    # empty required_env is the same as absent, not a key-based app
+    assert (
+        classify_app_auth("stdio", {"command": "npx", "required_env": []}) == "keyless"
+    )
+    # transport check is case-insensitive, like the other classifications
+    assert classify_app_auth("STDIO", {"command": "npx"}) == "keyless"
+    # keyless is stdio-only: a command on a remote transport is mis-authored,
+    # not connectable
+    assert classify_app_auth("streamable_http", {"command": "npx"}) == "unconnectable"
+    assert classify_app_auth("sse", {"command": "npx"}) == "unconnectable"
+    assert classify_app_auth(None, {"command": "npx"}) == "unconnectable"
+
+
 def test_inconsistent_entries_are_unconnectable_not_misrouted():
     # required_env but no command -> not launchable
     assert classify_app_auth("stdio", {"required_env": ["KEY"]}) == "unconnectable"
-    # command but no required_env -> nothing to prompt for
-    assert classify_app_auth("stdio", {"command": "npx"}) == "unconnectable"
     assert classify_app_auth("stdio", None) == "unconnectable"
     assert classify_app_auth(None, None) == "unconnectable"
     # malformed launch_config (non-dict) must not raise AttributeError

@@ -99,9 +99,11 @@ class PublicMCPAppCreate(PublicMCPAppBase):
         # re-deriving the rule here. Reject an entry that declares a partial
         # launch_config (either the key-based or the remote-OAuth shape) yet
         # still classifies as "unconnectable" — the write-time constraint
-        # issue #764 asked for. Covers four asymmetric shapes:
-        # command-without-required_env, required_env-without-command,
-        # url-without-auth.type=mcp_oauth, and auth.type=mcp_oauth-without-url.
+        # issue #764 asked for. Covers the asymmetric shapes:
+        # required_env-without-command, url-without-auth.type=mcp_oauth, and
+        # auth.type=mcp_oauth-without-url. (command-without-required_env on a
+        # stdio transport is not partial — it classifies as "keyless"; the
+        # same shape on a remote transport still rejects here.)
         from ..mcp_apps import classify_app_auth
 
         launch = self.launch_config or {}
@@ -115,7 +117,8 @@ class PublicMCPAppCreate(PublicMCPAppBase):
         ):
             raise ValueError(
                 "A key-based catalog app must declare both launch_config.command "
-                "and launch_config.required_env; a remote-OAuth catalog app must "
+                "and launch_config.required_env (a stdio command without "
+                "required_env is a keyless app); a remote-OAuth catalog app must "
                 "declare both launch_config.url and launch_config.auth.type == "
                 "'mcp_oauth' (with transport one of sse/websocket/streamable_http), "
                 "otherwise it cannot be connected."

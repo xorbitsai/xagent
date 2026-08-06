@@ -2312,8 +2312,9 @@ def _add_catalog_server_with_race_recovery(
 
 
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
-    """Idempotently ensure the shared server row for a key-based catalog app
-    exists, without creating any per-user association. Returns (server, app_info).
+    """Idempotently ensure the shared server row for a key-based or keyless
+    catalog app exists, without creating any per-user association. Returns
+    (server, app_info).
 
     Used by connect before attaching the caller's env. Raises 400/404/409.
     """
@@ -2329,10 +2330,12 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="OAuth apps must be connected via the OAuth flow",
         )
-    if app_info.get("auth_type") != "api_key":
+    # "keyless" shares this path: same shared stdio server row, just no
+    # required_env to attach (the env merge below reduces to a no-op).
+    if app_info.get("auth_type") not in ("api_key", "keyless"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This app cannot be connected with an API key",
+            detail="This app cannot be connected via the connect endpoint",
         )
     launch = app_info.get("launch_config") or {}
     command = launch.get("command")
@@ -2464,10 +2467,11 @@ def connect_mcp_app(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> MCPServerResponse:
-    """Connect a key-based (non-oauth) catalog app for the current user.
+    """Connect a key-based or keyless (non-oauth) catalog app for the current user.
 
     One shared server row backs the app for all users; each user gets their own
-    per-user env (their key). Connecting again updates the caller's key.
+    per-user env (their key). Connecting again updates the caller's key. For
+    keyless apps the association is created with no env at all.
     """
     from xagent.core.utils.encryption import decrypt_env_dict, encrypt_env_dict
 

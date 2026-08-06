@@ -519,6 +519,32 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 ],
             },
         },
+        {
+            "app_id": "chrome",
+            "name": "Chrome",
+            "description": "Automate a Chrome browser: open pages, read content, fill forms, take screenshots, and inspect network requests.",
+            "icon": "https://www.google.com/s2/favicons?domain=chrome.google.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Keyless (non-oauth): no secrets to collect — connecting only
+            # creates the per-user association via POST /api/mcp/apps/{id}/connect.
+            # --headless/--isolated keep server deployments displayless and give
+            # each session a throwaway profile instead of a shared one.
+            # Version-pinned: npx resolves this on every launch, so an
+            # unpinned tag would silently pick up new upstream releases.
+            "launch_config": {
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "chrome-devtools-mcp@1.6.0",
+                    "--headless",
+                    "--isolated",
+                ],
+            },
+        },
     ]
 
 

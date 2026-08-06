@@ -499,14 +499,12 @@ def test_connect_rejects_oauth_app(test_db):
     assert exc.value.status_code == 400
 
 
-def test_connect_rejects_unconnectable_app(test_db):
-    """An entry that classifies as "unconnectable" (a launch command but no
-    required_env, so nothing to key on) is rejected by the key-based gate. Such
-    a row can only reach the DB directly / pre-validator; the connect gate is the
-    backstop. Guards the auth_type != "api_key" branch of _ensure_catalog_app_server.
+def test_connect_keyless_app_creates_association_without_env(test_db):
+    """A keyless entry (a stdio command with no required_env, e.g. Chrome)
+    connects through the same endpoint: shared server row + non-owner
+    association, but with no per-user env at all. Any env a caller does send is
+    dropped — required_env is empty, so nothing is allowed through.
     """
-    from fastapi import HTTPException
-
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
 
     test_db.add(
@@ -519,9 +517,55 @@ def test_connect_rejects_unconnectable_app(test_db):
     )
     test_db.commit()
 
+    connect_mcp_app(
+        "keyless",
+        MCPAppConnectRequest(env={"INJECTED": "nope"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    server = test_db.query(MCPServer).filter(MCPServer.name == "keyless").first()
+    assert server is not None
+    assert server.transport == "stdio"
+    assert server.command == "npx"
+    assert server.args == ["-y", "some-mcp"]
+
+    assoc = (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.user_id == 1, UserMCPServer.mcpserver_id == server.id)
+        .first()
+    )
+    assert assoc is not None
+    assert assoc.is_owner is False
+    assert assoc.is_active is True
+    # No declared keys -> nothing stored, not even the injected env.
+    assert assoc.env is None
+
+
+def test_connect_rejects_unconnectable_app(test_db):
+    """An entry that classifies as "unconnectable" (required_env but no launch
+    command, so nothing to run) is rejected by the connect gate. Such a row can
+    only reach the DB directly / pre-validator; the connect gate is the backstop.
+    Guards the auth_type not in ("api_key", "keyless") branch of
+    _ensure_catalog_app_server.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="broken",
+            name="broken",
+            transport="stdio",
+            launch_config={"required_env": ["KEY"]},
+        )
+    )
+    test_db.commit()
+
     with pytest.raises(HTTPException) as exc:
         connect_mcp_app(
-            "keyless",
+            "broken",
             MCPAppConnectRequest(env={"X": "y"}),
             current_user=_user(test_db, 1),
             db=test_db,

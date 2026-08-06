@@ -570,6 +570,38 @@ export function ConnectMcpDialog({
     }
   }
 
+  // Keyless catalog app (e.g. Chrome): no secrets to collect, so skip the key
+  // dialog entirely and POST straight to the connect endpoint. env is omitted
+  // (not {}) — there is nothing to set, and the shape mirrors submitKeyConnect's
+  // shared/platform branch.
+  const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
+    setLoadingApp(app.id)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      })
+      if (response.ok) {
+        toast.success(t('tools.mcp.buttons.save'))
+        if (autoSelect && onConnectSelected) {
+          setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name])
+        }
+        if (onSuccess) onSuccess()
+        loadApps()
+        setSelectedApp(null)
+      } else {
+        const error = await response.json()
+        toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
+      }
+    } catch (error) {
+      console.error("Failed to connect app:", error)
+      toast.error(t('tools.mcp.alerts.saveFailed'))
+    } finally {
+      setLoadingApp(null)
+    }
+  }
+
   // Remote-MCP OAuth catalog app (e.g. Granola): the backend ensures the
   // shared server row + this user's association, runs Dynamic Client
   // Registration when the provider has no static client, and returns the
@@ -683,10 +715,13 @@ export function ConnectMcpDialog({
 
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
     if (app.auth_type !== "builtin_oauth") {
-      // Key-based catalog app: collect the key; remote-MCP OAuth app: start
-      // the per-user OAuth (DCR) flow. Anything else is a mis-authored entry.
+      // Key-based catalog app: collect the key; keyless app: connect directly;
+      // remote-MCP OAuth app: start the per-user OAuth (DCR) flow. Anything
+      // else is a mis-authored entry.
       if (app.auth_type === "api_key") {
         openKeyConnect(app);
+      } else if (app.auth_type === "keyless") {
+        void submitKeylessConnect(app, autoSelect);
       } else if (app.auth_type === "mcp_oauth") {
         handleConnectMcpOAuthApp(app, autoSelect);
       } else {

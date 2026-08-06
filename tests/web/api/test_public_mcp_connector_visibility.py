@@ -1163,29 +1163,31 @@ def test_mixed_case_oauth_transport_app_is_marked_connected(
             pass
 
 
-def test_admin_create_app_rejects_keyless_command_entry() -> None:
-    """Write-time constraint (#764): a non-oauth entry with a launch command but
-    no required_env would classify as "unconnectable", so the admin API rejects
-    it instead of silently persisting an unconnectable row."""
+def test_admin_create_app_accepts_keyless_and_rejects_partial_key_shapes() -> None:
+    """Write-time constraint (#764), updated for the keyless class: a stdio
+    entry with a launch command and no required_env classifies as "keyless"
+    (e.g. Chrome) and is accepted; the genuinely partial shapes — required_env
+    without a command, or a command on a remote transport — still classify as
+    "unconnectable" and are rejected."""
     temp_dir = _setup_test_db()
     try:
         _setup_admin()
         admin_headers = _login("admin", "admin123")
 
-        # Shape 1: command without required_env.
+        # A stdio command without required_env is a valid keyless app.
         resp = client.post(
             "/api/admin/mcp/apps",
             headers=admin_headers,
             json={
-                "app_id": "bad-keyless",
-                "name": "BadKeyless",
+                "app_id": "ok-keyless",
+                "name": "OkKeyless",
                 "transport": "stdio",
                 "launch_config": {"command": "npx", "args": ["-y", "x"]},
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 200
 
-        # Shape 2 (the reverse asymmetric shape): required_env without command.
+        # required_env without command stays rejected.
         resp = client.post(
             "/api/admin/mcp/apps",
             headers=admin_headers,
@@ -1194,6 +1196,19 @@ def test_admin_create_app_rejects_keyless_command_entry() -> None:
                 "name": "BadNoCommand",
                 "transport": "stdio",
                 "launch_config": {"required_env": ["KEY"]},
+            },
+        )
+        assert resp.status_code == 422
+
+        # A command on a remote transport is not keyless — still rejected.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-remote-command",
+                "name": "BadRemoteCommand",
+                "transport": "streamable_http",
+                "launch_config": {"command": "npx", "args": ["-y", "x"]},
             },
         )
         assert resp.status_code == 422
@@ -1304,6 +1319,9 @@ def test_admin_update_app_enforces_auth_classification() -> None:
         assert created.status_code == 200
         app_pk = created.json()["id"]
 
+        # Dropping the command (keeping required_env) is a genuinely partial
+        # shape and must be rejected. (Dropping required_env instead would be a
+        # legitimate api_key -> keyless transition, not a violation.)
         updated = client.put(
             f"/api/admin/mcp/apps/{app_pk}",
             headers=admin_headers,
@@ -1311,7 +1329,7 @@ def test_admin_update_app_enforces_auth_classification() -> None:
                 "app_id": "good-keyed",
                 "name": "GoodKeyed",
                 "transport": "stdio",
-                "launch_config": {"command": "npx"},
+                "launch_config": {"required_env": ["KEY"]},
             },
         )
         assert updated.status_code == 422
@@ -1405,7 +1423,9 @@ def test_admin_list_apps_does_not_500_on_partial_launch_config_row() -> None:
                     app_id="legacy-bad",
                     name="LegacyBad",
                     transport="stdio",
-                    launch_config={"command": "npx"},
+                    # required_env without a command: still a genuinely partial
+                    # shape (command-only now classifies "keyless", not partial).
+                    launch_config={"required_env": ["KEY"]},
                 )
             )
             db.commit()
@@ -1773,10 +1793,13 @@ def test_admin_custom_patch_validates_merged_state_and_keeps_app_id_immutable() 
         assert updated.json()["launch_config"]["command"] == "new-command"
         assert updated.json()["is_builtin"] is False
 
+        # required_env without a command is still a partial shape on the merged
+        # state. (command without required_env would now merge into a valid
+        # keyless app instead.)
         invalid = client.patch(
             f"/api/admin/mcp/apps/{app_pk}",
             headers=admin_headers,
-            json={"launch_config": {"command": "incomplete-command"}},
+            json={"launch_config": {"required_env": ["CUSTOM_TOKEN"]}},
         )
         assert invalid.status_code == 422
 

@@ -118,6 +118,9 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       <button type="button" onClick={() => onConnectStart(mcpOauthApp())}>
         connect-granola
       </button>
+      <button type="button" onClick={() => onConnectStart(keylessApp())}>
+        connect-chrome
+      </button>
       <button type="button" onClick={() => onConnectStart(builtinOauthApp())}>
         connect-builtin
       </button>
@@ -180,6 +183,20 @@ function mcpOauthApp() {
     is_connected: false,
     transport: "streamable_http",
     auth_type: "mcp_oauth",
+  }
+}
+
+// A keyless catalog app, e.g. Chrome: a local stdio command with no secrets —
+// connecting POSTs straight to /apps/{id}/connect with no env and no dialog.
+function keylessApp() {
+  return {
+    id: "chrome",
+    name: "Chrome",
+    description: "",
+    icon: "",
+    is_connected: false,
+    transport: "stdio",
+    auth_type: "keyless",
   }
 }
 
@@ -419,6 +436,56 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     } finally {
       openSpy.mockRestore()
     }
+  })
+
+  it("connects a keyless catalog app directly through the connect endpoint", async () => {
+    let connectBody: string | undefined
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        expect(options?.method).toBe("POST")
+        connectBody = options?.body as string
+        return Promise.resolve({ ok: true, json: async () => ({ id: 1 }) })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+
+    // No key dialog, no popup — just the POST, with an empty body (no env at
+    // all; an env key would be dropped by the backend anyway).
+    await waitFor(() => {
+      expect(connectBody).toBe("{}")
+    })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("surfaces the backend error when a keyless connect fails", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        return Promise.resolve({
+          ok: false,
+          status: 400,
+          json: async () => ({ detail: "This app cannot be connected via the connect endpoint" }),
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "This app cannot be connected via the connect endpoint",
+      )
+    })
   })
 
   it("surfaces the backend error and closes the popup when oauth/connect fails", async () => {

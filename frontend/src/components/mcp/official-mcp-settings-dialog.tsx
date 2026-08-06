@@ -217,12 +217,15 @@ export function OfficialMcpSettingsDialog({
               <>
                 {(() => {
                   const isKeyBased = app.auth_type === "api_key"
+                  // Keyless apps have no key and no editable config — once
+                  // connected, disconnect is the only sensible action.
+                  const isKeyless = app.auth_type === "keyless"
                   // Team tool the viewer doesn't own: they can use it, but the backend
                   // rejects edit/delete/unshare (403), so don't render those buttons.
                   const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
                   return (
                     <>
-                      {!isNonOwnedTeamTool && (
+                      {!isNonOwnedTeamTool && !isKeyless && (
                         <Button
                           className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
                           onClick={() => {

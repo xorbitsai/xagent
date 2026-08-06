@@ -20,6 +20,9 @@ mcp = FastMCP("google-sheets-mcp")
 
 _SPREADSHEET_URL_ID_PATTERN = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
 
+_sheets_service: Any = None
+_drive_service: Any = None
+
 
 def _get_credentials() -> Credentials:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
@@ -45,11 +48,21 @@ def _get_credentials() -> Credentials:
 
 
 def get_sheets_service() -> Any:
-    return build("sheets", "v4", credentials=_get_credentials())
+    global _sheets_service
+    if _sheets_service is None:
+        _sheets_service = build(
+            "sheets", "v4", credentials=_get_credentials(), static_discovery=True
+        )
+    return _sheets_service
 
 
 def get_drive_service() -> Any:
-    return build("drive", "v3", credentials=_get_credentials())
+    global _drive_service
+    if _drive_service is None:
+        _drive_service = build(
+            "drive", "v3", credentials=_get_credentials(), static_discovery=True
+        )
+    return _drive_service
 
 
 def _resolve_spreadsheet_id(spreadsheet_id: str) -> str:
@@ -64,12 +77,12 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
     and the list of sheets (tabs) with their sheet_id, title, and grid size.
     """
     try:
-        sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         service = get_sheets_service()
         spreadsheet = (
             service.spreadsheets()
             .get(
-                spreadsheetId=sheet_id,
+                spreadsheetId=resolved_spreadsheet_id,
                 fields="spreadsheetId,properties.title,spreadsheetUrl,sheets.properties",
             )
             .execute()
@@ -90,7 +103,9 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
         return json.dumps(
             {
                 "status": "success",
-                "spreadsheet_id": spreadsheet.get("spreadsheetId", sheet_id),
+                "spreadsheet_id": spreadsheet.get(
+                    "spreadsheetId", resolved_spreadsheet_id
+                ),
                 "title": spreadsheet.get("properties", {}).get("title"),
                 "url": spreadsheet.get("spreadsheetUrl"),
                 "sheets": sheets,
@@ -135,13 +150,15 @@ def google_sheets_create_spreadsheet(
                 .get(fileId=spreadsheet["spreadsheetId"], fields="parents")
                 .execute()
             )
-            previous_parents = ",".join(existing_file.get("parents", []))
-            drive.files().update(
-                fileId=spreadsheet["spreadsheetId"],
-                addParents=parent_id,
-                removeParents=previous_parents,
-                fields="id,parents",
-            ).execute()
+            previous_parents = existing_file.get("parents") or []
+            update_kwargs: dict[str, Any] = {
+                "fileId": spreadsheet["spreadsheetId"],
+                "addParents": parent_id,
+                "fields": "id,parents",
+            }
+            if previous_parents:
+                update_kwargs["removeParents"] = ",".join(previous_parents)
+            drive.files().update(**update_kwargs).execute()
 
         return json.dumps(
             {
@@ -163,12 +180,12 @@ def google_sheets_read_range(spreadsheet_id: str, range_name: str) -> str:
     range_name="Sheet1!A1:D10". spreadsheet_id accepts a bare id or full URL.
     """
     try:
-        sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         service = get_sheets_service()
         result = (
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=sheet_id, range=range_name)
+            .get(spreadsheetId=resolved_spreadsheet_id, range=range_name)
             .execute()
         )
         return json.dumps(
@@ -198,7 +215,7 @@ def google_sheets_update_range(
     "RAW" (stores every value as a literal string).
     """
     try:
-        sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         values = json.loads(values_json)
         if not isinstance(values, list) or not all(
             isinstance(row, list) for row in values
@@ -212,7 +229,7 @@ def google_sheets_update_range(
             service.spreadsheets()
             .values()
             .update(
-                spreadsheetId=sheet_id,
+                spreadsheetId=resolved_spreadsheet_id,
                 range=range_name,
                 valueInputOption=value_input_option,
                 body={"values": values},
@@ -244,7 +261,7 @@ def google_sheets_append_rows(
     rows, e.g. '[["a","b"],["c","d"]]'.
     """
     try:
-        sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         values = json.loads(values_json)
         if not isinstance(values, list) or not all(
             isinstance(row, list) for row in values
@@ -258,7 +275,7 @@ def google_sheets_append_rows(
             service.spreadsheets()
             .values()
             .append(
-                spreadsheetId=sheet_id,
+                spreadsheetId=resolved_spreadsheet_id,
                 range=range_name,
                 valueInputOption=value_input_option,
                 insertDataOption="INSERT_ROWS",
@@ -286,12 +303,12 @@ def google_sheets_clear_range(spreadsheet_id: str, range_name: str) -> str:
     removing cell formatting.
     """
     try:
-        sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         service = get_sheets_service()
         result = (
             service.spreadsheets()
             .values()
-            .clear(spreadsheetId=sheet_id, range=range_name)
+            .clear(spreadsheetId=resolved_spreadsheet_id, range=range_name)
             .execute()
         )
         return json.dumps(
@@ -313,12 +330,12 @@ def google_sheets_add_sheet(
     Add a new sheet (tab) to an existing spreadsheet.
     """
     try:
-        sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         service = get_sheets_service()
         result = (
             service.spreadsheets()
             .batchUpdate(
-                spreadsheetId=sheet_id,
+                spreadsheetId=resolved_spreadsheet_id,
                 body={
                     "requests": [
                         {

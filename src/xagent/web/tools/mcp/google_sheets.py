@@ -74,17 +74,18 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
             )
             .execute()
         )
-        sheets = [
-            {
-                "sheet_id": s["properties"]["sheetId"],
-                "title": s["properties"]["title"],
-                "row_count": s["properties"].get("gridProperties", {}).get("rowCount"),
-                "column_count": s["properties"]
-                .get("gridProperties", {})
-                .get("columnCount"),
-            }
-            for s in spreadsheet.get("sheets", [])
-        ]
+        sheets = []
+        for s in spreadsheet.get("sheets", []):
+            properties = s.get("properties", {})
+            grid_properties = properties.get("gridProperties") or {}
+            sheets.append(
+                {
+                    "sheet_id": properties.get("sheetId"),
+                    "title": properties.get("title"),
+                    "row_count": grid_properties.get("rowCount"),
+                    "column_count": grid_properties.get("columnCount"),
+                }
+            )
 
         return json.dumps(
             {
@@ -129,9 +130,16 @@ def google_sheets_create_spreadsheet(
 
         if parent_id:
             drive = get_drive_service()
+            existing_file = (
+                drive.files()
+                .get(fileId=spreadsheet["spreadsheetId"], fields="parents")
+                .execute()
+            )
+            previous_parents = ",".join(existing_file.get("parents", []))
             drive.files().update(
                 fileId=spreadsheet["spreadsheetId"],
                 addParents=parent_id,
+                removeParents=previous_parents,
                 fields="id,parents",
             ).execute()
 
@@ -192,8 +200,12 @@ def google_sheets_update_range(
     try:
         sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         values = json.loads(values_json)
-        if not isinstance(values, list):
-            raise ValueError("values_json must be a JSON array of rows")
+        if not isinstance(values, list) or not all(
+            isinstance(row, list) for row in values
+        ):
+            raise ValueError(
+                "values_json must be a 2D JSON array of rows (list of lists)"
+            )
 
         service = get_sheets_service()
         result = (
@@ -234,8 +246,12 @@ def google_sheets_append_rows(
     try:
         sheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         values = json.loads(values_json)
-        if not isinstance(values, list):
-            raise ValueError("values_json must be a JSON array of rows")
+        if not isinstance(values, list) or not all(
+            isinstance(row, list) for row in values
+        ):
+            raise ValueError(
+                "values_json must be a 2D JSON array of rows (list of lists)"
+            )
 
         service = get_sheets_service()
         result = (

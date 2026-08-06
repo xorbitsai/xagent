@@ -260,6 +260,25 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "google-sheets",
+            "name": "Google Sheets",
+            "description": "Connect to Google Sheets to read and update ranges, append rows, manage sheets, and create spreadsheets.",
+            "icon": "https://www.google.com/s2/favicons?domain=sheets.google.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "google",
+            "category": "Productivity",
+            "oauth_scopes": [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.file",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_sheets"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "google-ads",
             "name": "Google Ads",
             "description": "Connect to Google Ads to list accessible accounts, inspect campaigns, and run GAQL reports.",

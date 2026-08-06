@@ -5,7 +5,7 @@ Provides REST API endpoints for managing and using agent templates.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -114,20 +114,15 @@ class TemplateInfo(BaseModel):
     is_liked: bool = Field(
         default=False, description="Whether the current user liked this template"
     )
-    type: str = Field(
+    type: Literal["agent", "workforce"] = Field(
         default="agent",
         description="'agent' for a single-agent template, 'workforce' for a "
         "manager + worker-agents template",
     )
-    manager_name: Optional[str] = Field(
-        default=None,
-        description="Display name of the manager agent a 'workforce'-type "
-        "template creates. None for 'agent'-type templates.",
-    )
-    worker_names: list[str] = Field(
-        default_factory=list,
-        description="Display names of the worker agents a 'workforce'-type "
-        "template creates. Empty for 'agent'-type templates.",
+    agent_count: int = Field(
+        default=0,
+        description="Total number of agents (manager + workers) a "
+        "'workforce'-type template creates. 0 for 'agent'-type templates.",
     )
 
 
@@ -260,35 +255,44 @@ def increment_template_likes(db: Session, template_id: str) -> None:
     )
 
 
-def get_workforce_agent_names(
-    template: dict[str, Any],
-) -> tuple[Optional[str], list[str]]:
-    """(manager_name, worker_names) for a workforce-type template. Split
-    into two fields rather than one flat list so "which one is the manager"
-    is structural, not "index 0 by convention" - and a worker with no name
-    would previously be silently dropped from a single list rather than
-    visibly changing the count (PR #1127 review; template loading now
-    rejects a missing agents[].name outright, but this stays defensive).
+def increment_template_used_count(db: Session, template_id: str) -> None:
+    """Increment template used_count atomically in the database - the same
+    UPDATE-in-place pattern as `increment_template_likes` above. The
+    previous `stats.used_count += 1` ORM read-modify-write lost increments
+    under concurrent successes on the same template (two concurrent
+    `use-as-workforce` calls could both read used_count=0 and both write 1,
+    losing one), and its `TemplateStats` row-creation race was swallowed by
+    a broad `except IntegrityError` with no compensating re-read (PR #1127
+    re-review, m3). Callers must `db.commit()` then `db.refresh(stats)` to
+    see the post-increment value, matching `increment_template_likes`'s
+    existing callers.
+    """
+    db.query(TemplateStats).filter(TemplateStats.template_id == template_id).update(
+        {TemplateStats.used_count: TemplateStats.used_count + 1},
+        synchronize_session=False,
+    )
+
+
+def get_workforce_agent_count(template: dict[str, Any]) -> int:
+    """Total agents (1 manager + N workers) a workforce-type template
+    creates - the card badge's only need, computed server-side rather than
+    shipping name lists the frontend would just count (PR #1127 re-review
+    simplification; this replaced a manager_name/worker_names pair whose
+    only consumer read lengths/presence). 0 for agent-type templates.
     Derived entirely from static YAML fields (no per-agent template
     lookups), since this runs for every template on every
     `GET /api/templates/` page load.
     """
+    if template.get("type") != "workforce":
+        # An agent-type template carrying a stray workforce_config block
+        # (unvalidated for that type) must not advertise a count.
+        return 0
     workforce_config = template.get("workforce_config")
     if not isinstance(workforce_config, dict):
-        return None, []
-
-    manager = workforce_config.get("manager")
-    manager_name = (
-        str(manager["name"])
-        if isinstance(manager, dict) and manager.get("name")
-        else None
-    )
-    worker_names = [
-        str(agent["name"])
-        for agent in workforce_config.get("agents") or []
-        if isinstance(agent, dict) and agent.get("name")
-    ]
-    return manager_name, worker_names
+        return 0
+    workers = workforce_config.get("agents")
+    worker_count = len(workers) if isinstance(workers, list) else 0
+    return 1 + worker_count
 
 
 # ===== Endpoints =====
@@ -334,7 +338,6 @@ async def list_templates(
         )
         connections = template.get("connections", [])
         tags = get_localized_value(template.get("tags", {}), lang, [])
-        manager_name, worker_names = get_workforce_agent_names(template)
 
         result.append(
             TemplateInfo(
@@ -355,8 +358,7 @@ async def list_templates(
                 used_count=stats.used_count,
                 is_liked=template_id in liked_template_ids,
                 type=template.get("type", "agent"),
-                manager_name=manager_name,
-                worker_names=worker_names,
+                agent_count=get_workforce_agent_count(template),
             )
         )
 
@@ -406,7 +408,6 @@ async def get_template(
     )
     connections = template.get("connections", [])
     tags = get_localized_value(template.get("tags", {}), lang, [])
-    manager_name, worker_names = get_workforce_agent_names(template)
 
     return TemplateDetail(
         id=template["id"],
@@ -426,8 +427,7 @@ async def get_template(
         used_count=stats.used_count,
         is_liked=is_template_liked(db, int(current_user.id), template_id),
         type=template.get("type", "agent"),
-        manager_name=manager_name,
-        worker_names=worker_names,
+        agent_count=get_workforce_agent_count(template),
         agent_config=(
             {
                 "instructions": template["agent_config"].get("instructions", ""),
@@ -536,11 +536,24 @@ async def use_template(
 
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if template.get("type") == "workforce":
+        # Every other agent-creation surface (the service-layer raises,
+        # the v1 400, the home/task/builder filters) already refuses a
+        # workforce template - this legacy endpoint was left ungated,
+        # returning 200 "Template usage recorded" while creating nothing
+        # (PR #1127 re-review, m2). It predates the workforce type and
+        # frontend code only calls /use-as-workforce for one, but external
+        # API consumers could still hit it directly.
+        raise HTTPException(
+            status_code=400,
+            detail="This template creates a workforce, not a single agent; "
+            "use POST /{template_id}/use-as-workforce instead",
+        )
 
-    # Increment used count
     stats = get_or_create_template_stats(db, template_id)
-    stats.used_count += 1
+    increment_template_used_count(db, template_id)
     db.commit()
+    db.refresh(stats)
 
     return {
         "message": "Template usage recorded",
@@ -593,8 +606,8 @@ async def use_template_as_workforce(
     # otherwise see a 500 for an operation that actually already succeeded,
     # with no way to discover the workforce it already created.
     try:
-        stats = get_or_create_template_stats(db, template_id)
-        stats.used_count += 1
+        get_or_create_template_stats(db, template_id)
+        increment_template_used_count(db, template_id)
         db.commit()
     except Exception:
         db.rollback()

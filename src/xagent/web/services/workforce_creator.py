@@ -25,7 +25,11 @@ from .workforce_access import (
     can_create_workforce,
     resolve_create_scope,
 )
-from .workforce_names import resolve_unique_agent_name, resolve_unique_workforce_name
+from .workforce_names import (
+    is_workforce_name_unique_violation,
+    resolve_unique_agent_name,
+    resolve_unique_workforce_name,
+)
 from .workforce_snapshot import normalize_text
 from .workforce_workers import create_workforce_worker
 
@@ -288,15 +292,17 @@ def _find_quick_access_worker_agent(
     )
 
 
-# Stable English prefix the frontend matches on to render a translated,
-# agent-name-specific message (see WORKFORCE_USE_ERROR_KEYS in
-# templates/page.tsx) - the variable part (the agent's name) is
-# deliberately appended as its own sentence after it, not interpolated
-# into the middle of the fixed text, so that prefix match stays exact
-# regardless of the name's contents.
-UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX = (
-    "This workforce needs an agent that is currently unpublished: "
-)
+# Machine-readable error codes for the workforce-from-template flow,
+# following the structured-detail pattern already used by agents.py
+# ("agent_in_use_by_workforce") and mcp.py. The frontend maps these codes
+# to translated messages instead of byte-matching human-readable English
+# detail strings, which silently degraded to a generic toast on any
+# backend wording change (PR #1127 re-review, m4). `params` carries the
+# variable parts (e.g. the agent's name) separately so translations can
+# interpolate them.
+WORKFORCE_CREATE_ACCESS_DENIED_CODE = "workforce_create_access_denied"
+WORKFORCE_CREATE_CONFLICT_CODE = "workforce_create_conflict"
+WORKFORCE_WORKER_UNPUBLISHED_CODE = "workforce_worker_unpublished"
 
 
 def _ensure_published_quick_access_agent(agent: Agent) -> Agent:
@@ -315,9 +321,13 @@ def _ensure_published_quick_access_agent(agent: Agent) -> Agent:
     if agent.status != AgentStatus.PUBLISHED:
         raise HTTPException(
             status_code=400,
-            detail=f"{UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX}{agent.name}. "
-            "Republish it from your Agents list, then try this workforce "
-            "template again.",
+            detail={
+                "code": WORKFORCE_WORKER_UNPUBLISHED_CODE,
+                "message": f"This workforce needs an agent that is "
+                f"currently unpublished: {agent.name}. Republish it from "
+                "your Agents list, then try this workforce template again.",
+                "params": {"agent_name": agent.name},
+            },
         )
     return agent
 
@@ -469,8 +479,11 @@ async def _get_or_create_quick_access_worker_agent(
 
     raise HTTPException(
         status_code=409,
-        detail="Could not create the workforce's worker agents due to a "
-        "concurrent request; please try again.",
+        detail={
+            "code": WORKFORCE_CREATE_CONFLICT_CODE,
+            "message": "Could not create the workforce's worker agents due "
+            "to a concurrent request; please try again.",
+        },
     )
 
 
@@ -499,7 +512,13 @@ async def create_workforce_from_template(
 
     scope_type, scope_id = resolve_create_scope(db, user)
     if not can_create_workforce(db, user, scope_type, scope_id):
-        raise HTTPException(status_code=403, detail="Access denied")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": WORKFORCE_CREATE_ACCESS_DENIED_CODE,
+                "message": "Access denied",
+            },
+        )
 
     owner_user_id = int(user.id)
     try:
@@ -509,19 +528,16 @@ async def create_workforce_from_template(
             scope_id=scope_id,
             name=str(template.get("name") or "Workforce"),
         )
-        # Unlike the worker-resolution loop below, this insert is NOT
-        # wrapped in its own `db.begin_nested()` - a concurrent collision
-        # here would propagate straight out of the outer `try`, rolling
-        # back the whole workforce creation instead of just this insert.
-        # That is safe only because `uq_agents_user_id_name_active`
-        # (`AGENT_NAME_UNIQUE_INDEX` in `xagent/web/models/agent.py`) is a
-        # partial index whose predicate excludes
-        # `origin='workforce_generated_manager'` rows entirely, so two
-        # concurrent managers can even share a name without ever hitting a
-        # unique-constraint collision in the first place. If that predicate
-        # ever changes, concurrent workforce instantiation would need the
-        # same SAVEPOINT-retry treatment as the worker path (PR #1127
-        # re-review, F11).
+        # The manager-agent insert (unlike the Workforce insert just below)
+        # is NOT wrapped in its own `db.begin_nested()` - that is safe only
+        # because `uq_agents_user_id_name_active` (`AGENT_NAME_UNIQUE_INDEX`
+        # in `xagent/web/models/agent.py`) is a partial index whose
+        # predicate excludes `origin='workforce_generated_manager'` rows
+        # entirely, so two concurrent managers can even share a name
+        # without ever hitting a unique-constraint collision in the first
+        # place. If that predicate ever changes, this insert would need the
+        # same SAVEPOINT-retry treatment as the Workforce insert below (PR
+        # #1127 re-review, F11).
         manager_agent = AgentStore(db).add_agent(
             user_id=owner_user_id,
             name=resolve_unique_agent_name(
@@ -545,20 +561,59 @@ async def create_workforce_from_template(
             allowed_domains=[],
         )
 
-        workforce = Workforce(
-            owner_user_id=owner_user_id,
-            scope_type=scope_type,
-            scope_id=scope_id,
-            name=name,
-            description=normalize_text(
-                cast(str | None, get_localized_description(template, lang)),
-                "description",
-            ),
-            manager_agent_id=int(manager_agent.id),
-            status="draft",
+        workforce_description = normalize_text(
+            cast(str | None, get_localized_description(template, lang)),
+            "description",
         )
-        db.add(workforce)
-        db.flush()
+        # `name` came from an unlocked check-then-insert
+        # (`resolve_unique_workforce_name`), same shape as the worker-agent
+        # race below - two concurrent instantiations of the SAME template
+        # (this template's name is fixed, unlike `create_workforce_from_prompt`'s
+        # LLM-generated one, so this collision is not just theoretical) can
+        # both resolve the same name and race to insert it. Retry inside a
+        # SAVEPOINT so a collision only unwinds this insert, not the
+        # manager agent already created above (PR #1127 re-review, M1).
+        workforce: Workforce | None = None
+        for attempt in range(TEMPLATE_RESOLVE_RACE_RETRIES):
+            try:
+                with db.begin_nested():
+                    workforce = Workforce(
+                        owner_user_id=owner_user_id,
+                        scope_type=scope_type,
+                        scope_id=scope_id,
+                        name=name,
+                        description=workforce_description,
+                        manager_agent_id=int(manager_agent.id),
+                        status="draft",
+                    )
+                    db.add(workforce)
+                    db.flush()
+                break
+            except IntegrityError as exc:
+                if not is_workforce_name_unique_violation(exc):
+                    raise
+                logger.warning(
+                    "Workforce name %r collided (attempt %s/%s) for "
+                    "scope_type=%s scope_id=%s; retrying with a new name",
+                    name,
+                    attempt + 1,
+                    TEMPLATE_RESOLVE_RACE_RETRIES,
+                    scope_type,
+                    scope_id,
+                )
+                name = resolve_unique_workforce_name(
+                    db, scope_type=scope_type, scope_id=scope_id, name=name
+                )
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": WORKFORCE_CREATE_CONFLICT_CODE,
+                    "message": "Could not create the workforce due to a "
+                    "concurrent request; please try again.",
+                },
+            )
+        assert workforce is not None
 
         for index, agent_spec in enumerate(agent_specs):
             worker_agent = await _get_or_create_quick_access_worker_agent(

@@ -193,14 +193,40 @@ class TemplateManager:
 
         return data
 
+    @staticmethod
+    def _require_string(
+        container: Dict[str, Any], key: str, *, path: str, required: bool = True
+    ) -> None:
+        """Enforce that `container[key]` is a real (optionally absent)
+        string, and write the stripped value back in place.
+
+        Strict `isinstance` rather than `str(...)` coercion: a list/dict/int
+        that YAML happened to parse for one of these fields used to slip
+        through load-time validation and only surface downstream - as a
+        garbage prompt or template id, or as an `AttributeError` → 500 when
+        `normalize_text(...).strip()` hit a non-string `description`/`alias`
+        (PR #1127 re-review, m1). Writing the stripped value back also
+        keeps the duplicate-check and the runtime lookup seeing the same
+        `template_id` - previously a template id with surrounding
+        whitespace was stripped for the duplicate check but looked up raw,
+        guaranteeing a "references an unknown template" 400 at use time.
+        """
+        value = container.get(key)
+        if value is None and not required:
+            return
+        if not isinstance(value, str) or not value.strip():
+            requirement = "a non-empty string" if required else "a string or omitted"
+            raise ValueError(f"'{path}.{key}' must be {requirement}")
+        container[key] = value.strip()
+
     def _validate_workforce_config(self, workforce_config: Any) -> None:
         """Validate the shape of `workforce_config` for a workforce-type
-        template. A workforce template is instantiated as a fresh manager
-        agent (defined inline via `manager.instructions`) plus one worker
-        agent per `agents[]` entry, each reused/created from an existing
-        template id (`agents[].template_id`) - see
-        `create_workforce_from_template` in
-        `xagent.web.services.workforce_creator`.
+        template, normalizing (stripping) its string fields in place. A
+        workforce template is instantiated as a fresh manager agent
+        (defined inline via `manager.instructions`) plus one worker agent
+        per `agents[]` entry, each reused/created from an existing template
+        id (`agents[].template_id`) - see `create_workforce_from_template`
+        in `xagent.web.services.workforce_creator`.
         """
         if not isinstance(workforce_config, dict):
             raise ValueError(
@@ -208,17 +234,12 @@ class TemplateManager:
             )
 
         manager = workforce_config.get("manager")
-        if (
-            not isinstance(manager, dict)
-            or not str(manager.get("instructions") or "").strip()
-        ):
-            raise ValueError(
-                "'workforce_config.manager.instructions' must be a non-empty string"
-            )
-        if not str(manager.get("name") or "").strip():
-            raise ValueError(
-                "'workforce_config.manager.name' must be a non-empty string"
-            )
+        if not isinstance(manager, dict):
+            raise ValueError("'workforce_config.manager' must be a mapping")
+        manager_path = "workforce_config.manager"
+        self._require_string(manager, "instructions", path=manager_path)
+        self._require_string(manager, "name", path=manager_path)
+        self._require_string(manager, "description", path=manager_path, required=False)
         execution_mode = manager.get("execution_mode")
         if execution_mode is not None and execution_mode not in _VALID_EXECUTION_MODES:
             # Passed straight into AgentStore.add_agent with no further
@@ -249,11 +270,16 @@ class TemplateManager:
                 raise ValueError(
                     f"'workforce_config.agents[{index}]' must be a mapping"
                 )
-            template_id = str(agent.get("template_id") or "").strip()
-            if not template_id:
-                raise ValueError(
-                    f"'workforce_config.agents[{index}].template_id' must be a non-empty string"
-                )
+            agent_path = f"workforce_config.agents[{index}]"
+            self._require_string(agent, "template_id", path=agent_path)
+            self._require_string(agent, "assignment_instructions", path=agent_path)
+            self._require_string(agent, "alias", path=agent_path, required=False)
+            # Required so every worker has a stable display name - the
+            # card's agent-count badge used to silently omit a nameless
+            # worker rather than surface the gap, undercounting.
+            self._require_string(agent, "name", path=agent_path)
+
+            template_id = agent["template_id"]
             if template_id in seen_template_ids:
                 # Two agents[] entries resolving to the same quick-access
                 # worker agent make the template permanently unusable: the
@@ -265,18 +291,6 @@ class TemplateManager:
                     f"{template_id!r}"
                 )
             seen_template_ids.add(template_id)
-            if not str(agent.get("name") or "").strip():
-                # Required so every worker has a stable display name -
-                # `get_workforce_agent_names` used to silently omit a
-                # nameless worker rather than surface the gap, which
-                # undercounted the card's agent-count badge.
-                raise ValueError(
-                    f"'workforce_config.agents[{index}].name' must be a non-empty string"
-                )
-            if not str(agent.get("assignment_instructions") or "").strip():
-                raise ValueError(
-                    f"'workforce_config.agents[{index}].assignment_instructions' must be a non-empty string"
-                )
 
     def _validate_sample_prompts(self, sample_prompts: Any) -> None:
         """Validate the (optional) sample_prompts shape at parse time, the
@@ -342,48 +356,31 @@ class TemplateManager:
         connections = template.get("connections", [])
         template_type = template.get("type", "agent")
 
-        if template_type != "agent":
-            return {
-                "id": template["id"],
-                "name": template["name"],
-                "category": template.get("category", ""),
-                "featured": template.get("featured", False),
-                "descriptions": template.get("descriptions", {}),
-                "features": template.get("features", {}),
-                "sample_prompts": template.get("sample_prompts", {}),
-                "connections": connections,
-                "setup_time": template.get("setup_time", "5 min setup"),
-                "tags": template.get("tags", {}),
-                "author": template.get("author", ""),
-                "version": template.get("version", ""),
-                "agent_config": None,
-                "type": template_type,
-                "workforce_config": template.get("workforce_config"),
-            }
+        agent_config_dict: Optional[Dict[str, Any]] = None
+        if template_type == "agent":
+            # The agent_config could be an AgentConfig pydantic model or a dict
+            agent_config = template.get("agent_config", {})
 
-        # The agent_config could be an AgentConfig pydantic model or a dict
-        agent_config = template.get("agent_config", {})
+            if hasattr(agent_config, "model_dump"):
+                agent_config_dict = agent_config.model_dump()
+            elif hasattr(agent_config, "dict"):
+                agent_config_dict = agent_config.dict()
+            else:
+                agent_config_dict = dict(agent_config)
 
-        if hasattr(agent_config, "model_dump"):
-            agent_config_dict = agent_config.model_dump()
-        elif hasattr(agent_config, "dict"):
-            agent_config_dict = agent_config.dict()
-        else:
-            agent_config_dict = dict(agent_config)
+            tool_categories = agent_config_dict.get("tool_categories", [])
+            if not isinstance(tool_categories, list):
+                tool_categories = list(tool_categories) if tool_categories else []
 
-        tool_categories = agent_config_dict.get("tool_categories", [])
-        if not isinstance(tool_categories, list):
-            tool_categories = list(tool_categories) if tool_categories else []
+            for conn in connections:
+                conn_name = conn.get("name") if isinstance(conn, dict) else conn
+                if not conn_name:
+                    continue
+                mcp_category = f"mcp:{conn_name}"
+                if mcp_category not in tool_categories:
+                    tool_categories.append(mcp_category)
 
-        for conn in connections:
-            conn_name = conn.get("name") if isinstance(conn, dict) else conn
-            if not conn_name:
-                continue
-            mcp_category = f"mcp:{conn_name}"
-            if mcp_category not in tool_categories:
-                tool_categories.append(mcp_category)
-
-        agent_config_dict["tool_categories"] = tool_categories
+            agent_config_dict["tool_categories"] = tool_categories
 
         return {
             "id": template["id"],

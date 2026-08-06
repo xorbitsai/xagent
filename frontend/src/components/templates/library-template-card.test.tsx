@@ -49,8 +49,7 @@ describe("LibraryTemplateCard", () => {
       <LibraryTemplateCard
         template={makeTemplate({
           type: "workforce",
-          manager_name: "Growth Marketing Manager",
-          worker_names: ["GA Analyzer", "Ads Recommendation"],
+          agent_count: 3,
         })}
         useLabel="Use Template"
         defaultSetupTime="5 min setup"

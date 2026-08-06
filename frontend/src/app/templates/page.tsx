@@ -2,10 +2,10 @@
 
 import { useI18n } from "@/contexts/i18n-context";
 import { Loader2 } from "lucide-react";
-import { Suspense, useState, useEffect, useMemo } from "react";
+import React, { Suspense, useState, useEffect, useMemo, useRef } from "react";
 import { getApiUrl } from "@/lib/utils";
 import { useRouter, useSearchParams } from "next/navigation";
-import { apiRequest, getApiErrorMessage, parseApiResponse } from "@/lib/api-wrapper";
+import { apiRequest, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
 import { toast } from "sonner";
 import { SearchInput } from "@/components/ui/search-input";
 import { PageHeader } from "@/components/ui/page-header";
@@ -41,26 +41,23 @@ const formatFallbackLabel = (category: string) =>
     .replace(/_/g, " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
 
-// The backend's HTTPException `detail` strings are English-only and not
-// meant to be shown as-is to a zh-locale user. Only the exact, static
-// messages we control are mapped to a translated string; anything else
-// (including the dynamic template-id messages) falls back to the generic
-// translated error below rather than leaking raw English (PR #1127 review).
-const WORKFORCE_USE_ERROR_KEYS: Record<string, TranslationKey> = {
-  "Access denied": "templates.errors.useWorkforceAccessDenied",
-  "Could not create the workforce's worker agents due to a concurrent request; please try again.":
-    "templates.errors.useWorkforceRetry",
+// The workforce-creation error paths return a structured
+// `detail: {code, message, params}` (see the WORKFORCE_*_CODE constants in
+// src/xagent/web/services/workforce_creator.py), mapped here by machine
+// code rather than by byte-matching human-readable English strings - a
+// backend wording change used to silently degrade every mapped error to
+// the generic toast (PR #1127 re-review, m4). Any error without a mapped
+// code (including plain-string details from other paths) falls back to
+// the generic translated message rather than leaking raw English.
+const WORKFORCE_USE_ERROR_CODE_KEYS: Record<string, TranslationKey> = {
+  workforce_create_access_denied: "templates.errors.useWorkforceAccessDenied",
+  workforce_create_conflict: "templates.errors.useWorkforceRetry",
 };
 
-// Must match UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX in
-// src/xagent/web/services/workforce_creator.py exactly - a stable marker
-// for a message whose remainder (the agent's name) is too dynamic to be a
-// WORKFORCE_USE_ERROR_KEYS key. Unlike that map's generic 409, this error
-// can never be resolved by retrying, so it needs its own specific,
-// translated message rather than falling back to the generic one
-// (PR #1127 re-review, F1).
-const UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX =
-  "This workforce needs an agent that is currently unpublished: ";
+// Unlike the codes above, this error can never be resolved by retrying, so
+// it renders its own message interpolating the agent's name from
+// detail.params rather than a static translation (PR #1127 re-review, F1).
+const WORKFORCE_WORKER_UNPUBLISHED_CODE = "workforce_worker_unpublished";
 
 export default function TemplatesPage() {
   return (
@@ -91,6 +88,18 @@ function TemplatesPageContent() {
   const [searchQuery, setSearchQuery] = useState("");
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
+  // If the user navigates away while a workforce creation request is still
+  // in flight, the request still resolves - without this guard, its
+  // .then()/finally would call setState and router.push on an unmounted
+  // page, yanking the user back to the just-created workforce's canvas
+  // with no way to know why (PR #1127 re-review, M3).
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     const fetchTemplates = async () => {
@@ -205,48 +214,56 @@ function TemplatesPageContent() {
   }, [categories, featuredTemplates, filteredTemplates, searchQuery, selectedCategory, selectedType]);
 
   const handleUseTemplate = async (templateId: string) => {
+    // A workforce creation in flight locks EVERY card, not just other
+    // workforce cards - clicking a plain Agent card mid-creation used to
+    // still work, landing the user on /build/new only to be redirected back
+    // to the just-created workforce's canvas once that request resolved
+    // (PR #1127 re-review, M3).
+    if (creatingWorkforceId) return;
+
     const template = templates.find((item) => item.id === templateId);
     if (template?.type === "workforce") {
-      // Guards against a repeat click firing a second creation request while
-      // the first is still in flight (the card also disables itself via
-      // creatingWorkforceId, but that state update isn't synchronous).
-      if (creatingWorkforceId) return;
       setCreatingWorkforceId(templateId);
       try {
         const response = await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use-as-workforce?lang=${locale}`, {
           method: "POST",
         });
+        // The user may have navigated away while this request was in
+        // flight; the workforce still got created (or not) server-side
+        // either way, but this page must not act on that anymore.
+        if (!isMountedRef.current) return;
         if (response.ok) {
           const data = await response.json();
+          if (!isMountedRef.current) return;
           router.push(`/workforces/${data.workforce_id}?view=canvas`);
           return;
         }
         const parsed = await parseApiResponse(response);
-        const rawDetail = getApiErrorMessage(response, parsed, "");
-        if (rawDetail.startsWith(UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX)) {
-          // The backend appends a fixed ". Republish it..." sentence after
-          // the agent's name; strip it by locating that known suffix from
-          // the END rather than splitting on the first ". " - an agent
-          // named e.g. "Mr. Smith Analyzer" must not be truncated to "Mr".
-          // Falls back to the whole remainder if the suffix ever changes.
-          const remainder = rawDetail.slice(UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX.length);
-          const suffixStart = remainder.lastIndexOf(". Republish it");
-          const agentName = suffixStart > 0 ? remainder.slice(0, suffixStart) : remainder;
+        const detail = isJsonRecord(parsed.data) ? parsed.data.detail : null;
+        const code =
+          isJsonRecord(detail) && typeof detail.code === "string" ? detail.code : null;
+        if (code === WORKFORCE_WORKER_UNPUBLISHED_CODE) {
+          const params = isJsonRecord(detail) ? detail.params : null;
+          const agentName =
+            isJsonRecord(params) && typeof params.agent_name === "string"
+              ? params.agent_name
+              : "";
           toast.error(t("templates.errors.useWorkforceUnpublishedAgent", { agentName }));
         } else {
-          const messageKey = rawDetail ? WORKFORCE_USE_ERROR_KEYS[rawDetail] : undefined;
+          const messageKey = code ? WORKFORCE_USE_ERROR_CODE_KEYS[code] : undefined;
           toast.error(messageKey ? t(messageKey) : t("templates.errors.useWorkforceFailed"));
         }
       } catch {
-        toast.error(t("templates.errors.useWorkforceFailed"));
+        if (isMountedRef.current) toast.error(t("templates.errors.useWorkforceFailed"));
       } finally {
-        setCreatingWorkforceId(null);
+        if (isMountedRef.current) setCreatingWorkforceId(null);
       }
       return;
     }
     try {
       await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use`, { method: "POST" });
     } catch { }
+    if (!isMountedRef.current) return;
     router.push(`/build/new?template=${templateId}`);
   };
 
@@ -412,10 +429,11 @@ function TemplateSection({
             formatAgentsCount={formatAgentsCount}
             isBusy={creatingWorkforceId === template.id}
             busyLabel={busyLabel}
+            // Locks every OTHER card - agent or workforce - while a
+            // workforce is being created, matching the same-scoped lock
+            // handleUseTemplate now enforces (PR #1127 re-review, M3).
             disabled={
-              template.type === "workforce" &&
-              creatingWorkforceId !== null &&
-              creatingWorkforceId !== template.id
+              creatingWorkforceId !== null && creatingWorkforceId !== template.id
             }
             onUse={onUse}
             onLike={onLike}

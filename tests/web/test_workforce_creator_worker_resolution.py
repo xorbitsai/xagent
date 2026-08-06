@@ -170,7 +170,7 @@ def test_reuse_raises_specific_error_when_existing_agent_is_unpublished(
     from fastapi import HTTPException
 
     from xagent.web.services.workforce_creator import (
-        UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX,
+        WORKFORCE_WORKER_UNPUBLISHED_CODE,
     )
 
     user = _create_user(db_session)
@@ -197,8 +197,9 @@ def test_reuse_raises_specific_error_when_existing_agent_is_unpublished(
         )
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.detail.startswith(UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX)
-    assert "GA Analyzer" in exc_info.value.detail
+    assert exc_info.value.detail["code"] == WORKFORCE_WORKER_UNPUBLISHED_CODE
+    assert exc_info.value.detail["params"]["agent_name"] == "GA Analyzer"
+    assert "GA Analyzer" in exc_info.value.detail["message"]
     # Never silently republished or replaced.
     db_session.refresh(unpublished)
     assert unpublished.status == AgentStatus.DRAFT

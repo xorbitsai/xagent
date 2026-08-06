@@ -109,11 +109,9 @@ export function LibraryTemplateCard({
     onUse(template.id);
   };
   const isWorkforce = template.type === "workforce";
-  // Manager + workers - the badge label reads "N agents", so the count
-  // must include the manager too, or it undercounts by one against what
-  // "Use" actually creates (PR #1127 re-review, F6a).
-  const totalAgentCount =
-    (template.worker_names?.length || 0) + (template.manager_name ? 1 : 0);
+  // Server-computed manager + workers total, matching what "Use" actually
+  // creates (PR #1127 re-review, F6a).
+  const totalAgentCount = template.agent_count || 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (isNestedInteractiveElement(event.target, event.currentTarget)) {

@@ -558,12 +558,36 @@ sample_prompts:
         "mutate,match",
         [
             (lambda c: "not a dict", "must be a mapping"),
-            (lambda c: {**c, "manager": None}, "manager.instructions"),
+            (lambda c: {**c, "manager": None}, "manager.*must be a mapping"),
             (
                 lambda c: {**c, "manager": {"name": "M", "instructions": "  "}},
                 "manager.instructions",
             ),
             (lambda c: {**c, "manager": {"instructions": "Go"}}, "manager.name"),
+            # Strict isinstance(str) - str(...) coercion used to let YAML
+            # lists/ints through load-time validation, only to surface as
+            # garbage prompts/ids (or an AttributeError -> 500 for the
+            # normalize_text'd optional fields) at instantiation time
+            # (PR #1127 re-review, m1).
+            (
+                lambda c: {
+                    **c,
+                    "manager": {**c["manager"], "instructions": ["not", "a", "str"]},
+                },
+                "manager.instructions",
+            ),
+            (
+                lambda c: {**c, "manager": {**c["manager"], "description": 123}},
+                "manager.description",
+            ),
+            (
+                lambda c: {**c, "agents": [{**c["agents"][0], "template_id": 42}]},
+                r"agents\[0\]\.template_id",
+            ),
+            (
+                lambda c: {**c, "agents": [{**c["agents"][0], "alias": ["GA"]}]},
+                r"agents\[0\]\.alias",
+            ),
             (lambda c: {**c, "agents": None}, "agents.*non-empty list"),
             (lambda c: {**c, "agents": []}, "agents.*non-empty list"),
             (lambda c: {**c, "agents": ["not a dict"]}, r"agents\[0\].*mapping"),
@@ -620,6 +644,22 @@ sample_prompts:
         config = mutate(self._valid_workforce_config())
         with pytest.raises(ValueError, match=match):
             manager._validate_workforce_config(config)
+
+    def test_workforce_config_strings_are_normalized_in_place(self, tmp_path):
+        """Validation strips string fields in place. A template_id with
+        surrounding whitespace used to be stripped for the duplicate check
+        but looked up RAW at instantiation time, guaranteeing a
+        "references an unknown template" 400 the moment anyone used the
+        template (PR #1127 re-review, m1)."""
+        manager = TemplateManager(templates_root=tmp_path)
+        config = self._valid_workforce_config()
+        config["agents"][0]["template_id"] = "  ga-analyzer  "
+        config["manager"]["name"] = " Growth Manager "
+
+        manager._validate_workforce_config(config)
+
+        assert config["agents"][0]["template_id"] == "ga-analyzer"
+        assert config["manager"]["name"] == "Growth Manager"
 
     @pytest.mark.asyncio
     async def test_workforce_type_template_requires_workforce_config(self, tmp_path):

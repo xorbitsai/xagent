@@ -231,7 +231,7 @@ class V1TemplateSummary(BaseModel):
     tags: list[str] = Field(default_factory=list)
     author: str = ""
     version: str = ""
-    type: str = Field(
+    type: Literal["agent", "workforce"] = Field(
         default="agent",
         description="'agent' for a single-agent template, 'workforce' for a "
         "manager + worker-agents template that this API does not yet "

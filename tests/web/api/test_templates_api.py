@@ -12,7 +12,9 @@ from sqlalchemy.exc import IntegrityError
 
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.templates import (
+    get_or_create_template_stats,
     increment_template_likes,
+    increment_template_used_count,
 )
 from xagent.web.api.templates import router as templates_router
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
@@ -650,6 +652,64 @@ class TestTemplatesAPI:
             )
             assert response.json()["used_count"] == 1
 
+    def test_use_rejects_workforce_template(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        """The legacy POST /use only knows how to record usage for an
+        agent-creation flow (the frontend never calls it for a workforce
+        template today, but nothing stopped an external caller from
+        hitting it directly and getting a misleading 200 "recorded" while
+        creating nothing - every other agent-creation surface already
+        refuses workforce templates) (PR #1127 re-review, m2)."""
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            response = client.post(
+                "/api/templates/growth_workforce/use", headers=admin_headers
+            )
+            assert response.status_code == 400
+
+            detail = client.get(
+                "/api/templates/growth_workforce", headers=admin_headers
+            ).json()
+            assert detail["used_count"] == 0
+
+    def test_use_count_increments_atomically_under_concurrent_reads(
+        self, mock_app_state, admin_headers
+    ):
+        """`stats.used_count += 1` is an ORM read-modify-write: two sessions
+        that both read used_count=0 before either commits would both write
+        1, losing an increment. `increment_template_used_count` (mirroring
+        the existing `increment_template_likes` pattern) uses an atomic
+        `UPDATE ... SET used_count = used_count + 1` instead - simulate two
+        already-open sessions racing to prove the count doesn't stall at 1
+        (PR #1127 re-review, m3)."""
+        with patch.object(client.app, "state", mock_app_state):
+            db1 = next(get_db())
+            db2 = next(get_db())
+            try:
+                stats1 = get_or_create_template_stats(db1, "customer_support")
+                stats2 = get_or_create_template_stats(db2, "customer_support")
+                assert stats1.used_count == 0
+                assert stats2.used_count == 0
+
+                increment_template_used_count(db1, "customer_support")
+                db1.commit()
+                increment_template_used_count(db2, "customer_support")
+                db2.commit()
+            finally:
+                db1.close()
+                db2.close()
+
+            db = next(get_db())
+            try:
+                stats = (
+                    db.query(TemplateStats)
+                    .filter(TemplateStats.template_id == "customer_support")
+                    .one()
+                )
+                assert stats.used_count == 2
+            finally:
+                db.close()
+
     def test_get_template_increments_views(self, mock_app_state, admin_headers):
         """测试获取模板详情增加访问次数"""
         with patch.object(client.app, "state", mock_app_state):
@@ -967,9 +1027,8 @@ workforce_config:
         "please try again" a retry can never resolve - and the failed
         attempt must not leave a stray manager/Workforce behind
         (PR #1127 re-review, F1)."""
-        from xagent.web.models.agent import AgentOrigin, AgentStatus
         from xagent.web.services.workforce_creator import (
-            UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX,
+            WORKFORCE_WORKER_UNPUBLISHED_CODE,
         )
 
         db = next(get_db())
@@ -995,10 +1054,13 @@ workforce_config:
                 headers=admin_headers,
             )
             assert response.status_code == 400
-            assert response.json()["detail"].startswith(
-                UNPUBLISHED_WORKER_AGENT_DETAIL_PREFIX
-            )
-            assert "GA Analyzer" in response.json()["detail"]
+            # Structured {code, message, params} detail - the frontend maps
+            # the machine code and interpolates params.agent_name rather
+            # than parsing the English message (PR #1127 re-review, m4).
+            detail = response.json()["detail"]
+            assert detail["code"] == WORKFORCE_WORKER_UNPUBLISHED_CODE
+            assert detail["params"]["agent_name"] == "GA Analyzer"
+            assert "GA Analyzer" in detail["message"]
 
             db = next(get_db())
             try:
@@ -1008,3 +1070,205 @@ workforce_config:
                 assert db.query(Agent).count() == 1
             finally:
                 db.close()
+
+    def test_recovers_from_a_genuine_concurrent_workforce_name_collision(
+        self, workforce_mock_app_state, admin_headers, admin_user
+    ):
+        """Two concurrent instantiations of THIS SAME template resolve the
+        SAME Workforce name - unlike `create_workforce_from_prompt`'s
+        LLM-generated name, a workforce template's name is fixed, so this
+        collision is the realistic case, not a theoretical one. Uses a
+        genuinely separate session (not a row staged inside the same
+        SAVEPOINT scope, which a first attempt at this test class of
+        problem already proved gets rolled back right along with the
+        failed insert - see the worker-resolution race tests) to commit a
+        colliding `Workforce` row between our own `resolve_unique_workforce_name`
+        check and our own insert, reproducing the exact TOCTOU window a
+        double-click, a double-tab, or a retried request can hit
+        (PR #1127 re-review, M1)."""
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import get_engine
+        from xagent.web.services import workforce_creator
+
+        real_resolve_unique_workforce_name = (
+            workforce_creator.resolve_unique_workforce_name
+        )
+        session_factory = sessionmaker(bind=get_engine())
+        call_count = {"n": 0}
+        competitor_manager_id: dict[str, int] = {}
+
+        def _collide_once_then_resolve(db, *, scope_type, scope_id, name):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                competitor_session = session_factory()
+                try:
+                    # This engine enforces FK constraints (PRAGMA
+                    # foreign_keys=ON, see src/xagent/db/sqlite.py) -
+                    # manager_agent_id needs a real Agent row.
+                    competitor_manager = Agent(
+                        user_id=admin_user["id"],
+                        name="Competitor Manager",
+                        instructions="from the concurrent winner",
+                        execution_mode="think",
+                        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+                        status=AgentStatus.PUBLISHED,
+                    )
+                    competitor_session.add(competitor_manager)
+                    competitor_session.flush()
+                    competitor_manager_id["id"] = competitor_manager.id
+                    competitor_session.add(
+                        Workforce(
+                            owner_user_id=admin_user["id"],
+                            scope_type=scope_type,
+                            scope_id=scope_id,
+                            name=name,
+                            manager_agent_id=competitor_manager.id,
+                            status="draft",
+                        )
+                    )
+                    competitor_session.commit()
+                finally:
+                    competitor_session.close()
+                return name
+            return real_resolve_unique_workforce_name(
+                db, scope_type=scope_type, scope_id=scope_id, name=name
+            )
+
+        with (
+            patch.object(client.app, "state", workforce_mock_app_state),
+            patch.object(
+                workforce_creator,
+                "resolve_unique_workforce_name",
+                side_effect=_collide_once_then_resolve,
+            ),
+        ):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        assert call_count["n"] == 2
+
+        db = next(get_db())
+        try:
+            workforces = db.query(Workforce).all()
+            assert len(workforces) == 2
+            # The competitor's manager agent is a fixture of this test, not
+            # the real request's - so whichever row does NOT point at it is
+            # the real request's Workforce, and it must have gotten a
+            # disambiguated name rather than colliding again.
+            real_workforce = next(
+                w
+                for w in workforces
+                if w.manager_agent_id != competitor_manager_id["id"]
+            )
+            competitor_workforce = next(
+                w
+                for w in workforces
+                if w.manager_agent_id == competitor_manager_id["id"]
+            )
+            assert competitor_workforce.name == "Growth Marketing Workforce"
+            assert real_workforce.name != "Growth Marketing Workforce"
+            assert real_workforce.name.startswith("Growth Marketing Workforce")
+        finally:
+            db.close()
+
+    def test_recovers_from_a_genuine_concurrent_worker_agent_collision(
+        self, workforce_mock_app_state, admin_headers, admin_user
+    ):
+        """Two-session counterpart of the worker-resolution unit tests
+        (which run on a shared-connection in-memory DB): the competing
+        quick-access GA Analyzer is committed by a genuinely separate
+        session/transaction against the file-backed test DB, and only the
+        resolver's initial SELECT miss is simulated - so the INSERT
+        collision, the SAVEPOINT rollback, the constraint classification,
+        and the recovery re-read all run against a real concurrent
+        transaction's committed row (PR #1127 re-review, m5).
+
+        The competitor must commit BEFORE the request starts: by the time
+        worker resolution runs, the request's transaction already holds
+        the manager-agent/Workforce writes, and SQLite's single-writer
+        model blocks any other session's commit until that transaction
+        ends ("database is locked" - reproduced). Interleaving a
+        mid-transaction competitor commit is only physically possible on
+        PostgreSQL; this is the maximal genuine reproduction SQLite
+        permits.
+        """
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import get_engine
+        from xagent.web.services import workforce_creator
+
+        real_find = workforce_creator._find_quick_access_worker_agent
+        session_factory = sessionmaker(bind=get_engine())
+        competitor_agent_id: dict[str, int] = {}
+        ga_lookups = {"n": 0}
+
+        competitor_session = session_factory()
+        try:
+            competitor = Agent(
+                user_id=admin_user["id"],
+                name="GA Analyzer",
+                instructions="from the concurrent winner",
+                execution_mode="balanced",
+                template_id="ga_analyzer",
+                origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                status=AgentStatus.PUBLISHED,
+            )
+            competitor_session.add(competitor)
+            competitor_session.commit()
+            competitor_agent_id["id"] = competitor.id
+        finally:
+            competitor_session.close()
+
+        def _miss_once_then_delegate(db, *, user_id, template_id):
+            if template_id != "ga_analyzer":
+                return real_find(db, user_id=user_id, template_id=template_id)
+            ga_lookups["n"] += 1
+            if ga_lookups["n"] == 1:
+                # Simulates the TOCTOU window: this SELECT ran before the
+                # concurrent winner's commit became visible.
+                return None
+            return real_find(db, user_id=user_id, template_id=template_id)
+
+        with (
+            patch.object(client.app, "state", workforce_mock_app_state),
+            patch.object(
+                workforce_creator,
+                "_find_quick_access_worker_agent",
+                side_effect=_miss_once_then_delegate,
+            ),
+        ):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        # Initial miss + the post-IntegrityError recovery re-read.
+        assert ga_lookups["n"] == 2
+
+        db = next(get_db())
+        try:
+            workforce_id = response.json()["workforce_id"]
+            worker_agent_ids = {
+                w.agent_id
+                for w in db.query(WorkforceAgent).filter(
+                    WorkforceAgent.workforce_id == workforce_id
+                )
+            }
+            # The concurrent winner's row was reused, not duplicated.
+            assert competitor_agent_id["id"] in worker_agent_ids
+            assert (
+                db.query(Agent)
+                .filter(
+                    Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                    Agent.template_id == "ga_analyzer",
+                )
+                .count()
+                == 1
+            )
+        finally:
+            db.close()

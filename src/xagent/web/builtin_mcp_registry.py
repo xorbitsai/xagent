@@ -515,6 +515,27 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "notion",
+            "name": "Notion",
+            "description": "Connect to Notion to search your workspace and read, create and update pages and databases through Notion's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=notion.so&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola: Notion hosts the
+            # MCP server itself and exposes its own tools — there is no local
+            # module to launch. Users connect via POST
+            # /api/mcp/apps/{id}/oauth/connect (per-user OAuth Authorization
+            # Code + PKCE); Notion supports Dynamic Client Registration, so no
+            # static client credentials are required.
+            "launch_config": {
+                "url": "https://mcp.notion.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        },
+        {
             "app_id": "aws",
             "name": "AWS",
             "description": "Connect to AWS to check CloudWatch alarms/metrics/logs, DynamoDB health, and SQS queue depth.",

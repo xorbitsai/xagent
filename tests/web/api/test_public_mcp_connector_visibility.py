@@ -771,6 +771,13 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
         "auth": {"type": "mcp_oauth"},
     }
 
+    # Remote MCP: Notion hosts the server itself, same shape as Granola.
+    assert rows_by_app_id["notion"]["transport"] == "streamable_http"
+    assert rows_by_app_id["notion"]["launch_config"] == {
+        "url": "https://mcp.notion.com/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
     assert rows_by_app_id["aws"]["launch_config"] == {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.aws"],
@@ -778,14 +785,15 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
     }
 
 
-def test_builtin_registry_classifies_granola_as_mcp_oauth() -> None:
+@pytest.mark.parametrize("app_id", ["granola", "notion"])
+def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
     """The registry shape must classify as mcp_oauth — anything else means the
     catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps
     and generic_oauth_login rejects non-"oauth" transports)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
     from xagent.web.mcp_apps import classify_app_auth
 
-    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "granola")
+    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == app_id)
     assert classify_app_auth(row["transport"], row["launch_config"]) == "mcp_oauth"
 
 

@@ -523,3 +523,322 @@ sample_prompts:
         templates = await manager.list_templates()
 
         assert len(templates) == 0
+
+    # ----- workforce_config validation (PR #1127 review: zero coverage) -----
+
+    @staticmethod
+    def _valid_workforce_config():
+        return {
+            "manager": {
+                "name": "Growth Manager",
+                "instructions": "Orchestrate.",
+                "execution_mode": "think",
+                "tool_categories": ["basic"],
+                "skills": [],
+            },
+            "agents": [
+                {
+                    "template_id": "ga-analyzer",
+                    "name": "GA Analyzer",
+                    "assignment_instructions": "Measure performance.",
+                },
+                {
+                    "template_id": "ads-recommendation",
+                    "name": "Ads Recommendation",
+                    "assignment_instructions": "Recommend spend changes.",
+                },
+            ],
+        }
+
+    def test_valid_workforce_config_does_not_raise(self, tmp_path):
+        manager = TemplateManager(templates_root=tmp_path)
+        manager._validate_workforce_config(self._valid_workforce_config())
+
+    @pytest.mark.parametrize(
+        "mutate,match",
+        [
+            (lambda c: "not a dict", "must be a mapping"),
+            (lambda c: {**c, "manager": None}, "manager.*must be a mapping"),
+            (
+                lambda c: {**c, "manager": {"name": "M", "instructions": "  "}},
+                "manager.instructions",
+            ),
+            (lambda c: {**c, "manager": {"instructions": "Go"}}, "manager.name"),
+            # Strict isinstance(str) - str(...) coercion used to let YAML
+            # lists/ints through load-time validation, only to surface as
+            # garbage prompts/ids (or an AttributeError -> 500 for the
+            # normalize_text'd optional fields) at instantiation time
+            # (PR #1127 re-review, m1).
+            (
+                lambda c: {
+                    **c,
+                    "manager": {**c["manager"], "instructions": ["not", "a", "str"]},
+                },
+                "manager.instructions",
+            ),
+            (
+                lambda c: {**c, "manager": {**c["manager"], "description": 123}},
+                "manager.description",
+            ),
+            (
+                lambda c: {**c, "agents": [{**c["agents"][0], "template_id": 42}]},
+                r"agents\[0\]\.template_id",
+            ),
+            (
+                lambda c: {**c, "agents": [{**c["agents"][0], "alias": ["GA"]}]},
+                r"agents\[0\]\.alias",
+            ),
+            (lambda c: {**c, "agents": None}, "agents.*non-empty list"),
+            (lambda c: {**c, "agents": []}, "agents.*non-empty list"),
+            (lambda c: {**c, "agents": ["not a dict"]}, r"agents\[0\].*mapping"),
+            (
+                lambda c: {**c, "agents": [{**c["agents"][0], "template_id": ""}]},
+                r"agents\[0\]\.template_id",
+            ),
+            (
+                lambda c: {**c, "agents": [{**c["agents"][0], "name": ""}]},
+                r"agents\[0\]\.name",
+            ),
+            (
+                lambda c: {
+                    **c,
+                    "agents": [{**c["agents"][0], "assignment_instructions": ""}],
+                },
+                r"agents\[0\]\.assignment_instructions",
+            ),
+            (
+                lambda c: {
+                    **c,
+                    "agents": [
+                        c["agents"][0],
+                        {
+                            **c["agents"][1],
+                            "template_id": c["agents"][0]["template_id"],
+                        },
+                    ],
+                },
+                "duplicate template_id",
+            ),
+            (
+                lambda c: {
+                    **c,
+                    "manager": {**c["manager"], "execution_mode": "sonic"},
+                },
+                "manager.execution_mode",
+            ),
+            (
+                lambda c: {
+                    **c,
+                    "manager": {**c["manager"], "tool_categories": "basic"},
+                },
+                "manager.tool_categories",
+            ),
+            (
+                lambda c: {**c, "manager": {**c["manager"], "skills": [123]}},
+                "manager.skills",
+            ),
+        ],
+    )
+    def test_invalid_workforce_config_raises(self, tmp_path, mutate, match):
+        manager = TemplateManager(templates_root=tmp_path)
+        config = mutate(self._valid_workforce_config())
+        with pytest.raises(ValueError, match=match):
+            manager._validate_workforce_config(config)
+
+    def test_workforce_config_strings_are_normalized_in_place(self, tmp_path):
+        """Validation strips string fields in place. A template_id with
+        surrounding whitespace used to be stripped for the duplicate check
+        but looked up RAW at instantiation time, guaranteeing a
+        "references an unknown template" 400 the moment anyone used the
+        template (PR #1127 re-review, m1)."""
+        manager = TemplateManager(templates_root=tmp_path)
+        config = self._valid_workforce_config()
+        config["agents"][0]["template_id"] = "  ga-analyzer  "
+        config["manager"]["name"] = " Growth Manager "
+
+        manager._validate_workforce_config(config)
+
+        assert config["agents"][0]["template_id"] == "ga-analyzer"
+        assert config["manager"]["name"] == "Growth Manager"
+
+    @pytest.mark.asyncio
+    async def test_workforce_type_template_requires_workforce_config(self, tmp_path):
+        """A `type: workforce` template with no workforce_config at all must
+        fail to load (not silently become a broken, config-less template)."""
+        (tmp_path / "broken_workforce.yaml").write_text(
+            """
+id: broken_workforce
+name: Broken Workforce
+category: Marketing
+type: workforce
+descriptions:
+  en: Missing workforce_config entirely.
+"""
+        )
+        manager = TemplateManager(templates_root=tmp_path)
+        await manager.initialize()
+
+        assert await manager.get_template("broken_workforce") is None
+
+    @pytest.mark.asyncio
+    async def test_agent_type_template_never_sees_workforce_validation(self, tmp_path):
+        """type defaults to 'agent' and must not trip workforce_config
+        validation just because a template happens to omit it (the common
+        case for every pre-existing template)."""
+        (tmp_path / "plain_agent.yaml").write_text(
+            """
+id: plain_agent
+name: Plain Agent
+category: General
+descriptions:
+  en: A normal single-agent template.
+agent_config:
+  instructions: You help with things.
+"""
+        )
+        manager = TemplateManager(templates_root=tmp_path)
+        await manager.initialize()
+
+        template = await manager.get_template("plain_agent")
+        assert template is not None
+        assert template["type"] == "agent"
+        assert template["workforce_config"] is None
+        assert template["agent_config"]["instructions"]
+
+    # ----- _warn_on_dangling_workforce_references -----
+
+    @pytest.mark.asyncio
+    async def test_dangling_workforce_reference_warns_but_still_loads(
+        self, tmp_path, caplog
+    ):
+        (tmp_path / "wf.yaml").write_text(
+            """
+id: wf
+name: WF
+category: Marketing
+type: workforce
+descriptions:
+  en: A workforce with a typo'd worker reference.
+workforce_config:
+  manager:
+    name: Manager
+    instructions: Orchestrate.
+  agents:
+  - template_id: does-not-exist
+    name: Ghost Worker
+    assignment_instructions: Do the thing.
+"""
+        )
+        manager = TemplateManager(templates_root=tmp_path)
+        with caplog.at_level("WARNING"):
+            await manager.initialize()
+
+        assert await manager.get_template("wf") is not None
+        assert any(
+            "does-not-exist" in record.message and record.levelname == "WARNING"
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_workforce_referencing_another_workforce_warns(
+        self, tmp_path, caplog
+    ):
+        """agents[].template_id must resolve to an 'agent'-type template - a
+        workforce referencing another workforce as a worker would crash at
+        instantiation time (that template's agent_config is null), so this
+        must be flagged at load time too, not just guarded at the point of
+        use."""
+        (tmp_path / "inner.yaml").write_text(
+            """
+id: inner
+name: Inner
+category: Marketing
+type: workforce
+descriptions:
+  en: Another workforce, wrongly used as a worker below.
+workforce_config:
+  manager:
+    name: Inner Manager
+    instructions: Orchestrate.
+  agents:
+  - template_id: leaf
+    name: Leaf
+    assignment_instructions: Do the thing.
+"""
+        )
+        (tmp_path / "leaf.yaml").write_text(
+            """
+id: leaf
+name: Leaf
+category: Marketing
+descriptions:
+  en: A normal single-agent template.
+agent_config:
+  instructions: You help with things.
+"""
+        )
+        (tmp_path / "outer.yaml").write_text(
+            """
+id: outer
+name: Outer
+category: Marketing
+type: workforce
+descriptions:
+  en: References 'inner' (a workforce) as if it were a single agent.
+workforce_config:
+  manager:
+    name: Outer Manager
+    instructions: Orchestrate.
+  agents:
+  - template_id: inner
+    name: Nested Workforce
+    assignment_instructions: Do the thing.
+"""
+        )
+        manager = TemplateManager(templates_root=tmp_path)
+        with caplog.at_level("WARNING"):
+            await manager.initialize()
+
+        assert any(
+            "outer" in record.message
+            and "inner" in record.message
+            and "not 'agent'" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_builtin_workforce_template_references_resolve(self):
+        """The real shipped YAML never loaded in any test before this - a
+        typo'd `workforce_config.agents[].template_id` on the built-in
+        Growth Marketing Workforce template would not have failed CI. Load
+        the actual built_in/ directory and assert every workforce
+        template's references resolve to a loaded 'agent'-type template."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        manager = TemplateManager(templates_root=built_in_dir)
+        await manager.initialize()
+        templates = {t["id"]: t for t in await manager.list_templates()}
+
+        workforce_templates = [
+            t for t in templates.values() if t["type"] == "workforce"
+        ]
+        assert workforce_templates, "expected at least one built-in workforce template"
+
+        offenders: list[str] = []
+        for template in workforce_templates:
+            workforce_config = template.get("workforce_config") or {}
+            for agent in workforce_config.get("agents") or []:
+                referenced_id = agent.get("template_id")
+                referenced = templates.get(referenced_id)
+                if referenced is None:
+                    offenders.append(
+                        f"{template['id']} -> unknown template_id {referenced_id!r}"
+                    )
+                elif referenced.get("type", "agent") != "agent":
+                    offenders.append(
+                        f"{template['id']} -> {referenced_id!r} has type="
+                        f"{referenced.get('type')!r}, not 'agent'"
+                    )
+
+        assert not offenders, "\n".join(offenders)

@@ -63,10 +63,28 @@ def _purge_user_task_rows(db: Session, *, user_id: int) -> None:
     Ordering matches ``purge_task_rows``: every child row referencing
     ``tasks.id`` goes before the ``tasks`` delete, so the purge stays valid
     under enforced foreign keys regardless of whether the deployment's schema
-    carries ``ON DELETE`` clauses.
+    carries ``ON DELETE`` clauses. ``tasks`` itself is also referenced --
+    ``last_checkpoint_trace_event_id`` FKs to ``trace_events.id`` -- so the
+    pointer columns are NULLed first, before the ``trace_events`` delete
+    below.
     """
 
     task_ids = select(Task.id).where(Task.user_id == user_id).scalar_subquery()
+
+    # NULL the checkpoint pointer columns before the trace_events delete
+    # below: a task still pointing at a row would block (or, without
+    # DB-level enforcement, orphan) that delete. A bulk statement, not an
+    # ORM attribute assignment, because this session has autoflush
+    # disabled -- an attribute assignment would not reach the database
+    # until a later flush, by which point the trace_events delete has
+    # already run.
+    db.query(Task).filter(Task.user_id == user_id).update(
+        {
+            Task.last_checkpoint_event_id: None,
+            Task.last_checkpoint_trace_event_id: None,
+        },
+        synchronize_session=False,
+    )
 
     # Children without a DB-level ``ON DELETE`` clause -- these are the rows a
     # bare ``DELETE FROM tasks`` would strand or fail on under strict FKs.

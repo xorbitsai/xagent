@@ -231,10 +231,20 @@ class V1TemplateSummary(BaseModel):
     tags: list[str] = Field(default_factory=list)
     author: str = ""
     version: str = ""
+    type: Literal["agent", "workforce"] = Field(
+        default="agent",
+        description="'agent' for a single-agent template, 'workforce' for a "
+        "manager + worker-agents template that this API does not yet "
+        "support instantiating.",
+    )
 
 
 class V1TemplateDetail(V1TemplateSummary):
-    agent_config: dict[str, Any]
+    agent_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Agent configuration for an 'agent'-type template. None "
+        "for a 'workforce'-type template.",
+    )
 
 
 class CreateTaskResponse(BaseModel):

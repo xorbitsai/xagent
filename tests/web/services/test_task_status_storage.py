@@ -506,6 +506,7 @@ _LEASE_CASE_BUILDER_NAMES = {
     "lease_run_id_case",
     "lease_state_version_case",
     "lease_checkpoint_event_id_case",
+    "lease_checkpoint_trace_event_id_case",
 }
 
 
@@ -594,7 +595,7 @@ def _stray_task_status_case_calls(
 
 
 def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> None:
-    """Without this, someone can inline a fourth Task.status-referencing
+    """Without this, someone can inline a fifth Task.status-referencing
     case() back into a statement and the imported-builder tests above stay
     green while production drifts -- the same failure mode this recoupling
     closes, one level up. Scoped to case() calls that reference
@@ -605,13 +606,12 @@ def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> N
     source = Path(task_lease_service.__file__).read_text()
     stray = _stray_task_status_case_calls(source, _LEASE_CASE_BUILDER_NAMES)
     assert stray == [], (
-        f"case() referencing Task.status called outside the three lease "
-        f"builders: {stray}"
+        f"case() referencing Task.status called outside the lease builders: {stray}"
     )
 
 
 def test_lease_case_ban_ignores_case_calls_on_unrelated_columns() -> None:
-    """Negative control: a case() outside the three builders that never
+    """Negative control: a case() outside the lease builders that never
     touches Task.status must not be flagged by the check above.
     """
     fixture = """
@@ -661,7 +661,7 @@ def test_lease_case_ban_flags_qualified_and_aliased_case_calls(
 
 
 def test_lease_case_ban_allows_helpers_nested_in_the_lease_builders() -> None:
-    """A helper function nested *inside* one of the three lease builders
+    """A helper function nested *inside* one of the lease builders
     must not be flagged -- this requires checking every enclosing scope,
     not just the innermost one.
     """

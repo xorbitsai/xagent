@@ -1806,7 +1806,7 @@ describe("Home", () => {
 
       expect(templateDecoder.match(/return \{/g)).toHaveLength(1)
       expect(templateDecoder).toMatch(
-        /connections\.push\(\{ name: connection\.name, logo: connection\.logo \}\);[\s\S]*?return \{\s*id: value\.id,\s*name: value\.name,\s*category: value\.category,\s*description: value\.description,\s*features: \[\.\.\.value\.features\],\s*connections,\s*setup_time: value\.setup_time,\s*likes: value\.likes,\s*used_count: value\.used_count,\s*\};/,
+        /connections\.push\(\{ name: connection\.name, logo: connection\.logo \}\);[\s\S]*?return \{\s*id: value\.id,\s*name: value\.name,\s*category: value\.category,\s*description: value\.description,\s*features: \[\.\.\.value\.features\],\s*connections,\s*setup_time: value\.setup_time,\s*likes: value\.likes,\s*used_count: value\.used_count,[\s\S]*?type: typeof value\.type === "string" \? value\.type : "agent",\s*\};/,
       )
       expect(recentDecoder.match(/return \{/g)).toHaveLength(1)
       expect(recentDecoder).toMatch(

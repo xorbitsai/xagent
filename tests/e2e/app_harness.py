@@ -14,6 +14,7 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.shared.db_teardown import drop_all_tables
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import get_engine, get_session_local, init_db
@@ -219,9 +220,7 @@ def run_e2e_app_client(
         reset_chat_agent_manager(monkeypatch)
         clear_connection_cache()
         try:
-            from xagent.web.models.database import Base
-
-            Base.metadata.drop_all(bind=get_engine())
+            drop_all_tables(get_engine())
             get_engine().dispose()
         except RuntimeError:
             pass

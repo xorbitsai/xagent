@@ -1572,6 +1572,21 @@ Build when you need.`,
       knowledge: "Knowledge & Research",
       sales: "Sales & Outreach"
     },
+    typeFilter: {
+      all: "All types",
+      agent: "Agent",
+      workforce: "Workforce"
+    },
+    workforceBadge: "Workforce",
+    agentsCountOne: "{count} agent",
+    agentsCountOther: "{count} agents",
+    creatingWorkforce: "Creating...",
+    errors: {
+      useWorkforceFailed: "Couldn't create the workforce from this template. Please try again.",
+      useWorkforceAccessDenied: "You don't have permission to create a workforce.",
+      useWorkforceRetry: "Too many concurrent requests for this template. Please try again.",
+      useWorkforceUnpublishedAgent: "The \"{agentName}\" agent this workforce needs is currently unpublished. Republish it from your Agents list, then try again."
+    }
   },
   sidebar: {
     tasks: {
@@ -2452,6 +2467,7 @@ Build when you need.`,
         unknown: "An unknown error occurred",
         notFound: "Agent not found",
         notFoundDesc: "The agent you are looking for does not exist or has been deleted.",
+        templateIsWorkforce: "This template creates a workforce, not a single agent. Use it from the Templates page instead.",
       },
       kbToolWarning: {
         title: "Knowledge Tools Required",

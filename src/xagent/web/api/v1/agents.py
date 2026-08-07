@@ -20,6 +20,7 @@ from ...services.agent_management import (
     InvalidKnowledgeBaseError,
     RuntimeKeySnapshot,
     TemplateNotFoundError,
+    WorkforceTemplateNotSupportedError,
 )
 from ...services.api_keys import KeyRotationConflict
 from .deps import (
@@ -153,6 +154,13 @@ async def create_agent_from_template(
         )
     except TemplateNotFoundError:
         raise V1ApiError(V1ErrorCode.TEMPLATE_NOT_FOUND, 404)
+    except WorkforceTemplateNotSupportedError:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            400,
+            "This template creates a workforce, not a single agent, and "
+            "cannot be used with this endpoint.",
+        )
     except DuplicateAgentNameError:
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT, 400, "Agent with this name already exists."

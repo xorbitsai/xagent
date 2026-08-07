@@ -1996,7 +1996,7 @@ const zh = {
       createDescription: "创建新的知识库并上传文档或从网站导入内容",
       basicInfo: {
         title: "基本信息",
-        nameLabel: "知识库名称 *",
+        nameLabel: "知识库名称",
         namePlaceholder: "请输入知识库名称",
         descriptionLabel: "描述",
         descriptionPlaceholder: "知识库描述（可选）",

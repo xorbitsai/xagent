@@ -1996,7 +1996,7 @@ Build when you need.`,
       createDescription: "Create a new knowledge base and upload documents or import from website",
       basicInfo: {
         title: "Basic Information",
-        nameLabel: "Knowledge Base Name *",
+        nameLabel: "Knowledge Base Name",
         namePlaceholder: "Enter knowledge base name",
         descriptionLabel: "Description",
         descriptionPlaceholder: "Knowledge base description (optional)",

@@ -767,7 +767,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             {currentStep === 1 && (
               <div className="space-y-6 mt-4">
                 <div>
-                  <Label htmlFor="collection_name" className="text-sm font-medium">{t("kb.dialog.basicInfo.nameLabel")}</Label>
+                  <Label htmlFor="collection_name" className="text-sm font-medium">{t("kb.dialog.basicInfo.nameLabel")} <span className="text-destructive">*</span></Label>
                   <Input
                     id="collection_name"
                     value={newCollectionName}

@@ -1,7 +1,7 @@
 "use client";
 
-import { type KeyboardEvent, type MouseEvent } from "react";
-import { Clock, Heart, Play } from "lucide-react";
+import React, { type KeyboardEvent, type MouseEvent } from "react";
+import { Clock, Heart, Loader2, Play, Users } from "lucide-react";
 import type { Template } from "@/types/template";
 import { cn } from "@/lib/utils";
 import { isNestedInteractiveElement } from "./template-card-utils";
@@ -11,6 +11,21 @@ interface LibraryTemplateCardProps {
   categoryLabel?: string;
   useLabel: string;
   defaultSetupTime: string;
+  workforceBadgeLabel?: string;
+  formatAgentsCount?: (count: number) => string;
+  /** True while this specific template's "Use" action is in flight (currently only
+   * meaningful for workforce templates, which create real records server-side and
+   * can take a few seconds). Disables activation and swaps the button to a spinner
+   * so a slow request can't be re-triggered by an impatient repeat click. */
+  isBusy?: boolean;
+  busyLabel?: string;
+  /** True when a *different* workforce template is currently being created
+   * (creatingWorkforceId is a single global lock, not per-card - see
+   * templates/page.tsx). Blocks activation like isBusy, but without
+   * claiming this card itself is the one in flight: no spinner, no label
+   * swap, just a visibly disabled state instead of a click that silently
+   * does nothing. */
+  disabled?: boolean;
   onUse: (templateId: string) => void;
   onLike?: (templateId: string, event: MouseEvent<HTMLButtonElement>) => void;
   className?: string;
@@ -79,11 +94,24 @@ export function LibraryTemplateCard({
   categoryLabel,
   useLabel,
   defaultSetupTime,
+  workforceBadgeLabel,
+  formatAgentsCount,
+  isBusy,
+  busyLabel,
+  disabled,
   onUse,
   onLike,
   className,
 }: LibraryTemplateCardProps) {
-  const handleActivate = () => onUse(template.id);
+  const isBlocked = isBusy || disabled;
+  const handleActivate = () => {
+    if (isBlocked) return;
+    onUse(template.id);
+  };
+  const isWorkforce = template.type === "workforce";
+  // Server-computed manager + workers total, matching what "Use" actually
+  // creates.
+  const totalAgentCount = template.agent_count || 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (isNestedInteractiveElement(event.target, event.currentTarget)) {
@@ -103,24 +131,37 @@ export function LibraryTemplateCard({
     <div
       role="button"
       tabIndex={0}
+      aria-disabled={isBlocked || undefined}
+      aria-busy={isBusy || undefined}
       onClick={handleActivate}
       onKeyDown={handleKeyDown}
       className={cn(
         "group flex h-full cursor-pointer flex-col rounded-[18px] border border-border bg-card p-5 shadow-sm transition-all duration-300 ease-out hover:-translate-y-1 hover:border-transparent hover:shadow-[0_16px_40px_rgba(0,0,0,0.11)]",
+        isBusy && "cursor-wait opacity-70",
+        disabled && !isBusy && "cursor-not-allowed opacity-50",
         className
       )}
     >
-      {/* Category pill + setup time */}
+      {/* Category pill + workforce badge + setup time */}
       <div className="mb-3.5 flex items-center justify-between gap-2">
-        <span
-          className={cn(
-            "inline-flex items-center gap-1.5 rounded-full px-[9px] py-1 text-[11.5px] font-semibold",
-            pill
-          )}
-        >
-          <span className="h-[5px] w-[5px] rounded-full bg-current" />
-          {categoryLabel || template.category}
-        </span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full px-[9px] py-1 text-[11.5px] font-semibold",
+              pill
+            )}
+          >
+            <span className="h-[5px] w-[5px] rounded-full bg-current" />
+            {categoryLabel || template.category}
+          </span>
+          {isWorkforce ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-[9px] py-1 text-[11.5px] font-semibold text-teal-700 dark:bg-teal-950/50 dark:text-teal-300">
+              <Users className="h-3 w-3 flex-shrink-0" />
+              {workforceBadgeLabel}
+              {totalAgentCount > 0 && formatAgentsCount ? ` · ${formatAgentsCount(totalAgentCount)}` : ""}
+            </span>
+          ) : null}
+        </div>
         {template.setup_time || defaultSetupTime ? (
           <span className="flex items-center gap-1 whitespace-nowrap text-[11.5px] font-medium text-muted-foreground">
             <Clock className="h-3 w-3 flex-shrink-0" />
@@ -176,13 +217,24 @@ export function LibraryTemplateCard({
 
       <button
         type="button"
-        className="mt-4 h-[38px] rounded-[10px] bg-primary/10 text-[13.5px] font-semibold text-primary transition-all duration-300 hover:bg-primary hover:text-primary-foreground active:scale-[0.98]"
+        disabled={isBlocked}
+        className={cn(
+          "mt-4 flex h-[38px] items-center justify-center gap-1.5 rounded-[10px] bg-primary/10 text-[13.5px] font-semibold text-primary transition-all duration-300 hover:bg-primary hover:text-primary-foreground active:scale-[0.98] disabled:opacity-70 disabled:hover:bg-primary/10 disabled:hover:text-primary",
+          isBusy ? "disabled:cursor-wait" : "disabled:cursor-not-allowed"
+        )}
         onClick={(event) => {
           event.stopPropagation();
           handleActivate();
         }}
       >
-        {useLabel}
+        {isBusy ? (
+          <>
+            <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin" />
+            {busyLabel || useLabel}
+          </>
+        ) : (
+          useLabel
+        )}
       </button>
     </div>
   );

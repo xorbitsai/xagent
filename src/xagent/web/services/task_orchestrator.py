@@ -975,6 +975,7 @@ def _claim_turn_no_commit(
                 Task.last_heartbeat_at: None,
                 Task.run_id: run_id,
                 Task.last_checkpoint_event_id: None,
+                Task.last_checkpoint_trace_event_id: None,
                 Task.state_version: func.coalesce(Task.state_version, 0) + 1,
                 Task.control_state: TaskControlState.RUNNING.value,
             },

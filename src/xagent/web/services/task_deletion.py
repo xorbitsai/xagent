@@ -28,6 +28,21 @@ def purge_task_rows(
     if task is None:
         return False
 
+    # NULL the checkpoint pointer columns before the trace_events delete
+    # below: last_checkpoint_trace_event_id FKs to trace_events.id, so a
+    # task still pointing at a row would block (or, without DB-level
+    # enforcement, orphan) that delete. A bulk statement, not an ORM
+    # attribute assignment, because this session has autoflush disabled --
+    # an attribute assignment would not reach the database until a later
+    # flush, by which point the trace_events delete has already run.
+    db.query(Task).filter(Task.id == task_id).update(
+        {
+            Task.last_checkpoint_event_id: None,
+            Task.last_checkpoint_trace_event_id: None,
+        },
+        synchronize_session=False,
+    )
+
     db.query(TraceCheckpointBlob).filter(TraceCheckpointBlob.task_id == task_id).delete(
         synchronize_session=False
     )

@@ -50,6 +50,7 @@ interface HomeTemplateCard {
   setup_time: string;
   likes: number;
   used_count: number;
+  type: string;
 }
 
 interface RecentTask {
@@ -99,6 +100,9 @@ function decodeHomeTemplateCard(value: unknown): HomeTemplateCard | null {
     setup_time: value.setup_time,
     likes: value.likes,
     used_count: value.used_count,
+    // Optional on the wire (older cached responses, other clients); default
+    // to "agent" like the backend does everywhere else.
+    type: typeof value.type === "string" ? value.type : "agent",
   };
 }
 
@@ -108,6 +112,12 @@ function decodeHomeTemplates(value: unknown): HomeTemplateCard[] | null {
   for (const template of value) {
     const decoded = decodeHomeTemplateCard(template);
     if (!decoded) return null;
+    // The home page's "Use Template" button only knows how to build a
+    // single agent (/build/new?template=). Workforce templates need the
+    // dedicated instantiation flow on the Templates page instead, so they
+    // are left out of this surface rather than silently producing a
+    // broken, empty-instruction agent.
+    if (decoded.type === "workforce") continue;
     templates.push(decoded);
   }
   return templates;

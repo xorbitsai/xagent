@@ -80,7 +80,14 @@ function TaskHomePageContent() {
       const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
       if (response.ok) {
         const data = await response.json();
-        setTemplates(Array.isArray(data) ? data : []);
+        // Quick-access resolves a template straight into a single published
+        // agent (POST /api/agents/from-template/resolve) - a workforce
+        // template has no single-agent config to resolve, so it's excluded
+        // here rather than surfacing as a broken agent.
+        const agentTemplates = Array.isArray(data)
+          ? data.filter((template) => template?.type !== "workforce")
+          : [];
+        setTemplates(agentTemplates);
       } else {
         setTemplatesError(true);
       }

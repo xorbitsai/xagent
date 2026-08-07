@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import threading
 from datetime import timedelta
 
@@ -11,6 +12,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.db_teardown import drop_all_tables
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE, LEGACY_CHECKPOINT_TYPES
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -47,7 +49,7 @@ def db_session(tmp_path):
         yield db
     finally:
         db.close()
-        Base.metadata.drop_all(bind=get_engine())
+        drop_all_tables(get_engine())
 
 
 @pytest.fixture()
@@ -1155,9 +1157,52 @@ async def test_cancellation_safe_acquire_drains_and_cleans_returned_lease() -> N
     assert cleaned_leases == [expected_lease]
 
 
+_CASE_WHEN_PATTERN = re.compile(r"WHEN (.+?) THEN")
+
+
+def _case_when_clause(case_expr) -> str:
+    """The compiled WHEN condition of a two-branch case(), with literal
+    binds inlined so two structurally-identical predicates compile to the
+    same string regardless of bind-parameter naming.
+    """
+    compiled = str(case_expr.compile(compile_kwargs={"literal_binds": True}))
+    match = _CASE_WHEN_PATTERN.search(compiled)
+    assert match is not None, compiled
+    return match.group(1)
+
+
+def test_lease_checkpoint_pointer_case_predicates_match() -> None:
+    """lease_checkpoint_event_id_case and lease_checkpoint_trace_event_id_case
+    must clear their column under exactly the same condition.
+
+    Both builders share _checkpoint_pointer_clearing_predicate(), so this
+    passes by construction today; the assertion is what actually enforces
+    it -- a future edit that inlines a diverging predicate into one builder
+    would otherwise pass every other test here (each builder's own column
+    still clears/retains correctly in isolation) while silently breaking
+    the recovery CAS fence's two-column conjunction, which depends on both
+    columns clearing together (see recover_expired_task_lease_no_commit).
+    """
+    legacy_when = _case_when_clause(task_lease_service.lease_checkpoint_event_id_case())
+    exact_when = _case_when_clause(
+        task_lease_service.lease_checkpoint_trace_event_id_case()
+    )
+    assert legacy_when == exact_when
+
+
 def test_new_run_lease_claim_rejects_a_second_claim(db_session) -> None:
     task = _create_task(db_session)
     task.last_checkpoint_event_id = "previous-run-checkpoint"
+    previous_checkpoint = TraceEvent(
+        task_id=task.id,
+        event_id="previous-run-checkpoint",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={"checkpoint_type": CHECKPOINT_TYPE, "snapshot": {"type": "checkpoint"}},
+    )
+    db_session.add(previous_checkpoint)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = previous_checkpoint.id
     db_session.commit()
 
     first = acquire_task_lease(
@@ -1179,12 +1224,26 @@ def test_new_run_lease_claim_rejects_a_second_claim(db_session) -> None:
     db_session.refresh(task)
     assert task.run_id == first.run_id
     assert task.last_checkpoint_event_id is None
+    # A new run clears both pointer columns together -- see
+    # lease_checkpoint_trace_event_id_case's docstring for why a single
+    # column left behind would desync the recovery CAS fence.
+    assert task.last_checkpoint_trace_event_id is None
 
 
 def test_same_run_resume_lease_preserves_checkpoint_pointer(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.WAITING_FOR_USER)
     task.run_id = "resumable-run"
     task.last_checkpoint_event_id = "current-run-checkpoint"
+    current_checkpoint = TraceEvent(
+        task_id=task.id,
+        event_id="current-run-checkpoint",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={"checkpoint_type": CHECKPOINT_TYPE, "snapshot": {"type": "checkpoint"}},
+    )
+    db_session.add(current_checkpoint)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = current_checkpoint.id
     db_session.commit()
 
     lease = acquire_task_lease(
@@ -1201,6 +1260,44 @@ def test_same_run_resume_lease_preserves_checkpoint_pointer(db_session) -> None:
     )
     db_session.refresh(task)
     assert task.last_checkpoint_event_id == "current-run-checkpoint"
+    # A same-run resume retains both pointer columns together.
+    assert task.last_checkpoint_trace_event_id == current_checkpoint.id
+
+
+def test_running_task_reacquire_retains_checkpoint_pointer_via_case(
+    db_session,
+) -> None:
+    """acquire_task_lease_no_commit's case()-retain branch (no new_run, no
+    expected_run_id) only fires when the row is already a live RUNNING row
+    with a run id -- exercised here by a heartbeat-style reacquire on a
+    task that is already RUNNING with the same runner, unlike every other
+    acquire_task_lease call in this file, which starts from a non-RUNNING
+    task and only ever hits the case()'s clear side.
+    """
+    task = _create_task(db_session, status=TaskStatus.RUNNING)
+    task.runner_id = "runner-a"
+    task.run_id = "existing-run"
+    task.last_checkpoint_event_id = "existing-checkpoint"
+    checkpoint = TraceEvent(
+        task_id=task.id,
+        event_id="existing-checkpoint",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={"checkpoint_type": CHECKPOINT_TYPE, "snapshot": {"type": "checkpoint"}},
+    )
+    db_session.add(checkpoint)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = checkpoint.id
+    db_session.commit()
+
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+
+    assert lease is not None
+    assert lease.run_id == "existing-run"
+    db_session.refresh(task)
+    assert task.last_checkpoint_event_id == "existing-checkpoint"
+    # Both pointer columns retained together via the paired case() builders.
+    assert task.last_checkpoint_trace_event_id == checkpoint.id
 
 
 def test_lease_acquire_rejects_a_superseded_run(db_session) -> None:
@@ -1248,21 +1345,24 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
     task.run_id = "checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
     task.last_checkpoint_event_id = "checkpoint-1"
-    db_session.add(
-        TraceEvent(
-            task_id=task.id,
-            event_id="checkpoint-1",
-            event_type="system_update_general",
-            timestamp=utc_now(),
-            step_id=None,
-            parent_event_id=None,
-            data={
-                "checkpoint_type": CHECKPOINT_TYPE,
-                "snapshot": {"type": "checkpoint"},
-                TASK_RUN_ID_TRACE_FIELD: "checkpoint-run",
-            },
-        )
+    checkpoint_event = TraceEvent(
+        task_id=task.id,
+        event_id="checkpoint-1",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        step_id=None,
+        parent_event_id=None,
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: "checkpoint-run",
+        },
     )
+    db_session.add(checkpoint_event)
+    db_session.flush()
+    # Exercises the PK-anchored resolution path (not just the legacy
+    # string fallback): recovery must reach the same PAUSED verdict.
+    task.last_checkpoint_trace_event_id = checkpoint_event.id
     db_session.commit()
 
     assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
@@ -1278,22 +1378,27 @@ def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
     task.run_id = "child-checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
     task.last_checkpoint_event_id = "child-checkpoint-1"
-    db_session.add(
-        TraceEvent(
-            task_id=task.id,
-            build_id="agent_123_child",
-            event_id="child-checkpoint-1",
-            event_type="system_update_general",
-            timestamp=utc_now(),
-            step_id=None,
-            parent_event_id=None,
-            data={
-                "checkpoint_type": CHECKPOINT_TYPE,
-                "snapshot": {"type": "checkpoint"},
-                TASK_RUN_ID_TRACE_FIELD: "child-checkpoint-run",
-            },
-        )
+    child_checkpoint_event = TraceEvent(
+        task_id=task.id,
+        build_id="agent_123_child",
+        event_id="child-checkpoint-1",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        step_id=None,
+        parent_event_id=None,
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: "child-checkpoint-run",
+        },
     )
+    db_session.add(child_checkpoint_event)
+    db_session.flush()
+    # Exercises the PK-anchored resolution path: an anchored build-scoped
+    # row must fail its own validation (build_id is not None), the same
+    # FAILED verdict the legacy scan reaches -- and it must not fall back
+    # to searching other rows for a match.
+    task.last_checkpoint_trace_event_id = child_checkpoint_event.id
     db_session.commit()
 
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
@@ -1309,21 +1414,22 @@ def test_stale_running_task_with_legacy_checkpoint_becomes_paused(db_session) ->
     task.run_id = "legacy-checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
     task.last_checkpoint_event_id = "legacy-checkpoint-1"
-    db_session.add(
-        TraceEvent(
-            task_id=task.id,
-            event_id="legacy-checkpoint-1",
-            event_type="system_update_general",
-            timestamp=utc_now(),
-            step_id=None,
-            parent_event_id=None,
-            data={
-                "checkpoint_type": next(iter(LEGACY_CHECKPOINT_TYPES)),
-                "snapshot": {"type": "checkpoint"},
-                TASK_RUN_ID_TRACE_FIELD: "legacy-checkpoint-run",
-            },
-        )
+    legacy_checkpoint_event = TraceEvent(
+        task_id=task.id,
+        event_id="legacy-checkpoint-1",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        step_id=None,
+        parent_event_id=None,
+        data={
+            "checkpoint_type": next(iter(LEGACY_CHECKPOINT_TYPES)),
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: "legacy-checkpoint-run",
+        },
     )
+    db_session.add(legacy_checkpoint_event)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = legacy_checkpoint_event.id
     db_session.commit()
 
     assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED

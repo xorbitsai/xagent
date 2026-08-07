@@ -1572,6 +1572,21 @@ const zh = {
       knowledge: "知识与研究",
       sales: "销售与外联"
     },
+    typeFilter: {
+      all: "全部类型",
+      agent: "智能体",
+      workforce: "工作组"
+    },
+    workforceBadge: "工作组",
+    agentsCountOne: "{count} 个智能体",
+    agentsCountOther: "{count} 个智能体",
+    creatingWorkforce: "创建中…",
+    errors: {
+      useWorkforceFailed: "从该模版创建工作组失败，请重试。",
+      useWorkforceAccessDenied: "你没有权限创建工作组。",
+      useWorkforceRetry: "该模版当前并发请求过多，请重试。",
+      useWorkforceUnpublishedAgent: "该工作组需要的智能体「{agentName}」当前未发布，请在你的智能体列表中重新发布它，然后再试一次。"
+    }
   },
   sidebar: {
     tasks: {
@@ -2452,6 +2467,7 @@ const zh = {
         unknown: "发生未知错误",
         notFound: "Agent 不存在",
         notFoundDesc: "该 Agent 不存在或已被删除",
+        templateIsWorkforce: "该模版会创建一个工作组，而不是单个智能体，请在 Templates 页面使用它。",
       },
       kbToolWarning: {
         title: "需要启用知识库工具",

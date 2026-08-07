@@ -37,6 +37,7 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.db_teardown import drop_all_tables
 from xagent.web.api.a2a import router as a2a_router
 from xagent.web.api.agent_api_keys import router as agent_api_keys_router
 from xagent.web.api.agents import router as agents_router
@@ -53,7 +54,7 @@ from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
 from xagent.web.api.widget import widget_router
 from xagent.web.api.workforces import router as workforces_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
-from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.database import get_db, get_engine
 from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services.a2a_protocol import (
     A2AApiError,
@@ -216,7 +217,7 @@ def _test_db() -> Iterator[None]:
 
     yield
 
-    Base.metadata.drop_all(bind=get_engine())
+    drop_all_tables(get_engine())
     try:
         shutil.rmtree(temp_dir)
     except OSError:
@@ -353,7 +354,7 @@ def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
     keeps the claim-to-schedule handoff real -- a raise anywhere in it still
     fails the test -- while leaving no live background task for
     ``public_chat_access.py`` to drop un-awaited, which would otherwise race
-    ``Base.metadata.drop_all`` below.
+    the schema teardown below.
 
     Lives here rather than in each suite: three api/ suites need it, and while
     each kept its own copy they drifted -- two stubbed a call the workforce

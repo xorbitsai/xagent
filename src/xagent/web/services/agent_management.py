@@ -79,6 +79,17 @@ class TemplateNotFoundError(LookupError):
     """Raised when a template id cannot be resolved."""
 
 
+class WorkforceTemplateNotSupportedError(ValueError):
+    """Raised when a template's `type` is "workforce" but the caller only
+    knows how to create a single Agent from it.
+
+    A workforce template's `agent_config` carries no real instructions (see
+    `TemplateManager._enrich_template`), so without this gate every one of
+    these single-agent creation paths would silently publish an agent with
+    empty instructions instead of failing.
+    """
+
+
 class InvalidAgentModelConfigError(ValueError):
     """Raised when the agent model slot payload does not match DB id shape."""
 
@@ -759,6 +770,8 @@ class AgentManagementService:
         template = await self.template_manager.get_template(template_id)
         if template is None:
             raise TemplateNotFoundError(template_id)
+        if template.get("type", "agent") != "agent":
+            raise WorkforceTemplateNotSupportedError(template_id)
 
         agent_config = template.get("agent_config") or {}
         final_name = name or template.get("name") or template_id
@@ -1235,6 +1248,8 @@ class AgentManagementRuntime:
         template = await self.template_manager.get_template(template_id)
         if template is None:
             raise TemplateNotFoundError(template_id)
+        if template.get("type", "agent") != "agent":
+            raise WorkforceTemplateNotSupportedError(template_id)
 
         agent_config = template.get("agent_config") or {}
         final_description = description

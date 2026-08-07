@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import func, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from ...config import get_checkpoint_history_limit
@@ -31,6 +32,8 @@ from ...web.models.tool_config import ToolUsage
 from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
     CHECKPOINT_LOAD_UNAVAILABLE,
+    CHECKPOINT_PK_ANCHOR_DANGLING,
+    CHECKPOINT_PRUNE_FAILED,
     clear_degradation,
     register_degradation,
 )
@@ -63,6 +66,25 @@ CHECKPOINT_ROW_SCAN_LIMIT = 100
 # scan that reaches the cap without a resolution is treated as unavailable
 # rather than continuing indefinitely.
 CHECKPOINT_SCAN_MAX_PAGES = 50
+
+
+@dataclass(frozen=True)
+class _AnchorFallback:
+    """Why the PK anchor deferred to the legacy scan.
+
+    Distinguishes "no PK anchor to try" from a resolved snapshot, which may
+    legitimately be an empty dict. An unset or dangling pointer defers with
+    nothing to carry. A correctly identified anchor row whose payload could
+    not be read defers *and* hands the scan the same verdict flag the scan
+    would have set for that row itself: the scan's candidate filter can
+    legitimately exclude that row (a row carrying no execution identity is
+    anchored but not scanned, see _load_pk_anchored_checkpoint), and an
+    excluded row must never let an unreadable checkpoint become "no
+    checkpoint".
+    """
+
+    undecodable: bool = False
+    generic_failure: bool = False
 
 
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
@@ -194,6 +216,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 # below), and a zero-row first page is authoritative.
                 _checkpoint_execution_id_predicate(str(execution_id)),
             )
+            anchored_fallback = _AnchorFallback()
             if self.build_id is None:
                 try:
                     run_id = self._root_checkpoint_read_partition(db)
@@ -215,6 +238,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         f"task {self.task_id}: could not resolve the "
                         "checkpoint read partition"
                     ) from exc
+                anchored = self._load_pk_anchored_checkpoint(
+                    db, run_id, str(execution_id)
+                )
+                if not isinstance(anchored, _AnchorFallback):
+                    return anchored
+                anchored_fallback = anchored
                 query = query.filter(
                     DatabaseTraceEvent.build_id.is_(None),
                     self._checkpoint_run_partition_filter(run_id),
@@ -227,9 +256,11 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 DatabaseTraceEvent.id.desc(),
             )
 
-            saw_generic_failure = False
-            saw_undecodable_row = False
-            saw_any_row = False
+            saw_generic_failure = anchored_fallback.generic_failure
+            saw_undecodable_row = anchored_fallback.undecodable
+            saw_any_row = (
+                anchored_fallback.undecodable or anchored_fallback.generic_failure
+            )
             offset = 0
             page_count = 0
             while True:
@@ -440,6 +471,178 @@ class DatabaseTraceHandler(BaseTraceHandler):
         run_field = DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD].as_string()
         return run_field == run_id if run_id is not None else run_field.is_(None)
 
+    def _load_pk_anchored_checkpoint(
+        self,
+        db: Session,
+        run_id: str | None,
+        execution_id: str,
+    ) -> Dict[str, Any] | _AnchorFallback:
+        """Resolve the checkpoint through the task's exact-row pointer.
+
+        Returns an ``_AnchorFallback`` when the read defers to the legacy
+        scan. An empty one means there was nothing to anchor on: the
+        pointer is unset, or it names a row that no longer exists (only
+        possible on a database upgraded through Alembic rather than created
+        fresh, since that path has no DB-level FK -- see the migration that
+        adds this column).
+
+        Once a target row is found, its *identity* is authoritative: a
+        validation mismatch raises rather than falling back to search other
+        rows. Its *payload* is not. A row that is correctly identified but
+        whose payload cannot be read defers to the scan as well, so the
+        older rows history pruning deliberately retains can still answer
+        the read (see _prune_checkpoint_history). That fallback carries the
+        row's own verdict flag on the returned ``_AnchorFallback``, because
+        the scan may legitimately exclude the very row the pointer named,
+        and a scan that then finds nothing must not report "no checkpoint"
+        for a checkpoint that exists and is unreadable.
+
+        The execution-identity check here is verification, not the legacy
+        scan's filtering: that scan excludes non-matching rows from its
+        candidate set via ``_checkpoint_execution_id_predicate`` before it
+        ever sees them, but the pointer names one row unconditionally, so
+        the row's own claimed identity (if it has one) has to be checked
+        against the caller's after the fact. A row carrying no execution
+        identity at all passes this check, because
+        ``checkpoint_execution_id()`` returns "" for it and the conjunct
+        short-circuits. The legacy scan does the opposite: its
+        ``coalesce(nullif(...))`` predicate yields NULL for such a row and
+        ``NULL = :execution_id`` is never true, so the scan drops it from
+        the candidate set. The anchor path is deliberately the more
+        permissive of the two -- a pointer that names a row is a stronger
+        identity claim than a JSON field match, and the rows without the
+        field are legacy rows written before it existed, exactly the rows
+        the migration's backfill anchors. Nothing depends on the two
+        agreeing: web's ``execution_id`` is the task id.
+        """
+        # Cleared before the pointer is even read, not only when one
+        # resolves to a row: the registry is process-wide, so a process
+        # where no task currently has an anchor would otherwise keep a
+        # stale dangling signal set forever. The coarseness is real and
+        # accepted -- one healthy task's read clears another task's
+        # dangling signal -- and is the same cross-task coarseness the
+        # signal already has in the registering direction.
+        clear_degradation(CHECKPOINT_PK_ANCHOR_DANGLING)
+        try:
+            pointer = (
+                db.query(Task.last_checkpoint_trace_event_id)
+                .filter(Task.id == self.task_id)
+                .one_or_none()
+            )
+        except Exception as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint pointer lookup failed",
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: checkpoint pointer lookup failed"
+            ) from exc
+        if pointer is None or pointer[0] is None:
+            return _AnchorFallback()
+
+        pointer_id = pointer[0]
+        try:
+            row = db.get(DatabaseTraceEvent, pointer_id)
+        except Exception as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: checkpoint pointer row fetch failed",
+            )
+            raise CheckpointUnavailableError(
+                f"task {self.task_id}: checkpoint pointer row fetch failed"
+            ) from exc
+        if row is None:
+            register_degradation(
+                CHECKPOINT_PK_ANCHOR_DANGLING,
+                f"task {self.task_id}: checkpoint pointer {pointer_id} has "
+                "no matching trace_events row; falling back to the legacy "
+                "scan",
+            )
+            return _AnchorFallback()
+
+        row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
+        run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)
+        partition_matches = (
+            run_field == run_id if run_id is not None else run_field is None
+        )
+        row_execution_id = checkpoint_execution_id(row_data)
+        if (
+            row.task_id != self.task_id
+            or row.event_type != "system_update_general"
+            or row.build_id is not None
+            or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
+            or not partition_matches
+            or (row_execution_id and row_execution_id != execution_id)
+        ):
+            raise CheckpointCorruptError(
+                f"task {self.task_id}: checkpoint pointer {pointer_id} does "
+                "not match the row it anchors"
+            )
+
+        try:
+            decoded = decode_trace_event_data(
+                db,
+                task_id=self.task_id,
+                data=dict(row_data),
+                strict=True,
+            )
+        except CheckpointMessageDecodeError as exc:
+            # Permanent per-row failure, classified exactly as the scan
+            # classifies one: log, no signal, and defer -- an older row may
+            # still carry a usable checkpoint.
+            logger.warning(
+                "Checkpoint pointer %s row for task %s is undecodable; "
+                "falling back to the legacy scan: %s",
+                pointer_id,
+                self.task_id,
+                exc,
+            )
+            return _AnchorFallback(undecodable=True)
+        except Exception:
+            # E.g. a transient DB error from the blob prefetch: the same
+            # generic case the scan registers CHECKPOINT_DECODE_FALLBACK
+            # for. CHECKPOINT_LOAD_UNAVAILABLE belongs to the exhausted-set
+            # verdict, not to one row.
+            register_degradation(
+                CHECKPOINT_DECODE_FALLBACK,
+                f"task {self.task_id}: checkpoint decode failed, fell back "
+                f"past pointer {pointer_id}",
+            )
+            logger.warning(
+                "Checkpoint pointer %s row for task %s failed to decode; "
+                "falling back to the legacy scan",
+                pointer_id,
+                self.task_id,
+                exc_info=True,
+            )
+            return _AnchorFallback(generic_failure=True)
+        # The scan retires these two signals on two different facts: the
+        # load signal once a page query returns, the decode-fallback signal
+        # once a row decodes. An anchored read establishes both in one round
+        # trip, so both clears land here -- and here rather than at the top
+        # of this function, where the dangling clear sits, because that one
+        # reports on the pointer every attempt re-reads while these report
+        # that the read actually got through. An anchored read returns
+        # without ever entering the scan, so without these a decode-fallback
+        # signal set by one bad row could never retire in the steady state
+        # this anchor exists to produce.
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        clear_degradation(CHECKPOINT_DECODE_FALLBACK)
+
+        snapshot = decoded.get("snapshot") if isinstance(decoded, dict) else None
+        if not isinstance(snapshot, dict):
+            # Readable checkpoint_type but no payload: the same permanent
+            # per-row class as an undecodable row, and deferred the same way.
+            logger.warning(
+                "Checkpoint pointer %s row for task %s has a readable "
+                "checkpoint_type but no snapshot; falling back to the "
+                "legacy scan",
+                pointer_id,
+                self.task_id,
+            )
+            return _AnchorFallback(undecodable=True)
+        return dict(snapshot)
+
     def _sync_save_to_database(self, event: CoreTraceEvent) -> None:
         """Synchronous database save operation (runs in thread pool)."""
         # Create database session
@@ -518,6 +721,18 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 and self.build_id is None
                 and checkpoint_lease is not None
             ):
+                # Flush the pending insert so trace_event.id (the row's
+                # primary key) is assigned before the pointer UPDATE below
+                # reads it. autoflush is off for this session, so without
+                # this the exact-row anchor column would be built from an
+                # unassigned id and silently written NULL.
+                db.flush()
+                if trace_event.id is None:
+                    raise RuntimeError(
+                        f"Task {self.task_id} checkpoint {event.id} row has no "
+                        "primary key after flush; refusing to write a NULL "
+                        "checkpoint anchor"
+                    )
                 pointer_update = db.execute(
                     update(Task)
                     .where(
@@ -526,10 +741,43 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         Task.runner_id == checkpoint_lease.runner_id,
                         Task.run_id == checkpoint_lease.run_id,
                     )
-                    .values(last_checkpoint_event_id=str(event.id))
+                    .values(
+                        last_checkpoint_event_id=str(event.id),
+                        last_checkpoint_trace_event_id=trace_event.id,
+                    )
                     .execution_options(synchronize_session=False)
                 )
                 if int(getattr(pointer_update, "rowcount", 0) or 0) != 1:
+                    task_still_exists = (
+                        db.query(Task.id).filter(Task.id == self.task_id).first()
+                        is not None
+                    )
+                    if not task_still_exists:
+                        # The task row is gone, not merely leased elsewhere --
+                        # the same outcome the trace_events.task_id FK
+                        # produces for the row itself wherever that FK is
+                        # enforced. Discard the staged row so this path
+                        # leaves nothing behind, then classify it exactly as
+                        # that FK violation is classified below: a required
+                        # event still fails loudly, a best-effort event is
+                        # dropped quietly.
+                        db.rollback()
+                        if getattr(event, "require_persisted", False):
+                            logger.error(
+                                "Required trace event references missing task %s: %s",
+                                self.task_id,
+                                event.id,
+                            )
+                            raise RuntimeError(
+                                f"Task {self.task_id} no longer exists; "
+                                f"checkpoint {event.id} was not persisted"
+                            )
+                        logger.debug(
+                            "Skip checkpoint pointer update for missing task %s: %s",
+                            self.task_id,
+                            event.id,
+                        )
+                        return
                     raise RuntimeError(
                         f"Task {self.task_id} lease changed before checkpoint "
                         f"{event.id} could be persisted"
@@ -616,6 +864,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
         dedup, but a blob referenced only by pruned rows (e.g. a message
         later dropped by context compaction) is orphaned until whole-task
         deletion cleans it up.
+
+        Retention is exactly ``limit`` rows, with one exception: when the
+        task's exact-row pointer names a row that itself ranks outside the
+        window, protecting that row keeps ``limit + 1``.
         """
         limit = get_checkpoint_history_limit()
         if limit <= 0:
@@ -637,6 +889,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         run_id if isinstance(run_id, str) and run_id else None
                     )
                 )
+            anchor = (
+                db.query(Task.last_checkpoint_trace_event_id)
+                .filter(Task.id == self.task_id)
+                .one_or_none()
+            )
+            anchor_id = anchor[0] if anchor is not None else None
             stale_rows = (
                 db.query(DatabaseTraceEvent.id)
                 .filter(
@@ -655,9 +913,24 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 .offset(limit)
                 .all()
             )
-            if not stale_rows:
+            # This query completing is the proof the retention path is
+            # healthy, whatever it found. Clearing only after a successful
+            # delete would leave a steady state with nothing to prune unable
+            # to clear the signal at all.
+            clear_degradation(CHECKPOINT_PRUNE_FAILED)
+            # Rank first, protect after. The row this task's exact-row
+            # pointer references is never deleted, whatever its position in
+            # the retention ranking; excluding it from the candidate set
+            # instead would shift every remaining row's OFFSET rank by one
+            # and retain limit + 1 rows whenever the anchor sits inside the
+            # window. For the steady-state writer the protection is
+            # structurally unreachable -- the pointer always names the row
+            # just written, which ranks ahead of the offset -- but it guards
+            # the backfill-vs-prune window and future back-pointing anchors
+            # that may point at an older row.
+            stale_ids = [row_id for (row_id,) in stale_rows if row_id != anchor_id]
+            if not stale_ids:
                 return
-            stale_ids = [row_id for (row_id,) in stale_rows]
             # Chunk the IN clause: a backlog from previously-disabled pruning
             # can exceed SQLite's bind-parameter limit in one statement.
             for chunk in chunks(stale_ids, SQL_IN_CLAUSE_CHUNK_SIZE):
@@ -670,6 +943,34 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 len(stale_ids),
                 self.task_id,
                 execution_id,
+            )
+        except (IntegrityError, OperationalError):
+            # PostgreSQL enforces the anchor FK, so a race that lets a
+            # candidate row become the active anchor between selection and
+            # delete surfaces here as a restrict violation (IntegrityError).
+            # A database upgraded through Alembic on SQLite has no DB-level
+            # FK for this column and cannot raise this; a freshly created
+            # SQLite database (create_all, e.g. tests) does have the FK and
+            # can. Under stricter isolation levels the same race can instead
+            # surface as psycopg2's SerializationFailure or DeadlockDetected,
+            # both of which SQLAlchemy wraps in OperationalError, not
+            # IntegrityError -- catch both so this retention path degrades
+            # the same way regardless of which one the database raises. The
+            # signal is named for the outcome rather than for either cause:
+            # OperationalError also covers lock timeouts and dropped
+            # connections, /health publishes only the signal name, and the
+            # operator's response to all of them is the same -- retention
+            # stopped, rows are accumulating, read the logged traceback for
+            # which one it was.
+            db.rollback()
+            register_degradation(
+                CHECKPOINT_PRUNE_FAILED,
+                f"task {self.task_id}: checkpoint prune could not delete stale rows",
+            )
+            logger.warning(
+                "Checkpoint prune failed for task %s",
+                self.task_id,
+                exc_info=True,
             )
         except Exception:
             db.rollback()

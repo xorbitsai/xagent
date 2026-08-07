@@ -38,10 +38,12 @@ afterEach(() => {
 })
 
 describe("AgentSshBindings", () => {
-  it("skips the bindings fetch when the user is not in a team", async () => {
+  it("skips the bindings fetch when the user is not in a team", () => {
     inTeamMock.value = false
     render(<AgentSshBindings agentId="agent-1" />)
-    await waitFor(() => expect(apiRequestMock).not.toHaveBeenCalled())
+    // render flushes the effect synchronously and the guard returns before any
+    // await, so the absence of a call is observable without waitFor.
+    expect(apiRequestMock).not.toHaveBeenCalled()
     expect(toastErrorMock).not.toHaveBeenCalled()
   })
 

@@ -195,7 +195,7 @@ function installApiMocks() {
   })
 }
 
-describe("KnowledgeBaseCreationDialog multi-file naming", () => {
+describe("KnowledgeBaseCreationDialog collection naming", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
@@ -207,7 +207,7 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     cleanup()
   })
 
-  it("requires an explicit collection name for multiple file uploads", async () => {
+  it.each([1, 2])("rejects an empty collection name for %i file upload(s)", async (fileCount) => {
     const { container } = render(
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
     )
@@ -217,10 +217,10 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     const fileInput = container.querySelector("#file-upload") as HTMLInputElement
     fireEvent.change(fileInput, {
       target: {
-        files: [
-          new File(["a"], "alpha.txt", { type: "text/plain" }),
-          new File(["b"], "beta.txt", { type: "text/plain" }),
-        ],
+        files: Array.from(
+          { length: fileCount },
+          (_, index) => new File(["a"], `file ${index}!.txt`, { type: "text/plain" })
+        ),
       },
     })
 
@@ -228,11 +228,38 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.multiFileNameRequired")
+      expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.nameRequired", expect.anything())
     })
 
     const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest/jobs")
     expect(ingestCalls).toHaveLength(0)
+  })
+
+  it("rejects a whitespace-only collection name", async () => {
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "   " },
+    })
+
+    fireEvent.click(screen.getByText("common.next"))
+
+    fireEvent.change(container.querySelector("#file-upload") as HTMLInputElement, {
+      target: { files: [new File(["a"], "alpha.txt", { type: "text/plain" })] },
+    })
+
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.nameRequired", expect.anything())
+    })
+
+    expect(
+      apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest/jobs")
+    ).toHaveLength(0)
   })
 
   it("uses the same explicit collection name for each uploaded file", async () => {
@@ -304,6 +331,10 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={onSuccess} />
     )
 
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "alpha" },
+    })
+
     fireEvent.click(screen.getByText("common.next"))
 
     const fileInput = container.querySelector("#file-upload") as HTMLInputElement
@@ -363,9 +394,13 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     })
 
     try {
-      render(
+      const { container } = render(
         <KnowledgeBaseCreationDialog open={true} onOpenChange={onOpenChange} onSuccess={onSuccess} />
       )
+
+      fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+        target: { value: "cloud-docs" },
+      })
 
       fireEvent.click(screen.getByText("common.next"))
       fireEvent.click(screen.getByText("kb.dialog.tabs.cloud"))
@@ -443,6 +478,10 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       const { container } = render(
         <KnowledgeBaseCreationDialog open={true} onOpenChange={onOpenChange} onSuccess={onSuccess} />
       )
+
+      fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+        target: { value: "web_collection" },
+      })
 
       fireEvent.click(screen.getByText("common.next"))
       fireEvent.click(screen.getByText("kb.dialog.tabs.web"))

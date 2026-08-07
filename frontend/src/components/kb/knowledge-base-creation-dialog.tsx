@@ -173,9 +173,6 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
   // Embedding models state
   const [embeddingModels, setEmbeddingModels] = useState<Model[]>([])
   const trimmedCollectionName = newCollectionName.trim()
-  const requiresExplicitCollectionName =
-    (activeImportTab === "file" && selectedFiles.length > 1) ||
-    (activeImportTab === "cloud" && totalCloudFiles > 1)
 
   useEffect(() => {
     if (open) {
@@ -350,11 +347,6 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       return
     }
 
-    if (selectedFiles.length > 1 && !trimmedCollectionName) {
-      toast.error(t("kb.errors.multiFileNameRequired"))
-      return
-    }
-
     setIsUploading(true)
     setUploadProgress(0)
     setUploadProgressDetail(null)
@@ -370,7 +362,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         const file = selectedFiles[i]
         const formData = new FormData()
 
-        const collectionName = trimmedCollectionName || file.name.replace(/\.[^/.]+$/, "")
+        const collectionName = trimmedCollectionName
         setCurrentUploadFileName(file.name)
         setCurrentUploadCollection(collectionName)
         setUploadProgressDetail(null)
@@ -510,7 +502,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
       const formData = new FormData()
 
-      const collectionName = trimmedCollectionName || "web_collection"
+      const collectionName = trimmedCollectionName
 
       formData.append("collection", collectionName)
       formData.append("start_url", webIngestionConfig.start_url)
@@ -632,18 +624,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         files.map(file => ({ provider, fileId: file.id, fileName: file.name }))
       )
 
-      // Determine collection name
-      if (filesToIngest.length > 1 && !trimmedCollectionName) {
-        toast.error(t("kb.errors.multiFileNameRequired"))
-        return
-      }
-
-      let collectionName = trimmedCollectionName
-      if (!collectionName && filesToIngest.length > 0) {
-        // Use first file name without extension as default collection name
-        collectionName = filesToIngest[0].fileName.replace(/\.[^/.]+$/, "")
-      }
-      if (!collectionName) collectionName = "cloud_collection"
+      const collectionName = trimmedCollectionName
 
       // Prepare separators
       let separators: string[] | undefined = undefined
@@ -786,19 +767,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             {currentStep === 1 && (
               <div className="space-y-6 mt-4">
                 <div>
-                  <Label htmlFor="collection_name" className="text-sm font-medium">{t("kb.dialog.basicInfo.nameLabel")} {t("common.optional")}</Label>
+                  <Label htmlFor="collection_name" className="text-sm font-medium">{t("kb.dialog.basicInfo.nameLabel")}</Label>
                   <Input
                     id="collection_name"
                     value={newCollectionName}
                     onChange={(e) => setNewCollectionName(e.target.value)}
                     placeholder={t("kb.dialog.basicInfo.namePlaceholder")}
                     className="mt-1.5"
+                    required
+                    aria-required="true"
                   />
-                  {requiresExplicitCollectionName && !trimmedCollectionName && (
-                    <p className="mt-2 text-sm text-destructive">
-                      {t("kb.dialog.basicInfo.multiFileRequiredHint")}
-                    </p>
-                  )}
                 </div>
                 <div>
                   <Label htmlFor="collection_description" className="text-sm font-medium">{t("kb.dialog.basicInfo.descriptionLabel")} {t("common.optional")}</Label>
@@ -1287,6 +1265,13 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
               ) : (
                 <Button
                   onClick={() => {
+                    // Single guard for every import tab: the name is required, so
+                    // the backend never has to reject a silently derived one.
+                    if (!trimmedCollectionName) {
+                      toast.error(t("kb.errors.nameRequired"))
+                      setCurrentStep(1)
+                      return
+                    }
                     if (activeImportTab === "web") {
                       handleWebIngest()
                     } else if (activeImportTab === "cloud") {

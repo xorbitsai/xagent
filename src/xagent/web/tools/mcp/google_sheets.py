@@ -95,11 +95,12 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
                 "title": spreadsheet.get("properties", {}).get("title"),
                 "url": spreadsheet.get("spreadsheetUrl"),
                 "sheets": sheets,
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error getting spreadsheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -133,7 +134,7 @@ def google_sheets_create_spreadsheet(
         )
     except Exception as e:
         logger.error(f"Error creating spreadsheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
     if parent_id:
         try:
@@ -164,7 +165,8 @@ def google_sheets_create_spreadsheet(
                         "Spreadsheet was created but could not be moved to "
                         f"parent_id {parent_id!r}: {e}"
                     ),
-                }
+                },
+                ensure_ascii=False,
             )
 
     return json.dumps(
@@ -173,17 +175,26 @@ def google_sheets_create_spreadsheet(
             "spreadsheet_id": spreadsheet.get("spreadsheetId"),
             "title": spreadsheet.get("properties", {}).get("title"),
             "url": spreadsheet.get("spreadsheetUrl"),
-        }
+        },
+        ensure_ascii=False,
     )
 
 
 @mcp.tool()
-def google_sheets_read_range(spreadsheet_id: str, range_name: str) -> str:
+def google_sheets_read_range(
+    spreadsheet_id: str, range_name: str, max_rows: int = 1000
+) -> str:
     """
     Read cell values from a range in a Google Sheets spreadsheet, e.g.
     range_name="Sheet1!A1:D10". spreadsheet_id accepts a bare id or full URL.
+    A bare tab reference like range_name="Sheet1" is valid A1 notation for
+    the entire sheet, so max_rows caps how many rows are returned; extra
+    rows are dropped and the response sets truncated=true.
     """
     try:
+        if max_rows < 1:
+            raise ValueError("max_rows must be at least 1")
+
         resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
         service = get_sheets_service()
         result = (
@@ -192,16 +203,23 @@ def google_sheets_read_range(spreadsheet_id: str, range_name: str) -> str:
             .get(spreadsheetId=resolved_spreadsheet_id, range=range_name)
             .execute()
         )
+        values = result.get("values", [])
+        truncated = len(values) > max_rows
+        if truncated:
+            values = values[:max_rows]
+
         return json.dumps(
             {
                 "status": "success",
                 "range": result.get("range", range_name),
-                "values": result.get("values", []),
-            }
+                "values": values,
+                "truncated": truncated,
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error reading range: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -237,11 +255,12 @@ def google_sheets_update_range(
                 "status": "success",
                 "updated_range": result.get("updatedRange", range_name),
                 "updated_cells": result.get("updatedCells", 0),
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error updating range: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -277,11 +296,12 @@ def google_sheets_append_rows(
                 "status": "success",
                 "updated_range": updates.get("updatedRange", range_name),
                 "updated_rows": updates.get("updatedRows", 0),
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error appending rows: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -303,11 +323,12 @@ def google_sheets_clear_range(spreadsheet_id: str, range_name: str) -> str:
             {
                 "status": "success",
                 "cleared_range": result.get("clearedRange", range_name),
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error clearing range: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -350,11 +371,12 @@ def google_sheets_add_sheet(
                 "status": "success",
                 "sheet_id": new_sheet.get("sheetId"),
                 "title": new_sheet.get("title"),
-            }
+            },
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error adding sheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -372,11 +394,12 @@ def google_sheets_delete_sheet(spreadsheet_id: str, sheet_id: int) -> str:
             body={"requests": [{"deleteSheet": {"sheetId": sheet_id}}]},
         ).execute()
         return json.dumps(
-            {"status": "success", "message": f"Sheet {sheet_id} deleted."}
+            {"status": "success", "message": f"Sheet {sheet_id} deleted."},
+            ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error deleting sheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,71 @@ def test_resolve_spreadsheet_id_accepts_bare_id_and_url_forms(value, expected):
     assert google_sheets._resolve_spreadsheet_id(value) == expected
 
 
+_URL_WITH_ID = "https://docs.google.com/spreadsheets/d/abc123/edit#gid=0"
+
+
+@pytest.mark.parametrize(
+    ("mock_target", "invoke"),
+    [
+        (
+            lambda sp: sp.get,
+            lambda sid: google_sheets.google_sheets_get_spreadsheet(sid),
+        ),
+        (
+            lambda sp: sp.values.return_value.get,
+            lambda sid: google_sheets.google_sheets_read_range(sid, "Sheet1!A1"),
+        ),
+        (
+            lambda sp: sp.values.return_value.update,
+            lambda sid: google_sheets.google_sheets_update_range(
+                sid, "Sheet1!A1", [["x"]]
+            ),
+        ),
+        (
+            lambda sp: sp.values.return_value.append,
+            lambda sid: google_sheets.google_sheets_append_rows(
+                sid, "Sheet1!A1", [["x"]]
+            ),
+        ),
+        (
+            lambda sp: sp.values.return_value.clear,
+            lambda sid: google_sheets.google_sheets_clear_range(sid, "Sheet1!A1"),
+        ),
+        (
+            lambda sp: sp.batchUpdate,
+            lambda sid: google_sheets.google_sheets_add_sheet(sid, "Extra"),
+        ),
+        (
+            lambda sp: sp.batchUpdate,
+            lambda sid: google_sheets.google_sheets_delete_sheet(sid, 1),
+        ),
+    ],
+    ids=[
+        "get_spreadsheet",
+        "read_range",
+        "update_range",
+        "append_rows",
+        "clear_range",
+        "add_sheet",
+        "delete_sheet",
+    ],
+)
+def test_id_taking_tools_resolve_full_spreadsheet_urls(
+    monkeypatch, mock_target, invoke
+):
+    """Every id-taking tool calls _resolve_spreadsheet_id before hitting the
+    API, but the other tests here all pass an already-bare id, so none of
+    them would notice if that call were deleted from a tool. Drive this
+    through the real call sites with a full URL and assert the *resolved*
+    id is what reached the mocked API call, for each of the 7 tools."""
+    spreadsheets = Mock()
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    invoke(_URL_WITH_ID)
+
+    assert mock_target(spreadsheets).call_args.kwargs["spreadsheetId"] == "abc123"
+
+
 def test_get_spreadsheet_defaults_missing_grid_properties(monkeypatch):
     """A non-grid sheet (e.g. a chart sheet) can omit gridProperties entirely;
     parsing must not raise KeyError/AttributeError on that shape."""
@@ -186,6 +251,58 @@ def test_read_range_returns_values(monkeypatch):
 
     assert result["status"] == "success"
     assert result["values"] == [["a", "b"], ["c", "d"]]
+    assert result["truncated"] is False
+
+
+def test_read_range_defaults_missing_values_key(monkeypatch):
+    """A range with no data at all omits the "values" key entirely rather
+    than sending an empty array; the tool's .get("values", []) default must
+    produce an empty list, not raise."""
+    spreadsheets = Mock()
+    spreadsheets.values.return_value.get.return_value.execute.return_value = {
+        "range": "Sheet1!A1:B2"
+    }
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(google_sheets.google_sheets_read_range("sid", "Sheet1!A1:B2"))
+
+    assert result["status"] == "success"
+    assert result["values"] == []
+    assert result["truncated"] is False
+
+
+def test_read_range_caps_rows_and_flags_truncated(monkeypatch):
+    spreadsheets = Mock()
+    spreadsheets.values.return_value.get.return_value.execute.return_value = {
+        "range": "Sheet1",
+        "values": [[str(i)] for i in range(5)],
+    }
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(
+        google_sheets.google_sheets_read_range("sid", "Sheet1", max_rows=3)
+    )
+
+    assert result["status"] == "success"
+    assert result["values"] == [["0"], ["1"], ["2"]]
+    assert result["truncated"] is True
+
+
+@pytest.mark.parametrize("bad_max_rows", [0, -1])
+def test_read_range_rejects_non_positive_max_rows(monkeypatch, bad_max_rows):
+    """A negative max_rows would otherwise flow into values[:max_rows] and
+    silently drop rows from the *end* (values[:-1]) instead of capping —
+    reject it before the API call like google_analytics does for limit."""
+    spreadsheets = Mock()
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(
+        google_sheets.google_sheets_read_range("sid", "Sheet1", max_rows=bad_max_rows)
+    )
+
+    assert result["status"] == "error"
+    assert "max_rows" in result["message"]
+    spreadsheets.values.return_value.get.assert_not_called()
 
 
 def test_update_range_sends_values_as_2d_array(monkeypatch):
@@ -275,11 +392,36 @@ def test_append_rows_sends_values_as_2d_array(monkeypatch):
     assert body == {"values": [["e", "f"]]}
 
 
+def test_append_rows_defaults_missing_updates_key(monkeypatch):
+    spreadsheets = Mock()
+    spreadsheets.values.return_value.append.return_value.execute.return_value = {}
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(
+        google_sheets.google_sheets_append_rows("sid", "Sheet1!A1", [["e", "f"]])
+    )
+
+    assert result["status"] == "success"
+    assert result["updated_range"] == "Sheet1!A1"
+    assert result["updated_rows"] == 0
+
+
 def test_clear_range(monkeypatch):
     spreadsheets = Mock()
     spreadsheets.values.return_value.clear.return_value.execute.return_value = {
         "clearedRange": "Sheet1!A1:D10"
     }
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(google_sheets.google_sheets_clear_range("sid", "Sheet1!A1:D10"))
+
+    assert result["status"] == "success"
+    assert result["cleared_range"] == "Sheet1!A1:D10"
+
+
+def test_clear_range_defaults_missing_cleared_range_key(monkeypatch):
+    spreadsheets = Mock()
+    spreadsheets.values.return_value.clear.return_value.execute.return_value = {}
     _mock_sheets_service(monkeypatch, spreadsheets)
 
     result = json.loads(google_sheets.google_sheets_clear_range("sid", "Sheet1!A1:D10"))

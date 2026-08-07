@@ -1,5 +1,6 @@
 """Core document search functionality for RAG pipelines."""
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -353,15 +354,15 @@ async def _search_knowledge_base_impl(
         collection_warnings: list[str] = []
         total_searched = 0
 
-        for collection_info in collections_to_iterate:
-            collection_name = collection_info.name
+        async def _search_one(
+            collection_info: Any,
+        ) -> tuple[list[Dict[str, Any]], Optional[str], Optional[str], int]:
+            """Search one collection off the event loop.
 
-            # Skip collections with no embeddings
-            if collection_info.embeddings == 0:
-                logger.debug(
-                    f"Skipping collection with no embeddings: {collection_name}"
-                )
-                continue
+            Returns (results, error, warning, documents_searched); failures are
+            returned rather than raised so one collection cannot fail the batch.
+            """
+            collection_name = collection_info.name
 
             # Per-KB rerank resolution: explicit tool arg wins, otherwise
             # use the collection's bound rerank_model_id; when neither is
@@ -378,7 +379,10 @@ async def _search_knowledge_base_impl(
                     f"Searching collection '{collection_name}' for: {tool_args.query}"
                 )
 
-                result = run_document_search(
+                # run_document_search is a blocking sync pipeline; running it
+                # inline would pin the event loop for the whole retrieval.
+                result = await asyncio.to_thread(
+                    run_document_search,
                     collection=collection_name,
                     query_text=tool_args.query,
                     config=search_config,
@@ -390,36 +394,65 @@ async def _search_knowledge_base_impl(
 
                 if result.status not in {"success", "partial_success"}:
                     error_message = result.message or "; ".join(result.warnings)
-                    collection_errors.append(
-                        f"{collection_name}: {error_message or 'search failed'}"
-                    )
                     logger.warning(
                         "Search pipeline returned status '%s' for collection '%s': %s",
                         result.status,
                         collection_name,
                         error_message,
                     )
-                    continue
+                    return (
+                        [],
+                        f"{collection_name}: {error_message or 'search failed'}",
+                        None,
+                        0,
+                    )
 
+                warning: Optional[str] = None
                 if result.status != "success" or result.warnings:
                     warning_message = result.message or "; ".join(result.warnings)
                     if warning_message:
-                        collection_warnings.append(
-                            f"{collection_name}: {warning_message}"
-                        )
+                        warning = f"{collection_name}: {warning_message}"
 
-                if result.results:
-                    for res in result.results:
-                        res_dict = dict(res)
-                        res_dict["collection"] = collection_name
-                        all_results.append(res_dict)
+                if not result.results:
+                    return [], None, warning, 0
 
-                    total_searched += collection_info.documents
+                results = []
+                for res in result.results:
+                    res_dict = dict(res)
+                    res_dict["collection"] = collection_name
+                    results.append(res_dict)
+                return results, None, warning, collection_info.documents
 
             except Exception as e:
-                collection_errors.append(f"{collection_name}: {e}")
                 logger.warning(f"Failed to search collection '{collection_name}': {e}")
+                return [], f"{collection_name}: {e}", None, 0
+
+        # Skip collections with no embeddings before fanning out.
+        searchable = []
+        for collection_info in collections_to_iterate:
+            if collection_info.embeddings == 0:
+                logger.debug(
+                    f"Skipping collection with no embeddings: {collection_info.name}"
+                )
                 continue
+            searchable.append(collection_info)
+
+        # Search every collection concurrently: total latency is bounded by the
+        # slowest collection instead of the sum of all of them. gather preserves
+        # input order, so aggregation order is unchanged.
+        # ponytail: no concurrency cap - an agent binds a handful of KBs; add a
+        # Semaphore if that ever stops being true.
+        for results, error, warning, documents in await asyncio.gather(
+            *(_search_one(collection_info) for collection_info in searchable)
+        ):
+            if error:
+                collection_errors.append(error)
+                continue
+            if warning:
+                collection_warnings.append(warning)
+            if results:
+                all_results.extend(results)
+                total_searched += documents
 
         if not all_results:
             if collection_errors:

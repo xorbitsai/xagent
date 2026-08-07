@@ -45,11 +45,21 @@ ROW = {
     "is_visible_in_connector": True,
     # Keyless (non-oauth): no required_env — connecting only creates the
     # per-user association via POST /api/mcp/apps/{id}/connect.
-    # Version-pinned: npx resolves this on every launch, so an unpinned tag
-    # would silently pick up new upstream releases.
+    # Version pin + sandbox/telemetry flags: see builtin_mcp_registry.py's
+    # chrome row for the full rationale. This is a frozen snapshot of that
+    # row (test_seed_row_matches_registry enforces they never drift apart).
     "launch_config": {
         "command": "npx",
-        "args": ["-y", "chrome-devtools-mcp@1.6.0", "--headless", "--isolated"],
+        "args": [
+            "-y",
+            "chrome-devtools-mcp@1.6.0",
+            "--headless",
+            "--isolated",
+            "--chrome-arg=--no-sandbox",
+            "--chrome-arg=--disable-setuid-sandbox",
+            "--no-usage-statistics",
+            "--no-performance-crux",
+        ],
     },
 }
 

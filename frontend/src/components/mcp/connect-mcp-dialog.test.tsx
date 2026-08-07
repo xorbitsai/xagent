@@ -32,8 +32,29 @@ vi.mock("@/components/ui/sonner", () => ({
 }))
 
 vi.mock("@/components/ui/dialog", () => ({
-  Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
-    open ? <div>{children}</div> : null,
+  // role="dialog" + an Escape handler wired to the real onOpenChange prop, so
+  // tests can fireEvent.keyDown(getByRole("dialog"), {key: "Escape"}) to
+  // exercise the component's own onOpenChange guard logic (e.g. refusing to
+  // close while a connect request is in flight) instead of just no-op'ing it.
+  Dialog: ({
+    open,
+    onOpenChange,
+    children,
+  }: {
+    open: boolean
+    onOpenChange?: (open: boolean) => void
+    children: React.ReactNode
+  }) =>
+    open ? (
+      <div
+        role="dialog"
+        onKeyDown={(event) => {
+          if (event.key === "Escape") onOpenChange?.(false)
+        }}
+      >
+        {children}
+      </div>
+    ) : null,
   DialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DialogTitle: ({ children }: { children: React.ReactNode }) => <h1>{children}</h1>,
@@ -455,10 +476,11 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     renderDialog()
     fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
 
-    // No key dialog, no popup — just the POST, with an empty body (no env at
-    // all; an env key would be dropped by the backend anyway).
+    // No key dialog, no popup — just the POST. is_active is sent explicitly
+    // (true) so reconnecting after a dormant association reactivates it
+    // instead of silently staying disconnected; there's no env to send.
     await waitFor(() => {
-      expect(connectBody).toBe("{}")
+      expect(connectBody).toBe(JSON.stringify({ is_active: true }))
     })
     expect(toastErrorMock).not.toHaveBeenCalled()
   })
@@ -485,6 +507,48 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       expect(toastErrorMock).toHaveBeenCalledWith(
         "This app cannot be connected via the connect endpoint",
       )
+    })
+  })
+
+  it("keeps the dialog open on Escape while a keyless connect is in flight", async () => {
+    const onOpenChange = vi.fn()
+    // A deferred connect response: held open until resolveConnect() runs, so
+    // the test can assert the mid-flight (loadingApp set) behavior before
+    // the request settles.
+    let resolveConnect: (() => void) | undefined
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        return new Promise((resolve) => {
+          resolveConnect = () => resolve({ ok: true, json: async () => ({ id: 1 }) })
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    render(
+      <ConnectMcpDialog open onOpenChange={onOpenChange} selectedMcpServers={selectedMcpServers} />,
+    )
+    fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+
+    // The connect POST fired (mock captured the resolver) but hasn't
+    // resolved yet — this is the in-flight window the guard must cover.
+    await waitFor(() => {
+      expect(resolveConnect).toBeDefined()
+    })
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    expect(onOpenChange).not.toHaveBeenCalledWith(false)
+
+    // Once the request settles, Escape closes normally again. The guard
+    // clears in the connect's finally block, which the test can't await
+    // directly — so retry the Escape inside waitFor until it lands.
+    resolveConnect?.()
+    await waitFor(() => {
+      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+      expect(onOpenChange).toHaveBeenCalledWith(false)
     })
   })
 

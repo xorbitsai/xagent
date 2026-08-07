@@ -534,7 +534,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # --headless/--isolated keep server deployments displayless and give
             # each session a throwaway profile instead of a shared one.
             # Version-pinned: npx resolves this on every launch, so an
-            # unpinned tag would silently pick up new upstream releases.
+            # unpinned tag would silently pick up new upstream releases; the
+            # backend image (Dockerfile.backend) pre-installs this exact
+            # version globally so npx resolves it locally instead of hitting
+            # the npm registry on every server launch.
+            # No --executablePath/--channel: the default "stable" channel
+            # resolution finds Chrome per-platform (/Applications/... on
+            # macOS dev hosts, /opt/google/chrome/chrome in the backend
+            # image, which Dockerfile.backend guarantees exists) — a
+            # hardcoded path here would break every other platform.
+            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
+            # backend container runs Chrome as root, same as the existing
+            # browser_use tool (core/tools/core/browser_use.py) in this image.
+            # --no-usage-statistics/--no-performance-crux: chrome-devtools-mcp
+            # sends usage telemetry to Google and POSTs page URLs to the CrUX
+            # API by default; opt out until this connector's data flow is
+            # disclosed to users.
             "launch_config": {
                 "command": "npx",
                 "args": [
@@ -542,6 +557,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     "chrome-devtools-mcp@1.6.0",
                     "--headless",
                     "--isolated",
+                    "--chrome-arg=--no-sandbox",
+                    "--chrome-arg=--disable-setuid-sandbox",
+                    "--no-usage-statistics",
+                    "--no-performance-crux",
                 ],
             },
         },

@@ -119,6 +119,11 @@ export function ConnectMcpDialog({
   const [keyEnvValues, setKeyEnvValues] = useState<Record<string, string>>({})
   const [keyEnvSource, setKeyEnvSource] = useState<"own" | "shared" | "platform">("own")
   const [isConnectingKey, setIsConnectingKey] = useState(false)
+  // True only while a catalog connect POST (key-based or keyless) is in
+  // flight — deliberately narrower than loadingApp, which also stays set for
+  // the whole builtin-OAuth popup wait (up to 5 minutes): the main dialog's
+  // close guard reads this, and must not lock the dialog for that long.
+  const [isCatalogConnectInFlight, setIsCatalogConnectInFlight] = useState(false)
   // Ownership choice at connect/create; "team" triggers a share call after success.
   const [shareChoice, setShareChoice] = useState<"private" | "team">("private")
   const [localSelectedServers, setLocalSelectedServers] = useState<string[]>([])
@@ -525,66 +530,36 @@ export function ConnectMcpDialog({
     setConnectingKeyApp(app)
   }
 
-  const submitKeyConnect = async (autoSelect: boolean) => {
-    if (!connectingKeyApp) return
-    // Only the "own" source sends a per-user key. For shared/platform we omit
-    // env entirely (undefined drops from the JSON) so the backend leaves the
-    // stored own key untouched — an empty {} would clear it, forcing re-entry
-    // when switching back to "own".
-    const env = keyEnvSource === "own" ? keyEnvValues : undefined
-    setIsConnectingKey(true)
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${connectingKeyApp.id}/connect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ env, env_source: keyEnvSource })
-      })
-      if (response.ok) {
-        toast.success(t('tools.mcp.buttons.save'))
-        // "Share with team" chosen: catalog connect users are usually not the
-        // owner, so shareConnector toasts a clear 403 message and stays private.
-        if (shareChoice === "team") {
-          try {
-            const connected = await response.json()
-            if (Number.isInteger(connected?.id)) await shareConnector({ type: "mcp", id: connected.id })
-          } catch (error) {
-            console.error("Failed to read connected app for sharing:", error)
-          }
-        }
-        if (autoSelect && onConnectSelected) {
-          setLocalSelectedServers(prev => prev.includes(connectingKeyApp.name) ? prev : [...prev, connectingKeyApp.name])
-        }
-        if (onSuccess) onSuccess()
-        loadApps()
-        setConnectingKeyApp(null)
-        setSelectedApp(null)
-      } else {
-        const error = await response.json()
-        toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
-      }
-    } catch (error) {
-      console.error("Failed to connect app:", error)
-      toast.error(t('tools.mcp.alerts.saveFailed'))
-    } finally {
-      setIsConnectingKey(false)
+  // Shared POST to /apps/{id}/connect for both catalog-connect paths (key-based
+  // and keyless): same request shape, same success/error/loading handling.
+  // Callers own their own loading-state setter and any path-specific
+  // post-success work (closing their own dialog state, sharing with team) via
+  // the onSuccess callback, which receives the raw response so it can still
+  // read the connected server's id when needed.
+  const connectCatalogApp = async (
+    app: AppIntegration,
+    body: Record<string, unknown>,
+    options: {
+      autoSelect: boolean
+      setLoading: (loading: boolean) => void
+      onSuccess?: (response: Response) => Promise<void> | void
     }
-  }
-
-  // Keyless catalog app (e.g. Chrome): no secrets to collect, so skip the key
-  // dialog entirely and POST straight to the connect endpoint. env is omitted
-  // (not {}) — there is nothing to set, and the shape mirrors submitKeyConnect's
-  // shared/platform branch.
-  const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
-    setLoadingApp(app.id)
+  ) => {
+    options.setLoading(true)
+    setIsCatalogConnectInFlight(true)
     try {
       const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
+        body: JSON.stringify(body)
       })
       if (response.ok) {
         toast.success(t('tools.mcp.buttons.save'))
-        if (autoSelect && onConnectSelected) {
+        // Path-specific follow-up runs before the loadApps() refresh below so
+        // its effects (e.g. the key path's team share) are already reflected
+        // in the reloaded list.
+        if (options.onSuccess) await options.onSuccess(response)
+        if (options.autoSelect && onConnectSelected) {
           setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name])
         }
         if (onSuccess) onSuccess()
@@ -598,8 +573,48 @@ export function ConnectMcpDialog({
       console.error("Failed to connect app:", error)
       toast.error(t('tools.mcp.alerts.saveFailed'))
     } finally {
-      setLoadingApp(null)
+      options.setLoading(false)
+      setIsCatalogConnectInFlight(false)
     }
+  }
+
+  const submitKeyConnect = async (autoSelect: boolean) => {
+    if (!connectingKeyApp) return
+    const app = connectingKeyApp
+    // Only the "own" source sends a per-user key. For shared/platform we omit
+    // env entirely (undefined drops from the JSON) so the backend leaves the
+    // stored own key untouched — an empty {} would clear it, forcing re-entry
+    // when switching back to "own".
+    const env = keyEnvSource === "own" ? keyEnvValues : undefined
+    await connectCatalogApp(app, { env, env_source: keyEnvSource }, {
+      autoSelect,
+      setLoading: setIsConnectingKey,
+      onSuccess: async (response) => {
+        // "Share with team" chosen: catalog connect users are usually not the
+        // owner, so shareConnector toasts a clear 403 message and stays private.
+        if (shareChoice === "team") {
+          try {
+            const connected = await response.json()
+            if (Number.isInteger(connected?.id)) await shareConnector({ type: "mcp", id: connected.id })
+          } catch (error) {
+            console.error("Failed to read connected app for sharing:", error)
+          }
+        }
+        setConnectingKeyApp(null)
+      },
+    })
+  }
+
+  // Keyless catalog app (e.g. Chrome): no secrets to collect, so skip the key
+  // dialog entirely and POST straight to the connect endpoint. is_active is
+  // sent explicitly (not omitted) so re-connecting after a dormant
+  // association (is_active=false) reactivates it instead of silently staying
+  // disconnected — the backend only flips is_active when told to.
+  const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
+    await connectCatalogApp(app, { is_active: true }, {
+      autoSelect,
+      setLoading: (loading) => setLoadingApp(loading ? app.id : null),
+    })
   }
 
   // Remote-MCP OAuth catalog app (e.g. Granola): the backend ensures the
@@ -844,6 +859,12 @@ export function ConnectMcpDialog({
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
+        // Mirrors the key-connect dialog's guard (isConnectingKey below): don't
+        // let an outside click/Escape close this dialog while a catalog
+        // connect POST is in flight, or its success/error toast fires after
+        // the user already believes they dismissed it. Scoped to the POST
+        // itself (not loadingApp, which also spans OAuth popup waits).
+        if (!nextOpen && isCatalogConnectInFlight) return
         if (!nextOpen) {
           connectorEditRequestRef.current += 1
           setCustomApiEditBaseline(null)

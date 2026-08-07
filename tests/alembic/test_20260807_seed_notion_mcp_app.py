@@ -1,6 +1,7 @@
 """Tests for the Notion remote-MCP connector seed migration."""
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -68,8 +69,17 @@ def test_upgrade_inserts_notion(tmp_path):
         ).first()
         assert row[0] == "streamable_http"
         assert row[1] is None
-        assert "https://mcp.notion.com/mcp" in str(row[2])
-        assert "mcp_oauth" in str(row[2])
+        # Exact comparison (not substring checks): the seeded config must not
+        # carry any field beyond the remote URL and auth type — an unexpected
+        # extra field (e.g. a local command) would change how the connector
+        # is classified and launched.
+        launch_config = row[2]
+        if isinstance(launch_config, str):
+            launch_config = json.loads(launch_config)
+        assert launch_config == {
+            "url": "https://mcp.notion.com/mcp",
+            "auth": {"type": "mcp_oauth"},
+        }
 
 
 def test_upgrade_is_idempotent(tmp_path):

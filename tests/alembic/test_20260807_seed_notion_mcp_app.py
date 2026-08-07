@@ -18,8 +18,9 @@ def _load_migration_module():
     spec = importlib.util.spec_from_file_location(
         "seed_notion_migration", migration_file
     )
-    module = importlib.util.module_from_spec(spec)
+    assert spec is not None
     assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
@@ -96,7 +97,7 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
-def test_seed_row_matches_registry(tmp_path):
+def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
     notion row (the migration is a frozen copy; this catches drift)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
@@ -108,7 +109,7 @@ def test_seed_row_matches_registry(tmp_path):
     assert migration.ROW == registry_row
 
 
-def test_seed_row_classifies_as_mcp_oauth(tmp_path):
+def test_seed_row_classifies_as_mcp_oauth():
     """The seeded shape must classify as a remote-MCP OAuth connector — an
     "unconnectable" classification would make the catalog entry dead on
     arrival (no connect endpoint accepts it)."""

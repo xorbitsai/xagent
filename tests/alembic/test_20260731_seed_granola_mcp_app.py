@@ -1,6 +1,7 @@
 """Tests for the Granola remote-MCP connector seed migration."""
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -63,13 +64,48 @@ def test_upgrade_inserts_granola(tmp_path):
         assert "granola" in _app_ids(connection)
         row = connection.execute(
             text(
-                "SELECT transport, provider_name, launch_config FROM public_mcp_apps WHERE app_id='granola'"
+                "SELECT name, description, icon, transport, provider_name,"
+                " category, oauth_scopes, is_visible_in_connector, launch_config"
+                " FROM public_mcp_apps WHERE app_id='granola'"
             )
         ).first()
-        assert row[0] == "streamable_http"
-        assert row[1] is None
-        assert "https://mcp.granola.ai/mcp" in str(row[2])
-        assert "mcp_oauth" in str(row[2])
+        oauth_scopes = row[6]
+        if isinstance(oauth_scopes, str):
+            oauth_scopes = json.loads(oauth_scopes)
+        # Exact comparison (not substring checks): the seeded config must not
+        # carry any field beyond the remote URL and auth type — an unexpected
+        # extra field (e.g. a local command) would change how the connector
+        # is classified and launched.
+        launch_config = row[8]
+        if isinstance(launch_config, str):
+            launch_config = json.loads(launch_config)
+        # Full-row comparison, not just transport/provider_name/launch_config:
+        # a drifted name/description/icon/category/scopes/visibility would
+        # otherwise pass this test silently.
+        assert (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            oauth_scopes,
+            bool(row[7]),
+            launch_config,
+        ) == (
+            "Granola",
+            "Connect to Granola to search and read your meeting notes, transcripts and action items through Granola's hosted MCP server.",
+            "https://www.google.com/s2/favicons?domain=granola.ai&sz=128",
+            "streamable_http",
+            None,
+            "Productivity",
+            None,
+            True,
+            {
+                "url": "https://mcp.granola.ai/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -118,5 +154,15 @@ def test_downgrade_removes_granola(tmp_path):
         _create_table(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
+            # A sentinel row unrelated to this migration must survive the
+            # downgrade — otherwise "granola" missing from _app_ids could
+            # equally mean the whole table was wiped, not just its own row.
+            connection.execute(
+                text(
+                    "INSERT INTO public_mcp_apps (app_id, name) VALUES ('sentinel', 'Sentinel')"
+                )
+            )
             migration.downgrade()
-        assert "granola" not in _app_ids(connection)
+        app_ids = _app_ids(connection)
+        assert "granola" not in app_ids
+        assert "sentinel" in app_ids

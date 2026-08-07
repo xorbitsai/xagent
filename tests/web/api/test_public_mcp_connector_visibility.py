@@ -764,24 +764,33 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
         "required_env": ["GOOGLE_MAPS_API_KEY"],
     }
 
-    # Remote MCP (no local command at all): Granola hosts the server itself.
+    assert rows_by_app_id["aws"]["launch_config"] == {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.aws"],
+        "required_env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+    }
+
+
+def test_remote_mcp_apps_launch_config() -> None:
+    """Granola and Notion have no local launch command at all — they host
+    their own MCP server and are reached over streamable_http. This is
+    intentionally split out of test_builtin_registry_uses_runtime_available_
+    launch_commands, whose name is about local launch *commands* and would
+    misdescribe these remote-only entries."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
+
     assert rows_by_app_id["granola"]["transport"] == "streamable_http"
     assert rows_by_app_id["granola"]["launch_config"] == {
         "url": "https://mcp.granola.ai/mcp",
         "auth": {"type": "mcp_oauth"},
     }
 
-    # Remote MCP: Notion hosts the server itself, same shape as Granola.
     assert rows_by_app_id["notion"]["transport"] == "streamable_http"
     assert rows_by_app_id["notion"]["launch_config"] == {
         "url": "https://mcp.notion.com/mcp",
         "auth": {"type": "mcp_oauth"},
-    }
-
-    assert rows_by_app_id["aws"]["launch_config"] == {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.aws"],
-        "required_env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
     }
 
 

@@ -455,6 +455,30 @@ sample_prompts:
 
         assert not offenders
 
+    @pytest.mark.asyncio
+    async def test_builtin_ga_analyzer_preconfigures_google_analytics_connector(self):
+        """The GA Analyzer template must ship with the Google Analytics
+        connector preconfigured: declared under `connections:` (so the card
+        advertises it and the build wizard preconnects it) and merged into
+        the enriched agent_config.tool_categories as an `mcp:` entry (so an
+        agent created from the template actually gets the connector). Its
+        instructions promise a live GA4 pull - without the connector that
+        promise is dead on arrival."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        manager = TemplateManager(templates_root=built_in_dir)
+        template = await manager.get_template("marketing-google-analytics-analyzer")
+
+        assert template is not None
+        connection_names = [
+            conn.get("name")
+            for conn in template["connections"]
+            if isinstance(conn, dict)
+        ]
+        assert "Google Analytics" in connection_names
+        assert "mcp:Google Analytics" in template["agent_config"]["tool_categories"]
+
     def test_builtin_sample_prompt_highlights_are_literal_substrings(self):
         """Every highlight must be a literal substring of its own prompt, in
         both locales - otherwise the frontend's highlight matching

@@ -43,9 +43,10 @@ sample_prompts:
 # of what marketing-google-analytics-analyzer and
 # marketing-google-ads-recommendation actually declare under their own
 # `connections:`, so the card doesn't advertise an integration this
-# workforce doesn't have (this previously listed "Google Analytics",
-# which neither sub-template connects to at all).
+# workforce doesn't have (PR #1127 re-review, F7).
 connections:
+- name: Google Analytics
+  logo: https://www.google.com/s2/favicons?domain=analytics.google.com&sz=64
 - name: Google Docs
   logo: https://www.google.com/s2/favicons?domain=docs.google.com&sz=64
 - name: Google Slides
@@ -105,7 +106,7 @@ workforce_config:
     name: Google Analytics Analyzer
     alias: GA Analyzer
     assignment_instructions: |
-      Produce a 'Signals for Ads' table: for each campaign / source, report sessions, CVR, conversions, value, and a verdict (winning / underperforming), comparing the current period to the prior period of equal length. Ask the Growth Marketing Manager for the GA4 export or period range if you don't already have it.
+      Produce a 'Signals for Ads' table: for each campaign / source, report sessions, CVR, conversions, value, and a verdict (winning / underperforming), comparing the current period to the prior period of equal length. Pull the data from the connected Google Analytics account when one is available; otherwise ask the Growth Marketing Manager for a GA4 export. Ask for the period range if you don't already have it.
   - template_id: marketing-google-ads-recommendation
     name: Google Ads Recommendation
     alias: Ads Recommendation

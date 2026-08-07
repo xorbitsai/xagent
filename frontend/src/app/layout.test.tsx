@@ -121,7 +121,9 @@ describe("RootLayout metadata", () => {
       siteName: "Xagent",
       title: "Xagent",
       description: "AI-powered agent and workflow management system",
-      images: [{ url: "/xagent_logo.png", alt: "Xagent Logo" }],
+      type: "website",
+      url: "/",
+      images: [{ url: "/xagent_logo.png", alt: "Xagent Logo", width: 300, height: 300, type: "image/png" }],
     })
     expect(metadata.metadataBase).toEqual(new URL("https://cloud.xagent.co"))
   })

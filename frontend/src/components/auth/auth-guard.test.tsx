@@ -29,9 +29,18 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-vi.mock("@/lib/branding", () => ({
-  getBrandingFromEnv: () => ({ appName: "Xagent", whiteLogoPath: "/logo-white.png" }),
-}))
+// Reads whiteLogoPath/appName off the real defaultBranding so this mock can't
+// drift from the actual default asset path.
+vi.mock("@/lib/branding", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/branding")>()
+  return {
+    ...actual,
+    getBrandingFromEnv: () => ({
+      appName: actual.defaultBranding.appName,
+      whiteLogoPath: actual.defaultBranding.whiteLogoPath,
+    }),
+  }
+})
 
 // Pins the exact regression this PR fixes: static export (next build)
 // freezes this loading branch into out/index.html for "/", since auth only
@@ -57,6 +66,10 @@ describe("AuthGuard loading state", () => {
         "Build, deploy, and scale intelligent agents that work for you — no code required.",
       ),
     ).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: "Xagent" })).toHaveAttribute(
+      "src",
+      "/xagent_white_logo.png",
+    )
     expect(screen.queryByTestId("children")).not.toBeInTheDocument()
   })
 

@@ -96,6 +96,11 @@ export function AuthGuard({ children }: AuthGuardProps) {
     // crawlers — see only this markup, so it carries real copy about what
     // the app does instead of a bare spinner. A JS-executing crawler that
     // runs the redirect effect above will move past it once auth resolves.
+    //
+    // Logo and title/subtitle typography intentionally match the real hero in
+    // page.tsx (logo size, font size/weight, line-height) so the swap to the
+    // authenticated page is visually seamless. The decorative gradient
+    // background is deliberately not replicated here.
     if (pathname === "/") {
       return (
         <div className="min-h-screen bg-[#0D1117] flex items-center justify-center px-6">
@@ -103,12 +108,14 @@ export function AuthGuard({ children }: AuthGuardProps) {
             <img
               src={branding.whiteLogoPath}
               alt={branding.appName}
-              className="w-12 h-12 mb-4 object-contain rounded-[14px] mx-auto"
+              className="w-14 h-14 mb-6 object-contain rounded-[16px] shadow-2xl mx-auto"
             />
-            <h1 className="text-white text-2xl font-bold mb-3">
+            <h1 className="text-white text-[34px] font-extrabold mb-3 tracking-tight leading-[1.15]">
               {t('home.hero.title', { appName: branding.appName })}
             </h1>
-            <p className="text-[#8B949E] mb-6">{t('home.hero.subtitle')}</p>
+            <p className="text-gray-400 text-[13.5px] font-medium mb-8 leading-[1.7]">
+              {t('home.hero.subtitle')}
+            </p>
             <div className="w-8 h-8 border-2 border-[#8B949E] border-t-transparent rounded-full animate-spin mx-auto"></div>
           </div>
         </div>

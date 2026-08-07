@@ -41,3 +41,18 @@ export function getBrandingFromEnv(): BrandingConfig {
     siteUrl: process.env.NEXT_PUBLIC_SITE_URL || defaultBranding.siteUrl,
   }
 }
+
+// A malformed NEXT_PUBLIC_SITE_URL (e.g. missing scheme) must not take down
+// the production build; fall back to the default site URL instead.
+//
+// Lives here rather than in app/layout.tsx: Next.js's typed-routes checker
+// restricts route modules (layout.tsx/page.tsx) to a fixed set of named
+// exports, so an extra export there fails `tsc` against .next/types.
+export function resolveMetadataBase(siteUrl: string): URL {
+  try {
+    return new URL(siteUrl)
+  } catch {
+    console.error(`Invalid NEXT_PUBLIC_SITE_URL "${siteUrl}", falling back to ${defaultBranding.siteUrl}`)
+    return new URL(defaultBranding.siteUrl)
+  }
+}

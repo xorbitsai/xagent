@@ -10,7 +10,6 @@ from mcp.server.fastmcp import FastMCP
 
 from .utils import resolve_id_from_url, setup_proxy_env
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-sheets-mcp")
 
 # Ensure standard proxy environment variables are set to prevent hanging requests
@@ -18,10 +17,7 @@ setup_proxy_env()
 
 mcp = FastMCP("google-sheets-mcp")
 
-_SPREADSHEET_URL_ID_PATTERN = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
-
-_sheets_service: Any = None
-_drive_service: Any = None
+_SPREADSHEET_URL_ID_PATTERN = re.compile(r"/spreadsheets/(?:u/\d+/)?d/([a-zA-Z0-9_-]+)")
 
 
 def _get_credentials() -> Credentials:
@@ -48,21 +44,11 @@ def _get_credentials() -> Credentials:
 
 
 def get_sheets_service() -> Any:
-    global _sheets_service
-    if _sheets_service is None:
-        _sheets_service = build(
-            "sheets", "v4", credentials=_get_credentials(), static_discovery=True
-        )
-    return _sheets_service
+    return build("sheets", "v4", credentials=_get_credentials())
 
 
 def get_drive_service() -> Any:
-    global _drive_service
-    if _drive_service is None:
-        _drive_service = build(
-            "drive", "v3", credentials=_get_credentials(), static_discovery=True
-        )
-    return _drive_service
+    return build("drive", "v3", credentials=_get_credentials())
 
 
 def _resolve_spreadsheet_id(spreadsheet_id: str) -> str:
@@ -126,7 +112,10 @@ def google_sheets_create_spreadsheet(
     Create a new Google Sheets spreadsheet with the given title.
     Optionally pass sheet_titles to create additional named sheets (tabs)
     beyond the default first sheet, and parent_id to place the spreadsheet
-    in a specific Drive folder.
+    in a specific Drive folder. Because this connector is authorized with
+    the drive.file scope, parent_id only works for a folder this app has
+    already created or that the user explicitly picked; other folder ids
+    will typically be rejected by the Drive API.
     """
     try:
         service = get_sheets_service()
@@ -142,8 +131,12 @@ def google_sheets_create_spreadsheet(
             )
             .execute()
         )
+    except Exception as e:
+        logger.error(f"Error creating spreadsheet: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
 
-        if parent_id:
+    if parent_id:
+        try:
             drive = get_drive_service()
             existing_file = (
                 drive.files()
@@ -159,18 +152,29 @@ def google_sheets_create_spreadsheet(
             if previous_parents:
                 update_kwargs["removeParents"] = ",".join(previous_parents)
             drive.files().update(**update_kwargs).execute()
+        except Exception as e:
+            logger.error(f"Error moving new spreadsheet to parent_id: {e}")
+            return json.dumps(
+                {
+                    "status": "partial",
+                    "spreadsheet_id": spreadsheet.get("spreadsheetId"),
+                    "title": spreadsheet.get("properties", {}).get("title"),
+                    "url": spreadsheet.get("spreadsheetUrl"),
+                    "message": (
+                        "Spreadsheet was created but could not be moved to "
+                        f"parent_id {parent_id!r}: {e}"
+                    ),
+                }
+            )
 
-        return json.dumps(
-            {
-                "status": "success",
-                "spreadsheet_id": spreadsheet.get("spreadsheetId"),
-                "title": spreadsheet.get("properties", {}).get("title"),
-                "url": spreadsheet.get("spreadsheetUrl"),
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error creating spreadsheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+    return json.dumps(
+        {
+            "status": "success",
+            "spreadsheet_id": spreadsheet.get("spreadsheetId"),
+            "title": spreadsheet.get("properties", {}).get("title"),
+            "url": spreadsheet.get("spreadsheetUrl"),
+        }
+    )
 
 
 @mcp.tool()
@@ -204,26 +208,18 @@ def google_sheets_read_range(spreadsheet_id: str, range_name: str) -> str:
 def google_sheets_update_range(
     spreadsheet_id: str,
     range_name: str,
-    values_json: str,
+    values: list[list[Any]],
     value_input_option: str = "USER_ENTERED",
 ) -> str:
     """
     Overwrite cell values in a range, e.g. range_name="Sheet1!A1:B2".
-    values_json must be a JSON-encoded 2D array of rows, e.g.
-    '[["a","b"],["c","d"]]'. value_input_option controls parsing:
-    "USER_ENTERED" (default, parses formulas/numbers like typed input) or
-    "RAW" (stores every value as a literal string).
+    values must be a 2D array of rows, e.g. [["a","b"],["c","d"]].
+    value_input_option controls parsing: "USER_ENTERED" (default, parses
+    formulas/numbers like typed input) or "RAW" (stores every value as a
+    literal string).
     """
     try:
         resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
-        values = json.loads(values_json)
-        if not isinstance(values, list) or not all(
-            isinstance(row, list) for row in values
-        ):
-            raise ValueError(
-                "values_json must be a 2D JSON array of rows (list of lists)"
-            )
-
         service = get_sheets_service()
         result = (
             service.spreadsheets()
@@ -252,24 +248,16 @@ def google_sheets_update_range(
 def google_sheets_append_rows(
     spreadsheet_id: str,
     range_name: str,
-    values_json: str,
+    values: list[list[Any]],
     value_input_option: str = "USER_ENTERED",
 ) -> str:
     """
     Append rows after the last row of data found in range_name, e.g.
-    range_name="Sheet1!A1". values_json must be a JSON-encoded 2D array of
-    rows, e.g. '[["a","b"],["c","d"]]'.
+    range_name="Sheet1!A1". values must be a 2D array of rows, e.g.
+    [["a","b"],["c","d"]].
     """
     try:
         resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
-        values = json.loads(values_json)
-        if not isinstance(values, list) or not all(
-            isinstance(row, list) for row in values
-        ):
-            raise ValueError(
-                "values_json must be a 2D JSON array of rows (list of lists)"
-            )
-
         service = get_sheets_service()
         result = (
             service.spreadsheets()
@@ -354,7 +342,9 @@ def google_sheets_add_sheet(
             )
             .execute()
         )
-        new_sheet = result["replies"][0]["addSheet"]["properties"]
+        new_sheet = (
+            (result.get("replies") or [{}])[0].get("addSheet", {}).get("properties", {})
+        )
         return json.dumps(
             {
                 "status": "success",
@@ -390,4 +380,5 @@ def google_sheets_delete_sheet(spreadsheet_id: str, sheet_id: int) -> str:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     mcp.run()

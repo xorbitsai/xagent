@@ -46,9 +46,9 @@ const formatFallbackLabel = (category: string) =>
 // src/xagent/web/services/workforce_creator.py), mapped here by machine
 // code rather than by byte-matching human-readable English strings - a
 // backend wording change used to silently degrade every mapped error to
-// the generic toast (PR #1127 re-review, m4). Any error without a mapped
-// code (including plain-string details from other paths) falls back to
-// the generic translated message rather than leaking raw English.
+// the generic toast. Any error without a mapped code (including
+// plain-string details from other paths) falls back to the generic
+// translated message rather than leaking raw English.
 const WORKFORCE_USE_ERROR_CODE_KEYS: Record<string, TranslationKey> = {
   workforce_create_access_denied: "templates.errors.useWorkforceAccessDenied",
   workforce_create_conflict: "templates.errors.useWorkforceRetry",
@@ -56,7 +56,7 @@ const WORKFORCE_USE_ERROR_CODE_KEYS: Record<string, TranslationKey> = {
 
 // Unlike the codes above, this error can never be resolved by retrying, so
 // it renders its own message interpolating the agent's name from
-// detail.params rather than a static translation (PR #1127 re-review, F1).
+// detail.params rather than a static translation.
 const WORKFORCE_WORKER_UNPUBLISHED_CODE = "workforce_worker_unpublished";
 
 export default function TemplatesPage() {
@@ -92,7 +92,7 @@ function TemplatesPageContent() {
   // in flight, the request still resolves - without this guard, its
   // .then()/finally would call setState and router.push on an unmounted
   // page, yanking the user back to the just-created workforce's canvas
-  // with no way to know why (PR #1127 re-review, M3).
+  // with no way to know why.
   const isMountedRef = useRef(true);
   useEffect(() => {
     isMountedRef.current = true;
@@ -217,8 +217,7 @@ function TemplatesPageContent() {
     // A workforce creation in flight locks EVERY card, not just other
     // workforce cards - clicking a plain Agent card mid-creation used to
     // still work, landing the user on /build/new only to be redirected back
-    // to the just-created workforce's canvas once that request resolved
-    // (PR #1127 re-review, M3).
+    // to the just-created workforce's canvas once that request resolved.
     if (creatingWorkforceId) return;
 
     const template = templates.find((item) => item.id === templateId);
@@ -431,7 +430,7 @@ function TemplateSection({
             busyLabel={busyLabel}
             // Locks every OTHER card - agent or workforce - while a
             // workforce is being created, matching the same-scoped lock
-            // handleUseTemplate now enforces (PR #1127 re-review, M3).
+            // handleUseTemplate enforces.
             disabled={
               creatingWorkforceId !== null && creatingWorkforceId !== template.id
             }

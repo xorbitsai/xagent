@@ -184,6 +184,14 @@ class AgentShareLinkResponse(BaseModel):
     share_updated_at: Optional[str]
 
 
+def _workforce_template_not_supported_response() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail="This template creates a workforce, not a single agent; "
+        "use it from the Templates page instead",
+    )
+
+
 def _unshared_error_response(
     error: UnsharedConnectorsError | UnsharedKnowledgeBasesError,
 ) -> HTTPException:
@@ -572,11 +580,7 @@ async def resolve_agent_from_template(
     except TemplateNotFoundError:
         raise HTTPException(status_code=404, detail="Template not found")
     except WorkforceTemplateNotSupportedError:
-        raise HTTPException(
-            status_code=400,
-            detail="This template creates a workforce, not a single agent; "
-            "use it from the Templates page instead",
-        )
+        raise _workforce_template_not_supported_response()
     except DuplicateAgentNameError:
         raise HTTPException(
             status_code=400, detail="Agent with this name already exists"
@@ -637,11 +641,7 @@ async def create_agent_from_template(
     except TemplateNotFoundError:
         raise HTTPException(status_code=404, detail="Template not found")
     except WorkforceTemplateNotSupportedError:
-        raise HTTPException(
-            status_code=400,
-            detail="This template creates a workforce, not a single agent; "
-            "use it from the Templates page instead",
-        )
+        raise _workforce_template_not_supported_response()
     except DuplicateAgentNameError:
         raise HTTPException(
             status_code=400, detail="Agent with this name already exists"

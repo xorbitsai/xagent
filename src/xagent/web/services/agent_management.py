@@ -86,7 +86,7 @@ class WorkforceTemplateNotSupportedError(ValueError):
     A workforce template's `agent_config` carries no real instructions (see
     `TemplateManager._enrich_template`), so without this gate every one of
     these single-agent creation paths would silently publish an agent with
-    empty instructions instead of failing (PR #1127 review).
+    empty instructions instead of failing.
     """
 
 

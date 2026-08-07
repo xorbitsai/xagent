@@ -83,7 +83,7 @@ function TaskHomePageContent() {
         // Quick-access resolves a template straight into a single published
         // agent (POST /api/agents/from-template/resolve) - a workforce
         // template has no single-agent config to resolve, so it's excluded
-        // here rather than surfacing as a broken agent (PR #1127 review).
+        // here rather than surfacing as a broken agent.
         const agentTemplates = Array.isArray(data)
           ? data.filter((template) => template?.type !== "workforce")
           : [];

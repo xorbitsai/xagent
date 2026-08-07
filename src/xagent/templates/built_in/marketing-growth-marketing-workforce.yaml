@@ -43,8 +43,8 @@ sample_prompts:
 # of what marketing-google-analytics-analyzer and
 # marketing-google-ads-recommendation actually declare under their own
 # `connections:`, so the card doesn't advertise an integration this
-# workforce doesn't have (PR #1127 re-review, F7: this previously listed
-# "Google Analytics", which neither sub-template connects to at all).
+# workforce doesn't have (this previously listed "Google Analytics",
+# which neither sub-template connects to at all).
 connections:
 - name: Google Docs
   logo: https://www.google.com/s2/favicons?domain=docs.google.com&sz=64

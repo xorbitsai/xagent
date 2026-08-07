@@ -204,12 +204,12 @@ class TemplateManager:
         that YAML happened to parse for one of these fields used to slip
         through load-time validation and only surface downstream - as a
         garbage prompt or template id, or as an `AttributeError` → 500 when
-        `normalize_text(...).strip()` hit a non-string `description`/`alias`
-        (PR #1127 re-review, m1). Writing the stripped value back also
-        keeps the duplicate-check and the runtime lookup seeing the same
-        `template_id` - previously a template id with surrounding
-        whitespace was stripped for the duplicate check but looked up raw,
-        guaranteeing a "references an unknown template" 400 at use time.
+        `normalize_text(...).strip()` hit a non-string `description`/`alias`.
+        Writing the stripped value back also keeps the duplicate-check and
+        the runtime lookup seeing the same `template_id` - previously a
+        template id with surrounding whitespace was stripped for the
+        duplicate check but looked up raw, guaranteeing a "references an
+        unknown template" 400 at use time.
         """
         value = container.get(key)
         if value is None and not required:
@@ -246,7 +246,7 @@ class TemplateManager:
             # validation - a typo here would only surface as a broken
             # manager agent at instantiation time, out of step with how
             # carefully the rest of workforce_config is checked at load
-            # time (PR #1127 re-review, F10).
+            # time.
             raise ValueError(
                 "'workforce_config.manager.execution_mode' must be one of "
                 f"{sorted(_VALID_EXECUTION_MODES)}, got {execution_mode!r}"
@@ -285,7 +285,7 @@ class TemplateManager:
                 # worker agent make the template permanently unusable: the
                 # second create_workforce_worker() call 409s on the
                 # (workforce_id, agent_id) unique constraint every time this
-                # template is instantiated (PR #1127 review).
+                # template is instantiated.
                 raise ValueError(
                     f"'workforce_config.agents' has a duplicate template_id: "
                     f"{template_id!r}"
@@ -350,8 +350,7 @@ class TemplateManager:
         remembering to check `type` first - a workforce template's
         `agent_config` used to leak real (if useless) `instructions`/
         `tool_categories` here, which is exactly what silently produced a
-        published, empty-instruction agent on every un-gated path (PR
-        #1127 review).
+        published, empty-instruction agent on every un-gated path.
         """
         connections = template.get("connections", [])
         template_type = template.get("type", "agent")

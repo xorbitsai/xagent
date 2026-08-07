@@ -110,7 +110,7 @@ export function LibraryTemplateCard({
   };
   const isWorkforce = template.type === "workforce";
   // Server-computed manager + workers total, matching what "Use" actually
-  // creates (PR #1127 re-review, F6a).
+  // creates.
   const totalAgentCount = template.agent_count || 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {

@@ -1019,6 +1019,100 @@ workforce_config:
             finally:
                 db.close()
 
+    def test_rejects_a_worker_that_is_itself_a_workforce_template(
+        self, tmp_path, admin_headers
+    ):
+        """`workforce_config.agents[].template_id` must resolve to an
+        'agent'-type template. TemplateManager._enrich_template nulls
+        agent_config for any non-agent template, so without this runtime
+        guard a workforce referencing another workforce as a worker would
+        crash on `None.get(...)` instead of failing with a clear 400 - only
+        the load-time warning for this case had a test before this."""
+        import asyncio
+
+        from xagent.templates.manager import TemplateManager
+
+        templates_dir = tmp_path / "nested_workforce_templates"
+        templates_dir.mkdir()
+        (templates_dir / "inner_workforce.yaml").write_text(
+            """
+id: inner_workforce
+name: Inner Workforce
+category: Marketing
+type: workforce
+descriptions:
+  en: A workforce, wrongly referenced as a worker below.
+author: Xagent
+version: "1.0"
+
+workforce_config:
+  manager:
+    name: Inner Manager
+    instructions: |
+      You are the inner manager.
+  agents:
+  - template_id: leaf_agent
+    name: Leaf
+    assignment_instructions: Do the thing.
+"""
+        )
+        (templates_dir / "leaf_agent.yaml").write_text(
+            """
+id: leaf_agent
+name: Leaf Agent
+category: Marketing
+descriptions:
+  en: A normal single-agent template.
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You help with things.
+"""
+        )
+        (templates_dir / "outer_workforce.yaml").write_text(
+            """
+id: outer_workforce
+name: Outer Workforce
+category: Marketing
+type: workforce
+descriptions:
+  en: References inner_workforce (a workforce) as if it were a single agent.
+author: Xagent
+version: "1.0"
+
+workforce_config:
+  manager:
+    name: Outer Manager
+    instructions: |
+      You are the outer manager.
+  agents:
+  - template_id: inner_workforce
+    name: Nested Workforce
+    assignment_instructions: Do the thing.
+"""
+        )
+        template_manager = TemplateManager(templates_root=templates_dir)
+        asyncio.run(template_manager.initialize())
+        mock_state = MagicMock()
+        mock_state.template_manager = template_manager
+
+        with patch.object(client.app, "state", mock_state):
+            response = client.post(
+                "/api/templates/outer_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+            assert response.status_code == 400
+            assert "inner_workforce" in response.json()["detail"]
+
+            db = next(get_db())
+            try:
+                assert db.query(Workforce).count() == 0
+                assert db.query(Agent).count() == 0
+            finally:
+                db.close()
+
     def test_rejects_with_actionable_message_when_worker_agent_is_unpublished(
         self, workforce_mock_app_state, admin_headers, admin_user
     ):
@@ -1172,6 +1266,189 @@ workforce_config:
             assert competitor_workforce.name == "Growth Marketing Workforce"
             assert real_workforce.name != "Growth Marketing Workforce"
             assert real_workforce.name.startswith("Growth Marketing Workforce")
+        finally:
+            db.close()
+
+    def test_second_collision_advances_the_suffix_instead_of_compounding_it(
+        self, workforce_mock_app_state, admin_headers, admin_user
+    ):
+        """The retry loop must re-resolve from the ORIGINAL base name on
+        every collision, not from the previous (already-suffixed) attempt.
+        Feeding the suffixed name back in would compound suffixes on a
+        second collision within the same request ("X 2" -> "X 2 2")
+        instead of advancing to "X 3" - reachable since
+        TEMPLATE_RESOLVE_RACE_RETRIES allows more than one retry.
+
+        Pre-seeds two already-taken names ("Growth Marketing Workforce" and
+        "...  2") and makes the first two `resolve_unique_workforce_name`
+        calls lie that each is free (forcing two real INSERT collisions),
+        then lets the third call resolve for real - so the *result* proves
+        which base name the retry loop actually passed in.
+        """
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import get_engine
+        from xagent.web.services import workforce_creator
+
+        real_resolve_unique_workforce_name = (
+            workforce_creator.resolve_unique_workforce_name
+        )
+        session_factory = sessionmaker(bind=get_engine())
+
+        seed_session = session_factory()
+        try:
+            for taken_name in (
+                "Growth Marketing Workforce",
+                "Growth Marketing Workforce 2",
+            ):
+                manager = Agent(
+                    user_id=admin_user["id"],
+                    name=f"Manager for {taken_name}",
+                    instructions="pre-seeded",
+                    execution_mode="think",
+                    origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+                    status=AgentStatus.PUBLISHED,
+                )
+                seed_session.add(manager)
+                seed_session.flush()
+                seed_session.add(
+                    Workforce(
+                        owner_user_id=admin_user["id"],
+                        scope_type="user",
+                        scope_id=str(admin_user["id"]),
+                        name=taken_name,
+                        manager_agent_id=manager.id,
+                        status="draft",
+                    )
+                )
+            seed_session.commit()
+        finally:
+            seed_session.close()
+
+        call_args: list[str] = []
+
+        def _lie_twice_then_resolve_for_real(db, *, scope_type, scope_id, name):
+            call_args.append(name)
+            if len(call_args) == 1:
+                return "Growth Marketing Workforce"  # actually taken
+            if len(call_args) == 2:
+                return "Growth Marketing Workforce 2"  # actually taken
+            return real_resolve_unique_workforce_name(
+                db, scope_type=scope_type, scope_id=scope_id, name=name
+            )
+
+        with (
+            patch.object(client.app, "state", workforce_mock_app_state),
+            patch.object(
+                workforce_creator,
+                "resolve_unique_workforce_name",
+                side_effect=_lie_twice_then_resolve_for_real,
+            ),
+        ):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        # All three calls resolved from the same original base name - never
+        # from a previously-suffixed attempt.
+        assert call_args == ["Growth Marketing Workforce"] * 3
+
+        db = next(get_db())
+        try:
+            workforce = db.get(Workforce, response.json()["workforce_id"])
+            assert workforce.name == "Growth Marketing Workforce 3"
+        finally:
+            db.close()
+
+    def test_collision_after_an_already_suffixed_initial_resolution(
+        self, workforce_mock_app_state, admin_headers, admin_user
+    ):
+        """The retry's base name must be the TEMPLATE's raw name, not the
+        initial resolution's result - the initial resolution itself already
+        carries a suffix whenever the user instantiated this template
+        before ("Growth Marketing Workforce 2" on the second run). A retry
+        that re-resolved from that resolved name would compound
+        ("X 2" -> "X 2 2") even with the loop's own collided names handled
+        correctly.
+
+        Pre-seeds "X" and "X 2" as taken, has the initial resolution lie
+        that "X 2" is free (as if it resolved before a concurrent winner
+        committed it), and lets the retry resolve for real: from the raw
+        base it must skip both taken names and land on "X 3".
+        """
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import get_engine
+        from xagent.web.services import workforce_creator
+
+        real_resolve_unique_workforce_name = (
+            workforce_creator.resolve_unique_workforce_name
+        )
+        session_factory = sessionmaker(bind=get_engine())
+
+        seed_session = session_factory()
+        try:
+            for taken_name in (
+                "Growth Marketing Workforce",
+                "Growth Marketing Workforce 2",
+            ):
+                manager = Agent(
+                    user_id=admin_user["id"],
+                    name=f"Manager for {taken_name}",
+                    instructions="pre-seeded",
+                    execution_mode="think",
+                    origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+                    status=AgentStatus.PUBLISHED,
+                )
+                seed_session.add(manager)
+                seed_session.flush()
+                seed_session.add(
+                    Workforce(
+                        owner_user_id=admin_user["id"],
+                        scope_type="user",
+                        scope_id=str(admin_user["id"]),
+                        name=taken_name,
+                        manager_agent_id=manager.id,
+                        status="draft",
+                    )
+                )
+            seed_session.commit()
+        finally:
+            seed_session.close()
+
+        call_args: list[str] = []
+
+        def _lie_once_then_resolve_for_real(db, *, scope_type, scope_id, name):
+            call_args.append(name)
+            if len(call_args) == 1:
+                return "Growth Marketing Workforce 2"  # actually taken
+            return real_resolve_unique_workforce_name(
+                db, scope_type=scope_type, scope_id=scope_id, name=name
+            )
+
+        with (
+            patch.object(client.app, "state", workforce_mock_app_state),
+            patch.object(
+                workforce_creator,
+                "resolve_unique_workforce_name",
+                side_effect=_lie_once_then_resolve_for_real,
+            ),
+        ):
+            response = client.post(
+                "/api/templates/growth_workforce/use-as-workforce",
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        # The retry received the raw template name, not "...2".
+        assert call_args == ["Growth Marketing Workforce"] * 2
+
+        db = next(get_db())
+        try:
+            workforce = db.get(Workforce, response.json()["workforce_id"])
+            assert workforce.name == "Growth Marketing Workforce 3"
         finally:
             db.close()
 

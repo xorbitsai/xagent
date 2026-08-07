@@ -297,9 +297,8 @@ def _find_quick_access_worker_agent(
 # ("agent_in_use_by_workforce") and mcp.py. The frontend maps these codes
 # to translated messages instead of byte-matching human-readable English
 # detail strings, which silently degraded to a generic toast on any
-# backend wording change (PR #1127 re-review, m4). `params` carries the
-# variable parts (e.g. the agent's name) separately so translations can
-# interpolate them.
+# backend wording change. `params` carries the variable parts (e.g. the
+# agent's name) separately so translations can interpolate them.
 WORKFORCE_CREATE_ACCESS_DENIED_CODE = "workforce_create_access_denied"
 WORKFORCE_CREATE_CONFLICT_CODE = "workforce_create_conflict"
 WORKFORCE_WORKER_UNPUBLISHED_CODE = "workforce_worker_unpublished"
@@ -315,8 +314,8 @@ def _ensure_published_quick_access_agent(agent: Agent) -> Agent:
     `ensure_agent_access(..., require_published=True)` with a generic 400
     the frontend can only render as "please retry" - which can never
     succeed, since retrying resolves to the same unpublished agent every
-    time (PR #1127 re-review, F1). Raise here instead, with a message
-    specific enough to actually be actionable.
+    time. Raise here instead, with a message specific enough to actually
+    be actionable.
     """
     if agent.status != AgentStatus.PUBLISHED:
         raise HTTPException(
@@ -396,7 +395,7 @@ async def _get_or_create_quick_access_worker_agent(
     # minted quick-access agent - both write the same (user_id, template_id,
     # quick-access-origin) row, so leaving these hardcoded to empty here
     # would silently strand them the first time this path (rather than
-    # /task) happens to create the row first (PR #1127 re-review, F2).
+    # /task) happens to create the row first.
     # Deliberate exception: `knowledge_bases` stays empty. KB ids are
     # user-scoped runtime entities the /task path validates per-user via
     # `_validate_agent_knowledge_bases` (rejecting the template with a 400
@@ -442,7 +441,7 @@ async def _get_or_create_quick_access_worker_agent(
             # name collision as this template's quick-access race, which
             # burns every retry on a re-select that can never find a row
             # (nothing else raced for *this* template_id) and returns a
-            # misleading 409 (PR #1127 review).
+            # misleading 409.
             if is_agent_template_quick_access_unique_violation(exc):
                 # A concurrent request won the (user_id, template_id)
                 # quick-access race; its row should now be visible.
@@ -522,11 +521,12 @@ async def create_workforce_from_template(
 
     owner_user_id = int(user.id)
     try:
+        base_name = str(template.get("name") or "Workforce")
         name = resolve_unique_workforce_name(
             db,
             scope_type=scope_type,
             scope_id=scope_id,
-            name=str(template.get("name") or "Workforce"),
+            name=base_name,
         )
         # The manager-agent insert (unlike the Workforce insert just below)
         # is NOT wrapped in its own `db.begin_nested()` - that is safe only
@@ -536,8 +536,7 @@ async def create_workforce_from_template(
         # entirely, so two concurrent managers can even share a name
         # without ever hitting a unique-constraint collision in the first
         # place. If that predicate ever changes, this insert would need the
-        # same SAVEPOINT-retry treatment as the Workforce insert below (PR
-        # #1127 re-review, F11).
+        # same SAVEPOINT-retry treatment as the Workforce insert below.
         manager_agent = AgentStore(db).add_agent(
             user_id=owner_user_id,
             name=resolve_unique_agent_name(
@@ -572,7 +571,7 @@ async def create_workforce_from_template(
         # LLM-generated one, so this collision is not just theoretical) can
         # both resolve the same name and race to insert it. Retry inside a
         # SAVEPOINT so a collision only unwinds this insert, not the
-        # manager agent already created above (PR #1127 re-review, M1).
+        # manager agent already created above.
         workforce: Workforce | None = None
         for attempt in range(TEMPLATE_RESOLVE_RACE_RETRIES):
             try:
@@ -601,8 +600,15 @@ async def create_workforce_from_template(
                     scope_type,
                     scope_id,
                 )
+                # Re-resolve from the template's RAW name, never from a
+                # resolved (possibly suffixed) one - resolving from a
+                # suffixed name compounds suffixes ("X 2" -> "X 2 2")
+                # instead of advancing to "X 3". That holds both for the
+                # collided `name` from this loop and for the initial
+                # resolution above, which itself already carries a suffix
+                # whenever the user instantiated this template before.
                 name = resolve_unique_workforce_name(
-                    db, scope_type=scope_type, scope_id=scope_id, name=name
+                    db, scope_type=scope_type, scope_id=scope_id, name=base_name
                 )
         else:
             raise HTTPException(
@@ -658,9 +664,9 @@ def get_localized_description(
     `description` column. Unlike the template gallery response, this was
     never locale-aware at all - `create_workforce_from_template` had no way
     to know the caller's locale, so every Workforce got its English
-    description regardless of the creating user's UI language (PR #1127
-    re-review, F4). `lang` threads the same query param the sibling GET
-    endpoints already accept. `descriptions` is always a {en, zh, ...} dict
+    description regardless of the creating user's UI language. `lang`
+    threads the same query param the sibling GET endpoints already accept.
+    `descriptions` is always a {en, zh, ...} dict
     here - `TemplateManager._parse_yaml_file` raises ValueError for any
     other shape, so a template dict reaching this function can't carry a
     plain string instead.

@@ -262,10 +262,9 @@ def increment_template_used_count(db: Session, template_id: str) -> None:
     under concurrent successes on the same template (two concurrent
     `use-as-workforce` calls could both read used_count=0 and both write 1,
     losing one), and its `TemplateStats` row-creation race was swallowed by
-    a broad `except IntegrityError` with no compensating re-read (PR #1127
-    re-review, m3). Callers must `db.commit()` then `db.refresh(stats)` to
-    see the post-increment value, matching `increment_template_likes`'s
-    existing callers.
+    a broad `except IntegrityError` with no compensating re-read. Callers
+    must `db.commit()` then `db.refresh(stats)` to see the post-increment
+    value, matching `increment_template_likes`'s existing callers.
     """
     db.query(TemplateStats).filter(TemplateStats.template_id == template_id).update(
         {TemplateStats.used_count: TemplateStats.used_count + 1},
@@ -276,9 +275,9 @@ def increment_template_used_count(db: Session, template_id: str) -> None:
 def get_workforce_agent_count(template: dict[str, Any]) -> int:
     """Total agents (1 manager + N workers) a workforce-type template
     creates - the card badge's only need, computed server-side rather than
-    shipping name lists the frontend would just count (PR #1127 re-review
-    simplification; this replaced a manager_name/worker_names pair whose
-    only consumer read lengths/presence). 0 for agent-type templates.
+    shipping name lists the frontend would just count (this replaced a
+    manager_name/worker_names pair whose only consumer read
+    lengths/presence). 0 for agent-type templates.
     Derived entirely from static YAML fields (no per-agent template
     lookups), since this runs for every template on every
     `GET /api/templates/` page load.
@@ -540,10 +539,10 @@ async def use_template(
         # Every other agent-creation surface (the service-layer raises,
         # the v1 400, the home/task/builder filters) already refuses a
         # workforce template - this legacy endpoint was left ungated,
-        # returning 200 "Template usage recorded" while creating nothing
-        # (PR #1127 re-review, m2). It predates the workforce type and
-        # frontend code only calls /use-as-workforce for one, but external
-        # API consumers could still hit it directly.
+        # returning 200 "Template usage recorded" while creating nothing.
+        # It predates the workforce type and frontend code only calls
+        # /use-as-workforce for one, but external API consumers could
+        # still hit it directly.
         raise HTTPException(
             status_code=400,
             detail="This template creates a workforce, not a single agent; "

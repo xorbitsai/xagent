@@ -116,7 +116,7 @@ function decodeHomeTemplates(value: unknown): HomeTemplateCard[] | null {
     // single agent (/build/new?template=). Workforce templates need the
     // dedicated instantiation flow on the Templates page instead, so they
     // are left out of this surface rather than silently producing a
-    // broken, empty-instruction agent (PR #1127 review).
+    // broken, empty-instruction agent.
     if (decoded.type === "workforce") continue;
     templates.push(decoded);
   }

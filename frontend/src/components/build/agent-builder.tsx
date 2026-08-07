@@ -925,8 +925,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             // This builder only knows how to configure a single agent.
             // A workforce template's agent_config is always null (see
             // TemplateManager._enrich_template) - bail out loudly instead
-            // of silently publishing an agent with empty instructions
-            // (PR #1127 review).
+            // of silently publishing an agent with empty instructions.
             toast.error(t("builds.editor.error.templateIsWorkforce"))
             router.replace("/templates")
             return

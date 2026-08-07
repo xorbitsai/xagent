@@ -1,7 +1,7 @@
 """seed built-in Google Sheets (OAuth) MCP connector
 
 Revision ID: 20260806_seed_google_sheets_mcp_app
-Revises: 20260729_add_gmail_audience_grace
+Revises: 20260804_add_task_checkpoint_trace_event_anchor
 Create Date: 2026-08-06 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260806_seed_google_sheets_mcp_app"
-down_revision: Union[str, None] = "20260729_add_gmail_audience_grace"
+down_revision: Union[str, None] = "20260804_add_task_checkpoint_trace_event_anchor"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

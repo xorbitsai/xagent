@@ -3,15 +3,26 @@ import React, { type CSSProperties } from "react";
 import "./globals.css";
 import { ThemeProvider } from "@/contexts/theme-context";
 import { ApplicationShell } from "@/components/layout/application-shell";
-import { getBrandingFromEnv } from "@/lib/branding";
+import { defaultBranding, getBrandingFromEnv } from "@/lib/branding";
 import { I18nProvider } from "@/contexts/i18n-context";
 import { getThemeFromEnv, themes } from "@/lib/theme";
 import { Toaster } from "@/components/ui/sonner";
 
 const branding = getBrandingFromEnv();
 
+// A malformed NEXT_PUBLIC_SITE_URL (e.g. missing scheme) must not take down
+// the production build; fall back to the default site URL instead.
+function resolveMetadataBase(siteUrl: string): URL {
+  try {
+    return new URL(siteUrl);
+  } catch {
+    console.warn(`Invalid NEXT_PUBLIC_SITE_URL "${siteUrl}", falling back to ${defaultBranding.siteUrl}`);
+    return new URL(defaultBranding.siteUrl);
+  }
+}
+
 export const metadata: Metadata = {
-  metadataBase: new URL(branding.siteUrl),
+  metadataBase: resolveMetadataBase(branding.siteUrl),
   title: branding.appName,
   description: branding.description,
   applicationName: branding.appName,

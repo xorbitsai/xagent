@@ -2,6 +2,7 @@ import React from "react"
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { AuthGuard } from "./auth-guard"
+import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 const route = vi.hoisted(() => ({ pathname: "/" as string | null }))
 const authState = vi.hoisted(() => ({ isAuthenticated: false, isLoading: true }))
@@ -19,8 +20,13 @@ vi.mock("@/contexts/auth-context", () => ({
   }),
 }))
 
+// Resolves against the real English translation table (rather than an
+// identity passthrough) so this pins the actual copy shipped in out/index.html.
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({
+    t: (key: string, vars?: Record<string, string | number>) =>
+      resolveTranslation("en", key as TranslationKey, vars),
+  }),
 }))
 
 vi.mock("@/lib/branding", () => ({
@@ -39,11 +45,18 @@ describe("AuthGuard loading state", () => {
 
   afterEach(cleanup)
 
+  // Literal strings on purpose: asserting via resolveTranslation would pass
+  // even if the key were removed from the table (it falls back to the key on
+  // both sides), which is exactly the regression this test exists to catch.
   it("renders the home hero copy while auth resolves on the home route", () => {
     render(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
-    expect(screen.getByText("home.hero.title")).toBeInTheDocument()
-    expect(screen.getByText("home.hero.subtitle")).toBeInTheDocument()
+    expect(screen.getByText("Welcome to Xagent")).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        "Build, deploy, and scale intelligent agents that work for you — no code required.",
+      ),
+    ).toBeInTheDocument()
     expect(screen.queryByTestId("children")).not.toBeInTheDocument()
   })
 
@@ -52,7 +65,7 @@ describe("AuthGuard loading state", () => {
 
     render(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
-    expect(screen.getByText("common.loading")).toBeInTheDocument()
-    expect(screen.queryByText("home.hero.title")).not.toBeInTheDocument()
+    expect(screen.getByText("Loading...")).toBeInTheDocument()
+    expect(screen.queryByText("Welcome to Xagent")).not.toBeInTheDocument()
   })
 })

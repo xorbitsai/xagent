@@ -455,6 +455,59 @@ sample_prompts:
 
         assert not offenders
 
+    def test_builtin_workforce_connections_are_union_of_sub_template_connections(self):
+        """A `type: workforce` template's `connections:` is hand-maintained
+        display-only data (see the comment above `connections:` in
+        marketing-growth-marketing-workforce.yaml) - nothing in
+        `TemplateManager` derives or validates it against the sub-templates
+        it actually references. That invariant has drifted and been
+        hand-fixed at least twice already (PR #1127 re-review, F7; and
+        again when the Google Analytics connector was added to
+        marketing-google-analytics-analyzer). Assert it generically for
+        every built-in workforce template so this class of drift is caught
+        automatically instead of relying on a reviewer to notice."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+
+        def connection_names(data):
+            return {
+                conn.get("name") if isinstance(conn, dict) else conn
+                for conn in data.get("connections") or []
+            }
+
+        templates_by_id = {}
+        for template_file in built_in_dir.glob("*.yaml"):
+            data = yaml.safe_load(template_file.read_text(encoding="utf-8")) or {}
+            template_id = data.get("id")
+            if template_id:
+                templates_by_id[template_id] = data
+
+        offenders: list[str] = []
+        for template_id, data in templates_by_id.items():
+            if data.get("type") != "workforce":
+                continue
+
+            workforce_config = data.get("workforce_config") or {}
+            sub_template_ids = [
+                agent.get("template_id")
+                for agent in workforce_config.get("agents") or []
+            ]
+            expected = set()
+            for sub_template_id in sub_template_ids:
+                sub_template = templates_by_id.get(sub_template_id)
+                if sub_template is not None:
+                    expected |= connection_names(sub_template)
+
+            actual = connection_names(data)
+            if actual != expected:
+                offenders.append(
+                    f"{template_id}: connections {sorted(actual)} != union of "
+                    f"sub-template connections {sorted(expected)}"
+                )
+
+        assert not offenders, "\n".join(offenders)
+
     @pytest.mark.asyncio
     async def test_builtin_ga_analyzer_preconfigures_google_analytics_connector(self):
         """The GA Analyzer template must ship with the Google Analytics

@@ -39,11 +39,11 @@ sample_prompts:
 # NOT merged into any agent's tool_categories - GET /{id} nulls agent_config
 # for a workforce type, the manager's own tools come from
 # workforce_config.manager.tool_categories below, and its workers' tools
-# come from their own referenced single-agent templates. Kept as the union
-# of what marketing-google-analytics-analyzer and
-# marketing-google-ads-recommendation actually declare under their own
-# `connections:`, so the card doesn't advertise an integration this
-# workforce doesn't have (PR #1127 re-review, F7).
+# come from their own referenced single-agent templates. This list must
+# stay the union of the sub-templates' (workforce_config.agents[].template_id)
+# own `connections:` - don't list a connection the workforce doesn't have.
+# Enforced by
+# test_manager.py::test_builtin_workforce_connections_are_union_of_sub_template_connections.
 connections:
 - name: Google Analytics
   logo: https://www.google.com/s2/favicons?domain=analytics.google.com&sz=64

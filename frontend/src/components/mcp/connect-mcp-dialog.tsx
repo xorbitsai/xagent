@@ -567,7 +567,13 @@ export function ConnectMcpDialog({
         }
         if (onSuccess) onSuccess()
         loadApps()
-        setSelectedApp(null)
+        // Same clobber risk as loadingApp above: selectedApp is shared
+        // across the whole catalog too. If the user closed this app's
+        // settings and opened a different app while this request was still
+        // in flight, selectedApp now points at that other app — clearing it
+        // unconditionally would close whatever the user is currently
+        // looking at instead of just this (already-closed) dialog.
+        setSelectedApp(current => current?.id === app.id ? null : current)
       } else {
         const error = await response.json()
         toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
@@ -614,13 +620,22 @@ export function ConnectMcpDialog({
   // association (is_active=false) reactivates it instead of silently staying
   // disconnected — the backend only flips is_active when told to.
   const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
-    // Re-entry guard for this app: the settings dialog disables its Connect
-    // button while pending, but a second trigger surface (catalog card)
-    // must not fire an overlapping POST either.
+    // Defensive re-entry guard: today the settings dialog's
+    // disabled={isConnecting} is the only trigger and already closes this
+    // synchronously (the catalog card just opens that dialog, it has no
+    // connect action of its own) — but this makes the function safe against
+    // a future second trigger surface too, at no cost.
     if (loadingApp === app.id) return
     await connectCatalogApp(app, { is_active: true }, {
       autoSelect,
-      setLoading: (loading) => setLoadingApp(loading ? app.id : null),
+      // loadingApp is a single shared string across every app in the
+      // catalog, not per-app. Clear it only if it still names this app: if
+      // the user opened app B while app A's request was still pending, A's
+      // finally must not clobber B's in-flight loading/disabled state.
+      setLoading: (loading) => setLoadingApp(current => {
+        if (loading) return app.id
+        return current === app.id ? null : current
+      }),
     })
   }
 

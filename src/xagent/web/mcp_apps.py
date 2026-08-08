@@ -105,11 +105,18 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
     if launch.get("required_env") and launch.get("command"):
         return "api_key"
     # Keyless is deliberately stdio-only: a command on a remote transport is a
-    # mis-authored entry, not a connectable app.
+    # mis-authored entry, not a connectable app. Also excludes env_mapping —
+    # that shape means the launcher expects an injected token (the builtin
+    # OAuth apps' pattern, e.g. env_mapping={"SLACK_ACCESS_TOKEN":
+    # "access_token"}), so a custom app authored with that shape is not
+    # actually secret-free even though it has no required_env; classifying it
+    # keyless would offer a no-secrets Connect button for a server that fails
+    # at tool-call time for a missing token.
     if (
         str(transport or "").lower() == "stdio"
         and launch.get("command")
         and not launch.get("required_env")
+        and not launch.get("env_mapping")
     ):
         return "keyless"
     auth = launch.get("auth")

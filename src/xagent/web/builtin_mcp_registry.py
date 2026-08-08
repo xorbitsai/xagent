@@ -592,8 +592,13 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # image, which Dockerfile.backend guarantees exists) — a
             # hardcoded path here would break every other platform.
             # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
-            # backend container runs Chrome as root, same as the existing
-            # browser_use tool (core/tools/core/browser_use.py) in this image.
+            # backend container runs Chrome as root, needing the same root/
+            # no-sandbox exposure the existing browser_use tool
+            # (core/tools/core/browser_use.py) already carries in this image
+            # -- not identical flags (browser_use passes only --no-sandbox,
+            # plus --disable-web-security and file-access flags this
+            # connector does not set), just a comparable, already-accepted
+            # trade-off, not a new class of risk.
             # --no-usage-statistics/--no-performance-crux: chrome-devtools-mcp
             # sends usage telemetry to Google and POSTs page URLs to the CrUX
             # API by default; opt out until this connector's data flow is

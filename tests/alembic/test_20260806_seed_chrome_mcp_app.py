@@ -125,3 +125,33 @@ def test_downgrade_removes_chrome(tmp_path):
             migration.upgrade()
             migration.downgrade()
         assert "chrome" not in _app_ids(connection)
+
+
+def test_dockerfile_npx_cache_pin_matches_registry():
+    """The chrome-devtools-mcp version is pinned in three places: the
+    registry launch args, the migration snapshot (tied to the registry by
+    test_seed_row_matches_registry), and the Dockerfile's npx cache-warm
+    line. The first two are covered by dict equality; this closes the third
+    side of the triangle — an unsynchronized bump would silently reopen the
+    per-launch registry fetch the cache warm exists to prevent (the warmed
+    version would no longer match the version the launch args request).
+    """
+    import re
+
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    registry_row = next(
+        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "chrome"
+    )
+    registry_specs = {
+        arg
+        for arg in registry_row["launch_config"]["args"]
+        if arg.startswith("chrome-devtools-mcp@")
+    }
+    assert len(registry_specs) == 1
+
+    dockerfile = (
+        Path(__file__).parent.parent.parent / "docker/Dockerfile.backend"
+    ).read_text()
+    dockerfile_specs = set(re.findall(r"chrome-devtools-mcp@[\w.\-]+", dockerfile))
+    assert dockerfile_specs == registry_specs

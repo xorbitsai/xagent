@@ -119,6 +119,26 @@ def test_keyless_is_a_stdio_command_with_no_required_env():
     assert classify_app_auth(None, {"command": "npx"}) == "unconnectable"
 
 
+def test_keyless_excludes_env_mapping_shapes():
+    # env_mapping means the launcher expects an injected token (the builtin
+    # OAuth apps' pattern, e.g. env_mapping={"SLACK_ACCESS_TOKEN":
+    # "access_token"}) -- not required_env, but not secret-free either. A
+    # custom app authored with this shape and no required_env must not
+    # classify keyless: that would offer a no-secrets Connect button for a
+    # server that fails at tool-call time for a missing token.
+    assert (
+        classify_app_auth(
+            "stdio",
+            {"command": "uv", "env_mapping": {"TOKEN": "access_token"}},
+        )
+        == "unconnectable"
+    )
+    # Still keyless with an empty env_mapping -- same as absent.
+    assert (
+        classify_app_auth("stdio", {"command": "npx", "env_mapping": {}}) == "keyless"
+    )
+
+
 def test_inconsistent_entries_are_unconnectable_not_misrouted():
     # required_env but no command -> not launchable
     assert classify_app_auth("stdio", {"required_env": ["KEY"]}) == "unconnectable"

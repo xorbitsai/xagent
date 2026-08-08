@@ -121,15 +121,23 @@ vi.mock("./custom-mcp-form", () => ({
 
 vi.mock("./official-mcp-settings-dialog", () => ({
   OfficialMcpSettingsDialog: ({
+    isConnecting,
     onConfigure,
     onOpenChange,
     onConnectStart,
   }: {
+    isConnecting?: boolean
     onConfigure: (app: object) => void
     onOpenChange: (open: boolean) => void
     onConnectStart: (app: object) => void
   }) => (
     <div>
+      {/* Surfaces the real component's isConnecting prop for the cross-app
+          clobber regression test — this dialog mock is shared by every app,
+          so the value reflects whichever app is currently selectedApp. */}
+      <div data-testid="settings-is-connecting">
+        {isConnecting ? "connecting" : "idle"}
+      </div>
       <button
         type="button"
         onClick={() => onConfigure(customApiApp(1, "aggregated-a"))}
@@ -150,6 +158,13 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       </button>
       <button type="button" onClick={() => onConnectStart(keylessApp())}>
         connect-chrome
+      </button>
+      {/* A second, distinct keyless app for the cross-app clobber
+          regression test — same trigger shape as connect-chrome, different
+          app id, so a test can fire both without needing real Card-driven
+          app selection. */}
+      <button type="button" onClick={() => onConnectStart(keylessApp("keyless-b", "Keyless B"))}>
+        connect-keyless-b
       </button>
       <button type="button" onClick={() => onConnectStart(builtinOauthApp())}>
         connect-builtin
@@ -218,10 +233,10 @@ function mcpOauthApp() {
 
 // A keyless catalog app, e.g. Chrome: a local stdio command with no secrets —
 // connecting POSTs straight to /apps/{id}/connect with no env and no dialog.
-function keylessApp() {
+function keylessApp(id = "chrome", name = "Chrome") {
   return {
-    id: "chrome",
-    name: "Chrome",
+    id,
+    name,
     description: "",
     icon: "",
     is_connected: false,
@@ -493,6 +508,14 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       expect(connectBody).toBe(JSON.stringify({ is_active: true }))
     })
     expect(toastErrorMock).not.toHaveBeenCalled()
+    // Pins the connectSuccess key (not the old buttons.save "Save" label)
+    // for the shared connectCatalogApp helper. submitKeyConnect uses the
+    // exact same call site, so this also pins the api_key path's copy —
+    // there is no separate implementation to diverge. translateMock ignores
+    // interpolation params and returns the key verbatim, so toast.success
+    // receives only that one string argument here — the { name } param
+    // itself is exercised for real by the i18n locale files, not this mock.
+    expect(toastSuccessMock).toHaveBeenCalledWith("tools.mcp.dialog.connectSuccess")
   })
 
   it("surfaces the backend error when a keyless connect fails", async () => {
@@ -567,6 +590,82 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
     await waitFor(() => {
       expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+  })
+
+  it("does not let one app's finished connect clobber another app's in-flight state", async () => {
+    // Regression test: loadingApp is a single shared string across the whole
+    // catalog, not per-app. Before the finally-block match-guard, app A
+    // finishing while app B was still pending would unconditionally clear
+    // loadingApp to null, silently dropping B's spinner/disabled state
+    // mid-flight — this drives the real Card -> settings-dialog ->
+    // connect path (not the direct-button shortcut the other tests use) so
+    // it actually exercises isConnecting the way production does.
+    let resolveChrome: (() => void) | undefined
+    let resolveKeylessB: (() => void) | undefined
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [
+            { id: "chrome", name: "Chrome", description: "", icon: "", is_connected: false, transport: "stdio", auth_type: "keyless" },
+            { id: "keyless-b", name: "Keyless B", description: "", icon: "", is_connected: false, transport: "stdio", auth_type: "keyless" },
+          ],
+        })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        return new Promise((resolve) => {
+          resolveChrome = () => resolve({ ok: true, json: async () => ({ id: 1 }) })
+        })
+      }
+      if (url === "http://api.local/api/mcp/apps/keyless-b/connect") {
+        return new Promise((resolve) => {
+          resolveKeylessB = () => resolve({ ok: true, json: async () => ({ id: 2 }) })
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    await screen.findByText("Chrome")
+
+    // Select Chrome, start its connect, and confirm the settings dialog
+    // reflects it as connecting.
+    fireEvent.click(screen.getByText("Chrome"))
+    fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+    await waitFor(() => expect(resolveChrome).toBeDefined())
+    await waitFor(() => {
+      expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("connecting")
+    })
+
+    // Close Chrome's settings (its request is still pending) and select
+    // Keyless B instead — a real, reachable sequence today, since the
+    // settings dialog's close is not guarded against an in-flight connect.
+    fireEvent.click(screen.getByRole("button", { name: "close-settings" }))
+    fireEvent.click(screen.getByText("Keyless B"))
+    expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("idle")
+
+    fireEvent.click(screen.getByRole("button", { name: "connect-keyless-b" }))
+    await waitFor(() => expect(resolveKeylessB).toBeDefined())
+    await waitFor(() => {
+      expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("connecting")
+    })
+
+    // Chrome's request finishes while Keyless B is still pending. Its
+    // finally must not clear loadingApp out from under Keyless B.
+    resolveChrome?.()
+    await waitFor(() => {
+      // translateMock ignores interpolation params, so this only pins the
+      // key, not which app it was for — the point of this test is the
+      // isConnecting assertion right below, not the toast content.
+      expect(toastSuccessMock).toHaveBeenCalledWith("tools.mcp.dialog.connectSuccess")
+    })
+    expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("connecting")
+
+    // Finishing Keyless B's own request clears it normally.
+    resolveKeylessB?.()
+    await waitFor(() => {
+      expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("idle")
     })
   })
 

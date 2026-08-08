@@ -580,6 +580,48 @@ def test_connect_rejects_hidden_app(test_db):
     )
 
 
+def test_connect_rejects_the_real_shipped_chrome_app(test_db):
+    """End-to-end on the actual app_id="chrome", not a synthetic stand-in:
+    shipping hidden is this PR's entire safety story, so it must be pinned
+    against the real registry row, not just a hand-built fixture that happens
+    to share the shape. The DB row only needs app_id/is_visible_in_connector
+    to match the seed migration -- transport/launch_config are overlaid from
+    builtin_mcp_registry.py by get_app_by_id regardless of what's stored.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    registry_row = get_builtin_public_mcp_app("chrome")
+    assert registry_row is not None
+    assert registry_row["is_visible_in_connector"] is False, (
+        "chrome must ship hidden -- if this ever flips to True, this test's "
+        "premise (and the PR's rollout safety story) no longer holds"
+    )
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="chrome",
+            name="Chrome",
+            transport=registry_row["transport"],
+            is_visible_in_connector=registry_row["is_visible_in_connector"],
+            launch_config=registry_row["launch_config"],
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "chrome",
+            MCPAppConnectRequest(is_active=True),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 404
+    assert test_db.query(MCPServer).filter(MCPServer.name == "chrome").first() is None
+
+
 def test_connect_reactivates_dormant_association_when_requested(test_db):
     """The keyless connect flow sends is_active=True explicitly; the backend
     must flip a dormant (is_active=False) association back on. Guards the

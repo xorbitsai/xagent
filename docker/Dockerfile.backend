@@ -166,8 +166,14 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
 # not detect. Its default "stable" channel resolution checks exactly
 # /opt/google/chrome/chrome on Linux, so guarantee that path exists on every
 # platform this image builds for (docker-publish.yml: amd64 + arm64):
-#   - amd64: Google's own chrome deb (some layouts only ship .../google-chrome,
-#     so backfill the resolver path with a symlink if needed)
+#   - amd64: Google's own chrome deb currently ships the real binary at
+#     exactly .../chrome, so no symlink is needed -- but the resolver path is
+#     load-bearing, so fail the build loudly if a future package layout
+#     changes it, instead of silently shipping a broken image. (A symlink
+#     fallback to .../google-chrome would be wrong here regardless:
+#     google-chrome is a wrapper script that execs "$HERE/chrome", so
+#     pointing chrome -> google-chrome would create a self-referential exec
+#     loop, not a working fallback.)
 #   - arm64: Google publishes no arm64 Chrome at all; Debian's Chromium is
 #     CDP-compatible with chrome-devtools-mcp, symlinked into the same path
 RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
@@ -177,7 +183,7 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
         && apt-get update \
         && apt-get install -y --no-install-recommends google-chrome-stable \
         && rm -rf /var/lib/apt/lists/* \
-        && { [ -e /opt/google/chrome/chrome ] || ln -s /opt/google/chrome/google-chrome /opt/google/chrome/chrome; }; \
+        && { [ -e /opt/google/chrome/chrome ] || { echo "ERROR: google-chrome-stable no longer ships /opt/google/chrome/chrome -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; }; \
     else \
         apt-get update \
         && apt-get install -y --no-install-recommends chromium \

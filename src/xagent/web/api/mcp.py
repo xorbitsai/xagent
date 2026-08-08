@@ -2322,11 +2322,25 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
 
     is_visible_in_connector governs the catalog listing, but hiding an app is
     also used as a release gate (e.g. the chrome connector ships hidden until
-    persistent stdio sessions land) — so the connect endpoints must enforce it
+    persistent stdio sessions land) — so the connect paths must enforce it
     server-side too, or any caller who knows the app_id could still provision
     the connector with a direct POST. 404 (not 403) so a hidden app is
-    indistinguishable from a nonexistent one. Existing associations are not
-    affected: disconnect and the server/tool routes never call this.
+    indistinguishable from a nonexistent one.
+
+    Scope: wired into the api_key/keyless path (_ensure_catalog_app_server)
+    and the remote-MCP OAuth path (_ensure_catalog_mcp_oauth_server) only.
+    The builtin_oauth provider-redirect flow (auth.py generic_oauth_callback
+    -> _ensure_user_mcp_server) does NOT run this check — latent while every
+    oauth-transport catalog row ships visible, but hiding one of those would
+    not block new connections through that flow.
+
+    Blast radius: this fires on every connect call, before the caller's
+    existing association is looked up — so on a hidden app it also blocks
+    reconnect/key-rotation for already-connected users, not just fresh
+    connects (disconnect and the server/tool routes are unaffected — they
+    are server-scoped and never call this). Deliberate for now: it matches
+    the listing's "strong hide" semantics, and the only hidden app today
+    ships hidden from day one, so no such association can exist.
     """
     if not app_info.get("is_visible_in_connector", True):
         raise HTTPException(

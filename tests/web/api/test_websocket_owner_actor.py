@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
+from collections.abc import Callable
 from dataclasses import is_dataclass
 from types import SimpleNamespace
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -100,6 +101,57 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
     db.commit()
     db.refresh(t)
     return t
+
+
+# Anti-hang bounds, not latency assertions. Nothing here is measuring speed:
+# these handlers finish in milliseconds, and the budgets only exist so a
+# deadlock fails as a test error instead of hanging the run. They are therefore
+# set far above any plausible runtime on a contended CI runner. A wait on a
+# signal crossing the loop/worker-thread boundary must expire *before* the
+# handler deadline, so a stall is reported by the specific assertion that owns
+# the signal rather than by a bare TimeoutError on the whole handler.
+_THREAD_SIGNAL_DEADLINE_SECONDS = 10.0
+_HANDLER_DEADLINE_SECONDS = 30.0
+
+_T = TypeVar("_T")
+
+
+class _EventLoopLivenessProbe:
+    """Deterministic replacement for counting event-loop ticks.
+
+    Wrapping a synchronous step in :meth:`gate` makes that step queue an answer
+    on the event loop and then block until the loop delivers it. Off the loop
+    (in a worker thread) the loop runs the callback on its next pass. On the
+    loop thread the queued callback cannot run, because the loop thread is the
+    one blocking, so the wait expires. The verdict therefore depends on where
+    the work ran, not on how fast the machine is.
+    """
+
+    def __init__(self) -> None:
+        # Captured here rather than inside the gate: the gated step may run in
+        # a worker thread, where get_running_loop() raises.
+        self._loop = asyncio.get_running_loop()
+        self._answered = threading.Event()
+        self.step_ran = False
+        self.loop_ran_during_step = False
+
+    def gate(self, step: Callable[..., _T]) -> Callable[..., _T]:
+        """Wrap ``step`` so it holds until the event loop answers."""
+
+        def gated(*args: Any, **kwargs: Any) -> _T:
+            assert not self.step_ran, "the probe gates a single call"
+            self.step_ran = True
+            self._loop.call_soon_threadsafe(self._answered.set)
+            self.loop_ran_during_step = self._answered.wait(
+                timeout=_THREAD_SIGNAL_DEADLINE_SECONDS
+            )
+            return step(*args, **kwargs)
+
+        return gated
+
+    def assert_loop_stayed_responsive(self, what: str) -> None:
+        assert self.step_ran, f"{what} never ran"
+        assert self.loop_ran_during_step, f"{what} blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio
@@ -399,36 +451,26 @@ async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
     local_manager = websocket_api.ConnectionManager()
     local_manager.register_connection(websocket, task_id)  # type: ignore[arg-type]
     begin_turn = AsyncMock()
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
 
     monkeypatch.setattr(websocket_api, "get_db", local_get_db)
     monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     prepare_turn = websocket_api._prepare_websocket_turn_sync
-
-    def slow_prepare_turn(**kwargs):
-        time.sleep(0.05)
-        return prepare_turn(**kwargs)
-
-    monkeypatch.setattr(
-        websocket_api,
-        "_prepare_websocket_turn_sync",
-        slow_prepare_turn,
-    )
     monkeypatch.setattr(websocket_api, "manager", local_manager)
     monkeypatch.setattr(
         "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
         begin_turn,
     )
 
-    ticker_task = asyncio.create_task(ticker())
+    # The gate holds preparation open long enough for loop blocking to be
+    # observable. Overlap detection is a separate mechanism: the one-slot pool
+    # raises on a task-info checkout that collides with preparation.
+    probe = _EventLoopLivenessProbe()
+    monkeypatch.setattr(
+        websocket_api,
+        "_prepare_websocket_turn_sync",
+        probe.gate(prepare_turn),
+    )
     try:
         await asyncio.wait_for(
             _handle_chat_message_unserialized(
@@ -441,14 +483,12 @@ async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
                     "files": [],
                 },
             ),
-            timeout=1.0,
+            timeout=_HANDLER_DEADLINE_SECONDS,
         )
-        assert ticks >= 3, "WebSocket preparation blocked the asyncio event loop"
     finally:
-        ticker_stop.set()
-        await ticker_task
         engine.dispose()
 
+    probe.assert_loop_stayed_responsive("WebSocket preparation")
     begin_turn.assert_awaited_once()
 
 
@@ -519,29 +559,11 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
         send_personal_message=AsyncMock(),
     )
     begin_turn = AsyncMock()
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
 
     monkeypatch.setattr(websocket_api, "get_db", local_get_db)
     monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     prepare_turn = websocket_api._prepare_websocket_turn_sync
-
-    def slow_prepare_turn(**kwargs):
-        time.sleep(0.05)
-        return prepare_turn(**kwargs)
-
-    monkeypatch.setattr(
-        websocket_api,
-        "_prepare_websocket_turn_sync",
-        slow_prepare_turn,
-    )
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
         websocket_api,
@@ -554,7 +576,12 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
     )
 
     websocket_api._mark_task_pause_accepted(task_id)
-    ticker_task = asyncio.create_task(ticker())
+    probe = _EventLoopLivenessProbe()
+    monkeypatch.setattr(
+        websocket_api,
+        "_prepare_websocket_turn_sync",
+        probe.gate(prepare_turn),
+    )
     try:
         await asyncio.wait_for(
             _handle_chat_message_unserialized(
@@ -567,15 +594,16 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
                     "files": [],
                 },
             ),
-            timeout=1.0,
+            timeout=_HANDLER_DEADLINE_SECONDS,
         )
-        assert ticks >= 3, "pause settlement checkout blocked the event loop"
     finally:
         websocket_api._clear_task_pause_accepted(task_id)
-        ticker_stop.set()
-        await ticker_task
         engine.dispose()
 
+    probe.assert_loop_stayed_responsive("pause settlement preparation")
+    # The settlement itself is guarded by the one-slot pool: it opens its own
+    # session, so it can only succeed if the handler released its checkout
+    # before awaiting the previous run.
     background_manager.wait_for_previous.assert_awaited_once_with(task_id)
     begin_turn.assert_awaited_once()
     assert begin_turn.await_args.kwargs["kind"].value == "append"
@@ -910,7 +938,7 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
     def blocked_prepare_turn(**kwargs):
         preparation = prepare_turn(**kwargs)
         worker_finished.set()
-        assert release_worker.wait(timeout=2)
+        assert release_worker.wait(timeout=_THREAD_SIGNAL_DEADLINE_SECONDS)
         return preparation
 
     schedule = AsyncMock()
@@ -939,7 +967,9 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
         )
     )
     try:
-        assert await asyncio.to_thread(worker_finished.wait, 2)
+        assert await asyncio.to_thread(
+            worker_finished.wait, _THREAD_SIGNAL_DEADLINE_SECONDS
+        )
         handler.cancel()
         release_worker.set()
         with pytest.raises(asyncio.CancelledError):
@@ -1779,7 +1809,7 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
 
     def mark_delivery(*_args, **_kwargs) -> None:
         marker_started.set()
-        assert marker_release.wait(timeout=5)
+        assert marker_release.wait(timeout=_THREAD_SIGNAL_DEADLINE_SECONDS)
 
     async def resume_forever(*_args, **_kwargs) -> None:
         try:
@@ -1820,7 +1850,9 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
                 },
             )
         )
-        assert await asyncio.to_thread(marker_started.wait, 5)
+        assert await asyncio.to_thread(
+            marker_started.wait, _THREAD_SIGNAL_DEADLINE_SECONDS
+        )
         handling.cancel()
         marker_release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -2139,7 +2171,7 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
 
     def blocking_mark_delivery(*_args, **_kwargs) -> None:
         persistence_started.set()
-        assert allow_persistence.wait(timeout=2)
+        assert allow_persistence.wait(timeout=_THREAD_SIGNAL_DEADLINE_SECONDS)
         persistence_finished.set()
 
     with (
@@ -2163,9 +2195,10 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
                 },
             )
         )
-        await asyncio.wait_for(
-            asyncio.to_thread(persistence_started.wait, 1),
-            timeout=1,
+        # Without the assert a slow runner silently proceeds to cancel before
+        # persistence started, which changes what the rest of the test proves.
+        assert await asyncio.to_thread(
+            persistence_started.wait, _THREAD_SIGNAL_DEADLINE_SECONDS
         )
         handling.cancel()
         await asyncio.sleep(0)

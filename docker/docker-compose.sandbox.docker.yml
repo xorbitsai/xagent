@@ -9,6 +9,7 @@ services:
       - SANDBOX_MEMORY=512
       - XAGENT_SANDBOX_HOST_PROJECT_ROOT=${XAGENT_SANDBOX_HOST_PROJECT_ROOT:-${PWD}}
       - XAGENT_SANDBOX_HOST_STORAGE_ROOT=${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
+      - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}
     volumes:
       - type: bind
         source: ${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
@@ -18,3 +19,11 @@ services:
         target: /var/run/docker.sock
         bind:
           create_host_path: false
+
+  worker:
+    environment:
+      - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}
+
+  scheduler:
+    environment:
+      - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}

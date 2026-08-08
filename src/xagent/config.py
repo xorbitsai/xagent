@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
@@ -78,6 +79,7 @@ SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
 SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
     "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
 )
+SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -128,6 +130,12 @@ WIDGET_UPLOAD_IP_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT"
 WIDGET_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT"
 WIDGET_WS_TURN_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT"
 WIDGET_WS_TURN_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_RATE_LIMIT"
+WIDGET_AUTH_RATE_LIMIT = "XAGENT_WIDGET_AUTH_RATE_LIMIT"
+WIDGET_AUTH_IP_RATE_LIMIT = "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT"
+WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
+WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
+WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
+WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -977,6 +985,114 @@ def get_widget_ws_turn_rate_limit() -> str:
     legitimate guests).
     """
     return _get_rate_limit(WIDGET_WS_TURN_RATE_LIMIT, "240/minute")
+
+
+def get_widget_auth_rate_limit() -> str:
+    """Per-widget-entity limit on widget auth + embed-ticket minting (#1108).
+
+    The loose aggregate backstop bounding total auth/ticket volume through one
+    embedded agent/workforce across all callers. Deliberately loose: both
+    endpoints fire on every widget page load and the entity key is shared by
+    all of a widget's visitors, so a tight per-entity bucket would 429
+    ordinary visitors on a busy embed. The per-IP limit below is the tight
+    per-visitor / per-abuser bound. Kept at the same 4:1 entity:IP ratio as
+    the sibling widget upload / ws-turn gates — and auth is the one gate whose
+    denial is fail-closed client-side (the widget never loads), so its
+    aggregate backstop is deliberately the most tolerant, not the tightest.
+    Raise this for very high-traffic embeds.
+    """
+    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "1200/minute")
+
+
+def get_widget_auth_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget auth + embed-ticket minting (#1108).
+
+    The tight per-visitor / per-abuser bound (visitors have distinct IPs):
+    bounds one caller minting guest tokens / embed tickets (each call does DB
+    lookups and signs a JWT) regardless of how many widget keys or tickets
+    they cycle through, since the IP is not cheaply rotatable. Raise this
+    where many genuine visitors share one address (corporate NAT, carrier
+    CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy
+    — otherwise every caller resolves to the proxy's IP and this becomes one
+    global cap. (example.env carries the same caveat for all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_AUTH_IP_RATE_LIMIT, "300/minute")
+
+
+def get_widget_task_create_rate_limit() -> str:
+    """Per-widget-entity limit on public widget task creation (#1108).
+
+    The loose backstop bounding total task-create volume through one embedded
+    agent/workforce across all callers (one widget serves many legitimate
+    guests). The per-IP bucket below is the tighter per-abuser gate; unlike the
+    share path this cannot key on the guest, whose id is client-supplied and
+    rotatable at will. Kept at the 4:1 entity:IP ratio shared by every widget
+    gate: the entity bucket only accumulates on admitted requests, so ``ratio``
+    cooperating under-cap IPs are needed to saturate it — 4 here, not 2, on the
+    surface where each admitted request spawns an owner-billed run.
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_RATE_LIMIT, "240/minute")
+
+
+def get_widget_task_create_ip_rate_limit() -> str:
+    """Per-caller-IP limit on public widget task creation (#1108).
+
+    The tighter bucket: task creation is the costly surface (each spawns an
+    owner-billed run), and the caller IP is the only trustworthy per-abuser
+    key on the widget path. Numerically matches the widget upload/turn IP
+    default. Raise this where many genuine visitors share one address
+    (corporate NAT, carrier CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly
+    behind a reverse proxy — otherwise every caller resolves to the proxy's IP
+    and this becomes one global cap. (example.env carries the same caveat for
+    all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_run_quota() -> str:
+    """Per-widget-entity rolling run quota (#1108).
+
+    The widget mirror of :func:`get_share_run_quota`, in its own bucket so a
+    popular/abused widget cannot drain the owner's whole team quota. Keyed on
+    the embedded agent/workforce, with a per-creating-IP sub-quota
+    (:func:`get_widget_run_ip_quota`) as the per-abuser dimension — the widget
+    ``guest_id`` is client-supplied (rotatable at will), so unlike the share
+    path there is no per-guest sub-quota. NOTE: this quota applies to
+    already-live widget tasks as soon as it deploys (their ``agent_config``
+    carries the widget markers); the only opt-out is raising the env var.
+    """
+    return _get_rate_limit(WIDGET_RUN_QUOTA, "500/day")
+
+
+def get_widget_run_ip_quota() -> str:
+    """Per-creating-IP, per-widget rolling run sub-quota (#1108).
+
+    The per-abuser sub-quota under :func:`get_widget_run_quota`, mirroring the
+    share path's per-guest window. Its bucket is keyed ``entity|ip``, i.e.
+    scoped to one widget: a caller's budget on one embedded agent/workforce is
+    independent of every other widget on the instance. That scoping matters
+    because this quota is charged per *turn* — a bare-IP bucket would make one
+    NAT/CGNAT egress share a single turn budget across unrelated widgets.
+
+    Sizing: this is a share of a rolling owner-billed budget, not a burst
+    throttle, so it is deliberately far below the per-minute burst gates
+    (widget WS turn / task-create, both 60/minute per IP) and instead sized as
+    a fraction of :func:`get_widget_run_quota` — at the defaults one caller
+    needs several sustained hours to drain a widget's daily budget. It does
+    NOT stop a multi-IP abuser: roughly ``entity_quota / ip_quota`` IPs, each
+    staying under its own window, still exhaust the entity quota —
+    structurally the same limit as the share path's per-guest quota.
+
+    The IP is the one the server observed at task creation (stamped into
+    ``agent_config``, never client-supplied); tasks created before this deploy
+    carry no marker and are bounded by the entity quota alone. Raise it for
+    deployments fronted by large shared egress (corporate NAT, carrier CGNAT),
+    where many genuine visitors present one address, and set
+    XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy — otherwise
+    every caller resolves to the proxy's IP and this becomes one global cap.
+    (example.env carries the same caveat for all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "120/hour")
 
 
 def get_share_run_quota() -> str:
@@ -2116,6 +2232,56 @@ def get_sandbox_host_storage_root() -> Path | None:
     if env_str:
         return Path(os.path.expandvars(env_str.strip()))
     return None
+
+
+_SANDBOX_NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def validate_sandbox_namespace(namespace: str) -> None:
+    """Validate a sandbox ownership namespace.
+
+    Enforces the Docker Compose project-name grammar (lowercase letters,
+    decimal digits, dashes and underscores, beginning with a lowercase letter
+    or digit). Callers that accept a namespace from outside the environment
+    (e.g. the Docker sandbox service constructor) must run this so a
+    malformed value can never recreate a shared ownership domain.
+
+    Raises:
+        ValueError: The value does not match the grammar.
+    """
+    if not _SANDBOX_NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(
+            f"Invalid sandbox namespace {namespace!r}: must match the Docker "
+            "Compose project-name grammar (lowercase letters, digits, dashes, "
+            "underscores; start with a letter or digit)"
+        )
+
+
+def get_sandbox_namespace() -> str | None:
+    """Get the stable per-deployment namespace for sandbox resources.
+
+    The namespace is the ownership boundary between deployments that share one
+    Docker daemon: every sandbox container (physical name and owner labels)
+    a deployment creates is scoped to it, and every lookup/list/cleanup
+    operation is restricted to it. It must be stable across restarts and
+    unique per deployment; the Docker Compose project name
+    (``COMPOSE_PROJECT_NAME``) is the canonical source.
+
+    Accepts the Docker Compose project-name grammar: lowercase letters,
+    decimal digits, dashes and underscores, beginning with a lowercase letter
+    or digit.
+
+    Returns:
+        The configured namespace, or None when unset/empty.
+
+    Raises:
+        ValueError: The variable is set but does not match the grammar.
+    """
+    raw = os.getenv(SANDBOX_NAMESPACE, "").strip()
+    if not raw:
+        return None
+    validate_sandbox_namespace(raw)
+    return raw
 
 
 def get_boxlite_home_dir() -> Path | None:

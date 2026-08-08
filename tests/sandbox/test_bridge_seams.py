@@ -46,7 +46,7 @@ def event_loop():
 
 @pytest.fixture(scope="module")
 def docker_service():
-    return DockerSandboxService(MemDockerStore())
+    return DockerSandboxService(MemDockerStore(), namespace="test")
 
 
 def _unique_name(prefix: str) -> str:

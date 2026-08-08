@@ -28,7 +28,6 @@ from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
 from ..services.share_rate_limit import (
-    entity_rate_limit_key,
     get_share_rate_limiter,
     remote_ip_from_request,
 )
@@ -45,6 +44,7 @@ from .public_chat_access import (
     create_public_chat_task,
     public_chat_websocket_endpoint,
     upload_public_chat_files,
+    widget_entity_key,
 )
 
 widget_router = APIRouter(prefix="/api/widget", tags=["widget"])
@@ -243,6 +243,24 @@ async def issue_widget_embed_ticket(
         # Legacy key-less request (e.g. an old data-agent-id snippet): fail
         # with an actionable error rather than a generic 422.
         raise HTTPException(status_code=403, detail=WIDGET_KEY_REQUIRED_DETAIL)
+    # Abuse control (#1108): ticket minting does DB lookups plus a JWT
+    # signature per call, and an ungated mint loop would also let a caller
+    # refresh their per-IP auth budget for free. Same limiter as /auth: the
+    # per-IP counter IS shared with /auth (one budget across both halves of a
+    # page-load handshake), while the per-entity counter is separate — here it
+    # keys on the widget key, whereas /auth keys on the ticket's owner entity.
+    # The tight-IP / loose-entity shape is what keeps this from 429ing ordinary
+    # visitors on a busy embed: widget.js mints a ticket on every page load and
+    # the entity key is shared by all of a widget's visitors, so the
+    # per-visitor bound must be the IP.
+    # Derive the entity key through the same helper /auth uses (widget-key
+    # branch), rather than re-inlining the "key:<...>" scheme; the 403 above
+    # guarantees a non-empty key, so this is identical.
+    if not get_share_rate_limiter().allow_widget_auth(
+        _widget_auth_rate_limit_entity_key(None, request.widget_key),
+        remote_ip_from_request(req),
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     owner = _resolve_widget_owner_by_key(db, request.widget_key)
 
     origin = req.headers.get("origin") or req.headers.get("referer", "")
@@ -384,12 +402,87 @@ def _resolve_widget_auth_owner(
     raise HTTPException(status_code=403, detail=WIDGET_CREDENTIAL_REQUIRED_DETAIL)
 
 
+def _widget_auth_rate_limit_entity_key(
+    embed_ticket: str | None, widget_key: str | None
+) -> str:
+    """Stable per-widget key for the auth gate's loose-entity backstop (#1108).
+
+    The entity backstop must key on something one caller cannot rotate for
+    free. The raw embed ticket is NOT that: the embedded flow mints a fresh
+    ticket on every page load (no ``jti``, second-resolution ``exp``), so
+    raw-ticket buckets would never accumulate. Instead, decode the ticket's
+    *signed* claims — pure HMAC verification, no DB work — and key on the owner
+    entity they name; forging a different entity requires forging the
+    signature. Expiry is deliberately not checked here: an expired ticket
+    should still land in its stable bucket, and redemption enforces ``exp``.
+
+    Tickets that fail signature/shape checks collapse into one shared
+    ``invalid-ticket`` bucket. The direct widget-key flow keys on the key
+    string itself (already stable; the prefix avoids colliding with
+    ticket-derived entity keys). A bogus/nonexistent key does NOT collapse —
+    that would need a pre-gate DB lookup — so an attacker rotating fake keys
+    gets a fresh *entity* bucket per key; that is acceptable because the entity
+    bucket is only the loose aggregate backstop, and the tight per-IP bucket
+    (which this key does not affect) is the real per-abuser bound. Mirrors
+    :func:`_resolve_widget_auth_owner`'s precedence (ticket first).
+
+    A wholly credential-less request returns ``""`` and lets
+    :meth:`ShareRateLimiter._admit_ip_and_entity`'s own falsy-key fallback
+    bucket it (the request 403s right after the gate anyway).
+
+    NOTE: one widget therefore accumulates its auth backstop into up to two
+    distinct buckets — ``key:<widget_key>`` (direct-visit ``/auth`` and every
+    ``/embed-ticket`` call) and ``agent:<id>``/``workforce:<id>`` (embedded
+    ``/auth`` via ticket) — so the effective aggregate ceiling for one widget
+    is roughly double the single per-entity limit. Resolving both to one key
+    would need a pre-gate DB lookup, which is exactly what this gate runs ahead
+    of. The tight per-IP bound (the real per-abuser control) is unaffected.
+    """
+    if embed_ticket:
+        try:
+            claims = jwt.decode(
+                embed_ticket,
+                JWT_SECRET_KEY,
+                algorithms=[JWT_ALGORITHM],
+                options={"verify_exp": False},
+            )
+        except JWTError:
+            return "invalid-ticket"
+        if claims.get("type") != EMBED_TICKET_TYPE:
+            return "invalid-ticket"
+        owner_type = claims.get("owner_type") or EMBED_TICKET_OWNER_AGENT
+        if owner_type == EMBED_TICKET_OWNER_WORKFORCE:
+            workforce_id = claims.get("workforce_id")
+            if isinstance(workforce_id, int):
+                return f"workforce:{workforce_id}"
+            return "invalid-ticket"
+        agent_id = claims.get("agent_id")
+        if isinstance(agent_id, int):
+            return f"agent:{agent_id}"
+        return "invalid-ticket"
+    if widget_key:
+        return f"key:{widget_key}"
+    return ""
+
+
 @widget_router.post("/auth", response_model=WidgetAuthResponse)
 async def authenticate_widget(
     request: WidgetAuthRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
 ) -> Any:
     """Authenticate widget and issue a guest token"""
+    # Abuse control (#1108): the widget key is public by design, so this
+    # unauthenticated endpoint — every call does DB lookups and mints a JWT —
+    # is reachable by anyone who can view the hosting page. Bucket per caller
+    # IP (tight per-visitor bound) + per widget entity (loose aggregate
+    # backstop) before any DB work. Deriving the entity key costs one signature
+    # check at most; the DB resolution this gate protects happens below.
+    if not get_share_rate_limiter().allow_widget_auth(
+        _widget_auth_rate_limit_entity_key(request.embed_ticket, request.widget_key),
+        remote_ip_from_request(http_request),
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     owner = _resolve_widget_auth_owner(db, request)
 
     if owner.workforce is not None:
@@ -470,11 +563,8 @@ async def upload_widget_file(
     # widget guest_id is client-supplied, so a guest-keyed bucket is
     # rotatable at will. Matters most for the task-less workforce branch,
     # where each admitted request can mint orphan rows until GC catches up.
-    entity_key = entity_rate_limit_key(
-        widget_info.widget_agent_id, widget_info.widget_workforce_id
-    )
     if not get_share_rate_limiter().allow_widget_upload(
-        entity_key, remote_ip_from_request(request)
+        widget_entity_key(widget_info), remote_ip_from_request(request)
     ):
         raise HTTPException(status_code=429, detail="Too many requests")
     return await upload_public_chat_files(
@@ -492,15 +582,36 @@ async def upload_widget_file(
 @widget_router.post("/chat/task/create", response_model=TaskCreateResponse)
 async def create_widget_task(
     request: TaskCreateRequest,
+    http_request: Request,
     widget_info: PublicChatAccessContext = Depends(get_current_widget_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
     """Create new chat task for widget guest."""
+    # Abuse control (#1108): task-create is the costly surface (each spawns an
+    # owner-billed run). Mirror of the share task-create throttle, but keyed on
+    # the widget entity + caller IP, NOT the client-supplied (rotatable) widget
+    # guest_id — the same keying as the widget upload / ws-turn gates.
+    #
+    # Unlike /auth, this gate cannot be the first thing that runs: the entity
+    # key comes from the access context, which FastAPI resolves (JWT + DB
+    # lookups) before the handler body. So a throttled caller still pays for
+    # that resolution. Accepted: reaching here at all requires a valid guest
+    # token, and /auth — the surface reachable with no credential — does gate
+    # ahead of every DB touch.
+    client_ip = remote_ip_from_request(http_request)
+    if not get_share_rate_limiter().allow_widget_task_create(
+        widget_entity_key(widget_info), client_ip
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
+    # client_ip is stamped into agent_config as the per-abuser key for the
+    # widget run quota (#1108): the caller IP is not observable at the async
+    # execute_task chokepoint, so the creating request records it.
     return await create_public_chat_task(
         request=request,
         access_context=widget_info,
         db=db,
         default_channel_name="Web Widget",
+        client_ip=client_ip,
     )
 
 

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.services.share_rate_limit import reset_share_rate_limiter
 
@@ -163,6 +164,236 @@ def test_share_upload_returns_429_over_limit(
 
     assert _upload().status_code == 200
     assert _upload().status_code == 429
+
+
+def _widget_agent_key(name: str) -> str:
+    """Create a published agent, enable its widget, and return the widget key."""
+    db = _direct_db_session()
+    try:
+        agent = Agent(
+            user_id=_user_id(),
+            name=name,
+            description="d",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+    resp = client.put(
+        f"/api/agents/{agent_id}",
+        headers=_admin_headers(),
+        json={"widget_enabled": True, "allowed_domains": ["*"]},
+    )
+    assert resp.status_code == 200, resp.text
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        assert agent.widget_key
+        return str(agent.widget_key)
+    finally:
+        db.close()
+
+
+def _widget_guest_headers(widget_key: str) -> dict[str, str]:
+    resp = client.post(
+        "/api/widget/auth",
+        json={"guest_id": "rl-widget-guest", "widget_key": widget_key},
+    )
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+def test_widget_auth_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = _widget_agent_key("RL Widget Auth Agent")
+
+    # Tighten the loose per-entity backstop only after the key exists; the IP
+    # bound (300/min default) stays clear so this proves the entity gate.
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    body = {"guest_id": "g", "widget_key": key}
+    first = client.post("/api/widget/auth", json=body)
+    assert first.status_code == 200, first.text
+    second = client.post("/api/widget/auth", json=body)
+    assert second.status_code == 429, second.text
+
+
+def test_widget_task_create_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = _widget_agent_key("RL Widget Create Agent")
+    guest = _widget_guest_headers(key)
+
+    # Tighten the per-caller-IP bucket (the tight abuser gate) after the guest
+    # token is minted, since auth has its own separate bucket.
+    monkeypatch.setenv("XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    body = {"title": "hi", "description": "hi"}
+    first = client.post("/api/widget/chat/task/create", headers=guest, json=body)
+    assert first.status_code == 200, first.text
+    second = client.post("/api/widget/chat/task/create", headers=guest, json=body)
+    assert second.status_code == 429, second.text
+
+    # The admitted task carries the server-observed creator IP (#1108): the
+    # per-abuser key the run-quota gate reads back at the async chokepoint.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == int(first.json()["task_id"])).one()
+        assert task.agent_config.get("widget_client_ip") == "testclient"
+    finally:
+        db.close()
+
+
+def test_widget_task_create_ignores_spoofed_forwarded_for() -> None:
+    """#1108 F3: the stamped creator IP is a durable quota key, so a client
+    must not be able to choose it. Under the default XAGENT_TRUSTED_PROXY_HOPS=0
+    the header is ignored entirely and the peer address is stamped."""
+    key = _widget_agent_key("RL Widget XFF Agent")
+    guest = _widget_guest_headers(key)
+
+    resp = client.post(
+        "/api/widget/chat/task/create",
+        headers={**guest, "X-Forwarded-For": "9.9.9.9"},
+        json={"title": "hi", "description": "hi"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == int(resp.json()["task_id"])).one()
+        assert task.agent_config.get("widget_client_ip") == "testclient"
+    finally:
+        db.close()
+
+
+def test_widget_task_create_ignores_client_injected_entity_markers() -> None:
+    """#1108 F1: a widget guest must not be able to inject entity/identity
+    markers into their own task-create body — they select the run-quota bucket
+    (entity_rate_limit_key prefers workforce), so a client-controlled value
+    would fully bypass or misdirect the quota. The server stamps them."""
+    key = _widget_agent_key("RL Widget Inject Agent")
+    guest = _widget_guest_headers(key)
+
+    forged = {
+        "title": "hi",
+        "description": "hi",
+        "agent_config": {
+            # A forged workforce id would win over the real agent entity.
+            "widget_workforce_id": 999999,
+            "widget_agent_id": 888888,
+            "widget_client_ip": "1.2.3.4",
+            "auth_mode": "share",
+            "guest_id": "injected-guest",
+            "share_agent_id": 777777,
+            "share_token": "forged",
+        },
+    }
+    resp = client.post("/api/widget/chat/task/create", headers=guest, json=forged)
+    assert resp.status_code == 200, resp.text
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == int(resp.json()["task_id"])).one()
+        cfg = task.agent_config
+        # Entity markers: server-stamped, workforce cleared to None on the agent
+        # path, agent id is the real one — never the injected values.
+        assert cfg.get("widget_workforce_id") is None
+        assert cfg.get("widget_agent_id") != 888888
+        assert cfg.get("widget_agent_id") is not None
+        # Identity/quota markers: server values win, injected copies stripped.
+        assert cfg.get("auth_mode") == "widget"
+        assert cfg.get("guest_id") == "rl-widget-guest"
+        assert cfg.get("widget_client_ip") == "testclient"
+        assert "share_agent_id" not in cfg
+        assert "share_token" not in cfg
+    finally:
+        db.close()
+
+
+def test_widget_auth_rate_limits_invalid_credentials_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The auth gate must run BEFORE credential resolution: repeated attempts
+    with an *invalid* key get 429 once the bucket trips, not an endless
+    sequence of DB-backed 403s. Tightened on the per-IP bound since one client
+    (one IP) is the abuser here."""
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    body = {"guest_id": "g", "widget_key": "no-such-widget-key"}
+    first = client.post("/api/widget/auth", json=body)
+    assert first.status_code == 403, first.text
+    second = client.post("/api/widget/auth", json=body)
+    assert second.status_code == 429, second.text
+
+
+def test_widget_auth_ticket_rotation_shares_one_entity_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-entity backstop keys on the ticket's signed owner claims, not the
+    raw ticket string: the embedded flow mints a fresh ticket per page load, so
+    rotating tickets for one agent must land in one bucket."""
+    key = _widget_agent_key("RL Widget Ticket Agent")
+
+    def _mint_ticket() -> str:
+        resp = client.post(
+            "/api/widget/embed-ticket",
+            json={"widget_key": key},
+            headers={"origin": "https://any-site.example"},
+        )
+        assert resp.status_code == 200, resp.text
+        return str(resp.json()["ticket"])
+
+    # Mint both tickets before tightening: /embed-ticket shares the auth
+    # buckets (its entity key is the widget key, distinct from the ticket's
+    # agent entity, but they share the bucket family).
+    ticket_a = _mint_ticket()
+    ticket_b = _mint_ticket()
+
+    # Tighten the loose per-entity backstop; the ticket flow keys it on the
+    # agent entity, so two distinct tickets for one agent collide there.
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    first = client.post(
+        "/api/widget/auth", json={"guest_id": "g", "embed_ticket": ticket_a}
+    )
+    assert first.status_code == 200, first.text
+    # A *different* ticket for the same agent must hit the same bucket.
+    second = client.post(
+        "/api/widget/auth", json={"guest_id": "g", "embed_ticket": ticket_b}
+    )
+    assert second.status_code == 429, second.text
+
+
+def test_widget_embed_ticket_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket minting is gated too (#1108): an ungated mint loop would do free
+    DB work + JWT signatures and refresh the caller's auth budget. One IP mints
+    repeatedly, so the per-IP bound is what trips."""
+    key = _widget_agent_key("RL Widget Ticket Mint Agent")
+
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    def _mint():
+        return client.post(
+            "/api/widget/embed-ticket",
+            json={"widget_key": key},
+            headers={"origin": "https://any-site.example"},
+        )
+
+    assert _mint().status_code == 200
+    assert _mint().status_code == 429
 
 
 class _FakeWebSocket:

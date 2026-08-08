@@ -46,6 +46,14 @@ services:
       - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
       - XAGENT_CELERY_BROKER_URL=redis://redis:6379/1
       - XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS=${XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS:-3600}
+      # This backend sits behind the single nginx hop above, which sets
+      # X-Forwarded-For in append mode. Trust exactly that one hop so every
+      # per-IP rate limit (share/widget auth, task-create, run sub-quota,
+      # trigger callbacks) keys on the real client IP instead of nginx's
+      # container IP — otherwise all client traffic collapses onto one IP and
+      # per-IP caps become a single global cap. Raise only if you add more
+      # trusted proxies (CDN/LB) in front of nginx.
+      - XAGENT_TRUSTED_PROXY_HOPS=${XAGENT_TRUSTED_PROXY_HOPS:-1}
     env_file:
       - .env
     volumes:

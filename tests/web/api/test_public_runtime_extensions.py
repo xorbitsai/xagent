@@ -31,6 +31,7 @@ async def test_public_widget_rejects_task_runtime_extensions() -> None:
             access_context=context,
             db=object(),  # type: ignore[arg-type]
             default_channel_name="Public",
+            client_ip=None,
         )
 
     assert exc_info.value.status_code == 400

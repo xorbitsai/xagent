@@ -12,6 +12,7 @@ window) via should_audit_rate_limited.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import threading
@@ -205,4 +206,18 @@ def remote_ip_from_request(request: object) -> str | None:
     # The rightmost entry was appended by the nearest trusted proxy; walking
     # `hops` entries from the right lands on the last untrusted client.
     index = max(0, len(entries) - hops)
-    return entries[index]
+    candidate = entries[index]
+    # Only return an actually IP-shaped value. The selected entry is
+    # client-controlled whenever `hops` over-counts the real proxy chain, and
+    # callers use this as rate-limit key material and persist it (#1108's
+    # `widget_client_ip`), so an unvalidated header could inject an unbounded
+    # arbitrary string. Fall back to the peer address rather than trusting it.
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        logger.warning(
+            "Ignoring non-IP X-Forwarded-For entry %r; using peer address",
+            candidate[:64],
+        )
+        return peer_ip
+    return candidate

@@ -35,6 +35,13 @@ from .conftest import (
 
 pytestmark = pytest.mark.usefixtures("_test_db")
 
+# Anti-hang bounds, not latency assertions. The WS handler and the detached
+# command it enqueues settle in milliseconds; these budgets exist only so a
+# deadlock or a lost command fails as a test error instead of hanging the run,
+# so they are set far above any plausible runtime on a contended CI runner.
+_DEADLINE_SECONDS = 30.0
+_SETTLE_POLL_SECONDS = 0.01
+
 
 def _user_id(username: str = "admin") -> int:
     db = _direct_db_session()
@@ -799,10 +806,19 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
                 )
             )
             try:
-                await asyncio.wait_for(turn_started.wait(), timeout=1.0)
-                await asyncio.wait_for(asyncio.shield(handler_task), timeout=1.0)
+                await asyncio.wait_for(turn_started.wait(), timeout=_DEADLINE_SECONDS)
+                await asyncio.wait_for(
+                    asyncio.shield(handler_task), timeout=_DEADLINE_SECONDS
+                )
 
-                for _ in range(100):
+                # The command is applied by a detached background task, so the
+                # only observable signal is the committed row. Poll against a
+                # wall-clock deadline rather than a fixed iteration count: a
+                # loaded runner slows each iteration down, which would shrink a
+                # count-based budget exactly when it needs to be widest.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + _DEADLINE_SECONDS
+                while True:
                     command_db = _direct_db_session()
                     try:
                         run_status = (
@@ -819,14 +835,15 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
                         command_db.close()
                     if run_status == "running" and command_status == "completed":
                         break
-                    await asyncio.sleep(0.01)
-                else:
-                    raise AssertionError(
-                        "detached APPEND command did not project the WorkforceRun "
-                        "to running"
-                    )
+                    if loop.time() >= deadline:
+                        raise AssertionError(
+                            "detached APPEND command did not project the "
+                            f"WorkforceRun to running (run_status={run_status!r}, "
+                            f"command_status={command_status!r})"
+                        )
+                    await asyncio.sleep(_SETTLE_POLL_SECONDS)
             finally:
                 if not handler_task.done():
-                    await asyncio.wait_for(handler_task, timeout=1.0)
+                    await asyncio.wait_for(handler_task, timeout=_DEADLINE_SECONDS)
     finally:
         db.close()

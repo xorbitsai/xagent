@@ -276,6 +276,21 @@ class TestRemoteIpDerivation:
         request = self._request("10.0.0.1", "1.2.3.4, 203.0.113.7")
         assert remote_ip_from_request(request) == "203.0.113.7"
 
+    def test_non_ip_forwarded_entry_falls_back_to_peer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1108 F3: the selected entry is client-controlled when hops
+        over-counts the real chain, and callers now persist this value and use
+        it as rate-limit key material — so a non-IP-shaped entry must be
+        rejected in favour of the peer address rather than passed through."""
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "1")
+        for forged in ("not-an-ip", "a" * 5000, "203.0.113.7 evil", ""):
+            request = self._request("10.0.0.1", forged or None)
+            assert remote_ip_from_request(request) == "10.0.0.1", forged
+        # A genuine IPv6 entry still resolves normally.
+        request = self._request("10.0.0.1", "2001:db8::1")
+        assert remote_ip_from_request(request) == "2001:db8::1"
+
     def test_missing_forwarded_header_falls_back_to_peer(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -1,6 +1,7 @@
 """Test sandbox manager functionality."""
 
 import asyncio
+import logging
 import os
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -210,6 +211,11 @@ class TestCreateBoxliteService:
 class TestCreateDockerService:
     """Test _create_docker_service function."""
 
+    @pytest.fixture(autouse=True)
+    def _namespace_env(self, monkeypatch):
+        """A namespace is mandatory for the Docker sandbox implementation."""
+        monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "test")
+
     def test_uses_db_store(self):
         """Test Docker sandbox service is created with persistent store."""
         with (
@@ -223,6 +229,7 @@ class TestCreateDockerService:
 
         mock_store_cls.assert_called_once_with()
         assert mock_service_cls.call_args[1]["store"] is mock_store_cls.return_value
+        assert mock_service_cls.call_args[1]["namespace"] == "test"
 
     def test_creation_failure_returns_none(self):
         """Test that DockerSandboxService construction failure returns None."""
@@ -236,6 +243,73 @@ class TestCreateDockerService:
             result = _create_docker_service()
 
         assert result is None
+
+    def test_missing_namespace_is_fatal(self, monkeypatch):
+        """Missing namespace must fail loudly, never degrade to unscoped mode."""
+        monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
+        with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE is required"):
+            _create_docker_service()
+
+    def test_legacy_container_inventory_is_logged(self, caplog):
+        """Startup must surface inactive legacy containers for removal."""
+
+        class _ServiceWithLegacyCount(FakeSandboxService):
+            def count_legacy_containers(self) -> tuple[int, int]:
+                return 0, 2
+
+        with (
+            patch("xagent.web.sandbox_store.DBDockerStore", return_value=MagicMock()),
+            patch(
+                "xagent.sandbox.DockerSandboxService",
+                return_value=_ServiceWithLegacyCount(),
+            ),
+        ):
+            with caplog.at_level(logging.WARNING):
+                result = _create_docker_service()
+
+        assert result is not None
+        assert (
+            "2 inactive legacy xagent.managed=true sandbox container(s)" in caplog.text
+        )
+        assert "xagent.managed=true" in caplog.text
+
+    def test_running_legacy_containers_are_logged_as_errors(self, caplog):
+        class _ServiceWithLegacyCount(FakeSandboxService):
+            def count_legacy_containers(self) -> tuple[int, int]:
+                return 1, 2
+
+        with (
+            patch("xagent.web.sandbox_store.DBDockerStore", return_value=MagicMock()),
+            patch(
+                "xagent.sandbox.DockerSandboxService",
+                return_value=_ServiceWithLegacyCount(),
+            ),
+            caplog.at_level(logging.ERROR),
+        ):
+            result = _create_docker_service()
+
+        assert result is not None
+        assert (
+            "1 running legacy xagent.managed=true sandbox container(s)" in caplog.text
+        )
+        assert "Stop them before starting v2 sandbox workloads" in caplog.text
+
+    def test_legacy_inventory_failure_does_not_misreport_creation(self, caplog):
+        class _ServiceWithFailingLegacyCount(FakeSandboxService):
+            def count_legacy_containers(self) -> tuple[int, int]:
+                raise RuntimeError("legacy inventory unavailable")
+
+        service = _ServiceWithFailingLegacyCount()
+        with (
+            patch("xagent.web.sandbox_store.DBDockerStore", return_value=MagicMock()),
+            patch("xagent.sandbox.DockerSandboxService", return_value=service),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = _create_docker_service()
+
+        assert result is service
+        assert "Failed to inventory legacy sandbox containers" in caplog.text
+        assert "Failed to create Docker sandbox service" not in caplog.text
 
 
 class TestSandboxConfigParsing:

@@ -376,8 +376,14 @@
               if (!res.ok) {
                 // Fail closed: no ticket means auth would fail, and loading the
                 // iframe anyway would let a non-allowlisted embed slip through the
-                // direct-visit path. Surface an actionable error instead.
-                console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
+                // direct-visit path. Surface an actionable error instead — 429 is
+                // rate limiting (transient, high traffic), distinct from the
+                // domain-allowlist / stale-snippet causes behind a 403.
+                if (res.status === 429) {
+                  console.error('Xagent Widget: embed authorization rate-limited (HTTP 429), usually transient under high traffic. Reload the page to try again.');
+                } else {
+                  console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
+                }
                 return null;
               }
               return res.json();

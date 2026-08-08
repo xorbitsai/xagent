@@ -71,7 +71,9 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
   const { inTeam } = useAuth()
 
   const load = useCallback(async () => {
-    if (!agentId) return
+    // Same gate as the render-level `!inTeam` early return: hooks run before it,
+    // so without this the OSS build (no SSH routes) fetches and toasts a 404.
+    if (!agentId || !inTeam) return
     try {
       const res = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/ssh-targets`)
       if (!res.ok) throw new Error(await res.text())
@@ -84,7 +86,7 @@ export function AgentSshBindings({ agentId, readOnly = false, onCount }: AgentSs
       // bindings exist server-side, since onCount never fires.
       toast.error(t("ssh.bindings.loadFailed"))
     }
-  }, [agentId, onCount, t])
+  }, [agentId, inTeam, onCount, t])
 
   useEffect(() => {
     load()

@@ -581,6 +581,11 @@ def test_widget_task_create_starts_workforce_run(
         assert task.agent_config.get("auth_mode") == "widget"
         assert int(task.agent_config.get("widget_workforce_id")) == workforce_id
         assert task.agent_config.get("guest_id") == "guest_test"
+        # The server-observed creator IP is stamped on the workforce path too
+        # (#1108): it is the widget run quota's per-abuser key, and a future
+        # snapshot key collision in _merge_agent_config would silently drop it,
+        # degrading the sub-quota to entity-only. Regression-lock it here.
+        assert task.agent_config.get("widget_client_ip") == "testclient"
 
         run = db.query(WorkforceRun).filter(WorkforceRun.task_id == task_id).one()
         assert int(run.workforce_id) == workforce_id

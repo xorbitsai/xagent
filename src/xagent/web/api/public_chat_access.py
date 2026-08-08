@@ -851,6 +851,7 @@ async def _create_workforce_widget_chat_task(
     request: TaskCreateRequest,
     access_context: PublicChatAccessContext,
     db: Session,
+    client_ip: str | None,
 ) -> TaskCreateResponse:
     """Guest task creation for a widget-embedded workforce.
 
@@ -883,7 +884,15 @@ async def _create_workforce_widget_chat_task(
         extra_agent_config={
             "auth_mode": "widget",
             "widget_workforce_id": int(workforce.id),
+            # Null the agent marker for symmetry with the agent path (#1108):
+            # entity_rate_limit_key prefers workforce, so a stray agent id
+            # would be ignored anyway, but stamping both keeps the run-quota
+            # key unambiguous and independent of merge ordering.
+            "widget_agent_id": None,
             "guest_id": access_context.guest_id,
+            # Server-observed creator IP (#1108): the per-abuser key for the
+            # widget run quota. Stamped by the backend, never client-supplied.
+            "widget_client_ip": client_ip,
         },
     )
     task = result.task
@@ -905,6 +914,11 @@ async def create_public_chat_task(
     access_context: PublicChatAccessContext,
     db: Session,
     default_channel_name: str,
+    # Required (no default): the server-observed creator IP is the widget run
+    # quota's per-abuser key (#1108), so a caller must consciously pass it —
+    # ``None`` only for a genuinely IP-less path, never by omission. A silent
+    # default would degrade the quota to entity-only without anything failing.
+    client_ip: str | None,
 ) -> TaskCreateResponse:
     if request.runtime_extensions:
         raise HTTPException(
@@ -913,7 +927,7 @@ async def create_public_chat_task(
         )
     if access_context.widget_workforce_id is not None:
         return await _create_workforce_widget_chat_task(
-            request=request, access_context=access_context, db=db
+            request=request, access_context=access_context, db=db, client_ip=client_ip
         )
 
     task_description = request.description or ""
@@ -931,8 +945,17 @@ async def create_public_chat_task(
     agent_config = sanitize_client_agent_config(request.agent_config)
     agent_config["guest_id"] = access_context.guest_id
     agent_config["auth_mode"] = "widget"
-    if access_context.widget_agent_id is not None:
-        agent_config["widget_agent_id"] = access_context.widget_agent_id
+    # Server-observed creator IP (#1108): the per-abuser key for the widget
+    # run quota. Stamped by the backend, never client-supplied.
+    agent_config["widget_client_ip"] = client_ip
+    # Stamp BOTH entity markers from the validated access context, writing the
+    # inapplicable one as None (#1108). The run quota keys off these and
+    # entity_rate_limit_key prefers workforce, so a client-injected
+    # widget_workforce_id must never survive to redirect the bucket. The
+    # sanitizer already strips both, but stamping explicitly keeps this correct
+    # independent of the sanitizer's reserved-key set.
+    agent_config["widget_agent_id"] = access_context.widget_agent_id
+    agent_config["widget_workforce_id"] = access_context.widget_workforce_id
 
     agent_id = request.agent_id
     if agent_id is None and channel and channel.config:
@@ -1120,12 +1143,14 @@ async def create_share_chat_task(
     )
 
 
-def _widget_entity_key(context: PublicChatAccessContext) -> str | None:
+def widget_entity_key(context: PublicChatAccessContext) -> str | None:
     """Rate-limit key for the widget entity a guest is scoped to (#1056).
 
     Matches the ``allow_widget_upload`` keying: the widget ``guest_id`` is
     client-supplied (rotatable at will), so widget throttles key on the
-    embedded agent/workforce instead.
+    embedded agent/workforce instead. Shared with the widget HTTP endpoints
+    (#1108) so every gate derives the key from the access context the same
+    way.
     """
     return entity_rate_limit_key(context.widget_agent_id, context.widget_workforce_id)
 
@@ -1177,7 +1202,7 @@ async def _authorize_public_chat_websocket(
         lambda: _authorize_chat_websocket_sync(
             load_access_context=load_access_context,
             authorize_task=authorize_task,
-            widget_entity_key=_widget_entity_key,
+            widget_entity_key=widget_entity_key,
         )
     )
 

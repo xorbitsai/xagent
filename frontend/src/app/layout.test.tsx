@@ -2,7 +2,7 @@ import React from "react"
 import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import RootLayout from "@/app/layout"
+import RootLayout, { metadata } from "@/app/layout"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
 import { AUTH_CACHE_KEY } from "@/lib/auth-cache"
@@ -111,5 +111,20 @@ describe("RootLayout provider boundary", () => {
     expect(screen.getByTestId("layout-content")).toBeInTheDocument()
     expect(screen.getByTestId("voice-controller")).toBeInTheDocument()
     expect(screen.getByTestId("task-error-controller")).toBeInTheDocument()
+  })
+})
+
+describe("RootLayout metadata", () => {
+  it("exposes an application name and OpenGraph block for crawlers", () => {
+    expect(metadata.applicationName).toBe("Xagent")
+    expect(metadata.openGraph).toMatchObject({
+      siteName: "Xagent",
+      title: "Xagent",
+      description: "AI-powered agent and workflow management system",
+      type: "website",
+      url: "/",
+      images: [{ url: "/xagent_logo.png", alt: "Xagent Logo", width: 300, height: 300, type: "image/png" }],
+    })
+    expect(metadata.metadataBase).toEqual(new URL("https://cloud.xagent.co"))
   })
 })

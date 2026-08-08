@@ -415,7 +415,7 @@ async def test_execute_task_workforce_pool_timeout_stops_tracker_checkout(
             # lease acquisition; stub its checkout like the run gate's so the
             # pool timeout under test still lands on the workforce stage.
             patch(
-                "xagent.web.api.chat._load_task_share_quota_config_isolated",
+                "xagent.web.api.chat._load_task_public_run_quota_config_isolated",
                 return_value=None,
             ),
             patch(

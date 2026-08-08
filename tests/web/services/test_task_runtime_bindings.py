@@ -271,7 +271,20 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
     which requests get stripped at every task-create boundary.
     """
     assert CLIENT_RESERVED_AGENT_CONFIG_KEYS == frozenset(
-        {"runtime_extension_bindings", "execution_scope", "selected_file_ids"}
+        {
+            "runtime_extension_bindings",
+            "execution_scope",
+            "selected_file_ids",
+            # Public-channel identity/quota markers (#1108).
+            "auth_mode",
+            "guest_id",
+            "widget_agent_id",
+            "widget_workforce_id",
+            "widget_client_ip",
+            "share_agent_id",
+            "share_workforce_id",
+            "share_token",
+        }
     )
 
 

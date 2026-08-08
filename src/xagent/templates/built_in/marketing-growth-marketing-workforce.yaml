@@ -39,13 +39,14 @@ sample_prompts:
 # NOT merged into any agent's tool_categories - GET /{id} nulls agent_config
 # for a workforce type, the manager's own tools come from
 # workforce_config.manager.tool_categories below, and its workers' tools
-# come from their own referenced single-agent templates. Kept as the union
-# of what marketing-google-analytics-analyzer and
-# marketing-google-ads-recommendation actually declare under their own
-# `connections:`, so the card doesn't advertise an integration this
-# workforce doesn't have (this previously listed "Google Analytics",
-# which neither sub-template connects to at all).
+# come from their own referenced single-agent templates. This list must
+# stay the union of the sub-templates' (workforce_config.agents[].template_id)
+# own `connections:` - don't list a connection the workforce doesn't have.
+# Enforced by
+# test_manager.py::test_builtin_workforce_connections_are_union_of_sub_template_connections.
 connections:
+- name: Google Analytics
+  logo: https://www.google.com/s2/favicons?domain=analytics.google.com&sz=64
 - name: Google Docs
   logo: https://www.google.com/s2/favicons?domain=docs.google.com&sz=64
 - name: Google Slides
@@ -105,7 +106,7 @@ workforce_config:
     name: Google Analytics Analyzer
     alias: GA Analyzer
     assignment_instructions: |
-      Produce a 'Signals for Ads' table: for each campaign / source, report sessions, CVR, conversions, value, and a verdict (winning / underperforming), comparing the current period to the prior period of equal length. Ask the Growth Marketing Manager for the GA4 export or period range if you don't already have it.
+      Produce a 'Signals for Ads' table: for each campaign / source, report sessions, CVR, conversions, value, and a verdict (winning / underperforming), comparing the current period to the prior period of equal length. Pull the data from the connected Google Analytics account when one is available; otherwise ask the Growth Marketing Manager for a GA4 export. Ask for the period range if you don't already have it.
   - template_id: marketing-google-ads-recommendation
     name: Google Ads Recommendation
     alias: Ads Recommendation

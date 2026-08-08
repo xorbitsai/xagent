@@ -260,6 +260,25 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "google-sheets",
+            "name": "Google Sheets",
+            "description": "Connect to Google Sheets to read and update ranges, append rows, manage sheets, and create spreadsheets.",
+            "icon": "https://www.google.com/s2/favicons?domain=sheets.google.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "google",
+            "category": "Productivity",
+            "oauth_scopes": [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.file",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_sheets"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "google-ads",
             "name": "Google Ads",
             "description": "Connect to Google Ads to list accessible accounts, inspect campaigns, and run GAQL reports.",
@@ -492,6 +511,27 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # credentials, so the flow relies on Dynamic Client Registration.
             "launch_config": {
                 "url": "https://mcp.granola.ai/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        },
+        {
+            "app_id": "notion",
+            "name": "Notion",
+            "description": "Connect to Notion to search your workspace and read, create and update pages and databases through Notion's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=notion.so&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola: Notion hosts the
+            # MCP server itself and exposes its own tools — there is no local
+            # module to launch. Users connect via POST
+            # /api/mcp/apps/{id}/oauth/connect (per-user OAuth Authorization
+            # Code + PKCE); Notion supports Dynamic Client Registration, so no
+            # static client credentials are required.
+            "launch_config": {
+                "url": "https://mcp.notion.com/mcp",
                 "auth": {"type": "mcp_oauth"},
             },
         },

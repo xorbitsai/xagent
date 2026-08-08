@@ -26,6 +26,7 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_namespace,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_storage_root,
@@ -2518,6 +2519,20 @@ def _create_boxlite_service() -> Optional[SandboxService]:
 
 def _create_docker_service() -> Optional[SandboxService]:
     """Create Docker sandbox service."""
+    namespace = get_sandbox_namespace()
+    if namespace is None:
+        # Fatal, not a degraded start: without a stable per-deployment
+        # namespace, a backend on a shared Docker daemon can discover and
+        # delete another deployment's sandboxes (and vice versa). Refusing
+        # to start sandboxing is the safe failure mode.
+        raise RuntimeError(
+            "XAGENT_SANDBOX_NAMESPACE is required when the Docker sandbox "
+            "implementation is enabled; set it to a stable, unique per-"
+            "deployment identifier. Under Docker Compose use the Compose "
+            "project name (COMPOSE_PROJECT_NAME); other deployment modes "
+            "(pip/systemd) must pick their own stable value (see "
+            "docker/README.md 'Sandbox Runtime Overlays' and example.env)"
+        )
     try:
         from ..sandbox import DockerSandboxService
     except ImportError:
@@ -2528,12 +2543,37 @@ def _create_docker_service() -> Optional[SandboxService]:
 
     store = DBDockerStore()
 
-    service = None
     try:
-        service = DockerSandboxService(store=store)
-        logger.info("Created Docker sandbox service")
-    except Exception as e:
-        logger.error(f"Failed to create Docker sandbox service: {e}")
+        service = DockerSandboxService(store=store, namespace=namespace)
+    except Exception as exc:
+        logger.error("Failed to create Docker sandbox service: %s", exc)
+        return None
+
+    logger.info("Created Docker sandbox service (namespace=%s)", namespace)
+    try:
+        running_legacy_count, inactive_legacy_count = service.count_legacy_containers()
+    except Exception as exc:
+        logger.warning("Failed to inventory legacy sandbox containers: %s", exc)
+        return service
+
+    if running_legacy_count:
+        logger.error(
+            "Found %d running legacy xagent.managed=true sandbox container(s) "
+            "on this Docker daemon. Stop them before starting v2 sandbox "
+            "workloads that use the same host workspace: "
+            "docker ps --filter label=xagent.managed=true",
+            running_legacy_count,
+        )
+
+    if inactive_legacy_count:
+        logger.warning(
+            "Found %d inactive legacy xagent.managed=true sandbox container(s) "
+            "on this Docker daemon; they are never listed, reclaimed, or "
+            "counted against XAGENT_SANDBOX_MAX_CONTAINERS by this deployment. "
+            "After all co-located stacks are upgraded and drained, remove them "
+            "manually: docker ps -a --filter label=xagent.managed=true",
+            inactive_legacy_count,
+        )
 
     return service
 

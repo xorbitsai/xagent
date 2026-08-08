@@ -81,7 +81,7 @@ def event_loop():
 @pytest.fixture(scope="module")
 def docker_service():
     """Shared real Docker service/store for this module's tests."""
-    return DockerSandboxService(MemDockerStore())
+    return DockerSandboxService(MemDockerStore(), namespace="test")
 
 
 @pytest.fixture
@@ -301,7 +301,12 @@ class TestLegacyContainerMigration:
             # control (t0, including the Actor-child bind).
             template, config = t0_spec.to_backend_config()
             container = await docker_sandbox_module._create_container(
-                docker_service._client, sandbox_name, t0_spec.image, template, config
+                docker_service._client,
+                sandbox_name,
+                docker_service._namespace,
+                t0_spec.image,
+                template,
+                config,
             )
             await asyncio.to_thread(container.start)
             await asyncio.to_thread(container.reload)
@@ -397,6 +402,7 @@ class TestLegacyMatchingStoreRowStaysUnverified:
             container = await docker_sandbox_module._create_container(
                 docker_service._client,
                 sandbox_name,
+                docker_service._namespace,
                 desired_spec.image,
                 template,
                 config,

@@ -63,6 +63,7 @@ from xagent.config import (
     SANDBOX_IMAGE,
     SANDBOX_MAX_CONTAINERS,
     SANDBOX_MEMORY,
+    SANDBOX_NAMESPACE,
     SANDBOX_SWEEP_INTERVAL,
     SANDBOX_VOLUMES,
     SLACK_APP_TOKEN,
@@ -153,6 +154,7 @@ from xagent.config import (
     get_sandbox_image,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_namespace,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_slack_app_token,
@@ -183,6 +185,7 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    validate_sandbox_namespace,
 )
 
 
@@ -215,6 +218,9 @@ class TestEnvironmentVariableConstants:
 
     def test_sandbox_host_project_root_constant(self):
         assert SANDBOX_HOST_PROJECT_ROOT == "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
+
+    def test_sandbox_namespace_constant(self):
+        assert SANDBOX_NAMESPACE == "XAGENT_SANDBOX_NAMESPACE"
 
     def test_sandbox_host_storage_root_constant(self):
         assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
@@ -1487,6 +1493,62 @@ class TestGetSandboxHostStorageRoot:
         assert result == Path("/host/.xagent/../.xagent")
 
 
+class TestGetSandboxNamespace:
+    """Test get_sandbox_namespace() function."""
+
+    def test_no_env_var_returns_none(self, monkeypatch):
+        """Test that a missing namespace returns None."""
+        monkeypatch.delenv(SANDBOX_NAMESPACE, raising=False)
+        result = get_sandbox_namespace()
+        assert result is None
+
+    def test_blank_env_var_returns_none(self, monkeypatch):
+        """Test that a blank namespace returns None."""
+        monkeypatch.setenv(SANDBOX_NAMESPACE, "   ")
+        result = get_sandbox_namespace()
+        assert result is None
+
+    def test_valid_namespace(self, monkeypatch):
+        """Test that a Compose-project-name-shaped namespace is accepted."""
+        monkeypatch.setenv(SANDBOX_NAMESPACE, "my-project-1")
+        result = get_sandbox_namespace()
+        assert result == "my-project-1"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Upper-Case",
+            "-leading-dash",
+            "has space",
+            ":",
+            "a::b",
+            "a/b",
+            "a.b",
+            "café",
+        ],
+    )
+    def test_invalid_namespace_raises(self, monkeypatch, value):
+        """Test that malformed namespaces raise instead of silently degrading."""
+        monkeypatch.setenv(SANDBOX_NAMESPACE, value)
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            get_sandbox_namespace()
+
+    def test_validation_helper_rejects_empty_namespace(self):
+        """Direct callers must not bypass the getter's blank-to-None policy."""
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            validate_sandbox_namespace("")
+
+    def test_long_namespace_accepted_like_compose(self, monkeypatch):
+        """Compose accepts arbitrary-length project names; so must we.
+
+        Container identities hash the full namespace, label values preserve
+        it, and snapshot repository names use a bounded sanitized token plus
+        a digest, so backend identifiers do not impose a namespace length cap.
+        """
+        monkeypatch.setenv(SANDBOX_NAMESPACE, "a" * 100)
+        assert get_sandbox_namespace() == "a" * 100
+
+
 class TestGetBoxliteHomeDir:
     """Test get_boxlite_home_dir() function."""
 
@@ -1739,6 +1801,28 @@ class TestShareRateLimitConfig:
             "XAGENT_WIDGET_WS_TURN_RATE_LIMIT",
             "240/minute",
         ),
+        (
+            "get_widget_auth_rate_limit",
+            "XAGENT_WIDGET_AUTH_RATE_LIMIT",
+            "1200/minute",
+        ),
+        (
+            "get_widget_auth_ip_rate_limit",
+            "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT",
+            "300/minute",
+        ),
+        (
+            "get_widget_task_create_rate_limit",
+            "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT",
+            "240/minute",
+        ),
+        (
+            "get_widget_task_create_ip_rate_limit",
+            "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT",
+            "60/minute",
+        ),
+        ("get_widget_run_quota", "XAGENT_WIDGET_RUN_QUOTA", "500/day"),
+        ("get_widget_run_ip_quota", "XAGENT_WIDGET_RUN_IP_QUOTA", "120/hour"),
     ]
 
     @pytest.mark.parametrize("func_name,env_var,default", _CASES)

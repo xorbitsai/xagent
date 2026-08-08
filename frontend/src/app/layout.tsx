@@ -3,7 +3,7 @@ import React, { type CSSProperties } from "react";
 import "./globals.css";
 import { ThemeProvider } from "@/contexts/theme-context";
 import { ApplicationShell } from "@/components/layout/application-shell";
-import { getBrandingFromEnv } from "@/lib/branding";
+import { getBrandingFromEnv, resolveMetadataBase } from "@/lib/branding";
 import { I18nProvider } from "@/contexts/i18n-context";
 import { getThemeFromEnv, themes } from "@/lib/theme";
 import { Toaster } from "@/components/ui/sonner";
@@ -11,8 +11,26 @@ import { Toaster } from "@/components/ui/sonner";
 const branding = getBrandingFromEnv();
 
 export const metadata: Metadata = {
+  metadataBase: resolveMetadataBase(branding.siteUrl),
   title: branding.appName,
   description: branding.description,
+  applicationName: branding.appName,
+  openGraph: {
+    siteName: branding.appName,
+    title: branding.appName,
+    description: branding.description,
+    type: "website",
+    url: "/",
+    images: [
+      {
+        url: branding.logoPath,
+        alt: branding.logoAlt,
+        width: 300,
+        height: 300,
+        type: "image/png",
+      },
+    ],
+  },
   icons: {
     icon: branding.logoPath,
     apple: branding.logoPath,

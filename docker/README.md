@@ -264,6 +264,55 @@ In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container.
 
+> **Required action on upgrade:** Every existing deployment with
+> `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
+> `XAGENT_SANDBOX_NAMESPACE` before upgrading. The Compose overlay below sets
+> it automatically; pip/systemd deployments must set their own stable, unique
+> deployment identifier (see `example.env`). Missing values stop backend
+> startup rather than falling back to unsafe daemon-global ownership.
+
+The overlay sets `XAGENT_SANDBOX_NAMESPACE` on `backend`, `worker`, and
+`scheduler` from the resolved `${COMPOSE_PROJECT_NAME}`. Docker sibling mode
+treats that Compose project name as authoritative and overrides any namespace
+from `example.env`; a missing value fails during Compose interpolation. Every
+sandbox container a deployment creates is scoped to that namespace (physical
+name and owner labels), so multiple deployments sharing one Docker daemon
+never discover or manage each other's sandboxes. Co-located stacks must use
+distinct Compose project names and distinct `XAGENT_HOST_STORAGE_ROOT` paths.
+
+`XAGENT_SANDBOX_MAX_CONTAINERS` applies independently to each deployment
+namespace, not globally to the shared daemon. Size the daemon for up to the
+per-deployment limit multiplied by the number of co-located stacks, plus any
+legacy containers awaiting removal.
+
+Containers created before this scheme existed carry the legacy
+`xagent.managed=true` label and are ignored by current code: they are never
+listed, reclaimed, or counted against `XAGENT_SANDBOX_MAX_CONTAINERS`, and
+a backend restart recreates their sandboxes fresh (host bind mounts
+survive; container-layer state does not). The backend logs how many such
+containers exist at startup.
+
+Use one coordinated maintenance window to upgrade:
+
+1. Stop new sandbox admission and drain every task on the old stacks.
+2. Stop the old backends and their legacy sandbox containers before starting
+   any namespaced backend.
+3. Upgrade and start every co-located stack with a distinct Compose project
+   name and host storage root.
+4. After confirming that no old backend or task uses them, inventory and
+   remove the stopped legacy containers:
+
+   ```bash
+   docker ps -a --filter label=xagent.managed=true
+   ```
+
+Never run a legacy container and its v2 replacement concurrently. Both mount
+the same host workspace, so concurrent execution creates two live writers.
+
+Rollback also requires a maintenance window. Drain and stop the namespaced
+backends and their v2 containers before starting pre-namespace code; the old
+backend cannot see v2 containers and otherwise double-provisions sandboxes.
+
 ## Docker Files
 
 - `Dockerfile.backend` - Backend image (FastAPI, Python, Node.js)

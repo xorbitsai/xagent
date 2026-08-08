@@ -5,9 +5,13 @@ DockerSandbox tests
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import re
 import socket
 import tempfile
+import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,7 +41,7 @@ requires_docker = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def docker_service():
     """Provide a shared Docker sandbox service for integration-style tests."""
-    return DockerSandboxService(MemDockerStore())
+    return DockerSandboxService(MemDockerStore(), namespace="test")
 
 
 class _FakeContainerCollection:
@@ -95,7 +99,9 @@ class TestDockerSandboxServiceFailures:
         monkeypatch.setattr(
             docker_sandbox_module, "_create_container", fake_create_container
         )
-        service = DockerSandboxService(MemDockerStore(), client=_FakeDockerClient())
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
 
         with pytest.raises(RuntimeError, match="port conflict"):
             await service.get_or_create(
@@ -118,6 +124,544 @@ class TestDockerSandboxRunCodeValidation:
 
         with pytest.raises(ValueError, match="Unsupported code type: ruby"):
             await sandbox.run_code("puts 'hi'", code_type="ruby")  # type: ignore[arg-type]
+
+
+class _LabelFilteredCollection(_FakeContainerCollection):
+    """Container collection that applies Docker-style label filters."""
+
+    def __init__(self, containers=()):
+        super().__init__(containers)
+        self.filter_calls: list[dict] = []
+
+    @staticmethod
+    def _label_matches(filter_entry: str, labels: dict) -> bool:
+        if "=" in filter_entry:
+            key, value = filter_entry.split("=", 1)
+            return labels.get(key) == value
+        return filter_entry in labels
+
+    def list(self, *args, **kwargs):
+        filters = kwargs.get("filters") or {}
+        self.filter_calls.append(filters)
+        label_filters = filters.get("label") or []
+        if isinstance(label_filters, str):
+            label_filters = [label_filters]
+        return [
+            container
+            for container in self._containers
+            if all(
+                self._label_matches(entry, getattr(container, "labels", {}))
+                for entry in label_filters
+            )
+        ]
+
+
+def _labeled_container(
+    labels: dict,
+    name: str = "user::1",
+    status: str = "running",
+    on_remove: callable | None = None,
+    on_stop: callable | None = None,
+):
+    """Minimal container stub exposing the attrs/labels the service reads."""
+    return SimpleNamespace(
+        name=name,
+        status=status,
+        labels=labels,
+        attrs={
+            "Config": {
+                "Env": [],
+                "Image": "img",
+                "WorkingDir": "/home",
+                "NetworkDisabled": False,
+            },
+            "HostConfig": {
+                "PortBindings": {},
+                "NanoCpus": 1_000_000_000,
+                "Memory": 512 * 1024 * 1024,
+                "NetworkMode": "default",
+            },
+            "State": {"Status": status},
+            "NetworkSettings": {"Networks": {"bridge": {}}},
+            "Created": "2026-01-01T00:00:00Z",
+        },
+        reload=lambda: None,
+        stop=lambda timeout=None: (on_stop() if on_stop is not None else None),
+        remove=lambda force=False: (on_remove() if on_remove is not None else None),
+    )
+
+
+class _ClientWithCollection(_FakeDockerClient):
+    """Fake client hosting a caller-supplied container collection."""
+
+    def __init__(self, collection):
+        self.containers = collection
+
+
+def _capture_create_client():
+    """Client stub capturing containers.create kwargs."""
+    captured: dict = {}
+
+    class _Containers:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+    class _Client:
+        containers = _Containers()
+
+    return _Client(), captured
+
+
+class TestNamespaceIsolation:
+    """Two deployments sharing one Docker daemon must never see or mutate
+    each other's sandboxes (the co-located-instances fix)."""
+
+    @pytest.mark.asyncio
+    async def test_service_constructor_rejects_malformed_namespaces(self):
+        """The service boundary must not accept a namespace that could
+        recreate a shared ownership domain."""
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            DockerSandboxService(
+                MemDockerStore(),
+                namespace="",
+                client=_FakeDockerClient(),
+            )
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            DockerSandboxService(
+                MemDockerStore(),
+                namespace="Bad-Name",
+                client=_FakeDockerClient(),
+            )
+
+    def test_constructor_preserves_client_position_and_reads_namespace_env(
+        self, monkeypatch
+    ):
+        """Existing direct callers keep the client argument while the required
+        namespace comes from the documented environment variable."""
+        monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "alpha")
+
+        positional_client = _FakeDockerClient()
+        positional = DockerSandboxService(MemDockerStore(), positional_client)
+        assert positional._client is positional_client
+        assert positional._namespace == "alpha"
+
+        keyword_client = _FakeDockerClient()
+        keyword = DockerSandboxService(
+            MemDockerStore(),
+            client=keyword_client,
+        )
+        assert keyword._client is keyword_client
+        assert keyword._namespace == "alpha"
+
+    def test_constructor_without_namespace_env_fails_closed(self, monkeypatch):
+        """Compatibility must never fall back to daemon-global ownership."""
+        monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
+        with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE is required"):
+            DockerSandboxService(MemDockerStore(), _FakeDockerClient())
+
+    def test_count_legacy_containers_uses_exact_legacy_filter(self):
+        collection = _LabelFilteredCollection(
+            [
+                _labeled_container({"xagent.managed": "true"}),
+                _labeled_container(
+                    {"xagent.managed": "true"},
+                    status="exited",
+                ),
+                _labeled_container(
+                    {
+                        "xagent.managed": "v2",
+                        "xagent.sandbox.namespace": "alpha",
+                    }
+                ),
+            ]
+        )
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+
+        assert service.count_legacy_containers() == (1, 1)
+        assert collection.filter_calls[-1] == {"label": "xagent.managed=true"}
+
+    def test_count_legacy_containers_returns_zero_when_listing_fails(self, caplog):
+        class _FailingCollection:
+            @staticmethod
+            def list(*args, **kwargs):
+                raise RuntimeError("legacy inventory unavailable")
+
+        client = _FakeDockerClient()
+        client.containers = _FailingCollection()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=client,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert service.count_legacy_containers() == (0, 0)
+        assert "Failed to list legacy sandbox containers" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_physical_names_differ_across_namespaces(self):
+        """Equal logical names map to distinct physical container names."""
+        assert docker_sandbox_module._container_name(
+            "user::1", "alpha"
+        ) != docker_sandbox_module._container_name("user::1", "beta")
+
+    @pytest.mark.asyncio
+    async def test_snapshot_tags_differ_across_namespaces(self):
+        """Equal snapshot ids map to distinct images on a shared daemon."""
+        assert docker_sandbox_module._snapshot_tag(
+            "snap-1", "alpha"
+        ) != docker_sandbox_module._snapshot_tag("snap-1", "beta")
+        assert docker_sandbox_module._snapshot_tag("snap-1", "alpha").startswith(
+            "xagent-sandbox-snapshot-alpha-"
+        )
+
+    @pytest.mark.asyncio
+    async def test_snapshot_repository_is_docker_safe(self):
+        """Every validator-accepted namespace must map to a valid Docker
+        repository name, even when the namespace itself is not one.
+
+        The Docker reference grammar allows lowercase alphanumeric segments
+        separated by ``[._]``, ``__``, or ``-+`` runs; trailing separators,
+        mixed runs like ``a_-b``, and names over 255 characters are invalid.
+        """
+        docker_ref_re = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$")
+        namespaces = [
+            "alpha",
+            "foo-",
+            "foo_",
+            "a_-b",
+            "a--b",
+            "a__b",
+            "a---b",
+            "a" * 240,
+        ]
+        for ns in namespaces:
+            repo = docker_sandbox_module._snapshot_repository(ns)
+            assert docker_ref_re.fullmatch(repo), f"{ns!r} -> {repo}"
+            assert len(repo) <= 255, f"{ns!r} -> repo too long: {len(repo)}"
+            tag = docker_sandbox_module._snapshot_tag("snap-1", ns)
+            assert len(tag) <= 255, f"{ns!r} -> full reference too long"
+        # Every mapping includes the raw namespace digest. This prevents a safe
+        # namespace from impersonating another namespace's encoded token.
+        assert docker_sandbox_module._snapshot_repository("a-b") != (
+            docker_sandbox_module._snapshot_repository("a_-b")
+        )
+        assert docker_sandbox_module._snapshot_repository("a_b") != (
+            docker_sandbox_module._snapshot_repository("a-b-eb2980a5a2")
+        )
+
+    @pytest.mark.asyncio
+    async def test_find_container_is_scoped_to_owner_labels(self):
+        collection = _LabelFilteredCollection()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        await service.inspect("user::1")
+        assert collection.filter_calls[-1]["label"] == [
+            "xagent.managed=v2",
+            "xagent.sandbox.namespace=alpha",
+            "xagent.sandbox.name=user::1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_sandboxes_is_scoped_to_namespace(self):
+        collection = _LabelFilteredCollection()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        await service.list_sandboxes()
+        assert collection.filter_calls[-1]["label"] == [
+            "xagent.managed=v2",
+            "xagent.sandbox.namespace=alpha",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_foreign_and_legacy_containers_are_invisible(self):
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+        )
+        legacy = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+        )
+        collection = _LabelFilteredCollection([foreign, legacy])
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+
+        assert await alpha.inspect("user::1") is None
+        assert await beta.inspect("user::1") is not None
+        assert [sb.name for sb in await alpha.list_sandboxes()] == []
+        assert [sb.name for sb in await beta.list_sandboxes()] == ["user::1"]
+
+    @pytest.mark.asyncio
+    async def test_delete_never_touches_foreign_namespace(self):
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            on_remove=lambda: collection._containers.remove(foreign),
+        )
+        collection = _LabelFilteredCollection([foreign])
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+
+        await alpha.delete("user::1")
+        assert await beta.inspect("user::1") is not None
+
+        await beta.delete("user::1")
+        assert await beta.inspect("user::1") is None
+
+    @pytest.mark.asyncio
+    async def test_start_stop_never_touch_foreign_namespace(self):
+        stopped: list[str] = []
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            on_stop=lambda: stopped.append("beta"),
+        )
+        collection = _LabelFilteredCollection([foreign])
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+
+        from xagent.sandbox.base import SandboxNotFoundError
+
+        with pytest.raises(SandboxNotFoundError):
+            await alpha.start_existing("user::1")
+        with pytest.raises(SandboxNotFoundError):
+            await alpha.stop_existing("user::1")
+        assert stopped == [], "foreign container must never be stopped"
+        assert await beta.inspect("user::1") is not None
+
+    @pytest.mark.asyncio
+    async def test_create_container_writes_v2_owner_labels(self, monkeypatch):
+        async def _noop_ensure_image(_client, _image):
+            return None
+
+        monkeypatch.setattr(docker_sandbox_module, "_ensure_image", _noop_ensure_image)
+
+        for template in (
+            SandboxTemplate(type="image", image="img"),
+            # A snapshot-derived container must inherit nothing from the
+            # source image's owner labels: the image may carry a foreign
+            # deployment's xagent.managed/xagent.sandbox.namespace.
+            SandboxTemplate(type="snapshot", snapshot_id="snap-1"),
+        ):
+            client, captured = _capture_create_client()
+            await docker_sandbox_module._create_container(
+                client,
+                "user::1",
+                "alpha",
+                "img",
+                template,
+                SandboxConfig(),
+            )
+            assert captured["labels"]["xagent.managed"] == "v2"
+            assert captured["labels"]["xagent.sandbox.namespace"] == "alpha"
+            assert captured["labels"]["xagent.sandbox.name"] == "user::1"
+            assert captured["name"].startswith("xagent_sandbox_")
+
+
+class TestManagerPathsRespectNamespace:
+    """Manager destructive paths (cleanup/quiesce, idle sweep) operate only
+    on this service's namespace: foreign and legacy containers survive."""
+
+    @staticmethod
+    def _services(collection):
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+        return alpha, beta
+
+    @pytest.mark.asyncio
+    async def test_cleanup_quiesces_only_own_namespace(self):
+        stopped: list[str] = []
+        alpha_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "alpha",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="alpha-box",
+            on_stop=lambda: stopped.append("alpha"),
+        )
+        beta_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+            on_stop=lambda: stopped.append("beta"),
+        )
+        legacy_cont = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+            on_stop=lambda: stopped.append("legacy"),
+        )
+        collection = _LabelFilteredCollection([alpha_cont, beta_cont, legacy_cont])
+        alpha, beta = self._services(collection)
+
+        from xagent.web.sandbox_manager import SandboxManager
+
+        await SandboxManager(alpha).cleanup()
+
+        assert stopped == ["alpha"], "quiesce must stop only own-namespace containers"
+        assert await beta.inspect("user::1") is not None
+
+    @pytest.mark.asyncio
+    async def test_capacity_counts_only_own_namespace(self):
+        removed: list[str] = []
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+            on_remove=lambda: removed.append("beta"),
+        )
+        legacy = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+            on_remove=lambda: removed.append("legacy"),
+        )
+        collection = _LabelFilteredCollection([foreign, legacy])
+        alpha, _ = self._services(collection)
+
+        from xagent.web.sandbox_manager import SandboxManager
+
+        await SandboxManager(alpha)._ensure_capacity_for("user::2", cap=1)
+
+        assert removed == []
+        assert collection.filter_calls[-1]["label"] == [
+            "xagent.managed=v2",
+            "xagent.sandbox.namespace=alpha",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_idle_sweep_reclaims_only_own_namespace(self):
+        alpha_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "alpha",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="alpha-box",
+        )
+        beta_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+        )
+        legacy_cont = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+        )
+        collection = _LabelFilteredCollection([alpha_cont, beta_cont, legacy_cont])
+        alpha, beta = self._services(collection)
+
+        # Wire the removal side effect now that the collection exists.
+        alpha_cont.remove = lambda force=False: collection._containers.remove(
+            alpha_cont
+        )
+
+        from xagent.web.sandbox_manager import SandboxManager
+
+        reclaimed = await SandboxManager(alpha).sweep_idle_sandboxes(idle_ttl=0)
+
+        assert reclaimed == ["user::1"]
+        assert [c.name for c in collection._containers] == ["beta-box", "legacy-box"]
+        assert await beta.inspect("user::1") is not None
+
+
+@requires_docker
+class TestTwoNamespaceRealDockerIsolation:
+    """Real-daemon smoke test: two namespaces on one daemon are disjoint."""
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_same_logical_name_is_isolated_between_namespaces(self):
+        alpha = DockerSandboxService(MemDockerStore(), namespace="alpha")
+        beta = DockerSandboxService(MemDockerStore(), namespace="beta")
+        name = f"ns-isolation-{uuid.uuid4().hex[:8]}"
+        template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
+        config = SandboxConfig(cpus=1, memory=512)
+        for service in (alpha, beta):
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+        try:
+            sandbox = await alpha.get_or_create(name, template=template, config=config)
+            assert sandbox.name == name
+            # The other namespace must neither see nor adopt this container.
+            assert await beta.inspect(name) is None
+            assert name not in {sb.name for sb in await beta.list_sandboxes()}
+            # The destructive direction: a foreign delete must not touch it.
+            await beta.delete(name)
+            assert await alpha.inspect(name) is not None
+            await alpha.delete(name)
+            assert await alpha.inspect(name) is None
+            assert await beta.inspect(name) is None
+        finally:
+            for service in (alpha, beta):
+                try:
+                    await service.delete(name)
+                except Exception:
+                    pass
 
 
 @requires_docker
@@ -584,6 +1128,41 @@ class TestDockerSandboxService:
                     await service.delete(sandbox_name)
                 except Exception:
                     pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_snapshot_lifecycle_with_trailing_dash_namespace(self):
+        """Snapshot round-trip works with a Compose-legal namespace that is
+        not a valid Docker repository component on its own.
+
+        Regression for the raw-namespace repository embedding: a trailing-dash
+        project name previously produced an invalid reference format error at
+        container.commit."""
+        name = "test_snapshot_trailing_dash_ns"
+        snapshot_id = "trailing-dash-snap"
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="deployment-",
+        )
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+        try:
+            await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=512),
+            )
+            snapshot = await service.create_snapshot(name, snapshot_id)
+            assert snapshot.snapshot_id == snapshot_id
+            assert await service.list_snapshots() != []
+            await service.delete_snapshot(snapshot_id)
+            assert await service.list_snapshots() == []
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
 
 
 class TestSandboxControl:

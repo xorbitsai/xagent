@@ -764,13 +764,6 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
         "required_env": ["GOOGLE_MAPS_API_KEY"],
     }
 
-    # Remote MCP (no local command at all): Granola hosts the server itself.
-    assert rows_by_app_id["granola"]["transport"] == "streamable_http"
-    assert rows_by_app_id["granola"]["launch_config"] == {
-        "url": "https://mcp.granola.ai/mcp",
-        "auth": {"type": "mcp_oauth"},
-    }
-
     assert rows_by_app_id["aws"]["launch_config"] == {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.aws"],
@@ -778,14 +771,39 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
     }
 
 
-def test_builtin_registry_classifies_granola_as_mcp_oauth() -> None:
+def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
+    """Granola and Notion have no local launch command at all — they host
+    their own MCP server and are reached over streamable_http. This is
+    intentionally split out of
+    test_builtin_registry_uses_runtime_available_launch_commands, whose name
+    is about local launch *commands* and would misdescribe these
+    remote-only entries."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
+
+    assert rows_by_app_id["granola"]["transport"] == "streamable_http"
+    assert rows_by_app_id["granola"]["launch_config"] == {
+        "url": "https://mcp.granola.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+    assert rows_by_app_id["notion"]["transport"] == "streamable_http"
+    assert rows_by_app_id["notion"]["launch_config"] == {
+        "url": "https://mcp.notion.com/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+
+@pytest.mark.parametrize("app_id", ["granola", "notion"])
+def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
     """The registry shape must classify as mcp_oauth — anything else means the
     catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps
     and generic_oauth_login rejects non-"oauth" transports)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
     from xagent.web.mcp_apps import classify_app_auth
 
-    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "granola")
+    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == app_id)
     assert classify_app_auth(row["transport"], row["launch_config"]) == "mcp_oauth"
 
 

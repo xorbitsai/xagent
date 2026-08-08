@@ -149,11 +149,34 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # ``pop`` in ``_build_task_agent_config`` stays: that boundary substitutes a
 # recomputed list rather than only dropping the client's, and keeping it means
 # the substitution does not depend on this set's contents.
+#
+# The public-channel identity/quota markers (#1108) qualify under the same
+# three checks. The widget/share run quota reads ``auth_mode`` and the entity
+# ids back as authoritative at the ``execute_task`` chokepoint (the id selects
+# which quota bucket the run bills), and ``guest_id`` is the per-guest quota
+# key, so an anonymous widget/share guest must not pre-seed any of them. (1) No
+# server writer reaches this column *through* the sanitizer for these keys --
+# the public agent paths sanitize then stamp what they own, and the preview
+# path sets only ``is_preview``/``preview_agent_id``; (2) they are
+# server-minted identity/routing values no request body legitimately carries;
+# (3) the widget/share workforce paths pass them as ``extra_agent_config=``
+# server literals, which ``_merge_agent_config`` places *under* the built
+# config, and the snapshot never sets these keys, so no client can win a
+# collision. The widget agent-create path additionally stamps both entity
+# markers explicitly (one as ``None``) as belt-and-suspenders.
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
         EXECUTION_SCOPE_AGENT_CONFIG_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+        "auth_mode",
+        "guest_id",
+        "widget_agent_id",
+        "widget_workforce_id",
+        "widget_client_ip",
+        "share_agent_id",
+        "share_workforce_id",
+        "share_token",
     }
 )
 logger = logging.getLogger(__name__)

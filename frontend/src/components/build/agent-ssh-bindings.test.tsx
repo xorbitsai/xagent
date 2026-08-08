@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, render, waitFor } from "@testing-library/react"
+import { act, cleanup, render, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 // The OSS build ships no SSH routes, so the bindings fetch 404s and used to
@@ -21,9 +21,13 @@ vi.mock("@/components/ui/sonner", () => ({
 vi.mock("@/contexts/auth-context", () => ({
   useAuth: () => ({ inTeam: inTeamMock.value }),
 }))
-vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
-}))
+// The i18n return value must be referentially stable: `load` is keyed on `t`,
+// so a per-render `t` identity turns the mount effect into an unbounded
+// fetch/render loop (same hazard documented in agent-builder-publish-errors).
+vi.mock("@/contexts/i18n-context", () => {
+  const i18n = { locale: "en", t: (key: string) => key }
+  return { useI18n: () => i18n }
+})
 
 import { AgentSshBindings } from "./agent-ssh-bindings"
 
@@ -37,14 +41,27 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
+/** Let the load() promise chain settle so its catch branch can run. */
+async function flushLoad() {
+  await act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+}
+
 describe("AgentSshBindings", () => {
-  it("skips the bindings fetch when the user is not in a team", () => {
+  it("skips the bindings fetch when the user is not in a team", async () => {
     inTeamMock.value = false
-    render(<AgentSshBindings agentId="agent-1" />)
-    // render flushes the effect synchronously and the guard returns before any
-    // await, so the absence of a call is observable without waitFor.
+    const { container } = render(<AgentSshBindings agentId="agent-1" />)
+
+    // toast.error only fires from load()'s catch, two awaits in, so the
+    // absence of a toast is only meaningful once those microtasks have run.
+    await flushLoad()
     expect(apiRequestMock).not.toHaveBeenCalled()
     expect(toastErrorMock).not.toHaveBeenCalled()
+    // The render-level guard still renders nothing — the premise for leaving
+    // the targets-dropdown effect keyed on dialogOpen alone.
+    expect(container).toBeEmptyDOMElement()
   })
 
   it("loads bindings when the user is in a team", async () => {
@@ -56,5 +73,20 @@ describe("AgentSshBindings", () => {
     expect(apiRequestMock).toHaveBeenCalledWith(
       "http://api.local/api/agents/agent-1/ssh-targets",
     )
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("loads once the user joins a team after mount", async () => {
+    inTeamMock.value = false
+    apiRequestMock.mockResolvedValue({ ok: true, json: async () => [] })
+    const { rerender } = render(<AgentSshBindings agentId="agent-1" />)
+    await flushLoad()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+
+    // `inTeam` belongs in load()'s deps, not just the render guard: dropping it
+    // from the array leaves the fetch stuck on its mount-time value.
+    inTeamMock.value = true
+    rerender(<AgentSshBindings agentId="agent-1" />)
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(1))
   })
 })

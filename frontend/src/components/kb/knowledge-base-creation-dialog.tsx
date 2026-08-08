@@ -172,12 +172,15 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
   // Embedding models state
   const [embeddingModels, setEmbeddingModels] = useState<Model[]>([])
-  const trimmedCollectionName = newCollectionName.trim()
   // Flag only: the message itself stays in i18n so it follows a language switch.
   const [nameError, setNameError] = useState(false)
+  const trimmedCollectionName = newCollectionName.trim()
 
   useEffect(() => {
     if (open) {
+      // Clearing on open covers every close path (cancel, escape, overlay, the
+      // close button), which `resetState` alone does not.
+      setNameError(false)
       fetchEmbeddingModels()
     }
   }, [open])
@@ -313,6 +316,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     const sizes = ["B", "KB", "MB", "GB"]
     const i = Math.floor(Math.log(bytes) / Math.log(k))
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
+  }
+
+  /** Every way forward out of step 1 goes through here, so no later step ever
+   *  has to invent a collection name. Returns false when the name is missing. */
+  const requireCollectionName = () => {
+    if (trimmedCollectionName) return true
+    toast.error(t("kb.errors.nameRequired"))
+    setNameError(true)
+    setCurrentStep(1)
+    return false
   }
 
   const resetState = () => {
@@ -1018,7 +1031,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                 <div className="bg-primary/5 rounded-lg p-4 flex flex-col gap-2 border border-primary/20">
                   <div className="flex items-center gap-2 font-bold text-sm">
                     <Database className="w-4 h-4 text-primary" />
-                    {newCollectionName || "KB " + new Date().toLocaleString()}
+                    {newCollectionName}
                   </div>
                   <div className="flex items-center gap-2 text-sm text-muted-foreground ml-6">
                     <FileText className="w-4 h-4" />
@@ -1263,7 +1276,10 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
               )}
               {currentStep < 3 ? (
                 <Button
-                  onClick={() => setCurrentStep(prev => prev + 1)}
+                  onClick={() => {
+                    if (!requireCollectionName()) return
+                    setCurrentStep(prev => prev + 1)
+                  }}
                   disabled={
                     (currentStep === 2 && activeImportTab === "file" && selectedFiles.length === 0) ||
                     (currentStep === 2 && activeImportTab === "web" && !webIngestionConfig.start_url)
@@ -1276,14 +1292,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
               ) : (
                 <Button
                   onClick={() => {
-                    // Single guard for every import tab: the name is required, so
-                    // the backend never has to reject a silently derived one.
-                    if (!trimmedCollectionName) {
-                      toast.error(t("kb.errors.nameRequired"))
-                      setNameError(true)
-                      setCurrentStep(1)
-                      return
-                    }
+                    // Backstop for every import tab: submission must never fall
+                    // back to a derived name, whatever navigation allows.
+                    if (!requireCollectionName()) return
                     if (activeImportTab === "web") {
                       handleWebIngest()
                     } else if (activeImportTab === "cloud") {

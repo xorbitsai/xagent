@@ -231,21 +231,23 @@ async function goToStep3(container: HTMLElement, tab: ImportTab, fileCount = 1) 
   fireEvent.click(screen.getByText("common.next"))
 }
 
-/** The shared guard must warn, send the user back to step 1, and ingest nothing. */
+/** The shared guard must warn, park the user on step 1, and ingest nothing. */
 async function expectNameRejected(container: HTMLElement) {
   await waitFor(() => {
     expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.nameRequired")
   })
 
   // Step 1 is the only step rendering the name field, so its presence proves
-  // the guard moved the user back to where the problem can be fixed.
+  // the user is where the problem can actually be fixed.
   const nameInput = container.querySelector("#collection_name")
   expect(nameInput).not.toBeNull()
 
   // A toast alone leaves a screen reader with nothing at the field itself.
+  expect(nameInput?.getAttribute("aria-required")).toBe("true")
   expect(nameInput?.getAttribute("aria-invalid")).toBe("true")
   expect(screen.getByText("kb.errors.nameRequired")).toBeInTheDocument()
   expect(nameInput?.getAttribute("aria-describedby")).toBe("collection_name_error")
+  expect(container.querySelector("label[for=collection_name]")?.textContent).toContain("*")
 
   expect(
     apiRequestMock.mock.calls.filter(([url]) => String(url).includes("/api/kb/ingest"))
@@ -264,30 +266,25 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
     cleanup()
   })
 
-  it.each(IMPORT_TABS)("rejects an empty collection name on the %s tab", async (tab) => {
+  it.each([
+    ["an empty", ""],
+    ["a whitespace-only", "   "],
+  ])("refuses to leave step 1 with %s collection name", async (_label, value) => {
     const { container } = render(
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
     )
 
-    await goToStep3(container, tab)
-    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+    if (value) {
+      fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+        target: { value },
+      })
+    }
+
+    fireEvent.click(screen.getByText("common.next"))
 
     await expectNameRejected(container)
-  })
-
-  it.each(IMPORT_TABS)("rejects a whitespace-only collection name on the %s tab", async (tab) => {
-    const { container } = render(
-      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
-    )
-
-    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
-      target: { value: "   " },
-    })
-
-    await goToStep3(container, tab)
-    fireEvent.click(screen.getByText("kb.dialog.createButton"))
-
-    await expectNameRejected(container)
+    // Step 2 owns the file picker: never rendering it proves we did not advance.
+    expect(container.querySelector("#file-upload")).toBeNull()
   })
 
   it("clears the name error once the user starts typing", async () => {
@@ -295,8 +292,7 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
     )
 
-    await goToStep3(container, "file")
-    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+    fireEvent.click(screen.getByText("common.next"))
     await expectNameRejected(container)
 
     fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
@@ -307,15 +303,40 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
     expect(screen.queryByText("kb.errors.nameRequired")).toBeNull()
   })
 
-  it("rejects an empty collection name for multiple file uploads", async () => {
+  it("clears the name error when the dialog is closed and reopened", async () => {
+    const { container, rerender } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    fireEvent.click(screen.getByText("common.next"))
+    await expectNameRejected(container)
+
+    // Escape, the overlay and the close button all bypass the cancel handler,
+    // so only the parent's `open` flag flips.
+    rerender(<KnowledgeBaseCreationDialog open={false} onOpenChange={vi.fn()} onSuccess={vi.fn()} />)
+    rerender(<KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />)
+
+    await waitFor(() => {
+      expect(container.querySelector("#collection_name")?.getAttribute("aria-invalid")).toBe("false")
+    })
+    expect(screen.queryByText("kb.errors.nameRequired")).toBeNull()
+  })
+
+  it("previews the name the user typed", async () => {
     const { container } = render(
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
     )
 
-    await goToStep3(container, "file", 2)
-    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "team-docs" },
+    })
 
-    await expectNameRejected(container)
+    await goToStep3(container, "file")
+
+    expect(screen.getByText("team-docs")).toBeInTheDocument()
+    // The step-1 gate is what keeps the preview from ever needing a stand-in
+    // name; the "KB <date>" fallback it used to render is gone.
+    expect(container.textContent).not.toMatch(/KB \d/)
   })
 
   it("uses the same explicit collection name for each uploaded file", async () => {
@@ -328,19 +349,7 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
       target: { value: "team-docs" },
     })
 
-    fireEvent.click(screen.getByText("common.next"))
-
-    const fileInput = container.querySelector("#file-upload") as HTMLInputElement
-    fireEvent.change(fileInput, {
-      target: {
-        files: [
-          new File(["a"], "alpha.txt", { type: "text/plain" }),
-          new File(["b"], "beta.txt", { type: "text/plain" }),
-        ],
-      },
-    })
-
-    fireEvent.click(screen.getByText("common.next"))
+    await goToStep3(container, "file", 2)
     fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
@@ -391,16 +400,7 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
       target: { value: "alpha" },
     })
 
-    fireEvent.click(screen.getByText("common.next"))
-
-    const fileInput = container.querySelector("#file-upload") as HTMLInputElement
-    fireEvent.change(fileInput, {
-      target: {
-        files: [new File(["a"], "alpha.txt", { type: "text/plain" })],
-      },
-    })
-
-    fireEvent.click(screen.getByText("common.next"))
+    await goToStep3(container, "file")
     fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
@@ -458,16 +458,7 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
         target: { value: "cloud-docs" },
       })
 
-      fireEvent.click(screen.getByText("common.next"))
-      fireEvent.click(screen.getByText("kb.dialog.tabs.cloud"))
-      fireEvent.click(screen.getByText("kb.dialog.cloudConnect.googleDrive"))
-      fireEvent.click(await screen.findByTestId("mock-cloud-confirm"))
-
-      await waitFor(() => {
-        expect(screen.getByText("alpha.pdf")).toBeInTheDocument()
-      })
-
-      fireEvent.click(screen.getByText("common.next"))
+      await goToStep3(container, "cloud")
       fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
       await waitFor(() => {
@@ -539,12 +530,7 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
         target: { value: "web_collection" },
       })
 
-      fireEvent.click(screen.getByText("common.next"))
-      fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
-      fireEvent.change(container.querySelector("#start_url") as HTMLInputElement, {
-        target: { value: "https://example.com/docs" },
-      })
-      fireEvent.click(screen.getByText("common.next"))
+      await goToStep3(container, "web")
       fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
       await waitFor(() => {

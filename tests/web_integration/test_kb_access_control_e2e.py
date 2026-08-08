@@ -175,14 +175,16 @@ class TestKbAccessControlContract:
         assert resp.status_code == 403
         assert "Access denied" in resp.json()["detail"]
 
-    def test_save_collection_config_cross_tenant_returns_409(
+    def test_save_collection_config_cross_tenant_returns_403(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Saving config under a taken name reports a conflict, not a denial.
+        """Config saves stay a denial: the body is settings, with no name field.
 
-        The settings panel of an existing knowledge base drives this endpoint, and it
-        passes ``allow_create=True``, so a foreign name used to surface as
-        "Access denied" here too.
+        The other ``allow_create=True`` callers answer 409 because the user just
+        typed the name and can type another. This one is reached from the settings
+        panel of a knowledge base the caller already sees, so a foreign name is an
+        access attempt -- and "pick a different name" would point at an input the
+        form does not have. Hence ``taken_name_is_conflict=False``.
         """
         t1 = _register_and_login(client, "ac_cfg_t1", "pw-g1-", "ac_cfg_t1@example.com")
         t2 = _register_and_login(client, "ac_cfg_t2", "pw-g2-", "ac_cfg_t2@example.com")
@@ -196,14 +198,12 @@ class TestKbAccessControlContract:
             json={"embedding_model_id": "text-embedding-v4"},
             headers={"Authorization": f"Bearer {t2}"},
         )
-        assert resp.status_code == 409, resp.text
+        assert resp.status_code == 403, resp.text
         detail = resp.json()["detail"]
-        assert "name unavailable" in detail
-        assert "Access denied" not in detail
-        # The wording claims no ownership. This is not an anti-enumeration
-        # measure: the 409-vs-success distinction already reveals that the name
-        # is taken, whatever the sentence says.
-        assert "already exists" not in detail
+        assert "Access denied" in detail
+        # Still no name-picking advice, and still no owner id.
+        assert "different name" not in detail
+        assert "user_" not in detail
 
     @pytest.mark.parametrize(
         "slug, path, style",

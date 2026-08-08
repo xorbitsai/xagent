@@ -3502,14 +3502,19 @@ async def _ensure_collection_access(
     *,
     hide_missing: bool = False,
     allow_create: bool = False,
+    taken_name_is_conflict: Optional[bool] = None,
 ) -> None:
     """Enforce collection-level access semantics for KB APIs.
 
     Rules:
     - Admin users always pass.
     - If collection exists but is not visible to current user: raise 403, or 409
-      when ``allow_create`` is True (the caller is naming a new collection, so the
-      name is merely taken -- it is not an access violation).
+      when the caller is naming a new collection (the name is merely taken -- it is
+      not an access violation). ``taken_name_is_conflict`` decides; it defaults to
+      ``allow_create`` because most creating callers do carry a user-typed name.
+      Pass it explicitly for a caller that accepts unknown names without asking
+      for one -- there a foreign name really is an access attempt, and "pick a
+      different name" is nonsense on a form with no name field.
     - If collection does not exist globally: when ``allow_create`` is True, allow
       (first ingest / config for a new collection name); otherwise raise 404, or
       403 when ``hide_missing`` is True.
@@ -3551,7 +3556,7 @@ async def _ensure_collection_access(
             status_code=404, detail=f"Collection not found: {collection_name}"
         )
 
-    if allow_create:
+    if allow_create if taken_name_is_conflict is None else taken_name_is_conflict:
         # The caller wants to create this name, not reach someone else's collection:
         # that is a naming conflict (409), not an access violation (403).
         # NOTE: the existence check above is an unlocked read-then-branch, and it
@@ -3652,11 +3657,12 @@ async def save_collection_config(
 
     _user, _ = _effective_knowledge_base_user(db, _user, safe_collection, action="edit")
 
-    # ``allow_create=True`` is deliberate here, unlike the read-only duplicate
-    # check: this writes a config row keyed by the collection name, and it accepts
-    # a name that has no collection yet (the config e2e tests seed settings before
-    # any ingest). Claiming a name another tenant holds is a real naming conflict.
-    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    # Accepts a name with no collection yet (settings are seeded before any
+    # ingest), but the body is an ``IngestionConfig`` -- no name field, so a
+    # foreign name here is an access attempt, not someone picking a name.
+    await _ensure_collection_access(
+        safe_collection, _user, allow_create=True, taken_name_is_conflict=False
+    )
 
     config_json = config.model_dump_json(exclude_unset=True)
 
@@ -7479,19 +7485,18 @@ async def rename_collection_api(
             status_code=409,
             detail=f"Target collection already exists: {safe_new_collection}",
         )
-    if not any(c.name == safe_new_collection for c in visible_for_user.collections):
-        all_named = await _list_collections_with_retry(
-            user_id=None,
-            is_admin=True,
-            stage="rename_list_all_collections",
+    all_named = await _list_collections_with_retry(
+        user_id=None,
+        is_admin=True,
+        stage="rename_list_all_collections",
+    )
+    if any(c.name == safe_new_collection for c in all_named.collections):
+        raise HTTPException(
+            status_code=409,
+            detail=_collection_name_unavailable_detail(
+                safe_new_collection, advise_rename=True
+            ),
         )
-        if any(c.name == safe_new_collection for c in all_named.collections):
-            raise HTTPException(
-                status_code=409,
-                detail=_collection_name_unavailable_detail(
-                    safe_new_collection, advise_rename=True
-                ),
-            )
 
     mutation_scope = _resolve_collection_mutation_scope(
         collection_name=safe_old_collection,

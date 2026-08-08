@@ -317,12 +317,9 @@ describe("KnowledgeBaseDetailContent config save", () => {
       if (url === "http://api.local/api/kb/collections/demo/config") {
         return Promise.resolve(
           createJsonResponse(
-            {
-              detail:
-                "Knowledge base name unavailable: demo.",
-            },
+            { detail: "Access denied for collection: demo" },
             false,
-            409
+            403
           )
         )
       }
@@ -341,7 +338,7 @@ describe("KnowledgeBaseDetailContent config save", () => {
     cleanup()
   })
 
-  it("relays the backend verdict for a conflict instead of rename advice", async () => {
+  it("relays the denial verdict verbatim", async () => {
     render(<KnowledgeBaseDetailContent collectionName="demo" />)
 
     await waitFor(() => {
@@ -350,14 +347,13 @@ describe("KnowledgeBaseDetailContent config save", () => {
 
     fireEvent.click(screen.getByText("kb.index.saveConfig"))
 
-    // The settings panel has no name field either. The 409 means this collection
-    // is no longer visible to the caller, and the wording says only that.
+    // The settings panel has no name field, so this endpoint answers a foreign
+    // name with 403 rather than the ingest paths' "name taken" conflict.
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
         "kb.detail.errors.saveConfigFailed",
         expect.objectContaining({
-          description:
-            "Knowledge base name unavailable: demo.",
+          description: "Access denied for collection: demo",
         })
       )
     })

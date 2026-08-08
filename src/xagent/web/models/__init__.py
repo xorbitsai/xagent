@@ -18,6 +18,7 @@ from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
 from .task_command import TaskExecutionCommand
+from .task_interaction import TaskInteractionRequest
 from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
 from .trigger import (
@@ -62,6 +63,7 @@ __all__ = [
     "DeploymentOwnerType",
     "Task",
     "TaskExecutionCommand",
+    "TaskInteractionRequest",
     "TaskConnectorRuntimeContext",
     "DAGExecution",
     "TemplateStats",

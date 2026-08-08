@@ -3,6 +3,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.artifacts import artifact_type_for_filename
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
@@ -199,6 +200,57 @@ def test_reconcile_rewrites_label_to_filename_for_audio_when_extension_is_missin
         db.close()
 
 
+def test_reconcile_rewrites_label_for_m4v_extension():
+    # Regression test: the frontend's video regex
+    # (inline-file-preview-utils.ts) recognizes .m4v, and
+    # artifact_type_for_filename must agree or this rewrite silently
+    # no-ops for .m4v the same way it used to for all audio extensions.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video.m4v",
+            mime_type="video/mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（M4V）](file:real-id)",
+        )
+
+        assert content == "[generated_video.m4v](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_rewrites_label_case_insensitively():
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="CLIP.MP4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频](file:real-id)",
+        )
+
+        assert content == "[CLIP.MP4](file:real-id)"
+    finally:
+        db.close()
+
+
 def test_reconcile_keeps_custom_label_for_plain_download_file():
     db, user, task = _create_context()
     try:
@@ -220,6 +272,100 @@ def test_reconcile_keeps_custom_label_for_plain_download_file():
         assert content == "[下载笔记](file:real-id)"
     finally:
         db.close()
+
+
+def test_reconcile_keeps_custom_label_for_office_document():
+    # Office types are deliberately excluded from label-restore (rewriting
+    # them would flip existing compact links into heavy inline preview
+    # boxes). Use .docx so this fails loudly if "document" is ever added
+    # to the inline-preview media set by mistake.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="quarterly_report.docx",
+            mime_type=(
+                "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document"
+            ),
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载报告](file:real-id)",
+        )
+
+        assert content == "[下载报告](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_keeps_mismatched_label_that_already_has_media_extension():
+    # A label that already ends in a valid media suffix is left alone even
+    # when it names a different file than the record's real filename —
+    # there's no signal that the mismatch is wrong rather than intentional.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video_a1b2c3.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[my_clip.mp4](file:real-id)",
+        )
+
+        assert content == "[my_clip.mp4](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_skips_label_rewrite_for_filename_with_unsafe_chars():
+    # A real filename containing "]" must never be substituted into the
+    # label unescaped -- it would terminate the markdown link early and
+    # drop the file reference entirely, which is worse than leaving the
+    # model's prose label (and its plain-download fallback) in place.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="clip ].mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（MP4）](file:real-id)",
+        )
+
+        assert content == "[下载视频（MP4）](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_video_extension_detection_matches_frontend_set():
+    # Pins the backend's video-extension coverage to the frontend's regex
+    # in inline-file-preview-utils.ts (`/\.(mp4|m4v|mov|webm|mpeg|mpg)$/`).
+    # A mismatch here (like the missing .m4v this test was added to catch)
+    # makes the label-restore rewrite silently no-op for that extension.
+    frontend_video_extensions = {".mp4", ".m4v", ".mov", ".webm", ".mpeg", ".mpg"}
+    for extension in frontend_video_extensions:
+        assert artifact_type_for_filename(f"clip{extension}") == "video", extension
 
 
 def test_reconcile_reuses_prefetched_records_without_querying():

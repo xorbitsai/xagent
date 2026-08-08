@@ -2037,6 +2037,60 @@ def test_kb_rename_rejects_existing_visible_target_collection(test_env):
     mock_rename_storage.assert_not_called()
 
 
+def test_kb_rename_onto_another_tenants_name_advises_a_different_name(test_env):
+    """Rename is the one flow with a name field, so its 409 says what to do.
+
+    The shared wording omits that advice because the access check cannot tell a
+    name being chosen from an existing collection being written to. Rename can:
+    the new name is in the request. Without this, the only screen with a name
+    input would report a clash and never mention renaming.
+    """
+    app, headers, _, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionInfo,
+        ListCollectionsResult,
+    )
+
+    def _listing(*names: str) -> ListCollectionsResult:
+        return ListCollectionsResult(
+            status="success",
+            collections=[
+                CollectionInfo(name=name, documents=1, document_names=[])
+                for name in names
+            ],
+            total_count=len(names),
+            message="ok",
+            warnings=[],
+        )
+
+    # Visible to this user: only the source. Globally the target exists too,
+    # held by somebody else.
+    with (
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch(
+            "xagent.web.api.kb._list_collections_with_retry",
+            new_callable=AsyncMock,
+            side_effect=[_listing("mine"), _listing("mine", "theirs")],
+        ),
+        patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
+    ):
+        response = client.put(
+            "/api/kb/collections/mine",
+            data={"new_name": "theirs"},
+            headers=headers,
+        )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "Please choose a different name." in detail
+    # Still must not confirm who holds it.
+    assert "already exists" not in detail
+    assert "user_" not in detail
+    mock_rename_storage.assert_not_called()
+
+
 def test_delete_after_rename_not_denied_by_stale_list_collections(test_env):
     """When access passes, stale ``list_collections`` alone does not block delete.
 

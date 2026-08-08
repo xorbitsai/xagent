@@ -3467,24 +3467,28 @@ async def _list_collections_with_retry(
     )
 
 
-def _collection_name_unavailable_detail(collection_name: str) -> str:
+def _collection_name_unavailable_detail(
+    collection_name: str, *, advise_rename: bool = False
+) -> str:
     """Name-conflict wording that does not confirm another tenant owns the name.
 
-    States the fact and stops there. The same access check raises this both while
-    a name is being chosen and while an existing collection is being written to
-    -- identical requests, so the server cannot tell which -- and "pick another
-    name" is useless on a screen with no name field. Only a client that knows the
-    user just typed the name may add that advice.
+    States the fact, and only adds "pick another name" when the caller knows the
+    user just supplied one. `_ensure_collection_access` cannot know: it raises
+    this both while a name is being chosen and while an existing collection is
+    being written to, from requests the server cannot tell apart, and the advice
+    is useless on a screen with no name field. Rename can know -- the new name is
+    in the request -- so it passes ``advise_rename=True``.
     """
-    return f"Knowledge base name unavailable: {collection_name}."
+    detail = f"Knowledge base name unavailable: {collection_name}."
+    return f"{detail} Please choose a different name." if advise_rename else detail
 
 
 def _rename_target_has_files_detail(collection_name: str) -> str:
     """Storage-collision wording, for the rename dialog only.
 
     The owning user id belongs in the log, not here: the caller who sees this may
-    not be that owner. Renaming is the one flow with a name field, so unlike the
-    shared wording above this one can safely tell the user what to do.
+    not be that owner. Rename always has a name field, so this says what to do --
+    same reason the name-conflict wording above takes ``advise_rename=True`` here.
     """
     return (
         f"Cannot rename to '{collection_name}': that name already has stored "
@@ -7484,7 +7488,9 @@ async def rename_collection_api(
         if any(c.name == safe_new_collection for c in all_named.collections):
             raise HTTPException(
                 status_code=409,
-                detail=_collection_name_unavailable_detail(safe_new_collection),
+                detail=_collection_name_unavailable_detail(
+                    safe_new_collection, advise_rename=True
+                ),
             )
 
     mutation_scope = _resolve_collection_mutation_scope(

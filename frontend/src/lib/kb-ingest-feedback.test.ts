@@ -69,13 +69,16 @@ describe("getKnowledgeBaseErrorToastContent", () => {
   // Every 409 the backend can raise, checked against what the user is shown.
   // A "neutral" conflict repeats the backend's own sentence, because that
   // sentence is the only thing true of the cause that actually fired. The
-  // strings below are the verbatim output of each 409 branch in kb.py.
+  // strings below are the verbatim output of the rename dialog's four 409 exits in kb.py.
   it.each([
     [
       "the caller's own collection holds the name",
       "Target collection already exists: docs",
     ],
-    ["another tenant holds the name", "Knowledge base name unavailable: docs."],
+    [
+      "another tenant holds the name",
+      "Knowledge base name unavailable: docs. Please choose a different name.",
+    ],
     [
       "the target name already has stored files",
       "Cannot rename to 'docs': that name already has stored files. Please choose a different name.",
@@ -106,7 +109,6 @@ describe("getKnowledgeBaseErrorToastContent", () => {
 
     expect(result.title).toBe(COPY.genericTitle)
     expect(result.description).toBe("Knowledge base name unavailable: demo.")
-    expect(result.description).not.toContain("choose a different name")
   })
 
   it("keeps rollback toasts concise while preserving rollback context", () => {

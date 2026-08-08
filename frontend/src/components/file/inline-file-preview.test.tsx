@@ -277,6 +277,47 @@ describe('InlineFilePreview', () => {
     )
   })
 
+  it('loads managed video files through authenticated preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/video-file-id',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    expect(video.getAttribute('src')).toMatch(/^blob:/)
+    expect(screen.getByRole('link', { name: 'Open' }).getAttribute('href')).toMatch(
+      /^blob:/
+    )
+  })
+
+  it('renders a video link with a filename extension as an inline video preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/webm' }),
+    })
+
+    render(
+      <InlineFilePreview source={{ fileId: 'abc-123', filename: 'clip.webm' }} />
+    )
+
+    const video = await screen.findByLabelText('clip.webm')
+    expect(video.tagName.toLowerCase()).toBe('video')
+  })
+
   it('loads legacy workspace audio paths through authenticated preview', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

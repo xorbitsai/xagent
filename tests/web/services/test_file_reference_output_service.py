@@ -150,6 +150,52 @@ def test_reconcile_unlinks_record_with_invalid_file_id():
         db.close()
 
 
+def test_reconcile_rewrites_label_to_filename_when_extension_is_missing():
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（MP4）](file:real-id)",
+        )
+
+        assert content == "[generated_video.mp4](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_keeps_custom_label_for_plain_download_file():
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="notes.txt",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载笔记](file:real-id)",
+        )
+
+        assert content == "[下载笔记](file:real-id)"
+    finally:
+        db.close()
+
+
 def test_reconcile_reuses_prefetched_records_without_querying():
     db, user, task = _create_context()
     try:

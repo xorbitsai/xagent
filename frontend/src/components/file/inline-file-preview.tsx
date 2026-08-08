@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { FileText, Loader2, Volume2 } from 'lucide-react'
+import { FileText, Loader2, Video, Volume2 } from 'lucide-react'
 
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
 import { ExcelPreviewRenderer } from '@/components/file/excel-preview-renderer'
@@ -234,6 +234,110 @@ function InlineAudioPreview({
   )
 }
 
+function InlineVideoPreview({
+  source,
+  previewUrl,
+  filename,
+  openLabel,
+  className,
+  fileAccess,
+}: {
+  source: InlineFilePreviewSource
+  previewUrl: string
+  filename: string
+  openLabel: string
+  className?: string
+  fileAccess: FileAccessPolicy
+}) {
+  const shouldFallback = Boolean(source.fileId)
+  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
+
+  useEffect(() => {
+    let objectUrl: string | null = null
+    let isCancelled = false
+
+    setResolvedUrl(shouldFallback ? '' : previewUrl)
+
+    const loadAuthenticatedVideo = async () => {
+      if (!shouldFallback || !source.fileId) return
+      try {
+        const response = await fileAccess.request(
+          fileAccess.previewUrl(source.fileId),
+          {
+            cache: 'no-cache',
+            headers: {
+              'Cache-Control': 'no-cache',
+              Pragma: 'no-cache',
+            },
+          }
+        )
+        if (isCancelled) return
+        if (!response.ok) {
+          setResolvedUrl(previewUrl)
+          return
+        }
+        const blob = await response.blob()
+        if (isCancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setResolvedUrl(objectUrl)
+      } catch {
+        if (!isCancelled) {
+          setResolvedUrl(previewUrl)
+        }
+      }
+    }
+
+    void loadAuthenticatedVideo()
+
+    return () => {
+      isCancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
+
+  return (
+    <div
+      className={cn(
+        'overflow-hidden rounded-md border border-border/50 bg-background',
+        className
+      )}
+      data-inline-file-preview-wrapper
+    >
+      <div className="flex items-center gap-2 border-b border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <Video className="h-4 w-4 shrink-0" />
+        <span className="min-w-0 flex-1 truncate">{filename}</span>
+        {resolvedUrl ? (
+          <a
+            href={resolvedUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="shrink-0 text-foreground hover:underline"
+          >
+            {openLabel}
+          </a>
+        ) : null}
+      </div>
+      <div className="flex items-center justify-center bg-black/95 p-2">
+        {resolvedUrl ? (
+          <video
+            controls
+            playsInline
+            preload="metadata"
+            src={resolvedUrl}
+            className="max-h-[360px] w-full max-w-full rounded bg-black"
+            aria-label={filename}
+            title={filename}
+          />
+        ) : (
+          <div className="flex h-40 w-full items-center justify-center text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function InlineOfficeContent({
   kind,
   previewUrl,
@@ -418,6 +522,19 @@ export function InlineFilePreview({
   if (kind === 'audio') {
     return (
       <InlineAudioPreview
+        source={resolvedSource}
+        previewUrl={previewUrl}
+        filename={filename}
+        openLabel={openLabel}
+        className={className}
+        fileAccess={fileAccess}
+      />
+    )
+  }
+
+  if (kind === 'video') {
+    return (
+      <InlineVideoPreview
         source={resolvedSource}
         previewUrl={previewUrl}
         filename={filename}

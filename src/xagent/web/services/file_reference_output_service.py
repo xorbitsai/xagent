@@ -12,6 +12,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...core.file_ref import build_file_id_ref, parse_file_id_ref
+from ...core.tools.artifacts import artifact_type_for_filename
 from ..models.uploaded_file import UploadedFile
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,18 @@ logger = logging.getLogger(__name__)
 _MARKDOWN_FILE_REFERENCE_RE = re.compile(
     r"(?P<image>!)?\[(?P<label>[^\]]*)\]\((?P<target>file:[^)\s]+)\)"
 )
+
+# Media artifact types the frontend renders as inline players but only
+# detects by filename extension, since ``[label](file:id)`` targets are
+# opaque UUIDs. The model is free to rewrite ``label`` into descriptive
+# prose that drops the extension (e.g. "下载视频（MP4）"), which silently
+# degrades the player to a plain download link. Force the label back to the
+# real filename in that case so the extension survives into the rendered
+# markdown. Deliberately limited to lightweight media players: office types
+# (presentation/document/spreadsheet) keep the model's prose label because
+# rewriting it would flip existing compact links into heavy inline preview
+# boxes that eagerly fetch file bytes.
+_INLINE_PREVIEW_LINK_TYPES = {"video", "audio"}
 
 
 def load_assistant_file_reference_records(
@@ -116,6 +129,17 @@ def reconcile_assistant_file_references(
                 record.file_id,
             )
             return label
-        return f"{prefix}[{label}]({canonical_ref})"
+
+        display_label = label
+        filename = str(record.filename or "")
+        if (
+            not prefix
+            and artifact_type_for_filename(filename) in _INLINE_PREVIEW_LINK_TYPES
+        ):
+            suffix = Path(filename).suffix.casefold()
+            if suffix and not label.strip().casefold().endswith(suffix):
+                display_label = filename
+
+        return f"{prefix}[{display_label}]({canonical_ref})"
 
     return _MARKDOWN_FILE_REFERENCE_RE.sub(replacement, content)

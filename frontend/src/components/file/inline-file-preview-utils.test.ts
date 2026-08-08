@@ -33,6 +33,12 @@ describe('inline-file-preview-utils', () => {
     expect(getInlineFilePreviewKind({ filename: 'chart.png' })).toBe('image')
     expect(getInlineFilePreviewKind({ filename: 'podcast.mp3' })).toBe('audio')
     expect(getInlineFilePreviewKind({ mimeType: 'audio/mpeg' })).toBe('audio')
+    expect(getInlineFilePreviewKind({ filename: 'clip.mp4' })).toBe('video')
+    expect(getInlineFilePreviewKind({ filename: 'clip.webm' })).toBe('video')
+    expect(getInlineFilePreviewKind({ mimeType: 'video/mp4' })).toBe('video')
+    expect(getInlineFilePreviewKind({ type: 'video', filename: 'unknown.bin' })).toBe(
+      'video'
+    )
   })
 
   it('classifies .pptx (OOXML) as inline-previewable presentation', () => {

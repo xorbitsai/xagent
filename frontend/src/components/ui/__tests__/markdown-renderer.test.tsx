@@ -772,6 +772,21 @@ describe('MarkdownRenderer', () => {
     )
   })
 
+  it('renders video file links as an inline video preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content = '[puppy_drinking.mp4](file:550e8400-e29b-41d4-a716-446655440000)'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('puppy_drinking.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    await waitFor(() => {
+      expect(video.getAttribute('src')).toMatch(/^blob:/)
+    })
+  })
+
   it('renders file links as image previews when the path has an image extension', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

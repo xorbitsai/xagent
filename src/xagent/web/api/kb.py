@@ -3556,7 +3556,10 @@ async def _ensure_collection_access(
             status_code=404, detail=f"Collection not found: {collection_name}"
         )
 
-    if allow_create if taken_name_is_conflict is None else taken_name_is_conflict:
+    name_is_being_picked = (
+        allow_create if taken_name_is_conflict is None else taken_name_is_conflict
+    )
+    if name_is_being_picked:
         # The caller wants to create this name, not reach someone else's collection:
         # that is a naming conflict (409), not an access violation (403).
         # NOTE: the existence check above is an unlocked read-then-branch, and it

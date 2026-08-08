@@ -9,6 +9,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.file_reference_output_service import (
+    _AUDIO_EXTENSIONS,
     reconcile_assistant_file_references,
 )
 
@@ -358,6 +359,55 @@ def test_reconcile_skips_label_rewrite_for_filename_with_unsafe_chars():
         db.close()
 
 
+def test_reconcile_skips_label_rewrite_for_filename_with_control_chars():
+    # A filename containing a blank line would split the paragraph before
+    # CommonMark ever parses the inline link -- same failure mode as "]",
+    # through a different character class.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="a\n\nb.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（MP4）](file:real-id)",
+        )
+
+        assert content == "[下载视频（MP4）](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_rewrites_empty_label_to_filename_for_media():
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[](file:real-id)",
+        )
+
+        assert content == "[generated_video.mp4](file:real-id)"
+    finally:
+        db.close()
+
+
 def test_video_extension_detection_matches_frontend_set():
     # Pins the backend's video-extension coverage to the frontend's regex
     # in inline-file-preview-utils.ts (`/\.(mp4|m4v|mov|webm|mpeg|mpg)$/`).
@@ -366,6 +416,23 @@ def test_video_extension_detection_matches_frontend_set():
     frontend_video_extensions = {".mp4", ".m4v", ".mov", ".webm", ".mpeg", ".mpg"}
     for extension in frontend_video_extensions:
         assert artifact_type_for_filename(f"clip{extension}") == "video", extension
+
+
+def test_audio_extension_detection_matches_frontend_set():
+    # Same parity guard for audio, pinning _AUDIO_EXTENSIONS against the
+    # frontend regex (`/\.(mp3|wav|ogg|opus|flac|m4a|aac)$/`). Audio is the
+    # category that actually drifted historically: the initial label-restore
+    # fix silently no-oped for every audio extension.
+    frontend_audio_extensions = {
+        ".mp3",
+        ".wav",
+        ".ogg",
+        ".opus",
+        ".flac",
+        ".m4a",
+        ".aac",
+    }
+    assert frontend_audio_extensions == _AUDIO_EXTENSIONS
 
 
 def test_reconcile_reuses_prefetched_records_without_querying():

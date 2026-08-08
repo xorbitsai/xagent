@@ -150,22 +150,38 @@ function InlineImagePreview({
   )
 }
 
-function InlineAudioPreview({
+function InlineMediaPreview({
   source,
   previewUrl,
   filename,
   openLabel,
+  loadErrorText,
   className,
   fileAccess,
+  icon: Icon,
+  bodyClassName,
+  spinnerClassName,
+  renderMedia,
 }: {
   source: InlineFilePreviewSource
   previewUrl: string
   filename: string
   openLabel: string
+  loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
+  icon: React.ComponentType<{ className?: string }>
+  bodyClassName: string
+  spinnerClassName: string
+  renderMedia: (resolvedUrl: string, onError: () => void) => React.ReactNode
 }) {
   const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
+  const [failedUrl, setFailedUrl] = useState('')
+  // Terminal failure only: useResolvedMediaUrl already falls back from the
+  // authenticated fetch to the public preview URL, so an error event from
+  // the media element means both paths are exhausted. Keyed by URL so a
+  // later successful re-resolve (e.g. blob after fallback) clears it.
+  const failed = Boolean(resolvedUrl) && failedUrl === resolvedUrl
 
   return (
     <div
@@ -176,7 +192,7 @@ function InlineAudioPreview({
       data-inline-file-preview-wrapper
     >
       <div className="flex items-center gap-2 border-b border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        <Volume2 className="h-4 w-4 shrink-0" />
+        <Icon className="h-4 w-4 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{filename}</span>
         {resolvedUrl ? (
           <a
@@ -189,83 +205,88 @@ function InlineAudioPreview({
           </a>
         ) : null}
       </div>
-      <div className="p-3">
-        {resolvedUrl ? (
-          <audio
-            controls
-            preload="metadata"
-            src={resolvedUrl}
-            className="w-full"
-            aria-label={filename}
-            title={filename}
-          />
-        ) : (
-          <div className="flex h-14 items-center justify-center text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-          </div>
-        )}
-      </div>
+      {failed ? (
+        <div className="p-3 text-xs text-muted-foreground">{loadErrorText}</div>
+      ) : (
+        <div className={bodyClassName}>
+          {resolvedUrl ? (
+            renderMedia(resolvedUrl, () => setFailedUrl(resolvedUrl))
+          ) : (
+            <div
+              className={cn(
+                'flex items-center justify-center text-muted-foreground',
+                spinnerClassName
+              )}
+            >
+              <Loader2 className="h-4 w-4 animate-spin" />
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
 
-function InlineVideoPreview({
-  source,
-  previewUrl,
-  filename,
-  openLabel,
-  className,
-  fileAccess,
-}: {
+function InlineAudioPreview(props: {
   source: InlineFilePreviewSource
   previewUrl: string
   filename: string
   openLabel: string
+  loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
 }) {
-  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
-
+  const { filename } = props
   return (
-    <div
-      className={cn(
-        'overflow-hidden rounded-md border border-border/50 bg-background',
-        className
+    <InlineMediaPreview
+      {...props}
+      icon={Volume2}
+      bodyClassName="p-3"
+      spinnerClassName="h-14"
+      renderMedia={(resolvedUrl, onError) => (
+        <audio
+          controls
+          preload="metadata"
+          src={resolvedUrl}
+          className="w-full"
+          aria-label={filename}
+          title={filename}
+          onError={onError}
+        />
       )}
-      data-inline-file-preview-wrapper
-    >
-      <div className="flex items-center gap-2 border-b border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        <Video className="h-4 w-4 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{filename}</span>
-        {resolvedUrl ? (
-          <a
-            href={resolvedUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="shrink-0 text-foreground hover:underline"
-          >
-            {openLabel}
-          </a>
-        ) : null}
-      </div>
-      <div className="flex items-center justify-center bg-black/95 p-2">
-        {resolvedUrl ? (
-          <video
-            controls
-            playsInline
-            preload="metadata"
-            src={resolvedUrl}
-            className="max-h-[360px] w-full max-w-full rounded bg-black"
-            aria-label={filename}
-            title={filename}
-          />
-        ) : (
-          <div className="flex h-40 w-full items-center justify-center text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-          </div>
-        )}
-      </div>
-    </div>
+    />
+  )
+}
+
+function InlineVideoPreview(props: {
+  source: InlineFilePreviewSource
+  previewUrl: string
+  filename: string
+  openLabel: string
+  loadErrorText: string
+  className?: string
+  fileAccess: FileAccessPolicy
+}) {
+  const { filename } = props
+  return (
+    <InlineMediaPreview
+      {...props}
+      icon={Video}
+      bodyClassName="flex items-center justify-center bg-black/95 p-2"
+      spinnerClassName="h-40 w-full"
+      renderMedia={(resolvedUrl, onError) => (
+        <video
+          controls
+          playsInline
+          preload="metadata"
+          src={resolvedUrl}
+          className="max-h-[360px] w-full max-w-full rounded bg-black"
+          aria-label={filename}
+          title={filename}
+          onError={onError}
+        />
+      )}
+    />
   )
 }
 
@@ -457,6 +478,7 @@ export function InlineFilePreview({
         previewUrl={previewUrl}
         filename={filename}
         openLabel={openLabel}
+        loadErrorText={loadErrorText}
         className={className}
         fileAccess={fileAccess}
       />
@@ -470,6 +492,7 @@ export function InlineFilePreview({
         previewUrl={previewUrl}
         filename={filename}
         openLabel={openLabel}
+        loadErrorText={loadErrorText}
         className={className}
         fileAccess={fileAccess}
       />

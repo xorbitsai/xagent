@@ -52,13 +52,16 @@ def _is_inline_preview_media(filename: str) -> bool:
 # file like ``clip ].mp4`` must never be substituted into a ``[label](...)``
 # span unescaped: an embedded ``]`` (or ``[``/``\``) terminates the link
 # early and the file reference is lost entirely — worse than the plain
-# download link this rewrite is trying to improve on. Escaping instead of
-# skipping would work for a single pass, but ``_MARKDOWN_FILE_REFERENCE_RE``
-# has no notion of backslash-escapes, so a later reconcile pass over
-# already-escaped content would mis-locate the label boundary at the
-# escaped bracket. Skipping the rewrite for these filenames is the safe,
-# idempotent choice; the link still falls back to a plain download label.
-_UNSAFE_LABEL_CHARS = frozenset("[]\\")
+# download link this rewrite is trying to improve on. Control characters
+# are just as destructive through a different mechanism: a filename with a
+# blank line splits the paragraph before the inline link is even parsed.
+# Escaping instead of skipping would work for a single pass, but
+# ``_MARKDOWN_FILE_REFERENCE_RE`` has no notion of backslash-escapes, so a
+# later reconcile pass over already-escaped content would mis-locate the
+# label boundary at the escaped bracket. Skipping the rewrite for these
+# filenames is the safe, idempotent choice; the link still falls back to a
+# plain download label.
+_UNSAFE_LABEL_RE = re.compile(r"[\[\]\\\x00-\x1f\x7f]")
 
 
 def load_assistant_file_reference_records(
@@ -162,7 +165,7 @@ def reconcile_assistant_file_references(
         if (
             not prefix
             and _is_inline_preview_media(filename)
-            and not any(char in _UNSAFE_LABEL_CHARS for char in filename)
+            and not _UNSAFE_LABEL_RE.search(filename)
         ):
             suffix = Path(filename).suffix.casefold()
             if suffix and not label.strip().casefold().endswith(suffix):

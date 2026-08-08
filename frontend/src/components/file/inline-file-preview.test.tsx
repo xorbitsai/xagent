@@ -328,6 +328,71 @@ describe('InlineFilePreview', () => {
     expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
+  it('falls back to the public video preview when authenticated loading fails', async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 401 })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video).toHaveAttribute(
+      'src',
+      'http://api.local/api/files/public/preview/video-file-id'
+    )
+    expect(screen.getByRole('link', { name: 'Open' })).toHaveAttribute(
+      'href',
+      'http://api.local/api/files/public/preview/video-file-id'
+    )
+  })
+
+  it('revokes the video blob URL on unmount', async () => {
+    const revokeObjectUrlSpy = vi.spyOn(URL, 'revokeObjectURL')
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+
+    const { unmount } = render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    const blobUrl = video.getAttribute('src') || ''
+    expect(blobUrl).toMatch(/^blob:/)
+
+    unmount()
+    expect(revokeObjectUrlSpy).toHaveBeenCalledWith(blobUrl)
+
+    revokeObjectUrlSpy.mockRestore()
+  })
+
+  it('shows the load error text when the video fails on both paths', async () => {
+    // The hook already fell back to the public preview URL after the
+    // authenticated fetch failed; an error event from the element itself
+    // means both paths are exhausted.
+    apiRequestMock.mockResolvedValue({ ok: false, status: 403 })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    fireEvent.error(video)
+
+    expect(await screen.findByText('Failed to load preview.')).toBeInTheDocument()
+    expect(screen.queryByLabelText('clip.mp4')).not.toBeInTheDocument()
+    // The header keeps the filename and Open link so the file stays reachable.
+    expect(screen.getByText('clip.mp4')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Open' })).toBeInTheDocument()
+  })
+
   it('renders a video link with a filename extension as an inline video preview', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

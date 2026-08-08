@@ -806,9 +806,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
 
     setIsUpdating(true)
-    // Carried out of the try so the catch can classify on the status code rather
-    // than on the wording of the backend's message.
-    let failedStatus: number | undefined
     try {
       const formData = new FormData()
       formData.append("new_name", editCollectionName)
@@ -819,7 +816,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
-        failedStatus = response.status
         const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.edit.errors.renameFailed"))
       }
@@ -834,8 +830,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.edit.errors.updateFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed")),
-        failedStatus
+        // No status passed on purpose: rename answers 409 for a taken name, a
+        // colliding physical directory and lock contention alike, so only the
+        // backend's own detail can tell the user which one happened.
+        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed"))
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

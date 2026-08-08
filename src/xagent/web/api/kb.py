@@ -3631,6 +3631,10 @@ async def save_collection_config(
 
     _user, _ = _effective_knowledge_base_user(db, _user, safe_collection, action="edit")
 
+    # ``allow_create=True`` is deliberate here, unlike the read-only duplicate
+    # check: this writes a config row keyed by the collection name, and it accepts
+    # a name that has no collection yet (the config e2e tests seed settings before
+    # any ingest). Claiming a name another tenant holds is a real naming conflict.
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
     config_json = config.model_dump_json(exclude_unset=True)
@@ -6658,6 +6662,10 @@ async def check_documents_exist_api(
 
         # Read-only duplicate check: it names nothing, so it must not report a
         # naming conflict. Only an existing collection's detail page calls it.
+        # Trade-off: ``allow_create=True`` used to wave through the control-plane
+        # rename lag documented below, so during that window this now answers 404.
+        # The caller is fail-open (it warns and uploads anyway), so a missed
+        # duplicate warning is the whole cost.
         await _ensure_collection_access(safe_collection, _user)
 
         # Fetch document records through the API compatibility boundary.
@@ -7445,7 +7453,7 @@ async def rename_collection_api(
     if any(c.name == safe_new_collection for c in visible_for_user.collections):
         raise HTTPException(
             status_code=409,
-            detail=f"Target collection already exists: {safe_new_collection}",
+            detail=_collection_name_unavailable_detail(safe_new_collection),
         )
     if not any(c.name == safe_new_collection for c in visible_for_user.collections):
         all_named = await _list_collections_with_retry(

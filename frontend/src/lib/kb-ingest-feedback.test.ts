@@ -66,6 +66,20 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     expect(result.title).toBe(COPY.genericTitle)
   })
 
+  it("keeps the backend detail for a 409 the caller cannot disambiguate", () => {
+    // Rename answers 409 for lock contention as well as for a taken name, so it
+    // passes no status and the user must still learn what actually went wrong.
+    const result = getKnowledgeBaseErrorToastContent(
+      "Another operation is in progress; please try again later.",
+      COPY
+    )
+
+    expect(result).toEqual({
+      title: COPY.genericTitle,
+      description: "Another operation is in progress; please try again later.",
+    })
+  })
+
   it("keeps rollback toasts concise while preserving rollback context", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Failed to fully roll back ingest for demo/file.txt: delete failed. Original ingestion error: Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",

@@ -171,8 +171,8 @@ class TestKbAccessControlContract:
             json={"embedding_model_id": "text-embedding-v4"},
             headers={"Authorization": f"Bearer {t2}"},
         )
+        assert resp.status_code == 409, resp.text
         detail = resp.json()["detail"]
-        assert resp.status_code == 409
         assert "name unavailable" in detail
         assert "Access denied" not in detail
         # The wording claims no ownership. This is not an anti-enumeration
@@ -241,8 +241,10 @@ class TestKbAccessControlContract:
                 headers=headers,
             )
 
+        # Status first: a success body here is a bare list on some endpoints, so
+        # indexing "detail" would raise TypeError instead of naming the mismatch.
+        assert resp.status_code == 409, resp.text
         detail = resp.json()["detail"]
-        assert resp.status_code == 409
         assert "name unavailable" in detail
         assert "Access denied" not in detail
         # Wording only: it does not name an owner. See the note above -- the

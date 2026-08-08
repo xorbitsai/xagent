@@ -771,12 +771,13 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
     }
 
 
-def test_remote_mcp_apps_launch_config() -> None:
+def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
     """Granola and Notion have no local launch command at all — they host
     their own MCP server and are reached over streamable_http. This is
-    intentionally split out of test_builtin_registry_uses_runtime_available_
-    launch_commands, whose name is about local launch *commands* and would
-    misdescribe these remote-only entries."""
+    intentionally split out of
+    test_builtin_registry_uses_runtime_available_launch_commands, whose name
+    is about local launch *commands* and would misdescribe these
+    remote-only entries."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}

@@ -85,6 +85,8 @@ function getKnowledgeBaseToastCopy(
     genericTitle,
     nameUnavailableTitle: t("kb.errors.nameUnavailable"),
     nameUnavailableDescription: t("kb.errors.nameUnavailableHint"),
+    conflictTitle: t("kb.errors.conflict"),
+    conflictDescription: t("kb.errors.conflictHint"),
     embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
     embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
     rollbackTitle: t("kb.errors.rollbackFailed"),
@@ -526,7 +528,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.errors.uploadFailedGeneric")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric"))
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric")),
+        // Ingest targets a collection this user already owns, so a 409 here is
+        // never about the name.
+        { conflict: "opaque" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -722,7 +727,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.errors.webImportFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed")),
+        { conflict: "opaque" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -806,6 +812,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
 
     setIsUpdating(true)
+    let failedStatus: number | undefined
     try {
       const formData = new FormData()
       formData.append("new_name", editCollectionName)
@@ -816,6 +823,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
+        failedStatus = response.status
         const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.edit.errors.renameFailed"))
       }
@@ -830,10 +838,11 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.edit.errors.updateFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        // No status passed on purpose: rename answers 409 for a taken name, a
-        // colliding physical directory and lock contention alike, so only the
-        // backend's own detail can tell the user which one happened.
-        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed")),
+        // Rename answers 409 for a taken name, a colliding storage directory and
+        // lock contention alike, and those details name internal users and paths.
+        // Neutral copy is the only safe reading of an ambiguous conflict.
+        { status: failedStatus, conflict: "opaque" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -883,7 +892,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         },
       )
       if (!rerankResp.ok) {
-        failedStatus = rerankResp.status
+        // Deliberately not recorded as failedStatus: that variable carries the
+        // config endpoint's contract, and this is a different endpoint.
         const errorData = await rerankResp.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
       }
@@ -899,7 +909,9 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed")),
-        failedStatus
+        // The settings panel has no name field: a 409 means this collection is no
+        // longer visible to the user, not that they just typed a taken name.
+        { status: failedStatus, conflict: "opaque" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

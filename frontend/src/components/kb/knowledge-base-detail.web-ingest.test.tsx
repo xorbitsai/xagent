@@ -287,7 +287,7 @@ describe("KnowledgeBaseDetailContent config save", () => {
     cleanup()
   })
 
-  it("localizes a name conflict instead of echoing the raw backend detail", async () => {
+  it("shows neutral localized copy for a conflict, never the backend detail", async () => {
     render(<KnowledgeBaseDetailContent collectionName="demo" />)
 
     await waitFor(() => {
@@ -298,9 +298,17 @@ describe("KnowledgeBaseDetailContent config save", () => {
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "kb.errors.nameUnavailable",
-        expect.objectContaining({ description: "kb.errors.nameUnavailableHint" })
+        "kb.errors.conflict",
+        expect.objectContaining({ description: "kb.errors.conflictHint" })
       )
     })
+
+    // The settings panel has no name field, so "choose another name" would be
+    // useless advice here, and the backend sentence must not reach the user.
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      "kb.errors.nameUnavailable",
+      expect.anything()
+    )
+    expect(JSON.stringify(toastErrorMock.mock.calls)).not.toContain("demo. Please choose")
   })
 })

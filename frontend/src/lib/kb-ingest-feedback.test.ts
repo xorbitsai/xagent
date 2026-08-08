@@ -10,6 +10,8 @@ const COPY = {
   genericTitle: "上传失败",
   nameUnavailableTitle: "该知识库名称不可用",
   nameUnavailableDescription: "请换一个知识库名称后重试。",
+  conflictTitle: "操作与当前状态冲突",
+  conflictDescription: "该知识库正被其他操作占用或状态已变化，请稍后重试。",
   embeddingTitle: "知识库导入失败：未配置可用的嵌入模型",
   embeddingDescription: "请先配置默认嵌入模型，或选择一个可用的嵌入模型后重试。",
   rollbackTitle: "知识库导入失败，清理未完全完成",
@@ -20,7 +22,8 @@ describe("getKnowledgeBaseErrorToastContent", () => {
   it("maps embedding configuration errors to a concise actionable toast", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
-      COPY
+      COPY,
+      { conflict: "name-taken" }
     )
 
     expect(result).toEqual({
@@ -29,11 +32,11 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     })
   })
 
-  it("maps a 409 to actionable copy without leaking the raw detail", () => {
+  it("maps a name-taken 409 to actionable copy without leaking the raw detail", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test. Please choose a different name.",
       COPY,
-      409
+      { status: 409, conflict: "name-taken" }
     )
 
     expect(result).toEqual({
@@ -43,12 +46,10 @@ describe("getKnowledgeBaseErrorToastContent", () => {
   })
 
   it("classifies a 409 by status alone, whatever wording the backend sends", () => {
-    // The rename endpoint has its own conflict message; nothing may depend on
-    // the English prose of either one.
     const result = getKnowledgeBaseErrorToastContent(
-      "Target collection already exists: test",
+      "some entirely different sentence the backend may switch to",
       COPY,
-      409
+      { status: 409, conflict: "name-taken" }
     )
 
     expect(result).toEqual({
@@ -60,30 +61,48 @@ describe("getKnowledgeBaseErrorToastContent", () => {
   it("does not treat the conflict wording as a conflict without a 409", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test. Please choose a different name.",
-      COPY
+      COPY,
+      { status: 500, conflict: "name-taken" }
     )
 
     expect(result.title).toBe(COPY.genericTitle)
   })
 
-  it("keeps the backend detail for a 409 the caller cannot disambiguate", () => {
-    // Rename answers 409 for lock contention as well as for a taken name, so it
-    // passes no status and the user must still learn what actually went wrong.
-    const result = getKnowledgeBaseErrorToastContent(
-      "Another operation is in progress; please try again later.",
-      COPY
-    )
+  it("never puts the detail of an ambiguous 409 in front of the user", () => {
+    // Rename answers 409 for lock contention and for storage collisions whose
+    // detail names an internal user id, so "opaque" must yield neutral copy.
+    const leaky =
+      "Failed to rename collection: target physical directory already exists "
+      + "for user_3. A collection named 'x' already has physical files."
+    const result = getKnowledgeBaseErrorToastContent(leaky, COPY, {
+      status: 409,
+      conflict: "opaque",
+    })
 
     expect(result).toEqual({
-      title: COPY.genericTitle,
-      description: "Another operation is in progress; please try again later.",
+      title: COPY.conflictTitle,
+      description: COPY.conflictDescription,
     })
+    expect(JSON.stringify(result)).not.toContain("user_3")
+    expect(JSON.stringify(result)).not.toContain("physical")
+  })
+
+  it("does not offer the rename advice when the caller cannot confirm a name clash", () => {
+    const result = getKnowledgeBaseErrorToastContent(
+      "Knowledge base name unavailable: demo. Please choose a different name.",
+      COPY,
+      { status: 409, conflict: "opaque" }
+    )
+
+    expect(result.title).toBe(COPY.conflictTitle)
+    expect(result.title).not.toBe(COPY.nameUnavailableTitle)
   })
 
   it("keeps rollback toasts concise while preserving rollback context", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Failed to fully roll back ingest for demo/file.txt: delete failed. Original ingestion error: Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
-      COPY
+      COPY,
+      { conflict: "name-taken" }
     )
 
     expect(result).toEqual({
@@ -95,7 +114,8 @@ describe("getKnowledgeBaseErrorToastContent", () => {
   it("falls back to a generic title with a truncated description for unknown errors", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "A very long upload failure happened while processing the document and there are many more technical details that should not become the toast title for end users.",
-      COPY
+      COPY,
+      { conflict: "name-taken" }
     )
 
     expect(result.title).toBe(COPY.genericTitle)

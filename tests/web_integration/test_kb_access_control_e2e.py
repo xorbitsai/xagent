@@ -124,9 +124,34 @@ class TestKbAccessControlContract:
             data={"new_name": coll_b},
             headers={"Authorization": f"Bearer {t1}"},
         )
-        assert resp.status_code == 409
-        assert "name unavailable" in resp.json()["detail"]
-        assert "Access denied" not in resp.json()["detail"]
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert "name unavailable" in detail
+        assert "Access denied" not in detail
+
+    def test_rename_onto_own_collection_names_it(
+        self, client: TestClient, tmp_path: Path
+    ) -> None:
+        """A caller's own collection is named outright: they can act on it.
+
+        Only the cross-tenant branch above has to stay vague about ownership.
+        """
+        token = _register_and_login(
+            client, "ac_rn_own", "pw-ro-", "ac_rn_own@example.com"
+        )
+
+        coll_a = "ac_rename_own_source"
+        coll_b = "ac_rename_own_target"
+        _ingest_txt(client, token, coll_a, _write_sample_txt(tmp_path / "own_a.txt"))
+        _ingest_txt(client, token, coll_b, _write_sample_txt(tmp_path / "own_b.txt"))
+
+        resp = client.put(
+            f"/api/kb/collections/{coll_a}",
+            data={"new_name": coll_b},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"] == f"Target collection already exists: {coll_b}"
 
     def test_documents_check_cross_tenant_returns_403(
         self, client: TestClient, tmp_path: Path

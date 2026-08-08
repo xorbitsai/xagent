@@ -2,10 +2,29 @@ export interface KnowledgeBaseErrorToastCopy {
   genericTitle: string
   nameUnavailableTitle: string
   nameUnavailableDescription: string
+  conflictTitle: string
+  conflictDescription: string
   embeddingTitle: string
   embeddingDescription: string
   rollbackTitle: string
   rollbackDescription: string
+}
+
+/**
+ * What a 409 from the endpoint the caller just used actually means.
+ *
+ * The backend answers 409 for several unrelated situations (a taken name, a
+ * colliding storage directory, lock contention) and only the caller knows which
+ * of them its endpoint can produce, so it has to say. ``"opaque"`` is always
+ * safe: it yields a neutral message.
+ */
+export type KnowledgeBaseConflictKind = "name-taken" | "opaque"
+
+export interface KnowledgeBaseErrorSource {
+  /** HTTP status of the failed response, when the failure came from one. */
+  status?: number
+  /** Required so a new call site cannot silently inherit the wrong copy. */
+  conflict: KnowledgeBaseConflictKind
 }
 
 export interface KnowledgeBaseErrorToastContent {
@@ -140,25 +159,25 @@ function isRollbackFailure(message: string): boolean {
   )
 }
 
-/**
- * @param status HTTP status of the failed response, when the caller still has it.
- *   409 is the backend's only name-conflict code, so classifying on it keeps this
- *   independent of the English wording the backend happens to use.
- */
 export function getKnowledgeBaseErrorToastContent(
   message: string,
   copy: KnowledgeBaseErrorToastCopy,
-  status?: number
+  source: KnowledgeBaseErrorSource
 ): KnowledgeBaseErrorToastContent {
   const normalized = normalizeMessage(message)
   const originalError = extractOriginalIngestionError(normalized)
   const rootCause = originalError ?? normalized
 
-  if (status === 409) {
-    return {
-      title: copy.nameUnavailableTitle,
-      description: copy.nameUnavailableDescription,
-    }
+  // Conflict details name internal users and storage paths, so a 409 never gets
+  // to put the backend's own sentence in front of the user. Classifying on the
+  // status also keeps this independent of the backend's English wording.
+  if (source.status === 409) {
+    return source.conflict === "name-taken"
+      ? {
+          title: copy.nameUnavailableTitle,
+          description: copy.nameUnavailableDescription,
+        }
+      : { title: copy.conflictTitle, description: copy.conflictDescription }
   }
 
   if (isEmbeddingConfigurationError(rootCause)) {

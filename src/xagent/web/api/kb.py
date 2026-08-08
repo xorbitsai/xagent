@@ -6662,10 +6662,11 @@ async def check_documents_exist_api(
 
         # Read-only duplicate check: it names nothing, so it must not report a
         # naming conflict. Only an existing collection's detail page calls it.
-        # Trade-off: ``allow_create=True`` used to wave through the control-plane
-        # rename lag documented below, so during that window this now answers 404.
-        # The caller is fail-open (it warns and uploads anyway), so a missed
-        # duplicate warning is the whole cost.
+        # Trade-off: ``allow_create=True`` used to wave through any lag between
+        # ``list_collections`` and the vector store, so a collection missing from
+        # the listing now answers 403 (present globally) or 404 (absent) instead
+        # of being allowed. The caller is fail-open -- it warns and uploads
+        # anyway -- so a missed duplicate warning is the whole cost.
         await _ensure_collection_access(safe_collection, _user)
 
         # Fetch document records through the API compatibility boundary.
@@ -7451,9 +7452,11 @@ async def rename_collection_api(
         stage="rename_list_visible_collections",
     )
     if any(c.name == safe_new_collection for c in visible_for_user.collections):
+        # Deliberately not the vague cross-tenant wording: this collection is the
+        # caller's own, so naming it is useful -- they can go rename or delete it.
         raise HTTPException(
             status_code=409,
-            detail=_collection_name_unavailable_detail(safe_new_collection),
+            detail=f"Target collection already exists: {safe_new_collection}",
         )
     if not any(c.name == safe_new_collection for c in visible_for_user.collections):
         all_named = await _list_collections_with_retry(

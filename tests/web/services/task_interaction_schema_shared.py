@@ -206,3 +206,147 @@ def assert_rejected(db: Session, row: dict[str, object], constraint_name: str) -
         )
     finally:
         db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Hand-written shape literals for the create_all structural tests (T-shape-*).
+# Written independently of the model, per the judgment pinned in
+# task_status_storage_shared.py's TASK_STATUS_STORAGE_NAMES: deriving the
+# expectation from the column/constraint definitions would make the pin
+# agree with any change made to them instead of catching drift.
+# ---------------------------------------------------------------------------
+
+EXPECTED_COLUMNS: set[str] = {
+    "id",
+    "task_id",
+    "run_id",
+    "kind",
+    "protocol_version",
+    "status",
+    "active_slot",
+    "origin",
+    "request_payload",
+    "response_payload",
+    "request_idempotency_key",
+    "resume_trace_event_id",
+    "resume_event_id",
+    "resume_execution_id",
+    "resume_locator_format",
+    "resume_checkpoint_type",
+    "resume_run_partition",
+    "responder_user_id",
+    "responder_identity",
+    "terminal_reason",
+    "created_at",
+    "updated_at",
+    "expires_at",
+    "responded_at",
+    "terminated_at",
+}
+
+# column -> nullable
+EXPECTED_NULLABLE: dict[str, bool] = {
+    "id": False,
+    "task_id": False,
+    "run_id": False,
+    "kind": False,
+    "protocol_version": False,
+    "status": False,
+    "active_slot": True,
+    "origin": False,
+    "request_payload": False,
+    "response_payload": True,
+    "request_idempotency_key": False,
+    "resume_trace_event_id": True,
+    "resume_event_id": False,
+    "resume_execution_id": False,
+    "resume_locator_format": False,
+    "resume_checkpoint_type": False,
+    "resume_run_partition": False,
+    "responder_user_id": True,
+    "responder_identity": True,
+    "terminal_reason": True,
+    "created_at": False,
+    "updated_at": False,
+    "expires_at": False,
+    "responded_at": True,
+    "terminated_at": True,
+}
+
+# column -> VARCHAR length, for the string columns the task book pins.
+EXPECTED_STRING_LENGTHS: dict[str, int] = {
+    "run_id": 64,
+    "request_idempotency_key": 64,
+    "resume_run_partition": 64,
+    "resume_event_id": 255,
+    "resume_execution_id": 255,
+    "responder_identity": 255,
+    "origin": 20,
+}
+
+TIMESTAMP_COLUMNS: tuple[str, ...] = (
+    "created_at",
+    "updated_at",
+    "expires_at",
+    "responded_at",
+    "terminated_at",
+)
+
+# constraint name -> sorted column tuple
+EXPECTED_UNIQUE_CONSTRAINTS: dict[str, tuple[str, ...]] = {
+    "uq_task_interaction_active_slot": ("active_slot", "task_id"),
+    "uq_task_interaction_request_identity": (
+        "request_idempotency_key",
+        "run_id",
+        "task_id",
+    ),
+}
+
+EXPECTED_CHECK_CONSTRAINT_NAMES: set[str] = {
+    "ck_task_interaction_requests_status",
+    "ck_task_interaction_requests_kind",
+    "ck_task_interaction_requests_origin",
+    "ck_task_interaction_requests_resume_checkpoint_type",
+    "ck_task_interaction_requests_resume_locator_format",
+    "ck_task_interaction_requests_terminal_reason",
+    "ck_task_interaction_requests_active_slot_value",
+    "ck_task_interaction_requests_active_slot_pairs_status",
+    "ck_task_interaction_requests_active_anchor",
+    "ck_task_interaction_requests_active_protocol",
+    "ck_task_interaction_requests_terminal_pairs_status",
+    "ck_task_interaction_requests_answered_pairs_response",
+    "ck_task_interaction_requests_unanswered_has_no_response",
+    "ck_task_interaction_requests_answered_pairs_responded_at",
+    "ck_task_interaction_requests_unanswered_has_no_responded_at",
+    "ck_task_interaction_requests_responder_pairs_responded_at",
+    "ck_task_interaction_requests_expiry_after_creation",
+    "ck_task_interaction_requests_run_id_nonempty",
+    "ck_task_interaction_requests_resume_event_id_nonempty",
+    "ck_task_interaction_requests_resume_execution_id_nonempty",
+    "ck_task_interaction_requests_resume_run_partition_nonempty",
+    "ck_task_interaction_requests_request_idempotency_key_nonempty",
+}
+
+# constraint name -> (referred_table, referred_columns, ondelete)
+EXPECTED_FOREIGN_KEYS: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "fk_task_interaction_requests_task_id": ("tasks", ("id",), "CASCADE"),
+    "fk_task_interaction_requests_resume_trace_event_id": (
+        "trace_events",
+        ("id",),
+        "SET NULL",
+    ),
+    "fk_task_interaction_requests_responder_user_id": (
+        "users",
+        ("id",),
+        "SET NULL",
+    ),
+}
+
+# index name -> sorted column tuple, restricted to the *non-unique* subset.
+# PostgreSQL's get_indexes() also reports the two UNIQUE constraints' backing
+# indexes (unique=True); SQLite's does not. Filtering to unique=False first
+# is what makes this literal apply to both backends' reflection.
+EXPECTED_NONUNIQUE_INDEXES: dict[str, tuple[str, ...]] = {
+    "ix_task_interaction_requests_task_status": ("status", "task_id"),
+    "ix_task_interaction_requests_resume_trace_event_id": ("resume_trace_event_id",),
+}

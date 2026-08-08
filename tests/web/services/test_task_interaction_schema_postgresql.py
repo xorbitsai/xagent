@@ -1,4 +1,4 @@
-"""TaskInteractionRequest constraint-behavior sentinels (PostgreSQL half).
+"""TaskInteractionRequest constraint-behavior and shape sentinels (PostgreSQL half).
 
 Companion to test_task_interaction_schema.py; see that file's and
 task_interaction_schema_shared.py's module docstrings for the full
@@ -16,10 +16,18 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from tests.web.services.task_interaction_schema_shared import (
+    EXPECTED_CHECK_CONSTRAINT_NAMES,
+    EXPECTED_COLUMNS,
+    EXPECTED_FOREIGN_KEYS,
+    EXPECTED_NONUNIQUE_INDEXES,
+    EXPECTED_NULLABLE,
+    EXPECTED_STRING_LENGTHS,
+    EXPECTED_UNIQUE_CONSTRAINTS,
+    TIMESTAMP_COLUMNS,
     assert_accepted,
     assert_rejected,
     make_row,
@@ -673,3 +681,84 @@ def test_expires_at_round_trips_as_utc(db_session, fixtures) -> None:
     # (12:00 UTC); PostgreSQL normalizes on write, so this must round-trip
     # to that shared instant rather than to 20:00.
     assert non_utc_row.expires_at == utc_value
+
+
+# --------------------------------------------------------------------------
+# T-shape: create_all shape
+# --------------------------------------------------------------------------
+
+
+def test_table_is_registered_in_metadata() -> None:
+    import xagent.web.models as models
+
+    assert "task_interaction_requests" in models.Base.metadata.tables
+
+
+def test_created_columns_match_the_frozen_shape(db_session) -> None:
+    inspector = inspect(get_engine())
+    columns = {c["name"]: c for c in inspector.get_columns("task_interaction_requests")}
+    assert set(columns) == EXPECTED_COLUMNS
+    for name, expected_nullable in EXPECTED_NULLABLE.items():
+        assert columns[name]["nullable"] == expected_nullable, name
+    for name, expected_length in EXPECTED_STRING_LENGTHS.items():
+        assert columns[name]["type"].length == expected_length, name
+
+
+def test_all_timestamp_columns_are_timezone_aware(db_session) -> None:
+    """Unlike the SQLite half, PostgreSQL's reflection actually reports
+    this: str(column["type"]) prints "TIMESTAMP" either way, but
+    column["type"].timezone distinguishes timestamp with time zone from
+    timestamp without time zone (verified against information_schema)."""
+    inspector = inspect(get_engine())
+    columns = {c["name"]: c for c in inspector.get_columns("task_interaction_requests")}
+    for name in TIMESTAMP_COLUMNS:
+        assert columns[name]["type"].timezone is True, name
+
+
+def test_constraint_names_match_the_frozen_inventory(db_session) -> None:
+    inspector = inspect(get_engine())
+
+    unique = {
+        uc["name"]: tuple(sorted(uc["column_names"]))
+        for uc in inspector.get_unique_constraints("task_interaction_requests")
+    }
+    assert unique == EXPECTED_UNIQUE_CONSTRAINTS
+
+    checks = {
+        c["name"] for c in inspector.get_check_constraints("task_interaction_requests")
+    }
+    assert checks == EXPECTED_CHECK_CONSTRAINT_NAMES
+
+    fks = {
+        fk["name"]: (
+            fk["referred_table"],
+            tuple(fk["referred_columns"]),
+            (fk["options"] or {}).get("ondelete"),
+        )
+        for fk in inspector.get_foreign_keys("task_interaction_requests")
+    }
+    assert fks == EXPECTED_FOREIGN_KEYS
+
+    # PostgreSQL also reports the two UNIQUE constraints' backing indexes
+    # here (unique=True); filtering to unique=False first is what makes
+    # this literal apply to both backends -- see EXPECTED_NONUNIQUE_INDEXES.
+    nonunique_indexes = {
+        idx["name"]: tuple(sorted(idx["column_names"]))
+        for idx in inspector.get_indexes("task_interaction_requests")
+        if not idx["unique"]
+    }
+    assert nonunique_indexes == EXPECTED_NONUNIQUE_INDEXES
+
+
+def test_no_constraint_name_exceeds_the_postgres_identifier_limit() -> None:
+    """Structural guard for a real bug on this exact backend: SQLAlchemy
+    raises IdentifierError at create_all time for an explicitly given name
+    over 63 characters rather than truncating it -- see the SQLite half.
+    """
+    table = TaskInteractionRequest.__table__
+    names = [c.name for c in table.constraints if c.name is not None]
+    names += [ix.name for ix in table.indexes if ix.name is not None]
+    too_long = [name for name in names if len(name) > 63]
+    assert too_long == [], (
+        f"constraint/index name(s) exceed PostgreSQL's 63-char identifier limit: {too_long}"
+    )

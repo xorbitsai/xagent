@@ -82,11 +82,11 @@ describe('InlineFilePreview', () => {
     })
   })
 
-  it('uses the provider-scoped public credential for image and audio bytes', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      blob: async () => new Blob(['media'], { type: 'image/png' }),
-    })
+  it('uses the provider-scoped public credential for image and audio elements', async () => {
+    // With the public policy the tokened URL is handed to the media element
+    // directly — no blob fetch is made (preserving HTTP range requests for
+    // media playback) and the authenticated apiRequest path is never touched.
+    const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
 
     render(
@@ -102,15 +102,16 @@ describe('InlineFilePreview', () => {
       </FileAccessProvider>,
     )
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect(fetchMock).toHaveBeenCalledWith(
+    const image = await screen.findByAltText('image.png')
+    expect(image.getAttribute('src')).toBe(
       'http://api.local/api/files/public/preview/image-id?token=guest-a',
-      expect.objectContaining({ credentials: 'omit' }),
     )
-    expect(fetchMock).toHaveBeenCalledWith(
+    const audio = await screen.findByTitle('audio.mp3')
+    expect(audio.tagName).toBe('AUDIO')
+    expect(audio.getAttribute('src')).toBe(
       'http://api.local/api/files/public/preview/audio-id?token=guest-a',
-      expect.objectContaining({ credentials: 'omit' }),
     )
+    expect(fetchMock).not.toHaveBeenCalled()
     expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
@@ -302,6 +303,29 @@ describe('InlineFilePreview', () => {
     expect(screen.getByRole('link', { name: 'Open' }).getAttribute('href')).toMatch(
       /^blob:/
     )
+  })
+
+  it('streams video directly from the tokened URL under the public policy', async () => {
+    // Range requests only work when the media element loads the URL itself;
+    // a blob fetch would force the full download before playback starts.
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(
+      <FileAccessProvider policy={createPublicFileAccessPolicy('guest-a')}>
+        <InlineFilePreview
+          source={{ type: 'video', fileId: 'video-id', filename: 'clip.mp4' }}
+        />
+      </FileAccessProvider>,
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    expect(video.getAttribute('src')).toBe(
+      'http://api.local/api/files/public/preview/video-id?token=guest-a',
+    )
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
   it('renders a video link with a filename extension as an inline video preview', async () => {

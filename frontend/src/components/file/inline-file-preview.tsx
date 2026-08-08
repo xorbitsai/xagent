@@ -32,6 +32,74 @@ const fileNameFromSource = (source: InlineFilePreviewSource) =>
 const DEFAULT_OPEN_LABEL = 'Open'
 const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
 
+/**
+ * Resolve the URL a media element (<img>/<audio>/<video>) can load.
+ *
+ * The default in-app policy's authenticated preview route needs a Bearer
+ * header that media elements cannot send, so managed files are fetched into
+ * a blob object URL first. If that fetch fails, the public preview URL is a
+ * last-resort fallback: on Agent Builder surfaces it may also require auth,
+ * but a spinner with no recovery path is worse than attempting the
+ * anonymous endpoint.
+ *
+ * When the policy's authenticated route resolves to the same URL as the
+ * public inline route — the public widget/share policy carries its token in
+ * the query string — the URL is handed to the media element directly
+ * instead: a blob fetch would add no authorization there, and skipping it
+ * preserves HTTP range requests for progressive audio/video playback.
+ */
+function useResolvedMediaUrl(
+  source: InlineFilePreviewSource,
+  previewUrl: string,
+  fileAccess: FileAccessPolicy
+): string {
+  const fileId = source.fileId
+  const needsBlobFetch = Boolean(fileId) && fileAccess.previewUrl(fileId!) !== previewUrl
+  const [resolvedUrl, setResolvedUrl] = useState(needsBlobFetch ? '' : previewUrl)
+
+  useEffect(() => {
+    let objectUrl: string | null = null
+    let isCancelled = false
+
+    setResolvedUrl(needsBlobFetch ? '' : previewUrl)
+
+    const loadAuthenticatedMedia = async () => {
+      if (!needsBlobFetch || !fileId) return
+      try {
+        const response = await fileAccess.request(fileAccess.previewUrl(fileId), {
+          cache: 'no-cache',
+          headers: {
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          },
+        })
+        if (isCancelled) return
+        if (!response.ok) {
+          setResolvedUrl(previewUrl)
+          return
+        }
+        const blob = await response.blob()
+        if (isCancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setResolvedUrl(objectUrl)
+      } catch {
+        if (!isCancelled) {
+          setResolvedUrl(previewUrl)
+        }
+      }
+    }
+
+    void loadAuthenticatedMedia()
+
+    return () => {
+      isCancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [fileAccess, fileId, needsBlobFetch, previewUrl])
+
+  return resolvedUrl
+}
+
 function InlineImagePreview({
   source,
   previewUrl,
@@ -47,56 +115,7 @@ function InlineImagePreview({
   onFileClick?: (filePath: string, fileName: string) => void
   fileAccess: FileAccessPolicy
 }) {
-  const shouldFallback = Boolean(source.fileId)
-  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
-
-  useEffect(() => {
-    let objectUrl: string | null = null
-    let isCancelled = false
-
-    setResolvedUrl(shouldFallback ? '' : previewUrl)
-
-    const runFallback = async () => {
-      if (!shouldFallback) return
-      try {
-        const response = await fileAccess.request(
-          fileAccess.previewUrl(source.fileId!),
-          {
-            cache: 'no-cache',
-            headers: {
-              'Cache-Control': 'no-cache',
-              Pragma: 'no-cache',
-            },
-          }
-        )
-        if (isCancelled) return
-        if (!response.ok) {
-          // Last-resort fallback: try the public preview URL when the
-          // authenticated route fails. On Agent Builder surfaces that
-          // route may also require auth, but a spinner with no recovery
-          // path is worse than attempting the anonymous endpoint.
-          setResolvedUrl(previewUrl)
-          return
-        }
-        const blob = await response.blob()
-        if (isCancelled) return
-        objectUrl = URL.createObjectURL(blob)
-        setResolvedUrl(objectUrl)
-      } catch {
-        if (!isCancelled) {
-          // See comment above: public preview is best-effort after auth errors.
-          setResolvedUrl(previewUrl)
-        }
-      }
-    }
-
-    void runFallback()
-
-    return () => {
-      isCancelled = true
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-    }
-  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
+  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
 
   const handleClick = (event: React.MouseEvent<HTMLImageElement>) => {
     if (!onFileClick || !source.fileId) return
@@ -146,51 +165,7 @@ function InlineAudioPreview({
   className?: string
   fileAccess: FileAccessPolicy
 }) {
-  const shouldFallback = Boolean(source.fileId)
-  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
-
-  useEffect(() => {
-    let objectUrl: string | null = null
-    let isCancelled = false
-
-    setResolvedUrl(shouldFallback ? '' : previewUrl)
-
-    const loadAuthenticatedAudio = async () => {
-      if (!shouldFallback || !source.fileId) return
-      try {
-        const response = await fileAccess.request(
-          fileAccess.previewUrl(source.fileId),
-          {
-            cache: 'no-cache',
-            headers: {
-              'Cache-Control': 'no-cache',
-              Pragma: 'no-cache',
-            },
-          }
-        )
-        if (isCancelled) return
-        if (!response.ok) {
-          setResolvedUrl(previewUrl)
-          return
-        }
-        const blob = await response.blob()
-        if (isCancelled) return
-        objectUrl = URL.createObjectURL(blob)
-        setResolvedUrl(objectUrl)
-      } catch {
-        if (!isCancelled) {
-          setResolvedUrl(previewUrl)
-        }
-      }
-    }
-
-    void loadAuthenticatedAudio()
-
-    return () => {
-      isCancelled = true
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-    }
-  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
+  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
 
   return (
     <div
@@ -249,51 +224,7 @@ function InlineVideoPreview({
   className?: string
   fileAccess: FileAccessPolicy
 }) {
-  const shouldFallback = Boolean(source.fileId)
-  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
-
-  useEffect(() => {
-    let objectUrl: string | null = null
-    let isCancelled = false
-
-    setResolvedUrl(shouldFallback ? '' : previewUrl)
-
-    const loadAuthenticatedVideo = async () => {
-      if (!shouldFallback || !source.fileId) return
-      try {
-        const response = await fileAccess.request(
-          fileAccess.previewUrl(source.fileId),
-          {
-            cache: 'no-cache',
-            headers: {
-              'Cache-Control': 'no-cache',
-              Pragma: 'no-cache',
-            },
-          }
-        )
-        if (isCancelled) return
-        if (!response.ok) {
-          setResolvedUrl(previewUrl)
-          return
-        }
-        const blob = await response.blob()
-        if (isCancelled) return
-        objectUrl = URL.createObjectURL(blob)
-        setResolvedUrl(objectUrl)
-      } catch {
-        if (!isCancelled) {
-          setResolvedUrl(previewUrl)
-        }
-      }
-    }
-
-    void loadAuthenticatedVideo()
-
-    return () => {
-      isCancelled = true
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-    }
-  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
+  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
 
   return (
     <div

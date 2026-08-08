@@ -6005,48 +6005,48 @@ export function AppProvider({
   return (
     <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
       <LinksOpenInNewTabCapability.Provider value={linksOpenInNewTab}>
-      <FileAccessProvider policy={transport?.fileAccess}>
-        <AppContext.Provider
-        value={{
-        state,
-        dispatch,
-        filesDisabled,
-        agentCardsEnabled,
-        voiceInputEnabled,
-        taskControlsEnabled,
-        sendMessage,
-        executeTask,
-        pauseTask,
-        resumeTask,
-        selectStep,
-        clearMessages,
-        isConnected,
-        connectionError,
-        startNewConversation,
-        isConversationResetPending:
-          state.sessionConversation.phase === "reset_requested",
-        isMessageDeliveryPending: messageDeliveryCount > 0,
-        isSessionInteractionLocked:
-          state.sessionConversation.phase === "reload_required",
-        sessionConversationState: state.sessionConversation.phase,
-        setTaskId,
-        requestStatus,
-        getFilePreviewUrl,
-        getFileDownloadUrl,
-        openFilePreview,
-        switchFilePreview,
-        closeFilePreview,
-        startReplay,
-        stopReplay,
-        setReplayPlaying,
-        setReplaySpeed,
-        setReplayProgress,
-        setPendingMessage,
-        }}
-      >
-        {children}
-        </AppContext.Provider>
-      </FileAccessProvider>
+        <FileAccessProvider policy={transport?.fileAccess}>
+          <AppContext.Provider
+          value={{
+          state,
+          dispatch,
+          filesDisabled,
+          agentCardsEnabled,
+          voiceInputEnabled,
+          taskControlsEnabled,
+          sendMessage,
+          executeTask,
+          pauseTask,
+          resumeTask,
+          selectStep,
+          clearMessages,
+          isConnected,
+          connectionError,
+          startNewConversation,
+          isConversationResetPending:
+            state.sessionConversation.phase === "reset_requested",
+          isMessageDeliveryPending: messageDeliveryCount > 0,
+          isSessionInteractionLocked:
+            state.sessionConversation.phase === "reload_required",
+          sessionConversationState: state.sessionConversation.phase,
+          setTaskId,
+          requestStatus,
+          getFilePreviewUrl,
+          getFileDownloadUrl,
+          openFilePreview,
+          switchFilePreview,
+          closeFilePreview,
+          startReplay,
+          stopReplay,
+          setReplayPlaying,
+          setReplaySpeed,
+          setReplayProgress,
+          setPendingMessage,
+          }}
+        >
+          {children}
+          </AppContext.Provider>
+        </FileAccessProvider>
       </LinksOpenInNewTabCapability.Provider>
     </AgentCardPresentationCapability.Provider>
   )

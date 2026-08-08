@@ -16,13 +16,6 @@ export function resolveAgentCardPresentationCapability(
 
 // Off by default so every existing MarkdownRenderer consumer (skill-hub docs,
 // the file viewer, conversation logs, ...) keeps opening links in the same
-// tab. AppProvider turns this on only for the embedded Chat Widget, where an
-// in-tab navigation would carry the visitor's iframe away from the page.
+// tab. AppProvider turns this on only for the Chat Widget surface, where an
+// in-tab navigation would carry the visitor away from the conversation.
 export const LinksOpenInNewTabCapability = React.createContext(false)
-
-export function resolveLinksOpenInNewTabCapability(
-  requestedLinksOpenInNewTab: boolean | undefined,
-  inheritedLinksOpenInNewTab = false,
-): boolean {
-  return requestedLinksOpenInNewTab ?? inheritedLinksOpenInNewTab
-}

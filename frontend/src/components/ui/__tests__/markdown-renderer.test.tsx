@@ -52,7 +52,10 @@ vi.mock('@/contexts/i18n-context', () => ({
 }))
 
 import { JsonRenderer, MarkdownRenderer } from '../markdown-renderer'
-import { AgentCardPresentationCapability } from '@/contexts/presentation-capabilities'
+import {
+  AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
+} from '@/contexts/presentation-capabilities'
 import {
   getFilesDisabledPresentationFileLabel,
   projectFilesDisabledPresentation,
@@ -695,20 +698,28 @@ describe('MarkdownRenderer', () => {
     expect(image).toHaveAttribute('src', './a.png')
   })
 
-  it('opens ordinary links in a new tab only when linksOpenInNewTab is enabled', () => {
-    render(<MarkdownRenderer content="[Google](https://www.google.com)" linksOpenInNewTab />)
+  it('opens ordinary links in a new tab only when the LinksOpenInNewTab capability is enabled', () => {
+    render(
+      <LinksOpenInNewTabCapability.Provider value={true}>
+        <MarkdownRenderer content="[Google](https://www.google.com)" />
+      </LinksOpenInNewTabCapability.Provider>,
+    )
 
     const link = screen.getByRole('link', { name: 'Google' })
     expect(link).toHaveAttribute('target', '_blank')
     expect(link).toHaveAttribute('rel', 'noopener noreferrer')
   })
 
-  it('keeps in-page anchor links and mailto links in the current tab even when linksOpenInNewTab is enabled', () => {
+  it('keeps in-page anchor links and mailto links in the current tab even when the capability is enabled', () => {
     const content = [
       '[Jump to section](#section)',
       '[Email us](mailto:hello@example.com)',
     ].join('\n\n')
-    render(<MarkdownRenderer content={content} linksOpenInNewTab />)
+    render(
+      <LinksOpenInNewTabCapability.Provider value={true}>
+        <MarkdownRenderer content={content} />
+      </LinksOpenInNewTabCapability.Provider>,
+    )
 
     for (const name of ['Jump to section', 'Email us']) {
       const link = screen.getByRole('link', { name })

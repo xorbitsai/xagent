@@ -3467,6 +3467,14 @@ async def _list_collections_with_retry(
     )
 
 
+def _collection_name_unavailable_detail(collection_name: str) -> str:
+    """Name-conflict wording that does not confirm another tenant owns the name."""
+    return (
+        f"Knowledge base name unavailable: {collection_name}. "
+        "Please choose a different name."
+    )
+
+
 async def _ensure_collection_access(
     collection_name: str,
     user: User,
@@ -3478,7 +3486,9 @@ async def _ensure_collection_access(
 
     Rules:
     - Admin users always pass.
-    - If collection exists but is not visible to current user: raise 403.
+    - If collection exists but is not visible to current user: raise 403, or 409
+      when ``allow_create`` is True (the caller is naming a new collection, so the
+      name is merely taken -- it is not an access violation).
     - If collection does not exist globally: when ``allow_create`` is True, allow
       (first ingest / config for a new collection name); otherwise raise 404, or
       403 when ``hide_missing`` is True.
@@ -3515,6 +3525,14 @@ async def _ensure_collection_access(
             return
         raise HTTPException(
             status_code=404, detail=f"Collection not found: {collection_name}"
+        )
+
+    if allow_create:
+        # The caller wants to create this name, not reach someone else's collection:
+        # that is a naming conflict (409), not an access violation (403).
+        raise HTTPException(
+            status_code=409,
+            detail=_collection_name_unavailable_detail(collection_name),
         )
 
     raise HTTPException(
@@ -7426,8 +7444,8 @@ async def rename_collection_api(
         )
         if any(c.name == safe_new_collection for c in all_named.collections):
             raise HTTPException(
-                status_code=403,
-                detail=f"Access denied for collection: {safe_new_collection}",
+                status_code=409,
+                detail=_collection_name_unavailable_detail(safe_new_collection),
             )
 
     mutation_scope = _resolve_collection_mutation_scope(

@@ -1380,6 +1380,66 @@ async def test_ensure_collection_access_returns_404_when_collection_absent_globa
     assert mock_list.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_ensure_collection_access_returns_409_when_creating_taken_name():
+    """Creating a name another tenant already owns is a conflict, not a denial."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    visible = SimpleNamespace(collections=[])
+    all_collections = SimpleNamespace(collections=[SimpleNamespace(name="test")])
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        side_effect=[visible, all_collections],
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _ensure_collection_access("test", user, allow_create=True)
+
+    detail = str(exc_info.value.detail)
+    assert exc_info.value.status_code == 409
+    assert "Knowledge base name unavailable: test" in detail
+    assert "choose a different name" in detail
+    # Must not accuse the user, nor confirm that someone else owns the name.
+    assert "Access denied" not in detail
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_access_keeps_403_when_reaching_others_collection():
+    """Without allow_create the caller targets an existing collection: still 403."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    visible = SimpleNamespace(collections=[])
+    all_collections = SimpleNamespace(collections=[SimpleNamespace(name="test")])
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        side_effect=[visible, all_collections],
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _ensure_collection_access("test", user, hide_missing=False)
+
+    assert exc_info.value.status_code == 403
+    assert "Access denied for collection: test" in str(exc_info.value.detail)
+
+
 def test_kb_delete_physical_cleanup_failure_preserves_uploaded_file_records(
     test_env, temp_uploads
 ):

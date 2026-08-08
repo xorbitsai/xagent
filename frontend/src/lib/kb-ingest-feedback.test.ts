@@ -8,6 +8,8 @@ import {
 
 const COPY = {
   genericTitle: "上传失败",
+  nameUnavailableTitle: "该知识库名称不可用",
+  nameUnavailableDescription: "请换一个知识库名称后重试。",
   embeddingTitle: "知识库导入失败：未配置可用的嵌入模型",
   embeddingDescription: "请先配置默认嵌入模型，或选择一个可用的嵌入模型后重试。",
   rollbackTitle: "知识库导入失败，清理未完全完成",
@@ -24,6 +26,18 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     expect(result).toEqual({
       title: COPY.embeddingTitle,
       description: COPY.embeddingDescription,
+    })
+  })
+
+  it("maps a taken collection name to actionable copy without leaking the raw detail", () => {
+    const result = getKnowledgeBaseErrorToastContent(
+      "Knowledge base name unavailable: test. Please choose a different name.",
+      COPY
+    )
+
+    expect(result).toEqual({
+      title: COPY.nameUnavailableTitle,
+      description: COPY.nameUnavailableDescription,
     })
   })
 

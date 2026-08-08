@@ -58,6 +58,8 @@ function getKnowledgeBaseToastCopy(
 ) {
   return {
     genericTitle,
+    nameUnavailableTitle: t("kb.errors.nameUnavailable"),
+    nameUnavailableDescription: t("kb.errors.nameUnavailableHint"),
     embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
     embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
     rollbackTitle: t("kb.errors.rollbackFailed"),

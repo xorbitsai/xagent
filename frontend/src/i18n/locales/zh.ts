@@ -1893,6 +1893,8 @@ const zh = {
       multiFileNameRequired: "上传多个文件前，请先填写统一的知识库名称",
       uploadFailedFile: "上传文件失败: {name}",
       uploadFailed: "上传失败",
+      nameUnavailable: "该知识库名称不可用",
+      nameUnavailableHint: "请换一个知识库名称后重试。",
       embeddingModelUnavailable: "知识库导入失败：未配置可用的嵌入模型",
       embeddingModelUnavailableHint: "请先在模型设置中配置默认嵌入模型，或在索引设置中选择一个可用的嵌入模型后重试。",
       rollbackFailed: "知识库导入失败，清理未完全完成",

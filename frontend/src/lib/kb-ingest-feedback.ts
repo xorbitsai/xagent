@@ -1,5 +1,7 @@
 export interface KnowledgeBaseErrorToastCopy {
   genericTitle: string
+  nameUnavailableTitle: string
+  nameUnavailableDescription: string
   embeddingTitle: string
   embeddingDescription: string
   rollbackTitle: string
@@ -131,6 +133,11 @@ function isEmbeddingConfigurationError(message: string): boolean {
   )
 }
 
+/** Backend 409 for a taken collection name (``_collection_name_unavailable_detail``). */
+function isNameUnavailableError(message: string): boolean {
+  return message.includes("Knowledge base name unavailable:")
+}
+
 function isRollbackFailure(message: string): boolean {
   return (
     message.startsWith("Failed to fully roll back ingest") ||
@@ -145,6 +152,13 @@ export function getKnowledgeBaseErrorToastContent(
   const normalized = normalizeMessage(message)
   const originalError = extractOriginalIngestionError(normalized)
   const rootCause = originalError ?? normalized
+
+  if (isNameUnavailableError(rootCause)) {
+    return {
+      title: copy.nameUnavailableTitle,
+      description: copy.nameUnavailableDescription,
+    }
+  }
 
   if (isEmbeddingConfigurationError(rootCause)) {
     return {

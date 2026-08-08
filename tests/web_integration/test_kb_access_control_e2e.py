@@ -105,10 +105,10 @@ class TestKbAccessControlContract:
         assert resp.status_code == 404
         assert "not found" in resp.json()["detail"].lower()
 
-    def test_rename_target_name_taken_by_other_tenant_returns_403(
+    def test_rename_target_name_taken_by_other_tenant_returns_409(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Renaming into a name that exists on another tenant is forbidden."""
+        """Renaming into a taken name is a naming conflict, not an access violation."""
         t1 = _register_and_login(client, "ac_rn_t1", "pw-r1-", "ac_rn_t1@example.com")
         t2 = _register_and_login(client, "ac_rn_t2", "pw-r2-", "ac_rn_t2@example.com")
 
@@ -124,13 +124,14 @@ class TestKbAccessControlContract:
             data={"new_name": coll_b},
             headers={"Authorization": f"Bearer {t1}"},
         )
-        assert resp.status_code == 403
-        assert "Access denied" in resp.json()["detail"]
+        assert resp.status_code == 409
+        assert "name unavailable" in resp.json()["detail"]
+        assert "Access denied" not in resp.json()["detail"]
 
-    def test_documents_check_cross_tenant_returns_403(
+    def test_documents_check_cross_tenant_returns_409(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Duplicate-check on another tenant's collection name is forbidden."""
+        """Duplicate-check names a collection to ingest into: taken name -> 409."""
         t1 = _register_and_login(client, "ac_chk_t1", "pw-c1-", "ac_chk_t1@example.com")
         t2 = _register_and_login(client, "ac_chk_t2", "pw-c2-", "ac_chk_t2@example.com")
 
@@ -143,13 +144,17 @@ class TestKbAccessControlContract:
             json={"filenames": ["any.txt"]},
             headers={"Authorization": f"Bearer {t2}"},
         )
-        assert resp.status_code == 403
-        assert "Access denied" in resp.json()["detail"]
+        assert resp.status_code == 409
+        assert "name unavailable" in resp.json()["detail"]
 
-    def test_save_collection_config_cross_tenant_returns_403(
+    def test_save_collection_config_cross_tenant_returns_409(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Saving config against another tenant's collection name is forbidden."""
+        """Creating a knowledge base under a taken name reports a conflict, not denial.
+
+        Regression for #1139: the create dialog posts config first, so a name owned by
+        another tenant used to surface as "Access denied", accusing an innocent user.
+        """
         t1 = _register_and_login(client, "ac_cfg_t1", "pw-g1-", "ac_cfg_t1@example.com")
         t2 = _register_and_login(client, "ac_cfg_t2", "pw-g2-", "ac_cfg_t2@example.com")
 
@@ -162,5 +167,9 @@ class TestKbAccessControlContract:
             json={"embedding_model_id": "text-embedding-v4"},
             headers={"Authorization": f"Bearer {t2}"},
         )
-        assert resp.status_code == 403
-        assert "Access denied" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        assert resp.status_code == 409
+        assert "name unavailable" in detail
+        assert "Access denied" not in detail
+        # Deliberately vague: never confirm that another tenant owns this name.
+        assert "already exists" not in detail

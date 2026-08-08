@@ -237,3 +237,69 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
     expect(collectionCalls).toHaveLength(1)
   })
 })
+
+describe("KnowledgeBaseDetailContent config save", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    toastErrorMock.mockReset()
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/kb/collections") {
+        return Promise.resolve(
+          createJsonResponse({
+            collections: [
+              {
+                name: "demo",
+                documents: 0,
+                chunks: 0,
+                embeddings: 0,
+                parses: 0,
+                document_names: [],
+              },
+            ],
+          })
+        )
+      }
+      if (url === "http://api.local/api/kb/collections/demo/config") {
+        return Promise.resolve(
+          createJsonResponse(
+            {
+              detail:
+                "Knowledge base name unavailable: demo. Please choose a different name.",
+            },
+            false
+          )
+        )
+      }
+      if (url.startsWith("http://api.local/api/models/")) {
+        return Promise.resolve(createJsonResponse([]))
+      }
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("localizes a name conflict instead of echoing the raw backend detail", async () => {
+    render(<KnowledgeBaseDetailContent collectionName="demo" />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kb.index.saveConfig")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("kb.index.saveConfig"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "kb.errors.nameUnavailable",
+        expect.objectContaining({ description: "kb.errors.nameUnavailableHint" })
+      )
+    })
+  })
+})

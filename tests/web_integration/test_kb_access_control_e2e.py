@@ -150,10 +150,11 @@ class TestKbAccessControlContract:
     def test_save_collection_config_cross_tenant_returns_409(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Creating a knowledge base under a taken name reports a conflict, not denial.
+        """Saving config under a taken name reports a conflict, not a denial.
 
-        Regression for #1139: the create dialog posts config first, so a name owned by
-        another tenant used to surface as "Access denied", accusing an innocent user.
+        The settings panel of an existing knowledge base drives this endpoint, and it
+        passes ``allow_create=True``, so a foreign name used to surface as
+        "Access denied" here too.
         """
         t1 = _register_and_login(client, "ac_cfg_t1", "pw-g1-", "ac_cfg_t1@example.com")
         t2 = _register_and_login(client, "ac_cfg_t2", "pw-g2-", "ac_cfg_t2@example.com")
@@ -172,4 +173,34 @@ class TestKbAccessControlContract:
         assert "name unavailable" in detail
         assert "Access denied" not in detail
         # Deliberately vague: never confirm that another tenant owns this name.
+        assert "already exists" not in detail
+
+    def test_ingest_into_name_taken_by_other_tenant_returns_409(
+        self, client: TestClient, tmp_path: Path
+    ) -> None:
+        """The path from #1139: creating a knowledge base by uploading a file.
+
+        ``POST /api/kb/ingest`` is what the creation dialog calls, so this is the
+        request the reporter actually made when a foreign name accused them of an
+        access violation.
+        """
+        t1 = _register_and_login(client, "ac_ing_t1", "pw-i1-", "ac_ing_t1@example.com")
+        t2 = _register_and_login(client, "ac_ing_t2", "pw-i2-", "ac_ing_t2@example.com")
+
+        coll = "ac_ingest_foreign_coll"
+        sample = _write_sample_txt(tmp_path / "ac_ing.txt")
+        _ingest_txt(client, t1, coll, sample)
+
+        with open(sample, "rb") as handle:
+            resp = client.post(
+                "/api/kb/ingest",
+                files={"file": (sample.name, handle, "text/plain")},
+                data={"collection": coll},
+                headers={"Authorization": f"Bearer {t2}"},
+            )
+
+        detail = resp.json()["detail"]
+        assert resp.status_code == 409
+        assert "name unavailable" in detail
+        assert "Access denied" not in detail
         assert "already exists" not in detail

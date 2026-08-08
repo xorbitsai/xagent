@@ -825,7 +825,16 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       // Redirect to new URL after successful rename
       window.location.href = `/kb/${encodeURIComponent(editCollectionName)}`
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.detail.edit.errors.updateFailed"))
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.edit.errors.updateFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed"))
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsUpdating(false)
     }
@@ -878,7 +887,16 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       // Refresh info to ensure we're in sync
       await fetchCollectionInfo()
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.saveConfigFailed"))
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.errors.saveConfigFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed"))
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsSavingConfig(false)
     }

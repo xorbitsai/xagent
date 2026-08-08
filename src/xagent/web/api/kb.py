@@ -3530,6 +3530,12 @@ async def _ensure_collection_access(
     if allow_create:
         # The caller wants to create this name, not reach someone else's collection:
         # that is a naming conflict (409), not an access violation (403).
+        # NOTE: the existence check above is an unlocked read-then-branch, and it
+        # compares names case-sensitively. Two concurrent creates of the same name
+        # can therefore both pass it and collide in the storage layer instead of
+        # getting a clean 409, and "Test" and "test" count as different names. Both
+        # predate this branch: it makes the message friendlier, it is not an
+        # authoritative uniqueness check.
         raise HTTPException(
             status_code=409,
             detail=_collection_name_unavailable_detail(collection_name),

@@ -693,6 +693,14 @@ describe('MarkdownRenderer', () => {
     expect(image).toHaveAttribute('src', './a.png')
   })
 
+  it('opens ordinary external links in a new tab', () => {
+    render(<MarkdownRenderer content="[Google](https://www.google.com)" />)
+
+    const link = screen.getByRole('link', { name: 'Google' })
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+  })
+
   it('uses authenticated preview fallback for non-uuid file: images', async () => {
     apiRequestMock.mockResolvedValue({ ok: false })
     const content = '![final image](file:output/screenshot.png)'

@@ -405,7 +405,13 @@ function MarkdownLink({
   }
 
   return (
-    <a href={href || undefined} title={presentationTitle || undefined} {...props}>
+    <a
+      href={href || undefined}
+      title={presentationTitle || undefined}
+      target="_blank"
+      rel="noopener noreferrer"
+      {...props}
+    >
       {presentationChildren}
     </a>
   )

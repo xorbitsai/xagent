@@ -1986,10 +1986,7 @@ def get_kb_search_timeout_seconds() -> int:
     worker, so a timed-out search keeps running to completion in the default
     executor. The deadline frees the caller, not the worker. A worker stuck in
     rerank outlives it by that model's own budget (``RerankModelConfig.timeout``,
-    180s by default).
-    # ponytail: that budget is not clamped to this one - clamping means
-    # threading a per-call timeout through SearchConfig into the rerank
-    # adapter. Do it if leaked workers actually starve the executor.
+    180s by default), so it can outlast this deadline threefold.
 
     Priority:
         1. XAGENT_KB_SEARCH_TIMEOUT_SECONDS environment variable
@@ -1998,6 +1995,9 @@ def get_kb_search_timeout_seconds() -> int:
     Returns:
         Per-collection search timeout in seconds
     """
+    # ponytail: the rerank budget is not clamped to this one - clamping means
+    # threading a per-call timeout through SearchConfig into the rerank adapter.
+    # Do it if leaked workers actually starve the executor.
     return _get_positive_int_env(KB_SEARCH_TIMEOUT_SECONDS, 60)
 
 

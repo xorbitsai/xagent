@@ -66,12 +66,18 @@ class DashscopeRerank(BaseRerank):
                 ``model``'s format family.
             top_n: Number of top results to return.
             instruct: Custom instruction for reranking (new-format models).
-            timeout: HTTP request timeout in seconds (default: 60).
+            timeout: HTTP request timeout in seconds. Only direct callers ever
+                hit the 60s fallback: ``create_rerank_adapter`` always passes
+                ``RerankModelConfig.timeout``, whose own default is 180s, so
+                that is the effective timeout in the application.
         """
         self.model = model
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.top_n = top_n
         self.instruct = instruct
+        # Matches XinferenceRerank's fallback rather than ModelConfig's 180s:
+        # the two providers should not disagree on what a bare instantiation
+        # means, and the adapter overrides it in every real code path anyway.
         self.timeout = float(timeout) if timeout is not None else 60.0
         self.url = base_url or _default_url_for(model)
 

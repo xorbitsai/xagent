@@ -45,6 +45,17 @@ def test_dashscope_model_receives_the_configured_timeout():
     assert model.timeout == 7.5
 
 
+def test_dashscope_effective_timeout_is_the_config_default_not_the_fallback():
+    """The adapter always supplies a timeout, so the ctor fallback never wins."""
+    config = _config("dashscope")
+    model = _create_rerank_model(config)
+    assert config.timeout == 180.0
+    assert isinstance(model, DashscopeRerank)
+    assert model.timeout == 180.0
+    # The 60s ctor fallback applies to direct instantiation only.
+    assert DashscopeRerank(api_key="k").timeout == 60.0
+
+
 def test_create_rerank_model_default_provider_is_dashscope():
     # ``RerankModelConfig`` defaults to "dashscope".
     config = RerankModelConfig(

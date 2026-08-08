@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 # Prefix of the serialized READONLY_MODE warning that search_sparse raises
 # unconditionally under readonly=True (see collection_handle.search_sparse).
+# Matched against the string, not SearchWarning.code: the pipeline flattens
+# warnings to f"{code}: {message}" in _serialize_warnings before they reach us,
+# and the structured object is not plumbed this far. Change that format and this
+# filter silently stops matching - the readonly notice reappears in summaries,
+# which the readonly tests in test_document_search_collection_concurrency catch.
 _READONLY_WARNING_PREFIX = "READONLY_MODE:"
 
 if TYPE_CHECKING:
@@ -348,10 +353,22 @@ async def _search_knowledge_base_impl(
             "top_k": tool_args.top_k,
             "min_score": tool_args.min_score,
             "merge_results": True,
-            # Retrieval must not build indexes: create_index() commits to the
+            # Retrieval must not *build indexes*: create_index() commits to the
             # LanceDB table, and searching collections concurrently can now race
             # that commit (see collection_manager's CommitConflict note).
             # Indexes are built during ingestion, which is where they belong.
+            #
+            # This suppresses both index paths, not just FTS: the readonly branch
+            # of create_index returns before the dense/vector block and before the
+            # FTS block (lancedb_stores.py). Only the sparse path reports it
+            # (READONLY_MODE / FTS_INDEX_MISSING) - dense search hardcodes
+            # warnings=[] on success, so a skipped dense index build is silent.
+            #
+            # Not a claim that the search writes nothing: resolving the embedding
+            # model still stamps last_accessed_at per collection
+            # (collection_manager.mark_collection_accessed). That row-overwrite is
+            # pre-existing and guarded by a per-collection lock, so the N
+            # concurrent searches this fan-out creates land on N distinct keys.
             "readonly": True,
         }
 
@@ -373,32 +390,40 @@ async def _search_knowledge_base_impl(
             Returns (results, error, warning, documents_searched); failures are
             returned rather than raised so one collection cannot fail the batch.
             """
-            collection_name = collection_info.name
+            # Every attribute read lives inside the try below, so this really
+            # cannot raise into the gather. _failure reads the name lazily, so
+            # it stays usable even if that first read is what failed.
+            collection_name = "<unknown>"
 
             def _failure(
                 reason: str,
             ) -> tuple[list[Dict[str, Any]], Optional[str], Optional[str], int]:
                 return [], f"{collection_name}: {reason}", None, 0
 
-            # Per-KB rerank resolution: explicit tool arg wins, otherwise
-            # use the collection's bound rerank_model_id; when neither is
-            # set, no rerank stage is added for this collection.
-            search_config = dict(base_search_config)
-            collection_rerank = getattr(collection_info, "rerank_model_id", None)
-            effective_rerank = tool_args.rerank_model_id or collection_rerank
-            if effective_rerank:
-                search_config["rerank_model_id"] = effective_rerank
-            storage_user_id = getattr(collection_info, "storage_user_id", None)
-
             try:
+                collection_name = collection_info.name
+
+                # Per-KB rerank resolution: explicit tool arg wins, otherwise
+                # use the collection's bound rerank_model_id; when neither is
+                # set, no rerank stage is added for this collection.
+                search_config = dict(base_search_config)
+                collection_rerank = getattr(collection_info, "rerank_model_id", None)
+                effective_rerank = tool_args.rerank_model_id or collection_rerank
+                if effective_rerank:
+                    search_config["rerank_model_id"] = effective_rerank
+                storage_user_id = getattr(collection_info, "storage_user_id", None)
+
                 logger.info(
                     f"Searching collection '{collection_name}' for: {tool_args.query}"
                 )
 
                 # run_document_search is a blocking sync pipeline; running it
                 # inline would pin the event loop for the whole retrieval.
-                # The deadline frees this caller but not the worker: a timed-out
-                # to_thread call keeps running in the shared default executor.
+                # The deadline covers queueing too, not just execution: it starts
+                # when this coroutine is scheduled, so a saturated default
+                # executor can burn it before run_document_search even starts.
+                # And it frees this caller but not the worker - a timed-out
+                # to_thread call keeps running in that shared executor.
                 result = await asyncio.wait_for(
                     asyncio.to_thread(
                         run_document_search,
@@ -474,8 +499,14 @@ async def _search_knowledge_base_impl(
         # Search every collection concurrently: total latency is bounded by the
         # slowest collection instead of the sum of all of them. gather preserves
         # input order, so aggregation order is unchanged.
-        # ponytail: no concurrency cap - an agent binds a handful of KBs; add a
-        # Semaphore if that ever stops being true.
+        # ponytail: no concurrency cap. Holds for the bound-KB paths above, where
+        # the agent's own configuration is the bound. It does NOT hold for the
+        # final fallback branch: with neither `collections` nor
+        # `allowed_collections` set, this fans out over every collection visible
+        # to the caller, which _list_visible_collections unions across owners -
+        # unbounded by anything the agent declared. Add a Semaphore when that
+        # branch gets real traffic, or when fan-out width starves the shared
+        # default executor that every asyncio.to_thread caller draws from.
         for results, error, warning, documents in await asyncio.gather(
             *(_search_one(collection_info) for collection_info in searchable)
         ):

@@ -311,6 +311,48 @@ async def test_warnings_survive_when_no_collection_returns_results(
 
 
 @pytest.mark.asyncio
+async def test_a_broken_collection_object_cannot_escape_into_the_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_search_one promises never to raise, including on its attribute reads.
+
+    gather() has no return_exceptions, so an attribute read that escaped would
+    abort the whole batch and leave the sibling tasks running uncancelled.
+    """
+
+    class _Exploding:
+        name = "broken"
+        embeddings = 5
+        documents = 3
+
+        @property
+        def rerank_model_id(self) -> str:
+            # getattr's default only swallows AttributeError, not this.
+            raise RuntimeError("rerank binding is corrupt")
+
+    async def _list(
+        user_id: int | None = None, is_admin: bool = False
+    ) -> ListCollectionsResult:
+        del user_id, is_admin
+        listing = _collections("alpha")
+        listing.collections.append(_Exploding())  # type: ignore[arg-type]
+        return listing
+
+    monkeypatch.setattr(document_search, "_list_visible_collections", _list)
+    monkeypatch.setattr(
+        document_search,
+        "run_document_search",
+        lambda *, collection, **_kwargs: _pipeline_result(collection),
+    )
+
+    result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
+
+    # The healthy sibling still returns; the broken one degrades to an error.
+    assert [entry.collection for entry in result.results] == ["alpha"]
+    assert "broken: rerank binding is corrupt" in result.summary
+
+
+@pytest.mark.asyncio
 async def test_a_stuck_collection_times_out_without_holding_the_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

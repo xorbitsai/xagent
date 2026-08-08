@@ -13,6 +13,10 @@ from .RAG_tools.pipelines.document_search import run_document_search
 
 logger = logging.getLogger(__name__)
 
+# Prefix of the serialized READONLY_MODE warning that search_sparse raises
+# unconditionally under readonly=True (see collection_handle.search_sparse).
+_READONLY_WARNING_PREFIX = "READONLY_MODE:"
+
 if TYPE_CHECKING:
     from .RAG_tools.kb import KBToolCompatibilityFacade
 
@@ -371,6 +375,11 @@ async def _search_knowledge_base_impl(
             """
             collection_name = collection_info.name
 
+            def _failure(
+                reason: str,
+            ) -> tuple[list[Dict[str, Any]], Optional[str], Optional[str], int]:
+                return [], f"{collection_name}: {reason}", None, 0
+
             # Per-KB rerank resolution: explicit tool arg wins, otherwise
             # use the collection's bound rerank_model_id; when neither is
             # set, no rerank stage is added for this collection.
@@ -414,18 +423,22 @@ async def _search_knowledge_base_impl(
                         collection_name,
                         error_message,
                     )
-                    return (
-                        [],
-                        f"{collection_name}: {error_message or 'search failed'}",
-                        None,
-                        0,
-                    )
+                    return _failure(f"{error_message or 'search failed'}")
 
+                # The pipeline's message on a non-success status is boilerplate
+                # ("Hybrid search completed with warnings"), so the warning list
+                # has to win or every real diagnostic is masked by it. The
+                # readonly notice is self-inflicted by our own readonly=True and
+                # fires on every search; FTS_INDEX_MISSING, the warning that
+                # reports an actual consequence of it, is kept.
                 warning: Optional[str] = None
-                if result.status != "success" or result.warnings:
-                    warning_message = result.message or "; ".join(result.warnings)
-                    if warning_message:
-                        warning = f"{collection_name}: {warning_message}"
+                warning_message = "; ".join(
+                    w
+                    for w in result.warnings
+                    if not w.startswith(_READONLY_WARNING_PREFIX)
+                )
+                if warning_message:
+                    warning = f"{collection_name}: {warning_message}"
 
                 if not result.results:
                     return [], None, warning, 0
@@ -443,16 +456,10 @@ async def _search_knowledge_base_impl(
                     collection_name,
                     search_timeout_seconds,
                 )
-                return (
-                    [],
-                    f"{collection_name}: search timed out after "
-                    f"{search_timeout_seconds}s",
-                    None,
-                    0,
-                )
+                return _failure(f"search timed out after {search_timeout_seconds}s")
             except Exception as e:
                 logger.warning(f"Failed to search collection '{collection_name}': {e}")
-                return [], f"{collection_name}: {e}", None, 0
+                return _failure(str(e))
 
         # Skip collections with no embeddings before fanning out.
         searchable = []

@@ -149,9 +149,11 @@ async def test_one_failing_collection_does_not_drop_the_others(
     result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
 
     assert [entry.collection for entry in result.results] == ["alpha", "warned"]
-    assert "boom: connection reset" in result.summary
-    assert "status_error: nope" in result.summary
-    assert "warned: fell back to sparse" in result.summary
+    # Split the sections apart so a failure cannot pass as a mere warning.
+    warnings_section, errors_section = result.summary.split("\n\nErrors: ")
+    warnings_section = warnings_section.split("\n\nWarnings: ")[1]
+    assert errors_section == "boom: connection reset | status_error: nope"
+    assert warnings_section == "warned: fell back to sparse"
 
 
 @pytest.mark.asyncio
@@ -227,6 +229,59 @@ async def test_all_collections_failing_returns_the_errors_only_summary(
     assert "alpha: alpha is down" in result.summary
     assert "beta: beta is down" in result.summary
     assert "No relevant documents found" not in result.summary
+
+
+@pytest.mark.asyncio
+async def test_real_warnings_are_not_masked_by_the_boilerplate_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """readonly=True makes every hybrid search partial_success with a generic
+    message; the actual diagnostics must still reach the summary."""
+    _install_collections(monkeypatch, "alpha")
+
+    def search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
+        return _pipeline_result(
+            collection,
+            status="partial_success",
+            # Exactly what the hybrid pipeline sets alongside its warnings.
+            message="Hybrid search completed with warnings",
+            warnings=[
+                "READONLY_MODE: Readonly mode enabled for sparse search on model.",
+                "FTS_INDEX_MISSING: FTS index not found on 'text' column for model.",
+            ],
+        )
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
+
+    assert "alpha: FTS_INDEX_MISSING" in result.summary
+    assert "Hybrid search completed with warnings" not in result.summary
+    # Our own readonly flag is not a diagnostic worth showing the agent.
+    assert "READONLY_MODE" not in result.summary
+
+
+@pytest.mark.asyncio
+async def test_the_self_inflicted_readonly_notice_produces_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean readonly search must not decorate its summary with a warning."""
+    _install_collections(monkeypatch, "alpha")
+
+    def search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
+        return _pipeline_result(
+            collection,
+            status="partial_success",
+            message="Hybrid search completed with warnings",
+            warnings=["READONLY_MODE: Readonly mode enabled for sparse search."],
+        )
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
+
+    assert len(result.results) == 1
+    assert "Warnings:" not in result.summary
 
 
 @pytest.mark.asyncio

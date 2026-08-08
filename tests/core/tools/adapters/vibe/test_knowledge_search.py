@@ -801,7 +801,9 @@ class TestKnowledgeSearchTool:
         assert "Knowledge base search failed" not in result.summary
         assert "No relevant documents found" in result.summary
         assert "Warnings:" in result.summary
-        assert "Hybrid search completed with warnings" in result.summary
+        # The pipeline message is boilerplate; the warning list is the diagnostic.
+        assert "kb1: FTS fallback used" in result.summary
+        assert "Hybrid search completed with warnings" not in result.summary
 
     @pytest.mark.asyncio
     async def test_search_partial_success_with_results_keeps_results_and_warning(
@@ -858,7 +860,9 @@ class TestKnowledgeSearchTool:
         assert result.results
         assert result.results[0].text == "Recovered result"
         assert "Warnings:" in result.summary
-        assert "Hybrid search completed with warnings" in result.summary
+        # The pipeline message is boilerplate; the warning list is the diagnostic.
+        assert "kb1: FTS fallback used" in result.summary
+        assert "Hybrid search completed with warnings" not in result.summary
         assert "Knowledge base search failed" not in result.summary
 
     @pytest.mark.asyncio

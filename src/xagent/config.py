@@ -1979,12 +1979,17 @@ def get_kb_search_timeout_seconds() -> int:
     long as it runs; without a deadline an agent bound to N knowledge bases can
     pin N workers indefinitely. The default is generous because the budget has
     to cover embedding the query, the LanceDB scan and an optional rerank round
-    trip - the rerank HTTP client has no timeout of its own.
+    trip.
 
     Known limitation, same as the collection listing endpoint: cancelling the
     ``asyncio.wait_for`` coroutine does not stop the underlying ``to_thread``
     worker, so a timed-out search keeps running to completion in the default
-    executor. The deadline frees the caller, not the worker.
+    executor. The deadline frees the caller, not the worker. A worker stuck in
+    rerank outlives it by that model's own budget (``RerankModelConfig.timeout``,
+    180s by default).
+    # ponytail: that budget is not clamped to this one - clamping means
+    # threading a per-call timeout through SearchConfig into the rerank
+    # adapter. Do it if leaked workers actually starve the executor.
 
     Priority:
         1. XAGENT_KB_SEARCH_TIMEOUT_SECONDS environment variable

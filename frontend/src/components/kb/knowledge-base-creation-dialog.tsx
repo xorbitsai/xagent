@@ -489,7 +489,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         getKnowledgeBaseToastCopy(t, t("kb.errors.uploadFailed")),
         // Creating a knowledge base: the ingest endpoints answer 409 only when the
         // chosen name is already taken.
-        { status: failedStatus, conflict: "name-taken" }
+        { status: failedStatus, nameEntry: "user-entered" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -622,7 +622,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.errors.webIngestFailed")),
-        { status: failedStatus, conflict: "name-taken" }
+        { status: failedStatus, nameEntry: "user-entered" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -751,7 +751,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           t,
           t("kb.errors.cloudIngestFailed")
         ),
-        { status: failedStatus, conflict: "name-taken" }
+        { status: failedStatus, nameEntry: "user-entered" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

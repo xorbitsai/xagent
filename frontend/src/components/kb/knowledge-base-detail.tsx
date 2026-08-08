@@ -411,6 +411,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     if (selectedFiles.length === 0) return
 
     setIsUploading(true)
+    let failedStatus: number | undefined
     setUploadProgress(0)
     setUploadProgressDetail(null)
     setIngestionResults([])
@@ -443,6 +444,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         const parsed = await parseApiResponse(response)
 
         if (!response.ok) {
+          failedStatus = response.status
           const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
           if (errorData.status === 'error') {
             setIngestionResults(prev => [
@@ -529,9 +531,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric")),
-        // Ingest targets a collection this user already owns, so a 409 here is
-        // never about the name.
-        { conflict: "opaque" }
+        { status: failedStatus, nameEntry: "none" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -601,6 +601,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
 
     setIsWebIngesting(true)
+    let failedStatus: number | undefined
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
 
@@ -649,6 +650,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       setWebIngestionProgress(50)
 
       if (!response.ok) {
+        failedStatus = response.status
         const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
         if (errorData.status === 'error') {
           setWebIngestionResult(errorData as unknown as WebIngestionResult)
@@ -728,7 +730,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed")),
-        { conflict: "opaque" }
+        { status: failedStatus, nameEntry: "none" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -842,7 +844,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         // Rename answers 409 for a taken name, a colliding storage directory and
         // lock contention alike, and those details name internal users and paths.
         // Neutral copy is the only safe reading of an ambiguous conflict.
-        { status: failedStatus, conflict: "opaque" }
+        { status: failedStatus, nameEntry: "none" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -911,7 +913,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed")),
         // The settings panel has no name field: a 409 means this collection is no
         // longer visible to the user, not that they just typed a taken name.
-        { status: failedStatus, conflict: "opaque" }
+        { status: failedStatus, nameEntry: "none" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

@@ -11,20 +11,27 @@ export interface KnowledgeBaseErrorToastCopy {
 }
 
 /**
- * What a 409 from the endpoint the caller just used actually means.
+ * Whether the screen that triggered the request has a name field the user just
+ * filled in.
  *
- * The backend answers 409 for several unrelated situations (a taken name, a
- * colliding storage directory, lock contention) and only the caller knows which
- * of them its endpoint can produce, so it has to say. ``"opaque"`` is always
- * safe: it yields a neutral message.
+ * This is a question about the **UI**, not about the endpoint: the same endpoint
+ * is `"user-entered"` from the creation dialog and `"none"` from a knowledge
+ * base's own pages. It decides what a 409 may advise. Telling someone to "pick
+ * another name" is only actionable where a name was actually typed; everywhere
+ * else the honest answer is that the knowledge base changed under them.
+ *
+ * When in doubt use `"none"`: it yields neutral copy and can never mislead.
  */
-export type KnowledgeBaseConflictKind = "name-taken" | "opaque"
+export type KnowledgeBaseNameEntry = "user-entered" | "none"
 
 export interface KnowledgeBaseErrorSource {
-  /** HTTP status of the failed response, when the failure came from one. */
+  /**
+   * HTTP status of the failed response. Required to recognise a 409 at all, so
+   * a call site that inspects `response.ok` must pass `response.status` too.
+   */
   status?: number
   /** Required so a new call site cannot silently inherit the wrong copy. */
-  conflict: KnowledgeBaseConflictKind
+  nameEntry: KnowledgeBaseNameEntry
 }
 
 export interface KnowledgeBaseErrorToastContent {
@@ -172,7 +179,7 @@ export function getKnowledgeBaseErrorToastContent(
   // to put the backend's own sentence in front of the user. Classifying on the
   // status also keeps this independent of the backend's English wording.
   if (source.status === 409) {
-    return source.conflict === "name-taken"
+    return source.nameEntry === "user-entered"
       ? {
           title: copy.nameUnavailableTitle,
           description: copy.nameUnavailableDescription,

@@ -10,8 +10,8 @@ const COPY = {
   genericTitle: "上传失败",
   nameUnavailableTitle: "该知识库名称不可用",
   nameUnavailableDescription: "请换一个知识库名称后重试。",
-  conflictTitle: "操作与当前状态冲突",
-  conflictDescription: "该知识库正被其他操作占用或状态已变化，请稍后重试。",
+  conflictTitle: "该知识库的状态已变化",
+  conflictDescription: "请刷新页面后重试；若仍然失败，该名称可能已归他人所有。",
   embeddingTitle: "知识库导入失败：未配置可用的嵌入模型",
   embeddingDescription: "请先配置默认嵌入模型，或选择一个可用的嵌入模型后重试。",
   rollbackTitle: "知识库导入失败，清理未完全完成",
@@ -23,7 +23,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
       COPY,
-      { conflict: "name-taken" }
+      { nameEntry: "user-entered" }
     )
 
     expect(result).toEqual({
@@ -36,7 +36,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test. Please choose a different name.",
       COPY,
-      { status: 409, conflict: "name-taken" }
+      { status: 409, nameEntry: "user-entered" }
     )
 
     expect(result).toEqual({
@@ -49,7 +49,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "some entirely different sentence the backend may switch to",
       COPY,
-      { status: 409, conflict: "name-taken" }
+      { status: 409, nameEntry: "user-entered" }
     )
 
     expect(result).toEqual({
@@ -62,7 +62,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test. Please choose a different name.",
       COPY,
-      { status: 500, conflict: "name-taken" }
+      { status: 500, nameEntry: "user-entered" }
     )
 
     expect(result.title).toBe(COPY.genericTitle)
@@ -76,7 +76,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
       + "for user_3. A collection named 'x' already has physical files."
     const result = getKnowledgeBaseErrorToastContent(leaky, COPY, {
       status: 409,
-      conflict: "opaque",
+      nameEntry: "none",
     })
 
     expect(result).toEqual({
@@ -91,18 +91,17 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: demo. Please choose a different name.",
       COPY,
-      { status: 409, conflict: "opaque" }
+      { status: 409, nameEntry: "none" }
     )
 
     expect(result.title).toBe(COPY.conflictTitle)
-    expect(result.title).not.toBe(COPY.nameUnavailableTitle)
   })
 
   it("keeps rollback toasts concise while preserving rollback context", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Failed to fully roll back ingest for demo/file.txt: delete failed. Original ingestion error: Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
       COPY,
-      { conflict: "name-taken" }
+      { nameEntry: "user-entered" }
     )
 
     expect(result).toEqual({
@@ -115,7 +114,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "A very long upload failure happened while processing the document and there are many more technical details that should not become the toast title for end users.",
       COPY,
-      { conflict: "name-taken" }
+      { nameEntry: "user-entered" }
     )
 
     expect(result.title).toBe(COPY.genericTitle)

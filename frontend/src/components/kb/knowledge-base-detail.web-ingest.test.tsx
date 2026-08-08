@@ -236,6 +236,54 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
     const collectionCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/collections")
     expect(collectionCalls).toHaveLength(1)
   })
+
+  it("shows neutral copy for a 409 instead of the backend sentence", async () => {
+    // A collection can drop out of the caller's own listing while still existing
+    // globally, and then this endpoint answers 409 even though the user never
+    // typed a name here.
+    const previous = apiRequestMock.getMockImplementation()!
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/kb/ingest-web/jobs") {
+        return Promise.resolve(
+          createJsonResponse(
+            {
+              detail:
+                "Knowledge base name unavailable: demo. Please choose a different name.",
+            },
+            false,
+            409
+          )
+        )
+      }
+      return previous(url, options)
+    })
+
+    render(<KnowledgeBaseDetailContent collectionName="demo" />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kb.detail.files.addSource")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("kb.detail.files.addSource"))
+    fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
+    fireEvent.change(screen.getByLabelText("kb.dialog.webImport.basic.startUrl *"), {
+      target: { value: "https://example.com/docs" },
+    })
+    fireEvent.click(screen.getByText("kb.index.startImport"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "kb.errors.conflict",
+        expect.objectContaining({ description: "kb.errors.conflictHint" })
+      )
+    })
+
+    // This page has no name field, so the rename advice would be useless, and
+    // the backend sentence must not reach the user either way.
+    const shown = JSON.stringify(toastErrorMock.mock.calls)
+    expect(shown).not.toContain("Please choose a different name")
+    expect(shown).not.toContain("kb.errors.nameUnavailable")
+  })
 })
 
 describe("KnowledgeBaseDetailContent config save", () => {

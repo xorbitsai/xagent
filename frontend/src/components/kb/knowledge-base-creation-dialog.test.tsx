@@ -239,7 +239,13 @@ async function expectNameRejected(container: HTMLElement) {
 
   // Step 1 is the only step rendering the name field, so its presence proves
   // the guard moved the user back to where the problem can be fixed.
-  expect(container.querySelector("#collection_name")).not.toBeNull()
+  const nameInput = container.querySelector("#collection_name")
+  expect(nameInput).not.toBeNull()
+
+  // A toast alone leaves a screen reader with nothing at the field itself.
+  expect(nameInput?.getAttribute("aria-invalid")).toBe("true")
+  expect(screen.getByText("kb.errors.nameRequired")).toBeInTheDocument()
+  expect(nameInput?.getAttribute("aria-describedby")).toBe("collection_name_error")
 
   expect(
     apiRequestMock.mock.calls.filter(([url]) => String(url).includes("/api/kb/ingest"))
@@ -282,6 +288,23 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
     fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await expectNameRejected(container)
+  })
+
+  it("clears the name error once the user starts typing", async () => {
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    await goToStep3(container, "file")
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+    await expectNameRejected(container)
+
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "t" },
+    })
+
+    expect(container.querySelector("#collection_name")?.getAttribute("aria-invalid")).toBe("false")
+    expect(screen.queryByText("kb.errors.nameRequired")).toBeNull()
   })
 
   it("rejects an empty collection name for multiple file uploads", async () => {

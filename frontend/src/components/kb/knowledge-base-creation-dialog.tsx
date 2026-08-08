@@ -173,6 +173,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
   // Embedding models state
   const [embeddingModels, setEmbeddingModels] = useState<Model[]>([])
   const trimmedCollectionName = newCollectionName.trim()
+  // Flag only: the message itself stays in i18n so it follows a language switch.
+  const [nameError, setNameError] = useState(false)
 
   useEffect(() => {
     if (open) {
@@ -771,11 +773,21 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                   <Input
                     id="collection_name"
                     value={newCollectionName}
-                    onChange={(e) => setNewCollectionName(e.target.value)}
+                    onChange={(e) => {
+                      setNewCollectionName(e.target.value)
+                      setNameError(false)
+                    }}
                     placeholder={t("kb.dialog.basicInfo.namePlaceholder")}
                     className="mt-1.5"
                     aria-required="true"
+                    aria-invalid={nameError}
+                    aria-describedby={nameError ? "collection_name_error" : undefined}
                   />
+                  {nameError && (
+                    <p id="collection_name_error" className="mt-2 text-sm text-destructive">
+                      {t("kb.errors.nameRequired")}
+                    </p>
+                  )}
                 </div>
                 <div>
                   <Label htmlFor="collection_description" className="text-sm font-medium">{t("kb.dialog.basicInfo.descriptionLabel")} {t("common.optional")}</Label>
@@ -1268,6 +1280,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                     // the backend never has to reject a silently derived one.
                     if (!trimmedCollectionName) {
                       toast.error(t("kb.errors.nameRequired"))
+                      setNameError(true)
                       setCurrentStep(1)
                       return
                     }

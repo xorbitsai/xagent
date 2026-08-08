@@ -1887,7 +1887,7 @@ const zh = {
     },
     errors: {
       loadFailed: "知识库加载失败",
-      nameRequired: "请输入知识库名称",
+      nameRequired: "知识库名称不能为空",
       createFailed: "创建知识库失败",
       uploadFileRequired: "请选择要上传的文件",
       uploadFailedFile: "上传文件失败: {name}",

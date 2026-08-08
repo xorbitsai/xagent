@@ -1380,6 +1380,23 @@ async def test_ensure_collection_access_returns_404_when_collection_absent_globa
     assert mock_list.await_count == 2
 
 
+def test_rename_collision_detail_keeps_the_owner_id_out_of_the_response():
+    """The caller of a rename need not be the user who owns the colliding files.
+
+    Regression guard: this detail is shown verbatim in the UI, so leaking the
+    owning account's internal id here would expose it to another tenant.
+    """
+    import re
+
+    from xagent.web.api.kb import _rename_target_has_files_detail
+
+    detail = _rename_target_has_files_detail("docs")
+
+    assert "docs" in detail
+    assert not re.search(r"user_\d", detail)
+    assert "user_" not in detail
+
+
 @pytest.mark.asyncio
 async def test_ensure_collection_access_returns_409_when_creating_taken_name():
     """Creating a name another tenant already owns is a conflict, not a denial."""
@@ -1956,8 +1973,12 @@ def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads):
             f"Expected 409, got {response.status_code}: {response.text}"
         )
         detail = response.json()["detail"]
-        assert "already exists" in detail or "in progress" in detail, (
+        assert "already has stored files" in detail or "in progress" in detail, (
             f"Expected conflict error, got: {detail}"
+        )
+        # The colliding files may belong to another account: never name it here.
+        assert "user_" not in detail, (
+            f"Rename conflict leaked an internal account id: {detail}"
         )
 
 

@@ -12,11 +12,13 @@ vi.mock("@/lib/api-wrapper", () => ({
     text: null,
     isHtml: false,
   }),
+  // Mirrors api-wrapper.ts: detail wins over message. Getting this backwards
+  // silently drops the backend sentence and makes assertions about it vacuous.
   getUploadErrorMessage: (
     _response: unknown,
-    parsed: { data?: { message?: string } | null },
+    parsed: { data?: { detail?: string; message?: string } | null },
     messages: { generic: string }
-  ) => parsed?.data?.message || messages.generic,
+  ) => parsed?.data?.detail || parsed?.data?.message || messages.generic,
   isJsonRecord: (value: unknown) => typeof value === "object" && value !== null && !Array.isArray(value),
   UPLOAD_ERROR_MESSAGES: {},
 }))
@@ -237,7 +239,7 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
     expect(collectionCalls).toHaveLength(1)
   })
 
-  it("shows neutral copy for a 409 instead of the backend sentence", async () => {
+  it("relays the backend verdict for a 409 instead of rename advice", async () => {
     // A collection can drop out of the caller's own listing while still existing
     // globally, and then this endpoint answers 409 even though the user never
     // typed a name here.
@@ -271,18 +273,22 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
     })
     fireEvent.click(screen.getByText("kb.index.startImport"))
 
+    // This page has no name field, so "pick another name" would be useless
+    // advice; the accurate backend sentence is shown instead.
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "kb.errors.conflict",
-        expect.objectContaining({ description: "kb.errors.conflictHint" })
+        "kb.detail.errors.webImportFailed",
+        expect.objectContaining({
+          description:
+            "Knowledge base name unavailable: demo. Please choose a different name.",
+        })
       )
     })
 
-    // This page has no name field, so the rename advice would be useless, and
-    // the backend sentence must not reach the user either way.
-    const shown = JSON.stringify(toastErrorMock.mock.calls)
-    expect(shown).not.toContain("Please choose a different name")
-    expect(shown).not.toContain("kb.errors.nameUnavailable")
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      "kb.errors.nameUnavailable",
+      expect.anything()
+    )
   })
 })
 
@@ -335,7 +341,7 @@ describe("KnowledgeBaseDetailContent config save", () => {
     cleanup()
   })
 
-  it("shows neutral localized copy for a conflict, never the backend detail", async () => {
+  it("relays the backend verdict for a conflict instead of rename advice", async () => {
     render(<KnowledgeBaseDetailContent collectionName="demo" />)
 
     await waitFor(() => {
@@ -344,19 +350,21 @@ describe("KnowledgeBaseDetailContent config save", () => {
 
     fireEvent.click(screen.getByText("kb.index.saveConfig"))
 
+    // The settings panel has no name field either: the 409 really means this
+    // collection is no longer visible to the caller.
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "kb.errors.conflict",
-        expect.objectContaining({ description: "kb.errors.conflictHint" })
+        "kb.detail.errors.saveConfigFailed",
+        expect.objectContaining({
+          description:
+            "Knowledge base name unavailable: demo. Please choose a different name.",
+        })
       )
     })
 
-    // The settings panel has no name field, so "choose another name" would be
-    // useless advice here, and the backend sentence must not reach the user.
     expect(toastErrorMock).not.toHaveBeenCalledWith(
       "kb.errors.nameUnavailable",
       expect.anything()
     )
-    expect(JSON.stringify(toastErrorMock.mock.calls)).not.toContain("demo. Please choose")
   })
 })

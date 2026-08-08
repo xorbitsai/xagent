@@ -2,8 +2,6 @@ export interface KnowledgeBaseErrorToastCopy {
   genericTitle: string
   nameUnavailableTitle: string
   nameUnavailableDescription: string
-  conflictTitle: string
-  conflictDescription: string
   embeddingTitle: string
   embeddingDescription: string
   rollbackTitle: string
@@ -11,27 +9,29 @@ export interface KnowledgeBaseErrorToastCopy {
 }
 
 /**
- * Whether the screen that triggered the request has a name field the user just
- * filled in.
+ * Whether a 409 from this request is allowed to tell the user to pick another
+ * name.
  *
- * This is a question about the **UI**, not about the endpoint: the same endpoint
- * is `"user-entered"` from the creation dialog and `"none"` from a knowledge
- * base's own pages. It decides what a 409 may advise. Telling someone to "pick
- * another name" is only actionable where a name was actually typed; everywhere
- * else the honest answer is that the knowledge base changed under them.
+ * This states the **conclusion**, not the premise, because no single premise
+ * survives every call site: the rename dialog has a name field yet its 409 also
+ * covers storage collisions and lock contention, so "did the user type a name"
+ * cannot be answered usefully there.
  *
- * When in doubt use `"none"`: it yields neutral copy and can never mislead.
+ * Answer `"advise-rename"` only where a 409 has exactly one possible cause --
+ * the name just entered is taken. Everywhere else answer `"neutral"`, and the
+ * backend's own message is shown instead, which stays accurate whichever cause
+ * actually fired. `"neutral"` is always the safe answer.
  */
-export type KnowledgeBaseNameEntry = "user-entered" | "none"
+export type KnowledgeBaseConflictAdvice = "advise-rename" | "neutral"
 
 export interface KnowledgeBaseErrorSource {
   /**
-   * HTTP status of the failed response. Required to recognise a 409 at all, so
-   * a call site that inspects `response.ok` must pass `response.status` too.
+   * HTTP status of the failed response, or ``undefined`` when the failure did
+   * not come from one. Required rather than optional so a call site that checks
+   * ``response.ok`` cannot forget to pass ``response.status`` with it.
    */
-  status?: number
-  /** Required so a new call site cannot silently inherit the wrong copy. */
-  nameEntry: KnowledgeBaseNameEntry
+  status: number | undefined
+  conflictAdvice: KnowledgeBaseConflictAdvice
 }
 
 export interface KnowledgeBaseErrorToastContent {
@@ -175,16 +175,14 @@ export function getKnowledgeBaseErrorToastContent(
   const originalError = extractOriginalIngestionError(normalized)
   const rootCause = originalError ?? normalized
 
-  // Conflict details name internal users and storage paths, so a 409 never gets
-  // to put the backend's own sentence in front of the user. Classifying on the
-  // status also keeps this independent of the backend's English wording.
-  if (source.status === 409) {
-    return source.nameEntry === "user-entered"
-      ? {
-          title: copy.nameUnavailableTitle,
-          description: copy.nameUnavailableDescription,
-        }
-      : { title: copy.conflictTitle, description: copy.conflictDescription }
+  // Classifying on the status keeps this independent of the backend's English
+  // wording. A "neutral" 409 falls through and shows the backend's own message:
+  // inventing one sentence for every conflict cause would misstate most of them.
+  if (source.status === 409 && source.conflictAdvice === "advise-rename") {
+    return {
+      title: copy.nameUnavailableTitle,
+      description: copy.nameUnavailableDescription,
+    }
   }
 
   if (isEmbeddingConfigurationError(rootCause)) {

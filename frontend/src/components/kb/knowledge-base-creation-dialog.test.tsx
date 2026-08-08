@@ -13,11 +13,13 @@ vi.mock("@/lib/api-wrapper", () => ({
     text: null,
     isHtml: false,
   }),
+  // Mirrors api-wrapper.ts: detail wins over message. Getting this backwards
+  // silently drops the backend sentence and makes assertions about it vacuous.
   getUploadErrorMessage: (
     _response: unknown,
-    parsed: { data?: { message?: string } | null },
+    parsed: { data?: { detail?: string; message?: string } | null },
     messages: { generic: string }
-  ) => parsed?.data?.message || messages.generic,
+  ) => parsed?.data?.detail || parsed?.data?.message || messages.generic,
   isJsonRecord: (value: unknown) => typeof value === "object" && value !== null && !Array.isArray(value),
   UPLOAD_ERROR_MESSAGES: {},
 }))
@@ -142,10 +144,10 @@ vi.mock("./cloud-connect-dialog", () => ({
 
 import { KnowledgeBaseCreationDialog } from "./knowledge-base-creation-dialog"
 
-function createJsonResponse(body: unknown, ok = true) {
+function createJsonResponse(body: unknown, ok = true, status?: number) {
   return {
     ok,
-    status: ok ? 200 : 500,
+    status: status ?? (ok ? 200 : 500),
     json: vi.fn().mockResolvedValue(body),
   }
 }
@@ -271,6 +273,63 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     await waitFor(() => {
       expect(onSuccess).toHaveBeenCalledWith(["team-docs", "team-docs"])
     })
+  })
+
+  it("advises picking another name when the entered one is taken", async () => {
+    // The reported #1139 path: this is the only screen where the user typed the
+    // name, so it is the only one allowed to tell them to change it.
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=embedding") {
+        return Promise.resolve(createJsonResponse([]))
+      }
+      if (url === "http://api.local/api/models/user-default") {
+        return Promise.resolve(createJsonResponse({}))
+      }
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
+      }
+      if (url === "http://api.local/api/kb/ingest/jobs") {
+        return Promise.resolve(
+          createJsonResponse(
+            {
+              detail:
+                "Knowledge base name unavailable: test. Please choose a different name.",
+            },
+            false,
+            409
+          )
+        )
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "test" },
+    })
+
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.change(container.querySelector("#file-upload") as HTMLInputElement, {
+      target: { files: [new File(["a"], "alpha.txt", { type: "text/plain" })] },
+    })
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "kb.errors.nameUnavailable",
+        expect.objectContaining({ description: "kb.errors.nameUnavailableHint" })
+      )
+    })
+
+    // The backend sentence is replaced, not appended.
+    expect(JSON.stringify(toastErrorMock.mock.calls)).not.toContain(
+      "Please choose a different name"
+    )
   })
 
   it("uses the sync ingest endpoint when background jobs are unavailable", async () => {

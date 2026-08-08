@@ -10,8 +10,6 @@ const COPY = {
   genericTitle: "上传失败",
   nameUnavailableTitle: "该知识库名称不可用",
   nameUnavailableDescription: "请换一个知识库名称后重试。",
-  conflictTitle: "该知识库的状态已变化",
-  conflictDescription: "请刷新页面后重试；若仍然失败，该名称可能已归他人所有。",
   embeddingTitle: "知识库导入失败：未配置可用的嵌入模型",
   embeddingDescription: "请先配置默认嵌入模型，或选择一个可用的嵌入模型后重试。",
   rollbackTitle: "知识库导入失败，清理未完全完成",
@@ -23,7 +21,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
       COPY,
-      { nameEntry: "user-entered" }
+      { status: undefined, conflictAdvice: "advise-rename" }
     )
 
     expect(result).toEqual({
@@ -32,11 +30,11 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     })
   })
 
-  it("maps a name-taken 409 to actionable copy without leaking the raw detail", () => {
+  it("maps an advise-rename 409 to actionable copy without leaking the raw detail", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test. Please choose a different name.",
       COPY,
-      { status: 409, nameEntry: "user-entered" }
+      { status: 409, conflictAdvice: "advise-rename" }
     )
 
     expect(result).toEqual({
@@ -49,7 +47,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "some entirely different sentence the backend may switch to",
       COPY,
-      { status: 409, nameEntry: "user-entered" }
+      { status: 409, conflictAdvice: "advise-rename" }
     )
 
     expect(result).toEqual({
@@ -62,46 +60,72 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test. Please choose a different name.",
       COPY,
-      { status: 500, nameEntry: "user-entered" }
+      { status: 500, conflictAdvice: "advise-rename" }
     )
 
     expect(result.title).toBe(COPY.genericTitle)
   })
 
-  it("never puts the detail of an ambiguous 409 in front of the user", () => {
-    // Rename answers 409 for lock contention and for storage collisions whose
-    // detail names an internal user id, so "opaque" must yield neutral copy.
-    const leaky =
-      "Failed to rename collection: target physical directory already exists "
-      + "for user_3. A collection named 'x' already has physical files."
-    const result = getKnowledgeBaseErrorToastContent(leaky, COPY, {
+  // Every 409 the backend can raise, checked against what the user is shown.
+  // A "neutral" conflict must repeat the backend's own sentence, because that
+  // sentence is the only thing true of the cause that actually fired.
+  it.each([
+    [
+      "the caller's own collection holds the name",
+      "Target collection already exists: docs",
+    ],
+    [
+      "another tenant holds the name",
+      "Knowledge base name unavailable: docs. Please choose a different name.",
+    ],
+    [
+      "the target name already has stored files",
+      "Cannot rename to 'docs': that name already has stored files.",
+    ],
+    [
+      "another operation holds the lock",
+      "Another operation is in progress; please try again later.",
+    ],
+  ])("relays the backend verdict verbatim when %s", (_case, detail) => {
+    const result = getKnowledgeBaseErrorToastContent(detail, COPY, {
       status: 409,
-      nameEntry: "none",
+      conflictAdvice: "neutral",
     })
 
-    expect(result).toEqual({
-      title: COPY.conflictTitle,
-      description: COPY.conflictDescription,
-    })
-    expect(JSON.stringify(result)).not.toContain("user_3")
-    expect(JSON.stringify(result)).not.toContain("physical")
+    expect(result.title).toBe(COPY.genericTitle)
+    expect(result.description).toBe(detail)
+    // Never the rename advice: three of these four cannot be fixed by renaming.
+    expect(result.description).not.toBe(COPY.nameUnavailableDescription)
+  })
+
+  it("shows no internal user id for a storage collision", () => {
+    // The backend logs the owning user id rather than returning it, so nothing
+    // is left for this layer to strip.
+    const result = getKnowledgeBaseErrorToastContent(
+      "Cannot rename to 'docs': that name already has stored files.",
+      COPY,
+      { status: 409, conflictAdvice: "neutral" }
+    )
+
+    expect(JSON.stringify(result)).not.toMatch(/user_\d/)
   })
 
   it("does not offer the rename advice when the caller cannot confirm a name clash", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: demo. Please choose a different name.",
       COPY,
-      { status: 409, nameEntry: "none" }
+      { status: 409, conflictAdvice: "neutral" }
     )
 
-    expect(result.title).toBe(COPY.conflictTitle)
+    expect(result.title).toBe(COPY.genericTitle)
+    expect(result.description).not.toBe(COPY.nameUnavailableDescription)
   })
 
   it("keeps rollback toasts concise while preserving rollback context", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Failed to fully roll back ingest for demo/file.txt: delete failed. Original ingestion error: Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
       COPY,
-      { nameEntry: "user-entered" }
+      { status: undefined, conflictAdvice: "advise-rename" }
     )
 
     expect(result).toEqual({
@@ -114,7 +138,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "A very long upload failure happened while processing the document and there are many more technical details that should not become the toast title for end users.",
       COPY,
-      { nameEntry: "user-entered" }
+      { status: undefined, conflictAdvice: "advise-rename" }
     )
 
     expect(result.title).toBe(COPY.genericTitle)

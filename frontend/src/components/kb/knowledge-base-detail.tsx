@@ -85,8 +85,6 @@ function getKnowledgeBaseToastCopy(
     genericTitle,
     nameUnavailableTitle: t("kb.errors.nameUnavailable"),
     nameUnavailableDescription: t("kb.errors.nameUnavailableHint"),
-    conflictTitle: t("kb.errors.conflict"),
-    conflictDescription: t("kb.errors.conflictHint"),
     embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
     embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
     rollbackTitle: t("kb.errors.rollbackFailed"),
@@ -531,7 +529,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric")),
-        { status: failedStatus, nameEntry: "none" }
+        { status: failedStatus, conflictAdvice: "neutral" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -730,7 +728,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed")),
-        { status: failedStatus, nameEntry: "none" }
+        { status: failedStatus, conflictAdvice: "neutral" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -842,9 +840,9 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed")),
         // Rename answers 409 for a taken name, a colliding storage directory and
-        // lock contention alike, and those details name internal users and paths.
-        // Neutral copy is the only safe reading of an ambiguous conflict.
-        { status: failedStatus, nameEntry: "none" }
+        // lock contention alike, so no single sentence we could substitute would
+        // be true of all three: show the one the backend actually chose.
+        { status: failedStatus, conflictAdvice: "neutral" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -911,9 +909,9 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed")),
-        // The settings panel has no name field: a 409 means this collection is no
-        // longer visible to the user, not that they just typed a taken name.
-        { status: failedStatus, nameEntry: "none" }
+        // A 409 here means this collection is no longer visible to the caller,
+        // not that a name was just typed: show what the backend actually said.
+        { status: failedStatus, conflictAdvice: "neutral" }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

@@ -3475,6 +3475,12 @@ def _collection_name_unavailable_detail(collection_name: str) -> str:
     )
 
 
+def _rename_target_has_files_detail(collection_name: str) -> str:
+    """Storage-collision wording. The owning user id belongs in the log, not here:
+    the caller who sees this may not be that owner."""
+    return f"Cannot rename to '{collection_name}': that name already has stored files."
+
+
 async def _ensure_collection_access(
     collection_name: str,
     user: User,
@@ -7493,13 +7499,16 @@ async def rename_collection_api(
             collection_is_sanitized=True,
         )
         if old_dir.exists() and old_dir.is_dir() and new_dir.exists():
+            # The owning user id and the storage layout stay in the log: this
+            # detail is shown to the caller, who may not be that owner.
+            logger.warning(
+                "Rename blocked: %s already has files for user_%s",
+                safe_new_collection,
+                owner_id,
+            )
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "Failed to rename collection: target physical directory already "
-                    f"exists for user_{owner_id}. A collection named "
-                    f"'{safe_new_collection}' already has physical files."
-                ),
+                detail=_rename_target_has_files_detail(safe_new_collection),
             )
 
     physical_rename_results = {}

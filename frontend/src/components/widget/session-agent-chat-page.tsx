@@ -261,6 +261,11 @@ export function SessionAgentChatPage() {
   }, [bridge.session, bridge.status])
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    capabilities: {
+      // This page only renders for the embedded widget's session-resume
+      // route, so an in-tab navigation always abandons the visitor's iframe.
+      linksOpenInNewTab: "enabled",
+    },
     session: {
       connection,
       onConnectionClose: bridge.handleConnectionClose,

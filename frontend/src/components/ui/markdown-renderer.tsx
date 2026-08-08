@@ -18,7 +18,9 @@ import {
 import { getApiUrl } from '@/lib/utils'
 import {
   AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
   resolveAgentCardPresentationCapability,
+  resolveLinksOpenInNewTabCapability,
 } from '@/contexts/presentation-capabilities'
 import {
   isManagedFileUrl,
@@ -61,6 +63,7 @@ interface MarkdownRendererProps {
   className?: string
   filesDisabled?: boolean
   agentCardsEnabled?: boolean
+  linksOpenInNewTab?: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
 }
@@ -260,6 +263,7 @@ function containsPreviewFileLinkNode(node: any): boolean {
 type MarkdownRendererContextValue = {
   filesDisabled: boolean
   agentCardsEnabled: boolean
+  linksOpenInNewTab: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
   openLabel: string
@@ -309,6 +313,7 @@ function MarkdownLink({
   const {
     filesDisabled,
     agentCardsEnabled,
+    linksOpenInNewTab,
     onFileClick,
     onAgentClick,
     openLabel,
@@ -404,15 +409,15 @@ function MarkdownLink({
     return <span>{presentationChildren}</span>
   }
 
-  const opensInNewTab = Boolean(href) && !/^(#|mailto:|tel:)/i.test(href ?? '')
+  const opensInNewTab = linksOpenInNewTab && !!href && !/^(#|mailto:)/i.test(href)
 
   return (
     <a
+      {...props}
       href={href || undefined}
       title={presentationTitle || undefined}
       target={opensInNewTab ? '_blank' : undefined}
       rel={opensInNewTab ? 'noopener noreferrer' : undefined}
-      {...props}
     >
       {presentationChildren}
     </a>
@@ -496,6 +501,7 @@ export function MarkdownRenderer({
   className = '',
   filesDisabled = false,
   agentCardsEnabled,
+  linksOpenInNewTab,
   onFileClick,
   onAgentClick,
 }: MarkdownRendererProps) {
@@ -506,16 +512,22 @@ export function MarkdownRenderer({
     agentCardsEnabled,
     inheritedAgentCardsEnabled,
   )
+  const inheritedLinksOpenInNewTab = React.useContext(LinksOpenInNewTabCapability)
+  const resolvedLinksOpenInNewTab = resolveLinksOpenInNewTabCapability(
+    linksOpenInNewTab,
+    inheritedLinksOpenInNewTab,
+  )
   const contextValue = React.useMemo<MarkdownRendererContextValue>(
     () => ({
       filesDisabled,
       agentCardsEnabled: resolvedAgentCardsEnabled,
+      linksOpenInNewTab: resolvedLinksOpenInNewTab,
       onFileClick,
       onAgentClick,
       openLabel: t('files.previewDialog.buttons.open'),
       loadErrorText: t('files.previewDialog.errors.loadFailed'),
     }),
-    [filesDisabled, onFileClick, onAgentClick, resolvedAgentCardsEnabled, t]
+    [filesDisabled, onFileClick, onAgentClick, resolvedAgentCardsEnabled, resolvedLinksOpenInNewTab, t]
   )
   const displayContent = filesDisabled
     ? sanitizeFilesDisabledPresentationText(content)

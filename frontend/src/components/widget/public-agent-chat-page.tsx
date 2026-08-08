@@ -591,6 +591,10 @@ export function PublicAgentChatPage({
     capabilities: {
       agentCards: "disabled",
       voice: "disabled",
+      // Only the embedded widget iframe needs this: a "share" visitor already
+      // has the page to themselves, so an in-tab navigation away from it is
+      // ordinary browser behavior, not a lost conversation.
+      linksOpenInNewTab: authMode === "widget" ? "enabled" : "disabled",
     },
     buildWebSocketUrl: ({ baseUrl, taskId, token }) =>
       `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,

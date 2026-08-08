@@ -774,7 +774,6 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                     onChange={(e) => setNewCollectionName(e.target.value)}
                     placeholder={t("kb.dialog.basicInfo.namePlaceholder")}
                     className="mt-1.5"
-                    required
                     aria-required="true"
                   />
                 </div>

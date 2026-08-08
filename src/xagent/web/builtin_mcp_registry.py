@@ -528,7 +528,15 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": None,
             "category": "Productivity",
             "oauth_scopes": None,
-            "is_visible_in_connector": True,
+            # Hidden until the runtime supports execution-scoped (persistent)
+            # stdio MCP sessions: today every tool call spawns a fresh
+            # chrome-devtools-mcp process (mcp_adapter._execute_mcp_call ->
+            # create_session), so browser/page state does not survive across
+            # calls and any multi-step flow (navigate -> click/fill) breaks.
+            # Once persistent sessions land, admins can re-enable via
+            # PATCH /api/admin/mcp/apps — is_visible_in_connector is not a
+            # builtin-protected field, so no redeploy is needed.
+            "is_visible_in_connector": False,
             # Keyless (non-oauth): no secrets to collect — connecting only
             # creates the per-user association via POST /api/mcp/apps/{id}/connect.
             # --headless/--isolated keep server deployments displayless and give

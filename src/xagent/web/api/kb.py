@@ -3468,17 +3468,28 @@ async def _list_collections_with_retry(
 
 
 def _collection_name_unavailable_detail(collection_name: str) -> str:
-    """Name-conflict wording that does not confirm another tenant owns the name."""
-    return (
-        f"Knowledge base name unavailable: {collection_name}. "
-        "Please choose a different name."
-    )
+    """Name-conflict wording that does not confirm another tenant owns the name.
+
+    States the fact and stops there. The same access check raises this both while
+    a name is being chosen and while an existing collection is being written to
+    -- identical requests, so the server cannot tell which -- and "pick another
+    name" is useless on a screen with no name field. Only a client that knows the
+    user just typed the name may add that advice.
+    """
+    return f"Knowledge base name unavailable: {collection_name}."
 
 
 def _rename_target_has_files_detail(collection_name: str) -> str:
-    """Storage-collision wording. The owning user id belongs in the log, not here:
-    the caller who sees this may not be that owner."""
-    return f"Cannot rename to '{collection_name}': that name already has stored files."
+    """Storage-collision wording, for the rename dialog only.
+
+    The owning user id belongs in the log, not here: the caller who sees this may
+    not be that owner. Renaming is the one flow with a name field, so unlike the
+    shared wording above this one can safely tell the user what to do.
+    """
+    return (
+        f"Cannot rename to '{collection_name}': that name already has stored "
+        "files. Please choose a different name."
+    )
 
 
 async def _ensure_collection_access(

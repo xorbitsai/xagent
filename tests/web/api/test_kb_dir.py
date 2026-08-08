@@ -1,3 +1,4 @@
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -1395,6 +1396,8 @@ def test_rename_collision_detail_keeps_the_owner_id_out_of_the_response():
     assert "docs" in detail
     assert not re.search(r"user_\d", detail)
     assert "user_" not in detail
+    # Renaming is the one flow with a name field, so advice is actionable here.
+    assert "choose a different name" in detail
 
 
 @pytest.mark.asyncio
@@ -1424,9 +1427,11 @@ async def test_ensure_collection_access_returns_409_when_creating_taken_name():
     detail = str(exc_info.value.detail)
     assert exc_info.value.status_code == 409
     assert "Knowledge base name unavailable: test" in detail
-    assert "choose a different name" in detail
     # Must not accuse the user, nor confirm that someone else owns the name.
     assert "Access denied" not in detail
+    # This same check also fires for writes to an existing collection, whose
+    # screens have no name field, so the wording must not advise a rename.
+    assert "choose a different name" not in detail
 
 
 @pytest.mark.asyncio
@@ -1925,7 +1930,7 @@ def test_kb_rename_physical_rename_failure_aborts_operation(test_env, temp_uploa
             assert old_coll_dir.exists()
 
 
-def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads):
+def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads, caplog):
     """Test that rename_collection_api handles target directory already existing."""
     app, headers, user, _ = test_env
     client = TestClient(app)
@@ -1962,11 +1967,12 @@ def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads):
         mock_rename_storage.return_value = mock_rename_result
 
         # Attempt rename to existing directory
-        response = client.put(
-            f"/api/kb/collections/{old_collection_name}",
-            data={"new_name": new_collection_name},
-            headers=headers,
-        )
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.kb"):
+            response = client.put(
+                f"/api/kb/collections/{old_collection_name}",
+                data={"new_name": new_collection_name},
+                headers=headers,
+            )
 
         # Should fail with 409 (conflict)
         assert response.status_code == 409, (
@@ -1976,9 +1982,13 @@ def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads):
         assert "already has stored files" in detail or "in progress" in detail, (
             f"Expected conflict error, got: {detail}"
         )
-        # The colliding files may belong to another account: never name it here.
+        # The colliding files may belong to another account: never name it here,
+        # but keep it in the log so operators can still find the owner.
         assert "user_" not in detail, (
             f"Rename conflict leaked an internal account id: {detail}"
+        )
+        assert f"user_{user.id}" in caplog.text, (
+            "The owning account id must stay available to operators via the log"
         )
 
 

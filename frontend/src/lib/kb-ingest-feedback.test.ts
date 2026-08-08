@@ -32,7 +32,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
 
   it("maps an advise-rename 409 to actionable copy without leaking the raw detail", () => {
     const result = getKnowledgeBaseErrorToastContent(
-      "Knowledge base name unavailable: test. Please choose a different name.",
+      "Knowledge base name unavailable: test.",
       COPY,
       { status: 409, conflictAdvice: "advise-rename" }
     )
@@ -58,7 +58,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
 
   it("does not treat the conflict wording as a conflict without a 409", () => {
     const result = getKnowledgeBaseErrorToastContent(
-      "Knowledge base name unavailable: test. Please choose a different name.",
+      "Knowledge base name unavailable: test.",
       COPY,
       { status: 500, conflictAdvice: "advise-rename" }
     )
@@ -67,20 +67,18 @@ describe("getKnowledgeBaseErrorToastContent", () => {
   })
 
   // Every 409 the backend can raise, checked against what the user is shown.
-  // A "neutral" conflict must repeat the backend's own sentence, because that
-  // sentence is the only thing true of the cause that actually fired.
+  // A "neutral" conflict repeats the backend's own sentence, because that
+  // sentence is the only thing true of the cause that actually fired. The
+  // strings below are the verbatim output of each 409 branch in kb.py.
   it.each([
     [
       "the caller's own collection holds the name",
       "Target collection already exists: docs",
     ],
-    [
-      "another tenant holds the name",
-      "Knowledge base name unavailable: docs. Please choose a different name.",
-    ],
+    ["another tenant holds the name", "Knowledge base name unavailable: docs."],
     [
       "the target name already has stored files",
-      "Cannot rename to 'docs': that name already has stored files.",
+      "Cannot rename to 'docs': that name already has stored files. Please choose a different name.",
     ],
     [
       "another operation holds the lock",
@@ -94,31 +92,21 @@ describe("getKnowledgeBaseErrorToastContent", () => {
 
     expect(result.title).toBe(COPY.genericTitle)
     expect(result.description).toBe(detail)
-    // Never the rename advice: three of these four cannot be fixed by renaming.
-    expect(result.description).not.toBe(COPY.nameUnavailableDescription)
   })
 
-  it("shows no internal user id for a storage collision", () => {
-    // The backend logs the owning user id rather than returning it, so nothing
-    // is left for this layer to strip.
+  it("does not tell a screen without a name field to pick another name", () => {
+    // What the detail page and the settings panel actually receive. The backend
+    // states the fact only, so no rename advice can reach a screen that has no
+    // name to change.
     const result = getKnowledgeBaseErrorToastContent(
-      "Cannot rename to 'docs': that name already has stored files.",
-      COPY,
-      { status: 409, conflictAdvice: "neutral" }
-    )
-
-    expect(JSON.stringify(result)).not.toMatch(/user_\d/)
-  })
-
-  it("does not offer the rename advice when the caller cannot confirm a name clash", () => {
-    const result = getKnowledgeBaseErrorToastContent(
-      "Knowledge base name unavailable: demo. Please choose a different name.",
+      "Knowledge base name unavailable: demo.",
       COPY,
       { status: 409, conflictAdvice: "neutral" }
     )
 
     expect(result.title).toBe(COPY.genericTitle)
-    expect(result.description).not.toBe(COPY.nameUnavailableDescription)
+    expect(result.description).toBe("Knowledge base name unavailable: demo.")
+    expect(result.description).not.toContain("choose a different name")
   })
 
   it("keeps rollback toasts concise while preserving rollback context", () => {

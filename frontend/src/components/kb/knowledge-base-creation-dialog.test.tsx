@@ -293,7 +293,7 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
           createJsonResponse(
             {
               detail:
-                "Knowledge base name unavailable: test. Please choose a different name.",
+                "Knowledge base name unavailable: test.",
             },
             false,
             409
@@ -326,9 +326,9 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       )
     })
 
-    // The backend sentence is replaced, not appended.
+    // The backend sentence is replaced by the localized copy, not appended.
     expect(JSON.stringify(toastErrorMock.mock.calls)).not.toContain(
-      "Please choose a different name"
+      "Knowledge base name unavailable"
     )
   })
 

@@ -250,7 +250,7 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
           createJsonResponse(
             {
               detail:
-                "Knowledge base name unavailable: demo. Please choose a different name.",
+                "Knowledge base name unavailable: demo.",
             },
             false,
             409
@@ -273,14 +273,14 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
     })
     fireEvent.click(screen.getByText("kb.index.startImport"))
 
-    // This page has no name field, so "pick another name" would be useless
-    // advice; the accurate backend sentence is shown instead.
+    // This page has no name field. The backend states the fact without advising
+    // a rename, and that sentence is what the user sees.
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
         "kb.detail.errors.webImportFailed",
         expect.objectContaining({
           description:
-            "Knowledge base name unavailable: demo. Please choose a different name.",
+            "Knowledge base name unavailable: demo.",
         })
       )
     })
@@ -319,7 +319,7 @@ describe("KnowledgeBaseDetailContent config save", () => {
           createJsonResponse(
             {
               detail:
-                "Knowledge base name unavailable: demo. Please choose a different name.",
+                "Knowledge base name unavailable: demo.",
             },
             false,
             409
@@ -350,14 +350,14 @@ describe("KnowledgeBaseDetailContent config save", () => {
 
     fireEvent.click(screen.getByText("kb.index.saveConfig"))
 
-    // The settings panel has no name field either: the 409 really means this
-    // collection is no longer visible to the caller.
+    // The settings panel has no name field either. The 409 means this collection
+    // is no longer visible to the caller, and the wording says only that.
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
         "kb.detail.errors.saveConfigFailed",
         expect.objectContaining({
           description:
-            "Knowledge base name unavailable: demo. Please choose a different name.",
+            "Knowledge base name unavailable: demo.",
         })
       )
     })

@@ -404,12 +404,14 @@ function MarkdownLink({
     return <span>{presentationChildren}</span>
   }
 
+  const opensInNewTab = Boolean(href) && !/^(#|mailto:|tel:)/i.test(href ?? '')
+
   return (
     <a
       href={href || undefined}
       title={presentationTitle || undefined}
-      target="_blank"
-      rel="noopener noreferrer"
+      target={opensInNewTab ? '_blank' : undefined}
+      rel={opensInNewTab ? 'noopener noreferrer' : undefined}
       {...props}
     >
       {presentationChildren}

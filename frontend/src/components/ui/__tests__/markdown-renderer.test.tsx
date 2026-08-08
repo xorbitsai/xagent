@@ -701,6 +701,20 @@ describe('MarkdownRenderer', () => {
     expect(link).toHaveAttribute('rel', 'noopener noreferrer')
   })
 
+  it('keeps in-page anchor links and mailto links in the current tab', () => {
+    const content = [
+      '[Jump to section](#section)',
+      '[Email us](mailto:hello@example.com)',
+    ].join('\n\n')
+    render(<MarkdownRenderer content={content} />)
+
+    for (const name of ['Jump to section', 'Email us']) {
+      const link = screen.getByRole('link', { name })
+      expect(link).not.toHaveAttribute('target')
+      expect(link).not.toHaveAttribute('rel')
+    }
+  })
+
   it('uses authenticated preview fallback for non-uuid file: images', async () => {
     apiRequestMock.mockResolvedValue({ ok: false })
     const content = '![final image](file:output/screenshot.png)'

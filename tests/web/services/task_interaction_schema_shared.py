@@ -1,0 +1,208 @@
+"""Shared fixtures for the TaskInteractionRequest constraint-behavior suite.
+
+Split across test_task_interaction_schema.py (SQLite, always runs) and
+test_task_interaction_schema_postgresql.py (PostgreSQL, skips without
+XAGENT_TEST_POSTGRES_URL), following the split used for
+task_status_storage_shared.py / test_task_status_storage.py /
+test_task_status_storage_postgresql.py, so the PostgreSQL half's real
+Postgres dependency does not leak into every local test run. Row builders
+and the two assertion helpers below are written once here and called from
+both files, so both backends are pinned to the identical constraint
+inventory.
+
+Both backends report a violated CHECK the same way but with a different
+message shape -- SQLite: "CHECK constraint failed: <name>"; PostgreSQL:
+'violates check constraint "<name>"' -- so assert_rejected only checks
+that the constraint's name is a substring of str(exception), never
+anything about the rest of the message shape.
+
+UNIQUE violations are not symmetric the same way: PostgreSQL's message
+carries the constraint's name ('violates unique constraint "<name>"'),
+but SQLite's does not -- it reports the qualified column list instead
+("UNIQUE constraint failed: task_interaction_requests.task_id,
+task_interaction_requests.active_slot"), never the name given to the
+constraint. This was verified against the real model (not assumed): see
+_UNIQUE_CONSTRAINT_COLUMNS below, which assert_rejected uses to check
+column names on SQLite for the two UNIQUE constraints and falls back to
+name-substring matching everywhere else (including on PostgreSQL, where
+the name is always present).
+
+On PostgreSQL a failed statement poisons the rest of the transaction
+(InFailedSqlTransaction) until a rollback; assert_rejected always rolls
+back immediately after catching IntegrityError, mirroring the same
+recovery step task_status_storage_shared.py's PostgreSQL callers rely on.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from itertools import count
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.models.user import User
+
+_key_counter = count()
+_username_counter = count()
+
+# SQLite's UNIQUE violation message names columns, not the constraint --
+# see the module docstring. Column order here matches declaration order in
+# TaskInteractionRequest.__table_args__, which is also the order SQLite
+# lists them in.
+_UNIQUE_CONSTRAINT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "uq_task_interaction_active_slot": ("task_id", "active_slot"),
+    "uq_task_interaction_request_identity": (
+        "task_id",
+        "run_id",
+        "request_idempotency_key",
+    ),
+}
+
+
+def make_user(db: Session) -> int:
+    user = User(
+        username=f"interaction-schema-user-{next(_username_counter)}",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return int(user.id)
+
+
+def make_task(db: Session, *, user_id: int) -> int:
+    task = Task(user_id=user_id, title="interaction schema fixture task")
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return int(task.id)
+
+
+def make_trace_event(db: Session, *, task_id: int) -> int:
+    event = TraceEvent(
+        task_id=task_id,
+        event_id=f"interaction-schema-event-{next(_key_counter)}",
+        event_type="agent_execution_checkpoint",
+        timestamp=datetime.now(timezone.utc),
+        data={},
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return int(event.id)
+
+
+def make_row(
+    *,
+    task_id: int,
+    resume_trace_event_id: int | None,
+    status: str = "active",
+    **overrides: object,
+) -> dict[str, object]:
+    """Return a column-value dict for one legal TaskInteractionRequest row.
+
+    Defaults build a self-consistent row for ``status`` ("active" by
+    default): "active" gets active_slot=1, protocol_version=1, and a
+    non-null anchor; "terminated" gets active_slot=None and a valid
+    terminal_reason; "answered" gets active_slot=None, a response_payload,
+    responded_at and responder_identity. Any keyword in ``overrides``
+    replaces the corresponding default outright, including fields the
+    ``status``-specific defaults above set -- callers isolating a single
+    CHECK only need to pass the field(s) that CHECK inspects and rely on
+    these defaults to keep every *other* CHECK satisfied for the row's
+    status.
+
+    request_idempotency_key gets a fresh value on every call so identity
+    tests (T-uq-4/T-uq-5) only collide when a test deliberately repeats one
+    via ``overrides``.
+    """
+    now = datetime.now(timezone.utc)
+    row: dict[str, object] = {
+        "task_id": task_id,
+        "run_id": "run-a",
+        "kind": "clarification",
+        "protocol_version": 1,
+        "status": status,
+        "active_slot": None,
+        "origin": "internal",
+        "request_payload": {"prompt": "example"},
+        "response_payload": None,
+        "request_idempotency_key": f"req-{next(_key_counter)}",
+        "resume_trace_event_id": resume_trace_event_id,
+        "resume_event_id": "resume-event-1",
+        "resume_execution_id": "resume-execution-1",
+        "resume_locator_format": "trace_event_pk_v1",
+        "resume_checkpoint_type": "agent_execution_checkpoint",
+        "resume_run_partition": "partition-1",
+        "responder_user_id": None,
+        "responder_identity": None,
+        "terminal_reason": None,
+        "expires_at": now + timedelta(minutes=15),
+        "responded_at": None,
+        "terminated_at": None,
+    }
+    if status == "active":
+        row["active_slot"] = 1
+    elif status == "terminated":
+        row["terminal_reason"] = "deadline_elapsed"
+    elif status == "answered":
+        row["response_payload"] = {"answer": "example"}
+        row["responded_at"] = now
+        row["responder_identity"] = "user:1"
+    row.update(overrides)
+    return row
+
+
+def assert_accepted(db: Session, row: dict[str, object]) -> TaskInteractionRequest:
+    """Insert ``row``, commit, and confirm it reads back.
+
+    The positive half of every constraint pair pinned in this suite --
+    without at least one accepted case per pairing, a test suite made
+    entirely of rejections could pass even if the CHECK were made
+    unsatisfiable by every row (see the class docstring's `answered` full
+    pairing positive control).
+    """
+    obj = TaskInteractionRequest(**row)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def assert_rejected(db: Session, row: dict[str, object], constraint_name: str) -> None:
+    """Insert ``row``, expect IntegrityError naming ``constraint_name``, and
+    roll back immediately so the session stays usable for the caller's next
+    statement (see the module docstring for why this matters on
+    PostgreSQL)."""
+    obj = TaskInteractionRequest(**row)
+    db.add(obj)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        text = str(exc)
+        sqlite_columns = _UNIQUE_CONSTRAINT_COLUMNS.get(constraint_name)
+        if (
+            sqlite_columns is not None
+            and db.bind is not None
+            and (db.bind.dialect.name == "sqlite")
+        ):
+            for column in sqlite_columns:
+                qualified = f"task_interaction_requests.{column}"
+                assert qualified in text, (
+                    f"expected column {qualified!r} in the SQLite UNIQUE "
+                    f"violation text for {constraint_name!r}, got: {text}"
+                )
+        else:
+            assert constraint_name in text, (
+                f"expected {constraint_name!r} in the IntegrityError text, got: {text}"
+            )
+    else:
+        raise AssertionError(
+            f"expected IntegrityError naming {constraint_name!r}; insert succeeded"
+        )
+    finally:
+        db.rollback()

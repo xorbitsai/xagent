@@ -31,7 +31,19 @@ _MARKDOWN_FILE_REFERENCE_RE = re.compile(
 # (presentation/document/spreadsheet) keep the model's prose label because
 # rewriting it would flip existing compact links into heavy inline preview
 # boxes that eagerly fetch file bytes.
-_INLINE_PREVIEW_LINK_TYPES = {"video", "audio"}
+_INLINE_PREVIEW_LINK_TYPES = {"video"}
+# ``artifact_type_for_filename`` only knows image/video/office extensions
+# and never returns "audio", so audio must be matched by extension here.
+# This set mirrors the frontend's audio detection (see
+# ``getInlineFilePreviewKind`` in ``inline-file-preview-utils.ts``) — keep
+# the two in sync.
+_AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".opus", ".flac", ".m4a", ".aac"}
+
+
+def _is_inline_preview_media(filename: str, suffix: str) -> bool:
+    return artifact_type_for_filename(filename) in _INLINE_PREVIEW_LINK_TYPES or (
+        suffix in _AUDIO_EXTENSIONS
+    )
 
 
 def load_assistant_file_reference_records(
@@ -132,12 +144,9 @@ def reconcile_assistant_file_references(
 
         display_label = label
         filename = str(record.filename or "")
-        if (
-            not prefix
-            and artifact_type_for_filename(filename) in _INLINE_PREVIEW_LINK_TYPES
-        ):
-            suffix = Path(filename).suffix.casefold()
-            if suffix and not label.strip().casefold().endswith(suffix):
+        suffix = Path(filename).suffix.casefold()
+        if not prefix and suffix and _is_inline_preview_media(filename, suffix):
+            if not label.strip().casefold().endswith(suffix):
                 display_label = filename
 
         return f"{prefix}[{display_label}]({canonical_ref})"

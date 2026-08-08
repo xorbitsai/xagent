@@ -31,14 +31,16 @@ def _create_context():
     return db, user, task
 
 
-def _add_file(db, user, task, *, file_id: str, filename: str):
+def _add_file(
+    db, user, task, *, file_id: str, filename: str, mime_type: str = "video/mp4"
+):
     record = UploadedFile(
         file_id=file_id,
         user_id=int(user.id),
         task_id=int(task.id) if task is not None else None,
         filename=filename,
         storage_path=f"/tmp/{file_id}/{filename}",
-        mime_type="video/mp4",
+        mime_type=mime_type,
         file_size=123,
     )
     db.add(record)
@@ -169,6 +171,30 @@ def test_reconcile_rewrites_label_to_filename_when_extension_is_missing():
         )
 
         assert content == "[generated_video.mp4](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_rewrites_label_to_filename_for_audio_when_extension_is_missing():
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_podcast.mp3",
+            mime_type="audio/mpeg",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载音频（MP3）](file:real-id)",
+        )
+
+        assert content == "[generated_podcast.mp3](file:real-id)"
     finally:
         db.close()
 

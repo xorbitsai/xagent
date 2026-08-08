@@ -132,15 +132,19 @@ class MCPServerUpdate(BaseModel):
 
 
 class MCPAppConnectRequest(BaseModel):
-    """Connect a key-based (non-oauth) catalog app with the caller's own secrets.
+    """Connect a key-based or keyless (non-oauth) catalog app.
 
-    OAuth apps use the OAuth popup flow; this path is for apps like Google Maps
-    that authenticate with a static API key. The key is stored as a per-user env
-    override on a shared server row (see PR #750), so each user brings their own.
+    OAuth apps use the OAuth popup flow; this path is for apps that
+    authenticate with a static API key (e.g. Google Maps — the key is stored
+    as a per-user env override on a shared server row, see PR #750, so each
+    user brings their own) and for keyless apps with no secrets at all
+    (e.g. Chrome — the body carries only is_active).
     """
 
     env: Optional[dict] = Field(
-        None, description="Per-user env overrides (e.g. the API key)"
+        None,
+        description="Per-user env overrides (e.g. the API key). Ignored for "
+        "keyless apps, whose empty required_env allowlist drops every key.",
     )
     env_source: Optional[Literal["own", "shared", "platform"]] = Field(
         None,
@@ -150,7 +154,9 @@ class MCPAppConnectRequest(BaseModel):
     is_active: Optional[bool] = Field(
         None,
         description="Whether the connection is active (defaults to True on first "
-        "connect; left unchanged on reconnect when omitted)",
+        "connect; left unchanged on reconnect when omitted). The keyless connect "
+        "flow sends True explicitly so reconnecting a dormant association "
+        "reactivates it.",
     )
 
 
@@ -2311,6 +2317,23 @@ def _add_catalog_server_with_race_recovery(
     return server
 
 
+def _reject_hidden_catalog_app(app_info: dict) -> None:
+    """404 a connect attempt against a hidden catalog app.
+
+    is_visible_in_connector governs the catalog listing, but hiding an app is
+    also used as a release gate (e.g. the chrome connector ships hidden until
+    persistent stdio sessions land) — so the connect endpoints must enforce it
+    server-side too, or any caller who knows the app_id could still provision
+    the connector with a direct POST. 404 (not 403) so a hidden app is
+    indistinguishable from a nonexistent one. Existing associations are not
+    affected: disconnect and the server/tool routes never call this.
+    """
+    if not app_info.get("is_visible_in_connector", True):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
+        )
+
+
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a key-based or keyless
     catalog app exists, without creating any per-user association. Returns
@@ -2325,6 +2348,7 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
         )
+    _reject_hidden_catalog_app(app_info)
     if app_info.get("auth_type") == "builtin_oauth":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2394,6 +2418,7 @@ def _ensure_catalog_mcp_oauth_server(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
         )
+    _reject_hidden_catalog_app(app_info)
     if app_info.get("auth_type") != "mcp_oauth":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

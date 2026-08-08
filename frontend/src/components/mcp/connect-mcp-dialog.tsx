@@ -119,11 +119,14 @@ export function ConnectMcpDialog({
   const [keyEnvValues, setKeyEnvValues] = useState<Record<string, string>>({})
   const [keyEnvSource, setKeyEnvSource] = useState<"own" | "shared" | "platform">("own")
   const [isConnectingKey, setIsConnectingKey] = useState(false)
-  // True only while a catalog connect POST (key-based or keyless) is in
+  // Number of catalog connect POSTs (key-based or keyless) currently in
   // flight — deliberately narrower than loadingApp, which also stays set for
   // the whole builtin-OAuth popup wait (up to 5 minutes): the main dialog's
   // close guard reads this, and must not lock the dialog for that long.
-  const [isCatalogConnectInFlight, setIsCatalogConnectInFlight] = useState(false)
+  // A counter, not a boolean: with overlapping requests a boolean is cleared
+  // by the first finally while the second is still pending, silently
+  // reopening the guard window.
+  const [catalogConnectsInFlight, setCatalogConnectsInFlight] = useState(0)
   // Ownership choice at connect/create; "team" triggers a share call after success.
   const [shareChoice, setShareChoice] = useState<"private" | "team">("private")
   const [localSelectedServers, setLocalSelectedServers] = useState<string[]>([])
@@ -546,7 +549,7 @@ export function ConnectMcpDialog({
     }
   ) => {
     options.setLoading(true)
-    setIsCatalogConnectInFlight(true)
+    setCatalogConnectsInFlight(count => count + 1)
     try {
       const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
         method: 'POST',
@@ -554,7 +557,7 @@ export function ConnectMcpDialog({
         body: JSON.stringify(body)
       })
       if (response.ok) {
-        toast.success(t('tools.mcp.buttons.save'))
+        toast.success(t('tools.mcp.dialog.connectSuccess', { name: app.name }))
         // Path-specific follow-up runs before the loadApps() refresh below so
         // its effects (e.g. the key path's team share) are already reflected
         // in the reloaded list.
@@ -574,7 +577,7 @@ export function ConnectMcpDialog({
       toast.error(t('tools.mcp.alerts.saveFailed'))
     } finally {
       options.setLoading(false)
-      setIsCatalogConnectInFlight(false)
+      setCatalogConnectsInFlight(count => count - 1)
     }
   }
 
@@ -611,6 +614,10 @@ export function ConnectMcpDialog({
   // association (is_active=false) reactivates it instead of silently staying
   // disconnected — the backend only flips is_active when told to.
   const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
+    // Re-entry guard for this app: the settings dialog disables its Connect
+    // button while pending, but a second trigger surface (catalog card)
+    // must not fire an overlapping POST either.
+    if (loadingApp === app.id) return
     await connectCatalogApp(app, { is_active: true }, {
       autoSelect,
       setLoading: (loading) => setLoadingApp(loading ? app.id : null),
@@ -864,7 +871,7 @@ export function ConnectMcpDialog({
         // connect POST is in flight, or its success/error toast fires after
         // the user already believes they dismissed it. Scoped to the POST
         // itself (not loadingApp, which also spans OAuth popup waits).
-        if (!nextOpen && isCatalogConnectInFlight) return
+        if (!nextOpen && catalogConnectsInFlight > 0) return
         if (!nextOpen) {
           connectorEditRequestRef.current += 1
           setCustomApiEditBaseline(null)
@@ -1319,6 +1326,7 @@ export function ConnectMcpDialog({
         }}
         app={selectedApp}
         isGloballyConnected={selectedApp ? isAppConnected(selectedApp) : false}
+        isConnecting={!!selectedApp && loadingApp === selectedApp.id}
         onSuccess={() => {
           if (onSuccess) onSuccess();
           loadApps();

@@ -602,6 +602,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "npx",
                 "args": [
                     "-y",
+                    # npm-exec flag, must precede the package spec: with the
+                    # exact-version cache warmed at image build time
+                    # (Dockerfile.backend), resolution never hits the npm
+                    # registry at launch; on a cache miss (e.g. first run on
+                    # a dev machine) it still fetches normally.
+                    "--prefer-offline",
                     "chrome-devtools-mcp@1.6.0",
                     "--headless",
                     "--isolated",

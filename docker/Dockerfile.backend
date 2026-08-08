@@ -186,10 +186,14 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
         && ln -s /usr/bin/chromium /opt/google/chrome/chrome; \
     fi
 
-# Pinned to the same version as builtin_mcp_registry.py's launch_config so
-# npx resolves the already-installed global package instead of hitting the
-# npm registry on every MCP server launch.
-RUN npm install -g chrome-devtools-mcp@1.6.0
+# Warm the npx cache for the exact version pinned in
+# builtin_mcp_registry.py's launch_config. npx resolves against its own
+# cache (~/.npm/_npx), NOT global npm installs, so `npm install -g` would
+# not prevent per-launch registry hits — an exact-version spec with a warm
+# cache resolves fully offline (verified with npm_config_offline=true).
+# The backend runs as root, so build-time root's cache is the one the MCP
+# launch path reads. `--help` exercises resolution without starting Chrome.
+RUN npx -y chrome-devtools-mcp@1.6.0 --help > /dev/null
 
 COPY docker/entrypoint.sh /opt/xagent/deploy/entrypoint.sh
 RUN chmod +x /opt/xagent/deploy/entrypoint.sh

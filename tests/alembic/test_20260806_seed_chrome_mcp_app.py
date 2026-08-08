@@ -63,11 +63,18 @@ def test_upgrade_inserts_chrome(tmp_path):
         assert "chrome" in _app_ids(connection)
         row = connection.execute(
             text(
-                "SELECT transport, launch_config FROM public_mcp_apps WHERE app_id='chrome'"
+                "SELECT transport, launch_config, is_visible_in_connector "
+                "FROM public_mcp_apps WHERE app_id='chrome'"
             )
         ).first()
         assert row[0] == "stdio"
         assert "chrome-devtools-mcp" in str(row[1])
+        # Assert the persisted column value, not just dict agreement
+        # (test_seed_row_matches_registry): the table DDL defaults this
+        # column to 1, so a dropped/mistyped key would ship the connector
+        # visible — and it must stay hidden until persistent stdio MCP
+        # sessions land.
+        assert row[2] == 0
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -84,7 +91,7 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
-def test_seed_row_matches_registry(tmp_path):
+def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
     chrome row (the migration is a frozen copy; this catches drift)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
@@ -96,7 +103,7 @@ def test_seed_row_matches_registry(tmp_path):
     assert migration.ROW == registry_row
 
 
-def test_seed_row_classifies_keyless(tmp_path):
+def test_seed_row_classifies_keyless():
     """The Chrome entry must classify as "keyless" — an "unconnectable"
     classification would make the catalog entry dead on arrival in the
     connector UI."""

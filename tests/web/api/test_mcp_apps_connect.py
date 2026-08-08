@@ -542,6 +542,99 @@ def test_connect_keyless_app_creates_association_without_env(test_db):
     assert assoc.env is None
 
 
+def test_connect_rejects_hidden_app(test_db):
+    """is_visible_in_connector is a release gate, not just a display toggle:
+    a hidden app must not be connectable by anyone who knows the app_id (the
+    chrome connector ships hidden until persistent stdio sessions land). The
+    gate returns 404 so a hidden app is indistinguishable from a nonexistent
+    one, and it must fire before any shared server row is created.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="hidden-keyless",
+            name="hidden-keyless",
+            transport="stdio",
+            is_visible_in_connector=False,
+            launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "hidden-keyless",
+            MCPAppConnectRequest(is_active=True),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 404
+
+    # The gate fired before provisioning: no shared server row was created.
+    assert (
+        test_db.query(MCPServer).filter(MCPServer.name == "hidden-keyless").first()
+        is None
+    )
+
+
+def test_connect_reactivates_dormant_association_when_requested(test_db):
+    """The keyless connect flow sends is_active=True explicitly; the backend
+    must flip a dormant (is_active=False) association back on. Guards the
+    reactivation semantics the frontend now depends on
+    (connect-mcp-dialog.tsx submitKeylessConnect).
+    """
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="keyless-dormant",
+            name="keyless-dormant",
+            transport="stdio",
+            launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+        )
+    )
+    test_db.commit()
+
+    # First connect creates the association, then the user turns it off.
+    connect_mcp_app(
+        "keyless-dormant",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    server = test_db.query(MCPServer).filter(MCPServer.name == "keyless-dormant").one()
+    assoc = (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.user_id == 1, UserMCPServer.mcpserver_id == server.id)
+        .one()
+    )
+    assoc.is_active = False
+    test_db.commit()
+
+    # Reconnect with is_active=True reactivates; omitting it must NOT
+    # (a key-update reconnect may not silently re-enable a disabled row).
+    connect_mcp_app(
+        "keyless-dormant",
+        MCPAppConnectRequest(),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    test_db.refresh(assoc)
+    assert assoc.is_active is False
+
+    connect_mcp_app(
+        "keyless-dormant",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    test_db.refresh(assoc)
+    assert assoc.is_active is True
+
+
 def test_connect_rejects_unconnectable_app(test_db):
     """An entry that classifies as "unconnectable" (required_env but no launch
     command, so nothing to run) is rejected by the connect gate. Such a row can

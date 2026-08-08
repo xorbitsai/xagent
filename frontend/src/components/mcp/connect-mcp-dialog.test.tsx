@@ -6,6 +6,7 @@ import { ConnectMcpDialog } from "./connect-mcp-dialog"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const toastSuccessMock = vi.hoisted(() => vi.fn())
 const translateMock = vi.hoisted(() => (key: string) => key)
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
@@ -28,14 +29,15 @@ vi.mock("@/contexts/mcp-apps-context", () => ({
 }))
 
 vi.mock("@/components/ui/sonner", () => ({
-  toast: { error: toastErrorMock, success: vi.fn() },
+  toast: { error: toastErrorMock, success: toastSuccessMock },
 }))
 
 vi.mock("@/components/ui/dialog", () => ({
-  // role="dialog" + an Escape handler wired to the real onOpenChange prop, so
-  // tests can fireEvent.keyDown(getByRole("dialog"), {key: "Escape"}) to
-  // exercise the component's own onOpenChange guard logic (e.g. refusing to
-  // close while a connect request is in flight) instead of just no-op'ing it.
+  // role="dialog" + both Radix dismiss paths wired to the real onOpenChange
+  // prop — Escape via keyDown and outside-click via the overlay button — so
+  // tests exercise the component's own onOpenChange guard logic (e.g.
+  // refusing to close while a connect request is in flight) through the
+  // same callback Radix would invoke, instead of just no-op'ing it.
   Dialog: ({
     open,
     onOpenChange,
@@ -52,6 +54,13 @@ vi.mock("@/components/ui/dialog", () => ({
           if (event.key === "Escape") onOpenChange?.(false)
         }}
       >
+        <button
+          type="button"
+          data-testid="dialog-overlay"
+          onClick={() => onOpenChange?.(false)}
+        >
+          overlay
+        </button>
         {children}
       </div>
     ) : null,
@@ -315,6 +324,7 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
+    toastSuccessMock.mockReset()
   })
 
   afterEach(() => {
@@ -510,11 +520,11 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     })
   })
 
-  it("keeps the dialog open on Escape while a keyless connect is in flight", async () => {
+  it("keeps the dialog open while a keyless connect is in flight (Escape and outside click)", async () => {
     const onOpenChange = vi.fn()
     // A deferred connect response: held open until resolveConnect() runs, so
-    // the test can assert the mid-flight (loadingApp set) behavior before
-    // the request settles.
+    // the test can assert the mid-flight (guard active) behavior before the
+    // request settles.
     let resolveConnect: (() => void) | undefined
     apiRequestMock.mockImplementation((url: string) => {
       if (url.includes("/api/mcp/apps?")) {
@@ -539,15 +549,23 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       expect(resolveConnect).toBeDefined()
     })
 
+    // Both dismiss paths are refused mid-flight: Escape and outside click
+    // (the mock wires the overlay button to the same onOpenChange callback
+    // Radix's outside-click dismissal invokes).
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    fireEvent.click(screen.getAllByTestId("dialog-overlay")[0])
     expect(onOpenChange).not.toHaveBeenCalledWith(false)
 
-    // Once the request settles, Escape closes normally again. The guard
-    // clears in the connect's finally block, which the test can't await
-    // directly — so retry the Escape inside waitFor until it lands.
+    // Settle the request and wait on a state-based signal (the success
+    // toast fires in the same continuation that clears the guard)...
     resolveConnect?.()
     await waitFor(() => {
-      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+      expect(toastSuccessMock).toHaveBeenCalled()
+    })
+
+    // ...then a single Escape closes normally again.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    await waitFor(() => {
       expect(onOpenChange).toHaveBeenCalledWith(false)
     })
   })

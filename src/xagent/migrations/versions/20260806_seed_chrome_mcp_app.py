@@ -55,6 +55,7 @@ ROW = {
         "command": "npx",
         "args": [
             "-y",
+            "--prefer-offline",
             "chrome-devtools-mcp@1.6.0",
             "--headless",
             "--isolated",
@@ -87,9 +88,12 @@ def downgrade() -> None:
     inspector = sa.inspect(bind)
     if "public_mcp_apps" not in set(inspector.get_table_names()):
         return
-    # Only the catalog entry is removed. Any MCPServer/UserMCPServer rows created
-    # by users who already connected are not owned by this migration and are
-    # cleaned up through the normal disconnect path.
+    # Only the catalog entry is removed. Any MCPServer/UserMCPServer rows
+    # created by users who already connected are not owned by this migration
+    # and are intentionally left in place. Note the app-scoped
+    # connect/disconnect routes 404 once this row is gone (get_app_by_id
+    # returns None), so leftover rows are removed via the server-level route
+    # (DELETE /api/mcp/servers/{id}), not the catalog one.
     bind.execute(
         sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
     )

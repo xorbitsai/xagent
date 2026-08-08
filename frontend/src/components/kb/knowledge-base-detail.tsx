@@ -806,6 +806,9 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
 
     setIsUpdating(true)
+    // Carried out of the try so the catch can classify on the status code rather
+    // than on the wording of the backend's message.
+    let failedStatus: number | undefined
     try {
       const formData = new FormData()
       formData.append("new_name", editCollectionName)
@@ -816,7 +819,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
+        failedStatus = response.status
+        const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.edit.errors.renameFailed"))
       }
 
@@ -830,7 +834,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.edit.errors.updateFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed")),
+        failedStatus
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -842,6 +847,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
   const handleSaveConfig = async () => {
     setIsSavingConfig(true)
+    let failedStatus: number | undefined
     try {
       const payload: any = { ...ingestionConfig }
 
@@ -860,7 +866,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
+        failedStatus = response.status
+        const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
       }
 
@@ -878,6 +885,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         },
       )
       if (!rerankResp.ok) {
+        failedStatus = rerankResp.status
         const errorData = await rerankResp.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
       }
@@ -892,7 +900,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.errors.saveConfigFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed")),
+        failedStatus
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

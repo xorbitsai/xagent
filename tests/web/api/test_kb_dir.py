@@ -3232,6 +3232,23 @@ def test_kb_ingest_cloud_uses_unique_storage_paths_for_duplicate_filenames(
         session.close()
 
 
+def _visible_collections(*names: str):
+    """Make the caller's collection listing include ``names``.
+
+    ``/documents/check`` is read-only, so it no longer accepts a name that is
+    absent from the listing; production callers always own the collection.
+    """
+    from types import SimpleNamespace
+
+    return patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        return_value=SimpleNamespace(
+            collections=[SimpleNamespace(name=name) for name in names]
+        ),
+    )
+
+
 def test_check_documents_exist_prefers_uploaded_file_filename(test_env, temp_uploads):
     """Duplicate check should prefer UploadedFile filename over legacy source path."""
     app, headers, user, TestingSessionLocal = test_env
@@ -3264,9 +3281,12 @@ def test_check_documents_exist_prefers_uploaded_file_filename(test_env, temp_upl
         ),
     ]
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
-    ) as mock_get_store:
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_get_store,
+        _visible_collections("demo"),
+    ):
         mock_store = mock_get_store.return_value
         mock_store.list_document_records.return_value = records
         response = client.post(
@@ -3285,9 +3305,12 @@ def test_check_documents_exist_accepts_unicode_collection_name(test_env, temp_up
 
     collection_name = "示例知识库集合"
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
-    ) as mock_get_store:
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_get_store,
+        _visible_collections(collection_name),
+    ):
         mock_store = mock_get_store.return_value
         mock_store.list_document_records.return_value = []
 

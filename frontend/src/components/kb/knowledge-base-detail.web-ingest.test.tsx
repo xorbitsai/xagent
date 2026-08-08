@@ -119,10 +119,10 @@ vi.mock("./knowledge-base-document-list", () => ({
 
 import { KnowledgeBaseDetailContent } from "./knowledge-base-detail"
 
-function createJsonResponse(body: unknown, ok = true) {
+function createJsonResponse(body: unknown, ok = true, status?: number) {
   return {
     ok,
-    status: ok ? 200 : 500,
+    status: status ?? (ok ? 200 : 500),
     json: vi.fn().mockResolvedValue(body),
   }
 }
@@ -267,7 +267,8 @@ describe("KnowledgeBaseDetailContent config save", () => {
               detail:
                 "Knowledge base name unavailable: demo. Please choose a different name.",
             },
-            false
+            false,
+            409
           )
         )
       }

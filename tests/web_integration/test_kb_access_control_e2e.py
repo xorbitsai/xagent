@@ -128,10 +128,13 @@ class TestKbAccessControlContract:
         assert "name unavailable" in resp.json()["detail"]
         assert "Access denied" not in resp.json()["detail"]
 
-    def test_documents_check_cross_tenant_returns_409(
+    def test_documents_check_cross_tenant_returns_403(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Duplicate-check names a collection to ingest into: taken name -> 409."""
+        """Duplicate-check is read-only, so a foreign collection is a denial.
+
+        It creates nothing, so it must not answer with a naming-conflict status.
+        """
         t1 = _register_and_login(client, "ac_chk_t1", "pw-c1-", "ac_chk_t1@example.com")
         t2 = _register_and_login(client, "ac_chk_t2", "pw-c2-", "ac_chk_t2@example.com")
 
@@ -144,8 +147,8 @@ class TestKbAccessControlContract:
             json={"filenames": ["any.txt"]},
             headers={"Authorization": f"Bearer {t2}"},
         )
-        assert resp.status_code == 409
-        assert "name unavailable" in resp.json()["detail"]
+        assert resp.status_code == 403
+        assert "Access denied" in resp.json()["detail"]
 
     def test_save_collection_config_cross_tenant_returns_409(
         self, client: TestClient, tmp_path: Path
@@ -172,35 +175,76 @@ class TestKbAccessControlContract:
         assert resp.status_code == 409
         assert "name unavailable" in detail
         assert "Access denied" not in detail
-        # Deliberately vague: never confirm that another tenant owns this name.
+        # The wording claims no ownership. This is not an anti-enumeration
+        # measure: the 409-vs-success distinction already reveals that the name
+        # is taken, whatever the sentence says.
         assert "already exists" not in detail
 
+    @pytest.mark.parametrize(
+        "slug, path, style",
+        [
+            ("f", "/api/kb/ingest", "file"),
+            ("fj", "/api/kb/ingest/jobs", "file"),
+            ("w", "/api/kb/ingest-web", "web"),
+            ("wj", "/api/kb/ingest-web/jobs", "web"),
+            ("c", "/api/kb/ingest-cloud", "cloud"),
+        ],
+    )
     def test_ingest_into_name_taken_by_other_tenant_returns_409(
-        self, client: TestClient, tmp_path: Path
+        self, client: TestClient, tmp_path: Path, slug: str, path: str, style: str
     ) -> None:
-        """The path from #1139: creating a knowledge base by uploading a file.
+        """The path from #1139: creating a knowledge base by importing content.
 
-        ``POST /api/kb/ingest`` is what the creation dialog calls, so this is the
-        request the reporter actually made when a foreign name accused them of an
-        access violation.
+        Every ingest entry point takes ``allow_create=True``, and the creation
+        dialog drives all of them, so each must report a taken name as a conflict
+        rather than accuse the caller of an access violation.
         """
-        t1 = _register_and_login(client, "ac_ing_t1", "pw-i1-", "ac_ing_t1@example.com")
-        t2 = _register_and_login(client, "ac_ing_t2", "pw-i2-", "ac_ing_t2@example.com")
+        t1 = _register_and_login(
+            client, f"ac_ing_{slug}_t1", "pw-i1-", f"ac_ing_{slug}_t1@example.com"
+        )
+        t2 = _register_and_login(
+            client, f"ac_ing_{slug}_t2", "pw-i2-", f"ac_ing_{slug}_t2@example.com"
+        )
 
-        coll = "ac_ingest_foreign_coll"
+        coll = f"ac_ingest_foreign_coll_{slug}"
         sample = _write_sample_txt(tmp_path / "ac_ing.txt")
         _ingest_txt(client, t1, coll, sample)
 
-        with open(sample, "rb") as handle:
+        headers = {"Authorization": f"Bearer {t2}"}
+        if style == "file":
+            with open(sample, "rb") as handle:
+                resp = client.post(
+                    path,
+                    files={"file": (sample.name, handle, "text/plain")},
+                    data={"collection": coll},
+                    headers=headers,
+                )
+        elif style == "web":
             resp = client.post(
-                "/api/kb/ingest",
-                files={"file": (sample.name, handle, "text/plain")},
-                data={"collection": coll},
-                headers={"Authorization": f"Bearer {t2}"},
+                path,
+                data={"collection": coll, "start_url": "https://example.com/docs"},
+                headers=headers,
+            )
+        else:
+            resp = client.post(
+                path,
+                json={
+                    "collection": coll,
+                    "files": [
+                        {
+                            "provider": "google_drive",
+                            "fileId": "file-1",
+                            "fileName": "alpha.pdf",
+                        }
+                    ],
+                },
+                headers=headers,
             )
 
         detail = resp.json()["detail"]
         assert resp.status_code == 409
         assert "name unavailable" in detail
         assert "Access denied" not in detail
+        # Wording only: it does not name an owner. See the note above -- the
+        # status code itself is what discloses that the name exists.
         assert "already exists" not in detail

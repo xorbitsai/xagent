@@ -133,11 +133,6 @@ function isEmbeddingConfigurationError(message: string): boolean {
   )
 }
 
-/** Backend 409 for a taken collection name (``_collection_name_unavailable_detail``). */
-function isNameUnavailableError(message: string): boolean {
-  return message.includes("Knowledge base name unavailable:")
-}
-
 function isRollbackFailure(message: string): boolean {
   return (
     message.startsWith("Failed to fully roll back ingest") ||
@@ -145,15 +140,21 @@ function isRollbackFailure(message: string): boolean {
   )
 }
 
+/**
+ * @param status HTTP status of the failed response, when the caller still has it.
+ *   409 is the backend's only name-conflict code, so classifying on it keeps this
+ *   independent of the English wording the backend happens to use.
+ */
 export function getKnowledgeBaseErrorToastContent(
   message: string,
-  copy: KnowledgeBaseErrorToastCopy
+  copy: KnowledgeBaseErrorToastCopy,
+  status?: number
 ): KnowledgeBaseErrorToastContent {
   const normalized = normalizeMessage(message)
   const originalError = extractOriginalIngestionError(normalized)
   const rootCause = originalError ?? normalized
 
-  if (isNameUnavailableError(rootCause)) {
+  if (status === 409) {
     return {
       title: copy.nameUnavailableTitle,
       description: copy.nameUnavailableDescription,

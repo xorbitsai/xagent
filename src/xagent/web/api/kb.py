@@ -3494,6 +3494,9 @@ async def _ensure_collection_access(
       403 when ``hide_missing`` is True.
     - If ``list_collections`` returns ``status != "success"``, raise 503 (do not
       infer access from an empty list after a storage read failure).
+    - ``hide_missing`` wins over ``allow_create``: it short-circuits to 403 before
+      the global lookup, so a caller passing both never reaches the 409 branch.
+      No caller passes both today.
     """
     if bool(user.is_admin):
         return
@@ -6653,7 +6656,9 @@ async def check_documents_exist_api(
         if not requested:
             return {"existing_filenames": []}
 
-        await _ensure_collection_access(safe_collection, _user, allow_create=True)
+        # Read-only duplicate check: it names nothing, so it must not report a
+        # naming conflict. Only an existing collection's detail page calls it.
+        await _ensure_collection_access(safe_collection, _user)
 
         # Fetch document records through the API compatibility boundary.
         records = list_document_records(

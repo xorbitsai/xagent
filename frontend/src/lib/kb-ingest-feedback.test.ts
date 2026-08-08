@@ -29,16 +29,41 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     })
   })
 
-  it("maps a taken collection name to actionable copy without leaking the raw detail", () => {
+  it("maps a 409 to actionable copy without leaking the raw detail", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test. Please choose a different name.",
-      COPY
+      COPY,
+      409
     )
 
     expect(result).toEqual({
       title: COPY.nameUnavailableTitle,
       description: COPY.nameUnavailableDescription,
     })
+  })
+
+  it("classifies a 409 by status alone, whatever wording the backend sends", () => {
+    // The rename endpoint has its own conflict message; nothing may depend on
+    // the English prose of either one.
+    const result = getKnowledgeBaseErrorToastContent(
+      "Target collection already exists: test",
+      COPY,
+      409
+    )
+
+    expect(result).toEqual({
+      title: COPY.nameUnavailableTitle,
+      description: COPY.nameUnavailableDescription,
+    })
+  })
+
+  it("does not treat the conflict wording as a conflict without a 409", () => {
+    const result = getKnowledgeBaseErrorToastContent(
+      "Knowledge base name unavailable: test. Please choose a different name.",
+      COPY
+    )
+
+    expect(result.title).toBe(COPY.genericTitle)
   })
 
   it("keeps rollback toasts concise while preserving rollback context", () => {

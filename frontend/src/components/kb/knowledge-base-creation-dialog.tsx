@@ -358,6 +358,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     }
 
     setIsUploading(true)
+    // Classify on the status code, not on the backend's English wording.
+    let failedStatus: number | undefined
     setUploadProgress(0)
     setUploadProgressDetail(null)
     setIngestionResults([])
@@ -395,6 +397,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         const parsed = await parseApiResponse(response)
 
         if (!response.ok) {
+          failedStatus = response.status
           const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
           if (errorData.status === 'error') {
             setIngestionResults(prev => [
@@ -481,7 +484,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const rawMessage = err instanceof Error ? err.message : t("kb.errors.uploadFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.errors.uploadFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.errors.uploadFailed")),
+        failedStatus
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -504,6 +508,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     }
 
     setIsWebIngesting(true)
+    let failedStatus: number | undefined
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
 
@@ -553,6 +558,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       setWebIngestionProgress(50)
 
       if (!response.ok) {
+        failedStatus = response.status
         const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
         if (errorData.status === 'error') {
           setWebIngestionResult(errorData as unknown as WebIngestionResult)
@@ -611,7 +617,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const rawMessage = err instanceof Error ? err.message : t("kb.errors.webIngestFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.errors.webIngestFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.errors.webIngestFailed")),
+        failedStatus
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -626,6 +633,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     if (totalCloudFiles === 0) return
 
     setIsCloudConnecting(true)
+    let failedStatus: number | undefined
     setIngestionResults([])
 
     try {
@@ -685,6 +693,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const parsed = await parseApiResponse(response)
 
       if (!response.ok) {
+        failedStatus = response.status
         const errorMessage = getUploadErrorMessage(response, parsed, {
           generic: t("kb.errors.cloudIngestFailed") || "Cloud ingest failed",
           ...UPLOAD_ERROR_MESSAGES,
@@ -737,7 +746,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         getKnowledgeBaseToastCopy(
           t,
           t("kb.errors.cloudIngestFailed")
-        )
+        ),
+        failedStatus
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

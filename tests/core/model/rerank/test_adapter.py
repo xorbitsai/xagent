@@ -37,6 +37,14 @@ def test_create_rerank_model_routes_to_dashscope():
     assert isinstance(model, DashscopeRerank)
 
 
+def test_dashscope_model_receives_the_configured_timeout():
+    config = _config("dashscope")
+    config.timeout = 7.5
+    model = _create_rerank_model(config)
+    assert isinstance(model, DashscopeRerank)
+    assert model.timeout == 7.5
+
+
 def test_create_rerank_model_default_provider_is_dashscope():
     # ``RerankModelConfig`` defaults to "dashscope".
     config = RerankModelConfig(

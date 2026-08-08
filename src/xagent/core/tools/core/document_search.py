@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from ....config import get_kb_search_timeout_seconds
 from .RAG_tools.core.schemas import ListCollectionsResult
 from .RAG_tools.management.collections import list_collections
 from .RAG_tools.pipelines.document_search import run_document_search
@@ -343,6 +344,11 @@ async def _search_knowledge_base_impl(
             "top_k": tool_args.top_k,
             "min_score": tool_args.min_score,
             "merge_results": True,
+            # Retrieval must not build indexes: create_index() commits to the
+            # LanceDB table, and searching collections concurrently can now race
+            # that commit (see collection_manager's CommitConflict note).
+            # Indexes are built during ingestion, which is where they belong.
+            "readonly": True,
         }
 
         if tool_args.embedding_model_id:
@@ -353,6 +359,7 @@ async def _search_knowledge_base_impl(
         collection_errors: list[str] = []
         collection_warnings: list[str] = []
         total_searched = 0
+        search_timeout_seconds = get_kb_search_timeout_seconds()
 
         async def _search_one(
             collection_info: Any,
@@ -381,15 +388,22 @@ async def _search_knowledge_base_impl(
 
                 # run_document_search is a blocking sync pipeline; running it
                 # inline would pin the event loop for the whole retrieval.
-                result = await asyncio.to_thread(
-                    run_document_search,
-                    collection=collection_name,
-                    query_text=tool_args.query,
-                    config=search_config,
-                    user_id=storage_user_id if storage_user_id is not None else user_id,
-                    is_admin=False
-                    if getattr(collection_info, "ownership", "personal") == "team"
-                    else is_admin,
+                # The deadline frees this caller but not the worker: a timed-out
+                # to_thread call keeps running in the shared default executor.
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        run_document_search,
+                        collection=collection_name,
+                        query_text=tool_args.query,
+                        config=search_config,
+                        user_id=storage_user_id
+                        if storage_user_id is not None
+                        else user_id,
+                        is_admin=False
+                        if getattr(collection_info, "ownership", "personal") == "team"
+                        else is_admin,
+                    ),
+                    timeout=search_timeout_seconds,
                 )
 
                 if result.status not in {"success", "partial_success"}:
@@ -423,6 +437,19 @@ async def _search_knowledge_base_impl(
                     results.append(res_dict)
                 return results, None, warning, collection_info.documents
 
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Search of collection '%s' exceeded %ss",
+                    collection_name,
+                    search_timeout_seconds,
+                )
+                return (
+                    [],
+                    f"{collection_name}: search timed out after "
+                    f"{search_timeout_seconds}s",
+                    None,
+                    0,
+                )
             except Exception as e:
                 logger.warning(f"Failed to search collection '{collection_name}': {e}")
                 return [], f"{collection_name}: {e}", None, 0

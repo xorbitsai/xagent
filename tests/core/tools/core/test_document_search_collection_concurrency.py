@@ -50,12 +50,17 @@ def _pipeline_result(collection: str, **overrides: Any) -> SearchPipelineResult:
     return SearchPipelineResult(**payload)
 
 
-def _install_collections(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+def _install_collections(
+    monkeypatch: pytest.MonkeyPatch, *names: str, embeddings: int = 10
+) -> None:
     async def _list(
         user_id: int | None = None, is_admin: bool = False
     ) -> ListCollectionsResult:
         del user_id, is_admin
-        return _collections(*names)
+        listing = _collections(*names)
+        for collection in listing.collections:
+            collection.embeddings = embeddings
+        return listing
 
     monkeypatch.setattr(document_search, "_list_visible_collections", _list)
 
@@ -80,30 +85,39 @@ async def test_collections_are_searched_concurrently_off_the_event_loop(
     def blocking_search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
         with lock:
             worker_thread_ids.add(threading.get_ident())
-        # Only passes if all three searches are simultaneously in flight.
+        # Passing the barrier needs three OS threads resident at once, which is
+        # only possible if the loop dispatched all three without blocking on any.
         barrier.wait()
         return _pipeline_result(collection)
 
     monkeypatch.setattr(document_search, "run_document_search", blocking_search)
 
-    ticks = 0
-
-    async def tick() -> None:
-        nonlocal ticks
-        while True:
-            ticks += 1
-            await asyncio.sleep(0)
-
-    ticker = asyncio.create_task(tick())
-    try:
-        result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
-    finally:
-        ticker.cancel()
+    result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
 
     assert len(result.results) == 3
-    # The loop stayed responsive while the blocking pipeline ran.
-    assert ticks > 0
     assert loop_thread_id not in worker_thread_ids
+
+
+@pytest.mark.asyncio
+async def test_search_runs_readonly_so_retrieval_never_builds_an_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent retrieval must not reach create_index's LanceDB commit."""
+    _install_collections(monkeypatch, "alpha", "beta")
+    configs: list[dict[str, Any]] = []
+
+    def search(
+        *, collection: str, config: dict[str, Any], **_kwargs: Any
+    ) -> SearchPipelineResult:
+        configs.append(config)
+        return _pipeline_result(collection)
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    await document_search._search_knowledge_base_impl(_args(), user_id=1)
+
+    assert len(configs) == 2
+    assert all(config["readonly"] is True for config in configs)
 
 
 @pytest.mark.asyncio
@@ -121,8 +135,12 @@ async def test_one_failing_collection_does_not_drop_the_others(
                 collection, status="error", results=[], result_count=0, message="nope"
             )
         if collection == "warned":
+            # Empty message so the warnings list itself has to reach the summary.
             return _pipeline_result(
-                collection, status="partial_success", warnings=["fell back to vector"]
+                collection,
+                status="partial_success",
+                message="",
+                warnings=["fell back to sparse"],
             )
         return _pipeline_result(collection)
 
@@ -133,7 +151,7 @@ async def test_one_failing_collection_does_not_drop_the_others(
     assert [entry.collection for entry in result.results] == ["alpha", "warned"]
     assert "boom: connection reset" in result.summary
     assert "status_error: nope" in result.summary
-    assert "warned: ok" in result.summary
+    assert "warned: fell back to sparse" in result.summary
 
 
 @pytest.mark.asyncio
@@ -141,7 +159,6 @@ async def test_aggregation_order_totals_and_empty_collections_are_preserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Order follows the collection list and zero-embedding collections are skipped."""
-    _install_collections(monkeypatch, "alpha", "empty", "beta")
 
     async def _list(
         user_id: int | None = None, is_admin: bool = False
@@ -170,3 +187,125 @@ async def test_aggregation_order_totals_and_empty_collections_are_preserved(
     assert [entry.collection for entry in result.results] == ["alpha", "beta"]
     # total_searched counts documents of the two non-empty collections only.
     assert result.summary.startswith("Found 2 relevant results from 6 documents")
+
+
+@pytest.mark.asyncio
+async def test_every_collection_filtered_out_fans_out_to_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An all-empty listing must gather zero tasks, not fail on the empty fan-out."""
+    _install_collections(monkeypatch, "alpha", "beta", embeddings=0)
+
+    def search(**_kwargs: Any) -> SearchPipelineResult:
+        raise AssertionError("collections without embeddings must not be searched")
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
+
+    assert result.results == []
+    assert result.summary.startswith("No relevant documents found")
+    assert "Searched 0 documents" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_all_collections_failing_returns_the_errors_only_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no survivor the summary is the errors branch, not the no-results one."""
+    _install_collections(monkeypatch, "alpha", "beta")
+
+    def search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
+        raise RuntimeError(f"{collection} is down")
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
+
+    assert result.results == []
+    assert result.summary.startswith("Knowledge base search failed for one or more")
+    assert "alpha: alpha is down" in result.summary
+    assert "beta: beta is down" in result.summary
+    assert "No relevant documents found" not in result.summary
+
+
+@pytest.mark.asyncio
+async def test_warnings_survive_when_no_collection_returns_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warning from an empty-result collection still reaches the summary."""
+    _install_collections(monkeypatch, "alpha")
+
+    def search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
+        return _pipeline_result(
+            collection,
+            status="partial_success",
+            results=[],
+            result_count=0,
+            message="",
+            warnings=["index still building"],
+        )
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
+
+    assert result.results == []
+    assert result.summary.startswith("No relevant documents found")
+    assert "Warnings: alpha: index still building" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_collection_times_out_without_holding_the_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-collection deadline bounds the fan-out and spares its siblings."""
+    _install_collections(monkeypatch, "stuck", "fast")
+    monkeypatch.setattr(document_search, "get_kb_search_timeout_seconds", lambda: 0.2)
+    release = threading.Event()
+
+    def search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
+        if collection == "stuck":
+            release.wait(10)
+        return _pipeline_result(collection)
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    started = time.perf_counter()
+    try:
+        result = await document_search._search_knowledge_base_impl(_args(), user_id=1)
+    finally:
+        release.set()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 5
+    assert [entry.collection for entry in result.results] == ["fast"]
+    assert "stuck: search timed out after 0.2s" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_fan_out_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the caller must cancel the gather, not surface a partial result."""
+    _install_collections(monkeypatch, "alpha", "beta")
+    started = threading.Event()
+    release = threading.Event()
+
+    def search(*, collection: str, **_kwargs: Any) -> SearchPipelineResult:
+        started.set()
+        release.wait(10)
+        return _pipeline_result(collection)
+
+    monkeypatch.setattr(document_search, "run_document_search", search)
+
+    task = asyncio.create_task(
+        document_search._search_knowledge_base_impl(_args(), user_id=1)
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()

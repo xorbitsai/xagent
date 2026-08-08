@@ -61,6 +61,7 @@ FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFI
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
+KB_SEARCH_TIMEOUT_SECONDS = "XAGENT_KB_SEARCH_TIMEOUT_SECONDS"
 DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
@@ -1967,6 +1968,32 @@ def get_kb_collections_timeout_seconds() -> int:
         Per-scan timeout in seconds
     """
     return _get_positive_int_env(KB_COLLECTIONS_TIMEOUT_SECONDS, 30)
+
+
+def get_kb_search_timeout_seconds() -> int:
+    """Get the deadline for searching a single knowledge base collection.
+
+    Bounds one ``run_document_search`` call so an agent's knowledge_search does
+    not wait forever on a stuck backend. The collections of one search run
+    concurrently, so each of them holds a shared default-executor worker for as
+    long as it runs; without a deadline an agent bound to N knowledge bases can
+    pin N workers indefinitely. The default is generous because the budget has
+    to cover embedding the query, the LanceDB scan and an optional rerank round
+    trip - the rerank HTTP client has no timeout of its own.
+
+    Known limitation, same as the collection listing endpoint: cancelling the
+    ``asyncio.wait_for`` coroutine does not stop the underlying ``to_thread``
+    worker, so a timed-out search keeps running to completion in the default
+    executor. The deadline frees the caller, not the worker.
+
+    Priority:
+        1. XAGENT_KB_SEARCH_TIMEOUT_SECONDS environment variable
+        2. Default of 60 seconds
+
+    Returns:
+        Per-collection search timeout in seconds
+    """
+    return _get_positive_int_env(KB_SEARCH_TIMEOUT_SECONDS, 60)
 
 
 def get_default_sqlite_db_path() -> str:

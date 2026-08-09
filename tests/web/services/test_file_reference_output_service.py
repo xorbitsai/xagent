@@ -385,6 +385,58 @@ def test_reconcile_skips_label_rewrite_for_filename_with_control_chars():
         db.close()
 
 
+def test_reconcile_rewrites_label_for_image_syntax_video_reference():
+    # A model may wrap a video in image syntax. The frontend's image
+    # renderer resolves the preview kind from the label, so restoring the
+    # filename there turns a would-be broken <img> into a video player.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="![预览视频](file:real-id)",
+        )
+
+        assert content == "![generated_video.mp4](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_keeps_alt_text_for_image_syntax_image_reference():
+    # Genuine image references keep their (possibly descriptive) alt text —
+    # only video/audio labels are restored.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="chart.png",
+            mime_type="image/png",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="![季度收入图表](file:real-id)",
+        )
+
+        assert content == "![季度收入图表](file:real-id)"
+    finally:
+        db.close()
+
+
 def test_reconcile_rewrites_empty_label_to_filename_for_media():
     db, user, task = _create_context()
     try:

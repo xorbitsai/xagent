@@ -42,11 +42,12 @@ const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
  * but a spinner with no recovery path is worse than attempting the
  * anonymous endpoint.
  *
- * When the policy's authenticated route resolves to the same URL as the
- * public inline route — the public widget/share policy carries its token in
- * the query string — the URL is handed to the media element directly
- * instead: a blob fetch would add no authorization there, and skipping it
- * preserves HTTP range requests for progressive audio/video playback.
+ * A policy that declares ``requiresBlobFetch: false`` (the public
+ * widget/share policy carries its guest token in the query string) hands
+ * the URL to the media element directly instead: a blob fetch would add no
+ * authorization there, and skipping it preserves HTTP range requests for
+ * progressive audio/video playback. Policies that do not declare the
+ * capability get the conservative blob path, which works everywhere.
  */
 function useResolvedMediaUrl(
   source: InlineFilePreviewSource,
@@ -54,7 +55,7 @@ function useResolvedMediaUrl(
   fileAccess: FileAccessPolicy
 ): string {
   const fileId = source.fileId
-  const needsBlobFetch = Boolean(fileId) && fileAccess.previewUrl(fileId!) !== previewUrl
+  const needsBlobFetch = Boolean(fileId) && (fileAccess.requiresBlobFetch ?? true)
   const [resolvedUrl, setResolvedUrl] = useState(needsBlobFetch ? '' : previewUrl)
 
   useEffect(() => {
@@ -173,14 +174,20 @@ function InlineMediaPreview({
   icon: React.ComponentType<{ className?: string }>
   bodyClassName: string
   spinnerClassName: string
-  renderMedia: (resolvedUrl: string, onError: () => void) => React.ReactNode
+  renderMedia: (
+    resolvedUrl: string,
+    media: { onError: () => void; onLoaded: () => void }
+  ) => React.ReactNode
 }) {
   const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
   const [failedUrl, setFailedUrl] = useState('')
-  // Terminal failure only: useResolvedMediaUrl already falls back from the
-  // authenticated fetch to the public preview URL, so an error event from
-  // the media element means both paths are exhausted. Keyed by URL so a
-  // later successful re-resolve (e.g. blob after fallback) clears it.
+  const [loadedUrl, setLoadedUrl] = useState('')
+  // Terminal load failure only: useResolvedMediaUrl already falls back from
+  // the authenticated fetch to the public preview URL, so an error event
+  // from a media element that never loaded data means both paths are
+  // exhausted. Errors after data has loaded (e.g. a mid-playback decode
+  // hiccup) keep the player mounted — the element surfaces those itself.
+  // Keyed by URL so a later re-resolve clears the failure.
   const failed = Boolean(resolvedUrl) && failedUrl === resolvedUrl
 
   return (
@@ -210,7 +217,12 @@ function InlineMediaPreview({
       ) : (
         <div className={bodyClassName}>
           {resolvedUrl ? (
-            renderMedia(resolvedUrl, () => setFailedUrl(resolvedUrl))
+            renderMedia(resolvedUrl, {
+              onError: () => {
+                if (loadedUrl !== resolvedUrl) setFailedUrl(resolvedUrl)
+              },
+              onLoaded: () => setLoadedUrl(resolvedUrl),
+            })
           ) : (
             <div
               className={cn(
@@ -227,7 +239,7 @@ function InlineMediaPreview({
   )
 }
 
-function InlineAudioPreview(props: {
+type MediaWrapperProps = {
   source: InlineFilePreviewSource
   previewUrl: string
   filename: string
@@ -235,7 +247,9 @@ function InlineAudioPreview(props: {
   loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
-}) {
+}
+
+function InlineAudioPreview(props: MediaWrapperProps) {
   const { filename } = props
   return (
     <InlineMediaPreview
@@ -243,7 +257,7 @@ function InlineAudioPreview(props: {
       icon={Volume2}
       bodyClassName="p-3"
       spinnerClassName="h-14"
-      renderMedia={(resolvedUrl, onError) => (
+      renderMedia={(resolvedUrl, { onError, onLoaded }) => (
         <audio
           controls
           preload="metadata"
@@ -252,21 +266,14 @@ function InlineAudioPreview(props: {
           aria-label={filename}
           title={filename}
           onError={onError}
+          onLoadedData={onLoaded}
         />
       )}
     />
   )
 }
 
-function InlineVideoPreview(props: {
-  source: InlineFilePreviewSource
-  previewUrl: string
-  filename: string
-  openLabel: string
-  loadErrorText: string
-  className?: string
-  fileAccess: FileAccessPolicy
-}) {
+function InlineVideoPreview(props: MediaWrapperProps) {
   const { filename } = props
   return (
     <InlineMediaPreview
@@ -274,7 +281,7 @@ function InlineVideoPreview(props: {
       icon={Video}
       bodyClassName="flex items-center justify-center bg-black/95 p-2"
       spinnerClassName="h-40 w-full"
-      renderMedia={(resolvedUrl, onError) => (
+      renderMedia={(resolvedUrl, { onError, onLoaded }) => (
         <video
           controls
           playsInline
@@ -284,6 +291,7 @@ function InlineVideoPreview(props: {
           aria-label={filename}
           title={filename}
           onError={onError}
+          onLoadedData={onLoaded}
         />
       )}
     />

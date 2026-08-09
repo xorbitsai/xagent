@@ -393,6 +393,29 @@ describe('InlineFilePreview', () => {
     expect(screen.getByRole('link', { name: 'Open' })).toBeInTheDocument()
   })
 
+  it('keeps the player mounted when an error follows successful loading', async () => {
+    // A mid-playback decode hiccup fires the same native error event as a
+    // load failure; once data has loaded the element surfaces the problem
+    // itself and must not be replaced by the terminal error state.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    fireEvent.loadedData(video)
+    fireEvent.error(video)
+
+    expect(screen.getByLabelText('clip.mp4')).toBeInTheDocument()
+    expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
+  })
+
   it('renders a video link with a filename extension as an inline video preview', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

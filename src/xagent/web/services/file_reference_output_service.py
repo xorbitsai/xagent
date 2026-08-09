@@ -162,11 +162,12 @@ def reconcile_assistant_file_references(
 
         display_label = label
         filename = str(record.filename or "")
-        if (
-            not prefix
-            and _is_inline_preview_media(filename)
-            and not _UNSAFE_LABEL_RE.search(filename)
-        ):
+        # Applies to ``![...]`` references too: _is_inline_preview_media only
+        # matches video/audio, so genuine image alt text is never touched,
+        # while a model that wraps a video in image syntax still gets a label
+        # the frontend can classify (its image renderer resolves the preview
+        # kind from the label and would otherwise fall back to a broken img).
+        if _is_inline_preview_media(filename) and not _UNSAFE_LABEL_RE.search(filename):
             suffix = Path(filename).suffix.casefold()
             if suffix and not label.strip().casefold().endswith(suffix):
                 display_label = filename

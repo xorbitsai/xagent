@@ -787,6 +787,21 @@ describe('MarkdownRenderer', () => {
     })
   })
 
+  it('renders image-syntax video references as an inline video preview', async () => {
+    // The backend restores the filename as the label even for ![...] refs
+    // pointing at media files; the image renderer then resolves the video
+    // kind from the label instead of falling back to a broken <img>.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content = '![puppy_drinking.mp4](file:550e8400-e29b-41d4-a716-446655440000)'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('puppy_drinking.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+  })
+
   it('renders file links as image previews when the path has an image extension', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

@@ -276,6 +276,7 @@ def test_expression_dimension_is_actually_compared() -> None:
         "checks": {"ck_x": "active_slot IS NULL OR active_slot = 1"},
         "unique": {},
         "foreign_keys": {},
+        "primary_key": {},
         "indexes": {"unique": {}, "nonunique": {}},
         "columns": {},
     }

@@ -64,14 +64,30 @@ class TaskInteractionRequest(Base):  # type: ignore
     ``superseded_by_legacy_resume`` must not come back.
 
     Clock source for ``ck_task_interaction_requests_expiry_after_creation``:
-    ``created_at`` is bound by ``server_default=func.now()``, the
-    database's transaction-start clock,
-    so the direction of the comparison is safe -- truncation can only make
-    ``created_at`` earlier, never later. That said, SQLite's
-    ``CURRENT_TIMESTAMP`` only has second precision, so once a TTL shrinks to
-    sub-second granularity this CHECK stops protecting against a
-    zero-or-negative TTL on SQLite specifically; this needs revisiting before
-    any such TTL ships.
+    ``created_at`` is bound by ``server_default=func.now()`` and never from
+    Python, matching every other ``created_at`` in this package. That is
+    PostgreSQL's transaction-start clock and SQLite's per-statement
+    ``CURRENT_TIMESTAMP``; both can only place ``created_at`` at or before
+    the row's real insert instant, never after, so the CHECK never rejects
+    a legitimately positive TTL. The price of that direction-safety is that
+    this CHECK only pins the *sign* of the TTL -- it is not a guarantee
+    that a stored row is unexpired, and each backend leaves a measured
+    slack. PostgreSQL compares real ``timestamptz(6)`` values, but
+    ``now()`` does not advance inside an open transaction, so an inversion
+    smaller than the writing transaction's age is admitted. SQLite stores
+    ``DateTime`` as text: ``CURRENT_TIMESTAMP`` writes
+    ``"YYYY-MM-DD HH:MM:SS"`` with no fractional part while a Python-bound
+    ``expires_at`` writes ``"YYYY-MM-DD HH:MM:SS.ffffff"``, and the
+    lexicographic comparison makes the shorter string a prefix of the
+    longer one -- exactly as if ``created_at`` were truncated down to the
+    second, so any ``expires_at`` inside the insert's own wall-clock second
+    is admitted, including a zero or negative TTL of up to one second.
+    Neither slack is reachable at the minute-scale TTLs this table exists
+    for: a 15-minute inversion is rejected on both backends. The writing
+    primitive must still reject a non-positive TTL in plain Python before
+    it reaches SQL -- the same division of labour as the deleted
+    run-partition CHECK below -- and that obligation must be settled
+    before any sub-second TTL ships.
 
     ``expires_at`` must always be bound as an aware **UTC** datetime by the
     caller -- that obligation is portable, not SQLite-specific. Neither

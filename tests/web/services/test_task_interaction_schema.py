@@ -472,15 +472,13 @@ def test_responder_identity_pairs_responded_at_both_ways(db_session, fixtures) -
 
 
 def test_expiry_must_be_after_creation(db_session, fixtures) -> None:
-    """Contract N5's clock source: created_at is bound by
-    server_default=func.now(), the transaction-start clock, so truncation
-    can only make created_at earlier, never later -- the comparison
-    direction is safe. Both created_at and expires_at are bound explicitly
-    here to make the equal/before cases deterministic rather than racing
-    against the server's own clock. SQLite's CURRENT_TIMESTAMP is
-    second-precision, so this CHECK stops protecting against a
-    zero-or-negative TTL once a TTL shrinks below one second on SQLite
-    specifically -- see the model's class docstring.
+    """The CHECK pins the sign of the TTL, not row freshness. Both
+    created_at and expires_at are bound explicitly here, which makes the
+    equal/before cases deterministic and keeps the assertion independent
+    of the server-default format: a server-written created_at carries no
+    fractional seconds on SQLite while a Python bind does, and that
+    mixed-format comparison admits an inversion of up to one second --
+    see the model's class docstring for the per-backend slack.
     """
     task_id, anchor_id = fixtures
     fixed = datetime(2026, 1, 1, tzinfo=timezone.utc)

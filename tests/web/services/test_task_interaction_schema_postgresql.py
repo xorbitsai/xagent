@@ -614,7 +614,7 @@ def test_deleting_responder_user_sets_null_and_keeps_identity(
 
 
 def test_response_payload_none_lands_as_sql_null(db_session, fixtures) -> None:
-    """Contract N1 -- see the SQLite half."""
+    """Expiry is only authoritative for reclaim -- see the SQLite half."""
     task_id, anchor_id = fixtures
     none_row = assert_accepted(
         db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)

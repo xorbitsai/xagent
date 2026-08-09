@@ -47,12 +47,16 @@ class TaskInteractionRequest(Base):  # type: ignore
     historical wear); active rows make SET NULL collide with a CHECK, which
     behaves like RESTRICT.
 
-    ``response_payload`` uses ``JSON(none_as_null=True)`` -- the only column
-    in the repository with that flag -- so a Python ``None`` lands as SQL
-    NULL instead of the JSON scalar ``null``. Consumers must test "has this
-    request been answered" with SQL ``IS NULL``, never with
+    ``JSON(none_as_null=True)`` is confined to this table, carried by both of
+    its JSON columns. ``response_payload`` uses it so a Python ``None`` lands
+    as SQL NULL instead of the JSON scalar ``null``: consumers must test "has
+    this request been answered" with SQL ``IS NULL``, never with
     ``payload is None`` in Python, since a legitimate JSON ``null`` answer
-    value must still read as answered.
+    value must still read as answered. ``request_payload`` uses it so its
+    ``NOT NULL`` constraint actually fires on a Python ``None`` -- without
+    the flag, serialization runs before binding and a Python ``None`` would
+    reach the column as the JSON text ``null``, which ``NOT NULL`` does not
+    reject.
 
     ``terminal_reason`` vocabulary: each of the three members is spoken for
     by exactly one intended writer, and none of those writers exists yet.
@@ -281,10 +285,14 @@ class TaskInteractionRequest(Base):  # type: ignore
     # Frozen at ask time from task.source, falling back to "internal".
     origin = Column(String(20), nullable=False)
 
-    request_payload = Column(JSON, nullable=False)  # NOT NULL: no none_as_null needed
-    # The only none_as_null=True column in the repository (see class
-    # docstring): lets consumers tell "no answer yet" (SQL NULL) apart from
-    # "answered with a JSON null value" using SQL IS NULL.
+    # NOT NULL alone cannot stop a Python None: JSON serialization runs
+    # before binding, so None would land as the JSON text 'null'. none_as_null
+    # makes it a real SQL NULL, and the NOT NULL fires.
+    request_payload = Column(JSON(none_as_null=True), nullable=False)
+    # The flag is confined to this table and carried by both of its JSON
+    # columns (see class docstring): response_payload uses it to tell "no
+    # answer yet" from "answered with JSON null", request_payload uses it so
+    # NOT NULL actually fires.
     response_payload = Column(JSON(none_as_null=True), nullable=True)
 
     request_idempotency_key = Column(

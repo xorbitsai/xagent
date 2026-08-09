@@ -789,6 +789,26 @@ def test_response_payload_none_lands_as_sql_null(db_session, fixtures) -> None:
     assert nested_null_row.response_payload == {"answer": None}
 
 
+def test_request_payload_none_is_rejected(db_session, fixtures) -> None:
+    """request_payload is NOT NULL, and JSON(none_as_null=True) is what
+    makes that constraint actually fire on a Python None -- without the
+    flag, serialization runs before binding and None would reach the column
+    as the JSON text 'null', which NOT NULL does not reject (see the model's
+    class docstring). Not routed through assert_rejected: this is a column
+    NOT NULL violation, not a named CHECK, so there is no constraint name
+    for that helper to match against.
+    """
+    task_id, anchor_id = fixtures
+    row = make_row(
+        task_id=task_id, resume_trace_event_id=anchor_id, request_payload=None
+    )
+    obj = TaskInteractionRequest(**row)
+    db_session.add(obj)
+    with pytest.raises(IntegrityError, match="NOT NULL constraint failed"):
+        db_session.commit()
+    db_session.rollback()
+
+
 def test_expires_at_round_trips_as_utc(db_session, fixtures) -> None:
     """A caller-bound aware UTC expires_at must round-trip to the same wall-
     clock instant.
@@ -868,15 +888,17 @@ def test_table_is_registered_in_metadata() -> None:
     assert "task_interaction_requests" in models.Base.metadata.tables
 
 
-def test_response_payload_is_the_only_none_as_null_column() -> None:
-    """Pins the class docstring's claim that response_payload is the only
-    column in the repository using JSON(none_as_null=True).
+def test_none_as_null_is_confined_to_this_table() -> None:
+    """Pins the class docstring's claim that JSON(none_as_null=True) is
+    confined to this table, carried by both of its JSON columns.
 
     Imports xagent.web.models first (same reason as
     test_table_is_registered_in_metadata above) so every model's table is
     actually registered on Base.metadata before this walks it. Only JSON
     type instances carry a none_as_null attribute at all, so the getattr
-    default guards every other column type instead of assuming JSON.
+    default guards every other column type instead of assuming JSON. This is
+    a guard, not a preference: no OTHER table may quietly adopt the flag
+    without this test catching it.
     """
     import xagent.web.models as models
 
@@ -886,7 +908,10 @@ def test_response_payload_is_the_only_none_as_null_column() -> None:
         for column in table.columns
         if getattr(column.type, "none_as_null", False)
     }
-    assert none_as_null_columns == {("task_interaction_requests", "response_payload")}
+    assert none_as_null_columns == {
+        ("task_interaction_requests", "request_payload"),
+        ("task_interaction_requests", "response_payload"),
+    }
 
 
 def test_created_columns_match_the_frozen_shape(db_session) -> None:

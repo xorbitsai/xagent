@@ -708,6 +708,24 @@ def test_response_payload_none_lands_as_sql_null(db_session, fixtures) -> None:
     assert nested_null_row.response_payload == {"answer": None}
 
 
+def test_request_payload_none_is_rejected(db_session, fixtures) -> None:
+    """request_payload is NOT NULL, and JSON(none_as_null=True) is what
+    makes that constraint actually fire on a Python None -- see the SQLite
+    half and the model's class docstring. Not routed through
+    assert_rejected: this is a column NOT NULL violation, not a named
+    CHECK, so there is no constraint name for that helper to match against.
+    """
+    task_id, anchor_id = fixtures
+    row = make_row(
+        task_id=task_id, resume_trace_event_id=anchor_id, request_payload=None
+    )
+    obj = TaskInteractionRequest(**row)
+    db_session.add(obj)
+    with pytest.raises(IntegrityError, match="violates not-null constraint"):
+        db_session.commit()
+    db_session.rollback()
+
+
 def test_expires_at_round_trips_as_utc(db_session, fixtures) -> None:
     """PostgreSQL normalizes a non-UTC-but-aware value to the correct UTC
     instant instead of storing it verbatim (contrast the SQLite half, where

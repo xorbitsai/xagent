@@ -491,55 +491,57 @@ def test_terminated_status_and_terminated_at_are_paired_both_ways(
     )
 
 
-def test_answered_requires_response_payload(db_session, fixtures) -> None:
+def test_answered_status_and_response_payload_are_paired_both_ways(
+    db_session, fixtures
+) -> None:
+    """status='answered' iff response_payload IS NOT NULL, both directions."""
     task_id, anchor_id = fixtures
-    row = make_row(
-        task_id=task_id,
-        resume_trace_event_id=anchor_id,
-        status="answered",
-        response_payload=None,
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
+            response_payload=None,
+        ),
+        "ck_task_interaction_requests_response_pairs_status",
     )
     assert_rejected(
-        db_session, row, "ck_task_interaction_requests_answered_pairs_response"
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            response_payload={"stray": "value"},
+        ),
+        "ck_task_interaction_requests_response_pairs_status",
     )
 
 
-def test_unanswered_rejects_response_payload(db_session, fixtures) -> None:
+def test_answered_status_and_responded_at_are_paired_both_ways(
+    db_session, fixtures
+) -> None:
+    """status='answered' iff responded_at IS NOT NULL, both directions."""
     task_id, anchor_id = fixtures
-    row = make_row(
-        task_id=task_id,
-        resume_trace_event_id=anchor_id,
-        response_payload={"stray": "value"},
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
+            responded_at=None,
+            responder_identity=None,
+        ),
+        "ck_task_interaction_requests_responded_at_pairs_status",
     )
     assert_rejected(
-        db_session, row, "ck_task_interaction_requests_unanswered_has_no_response"
-    )
-
-
-def test_answered_requires_responded_at(db_session, fixtures) -> None:
-    task_id, anchor_id = fixtures
-    row = make_row(
-        task_id=task_id,
-        resume_trace_event_id=anchor_id,
-        status="answered",
-        responded_at=None,
-        responder_identity=None,
-    )
-    assert_rejected(
-        db_session, row, "ck_task_interaction_requests_answered_pairs_responded_at"
-    )
-
-
-def test_unanswered_rejects_responded_at(db_session, fixtures) -> None:
-    task_id, anchor_id = fixtures
-    row = make_row(
-        task_id=task_id,
-        resume_trace_event_id=anchor_id,
-        responded_at=datetime.now(timezone.utc),
-        responder_identity="user:1",
-    )
-    assert_rejected(
-        db_session, row, "ck_task_interaction_requests_unanswered_has_no_responded_at"
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            responded_at=datetime.now(timezone.utc),
+            responder_identity="user:1",
+        ),
+        "ck_task_interaction_requests_responded_at_pairs_status",
     )
 
 

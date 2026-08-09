@@ -212,7 +212,9 @@ class TaskInteractionRequest(Base):  # type: ignore
         # column in it can be unilaterally cleared by some FK's
         # ON DELETE SET NULL. The only columns affected by SET NULL on this
         # table are resume_trace_event_id and responder_user_id, and neither
-        # one enters a two-way pairing below.
+        # one enters a two-way pairing below. Every pair not subject to SET
+        # NULL is written as a single biconditional; the two SET NULL-
+        # affected columns are the only ones outside that form.
         CheckConstraint(
             "(status = 'terminated') = (terminal_reason IS NOT NULL)",
             name="ck_task_interaction_requests_terminal_pairs_status",
@@ -222,20 +224,12 @@ class TaskInteractionRequest(Base):  # type: ignore
             name="ck_task_interaction_requests_terminated_at_pairs_status",
         ),
         CheckConstraint(
-            "status <> 'answered' OR response_payload IS NOT NULL",
-            name="ck_task_interaction_requests_answered_pairs_response",
+            "(status = 'answered') = (response_payload IS NOT NULL)",
+            name="ck_task_interaction_requests_response_pairs_status",
         ),
         CheckConstraint(
-            "status = 'answered' OR response_payload IS NULL",
-            name="ck_task_interaction_requests_unanswered_has_no_response",
-        ),
-        CheckConstraint(
-            "status <> 'answered' OR responded_at IS NOT NULL",
-            name="ck_task_interaction_requests_answered_pairs_responded_at",
-        ),
-        CheckConstraint(
-            "status = 'answered' OR responded_at IS NULL",
-            name="ck_task_interaction_requests_unanswered_has_no_responded_at",
+            "(status = 'answered') = (responded_at IS NOT NULL)",
+            name="ck_task_interaction_requests_responded_at_pairs_status",
         ),
         # Renamed from ck_task_interaction_requests_responder_identity_pairs_responded_at
         # (66 chars): that name exceeds PostgreSQL's 63 character identifier

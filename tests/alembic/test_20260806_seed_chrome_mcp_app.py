@@ -92,6 +92,39 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
+def test_upgrade_forces_hidden_on_a_preexisting_colliding_row(tmp_path):
+    """Round-8 N1: a hand-created row with this app_id (visible by the table
+    default) would otherwise survive the collision branch untouched — and the
+    builtin registry overlays the real launch config onto any row sharing the
+    app_id at read time, silently yielding a visible, working Chrome
+    connector and defeating the hidden-rollout gate. The collision branch
+    must enforce hidden instead of returning early, without inserting a
+    duplicate or touching the operator's other fields."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('chrome-devtools', 'Operator Chrome', 'hand-made', "
+                "'stdio', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            text(
+                "SELECT COUNT(*), MIN(is_visible_in_connector), MIN(name) "
+                "FROM public_mcp_apps WHERE app_id='chrome-devtools'"
+            )
+        ).first()
+        assert row[0] == 1  # no duplicate inserted
+        assert row[1] == 0  # forced hidden
+        assert row[2] == "Operator Chrome"  # other fields left alone
+
+
 def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
     chrome row (the migration is a frozen copy; this catches drift)."""
@@ -233,3 +266,21 @@ def test_dockerfile_npx_cache_pin_matches_registry():
     ).read_text()
     dockerfile_specs = set(re.findall(r"chrome-devtools-mcp@[\w.\-]+", dockerfile))
     assert dockerfile_specs == registry_specs
+
+    # Round-8 N8: pin the whole npx resolution prefix, not just the version.
+    # The cache key npx resolves against is determined by the command +
+    # npx-level flags + package spec; if the warm line and the runtime launch
+    # args drift on that prefix (e.g. one gains --prefer-offline and the
+    # other doesn't), CI stays green while the warmed cache no longer
+    # matches what the runtime actually resolves. Tool-level flags after the
+    # package spec (--headless etc.) are intentionally excluded: the warm
+    # line runs --help instead of starting a server.
+    spec = next(iter(registry_specs))
+    args = registry_row["launch_config"]["args"]
+    runtime_prefix = " ".join(
+        [registry_row["launch_config"]["command"]] + args[: args.index(spec) + 1]
+    )
+    assert runtime_prefix in dockerfile, (
+        f"Dockerfile cache-warm line no longer matches the runtime npx "
+        f"resolution prefix {runtime_prefix!r}"
+    )

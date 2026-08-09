@@ -271,8 +271,12 @@ export function ConnectMcpDialog({
       return false
     } catch (error) {
       console.error("Failed to share connector:", error)
+      // Round-8 N4: a share timeout must not claim the *connection* timed
+      // out — by the time this runs, the connect POST already succeeded and
+      // its success toast already fired. Telling the user to "try again"
+      // would prompt them to retry an already-established connection.
       const timedOut = error instanceof DOMException && error.name === "TimeoutError"
-      toast.error(timedOut ? t('tools.mcp.alerts.connectTimedOut') : t("tools.mcp.alerts.saveFailed"))
+      toast.error(timedOut ? t('tools.mcp.alerts.shareTimedOut') : t("tools.mcp.alerts.saveFailed"))
       return false
     }
   }
@@ -679,11 +683,23 @@ export function ConnectMcpDialog({
   // sent explicitly (not omitted) so re-connecting after a dormant
   // association (is_active=false) reactivates it instead of silently staying
   // disconnected — the backend only flips is_active when told to.
+  // The ref guard (round-8 N6) covers the one window the disabled buttons
+  // can't: loadingApps is React state, so disabled={} lags a commit cycle,
+  // and a double-click landing in the same tick would fire two POSTs. The
+  // backend recovers idempotently, so this only saves a wasted duplicate
+  // request — a ref is synchronous, closing the window outright.
+  const keylessConnectsRef = React.useRef<Set<string>>(new Set())
   const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
-    await connectCatalogApp(app, { is_active: true }, {
-      autoSelect,
-      setLoading: (loading) => (loading ? markAppLoading(app.id) : clearAppLoading(app.id)),
-    })
+    if (keylessConnectsRef.current.has(app.id)) return
+    keylessConnectsRef.current.add(app.id)
+    try {
+      await connectCatalogApp(app, { is_active: true }, {
+        autoSelect,
+        setLoading: (loading) => (loading ? markAppLoading(app.id) : clearAppLoading(app.id)),
+      })
+    } finally {
+      keylessConnectsRef.current.delete(app.id)
+    }
   }
 
   // Remote-MCP OAuth catalog app (e.g. Granola): the backend ensures the
@@ -1299,7 +1315,10 @@ export function ConnectMcpDialog({
               </div>
 
               <div className="flex justify-end gap-3 mt-8 pt-4 border-t">
-                <Button variant="outline" onClick={requestClose}>
+                {/* Round-8 N2: requestClose silently refuses while a catalog
+                    connect is in flight — disable the trigger so the blocked
+                    state is visible instead of the button appearing dead. */}
+                <Button variant="outline" onClick={requestClose} disabled={catalogConnectsInFlight > 0}>
                   {t('tools.mcp.buttons.cancel')}
                 </Button>
                 <Button
@@ -1338,7 +1357,9 @@ export function ConnectMcpDialog({
                   {ownershipRadio}
                 </div>
                 <div className="flex justify-end gap-3 mt-8">
-                  <Button variant="outline" onClick={requestClose}>
+                  {/* Round-8 N2: same rationale as the Custom API tab's
+                      Cancel above. */}
+                  <Button variant="outline" onClick={requestClose} disabled={catalogConnectsInFlight > 0}>
                     {t('tools.mcp.buttons.cancel')}
                   </Button>
                   <Button onClick={handleSaveCustomMcp} disabled={isSavingCustom}>
@@ -1389,6 +1410,13 @@ export function ConnectMcpDialog({
       <OfficialMcpSettingsDialog
         open={!!selectedApp}
         onOpenChange={(nextOpen) => {
+          // Deliberately NOT gated on catalogConnectsInFlight, unlike the
+          // parent dialog's requestClose (round-8 N5): closing this per-app
+          // sub-dialog mid-connect is tolerated by design — in-flight state
+          // is tracked per app id, completion clears selectedApp only if it
+          // still points at the same app, and the cross-app regression
+          // tests pin exactly this sequence. Blocking it would trap the
+          // user inside the sub-dialog for the full request bound instead.
           if (!nextOpen) {
             connectorEditRequestRef.current += 1
             setSelectedApp(null)

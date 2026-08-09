@@ -466,6 +466,61 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
             pass
 
 
+def test_real_shipped_chrome_row_is_excluded_from_the_connector_list() -> None:
+    """Round-7/8 open nit: the synthetic hidden-app test above pins the
+    listing filter's mechanics, and the connect-endpoint 404 is pinned
+    elsewhere against the real app id — but nothing asserted the listing
+    filter on the row this PR actually ships. init_db seeds the real
+    registry rows (chrome-devtools included, hidden), so this drives the
+    exact shipped state end to end: the row exists in the DB (asserted, so
+    the listing check can't pass vacuously) yet never reaches the catalog
+    listing. A registry visibility flip cannot ship silently with the suite
+    green."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        # Guard against a vacuous pass: the row really is in the DB (seeded
+        # by init_db from the registry), and really is hidden.
+        db = next(get_db())
+        try:
+            seeded = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "chrome-devtools")
+                .one()
+            )
+            assert seeded.is_visible_in_connector is False, (
+                "chrome-devtools must ship hidden -- if this flips to True, "
+                "update this test's premise together with the unhide checklist"
+            )
+        finally:
+            db.close()
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+        app_ids = {app["id"] for app in response.json()}
+        assert "chrome-devtools" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_custom_stdio_mcp_with_same_name_does_not_mark_builtin_oauth_app_connected() -> (
     None
 ):

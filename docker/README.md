@@ -337,7 +337,7 @@ the backend image build runs `uv sync --locked` for reproducible installs.
 
 | Arg | Default | Effect |
 |-----|---------|--------|
-| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64) plus a warmed `npx` cache for the built-in Chrome MCP connector (`chrome-devtools-mcp`). Pass `--build-arg INSTALL_CHROME=false` to skip both, dropping the image size and the root, `--no-sandbox`-capable browser surface entirely for deployments that never enable the connector — it ships hidden from the connector catalog until #1200 lands regardless of this flag. |
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64) plus a warmed `npx` cache for the built-in Chrome MCP connector (`chrome-devtools-mcp`). Pass `--build-arg INSTALL_CHROME=false` to skip both, dropping the image size and the root, `--no-sandbox`-capable browser surface entirely for deployments that never enable the connector — it ships hidden from the connector catalog until #1200 lands regardless of this flag. Operator note: the connector launches via `npx` with an exact version pin; on a deployment whose npx cache is cold (a non-Docker install, or an `INSTALL_CHROME=false` image later flipped visible), the first tool call fetches that pinned package from the npm registry, as the backend user, before the server starts. |
 
 ```bash
 docker buildx build \

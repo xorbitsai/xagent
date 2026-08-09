@@ -230,7 +230,7 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
 # browser to run against buys nothing (the connector 404s on connect either
 # way while hidden, and every call would fail at launch without a browser).
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
-        npx -y chrome-devtools-mcp@1.6.0 --help > /dev/null; \
+        npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
     fi
 
 COPY docker/entrypoint.sh /opt/xagent/deploy/entrypoint.sh

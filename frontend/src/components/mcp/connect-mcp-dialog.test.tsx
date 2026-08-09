@@ -953,8 +953,11 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     fireEvent.click(container.querySelectorAll("#ownership-team")[0])
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
 
+    // Round-8 N4: the share step's timeout gets its own copy — the connect
+    // itself already succeeded, so the generic "connection timed out, try
+    // again" toast would prompt retrying an established connection.
     await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledWith("tools.mcp.alerts.connectTimedOut")
+      expect(toastErrorMock).toHaveBeenCalledWith("tools.mcp.alerts.shareTimedOut")
     })
 
     // submitKeyConnect's own request-body wiring: env_source travels with

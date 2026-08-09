@@ -78,9 +78,6 @@ def upgrade() -> None:
         return
 
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
-    if APP_ID in existing:
-        return
 
     # is_visible_in_connector is load-bearing for the release gate this row
     # ships behind, so its absence must fail loudly rather than let the
@@ -90,11 +87,32 @@ def upgrade() -> None:
     # that adds the column is a real ancestor in this chain). A plain
     # RuntimeError rather than assert: assertions are stripped under
     # `python -O`/PYTHONOPTIMIZE, which would silently defeat this guard.
+    # Checked before the collision branch so both paths are covered.
     if "is_visible_in_connector" not in columns:
         raise RuntimeError(
             "public_mcp_apps.is_visible_in_connector is missing; the chrome "
             "row must not seed visible"
         )
+
+    existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
+    if APP_ID in existing:
+        # A row with this app_id already exists (e.g. hand-created by an
+        # operator before this migration deployed -- #1143 literally asks
+        # for a Chrome connector, so that is a realistic precondition). Such
+        # a row keeps its own is_visible_in_connector, which defaults to
+        # TRUE for hand-created rows -- and the builtin registry overlays
+        # the real transport/launch_config onto ANY row sharing this app_id
+        # at read time, so a visible pre-existing row would silently become
+        # a working, one-click-connectable Chrome connector, defeating the
+        # hidden-rollout gate with no further action. Enforce hidden on the
+        # collision branch too, instead of returning untouched.
+        bind.execute(
+            sa.update(PUBLIC_MCP_APPS_TABLE)
+            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+            .values(is_visible_in_connector=False)
+        )
+        return
+
     row = {k: v for k, v in ROW.items() if k in columns}
     bind.execute(sa.insert(PUBLIC_MCP_APPS_TABLE), [row])
 

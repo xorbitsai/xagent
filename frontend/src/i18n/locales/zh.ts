@@ -1276,6 +1276,7 @@ const zh = {
         nameInvalidFormat: "名称只能包含大小写英文字母、数字、连字符(-)和下划线(_)",
         saveFailed: "保存失败",
         connectTimedOut: "连接超时，请重试",
+        shareTimedOut: "已连接，但分享给团队超时——可稍后在其设置中重新分享",
         deleteFailed: "删除失败",
         toggleFailed: "切换状态失败",
         atLeastOneSecret: "至少需要一个有效的密钥",

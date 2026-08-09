@@ -426,8 +426,9 @@ def test_responder_identity_pairs_responded_at_both_ways(db_session, fixtures) -
 
 
 def test_expiry_must_be_after_creation(db_session, fixtures) -> None:
-    """created_at and expires_at are both bound explicitly here (contract
-    N5) -- see the SQLite half for why."""
+    """created_at and expires_at are both bound explicitly here so the
+    equal/before cases do not race the server clock -- see the SQLite half
+    for why."""
     task_id, anchor_id = fixtures
     fixed = datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert_rejected(
@@ -503,7 +504,7 @@ def test_deleting_anchor_of_active_row_is_blocked(db_session, fixtures) -> None:
     """resume_trace_event_id is ON DELETE SET NULL, but
     ck_task_interaction_requests_active_anchor requires a non-null anchor on
     an active row -- the delete's SET NULL fails that CHECK instead of
-    going through. Bullet 5's core evidence; see the SQLite half.
+    going through -- see the SQLite half.
     """
     task_id, anchor_id = fixtures
     assert_accepted(
@@ -614,7 +615,9 @@ def test_deleting_responder_user_sets_null_and_keeps_identity(
 
 
 def test_response_payload_none_lands_as_sql_null(db_session, fixtures) -> None:
-    """Expiry is only authoritative for reclaim -- see the SQLite half."""
+    """JSON(none_as_null=True): a Python None payload lands as SQL NULL,
+    while a JSON null nested inside a payload does not -- see the SQLite
+    half."""
     task_id, anchor_id = fixtures
     none_row = assert_accepted(
         db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)

@@ -834,7 +834,7 @@ def test_created_columns_match_the_frozen_shape(db_session) -> None:
         assert columns[name]["type"].length == expected_length, name
 
 
-def test_all_timestamp_columns_are_timezone_aware(db_session) -> None:
+def test_all_timestamp_columns_are_timezone_aware() -> None:
     """Checked against the *declared* model column, not SQLite's reflection.
 
     On PostgreSQL, str(column["type"]) prints "TIMESTAMP" for both

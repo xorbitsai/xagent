@@ -74,6 +74,14 @@ def _purge_user_task_rows(db: Session, *, user_id: int) -> None:
     ``ON DELETE SET NULL`` that a still-active row's CHECK forbids -- so
     they must go after the pointer NULL-first and before the
     ``trace_events`` delete.
+
+    This path holds no lease and takes no row fence, matching how it
+    already treats every other child table; the interaction rows inherit
+    that shape. If a concurrent writer turns a row active between the
+    interaction delete and the ``trace_events`` delete, the failure mode
+    is one loud ``IntegrityError`` (the active-anchor CHECK) rolling back
+    the whole purge transaction with no partial state -- retrying the
+    deletion is the complete remedy.
     """
 
     task_ids = select(Task.id).where(Task.user_id == user_id).scalar_subquery()

@@ -422,11 +422,13 @@ def test_purge_task_rows_deletes_an_active_interaction_row_postgres(
 def test_purge_task_rows_deletes_a_terminal_interaction_row_sqlite(
     sqlite_fk_on_session,
 ) -> None:
-    """Regression control for M4: without a direct row-count assertion, this
-    test could stay green even if the interaction delete statement were
-    removed entirely, because a terminal row's anchor is never SET NULL by
-    the trace_events delete and so purge_task_rows would still return True
-    and leave the task deleted."""
+    """Regression control: the row count is asserted directly so the test
+    is about the interaction row being gone, not about purge returning
+    True. It is deliberately not a discriminator for removing the delete
+    statement -- a terminal row's anchor is never SET NULL by the
+    trace_events delete, and the ``tasks.id`` ON DELETE CASCADE removes
+    the row at the task delete regardless, so this stays green either
+    way. The active-row tests are the discriminators."""
     session = sqlite_fk_on_session
     task_id, _row_id = _seed_task_with_interaction_row(
         session, username="u-terminal-single", status="terminated"

@@ -982,10 +982,17 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # PostgreSQL enforces the anchor FK, so a race that lets a
             # candidate row become the active anchor between selection and
             # delete surfaces here as a restrict violation (IntegrityError).
-            # A database upgraded through Alembic on SQLite has no DB-level
-            # FK for this column and cannot raise this; a freshly created
-            # SQLite database (create_all, e.g. tests) does have the FK and
-            # can. Under stricter isolation levels the same race can instead
+            # Two anchors can do that: the task's checkpoint pointer, and an
+            # active interaction row whose resume_trace_event_id lands on a
+            # candidate -- the latter trips
+            # ck_task_interaction_requests_active_anchor on both backends
+            # (the ON DELETE SET NULL fires and the CHECK forbids the NULL
+            # on active rows). For the pointer FK, a database upgraded
+            # through Alembic on SQLite has no DB-level constraint today
+            # and cannot raise this -- that changes when the interaction
+            # table's migration lands, whose rows enforce their CHECK on
+            # upgraded SQLite too; a freshly created SQLite database
+            # (create_all, e.g. tests) has the FK and can. Under stricter isolation levels the same race can instead
             # surface as psycopg2's SerializationFailure or DeadlockDetected,
             # both of which SQLAlchemy wraps in OperationalError, not
             # IntegrityError -- catch both so this retention path degrades

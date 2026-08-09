@@ -159,15 +159,23 @@ def _force_next_identity_select_to_miss(
     matter what is actually committed, then let every later statement on
     ``db`` -- including any later ``SELECT`` -- run for real.
 
-    Exists because two sessions racing naturally (the winner commits, then
-    the loser's own pre-read runs) does not reach step 7's post-conflict
-    re-check on either backend this suite runs against: by the time the
-    loser's own step-3 pre-read fires, the winner's row is already
-    committed and visible to it (SQLite: a bare, non-transactional SELECT
-    sees the latest commit; PostgreSQL READ COMMITTED takes a fresh
-    per-statement snapshot), so the loser's call returns straight from
-    step 3 and never reaches its own INSERT at all. Forcing that one read
-    to lie is what actually drives the interleaving step 7 exists for: the
+    Exists because two sessions racing the way this suite constructs a race
+    (the winner commits and closes *before* the loser's own call even
+    starts) does not reach step 7's post-conflict re-check on either
+    backend: by the time the loser's own step-3 pre-read fires, the
+    winner's row is already committed and visible to it (SQLite: a bare,
+    non-transactional SELECT sees the latest commit; PostgreSQL READ
+    COMMITTED takes a fresh per-statement snapshot), so the loser's call
+    returns straight from step 3 and never reaches its own INSERT at all.
+    That is a fact about this suite's sequential, same-process
+    construction, not a general claim that step 7 is unreachable by
+    natural interleaving: on PostgreSQL specifically, a genuinely
+    concurrent INSERT that blocks on another session's still-uncommitted
+    duplicate row -- true overlap, not this suite's commit-then-run
+    ordering -- reaches step 7 naturally once the blocking transaction
+    commits and the waiting session's own INSERT then fails with a real
+    IntegrityError. Forcing one read to lie is what drives the same
+    interleaving inside this suite's own sequential constructions: the
     call proceeds to the reclaim UPDATE and its own INSERT, collides with
     the winner's real, already-committed row on the database's own unique
     constraints, rolls back its own inner savepoint, and only then does
@@ -237,6 +245,12 @@ _T_P_1_CASES = [
     ),
     pytest.param({"request_payload": None}, ValueError, id="payload-none"),
     pytest.param({"run_id": ""}, ValueError, id="run-id-empty"),
+    pytest.param({"now": datetime.now()}, ValueError, id="now-naive"),
+    pytest.param(
+        {"now": _now().replace(tzinfo=timezone(timedelta(hours=8)))},
+        ValueError,
+        id="now-non-utc",
+    ),
 ]
 
 _T_P_1_ANCHOR_CASES = [
@@ -350,6 +364,41 @@ def test_step_one_rejects_anchor_field_variants_without_sql(
     before = len(statements)
     with pytest.raises(expected_exc):
         stage_interaction_request(db, task_id=task_id, **kwargs)
+    assert statements[before:] == []
+    db.close()
+
+
+_T_P_TASK_ID_CASES = [
+    pytest.param(True, id="bool-true"),
+    pytest.param("7", id="string-digit"),
+    pytest.param(5.9, id="float"),
+    pytest.param(0, id="zero"),
+    pytest.param(-1, id="negative"),
+]
+
+
+@pytest.mark.parametrize("bad_task_id", _T_P_TASK_ID_CASES)
+def test_step_one_rejects_invalid_task_id_without_sql(
+    tmp_path: Path, bad_task_id: Any
+) -> None:
+    """``task_id`` gets a proper identity guard, not a silent ``int()``
+    coercion: ``bool`` is a subclass of ``int`` in Python and must be
+    rejected explicitly (``isinstance(x, bool)`` before ``isinstance(x,
+    int)``), a numeric string or a float must be rejected rather than
+    coerced, and zero/negative values must be rejected outright. All five
+    cases raise before any SQL is issued, the same as every other step-1
+    rejection."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    kwargs = _stage_kwargs(anchor)
+    before = len(statements)
+    with pytest.raises(ValueError):
+        stage_interaction_request(db, task_id=bad_task_id, **kwargs)
     assert statements[before:] == []
     db.close()
 
@@ -890,6 +939,95 @@ def test_p9b_replay_after_conflict_via_insert_collision(
     verify.close()
     assert row_count == 1, "A's own losing INSERT must not leave a second row"
     a.close()
+
+
+def test_p9c_post_conflict_recheck_reclassifies_terminal_identity_as_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-4 regression: when step 7's post-conflict re-check finds the
+    identity row it collided with in a *terminal* state, it must raise
+    ``InteractionRequestClosed`` -- the same classification step 3's own
+    pre-read gives that state -- not ``InteractionSlotTaken``. This is the
+    cell ``test_p9b_replay_after_conflict_via_insert_collision`` above does
+    not cover: that test's collision lands on a still-*active* identity row
+    (a REPLAY); this one lands on an already-*closed* one, which is a fact
+    about that row's own lifecycle, not an active-slot race.
+
+    B stages and commits a row at ``(task_id, run-a, key)``, then that row
+    is terminated directly, in one statement that respects
+    ``ck_..._terminated_at_pairs_status``'s paired-column shape (``status``,
+    ``terminated_at``, ``terminal_reason`` set together with
+    ``active_slot=NULL``) -- the same shape the module's own reclaim UPDATE
+    uses. The identity row still exists, just closed, so
+    ``uq_task_interaction_request_identity`` still blocks a second INSERT
+    at the same ``(task_id, run_id, key)`` -- unlike
+    ``uq_task_interaction_active_slot``, which B's terminated row no longer
+    holds. A's own pre-read is then forced to miss (the same
+    ``_force_next_identity_select_to_miss`` machinery ``test_p9b`` uses), so
+    A's call proceeds into the reclaim UPDATE and its own INSERT, which
+    collides for real -- on the identity unique, not the active-slot one.
+    That collision rolls back A's own inner savepoint, and step 7's own
+    re-check -- an unpatched, real SELECT by the time it runs -- finds B's
+    now-terminal row and reclassifies the conflict accordingly."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    anchor = _anchor(anchor_id)
+    key = _next_key()
+
+    b = session_factory()
+    b_result = stage_interaction_request(
+        b, task_id=task_id, **_stage_kwargs(anchor, request_idempotency_key=key)
+    )
+    b.commit()
+    assert b_result.created is True
+
+    b.execute(
+        sa.update(TaskInteractionRequest)
+        .where(TaskInteractionRequest.id == b_result.staged_db_id)
+        .values(
+            status="terminated",
+            active_slot=None,
+            terminal_reason="deadline_elapsed",
+            terminated_at=_now(),
+        )
+    )
+    b.commit()
+    b.close()
+
+    a = session_factory()
+    _force_next_identity_select_to_miss(monkeypatch, a)
+    before = len(statements)
+    with pytest.raises(InteractionRequestClosed) as excinfo:
+        stage_interaction_request(
+            a, task_id=task_id, **_stage_kwargs(anchor, request_idempotency_key=key)
+        )
+    issued = statements[before:]
+    assert not isinstance(excinfo.value, InteractionSlotTaken)
+
+    # The INSERT was genuinely attempted and genuinely collided -- on the
+    # identity unique, since B's row holds no active slot to collide on.
+    insert_count = sum(1 for s in issued if s.strip().upper().startswith("INSERT"))
+    assert insert_count == 1, issued
+    assert any("ROLLBACK TO SAVEPOINT" in s.upper() for s in issued), issued
+    assert not any("RELEASE SAVEPOINT" in s.upper() for s in issued), issued
+
+    a.rollback()
+    a.close()
+
+    verify = session_factory()
+    row_count = verify.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(
+            TaskInteractionRequest.task_id == task_id,
+            TaskInteractionRequest.request_idempotency_key == key,
+        )
+    ).scalar_one()
+    verify.close()
+    assert row_count == 1, "A's own losing INSERT must not leave a second row"
 
 
 def test_p10_slot_taken_does_not_retry(tmp_path: Path) -> None:

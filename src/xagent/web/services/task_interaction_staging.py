@@ -59,18 +59,22 @@ test's docstring for the removal condition.
 Every rejection the database's 23 CHECK constraints could raise on the
 INSERT is rejected in plain Python first, inside
 ``stage_interaction_request``'s validation block, because the post-conflict
-re-check (step 7 below) classifies any ``IntegrityError`` that does not
-match the caller's own identity key as a slot conflict --
-``InteractionSlotTaken``. That re-check cannot tell a real slot conflict
-apart from a programming error (an out-of-vocabulary ``origin``, a
-non-positive TTL, a ``None`` payload past ``JSON(none_as_null=True))``) that
-also violates a CHECK: both land on the same ``else`` branch. The backstop
-is the database's constraint set, not the primary defense; the primary
-defense is this validation block, and it must reject everything the INSERT
-could reject except the two concurrent-parent-deletion cells documented
-below, before the INSERT is ever issued. Adding a column CHECK to
-``TaskInteractionRequest`` without adding the matching Python check here
-reopens that misclassification funnel by one more case.
+re-check (step 7 below) classifies any ``IntegrityError`` for which no row
+exists at the caller's own identity as a slot conflict --
+``InteractionSlotTaken`` (a re-check hit that does exist there, but is
+already ``answered`` or ``terminated``, raises ``InteractionRequestClosed``
+instead -- see that exception's docstring -- because the identity row itself
+explains the conflict). A CHECK-violating programming error (an
+out-of-vocabulary ``origin``, a non-positive TTL, a ``None`` payload past
+``JSON(none_as_null=True))``) never inserted a row in the first place, so it
+always lands on the no-identity-row branch, indistinguishable from a real
+slot conflict. The backstop is the database's constraint set, not the
+primary defense; the primary defense is this validation block, and it must
+reject everything the INSERT could reject except the two
+concurrent-parent-deletion cells documented below, before the INSERT is
+ever issued. Adding a column CHECK to ``TaskInteractionRequest`` without
+adding the matching Python check here reopens that misclassification
+funnel by one more case.
 
 Two cells this validation block cannot close, by construction: the parent
 ``tasks`` row (``fk_task_interaction_requests_task_id``) or the anchor's
@@ -149,25 +153,35 @@ class InteractionHandoffError(RuntimeError):
 class InteractionSlotTaken(InteractionHandoffError):
     """The active-row INSERT collided with another request's active slot.
 
-    Raised only when the post-conflict re-check (step 7) does not find the
-    caller's own ``(task_id, run_id, request_idempotency_key)`` among the
-    surviving rows after an ``IntegrityError``. Because that re-check cannot
-    distinguish a real slot conflict from any other ``IntegrityError`` the
-    INSERT could have raised, this exception is also what a programming
-    error that skipped the plain-Python validation block would surface as.
-    See the module docstring's misclassification-funnel paragraph.
+    Raised only when the post-conflict re-check (step 7) finds no row at all
+    at the caller's own ``(task_id, run_id, request_idempotency_key)`` after
+    an ``IntegrityError`` -- there is no identity row to explain the
+    conflict, so it must have been the active-slot unique. A re-check hit
+    whose ``status`` is ``answered`` or ``terminated`` raises
+    ``InteractionRequestClosed`` instead (see that exception's docstring):
+    it is the same identity key, just already closed, not a slot race.
+    Because a no-hit re-check still cannot distinguish a real slot conflict
+    from any other ``IntegrityError`` the INSERT could have raised, this
+    exception is also what a programming error that skipped the
+    plain-Python validation block would surface as. See the module
+    docstring's misclassification-funnel paragraph.
     """
 
 
 class InteractionRequestClosed(InteractionHandoffError):
-    """The idempotency pre-read found this identity key already terminal.
+    """This identity key already names a terminal row.
 
     Raised when ``(task_id, run_id, request_idempotency_key)`` names a row
     whose ``status`` is ``answered`` or ``terminated`` rather than
-    ``active``. Identity is scoped by ``run_id``: a key that was reclaimed
-    to ``terminated`` earlier in the *same* run still raises this on reuse
-    (there is no cross-run leakage to guard against, because a different
-    run never shares this row at all).
+    ``active`` -- both by the idempotency pre-read (step 4, before this
+    call's own INSERT is ever attempted) and by the post-conflict re-check
+    (step 7, when this call's own INSERT collided with a row that turns out
+    to already be closed rather than merely active elsewhere). Both reads
+    share ``_identity_lookup_stmt``, so the two call sites classify the same
+    row state identically. Identity is scoped by ``run_id``: a key that was
+    reclaimed to ``terminated`` earlier in the *same* run still raises this
+    on reuse (there is no cross-run leakage to guard against, because a
+    different run never shares this row at all).
     """
 
 
@@ -399,6 +413,17 @@ def _validate_request_fields(
     caught by a CHECK constraint on the INSERT. See the module docstring's
     misclassification-funnel paragraph for why this list must stay complete.
 
+    Row 13 of that list: ``now`` must be validated as an aware UTC datetime
+    the same way ``expires_at`` is (row 6) -- not normalized, only rejected
+    if it fails. ``now`` has no CHECK constraint of its own to back this up
+    (unlike every other row here), but it is not a free pass: the reclaim
+    UPDATE (``_reclaim_stale_slot_stmt``) persists this exact value into
+    ``terminated_at`` and ``updated_at`` on every row it reclaims, so a
+    naive or non-UTC ``now`` would otherwise reach SQL and get silently
+    mis-stored the same way an unvalidated ``expires_at`` would (see
+    ``TaskInteractionRequest``'s own docstring on the aware-UTC obligation
+    for that column).
+
     Returns the normalized (stripped) idempotency key.
     """
 
@@ -424,6 +449,11 @@ def _validate_request_fields(
         raise ValueError("expires_at must be an aware UTC datetime")
     if utc_offset.total_seconds() != 0:
         raise ValueError("expires_at must be UTC (utcoffset must be zero)")
+    now_utc_offset = now.utcoffset()
+    if now.tzinfo is None or now_utc_offset is None:
+        raise ValueError("now must be an aware UTC datetime")
+    if now_utc_offset.total_seconds() != 0:
+        raise ValueError("now must be UTC (utcoffset must be zero)")
     if expires_at <= now:
         raise ValueError("expires_at must be after now")
     if not run_id:
@@ -472,12 +502,14 @@ def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.
     plain expiry when a row is both (``run_id <> :reclaim_run_id`` is
     checked before falling through to ``deadline_elapsed``).
 
-    One of two ``sa.text`` usages in this module -- the other is
-    ``interaction_handoff``'s SQLite-only savepoint guard, which needs no
-    parameter because its predicate is a hardcoded constant, not caller
-    input. This one carries caller input (``run_id``) and must stay
-    parameterized via ``.bindparams`` -- see the module docstring's
-    statement-discipline note.
+    ``terminal_reason`` is built with ``sa.case``, not ``sa.text`` -- Core
+    compiles and parameterizes ``run_id`` on both backends without any raw
+    SQL fragment, verified equivalent to the earlier hand-written ``CASE
+    WHEN run_id <> :reclaim_run_id THEN 'run_superseded' ELSE
+    'deadline_elapsed' END``. The only remaining ``sa.text`` usage in this
+    module is ``interaction_handoff``'s SQLite-only savepoint guard, which
+    needs no parameter because its predicate is a hardcoded constant, not
+    caller input.
 
     This UPDATE is also the shape the next status-writing statement on this
     table needs to follow: it writes ``status`` and ``terminated_at``
@@ -503,10 +535,10 @@ def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.
         )
         .values(
             status="terminated",
-            terminal_reason=sa.text(
-                "CASE WHEN run_id <> :reclaim_run_id THEN 'run_superseded' "
-                "ELSE 'deadline_elapsed' END"
-            ).bindparams(reclaim_run_id=run_id),
+            terminal_reason=sa.case(
+                (TaskInteractionRequest.run_id != run_id, "run_superseded"),
+                else_="deadline_elapsed",
+            ),
             active_slot=None,
             terminated_at=now,
             updated_at=now,
@@ -573,9 +605,16 @@ def stage_interaction_request(
        re-check identity with the same SELECT step 3 used. A hit whose
        ``status`` is ``active`` is a REPLAY-after-conflict: another session
        won the race between this call's step-3 read and its own INSERT, so
-       the row this call now owns is that winner's row, not a fresh one.
-       No hit (or a non-active hit) raises ``InteractionSlotTaken`` --
-       which, because this re-check cannot distinguish a genuine slot
+       the row this call now owns is that winner's row, not a fresh one. A
+       hit whose ``status`` is ``answered`` or ``terminated`` raises
+       ``InteractionRequestClosed`` -- the same classification step 3 gives
+       that state, since both reads share ``_identity_lookup_stmt``: the
+       identity row this call collided with had already closed by the time
+       the INSERT fired, which is a fact about that row's own lifecycle, not
+       an active-slot race. No hit at all raises ``InteractionSlotTaken`` --
+       the INSERT collided with some other row's active slot instead, and
+       there is no identity row here to explain the conflict any other way
+       -- which, because this re-check cannot distinguish a genuine slot
        conflict from a programming error that also violates some other
        CHECK, is why step 1's validation list must be complete.
 
@@ -584,7 +623,11 @@ def stage_interaction_request(
     directly lets a dead run silently displace a live run's question.
     """
 
-    resolved_task_id = int(task_id)
+    if isinstance(task_id, bool) or not isinstance(task_id, int):
+        raise ValueError(f"task_id must be a positive int, got {task_id!r}")
+    if task_id <= 0:
+        raise ValueError(f"task_id must be a positive int, got {task_id!r}")
+    resolved_task_id = task_id
     normalized_key = _validate_request_fields(
         run_id=run_id,
         anchor=anchor,
@@ -667,12 +710,17 @@ def stage_interaction_request(
                 request_idempotency_key=normalized_key,
             )
         ).first()
-        if again is not None and again.status == "active":
-            return StagedInteractionRequest(
-                staged_db_id=int(again.id),
-                created=False,
-                status=again.status,
-                active_slot=again.active_slot,
+        if again is not None:
+            if again.status == "active":
+                return StagedInteractionRequest(
+                    staged_db_id=int(again.id),
+                    created=False,
+                    status=again.status,
+                    active_slot=again.active_slot,
+                )
+            raise InteractionRequestClosed(
+                f"request {normalized_key!r} on task {resolved_task_id} run "
+                f"{run_id!r} is already {again.status}"
             )
         raise InteractionSlotTaken(
             f"task {resolved_task_id} already has an active interaction "

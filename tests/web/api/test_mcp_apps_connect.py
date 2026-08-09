@@ -680,6 +680,117 @@ def test_connect_reactivates_dormant_association_when_requested(test_db):
     assert assoc.is_active is True
 
 
+def test_hiding_an_app_blocks_reconnect_for_an_already_connected_user(test_db):
+    """Round-6 MINOR-5, first direction: _reject_hidden_catalog_app's
+    docstring claims hiding an app also blocks reconnect/key-rotation for
+    users who connected while it was visible, not just fresh connects. That
+    claim was previously prose-only -- pin it. The existing association must
+    survive untouched: the block is on the connect *attempt*, not the data.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    app = PublicMCPApp(
+        app_id="visible-then-hidden",
+        name="visible-then-hidden",
+        transport="stdio",
+        is_visible_in_connector=True,
+        launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+    )
+    test_db.add(app)
+    test_db.commit()
+
+    # Connect while visible.
+    connect_mcp_app(
+        "visible-then-hidden",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    server = (
+        test_db.query(MCPServer).filter(MCPServer.name == "visible-then-hidden").one()
+    )
+    assoc_before = (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.user_id == 1, UserMCPServer.mcpserver_id == server.id)
+        .one()
+    )
+    assert assoc_before.is_active is True
+
+    # An admin hides it (e.g. incident response, or reusing this PR's
+    # hidden-rollout idiom for another app).
+    app.is_visible_in_connector = False
+    test_db.commit()
+
+    # The existing user's reconnect/key-rotation attempt now 404s.
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "visible-then-hidden",
+            MCPAppConnectRequest(is_active=True),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 404
+
+    # The pre-existing association is untouched by the blocked attempt.
+    test_db.refresh(assoc_before)
+    assert assoc_before.is_active is True
+
+
+async def test_hiding_an_app_does_not_block_disconnect(test_db):
+    """Round-6 MINOR-5, second direction: the same docstring claims
+    disconnect (and the server/tool routes) are unaffected by hiding, since
+    they're server-scoped and never call _reject_hidden_catalog_app. Pin
+    that a user can still disconnect from an app that was hidden after they
+    connected.
+    """
+    from xagent.web.api.mcp import (
+        MCPAppConnectRequest,
+        connect_mcp_app,
+        delete_mcp_server,
+    )
+
+    app = PublicMCPApp(
+        app_id="visible-then-hidden-disconnect",
+        name="visible-then-hidden-disconnect",
+        transport="stdio",
+        is_visible_in_connector=True,
+        launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+    )
+    test_db.add(app)
+    test_db.commit()
+
+    connect_mcp_app(
+        "visible-then-hidden-disconnect",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    # Captured as a plain int: the sole user disconnecting deletes the
+    # shared MCPServer row too (no other user left), which would expire the
+    # ORM object itself if held onto and re-queried afterward.
+    server_id = (
+        test_db.query(MCPServer)
+        .filter(MCPServer.name == "visible-then-hidden-disconnect")
+        .one()
+        .id
+    )
+
+    app.is_visible_in_connector = False
+    test_db.commit()
+
+    # Disconnect is server-scoped (by numeric id, no catalog lookup) and must
+    # succeed even though the app is now hidden.
+    await delete_mcp_server(server_id, current_user=_user(test_db, 1), db=test_db)
+    assert (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.mcpserver_id == server_id, UserMCPServer.user_id == 1)
+        .first()
+        is None
+    )
+
+
 def test_connect_rejects_unconnectable_app(test_db):
     """An entry that classifies as "unconnectable" (required_env but no launch
     command, so nothing to run) is rejected by the connect gate. Such a row can

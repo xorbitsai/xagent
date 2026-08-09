@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -124,6 +125,83 @@ def test_downgrade_removes_chrome(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
+        assert "chrome-devtools" not in _app_ids(connection)
+
+
+def test_downgrade_then_upgrade_round_trip(tmp_path):
+    """Round-6 MINOR-4: downgrade().upgrade() had no coverage. A downgrade
+    only deletes the catalog row (leftover MCPServer/UserMCPServer rows are
+    intentionally left in place per the downgrade docstring), so a
+    subsequent upgrade must cleanly re-seed it rather than hitting the
+    existing-row early return or a uniqueness conflict.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+        rows = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='chrome-devtools'")
+        ).scalar()
+        assert rows == 1
+        assert "chrome-devtools" in _app_ids(connection)
+
+
+def test_upgrade_and_downgrade_are_no_ops_without_the_table(tmp_path):
+    """Round-6 MINOR-4: the early-return branch (both directions) when
+    public_mcp_apps doesn't exist yet -- e.g. a fresh database mid-migration
+    chain, before the migration that creates the table has run. Must not
+    raise; must not create the table itself.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        existing_tables = set(sa.inspect(connection).get_table_names())
+        assert "public_mcp_apps" not in existing_tables
+
+
+def test_upgrade_raises_if_visibility_column_is_missing(tmp_path):
+    """Round-6 MINOR-4/nit: exercises the RuntimeError path directly (the
+    migration test suite runs without -O, so the assert-vs-raise distinction
+    is otherwise never actually executed by this suite). A table missing
+    is_visible_in_connector must fail loudly rather than seed the chrome row
+    visible via the column-filter's silent drop.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    icon VARCHAR(1000),
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50),
+                    category VARCHAR(100),
+                    oauth_scopes JSON,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            try:
+                migration.upgrade()
+                raised = False
+            except RuntimeError as exc:
+                raised = True
+                assert "is_visible_in_connector" in str(exc)
+        assert raised, "upgrade() must raise when the visibility column is missing"
         assert "chrome-devtools" not in _app_ids(connection)
 
 

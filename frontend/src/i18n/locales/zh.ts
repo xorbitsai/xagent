@@ -1275,6 +1275,7 @@ const zh = {
         nameRequired: "服务器名称不能为空",
         nameInvalidFormat: "名称只能包含大小写英文字母、数字、连字符(-)和下划线(_)",
         saveFailed: "保存失败",
+        connectTimedOut: "连接超时，请重试",
         deleteFailed: "删除失败",
         toggleFailed: "切换状态失败",
         atLeastOneSecret: "至少需要一个有效的密钥",

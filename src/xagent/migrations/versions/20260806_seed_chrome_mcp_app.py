@@ -87,12 +87,14 @@ def upgrade() -> None:
     # column-filter below silently drop it and fall back to the table
     # default (TRUE) -- seeding the row visible, the opposite of intent.
     # Unreachable through any normal `alembic upgrade head` (the migration
-    # that adds the column is a real ancestor in this chain), so this is a
-    # defensive assertion, not a path this test suite needs to exercise.
-    assert "is_visible_in_connector" in columns, (
-        "public_mcp_apps.is_visible_in_connector is missing; the chrome row "
-        "must not seed visible"
-    )
+    # that adds the column is a real ancestor in this chain). A plain
+    # RuntimeError rather than assert: assertions are stripped under
+    # `python -O`/PYTHONOPTIMIZE, which would silently defeat this guard.
+    if "is_visible_in_connector" not in columns:
+        raise RuntimeError(
+            "public_mcp_apps.is_visible_in_connector is missing; the chrome "
+            "row must not seed visible"
+        )
     row = {k: v for k, v in ROW.items() if k in columns}
     bind.execute(sa.insert(PUBLIC_MCP_APPS_TABLE), [row])
 

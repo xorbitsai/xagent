@@ -58,6 +58,12 @@ import {
 // Matches the backend mask; a masked value submitted unchanged keeps the stored secret.
 const MASKED_SECRET_VALUE = "********"
 
+// Upper bound on a catalog connect POST (connectCatalogApp below). Without
+// this, a hung request left catalogConnectsInFlight stuck above zero forever
+// — silently blocking every future dialog close with no explanation
+// (round-6 MAJOR-1).
+const CATALOG_CONNECT_TIMEOUT_MS = 30_000
+
 // A connector's (type, numeric id) for the /api/connectors sharing endpoints.
 // Only connected connectors carry a numeric server_id; catalog entries without
 // one can't be shared/statused, so return null.
@@ -390,6 +396,27 @@ export function ConnectMcpDialog({
     }
   }
 
+  // Shared close path for every "close this dialog" action — the Dialog's
+  // own Escape/outside-click dismissal AND every Cancel/footer button, which
+  // previously called the raw onOpenChange(false) prop directly and so
+  // bypassed the in-flight guard entirely (round-6 MAJOR-1): starting a
+  // catalog connect on the Library tab, then switching to the Custom API/MCP
+  // tab and hitting Cancel (or successfully saving), closed the dialog out
+  // from under a still-pending POST. Anything that wants to close this
+  // dialog must call this, not the raw onOpenChange prop.
+  const requestClose = () => {
+    // Don't let a close action go through while a catalog connect POST is in
+    // flight, or its success/error toast fires after the user already
+    // believes they dismissed it. Scoped to the POST itself (not
+    // loadingApps, which also spans OAuth popup waits).
+    if (catalogConnectsInFlight > 0) return
+    connectorEditRequestRef.current += 1
+    setCustomApiEditBaseline(null)
+    setMcpEditBaseline(null)
+    onOpenChange(false)
+    setRuntimeValidationError(null)
+  }
+
   const handleSaveCustomMcp = async () => {
     if (!mcpFormData.name.trim()) {
       toast.error(t('tools.mcp.alerts.nameRequired'))
@@ -510,7 +537,7 @@ export function ConnectMcpDialog({
         setActiveTab("library");
       } else {
         // If in standalone tools page, just close the dialog
-        onOpenChange(false);
+        requestClose();
       }
 
       setEditingCustomServerId(null)
@@ -572,10 +599,14 @@ export function ConnectMcpDialog({
     options.setLoading(true)
     setCatalogConnectsInFlight(count => count + 1)
     try {
+      // Bounded so a hung request can't wedge the dialog's close guard
+      // (round-6 MAJOR-1) indefinitely — apiRequest forwards this signal
+      // straight through to fetch, no shared-wrapper change needed.
       const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(CATALOG_CONNECT_TIMEOUT_MS),
       })
       if (response.ok) {
         toast.success(t('tools.mcp.dialog.connectSuccess', { name: app.name }))
@@ -601,7 +632,8 @@ export function ConnectMcpDialog({
       }
     } catch (error) {
       console.error("Failed to connect app:", error)
-      toast.error(t('tools.mcp.alerts.saveFailed'))
+      const timedOut = error instanceof DOMException && error.name === "TimeoutError"
+      toast.error(timedOut ? t('tools.mcp.alerts.connectTimedOut') : t('tools.mcp.alerts.saveFailed'))
     } finally {
       options.setLoading(false)
       setCatalogConnectsInFlight(count => count - 1)
@@ -893,19 +925,14 @@ export function ConnectMcpDialog({
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        // Mirrors the key-connect dialog's guard (isConnectingKey below): don't
-        // let an outside click/Escape close this dialog while a catalog
-        // connect POST is in flight, or its success/error toast fires after
-        // the user already believes they dismissed it. Scoped to the POST
-        // itself (not loadingApps, which also spans OAuth popup waits).
-        if (!nextOpen && catalogConnectsInFlight > 0) return
+        // Radix's own Escape/outside-click dismissal — route it through the
+        // same requestClose() every explicit close action uses, so this is
+        // the only place the guard logic lives.
         if (!nextOpen) {
-          connectorEditRequestRef.current += 1
-          setCustomApiEditBaseline(null)
-          setMcpEditBaseline(null)
+          requestClose()
+          return
         }
         onOpenChange(nextOpen)
-        if (!nextOpen) setRuntimeValidationError(null)
       }}
     >
       <DialogContent className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50">
@@ -1265,7 +1292,7 @@ export function ConnectMcpDialog({
               </div>
 
               <div className="flex justify-end gap-3 mt-8 pt-4 border-t">
-                <Button variant="outline" onClick={() => onOpenChange(false)}>
+                <Button variant="outline" onClick={requestClose}>
                   {t('tools.mcp.buttons.cancel')}
                 </Button>
                 <Button
@@ -1304,7 +1331,7 @@ export function ConnectMcpDialog({
                   {ownershipRadio}
                 </div>
                 <div className="flex justify-end gap-3 mt-8">
-                  <Button variant="outline" onClick={() => onOpenChange(false)}>
+                  <Button variant="outline" onClick={requestClose}>
                     {t('tools.mcp.buttons.cancel')}
                   </Button>
                   <Button onClick={handleSaveCustomMcp} disabled={isSavingCustom}>
@@ -1333,7 +1360,7 @@ export function ConnectMcpDialog({
                 if (onConnectSelected) {
                   onConnectSelected(localSelectedServers);
                 }
-                onOpenChange(false);
+                requestClose();
               }}
             >
               <Zap className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.connect')}

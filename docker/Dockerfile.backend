@@ -206,7 +206,8 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
         && apt-get install -y --no-install-recommends chromium \
         && rm -rf /var/lib/apt/lists/* \
         && mkdir -p /opt/google/chrome \
-        && ln -s /usr/bin/chromium /opt/google/chrome/chrome; \
+        && ln -s /usr/bin/chromium /opt/google/chrome/chrome \
+        && { [ -e /opt/google/chrome/chrome ] || { echo "ERROR: chromium install did not produce /usr/bin/chromium to symlink -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; }; \
     fi
 
 # Warm the npx cache for the exact version pinned in

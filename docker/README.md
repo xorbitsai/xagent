@@ -333,6 +333,12 @@ Backend image dependencies are resolved from the committed `pyproject.toml` and
 `uv.lock` during the Docker build. Keep `uv.lock` up to date before publishing;
 the backend image build runs `uv sync --locked` for reproducible installs.
 
+**Build args:**
+
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64) plus a warmed `npx` cache for the built-in Chrome MCP connector (`chrome-devtools-mcp`). Pass `--build-arg INSTALL_CHROME=false` to skip both, dropping the image size and the root, `--no-sandbox`-capable browser surface entirely for deployments that never enable the connector — it ships hidden from the connector catalog until #1200 lands regardless of this flag. |
+
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \

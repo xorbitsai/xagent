@@ -759,6 +759,20 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         app_columns = {
             column["name"] for column in inspector.get_columns("public_mcp_apps")
         }
+        # Same guard as the chrome seed migration's upgrade(), and for the
+        # same reason: is_visible_in_connector is load-bearing for the
+        # hidden-rollout gate several rows ship behind (chrome today), so
+        # _filter_row silently dropping it and falling back to the table's
+        # visible-by-default would seed those rows visible. This caller only
+        # runs against a table just created from the current model (see
+        # should_seed_builtin_mcp_registry in database.py), so the column
+        # should always be present here -- this is belt-and-suspenders, not
+        # a path expected to actually fire.
+        if "is_visible_in_connector" not in app_columns:
+            raise RuntimeError(
+                "public_mcp_apps.is_visible_in_connector is missing; "
+                "builtin apps that ship hidden must not seed visible"
+            )
         existing_app_ids = set(
             bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars()
         )

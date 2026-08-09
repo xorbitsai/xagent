@@ -773,6 +773,49 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     }
   })
 
+  it("refuses to close via the Custom MCP tab's Cancel button while a catalog connect is in flight", async () => {
+    // Round-6 MAJOR-1: the Dialog's own onOpenChange guard only covered
+    // Escape/outside-click. Three buttons (Custom API Cancel, Custom MCP
+    // Cancel, the select-mode footer Connect button) called the raw
+    // onOpenChange(false) prop directly, bypassing it entirely — closing the
+    // whole dialog out from under a still-pending connect POST just by
+    // switching tabs and hitting Cancel. All three now route through the
+    // same requestClose() the Dialog itself uses; this exercises one of them
+    // (getAllByRole is needed because the Custom API tab has an identically
+    // labeled Cancel button under this file's tab mock, which renders every
+    // TabsContent regardless of the active tab).
+    const onOpenChange = vi.fn()
+    let resolveChrome: (() => void) | undefined
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        return new Promise((resolve) => {
+          resolveChrome = () => resolve({ ok: true, json: async () => ({ id: 1 }) })
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    render(
+      <ConnectMcpDialog open onOpenChange={onOpenChange} selectedMcpServers={selectedMcpServers} />,
+    )
+    fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+    await waitFor(() => expect(resolveChrome).toBeDefined())
+
+    const cancelButtons = screen.getAllByRole("button", { name: "tools.mcp.buttons.cancel" })
+    expect(cancelButtons.length).toBeGreaterThan(0)
+    fireEvent.click(cancelButtons[0])
+    expect(onOpenChange).not.toHaveBeenCalledWith(false)
+
+    resolveChrome?.()
+    await waitFor(() => {
+      fireEvent.click(cancelButtons[0])
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+  })
+
   it("surfaces the backend error and closes the popup when oauth/connect fails", async () => {
     const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
     const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)

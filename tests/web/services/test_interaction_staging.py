@@ -152,6 +152,52 @@ def _row_state(db: Session, staged_db_id: int):
     ).one()
 
 
+def _force_next_identity_select_to_miss(
+    monkeypatch: pytest.MonkeyPatch, db: Session
+) -> dict[str, bool]:
+    """Force the *next* ``SELECT`` issued on ``db`` to report no row, no
+    matter what is actually committed, then let every later statement on
+    ``db`` -- including any later ``SELECT`` -- run for real.
+
+    Exists because two sessions racing naturally (the winner commits, then
+    the loser's own pre-read runs) does not reach step 7's post-conflict
+    re-check on either backend this suite runs against: by the time the
+    loser's own step-3 pre-read fires, the winner's row is already
+    committed and visible to it (SQLite: a bare, non-transactional SELECT
+    sees the latest commit; PostgreSQL READ COMMITTED takes a fresh
+    per-statement snapshot), so the loser's call returns straight from
+    step 3 and never reaches its own INSERT at all. Forcing that one read
+    to lie is what actually drives the interleaving step 7 exists for: the
+    call proceeds to the reclaim UPDATE and its own INSERT, collides with
+    the winner's real, already-committed row on the database's own unique
+    constraints, rolls back its own inner savepoint, and only then does
+    step 7's second, *unpatched* identity SELECT run -- for real, against
+    the real database -- and find the winner's row.
+
+    Only the first ``SELECT`` on ``db`` after this is called is faked;
+    every other statement (the reclaim ``UPDATE``, the ``INSERT``, step 7's
+    own re-check ``SELECT``) goes through unpatched. Non-``SELECT``
+    statements (a caller's own prior write, the reclaim ``UPDATE``) are
+    never intercepted at all, regardless of ordering.
+    """
+
+    original_execute = Session.execute
+    state = {"armed": True}
+
+    class _MissResult:
+        def first(self) -> None:
+            return None
+
+    def _patched(self: Session, statement: Any, *args: Any, **kwargs: Any) -> Any:
+        if self is db and state["armed"] and isinstance(statement, sa.Select):
+            state["armed"] = False
+            return _MissResult()
+        return original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "execute", _patched)
+    return state
+
+
 def _clear_signals() -> None:
     for name in list(ops_signals.active_degradations()):
         ops_signals.clear_degradation(name)
@@ -689,10 +735,21 @@ def test_p8_owner_state_error_is_not_integrity_error(tmp_path: Path) -> None:
 
 
 def test_p9_replay_after_conflict(tmp_path: Path) -> None:
-    """Two sessions race on the same (task_id, run_id, key). The loser's
-    step-4 pre-read misses (it ran before the winner committed), but its
-    INSERT collides with the winner's row; the post-conflict re-check finds
-    the winner's row and replays it rather than raising SlotTaken."""
+    """Two sessions race on the same (task_id, run_id, key). ``a``'s own
+    manual pre-read (below, before ``b`` commits) misses, as intended -- but
+    that is not the read that decides this test's path. By the time ``a``'s
+    own call to ``stage_interaction_request`` runs its *own* step-3
+    pre-read, ``b`` has already committed, and a fresh SELECT on SQLite sees
+    a just-committed row immediately (no persistent snapshot outside an
+    explicit transaction) -- so ``a``'s call returns straight from step 3's
+    hit, exactly like a same-key replay with no race at all. It never
+    reaches its own INSERT, and therefore never reaches step 7's
+    post-conflict re-check. This test pins that pre-read replay path (a
+    real, separate contract this module makes) and that the loser's own
+    call never inserts a duplicate row -- not step 7. See
+    ``test_p9b_replay_after_conflict_via_insert_collision`` below for the
+    dedicated test that reaches step 7 for real, by forcing the second
+    call's own pre-read to miss despite the row already being committed."""
 
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
@@ -721,7 +778,9 @@ def test_p9_replay_after_conflict(tmp_path: Path) -> None:
     b.commit()
     b.close()
 
-    # A now finishes its own call; its INSERT collides with B's committed row.
+    # A now finishes its own call. B has already committed, so A's own
+    # step-3 pre-read hits B's row directly here -- no INSERT is attempted
+    # on this path (see test_p9b for the construction that forces one).
     a_result = stage_interaction_request(
         a, task_id=task_id, **_stage_kwargs(anchor, request_idempotency_key=key)
     )
@@ -734,8 +793,8 @@ def test_p9_replay_after_conflict(tmp_path: Path) -> None:
     # a_result is a StagedInteractionRequest by construction -- it is never
     # an InteractionSlotTaken instance, so asserting that in isolation pins
     # nothing about this test's outcome. What actually needs pinning: A's
-    # own failed INSERT, having lost the race, must not have left a second
-    # row behind alongside B's winning one.
+    # own call, having replayed B's row from its step-3 pre-read, must not
+    # have inserted a second row of its own alongside B's.
     verify = session_factory()
     row_count = verify.execute(
         sa.select(sa.func.count())
@@ -746,7 +805,91 @@ def test_p9_replay_after_conflict(tmp_path: Path) -> None:
         )
     ).scalar_one()
     verify.close()
-    assert row_count == 1, "the loser's own failed INSERT must not leave a second row"
+    assert row_count == 1, "the loser's own replayed call must not leave a second row"
+
+
+def test_p9b_replay_after_conflict_via_insert_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dedicated test for step 7's post-conflict re-check itself --
+    T-P-9 above pins the pre-read replay path (step 3), which is what every
+    naturally-racing construction on this codebase's two backends actually
+    exercises; it does not reach step 7 (confirmed: replacing step 7's
+    REPLAY return with an unconditional raise leaves T-P-9, T-SP-2, and
+    T-CM-1's ``replay-after-conflict`` cell all green).
+
+    Reaching step 7 for real requires the loser's own step-3 pre-read to
+    miss despite the winner's row already being committed -- an
+    interleaving that does not occur naturally on either backend this suite
+    runs against, so it is driven directly via
+    ``_force_next_identity_select_to_miss`` instead. B stages and commits
+    for real first. A's own pre-read is then forced to report a miss, so
+    A's call proceeds to the reclaim UPDATE and its own INSERT, which
+    collides for real with B's already-committed row (both
+    ``uq_task_interaction_active_slot`` and
+    ``uq_task_interaction_request_identity`` are live collision surfaces
+    here, since A and B share both ``task_id`` and ``run_id``). That
+    collision rolls back A's own inner savepoint, and step 7's own
+    re-check -- an unpatched, real SELECT by the time it runs -- finds B's
+    row and replays it.
+    """
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    anchor = _anchor(anchor_id)
+    key = _next_key()
+
+    b = session_factory()
+    b_result = stage_interaction_request(
+        b, task_id=task_id, **_stage_kwargs(anchor, request_idempotency_key=key)
+    )
+    b.commit()
+    b.close()
+    assert b_result.created is True
+
+    a = session_factory()
+    _mark_caller_write(a, task_id, "p9b-write")
+
+    _force_next_identity_select_to_miss(monkeypatch, a)
+    before = len(statements)
+    a_result = stage_interaction_request(
+        a, task_id=task_id, **_stage_kwargs(anchor, request_idempotency_key=key)
+    )
+    issued = statements[before:]
+
+    # The INSERT was genuinely attempted and genuinely collided.
+    insert_count = sum(1 for s in issued if s.strip().upper().startswith("INSERT"))
+    assert insert_count == 1, issued
+    # ...and its own inner savepoint rolled back rather than committed --
+    # this is what makes step 7's re-check possible at all (see the
+    # module's own docstring on why a shared savepoint breaks this).
+    assert any("ROLLBACK TO SAVEPOINT" in s.upper() for s in issued), issued
+    assert not any("RELEASE SAVEPOINT" in s.upper() for s in issued), issued
+
+    # Step 7's own re-check ran and replayed B's row -- not a fresh insert
+    # of A's own, and not InteractionSlotTaken.
+    assert a_result.created is False
+    assert a_result.staged_db_id == b_result.staged_db_id
+    assert a_result.status == "active"
+    assert a_result.active_slot == b_result.active_slot
+
+    a.commit()
+    assert _caller_write_survived(a, task_id, "p9b-write")
+
+    verify = session_factory()
+    row_count = verify.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(
+            TaskInteractionRequest.task_id == task_id,
+            TaskInteractionRequest.request_idempotency_key == key,
+        )
+    ).scalar_one()
+    verify.close()
+    assert row_count == 1, "A's own losing INSERT must not leave a second row"
+    a.close()
 
 
 def test_p10_slot_taken_does_not_retry(tmp_path: Path) -> None:
@@ -955,7 +1098,19 @@ def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
     the successful-return control. Every cell: (a) the with-block exits
     without the exception escaping; (b) exactly the swallowed exceptions
     register a degradation and log; (c) the caller's own pre-with pending
-    write survives and commits alongside the caller."""
+    write survives and commits alongside the caller.
+
+    The ``replay-after-conflict`` cell's own construction (below) pins the
+    step-3 pre-read replay path through the full context manager -- the
+    same path T-P-9 pins at the primitive level, not step 7's
+    post-conflict re-check: by the time this cell's own ``h.stage()`` call
+    runs its step-3 pre-read, the winner session has already committed, and
+    that pre-read hits directly (see T-P-9's docstring for why). Step 7 is
+    reached and pinned separately, by
+    ``test_p9b_replay_after_conflict_via_insert_collision`` at the
+    primitive level -- confirmed by the same poison-probe check T-P-9's
+    docstring describes: this cell stays green with step 7's REPLAY return
+    replaced by an unconditional raise."""
 
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
@@ -1008,15 +1163,13 @@ def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
         expect_signal = None
 
     if case == "replay-after-conflict":
-        # A real REPLAY-after-conflict, not a clean insert: db's own step-3
-        # pre-read must miss before a second session commits the
-        # conflicting row, so db's own INSERT below collides and it is
-        # step 7's post-conflict re-check -- not step 4's pre-read -- that
-        # returns the existing row. Same construction as T-P-9 / T-SP-2:
-        # db's first statement on this session has to happen before the
-        # winner's commit, or this session's own later reads would just see
-        # the winner's row directly instead of missing it (see _engine's
-        # docstring on this backend's pre-outer-commit visibility gap).
+        # A REPLAY-after-conflict via the step-3 pre-read, not a clean
+        # insert and not step 7 (see this test's own docstring): db's first
+        # statement on this session has to happen before the winner's
+        # commit, purely so this session's own connection exists before
+        # that commit -- db's own later pre-read inside h.stage() still
+        # hits the winner's row directly once it runs, since that commit
+        # has already happened by then. Same construction as T-P-9 / T-SP-2.
         from xagent.web.services.task_interaction_staging import (
             _identity_lookup_stmt,
         )

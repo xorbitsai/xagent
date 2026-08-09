@@ -14,6 +14,9 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.pool import QueuePool, StaticPool
 
+from tests.web.services.task_interaction_schema_shared import (
+    make_row as make_interaction_row,
+)
 from xagent.core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,
     CHECKPOINT_TYPE,
@@ -47,6 +50,7 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
 from xagent.web.services.task_lease_service import (
@@ -414,6 +418,28 @@ def _checkpoint_trace_row(
         timestamp=timestamp,
         data=data,
     )
+
+
+def _seed_interaction_row(
+    db: Session,
+    *,
+    task_id: int,
+    resume_trace_event_id: int | None,
+    status: str = "active",
+    **overrides: object,
+) -> TaskInteractionRequest:
+    row = TaskInteractionRequest(
+        **make_interaction_row(
+            task_id=task_id,
+            resume_trace_event_id=resume_trace_event_id,
+            status=status,
+            **overrides,
+        )
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
 
 
 @pytest.mark.asyncio
@@ -1895,6 +1921,326 @@ def test_database_trace_handler_prune_excludes_the_anchored_row(
             row.event_id
             for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
         } == {"anchored-old", "run-a-new"}
+    finally:
+        db.close()
+
+
+def test_prune_protects_a_trace_row_anchored_by_an_active_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second protection source (PR-C2b): an active interaction row's
+    resume_trace_event_id keeps its anchor alive even when the anchor ranks
+    outside the retention window, the same way the task's exact-row pointer
+    does in the test above -- but through task_interaction_requests instead
+    of tasks.last_checkpoint_trace_event_id."""
+    _, db, task = _create_trace_handler_test_task("interaction-anchor-protected")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    old_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="interaction-anchored-old",
+        execution_id="shared-execution",
+        label="interaction-anchored-old",
+        timestamp=now,
+        run_id="run-a",
+    )
+    db.add(old_row)
+    db.commit()
+    db.refresh(old_row)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="run-a-new",
+            execution_id="shared-execution",
+            label="run-a-new",
+            timestamp=now + timedelta(seconds=1),
+            run_id="run-a",
+        )
+    )
+    db.commit()
+    _seed_interaction_row(
+        db, task_id=task_id, resume_trace_event_id=old_row.id, status="active"
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        assert {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        } == {"interaction-anchored-old", "run-a-new"}
+    finally:
+        db.close()
+
+
+def test_prune_does_not_protect_a_terminal_interaction_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reverse control for the test above: a terminated interaction row's
+    resume_trace_event_id must not enter the protection set -- only
+    active_slot IS NOT NULL rows do -- or the protection set would keep
+    growing forever as interactions terminate instead of shrinking back to
+    just the exact-row pointer."""
+    _, db, task = _create_trace_handler_test_task("interaction-anchor-terminal")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    old_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="terminal-anchored-old",
+        execution_id="shared-execution",
+        label="terminal-anchored-old",
+        timestamp=now,
+        run_id="run-a",
+    )
+    db.add(old_row)
+    db.commit()
+    db.refresh(old_row)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="run-a-new",
+            execution_id="shared-execution",
+            label="run-a-new",
+            timestamp=now + timedelta(seconds=1),
+            run_id="run-a",
+        )
+    )
+    db.commit()
+    _seed_interaction_row(
+        db, task_id=task_id, resume_trace_event_id=old_row.id, status="terminated"
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        assert {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        } == {"run-a-new"}
+    finally:
+        db.close()
+
+
+def test_prune_protects_an_expired_but_active_interaction_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deliberately no expires_at filter on the protection-set query: an
+    expired-but-still-active request (nothing has terminated it yet) is
+    still answerable, so its anchor must stay protected."""
+    _, db, task = _create_trace_handler_test_task("interaction-anchor-expired")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    old_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="expired-anchored-old",
+        execution_id="shared-execution",
+        label="expired-anchored-old",
+        timestamp=now,
+        run_id="run-a",
+    )
+    db.add(old_row)
+    db.commit()
+    db.refresh(old_row)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="run-a-new",
+            execution_id="shared-execution",
+            label="run-a-new",
+            timestamp=now + timedelta(seconds=1),
+            run_id="run-a",
+        )
+    )
+    db.commit()
+    _seed_interaction_row(
+        db,
+        task_id=task_id,
+        resume_trace_event_id=old_row.id,
+        status="active",
+        created_at=now - timedelta(hours=2),
+        expires_at=now - timedelta(hours=1),
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        assert {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        } == {"expired-anchored-old", "run-a-new"}
+    finally:
+        db.close()
+
+
+def test_prune_retains_at_most_limit_plus_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both protection sources at once, anchoring two distinct rows: the
+    exact-row pointer and the active interaction anchor are the two
+    exceptions the docstring's limit + 2 bound accounts for."""
+    _, db, task = _create_trace_handler_test_task("limit-plus-two")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    pointer_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="pointer-anchored-oldest",
+        execution_id="shared-execution",
+        label="pointer-anchored-oldest",
+        timestamp=now,
+        run_id="run-a",
+    )
+    db.add(pointer_row)
+    db.commit()
+    db.refresh(pointer_row)
+    interaction_anchor_row = _checkpoint_trace_row(
+        task_id=task_id,
+        event_id="interaction-anchored-middle",
+        execution_id="shared-execution",
+        label="interaction-anchored-middle",
+        timestamp=now + timedelta(seconds=1),
+        run_id="run-a",
+    )
+    db.add(interaction_anchor_row)
+    db.commit()
+    db.refresh(interaction_anchor_row)
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="run-a-newest",
+            execution_id="shared-execution",
+            label="run-a-newest",
+            timestamp=now + timedelta(seconds=2),
+            run_id="run-a",
+        )
+    )
+    task.last_checkpoint_trace_event_id = pointer_row.id
+    db.commit()
+    _seed_interaction_row(
+        db,
+        task_id=task_id,
+        resume_trace_event_id=interaction_anchor_row.id,
+        status="active",
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        remaining = {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        }
+        assert remaining == {
+            "pointer-anchored-oldest",
+            "interaction-anchored-middle",
+            "run-a-newest",
+        }
+        assert len(remaining) == 3  # limit (1) + 2
+    finally:
+        db.close()
+
+
+def test_prune_retains_exactly_the_limit_when_the_interaction_anchor_is_in_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interaction-anchor analog of
+    test_database_trace_handler_prune_retains_exactly_the_limit_when_the_anchor_is_in_range:
+    when the protected row already ranks inside the retention window, its
+    protection is redundant with natural retention, and the retained count
+    must stay exactly ``limit``.
+
+    This is also the test that actually distinguishes "exclude protected
+    rows from the ranking query, then OFFSET" (M9's bug) from "OFFSET
+    first, then exclude protected rows from the stale set" (the correct
+    order): when every protected row ranks outside the window (as in
+    test_prune_retains_at_most_limit_plus_two above), both orderings
+    produce the identical final set -- removing a row that already sits
+    past the OFFSET boundary cannot change which rows are within it. The
+    divergence only appears when a protected row ranks inside the window,
+    which is exactly this scenario.
+    """
+    _, db, task = _create_trace_handler_test_task("interaction-anchor-in-range")
+    task_id = int(task.id)
+    now = datetime.now(timezone.utc)
+    rows = [
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id=event_id,
+            execution_id="shared-execution",
+            label=event_id,
+            timestamp=now + timedelta(seconds=offset),
+            run_id="run-a",
+        )
+        for offset, event_id in enumerate(["oldest", "middle", "newest"])
+    ]
+    db.add_all(rows)
+    db.commit()
+    db.refresh(rows[-1])
+    _seed_interaction_row(
+        db, task_id=task_id, resume_trace_event_id=rows[-1].id, status="active"
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        assert {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        } == {"newest"}
     finally:
         db.close()
 

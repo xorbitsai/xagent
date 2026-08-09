@@ -28,6 +28,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 from ...web.models.database import get_db
 from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
+from ...web.models.task_interaction import TaskInteractionRequest
 from ...web.models.tool_config import ToolUsage
 from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
@@ -37,6 +38,7 @@ from ...web.services.ops_signals import (
     clear_degradation,
     register_degradation,
 )
+from ...web.services.task_interaction_schema import interaction_requests_table_exists
 from ...web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
     current_task_lease,
@@ -853,9 +855,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
         would discard the caller's pending writes and turn a misuse bug into
         silent data loss.
 
-        Retention is exactly ``limit`` rows, with one exception: when the
-        task's exact-row pointer names a row that itself ranks outside the
-        window, protecting that row keeps ``limit + 1``.
+        Retention is exactly ``limit`` rows, with up to two exceptions:
+        protecting a row named by the task's exact-row pointer, or by an
+        active interaction request's resume anchor, when that row itself
+        ranks outside the window keeps up to ``limit + 2`` (one pointer per
+        task, and at most one active interaction row per task -- see
+        ``uq_task_interaction_active_slot``).
         """
         if db.new or db.dirty or db.deleted:
             raise RuntimeError(
@@ -910,17 +915,54 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # delete would leave a steady state with nothing to prune unable
             # to clear the signal at all.
             clear_degradation(CHECKPOINT_PRUNE_FAILED)
+            # Protection set, second source: a trace row anchored by an
+            # ACTIVE interaction row must survive retention, or answering
+            # that interaction later would find no checkpoint to resume
+            # from. Only active_slot IS NOT NULL rows protect: terminal rows
+            # are not resumable. Deliberately no expires_at filter -- an
+            # expired request is still answerable, so its anchor must stay.
+            #
+            # Placed after clear_degradation above, not before: on a
+            # deployment upgraded to a revision before this table exists the
+            # query raises OperationalError on SQLite and ProgrammingError
+            # on PostgreSQL, which would land in two different handlers and
+            # -- on SQLite -- register a CHECKPOINT_PRUNE_FAILED signal on
+            # every checkpoint that no operator could ever clear. The
+            # has_table gate makes that unreachable; the placement keeps the
+            # blast radius small if the gate is ever removed.
+            interaction_anchor_ids: set[int] = set()
+            if interaction_requests_table_exists(db):
+                interaction_anchor_ids = {
+                    row_id
+                    for (row_id,) in db.query(
+                        TaskInteractionRequest.resume_trace_event_id
+                    ).filter(
+                        TaskInteractionRequest.task_id == self.task_id,
+                        TaskInteractionRequest.active_slot.isnot(None),
+                        TaskInteractionRequest.resume_trace_event_id.isnot(None),
+                    )
+                }
             # Rank first, protect after. The row this task's exact-row
-            # pointer references is never deleted, whatever its position in
-            # the retention ranking; excluding it from the candidate set
-            # instead would shift every remaining row's OFFSET rank by one
-            # and retain limit + 1 rows whenever the anchor sits inside the
-            # window. For the steady-state writer the protection is
-            # structurally unreachable -- the pointer always names the row
+            # pointer references, and any row an active interaction request
+            # anchors, are never deleted, whatever their position in the
+            # retention ranking; excluding them from the candidate set
+            # instead would shift every remaining row's OFFSET rank and turn
+            # the retained count into an unpredictable limit + k. The
+            # exact-row pointer's protection is structurally unreachable for
+            # the steady-state writer -- the pointer always names the row
             # just written, which ranks ahead of the offset -- but it guards
-            # the backfill-vs-prune window and future back-pointing anchors
-            # that may point at an older row.
-            stale_ids = [row_id for (row_id,) in stale_rows if row_id != anchor_id]
+            # the backfill-vs-prune window and back-pointing anchors that
+            # point at an older row. The interaction anchor is exactly that
+            # kind of back-pointing anchor, arrived: a task can keep writing
+            # checkpoints after an interaction is raised, so the row the
+            # interaction resumes from steadily sinks in the retention
+            # ranking while the interaction stays open.
+            protected_ids = interaction_anchor_ids | (
+                {anchor_id} if anchor_id is not None else set()
+            )
+            stale_ids = [
+                row_id for (row_id,) in stale_rows if row_id not in protected_ids
+            ]
             if not stale_ids:
                 return
             # Chunk the IN clause: a backlog from previously-disabled pruning

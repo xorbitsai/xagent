@@ -51,6 +51,9 @@ from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.services.task_deletion import purge_task_rows
+from xagent.web.services.task_interaction_schema import (
+    interaction_requests_table_exists,
+)
 
 
 def _seed_task_with_anchored_checkpoint(session: Session, *, username: str) -> int:
@@ -175,6 +178,39 @@ def sqlite_fk_on_session(tmp_path):
     engine.dispose()
 
 
+def _tables_excluding_interaction_requests() -> list:
+    return [
+        table
+        for table in Base.metadata.sorted_tables
+        if table.name != TaskInteractionRequest.__tablename__
+    ]
+
+
+@pytest.fixture
+def sqlite_fk_on_session_without_interaction_table(tmp_path):
+    """Same shape as sqlite_fk_on_session, minus task_interaction_requests
+    -- reproduces a deployment upgraded to a revision before that table
+    exists (see test_task_interaction_schema_gate.py for the same filter
+    used against the presence predicate directly)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'fk_on_no_interaction.db'}")
+
+    @event.listens_for(engine, "connect")
+    def _set_fk(dbapi_connection, _record):  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    reset_checkpoint_anchor_fk_create_rule()
+    Base.metadata.create_all(
+        bind=engine, tables=_tables_excluding_interaction_requests()
+    )
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = session_factory()
+    yield session
+    session.close()
+    engine.dispose()
+
+
 @pytest.fixture
 def sqlite_upgraded_session(tmp_path):
     """A SQLite database shaped like the migration's ADD COLUMN path for a
@@ -214,6 +250,30 @@ def postgres_session():
         conn.execute(text("CREATE SCHEMA public"))
     reset_checkpoint_anchor_fk_create_rule()
     Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = session_factory()
+    yield session
+    session.close()
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    engine.dispose()
+
+
+@pytest.fixture
+def postgres_session_without_interaction_table():
+    """Same shape as postgres_session, minus task_interaction_requests."""
+    url = _postgres_url()
+    if not url:
+        pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    reset_checkpoint_anchor_fk_create_rule()
+    Base.metadata.create_all(
+        bind=engine, tables=_tables_excluding_interaction_requests()
+    )
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()
     yield session
@@ -670,3 +730,65 @@ def test_purge_user_task_rows_deletes_interaction_rows_before_trace_events_postg
         _purge_user_task_rows(session, user_id=user_id)
     _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
     session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Absent-table branch: both purge functions on a deployment upgraded to a
+# revision before task_interaction_requests exists (PR-C2b, P4).
+# ---------------------------------------------------------------------------
+
+
+def test_purge_task_rows_succeeds_without_the_interaction_table_sqlite(
+    sqlite_fk_on_session_without_interaction_table,
+) -> None:
+    session = sqlite_fk_on_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-single")
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+
+
+@pytest.mark.postgresql
+def test_purge_task_rows_succeeds_without_the_interaction_table_postgres(
+    postgres_session_without_interaction_table,
+) -> None:
+    session = postgres_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-single")
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+
+
+def test_purge_user_task_rows_succeeds_without_the_interaction_table_sqlite(
+    sqlite_fk_on_session_without_interaction_table,
+) -> None:
+    session = sqlite_fk_on_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-bulk")
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+
+
+@pytest.mark.postgresql
+def test_purge_user_task_rows_succeeds_without_the_interaction_table_postgres(
+    postgres_session_without_interaction_table,
+) -> None:
+    session = postgres_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-bulk")
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0

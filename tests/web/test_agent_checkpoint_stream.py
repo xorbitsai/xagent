@@ -53,6 +53,14 @@ from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
+from xagent.web.services.ops_signals import (
+    CHECKPOINT_PRUNE_FAILED,
+    active_degradations,
+    clear_degradation,
+)
+from xagent.web.services.task_interaction_schema import (
+    interaction_requests_table_exists,
+)
 from xagent.web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
     TaskLease,
@@ -418,6 +426,46 @@ def _checkpoint_trace_row(
         timestamp=timestamp,
         data=data,
     )
+
+
+def _create_trace_handler_test_task_without_interaction_table(
+    username: str,
+    *,
+    title: str = "Chat task",
+    description: str = "Task chat",
+):
+    """Same shape as _create_trace_handler_test_task, built with a filtered
+    create_all that excludes task_interaction_requests -- reproducing a
+    deployment upgraded to a revision before that table exists (the
+    migration that creates it is not merged). The table has no inbound
+    foreign keys, so excluding it cannot break create order (verified in
+    the audit: 52 of 53 tables created, tasks and trace_events both
+    present, has_table(target) False).
+    """
+    engine = _shared_memory_sqlite_engine()
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    tables = [
+        table
+        for table in Base.metadata.sorted_tables
+        if table.name != TaskInteractionRequest.__tablename__
+    ]
+    Base.metadata.create_all(bind=engine, tables=tables)
+    db = SessionLocal()
+
+    user = User(username=username, password_hash="hashed_password", is_admin=False)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    task = Task(
+        user_id=int(user.id),
+        title=title,
+        description=description,
+        status=TaskStatus.PENDING,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return SessionLocal, db, task
 
 
 def _seed_interaction_row(
@@ -2242,6 +2290,69 @@ def test_prune_retains_exactly_the_limit_when_the_interaction_anchor_is_in_range
             for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
         } == {"newest"}
     finally:
+        db.close()
+
+
+def test_prune_runs_without_the_interaction_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The has_table gate's reason to exist: on a deployment upgraded to a
+    revision before task_interaction_requests exists, prune must still
+    complete, still reclaim stale rows, and must not register
+    CHECKPOINT_PRUNE_FAILED -- registering it here would be exactly the
+    failure mode measured in the audit (SQLite's OperationalError landing
+    in the (IntegrityError, OperationalError) handler on every checkpoint
+    write, with no way for an operator to ever clear it)."""
+    _, db, task = _create_trace_handler_test_task_without_interaction_table(
+        "prune-without-interaction-table"
+    )
+    task_id = int(task.id)
+    assert interaction_requests_table_exists(db) is False
+    now = datetime.now(timezone.utc)
+    db.add_all(
+        [
+            _checkpoint_trace_row(
+                task_id=task_id,
+                event_id="no-table-old",
+                execution_id="shared-execution",
+                label="no-table-old",
+                timestamp=now,
+                run_id="run-a",
+            ),
+            _checkpoint_trace_row(
+                task_id=task_id,
+                event_id="no-table-new",
+                execution_id="shared-execution",
+                label="no-table-new",
+                timestamp=now + timedelta(seconds=1),
+                run_id="run-a",
+            ),
+        ]
+    )
+    db.commit()
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+        lambda: 1,
+    )
+
+    clear_degradation(CHECKPOINT_PRUNE_FAILED)
+    try:
+        DatabaseTraceHandler(task_id)._prune_checkpoint_history(
+            db,
+            {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "execution_id": "shared-execution",
+                TASK_RUN_ID_TRACE_FIELD: "run-a",
+            },
+        )
+
+        assert CHECKPOINT_PRUNE_FAILED not in active_degradations()
+        assert {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent).filter_by(task_id=task_id).all()
+        } == {"no-table-new"}
+    finally:
+        clear_degradation(CHECKPOINT_PRUNE_FAILED)
         db.close()
 
 

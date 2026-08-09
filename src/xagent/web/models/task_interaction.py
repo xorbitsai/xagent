@@ -33,6 +33,14 @@ class TaskInteractionRequest(Base):  # type: ignore
     ``uq_task_interaction_active_slot``, or every terminal row after the
     first would collide.
 
+    That cap reads as "one active slot per root Task" only because one
+    agent tree maps to exactly one ``tasks`` row today; the schema carries
+    no root concept of its own. If a root discriminator column is ever
+    added here it must be a ``NOT NULL`` sentinel -- an empty string, not a
+    nullable column -- because the same NULL-distinct behavior this
+    constraint relies on would otherwise void it entirely on the root
+    side, accepting a second active root row.
+
     ``protocol_version`` is governed by two constraints:
     ``ck_task_interaction_requests_protocol_version_floor`` (``>= 1``, every
     row) and ``ck_task_interaction_requests_active_protocol`` (``= 1``,
@@ -80,6 +88,14 @@ class TaskInteractionRequest(Base):  # type: ignore
     intentionally not in the vocabulary; the old name
     ``superseded_by_legacy_resume`` must not come back.
 
+    ``origin``'s IN-list is a frozen superset of ``Task.source`` literals,
+    not a mirror: retiring a ``Task.source`` value must not narrow this
+    CHECK, or historical rows written with the retired value become
+    unrecreatable; adding a new ``Task.source`` value needs this CHECK
+    updated plus a migration. The staging primitive validates ``origin`` in
+    Python before INSERT -- the CHECK is the backstop, not the primary
+    validation.
+
     Clock source for ``ck_task_interaction_requests_expiry_after_creation``:
     ``created_at`` is bound by ``server_default=func.now()`` and never from
     Python, matching every other ``created_at`` in this package. That is
@@ -120,7 +136,11 @@ class TaskInteractionRequest(Base):  # type: ignore
     ``+08:00``) is silently stored as local wall-clock time -- the CHECK
     still passes, and the row is accepted with the wrong instant. That
     aware-non-UTC corruption is SQLite-specific; the caller's UTC
-    obligation is not.
+    obligation is not. PostgreSQL converts an aware non-UTC value correctly
+    (verified: a ``+08:00`` bind reads back as the UTC instant); only
+    SQLite drops the offset. That asymmetry is exactly what the two
+    suites' round-trip tests measure -- they assert different outcomes on
+    purpose.
     ``expires_at`` is authoritative only for reclamation statements; readers
     must never use it to hide a row that is otherwise still ``active``.
 

@@ -919,13 +919,20 @@ def test_expires_at_round_trips_as_utc(db_session, fixtures) -> None:
         text("SELECT expires_at FROM task_interaction_requests WHERE id = :id"),
         {"id": non_utc_row.id},
     ).scalar_one()
-    # The +08:00 instant is 12:00 UTC, the same wall-clock moment as
-    # utc_value above; a correct UTC store would read back "12:00:00". A
-    # bare "20:00:00" instead confirms tzinfo was dropped and the local
-    # wall-clock digits were kept verbatim.
+    # Hazard pin, not a contract. The +08:00 instant is 12:00 UTC, and the
+    # PostgreSQL twin (same test name) asserts exactly that -- it reads back
+    # 12:00. SQLite's bind path drops tzinfo instead of converting, so the
+    # same value lands as the bare local wall-clock digits and the row is
+    # accepted with the wrong instant. The divergence between the two suites
+    # is measured, not accidental.
+    #
+    # If this assertion ever fails, SQLite bind-side normalization has been
+    # introduced: delete this block, drop the corresponding wrinkle from this
+    # test's docstring and from the model docstring's aware-non-UTC
+    # paragraph, and narrow the caller's UTC obligation there accordingly.
     assert raw_stored.startswith("2026-06-01 20:00:00"), (
-        f"expected the local wall-clock digits '20:00:00' to be stored verbatim "
-        f"(tzinfo dropped on bind), got: {raw_stored!r}"
+        f"the SQLite tzinfo-dropping hazard is no longer reproducing "
+        f"(expected the local wall-clock digits '20:00:00'); got: {raw_stored!r}"
     )
 
 

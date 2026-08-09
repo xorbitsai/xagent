@@ -811,7 +811,10 @@ def test_expires_at_round_trips_as_utc(db_session, fixtures) -> None:
     )
     # The +08:00 instant and utc_value are the same wall-clock moment
     # (12:00 UTC); PostgreSQL normalizes on write, so this must round-trip
-    # to that shared instant rather than to 20:00.
+    # to that shared instant rather than to 20:00. The SQLite twin (same
+    # test name) asserts the opposite outcome -- it reads back the bare
+    # "20:00:00" local digits; the divergence is measured backend behavior,
+    # not an inconsistency between the two suites.
     assert non_utc_row.expires_at == utc_value
 
 

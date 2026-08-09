@@ -17,13 +17,11 @@ export interface KnowledgeBaseErrorToastCopy {
  * covers storage collisions and lock contention, so "did the user type a name"
  * cannot be answered usefully there.
  *
- * Answer `"advise-rename"` only where a 409 has exactly one possible cause --
- * the name just entered is taken. Everywhere else answer `"neutral"`, and the
- * backend's own message is shown instead, which stays accurate whichever cause
- * actually fired. `"neutral"` is always the safe answer.
+ * Pass `true` only where a 409 has exactly one possible cause -- the name just
+ * entered is taken. Everywhere else pass `false` and the backend's own message
+ * is shown, which stays accurate whichever cause actually fired. `false` is
+ * always the safe answer.
  */
-export type KnowledgeBaseConflictAdvice = "advise-rename" | "neutral"
-
 export interface KnowledgeBaseErrorSource {
   /**
    * HTTP status of the failed response, or ``undefined`` when the failure did
@@ -31,7 +29,7 @@ export interface KnowledgeBaseErrorSource {
    * ``response.ok`` cannot forget to pass ``response.status`` with it.
    */
   status: number | undefined
-  conflictAdvice: KnowledgeBaseConflictAdvice
+  adviseRename: boolean
 }
 
 export interface KnowledgeBaseErrorToastContent {
@@ -176,9 +174,9 @@ export function getKnowledgeBaseErrorToastContent(
   const rootCause = originalError ?? normalized
 
   // Classifying on the status keeps this independent of the backend's English
-  // wording. A "neutral" 409 falls through and shows the backend's own message:
+  // wording. A 409 without that advice falls through to the backend's own message:
   // inventing one sentence for every conflict cause would misstate most of them.
-  if (source.status === 409 && source.conflictAdvice === "advise-rename") {
+  if (source.status === 409 && source.adviseRename) {
     return {
       title: copy.nameUnavailableTitle,
       description: copy.nameUnavailableDescription,

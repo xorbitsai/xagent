@@ -21,7 +21,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
       COPY,
-      { status: undefined, conflictAdvice: "advise-rename" }
+      { status: undefined, adviseRename: true }
     )
 
     expect(result).toEqual({
@@ -34,7 +34,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test.",
       COPY,
-      { status: 409, conflictAdvice: "advise-rename" }
+      { status: 409, adviseRename: true }
     )
 
     expect(result).toEqual({
@@ -47,7 +47,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "some entirely different sentence the backend may switch to",
       COPY,
-      { status: 409, conflictAdvice: "advise-rename" }
+      { status: 409, adviseRename: true }
     )
 
     expect(result).toEqual({
@@ -60,7 +60,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: test.",
       COPY,
-      { status: 500, conflictAdvice: "advise-rename" }
+      { status: 500, adviseRename: true }
     )
 
     expect(result.title).toBe(COPY.genericTitle)
@@ -90,7 +90,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
   ])("relays the backend verdict verbatim when %s", (_case, detail) => {
     const result = getKnowledgeBaseErrorToastContent(detail, COPY, {
       status: 409,
-      conflictAdvice: "neutral",
+      adviseRename: false,
     })
 
     expect(result.title).toBe(COPY.genericTitle)
@@ -104,7 +104,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Knowledge base name unavailable: demo.",
       COPY,
-      { status: 409, conflictAdvice: "neutral" }
+      { status: 409, adviseRename: false }
     )
 
     expect(result.title).toBe(COPY.genericTitle)
@@ -115,7 +115,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "Failed to fully roll back ingest for demo/file.txt: delete failed. Original ingestion error: Model 'text-embedding-v4' not found in hub and no environment configuration available for embedding.",
       COPY,
-      { status: undefined, conflictAdvice: "advise-rename" }
+      { status: undefined, adviseRename: true }
     )
 
     expect(result).toEqual({
@@ -128,7 +128,7 @@ describe("getKnowledgeBaseErrorToastContent", () => {
     const result = getKnowledgeBaseErrorToastContent(
       "A very long upload failure happened while processing the document and there are many more technical details that should not become the toast title for end users.",
       COPY,
-      { status: undefined, conflictAdvice: "advise-rename" }
+      { status: undefined, adviseRename: true }
     )
 
     expect(result.title).toBe(COPY.genericTitle)

@@ -409,7 +409,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     if (selectedFiles.length === 0) return
 
     setIsUploading(true)
-    let failedStatus: number | undefined
     setUploadProgress(0)
     setUploadProgressDetail(null)
     setIngestionResults([])
@@ -442,7 +441,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         const parsed = await parseApiResponse(response)
 
         if (!response.ok) {
-          failedStatus = response.status
           const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
           if (errorData.status === 'error') {
             setIngestionResults(prev => [
@@ -529,7 +527,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric")),
-        { status: failedStatus, conflictAdvice: "neutral" }
+        { status: undefined, adviseRename: false }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -599,7 +597,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
 
     setIsWebIngesting(true)
-    let failedStatus: number | undefined
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
 
@@ -648,7 +645,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       setWebIngestionProgress(50)
 
       if (!response.ok) {
-        failedStatus = response.status
         const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
         if (errorData.status === 'error') {
           setWebIngestionResult(errorData as unknown as WebIngestionResult)
@@ -728,7 +724,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed")),
-        { status: failedStatus, conflictAdvice: "neutral" }
+        { status: undefined, adviseRename: false }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -812,7 +808,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     }
 
     setIsUpdating(true)
-    let failedStatus: number | undefined
     try {
       const formData = new FormData()
       formData.append("new_name", editCollectionName)
@@ -823,7 +818,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
-        failedStatus = response.status
         const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.edit.errors.renameFailed"))
       }
@@ -842,7 +836,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         // Rename answers 409 for a taken name, a colliding storage directory and
         // lock contention alike, so no single sentence we could substitute would
         // be true of all three: show the one the backend actually chose.
-        { status: failedStatus, conflictAdvice: "neutral" }
+        { status: undefined, adviseRename: false }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -854,7 +848,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
   const handleSaveConfig = async () => {
     setIsSavingConfig(true)
-    let failedStatus: number | undefined
     try {
       const payload: any = { ...ingestionConfig }
 
@@ -873,7 +866,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
-        failedStatus = response.status
         const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
       }
@@ -892,8 +884,6 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         },
       )
       if (!rerankResp.ok) {
-        // Deliberately not recorded as failedStatus: that variable carries the
-        // config endpoint's contract, and this is a different endpoint.
         const errorData = await rerankResp.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
       }
@@ -911,7 +901,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed")),
         // A 409 here means this collection is no longer visible to the caller,
         // not that a name was just typed: show what the backend actually said.
-        { status: failedStatus, conflictAdvice: "neutral" }
+        { status: undefined, adviseRename: false }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,

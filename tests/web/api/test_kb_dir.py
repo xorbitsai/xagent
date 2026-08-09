@@ -1401,6 +1401,83 @@ def test_rename_collision_detail_keeps_the_owner_id_out_of_the_response():
 
 
 @pytest.mark.asyncio
+async def test_ensure_collection_access_allows_a_name_no_collection_holds():
+    """The #1139 happy path: naming something nobody has taken just returns.
+
+    Every other branch of this helper raises, so a regression that started
+    raising here too would still leave the suite green.
+    """
+    from xagent.core.tools.core.RAG_tools.core.schemas import ListCollectionsResult
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    empty = ListCollectionsResult(
+        status="success", collections=[], total_count=0, message="ok", warnings=[]
+    )
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        return_value=empty,
+    ) as mock_list:
+        await _ensure_collection_access("brand-new-name", user, allow_create=True)
+
+    assert mock_list.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_access_denies_a_taken_name_without_naming_intent():
+    """``taken_name_is_conflict=False`` keeps a taken name a denial, not a conflict.
+
+    This is the combination ``save_collection_config`` uses -- it accepts a name
+    with no collection behind it, but its body carries no name field, so a
+    foreign name is an access attempt rather than someone picking a name. Only
+    covered end to end otherwise, while the branching lives here.
+    """
+    from fastapi import HTTPException
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionInfo,
+        ListCollectionsResult,
+    )
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    def _listing(*names: str) -> ListCollectionsResult:
+        return ListCollectionsResult(
+            status="success",
+            collections=[
+                CollectionInfo(name=n, documents=1, document_names=[]) for n in names
+            ],
+            total_count=len(names),
+            message="ok",
+            warnings=[],
+        )
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        side_effect=[_listing(), _listing("someone-elses")],
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _ensure_collection_access(
+                "someone-elses",
+                user,
+                allow_create=True,
+                taken_name_is_conflict=False,
+            )
+
+    assert exc_info.value.status_code == 403
+    assert "Access denied for collection" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_ensure_collection_access_returns_409_when_creating_taken_name():
     """Creating a name another tenant already owns is a conflict, not a denial."""
     from types import SimpleNamespace

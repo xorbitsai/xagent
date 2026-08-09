@@ -20,6 +20,7 @@ from xagent.core.computer.schema import (
     ComputerActionType,
     ComputerElement,
     ComputerElementSource,
+    ComputerElementSurface,
     ComputerEnvironmentType,
     ComputerObservation,
     ComputerTarget,
@@ -57,6 +58,7 @@ def observation(
                     element_id="button-1",
                     source=ComputerElementSource.DOM,
                     bounds=NormalizedRect(x=0.1, y=0.1, width=0.2, height=0.1),
+                    surface=ComputerElementSurface.DOCUMENT,
                 )
             ]
             if with_element

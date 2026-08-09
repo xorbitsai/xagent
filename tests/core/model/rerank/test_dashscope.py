@@ -34,6 +34,19 @@ class TestDashscopeRerank:
         assert client.model == "qwen3-rerank"
         assert client.top_n is None
         assert client.instruct is None
+        assert client.timeout == 60.0
+
+    def test_requests_carry_the_configured_timeout(self):
+        """Every rerank call must be bounded; an unbounded post hangs retrieval."""
+        client = DashscopeRerank(api_key="test_key", timeout=12.0)
+        response = Mock()
+        response.json.return_value = {"results": [{"index": 0}]}
+
+        with patch("requests.post", return_value=response) as post:
+            client.compress(["doc"], "query")
+            client.compress_with_scores(["doc"], "query")
+
+        assert [call.kwargs["timeout"] for call in post.call_args_list] == [12.0, 12.0]
 
     def test_missing_api_key(self, monkeypatch):
         """Test error when API key is missing and not in env."""

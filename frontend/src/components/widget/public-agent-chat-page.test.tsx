@@ -170,6 +170,7 @@ function expectPublicProviderToken() {
   expect(app.provider?.transport?.capabilities).toEqual({
     agentCards: "disabled",
     voice: "disabled",
+    linksOpenInNewTab: "enabled",
   })
   expect(app.startScreenProps?.voiceInputEnabled).toBe(false)
   expect(app.provider?.transport?.buildWebSocketUrl?.({
@@ -578,6 +579,9 @@ describe("PublicAgentChatPage", () => {
       taskId: 42,
       token: app.provider?.token,
     })).toBe("wss://api.example/api/share/chat/ws/42?token=public-access-token")
+    // A share visitor already has the full page; unlike the embedded widget
+    // iframe, an in-tab navigation away from it is ordinary browser behavior.
+    expect(app.provider?.transport?.capabilities?.linksOpenInNewTab).toBe("disabled")
   })
 
   it("reuses a persisted, unexpired share token without re-authing", async () => {

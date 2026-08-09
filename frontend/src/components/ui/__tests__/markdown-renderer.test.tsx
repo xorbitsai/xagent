@@ -52,7 +52,10 @@ vi.mock('@/contexts/i18n-context', () => ({
 }))
 
 import { JsonRenderer, MarkdownRenderer } from '../markdown-renderer'
-import { AgentCardPresentationCapability } from '@/contexts/presentation-capabilities'
+import {
+  AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
+} from '@/contexts/presentation-capabilities'
 import {
   getFilesDisabledPresentationFileLabel,
   projectFilesDisabledPresentation,
@@ -680,17 +683,67 @@ describe('MarkdownRenderer', () => {
     expect(await screen.findByTestId('excel-preview')).toHaveTextContent('WFk=')
   })
 
-  it('preserves standard relative markdown links and images', () => {
+  it('preserves standard relative markdown links and images, and does not open them in a new tab by default', () => {
     const content = '[relative doc](../doc.md)\n\n![relative image](./a.png)'
     render(<MarkdownRenderer content={content} />)
 
     const link = screen.getByText('relative doc')
     expect(link).toBeInTheDocument()
     expect(link).toHaveAttribute('href', '../doc.md')
+    expect(link).not.toHaveAttribute('target')
+    expect(link).not.toHaveAttribute('rel')
 
     const image = screen.getByAltText('relative image')
     expect(image).toBeInTheDocument()
     expect(image).toHaveAttribute('src', './a.png')
+  })
+
+  it('opens ordinary links in a new tab only when the LinksOpenInNewTab capability is enabled', () => {
+    render(
+      <LinksOpenInNewTabCapability.Provider value={true}>
+        <MarkdownRenderer content="[Google](https://www.google.com)" />
+      </LinksOpenInNewTabCapability.Provider>,
+    )
+
+    const link = screen.getByRole('link', { name: 'Google' })
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+  })
+
+  it('keeps in-page anchor links and mailto links in the current tab even when the capability is enabled', () => {
+    const content = [
+      '[Jump to section](#section)',
+      '[Email us](mailto:hello@example.com)',
+    ].join('\n\n')
+    render(
+      <LinksOpenInNewTabCapability.Provider value={true}>
+        <MarkdownRenderer content={content} />
+      </LinksOpenInNewTabCapability.Provider>,
+    )
+
+    for (const name of ['Jump to section', 'Email us']) {
+      const link = screen.getByRole('link', { name })
+      expect(link).not.toHaveAttribute('target')
+      expect(link).not.toHaveAttribute('rel')
+    }
+  })
+
+  it('neutralizes javascript: hrefs before the new-tab check ever sees them', () => {
+    render(<MarkdownRenderer content="[click me](javascript:alert(1))" />)
+
+    const link = screen.getByText('click me')
+    expect(link).not.toHaveAttribute('href')
+    expect(link).not.toHaveAttribute('target')
+    expect(link).not.toHaveAttribute('rel')
+  })
+
+  it('does not add target/rel to a link with an empty href', () => {
+    render(<MarkdownRenderer content="[x]()" />)
+
+    const link = screen.getByText('x')
+    expect(link).not.toHaveAttribute('href')
+    expect(link).not.toHaveAttribute('target')
+    expect(link).not.toHaveAttribute('rel')
   })
 
   it('uses authenticated preview fallback for non-uuid file: images', async () => {
@@ -770,6 +823,36 @@ describe('MarkdownRenderer', () => {
       'http://api.local/api/files/public/preview/doc-file-id',
       expect.objectContaining({ cache: 'no-cache' })
     )
+  })
+
+  it('renders video file links as an inline video preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content = '[puppy_drinking.mp4](file:550e8400-e29b-41d4-a716-446655440000)'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('puppy_drinking.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    await waitFor(() => {
+      expect(video.getAttribute('src')).toMatch(/^blob:/)
+    })
+  })
+
+  it('renders image-syntax video references as an inline video preview', async () => {
+    // The backend restores the filename as the label even for ![...] refs
+    // pointing at media files; the image renderer then resolves the video
+    // kind from the label instead of falling back to a broken <img>.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content = '![puppy_drinking.mp4](file:550e8400-e29b-41d4-a716-446655440000)'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('puppy_drinking.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
   })
 
   it('renders file links as image previews when the path has an image extension', async () => {

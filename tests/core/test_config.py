@@ -42,6 +42,7 @@ from xagent.config import (
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
     KB_COLLECTIONS_TIMEOUT_SECONDS,
+    KB_SEARCH_TIMEOUT_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
@@ -133,6 +134,7 @@ from xagent.config import (
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
     get_kb_collections_timeout_seconds,
+    get_kb_search_timeout_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
@@ -1216,6 +1218,29 @@ class TestGetKbCollectionsTimeoutSeconds:
     def test_non_positive_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv(KB_COLLECTIONS_TIMEOUT_SECONDS, "0")
         assert get_kb_collections_timeout_seconds() == 30
+
+
+class TestGetKbSearchTimeoutSeconds:
+    """Test get_kb_search_timeout_seconds() function."""
+
+    def test_env_var_constant(self):
+        assert KB_SEARCH_TIMEOUT_SECONDS == "XAGENT_KB_SEARCH_TIMEOUT_SECONDS"
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(KB_SEARCH_TIMEOUT_SECONDS, raising=False)
+        assert get_kb_search_timeout_seconds() == 60
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(KB_SEARCH_TIMEOUT_SECONDS, "5")
+        assert get_kb_search_timeout_seconds() == 5
+
+    def test_invalid_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(KB_SEARCH_TIMEOUT_SECONDS, "not-a-number")
+        assert get_kb_search_timeout_seconds() == 60
+
+    def test_non_positive_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(KB_SEARCH_TIMEOUT_SECONDS, "0")
+        assert get_kb_search_timeout_seconds() == 60
 
 
 class TestGetDefaultSqliteDbPath:

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import threading
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -1252,11 +1253,15 @@ def test_same_run_resume_lease_preserves_checkpoint_pointer(db_session) -> None:
         runner_id="resume-runner",
         expected_run_id="resumable-run",
     )
+    assert lease is not None
 
     assert lease == TaskLease(
         task_id=int(task.id),
         runner_id="resume-runner",
         run_id="resumable-run",
+        # Not part of what this test pins: a fresh attempt id per claim is
+        # acquire's contract, exercised by the stamping tests below.
+        attempt_id=lease.attempt_id,
     )
     db_session.refresh(task)
     assert task.last_checkpoint_event_id == "current-run-checkpoint"
@@ -1343,6 +1348,7 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
     task.run_id = "checkpoint-run"
+    task.lease_attempt_id = "stale-attempt"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
     task.last_checkpoint_event_id = "checkpoint-1"
     checkpoint_event = TraceEvent(
@@ -1370,6 +1376,7 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
     assert task.status == TaskStatus.PAUSED
     assert task.runner_id is None
     assert task.lease_expires_at is None
+    assert task.lease_attempt_id is None
 
 
 def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
@@ -1437,3 +1444,175 @@ def test_stale_running_task_with_legacy_checkpoint_becomes_paused(db_session) ->
     assert task.status == TaskStatus.PAUSED
     assert task.runner_id is None
     assert task.lease_expires_at is None
+
+
+def test_acquire_stamps_a_fresh_attempt_id_onto_the_task_row(db_session) -> None:
+    """acquire -> tasks.lease_attempt_id -> TaskLease.attempt_id round-trips.
+
+    The lease is not stamped from RETURNING (see the values-dict read-back in
+    acquire_task_lease_no_commit), so the only thing proving the returned
+    identity is the one actually persisted is this three-way comparison.
+    """
+    task = _create_task(db_session, status=TaskStatus.PENDING)
+
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+
+    assert lease is not None
+    assert lease.attempt_id is not None
+    # Not a placeholder: it must parse as a uuid and fit String(64).
+    uuid.UUID(lease.attempt_id)
+    assert len(lease.attempt_id) <= 64
+
+    db_session.refresh(task)
+    assert task.lease_attempt_id == lease.attempt_id
+
+
+def test_each_acquisition_mints_a_new_attempt_id(db_session) -> None:
+    """A new value per claim -- this is what state_version cannot do."""
+    task = _create_task(db_session, status=TaskStatus.PENDING)
+
+    first = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert first is not None
+    release_task_lease(db_session, first, status=TaskStatus.PAUSED)
+
+    second = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert second is not None
+
+    assert first.attempt_id != second.attempt_id
+    db_session.refresh(task)
+    assert task.lease_attempt_id == second.attempt_id
+
+
+def test_same_run_resume_still_rotates_the_attempt_id(db_session) -> None:
+    """expected_run_id keeps the run but not the attempt: this is exactly the
+    shape where a successor run reacquires the SAME (runner_id, run_id)
+    tuple and must still be distinguishable from the stale run holding it."""
+    task = _create_task(db_session, status=TaskStatus.WAITING_FOR_USER)
+    task.run_id = "resumable-run"
+    db_session.commit()
+
+    first = acquire_task_lease(
+        db_session,
+        int(task.id),
+        runner_id="same-runner",
+        expected_run_id="resumable-run",
+    )
+    second = acquire_task_lease(
+        db_session,
+        int(task.id),
+        runner_id="same-runner",
+        expected_run_id="resumable-run",
+    )
+
+    assert first is not None and second is not None
+    assert (first.runner_id, first.run_id) == (second.runner_id, second.run_id)
+    assert first.attempt_id != second.attempt_id
+
+
+def test_new_run_acquisition_stamps_an_attempt_id(db_session) -> None:
+    """The stamp lives in the values-dict base, not a conditional branch --
+    it must fire on the new_run=True path too."""
+    task = _create_task(db_session, status=TaskStatus.PENDING)
+
+    lease = acquire_task_lease(
+        db_session, int(task.id), runner_id="runner-a", new_run=True
+    )
+
+    assert lease is not None
+    assert lease.attempt_id is not None
+    uuid.UUID(lease.attempt_id)
+    db_session.refresh(task)
+    assert task.lease_attempt_id == lease.attempt_id
+
+
+def test_release_clears_the_attempt_id(db_session) -> None:
+    """The column must not carry a finished attempt's value."""
+    task = _create_task(db_session, status=TaskStatus.PENDING)
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert lease is not None
+    db_session.refresh(task)
+    assert task.lease_attempt_id is not None
+
+    release_task_lease(db_session, lease, status=TaskStatus.PAUSED)
+
+    db_session.refresh(task)
+    assert task.lease_attempt_id is None
+
+
+def test_expired_lease_recovery_clears_the_attempt_id(db_session) -> None:
+    """Same invariant as release, exercised through expiry recovery.
+
+    No checkpoint is set up, so recovery lands on FAILED rather than PAUSED
+    -- that branch distinction is orthogonal to what this test pins.
+    """
+    task = _create_task(db_session, status=TaskStatus.RUNNING)
+    task.runner_id = "dead-runner"
+    task.run_id = "expiring-run"
+    task.lease_expires_at = utc_now() - timedelta(seconds=1)
+    task.lease_attempt_id = "stale-attempt"
+    db_session.commit()
+    assert task.lease_attempt_id is not None
+
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+    db_session.refresh(task)
+    assert task.lease_attempt_id is None
+
+
+def test_fail_and_release_clears_the_attempt_id(db_session) -> None:
+    """Same invariant, exercised through the fail-and-release writer."""
+    task = _create_task(db_session)
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert lease is not None
+    db_session.refresh(task)
+    assert task.lease_attempt_id is not None
+
+    changed = task_lease_service.fail_and_release_task_lease_no_commit(
+        db_session,
+        lease,
+        error_message="setup failed",
+    )
+    db_session.commit()
+
+    assert changed is True
+    db_session.refresh(task)
+    assert task.lease_attempt_id is None
+
+
+def test_release_current_runner_task_lease_clears_the_attempt_id(db_session) -> None:
+    """Same invariant, exercised through the current-runner release path."""
+    task = _create_task(db_session, status=TaskStatus.PENDING)
+    lease = acquire_task_lease(db_session, int(task.id), runner_id="runner-a")
+    assert lease is not None
+    db_session.refresh(task)
+    assert task.lease_attempt_id is not None
+
+    changed = task_lease_service.release_current_runner_task_lease(
+        db_session,
+        int(task.id),
+        status=TaskStatus.PAUSED,
+        runner_id="runner-a",
+    )
+
+    assert changed is True
+    db_session.refresh(task)
+    assert task.lease_attempt_id is None
+
+
+def test_task_lease_snapshot_never_carries_an_attempt_id() -> None:
+    """The ambient snapshot rebuilt from a task row must keep attempt_id None
+    even when the row has one, so a later attempt check cannot compare a
+    value against itself and always pass."""
+    from types import SimpleNamespace
+
+    from xagent.web.api.websocket import _task_lease_snapshot
+
+    row = SimpleNamespace(
+        id=7,
+        runner_id="runner-a",
+        run_id="run-b",
+        lease_attempt_id="attempt-c",
+    )
+    lease = _task_lease_snapshot(row)
+    assert lease is not None
+    assert lease.attempt_id is None

@@ -1,9 +1,35 @@
 export interface KnowledgeBaseErrorToastCopy {
   genericTitle: string
+  nameUnavailableTitle: string
+  nameUnavailableDescription: string
   embeddingTitle: string
   embeddingDescription: string
   rollbackTitle: string
   rollbackDescription: string
+}
+
+/**
+ * Whether a 409 from this request is allowed to tell the user to pick another
+ * name.
+ *
+ * This states the **conclusion**, not the premise, because no single premise
+ * survives every call site: the rename dialog has a name field yet its 409 also
+ * covers storage collisions and lock contention, so "did the user type a name"
+ * cannot be answered usefully there.
+ *
+ * Pass `true` only where a 409 has exactly one possible cause -- the name just
+ * entered is taken. Everywhere else pass `false` and the backend's own message
+ * is shown, which stays accurate whichever cause actually fired. `false` is
+ * always the safe answer.
+ */
+export interface KnowledgeBaseErrorSource {
+  /**
+   * HTTP status of the failed response, or ``undefined`` when the failure did
+   * not come from one. Required rather than optional so a call site that checks
+   * ``response.ok`` cannot forget to pass ``response.status`` with it.
+   */
+  status: number | undefined
+  adviseRename: boolean
 }
 
 export interface KnowledgeBaseErrorToastContent {
@@ -140,11 +166,22 @@ function isRollbackFailure(message: string): boolean {
 
 export function getKnowledgeBaseErrorToastContent(
   message: string,
-  copy: KnowledgeBaseErrorToastCopy
+  copy: KnowledgeBaseErrorToastCopy,
+  source: KnowledgeBaseErrorSource
 ): KnowledgeBaseErrorToastContent {
   const normalized = normalizeMessage(message)
   const originalError = extractOriginalIngestionError(normalized)
   const rootCause = originalError ?? normalized
+
+  // Classifying on the status keeps this independent of the backend's English
+  // wording. A 409 without that advice falls through to the backend's own message:
+  // inventing one sentence for every conflict cause would misstate most of them.
+  if (source.status === 409 && source.adviseRename) {
+    return {
+      title: copy.nameUnavailableTitle,
+      description: copy.nameUnavailableDescription,
+    }
+  }
 
   if (isEmbeddingConfigurationError(rootCause)) {
     return {

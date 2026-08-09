@@ -13,11 +13,13 @@ vi.mock("@/lib/api-wrapper", () => ({
     text: null,
     isHtml: false,
   }),
+  // Mirrors api-wrapper.ts: detail wins over message. Getting this backwards
+  // silently drops the backend sentence and makes assertions about it vacuous.
   getUploadErrorMessage: (
     _response: unknown,
-    parsed: { data?: { message?: string } | null },
+    parsed: { data?: { detail?: string; message?: string } | null },
     messages: { generic: string }
-  ) => parsed?.data?.message || messages.generic,
+  ) => parsed?.data?.detail || parsed?.data?.message || messages.generic,
   isJsonRecord: (value: unknown) => typeof value === "object" && value !== null && !Array.isArray(value),
   UPLOAD_ERROR_MESSAGES: {},
 }))
@@ -33,7 +35,10 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-vi.mock("sonner", () => ({
+// The component imports toast from this wrapper, not from `sonner` directly:
+// mocking the raw package would leave the wrapper's injected options in the
+// asserted arguments and force a meaningless matcher for them.
+vi.mock("@/components/ui/sonner", () => ({
   toast: {
     error: toastErrorMock,
     success: toastSuccessMock,
@@ -142,10 +147,10 @@ vi.mock("./cloud-connect-dialog", () => ({
 
 import { KnowledgeBaseCreationDialog } from "./knowledge-base-creation-dialog"
 
-function createJsonResponse(body: unknown, ok = true) {
+function createJsonResponse(body: unknown, ok = true, status?: number) {
   return {
     ok,
-    status: ok ? 200 : 500,
+    status: status ?? (ok ? 200 : 500),
     json: vi.fn().mockResolvedValue(body),
   }
 }
@@ -195,7 +200,63 @@ function installApiMocks() {
   })
 }
 
-describe("KnowledgeBaseCreationDialog multi-file naming", () => {
+const IMPORT_TABS = ["file", "web", "cloud"] as const
+type ImportTab = (typeof IMPORT_TABS)[number]
+
+/** Walk the wizard to step 3 (where the create button lives) for one import tab. */
+async function goToStep3(container: HTMLElement, tab: ImportTab, fileCount = 1) {
+  fireEvent.click(screen.getByText("common.next"))
+
+  if (tab === "file") {
+    fireEvent.change(container.querySelector("#file-upload") as HTMLInputElement, {
+      target: {
+        files: Array.from(
+          { length: fileCount },
+          (_, index) => new File(["a"], `file ${index}!.txt`, { type: "text/plain" })
+        ),
+      },
+    })
+  } else if (tab === "web") {
+    fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
+    fireEvent.change(container.querySelector("#start_url") as HTMLInputElement, {
+      target: { value: "https://example.com/docs" },
+    })
+  } else {
+    fireEvent.click(screen.getByText("kb.dialog.tabs.cloud"))
+    fireEvent.click(screen.getByText("kb.dialog.cloudConnect.googleDrive"))
+    fireEvent.click(await screen.findByTestId("mock-cloud-confirm"))
+    await waitFor(() => {
+      expect(screen.getByText("alpha.pdf")).toBeInTheDocument()
+    })
+  }
+
+  fireEvent.click(screen.getByText("common.next"))
+}
+
+/** The shared guard must warn, park the user on step 1, and ingest nothing. */
+async function expectNameRejected(container: HTMLElement) {
+  await waitFor(() => {
+    expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.nameRequired")
+  })
+
+  // Step 1 is the only step rendering the name field, so its presence proves
+  // the user is where the problem can actually be fixed.
+  const nameInput = container.querySelector("#collection_name")
+  expect(nameInput).not.toBeNull()
+
+  // A toast alone leaves a screen reader with nothing at the field itself.
+  expect(nameInput?.getAttribute("aria-required")).toBe("true")
+  expect(nameInput?.getAttribute("aria-invalid")).toBe("true")
+  expect(screen.getByText("kb.errors.nameRequired")).toBeInTheDocument()
+  expect(nameInput?.getAttribute("aria-describedby")).toBe("collection_name_error")
+  expect(container.querySelector("label[for=collection_name]")?.textContent).toContain("*")
+
+  expect(
+    apiRequestMock.mock.calls.filter(([url]) => String(url).includes("/api/kb/ingest"))
+  ).toHaveLength(0)
+}
+
+describe("KnowledgeBaseCreationDialog collection naming", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
@@ -207,32 +268,77 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     cleanup()
   })
 
-  it("requires an explicit collection name for multiple file uploads", async () => {
+  it.each([
+    ["an empty", ""],
+    ["a whitespace-only", "   "],
+  ])("refuses to leave step 1 with %s collection name", async (_label, value) => {
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    if (value) {
+      fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+        target: { value },
+      })
+    }
+
+    fireEvent.click(screen.getByText("common.next"))
+
+    await expectNameRejected(container)
+    // Step 2 owns the file picker: never rendering it proves we did not advance.
+    expect(container.querySelector("#file-upload")).toBeNull()
+  })
+
+  it("clears the name error once the user starts typing", async () => {
     const { container } = render(
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
     )
 
     fireEvent.click(screen.getByText("common.next"))
+    await expectNameRejected(container)
 
-    const fileInput = container.querySelector("#file-upload") as HTMLInputElement
-    fireEvent.change(fileInput, {
-      target: {
-        files: [
-          new File(["a"], "alpha.txt", { type: "text/plain" }),
-          new File(["b"], "beta.txt", { type: "text/plain" }),
-        ],
-      },
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "t" },
     })
+
+    expect(container.querySelector("#collection_name")?.getAttribute("aria-invalid")).toBe("false")
+    expect(screen.queryByText("kb.errors.nameRequired")).toBeNull()
+  })
+
+  it("clears the name error when the dialog is closed and reopened", async () => {
+    const { container, rerender } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
 
     fireEvent.click(screen.getByText("common.next"))
-    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+    await expectNameRejected(container)
+
+    // Escape, the overlay and the close button all bypass the cancel handler,
+    // so only the parent's `open` flag flips.
+    rerender(<KnowledgeBaseCreationDialog open={false} onOpenChange={vi.fn()} onSuccess={vi.fn()} />)
+    rerender(<KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />)
 
     await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledWith("kb.errors.multiFileNameRequired")
+      expect(container.querySelector("#collection_name")?.getAttribute("aria-invalid")).toBe("false")
+    })
+    expect(screen.queryByText("kb.errors.nameRequired")).toBeNull()
+  })
+
+  it("previews the name the user typed", async () => {
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "team-docs" },
     })
 
-    const ingestCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/ingest/jobs")
-    expect(ingestCalls).toHaveLength(0)
+    await goToStep3(container, "file")
+
+    expect(screen.getByText("team-docs")).toBeInTheDocument()
+    // The step-1 gate is what keeps the preview from ever needing a stand-in
+    // name; the "KB <date>" fallback it used to render is gone.
+    expect(container.textContent).not.toMatch(/KB \d/)
   })
 
   it("uses the same explicit collection name for each uploaded file", async () => {
@@ -245,19 +351,7 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       target: { value: "team-docs" },
     })
 
-    fireEvent.click(screen.getByText("common.next"))
-
-    const fileInput = container.querySelector("#file-upload") as HTMLInputElement
-    fireEvent.change(fileInput, {
-      target: {
-        files: [
-          new File(["a"], "alpha.txt", { type: "text/plain" }),
-          new File(["b"], "beta.txt", { type: "text/plain" }),
-        ],
-      },
-    })
-
-    fireEvent.click(screen.getByText("common.next"))
+    await goToStep3(container, "file", 2)
     fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
@@ -271,6 +365,63 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     await waitFor(() => {
       expect(onSuccess).toHaveBeenCalledWith(["team-docs", "team-docs"])
     })
+  })
+
+  it("advises picking another name when the entered one is taken", async () => {
+    // The reported #1139 path: this is the only screen where the user typed the
+    // name, so it is the only one allowed to tell them to change it.
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=embedding") {
+        return Promise.resolve(createJsonResponse([]))
+      }
+      if (url === "http://api.local/api/models/user-default") {
+        return Promise.resolve(createJsonResponse({}))
+      }
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
+      }
+      if (url === "http://api.local/api/kb/ingest/jobs") {
+        return Promise.resolve(
+          createJsonResponse(
+            {
+              detail:
+                "Knowledge base name unavailable: test.",
+            },
+            false,
+            409
+          )
+        )
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "test" },
+    })
+
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.change(container.querySelector("#file-upload") as HTMLInputElement, {
+      target: { files: [new File(["a"], "alpha.txt", { type: "text/plain" })] },
+    })
+    fireEvent.click(screen.getByText("common.next"))
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "kb.errors.nameUnavailable",
+        expect.objectContaining({ description: "kb.errors.nameUnavailableHint" })
+      )
+    })
+
+    // The backend sentence is replaced by the localized copy, not appended.
+    expect(JSON.stringify(toastErrorMock.mock.calls)).not.toContain(
+      "Knowledge base name unavailable"
+    )
   })
 
   it("uses the sync ingest endpoint when background jobs are unavailable", async () => {
@@ -304,16 +455,11 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
       <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={onSuccess} />
     )
 
-    fireEvent.click(screen.getByText("common.next"))
-
-    const fileInput = container.querySelector("#file-upload") as HTMLInputElement
-    fireEvent.change(fileInput, {
-      target: {
-        files: [new File(["a"], "alpha.txt", { type: "text/plain" })],
-      },
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "alpha" },
     })
 
-    fireEvent.click(screen.getByText("common.next"))
+    await goToStep3(container, "file")
     fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
     await waitFor(() => {
@@ -363,20 +509,15 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
     })
 
     try {
-      render(
+      const { container } = render(
         <KnowledgeBaseCreationDialog open={true} onOpenChange={onOpenChange} onSuccess={onSuccess} />
       )
 
-      fireEvent.click(screen.getByText("common.next"))
-      fireEvent.click(screen.getByText("kb.dialog.tabs.cloud"))
-      fireEvent.click(screen.getByText("kb.dialog.cloudConnect.googleDrive"))
-      fireEvent.click(await screen.findByTestId("mock-cloud-confirm"))
-
-      await waitFor(() => {
-        expect(screen.getByText("alpha.pdf")).toBeInTheDocument()
+      fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+        target: { value: "cloud-docs" },
       })
 
-      fireEvent.click(screen.getByText("common.next"))
+      await goToStep3(container, "cloud")
       fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
       await waitFor(() => {
@@ -444,12 +585,11 @@ describe("KnowledgeBaseCreationDialog multi-file naming", () => {
         <KnowledgeBaseCreationDialog open={true} onOpenChange={onOpenChange} onSuccess={onSuccess} />
       )
 
-      fireEvent.click(screen.getByText("common.next"))
-      fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
-      fireEvent.change(container.querySelector("#start_url") as HTMLInputElement, {
-        target: { value: "https://example.com/docs" },
+      fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+        target: { value: "web_collection" },
       })
-      fireEvent.click(screen.getByText("common.next"))
+
+      await goToStep3(container, "web")
       fireEvent.click(screen.getByText("kb.dialog.createButton"))
 
       await waitFor(() => {

@@ -3268,4 +3268,30 @@ describe("AppProvider websocket message routing", () => {
     expect(container.querySelector("[data-agent-card-wrapper]")).toBeNull()
     expect(apiRequestMock).not.toHaveBeenCalled()
   })
+
+  it("opens markdown links in a new tab only when the transport enables linksOpenInNewTab", () => {
+    const { unmount } = render(
+      <AppProvider
+        token="public-token"
+        transport={{ capabilities: { linksOpenInNewTab: "enabled" } }}
+      >
+        <MarkdownRenderer content="[Docs](https://example.com/docs)" />
+      </AppProvider>,
+    )
+
+    const widgetLink = screen.getByRole("link", { name: "Docs" })
+    expect(widgetLink).toHaveAttribute("target", "_blank")
+    expect(widgetLink).toHaveAttribute("rel", "noopener noreferrer")
+    unmount()
+
+    render(
+      <AppProvider token="public-token" transport={{ capabilities: {} }}>
+        <MarkdownRenderer content="[Docs](https://example.com/docs)" />
+      </AppProvider>,
+    )
+
+    const defaultLink = screen.getByRole("link", { name: "Docs" })
+    expect(defaultLink).not.toHaveAttribute("target")
+    expect(defaultLink).not.toHaveAttribute("rel")
+  })
 })

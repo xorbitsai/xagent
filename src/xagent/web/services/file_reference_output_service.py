@@ -12,6 +12,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...core.file_ref import build_file_id_ref, parse_file_id_ref
+from ...core.tools.artifacts import artifact_type_for_filename
 from ..models.uploaded_file import UploadedFile
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,48 @@ logger = logging.getLogger(__name__)
 _MARKDOWN_FILE_REFERENCE_RE = re.compile(
     r"(?P<image>!)?\[(?P<label>[^\]]*)\]\((?P<target>file:[^)\s]+)\)"
 )
+
+# ``artifact_type_for_filename`` only knows image/video/office extensions
+# and never returns "audio", so audio must be matched by extension here.
+# This set mirrors the frontend's audio detection (see
+# ``getInlineFilePreviewKind`` in ``inline-file-preview-utils.ts``) — keep
+# the two in sync.
+_AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".opus", ".flac", ".m4a", ".aac"}
+
+
+def _is_inline_preview_media(filename: str) -> bool:
+    """Whether ``filename`` is a video/audio artifact the frontend plays inline.
+
+    These types are only detected by filename extension, since
+    ``[label](file:id)`` targets are opaque UUIDs. The model is free to
+    rewrite the label into descriptive prose that drops the extension (e.g.
+    "下载视频（MP4）"), which silently degrades the player to a plain download
+    link — callers restore the real filename as the label in that case so
+    the extension survives into the rendered markdown. Deliberately limited
+    to lightweight media players: office types (presentation/document/
+    spreadsheet) keep the model's prose label because rewriting it would
+    flip existing compact links into heavy inline preview boxes that
+    eagerly fetch file bytes.
+    """
+    if artifact_type_for_filename(filename) == "video":
+        return True
+    return Path(filename).suffix.casefold() in _AUDIO_EXTENSIONS
+
+
+# ``UploadedFile.filename`` has no charset constraint, so a user-uploaded
+# file like ``clip ].mp4`` must never be substituted into a ``[label](...)``
+# span unescaped: an embedded ``]`` (or ``[``/``\``) terminates the link
+# early and the file reference is lost entirely — worse than the plain
+# download link this rewrite is trying to improve on. Control characters
+# are just as destructive through a different mechanism: a filename with a
+# blank line splits the paragraph before the inline link is even parsed.
+# Escaping instead of skipping would work for a single pass, but
+# ``_MARKDOWN_FILE_REFERENCE_RE`` has no notion of backslash-escapes, so a
+# later reconcile pass over already-escaped content would mis-locate the
+# label boundary at the escaped bracket. Skipping the rewrite for these
+# filenames is the safe, idempotent choice; the link still falls back to a
+# plain download label.
+_UNSAFE_LABEL_RE = re.compile(r"[\[\]\\\x00-\x1f\x7f]")
 
 
 def load_assistant_file_reference_records(
@@ -116,6 +159,19 @@ def reconcile_assistant_file_references(
                 record.file_id,
             )
             return label
-        return f"{prefix}[{label}]({canonical_ref})"
+
+        display_label = label
+        filename = str(record.filename or "")
+        # Applies to ``![...]`` references too: _is_inline_preview_media only
+        # matches video/audio, so genuine image alt text is never touched,
+        # while a model that wraps a video in image syntax still gets a label
+        # the frontend can classify (its image renderer resolves the preview
+        # kind from the label and would otherwise fall back to a broken img).
+        if _is_inline_preview_media(filename) and not _UNSAFE_LABEL_RE.search(filename):
+            suffix = Path(filename).suffix.casefold()
+            if suffix and not label.strip().casefold().endswith(suffix):
+                display_label = filename
+
+        return f"{prefix}[{display_label}]({canonical_ref})"
 
     return _MARKDOWN_FILE_REFERENCE_RE.sub(replacement, content)

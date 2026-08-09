@@ -971,6 +971,7 @@ def _claim_turn_no_commit(
                 Task.output: None,
                 Task.error_message: None,
                 Task.runner_id: None,
+                Task.lease_attempt_id: None,
                 Task.lease_expires_at: None,
                 Task.last_heartbeat_at: None,
                 Task.run_id: run_id,

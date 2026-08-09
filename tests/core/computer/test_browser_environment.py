@@ -19,6 +19,7 @@ from xagent.core.computer.schema import (
     ComputerAction,
     ComputerActionBatch,
     ComputerActionType,
+    ComputerElementSurface,
     ComputerTarget,
     NormalizedPoint,
 )
@@ -193,6 +194,7 @@ async def test_browser_observation_captures_screenshot_and_dom_elements(
     }
     assert observation.elements[0].element_id == "dom-1"
     assert observation.elements[0].label == "Continue"
+    assert observation.elements[0].surface is ComputerElementSurface.DOCUMENT
     assert store.calls[0]["image_bytes"] == b"browser-png"
     assert observation.metadata["browser_runtime_kind"] == "ephemeral_playwright"
     assert environment.current_observation == observation

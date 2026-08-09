@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -10,12 +11,17 @@ from xagent.core.computer.schema import (
     COMPUTER_FRAME_ID_METADATA_KEY,
     COMPUTER_SESSION_ID_METADATA_KEY,
     ComputerActionBatch,
+    ComputerElement,
+    ComputerElementSource,
+    ComputerElementSurface,
     ComputerEnvironmentType,
     ComputerObservation,
+    ComputerPerceptionMode,
+    NormalizedRect,
     Viewport,
 )
 from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
-from xagent.core.tools.adapters.vibe.computer import ComputerTool
+from xagent.core.tools.adapters.vibe.computer import ComputerTool, ComputerToolArgs
 
 
 def make_observation(session_id: str, index: int) -> ComputerObservation:
@@ -30,6 +36,7 @@ def make_observation(session_id: str, index: int) -> ComputerObservation:
                 "file_id": f"image-{index}",
                 "filename": f"{frame_id}.png",
                 "mime_type": "image/png",
+                "internal": True,
             },
             metadata={
                 COMPUTER_SESSION_ID_METADATA_KEY: session_id,
@@ -72,8 +79,225 @@ class EnvironmentFactory:
         return environment
 
 
+class RestrictedComputerEnvironment(FakeComputerEnvironment):
+    async def _observe(self) -> ComputerObservation:
+        observation = await super()._observe()
+        return observation.model_copy(
+            update={
+                "metadata": {
+                    "supported_actions": ["screenshot", "click"],
+                    "unsupported_actions": {
+                        "type": "same_pid_keyboard_ambiguity",
+                    },
+                }
+            }
+        )
+
+
+class RestrictedEnvironmentFactory(EnvironmentFactory):
+    def __call__(self, **kwargs: Any) -> RestrictedComputerEnvironment:
+        self.calls.append(kwargs)
+        environment = RestrictedComputerEnvironment(kwargs["session_id"])
+        self.environments.append(environment)
+        return environment
+
+
+class StaleScreenshotEnvironment(FakeComputerEnvironment):
+    async def _observe(self) -> ComputerObservation:
+        observation = await super()._observe()
+        return observation.model_copy(update={"metadata": {"screenshot_fresh": False}})
+
+
+class StaleScreenshotEnvironmentFactory(EnvironmentFactory):
+    def __call__(self, **kwargs: Any) -> StaleScreenshotEnvironment:
+        self.calls.append(kwargs)
+        environment = StaleScreenshotEnvironment(kwargs["session_id"])
+        self.environments.append(environment)
+        return environment
+
+
+class SemanticComputerEnvironment(FakeComputerEnvironment):
+    async def _observe(self) -> ComputerObservation:
+        observation = await super()._observe()
+        return observation.model_copy(
+            update={
+                "elements": [
+                    ComputerElement(
+                        element_id="button-1",
+                        source=ComputerElementSource.DOM,
+                        surface=ComputerElementSurface.DOCUMENT,
+                        bounds=NormalizedRect(
+                            x=0.1,
+                            y=0.1,
+                            width=0.2,
+                            height=0.1,
+                        ),
+                    )
+                ]
+            }
+        )
+
+
+class SemanticEnvironmentFactory(EnvironmentFactory):
+    def __call__(self, **kwargs: Any) -> SemanticComputerEnvironment:
+        self.calls.append(kwargs)
+        environment = SemanticComputerEnvironment(kwargs["session_id"])
+        self.environments.append(environment)
+        return environment
+
+
+class ArtifactWorkspace:
+    def __init__(self, root: Path) -> None:
+        self.workspace_dir = root
+        self.output_dir = root / "output"
+        self.output_dir.mkdir(parents=True)
+        self.source = root / "frame.png"
+        self.source.write_bytes(b"png-bytes")
+        self.registered: dict[str, str] = {}
+
+    def resolve_file_id(self, _file_id: str) -> Path:
+        return self.source
+
+    def get_file_id_from_path(self, file_path: str) -> str | None:
+        return self.registered.get(str(Path(file_path).resolve()))
+
+    def register_file(self, file_path: str) -> str:
+        resolved = str(Path(file_path).resolve())
+        file_id = f"public-{len(self.registered) + 1}"
+        self.registered[resolved] = file_id
+        return file_id
+
+
+@pytest.mark.parametrize(
+    ("mode", "description_fragment"),
+    [
+        (ComputerPerceptionMode.AUTO, "Never invent an element_id"),
+        (
+            ComputerPerceptionMode.VISION,
+            "Ignore semantic element IDs",
+        ),
+        (ComputerPerceptionMode.SEMANTIC, "Prefer an exact element_id"),
+    ],
+)
+def test_computer_tool_describes_explicit_perception_mode(
+    mode: ComputerPerceptionMode,
+    description_fragment: str,
+) -> None:
+    tool = ComputerTool(perception_mode=mode)
+
+    assert f"Perception mode is {mode.value}" in tool.description
+    assert description_fragment in tool.description
+
+
+def test_computer_tool_normalizes_bare_element_id_target() -> None:
+    parsed = ComputerToolArgs.model_validate(
+        {
+            "expected_frame_id": "frame-1",
+            "action": "click",
+            "target": "snapshot-1:4",
+        }
+    )
+
+    assert parsed.target is not None
+    assert parsed.target.element_id == "snapshot-1:4"
+    assert parsed.target.point is None
+
+
 @pytest.mark.asyncio
-async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -> None:
+async def test_computer_tool_executes_normalized_bare_element_id_target() -> None:
+    factory = SemanticEnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    initial = await tool.run_json_async({})
+
+    acted = await tool.run_json_async(
+        {
+            "expected_frame_id": initial["frame_id"],
+            "action": "click",
+            "target": "button-1",
+        }
+    )
+
+    assert acted["success"] is True
+    target = factory.environments[0].executed[0].actions[0].target
+    assert target is not None
+    assert target.element_id == "button-1"
+
+
+@pytest.mark.parametrize(
+    ("serialized_target", "element_id", "point"),
+    [
+        ('"snapshot-1:4"', "snapshot-1:4", None),
+        ('{"element_id": "snapshot-1:4"}', "snapshot-1:4", None),
+        ('{"point": {"x": 0.25, "y": 0.75}}', None, (0.25, 0.75)),
+    ],
+)
+def test_computer_tool_normalizes_json_encoded_target(
+    serialized_target: str,
+    element_id: str | None,
+    point: tuple[float, float] | None,
+) -> None:
+    parsed = ComputerToolArgs.model_validate(
+        {
+            "expected_frame_id": "frame-1",
+            "action": "click",
+            "target": serialized_target,
+        }
+    )
+
+    assert parsed.target is not None
+    assert parsed.target.element_id == element_id
+    assert (
+        None
+        if parsed.target.point is None
+        else (parsed.target.point.x, parsed.target.point.y)
+    ) == point
+
+
+@pytest.mark.parametrize("serialized_target", ['["snapshot-1:4"]', "null", "42"])
+def test_computer_tool_rejects_json_encoded_non_target_values(
+    serialized_target: str,
+) -> None:
+    with pytest.raises(ValueError):
+        ComputerToolArgs.model_validate(
+            {
+                "expected_frame_id": "frame-1",
+                "action": "click",
+                "target": serialized_target,
+            }
+        )
+
+
+def test_computer_tool_rejects_explicit_null_legacy_actions() -> None:
+    with pytest.raises(ValueError, match="exactly one action object"):
+        ComputerToolArgs.model_validate({"actions": None})
+
+
+def test_computer_tool_rejects_conflicting_nested_target() -> None:
+    with pytest.raises(ValueError, match="target conflicts"):
+        ComputerToolArgs.model_validate(
+            {
+                "target": "outer-1",
+                "actions": [
+                    {
+                        "type": "click",
+                        "target": "inner-2",
+                    }
+                ],
+            }
+        )
+
+
+def test_computer_tool_rejects_unknown_top_level_fields() -> None:
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        ComputerToolArgs.model_validate({"unexpected": "value"})
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_requires_initial_observation_then_expected_frame() -> None:
     factory = EnvironmentFactory()
     tool = ComputerTool(
         task_id="task-1",
@@ -87,15 +311,13 @@ async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -
     assert initial["session_id"] == "task-1"
     assert initial["frame_id"] == "frame-1"
     assert initial[CONTEXT_REFS_KEY][0]["file_ref"]["file_id"] == "image-1"
+    assert initial[CONTEXT_REFS_KEY][0]["file_ref"]["internal"] is True
+    assert "file_ref" not in initial
 
     missing_frame = await tool.run_json_async(
         {
-            "actions": [
-                {
-                    "type": "click",
-                    "target": {"point": {"x": 0.5, "y": 0.5}},
-                }
-            ]
+            "action": "click",
+            "target": {"point": {"x": 0.5, "y": 0.5}},
         }
     )
     assert missing_frame["success"] is False
@@ -104,18 +326,117 @@ async def test_computer_tool_requires_initial_screenshot_then_expected_frame() -
     acted = await tool.run_json_async(
         {
             "expected_frame_id": "frame-1",
-            "actions": [
-                {
-                    "type": "click",
-                    "target": {"point": {"x": 0.5, "y": 0.5}},
-                }
-            ],
+            "action": "click",
+            "target": {"point": {"x": 0.5, "y": 0.5}},
         }
     )
 
     assert acted["success"] is True
     assert acted["frame_id"] == "frame-2"
     assert factory.environments[0].executed[0].expected_frame_id == "frame-1"
+
+
+@pytest.mark.asyncio
+async def test_computer_screenshot_publishes_user_visible_artifact(tmp_path) -> None:
+    factory = EnvironmentFactory()
+    workspace = ArtifactWorkspace(tmp_path / "workspace")
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=workspace,  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    initial = await tool.run_json_async({})
+
+    captured = await tool.run_json_async({"action": "screenshot"})
+
+    assert initial["observation"]["screenshot"]["file_ref"]["internal"] is True
+    assert initial["delivery"] == "private_observation"
+    assert "not a user-visible image" in initial["message"]
+    assert captured["success"] is True
+    assert captured["delivery"] == "user_visible_artifact"
+    assert captured["file_ref"]["file_id"] == "public-1"
+    assert captured["file_ref"].get("internal") is not True
+    assert captured["inline_markdown"] == (
+        f"![{captured['file_ref']['filename']}](file:public-1)"
+    )
+    assert "rather than file_ref.markdown_link" in captured["message"]
+    assert Path(captured["file_ref"]["relative_path"]).parent.name == "output"
+    output_path = workspace.workspace_dir / captured["file_ref"]["relative_path"]
+    assert output_path.read_bytes() == b"png-bytes"
+    assert captured[CONTEXT_REFS_KEY][0]["file_ref"]["internal"] is True
+
+
+@pytest.mark.asyncio
+async def test_computer_screenshot_frames_unexpected_publish_failure(tmp_path) -> None:
+    factory = EnvironmentFactory()
+    workspace = ArtifactWorkspace(tmp_path / "workspace")
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=workspace,  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    initial = await tool.run_json_async({})
+
+    def fail_to_resolve(_file_id: str) -> Path:
+        raise ImportError("backend unavailable")
+
+    workspace.resolve_file_id = fail_to_resolve  # type: ignore[method-assign]
+    captured = await tool.run_json_async({"action": "screenshot"})
+
+    assert captured["success"] is False
+    assert captured["frame_id"] != initial["frame_id"]
+    assert captured["error"] == (
+        "Could not publish computer screenshot: backend unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_does_not_attach_or_publish_reused_screenshot(
+    tmp_path,
+) -> None:
+    factory = StaleScreenshotEnvironmentFactory()
+    workspace = ArtifactWorkspace(tmp_path / "workspace")
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=workspace,  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+
+    initial = await tool.run_json_async({})
+    captured = await tool.run_json_async({"action": "screenshot"})
+
+    assert initial["success"] is True
+    assert initial[CONTEXT_REFS_KEY] == []
+    assert captured["success"] is False
+    assert "temporarily unavailable" in captured["error"]
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_rejects_known_unsupported_action_without_losing_frame() -> (
+    None
+):
+    factory = RestrictedEnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+    )
+    initial = await tool.run_json_async({})
+
+    refused = await tool.run_json_async(
+        {
+            "expected_frame_id": initial["frame_id"],
+            "action": "type",
+            "text": "https://example.com",
+        }
+    )
+
+    assert refused["success"] is False
+    assert refused["frame_id"] == initial["frame_id"]
+    assert "same_pid_keyboard_ambiguity" in refused["error"]
+    assert "Do not retry" in refused["error"]
+    assert factory.environments[0].current_observation is not None
+    assert factory.environments[0].executed == []
 
 
 @pytest.mark.asyncio
@@ -178,7 +499,7 @@ async def test_computer_tool_rejects_action_before_first_observation() -> None:
     )
 
     assert result["success"] is False
-    assert "screenshot" in result["error"]
+    assert "observation" in result["error"]
     assert factory.environments[0].current_observation is None
 
 
@@ -204,7 +525,7 @@ async def test_computer_tool_returns_validation_error_with_current_frame() -> No
 
 
 def test_computer_tool_accepts_only_one_action_per_observation() -> None:
-    with pytest.raises(ValueError, match="at most 1"):
+    with pytest.raises(ValueError, match="exactly one action object"):
         ComputerTool(
             task_id="task-1",
             workspace=object(),  # type: ignore[arg-type]
@@ -212,6 +533,31 @@ def test_computer_tool_accepts_only_one_action_per_observation() -> None:
         ).args_type().model_validate(
             {"actions": [{"type": "screenshot"}, {"type": "screenshot"}]}
         )
+
+
+def test_computer_tool_exposes_flat_action_schema_and_accepts_legacy_shape() -> None:
+    args_type = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=EnvironmentFactory(),
+    ).args_type()
+
+    schema = args_type.model_json_schema()
+    assert "action" in schema["properties"]
+    assert "actions" not in schema["properties"]
+    parsed = args_type.model_validate(
+        {
+            "expected_frame_id": "frame-1",
+            "actions": [
+                {
+                    "type": "click",
+                    "target": {"point": {"x": 0.5, "y": 0.5}},
+                }
+            ],
+        }
+    )
+    assert parsed.action.value == "click"
+    assert parsed.to_action().target is not None
 
 
 @pytest.mark.asyncio

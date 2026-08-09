@@ -82,11 +82,11 @@ describe('InlineFilePreview', () => {
     })
   })
 
-  it('uses the provider-scoped public credential for image and audio bytes', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      blob: async () => new Blob(['media'], { type: 'image/png' }),
-    })
+  it('uses the provider-scoped public credential for image and audio elements', async () => {
+    // With the public policy the tokened URL is handed to the media element
+    // directly — no blob fetch is made (preserving HTTP range requests for
+    // media playback) and the authenticated apiRequest path is never touched.
+    const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
 
     render(
@@ -102,15 +102,16 @@ describe('InlineFilePreview', () => {
       </FileAccessProvider>,
     )
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect(fetchMock).toHaveBeenCalledWith(
+    const image = await screen.findByAltText('image.png')
+    expect(image.getAttribute('src')).toBe(
       'http://api.local/api/files/public/preview/image-id?token=guest-a',
-      expect.objectContaining({ credentials: 'omit' }),
     )
-    expect(fetchMock).toHaveBeenCalledWith(
+    const audio = await screen.findByTitle('audio.mp3')
+    expect(audio.tagName).toBe('AUDIO')
+    expect(audio.getAttribute('src')).toBe(
       'http://api.local/api/files/public/preview/audio-id?token=guest-a',
-      expect.objectContaining({ credentials: 'omit' }),
     )
+    expect(fetchMock).not.toHaveBeenCalled()
     expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
@@ -275,6 +276,158 @@ describe('InlineFilePreview', () => {
       'href',
       'http://api.local/api/files/public/preview/audio-file-id'
     )
+  })
+
+  it('loads managed video files through authenticated preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/video-file-id',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    expect(video.getAttribute('src')).toMatch(/^blob:/)
+    expect(screen.getByRole('link', { name: 'Open' }).getAttribute('href')).toMatch(
+      /^blob:/
+    )
+  })
+
+  it('streams video directly from the tokened URL under the public policy', async () => {
+    // Range requests only work when the media element loads the URL itself;
+    // a blob fetch would force the full download before playback starts.
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(
+      <FileAccessProvider policy={createPublicFileAccessPolicy('guest-a')}>
+        <InlineFilePreview
+          source={{ type: 'video', fileId: 'video-id', filename: 'clip.mp4' }}
+        />
+      </FileAccessProvider>,
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    expect(video.getAttribute('src')).toBe(
+      'http://api.local/api/files/public/preview/video-id?token=guest-a',
+    )
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the public video preview when authenticated loading fails', async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 401 })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video).toHaveAttribute(
+      'src',
+      'http://api.local/api/files/public/preview/video-file-id'
+    )
+    expect(screen.getByRole('link', { name: 'Open' })).toHaveAttribute(
+      'href',
+      'http://api.local/api/files/public/preview/video-file-id'
+    )
+  })
+
+  it('revokes the video blob URL on unmount', async () => {
+    const revokeObjectUrlSpy = vi.spyOn(URL, 'revokeObjectURL')
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+
+    const { unmount } = render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    const blobUrl = video.getAttribute('src') || ''
+    expect(blobUrl).toMatch(/^blob:/)
+
+    unmount()
+    expect(revokeObjectUrlSpy).toHaveBeenCalledWith(blobUrl)
+
+    revokeObjectUrlSpy.mockRestore()
+  })
+
+  it('shows the load error text when the video fails on both paths', async () => {
+    // The hook already fell back to the public preview URL after the
+    // authenticated fetch failed; an error event from the element itself
+    // means both paths are exhausted.
+    apiRequestMock.mockResolvedValue({ ok: false, status: 403 })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    fireEvent.error(video)
+
+    expect(await screen.findByText('Failed to load preview.')).toBeInTheDocument()
+    expect(screen.queryByLabelText('clip.mp4')).not.toBeInTheDocument()
+    // The header keeps the filename and Open link so the file stays reachable.
+    expect(screen.getByText('clip.mp4')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Open' })).toBeInTheDocument()
+  })
+
+  it('keeps the player mounted when an error follows successful loading', async () => {
+    // A mid-playback decode hiccup fires the same native error event as a
+    // load failure; once data has loaded the element surfaces the problem
+    // itself and must not be replaced by the terminal error state.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    fireEvent.loadedData(video)
+    fireEvent.error(video)
+
+    expect(screen.getByLabelText('clip.mp4')).toBeInTheDocument()
+    expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
+  })
+
+  it('renders a video link with a filename extension as an inline video preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/webm' }),
+    })
+
+    render(
+      <InlineFilePreview source={{ fileId: 'abc-123', filename: 'clip.webm' }} />
+    )
+
+    const video = await screen.findByLabelText('clip.webm')
+    expect(video.tagName.toLowerCase()).toBe('video')
   })
 
   it('loads legacy workspace audio paths through authenticated preview', async () => {

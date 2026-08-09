@@ -41,12 +41,12 @@ from ...web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
     current_task_lease,
 )
+from ...web.services.trace_event_staging import stage_trace_event_row
 from ...web.services.trace_message_storage import (
     SQL_IN_CLAUSE_CHUNK_SIZE,
     CheckpointMessageDecodeError,
     chunks,
     decode_trace_event_data,
-    encode_checkpoint_data_for_storage,
 )
 
 logger = logging.getLogger(__name__)
@@ -687,52 +687,32 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 checkpoint_lease = (
                     current_task_lease() if self.build_id is None else None
                 )
-                if checkpoint_lease is not None:
-                    data = {
-                        **data,
-                        TASK_RUN_ID_TRACE_FIELD: checkpoint_lease.run_id,
-                    }
-                data = encode_checkpoint_data_for_storage(
-                    db,
-                    task_id=self.task_id,
-                    data=data,
-                )
             else:
                 checkpoint_lease = None
 
-            # Create trace event record
-            trace_event = DatabaseTraceEvent(
+            staged = stage_trace_event_row(
+                db,
                 task_id=self.task_id,
-                build_id=self.build_id,  # ← 添加 build_id
+                build_id=self.build_id,
                 event_id=str(event.id),
                 event_type=event_type_str,
                 timestamp=timestamp,
                 step_id=event.step_id,
                 parent_event_id=str(event.parent_id) if event.parent_id else None,
                 data=data,
+                checkpoint_lease=checkpoint_lease,
             )
+            data = staged.stored_data
 
-            db.add(trace_event)
-
-            if (
-                event_type_str == "system_update_general"
-                and isinstance(data, dict)
-                and data.get("checkpoint_type") == CHECKPOINT_TYPE
-                and self.build_id is None
-                and checkpoint_lease is not None
-            ):
-                # Flush the pending insert so trace_event.id (the row's
-                # primary key) is assigned before the pointer UPDATE below
-                # reads it. autoflush is off for this session, so without
-                # this the exact-row anchor column would be built from an
-                # unassigned id and silently written NULL.
-                db.flush()
-                if trace_event.id is None:
-                    raise RuntimeError(
-                        f"Task {self.task_id} checkpoint {event.id} row has no "
-                        "primary key after flush; refusing to write a NULL "
-                        "checkpoint anchor"
-                    )
+            if staged.anchor is not None and checkpoint_lease is not None:
+                # staged.anchor is set on exactly the path that needs this
+                # pointer UPDATE, so it is read here rather than re-derived.
+                # Re-deriving would test the post-encode payload rebound at
+                # the line above, not the pre-encode payload the flush
+                # decision was actually made from; the two agree today only
+                # because no encoder touches checkpoint_type. The lease is
+                # re-tested only to narrow it for the fence below -- it is
+                # never None when the anchor is set.
                 pointer_update = db.execute(
                     update(Task)
                     .where(
@@ -743,7 +723,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     )
                     .values(
                         last_checkpoint_event_id=str(event.id),
-                        last_checkpoint_trace_event_id=trace_event.id,
+                        last_checkpoint_trace_event_id=staged.anchor.trace_event_id,
                     )
                     .execution_options(synchronize_session=False)
                 )
@@ -865,10 +845,22 @@ class DatabaseTraceHandler(BaseTraceHandler):
         later dropped by context compaction) is orphaned until whole-task
         deletion cleans it up.
 
+        The entry guard below is a caller-contract check, not one of those
+        prune failures: it fires only when a caller hands this method a
+        session with uncommitted work, which the sole call site -- right
+        after the checkpoint commit -- never does. It raises outside the
+        degrade-and-log block deliberately, because that block's rollback
+        would discard the caller's pending writes and turn a misuse bug into
+        silent data loss.
+
         Retention is exactly ``limit`` rows, with one exception: when the
         task's exact-row pointer names a row that itself ranks outside the
         window, protecting that row keeps ``limit + 1``.
         """
+        if db.new or db.dirty or db.deleted:
+            raise RuntimeError(
+                "checkpoint prune must not run with pending writes on the session"
+            )
         limit = get_checkpoint_history_limit()
         if limit <= 0:
             return

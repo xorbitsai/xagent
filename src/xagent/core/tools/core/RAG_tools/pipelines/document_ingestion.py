@@ -325,6 +325,56 @@ def _record_ingestion_status(
         )
 
 
+#: Tables every ingestion writes, besides the embeddings table. ``ingestion_runs``
+#: grows fastest of all: :func:`_record_ingestion_status` does a delete plus an
+#: add, so it gains two versions per run, on the failure path as well.
+#: ``collection_config`` is written by the same upload, just before and outside
+#: this pipeline (``_save_collection_config_with_snapshot``), with the same
+#: unconditional delete+add; nothing else would ever compact it.
+_INGEST_TABLES = (
+    "documents",
+    "parses",
+    "chunks",
+    "collection_config",
+    "collection_metadata",
+    "ingestion_runs",
+)
+
+
+def _compact_storage_if_needed(embedding_model_id: Optional[str]) -> None:
+    """Best-effort LanceDB compaction once an ingestion finishes, pass or fail.
+
+    Every ingestion appends one file per table and read latency scales with the
+    fragment count, so fragmented tables get merged and stale versions pruned.
+    Failed runs fragment too — they still write ``ingestion_runs`` and whatever
+    steps completed — so this runs on both paths. Scoped to the tables this
+    ingestion wrote: sweeping the whole database on every document (or every
+    crawled page) costs more than it saves. Maintenance must never fail the
+    pipeline, hence the blanket except.
+    """
+    try:
+        from ..LanceDB.model_tag_utils import embeddings_table_name, to_model_tag
+        from ..storage.factory import StorageFactory
+
+        tables = list(_INGEST_TABLES)
+        if embedding_model_id:
+            # The write path applies to_model_tag twice (CollectionHandle, then
+            # upsert_embeddings) and it is not idempotent for vendor-prefixed
+            # ids, so probe both spellings — the same compatibility trick as
+            # CollectionHandle._embedding_table_names. Missing tables are a
+            # cheap no-op in should_compact.
+            tables += [
+                embeddings_table_name(embedding_model_id),
+                embeddings_table_name(to_model_tag(embedding_model_id)),
+            ]
+        store = StorageFactory.get_factory().get_vector_index_store()
+        compacted = store.compact_tables(list(dict.fromkeys(tables)))
+        if compacted:
+            logger.info("Compacted LanceDB tables: %s", ", ".join(compacted))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("LanceDB compaction skipped: %s", exc)
+
+
 async def _compute_embeddings_async(
     chunks: List[ChunkForEmbedding],
     embedding_adapter: BaseEmbedding,
@@ -1453,3 +1503,9 @@ def _process_document_impl(
             warnings=warnings,
             user_id=user_id,
         )
+
+    finally:
+        # Failed runs fragment the tables too, and a deployment failing often is
+        # exactly the one that must not stop compacting. Never raises, so it
+        # cannot swallow either return above.
+        _compact_storage_if_needed(embedding_config.id if embedding_config else None)

@@ -3,6 +3,7 @@ import { getFilePublicDownloadUrl, getFilePublicPreviewUrl } from '@/lib/utils'
 export type InlineFilePreviewKind =
   | 'image'
   | 'audio'
+  | 'video'
   | 'presentation'
   | 'document'
   | 'spreadsheet'
@@ -27,6 +28,7 @@ export type PreviewUrlTrust = {
 const PREVIEWABLE_KINDS = new Set<PreviewableInlineFileKind>([
   'image',
   'audio',
+  'video',
   'presentation',
   'document',
   'spreadsheet',
@@ -47,9 +49,12 @@ const SPREADSHEET_MIME_TYPES = new Set<string>([
   'text/csv',
 ])
 
-/** Default OOXML mime types for inline preview kinds (images vary by file). */
+/**
+ * Default OOXML mime types for inline preview kinds. Kinds without an
+ * entry (file/image/audio/video vary per file) resolve to undefined.
+ */
 export const INLINE_FILE_PREVIEW_MIME_BY_KIND: Partial<
-  Record<PreviewableInlineFileKind, string>
+  Record<InlineFilePreviewKind, string>
 > = {
   presentation:
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
@@ -59,10 +64,7 @@ export const INLINE_FILE_PREVIEW_MIME_BY_KIND: Partial<
 
 export const getInlineFilePreviewMimeType = (
   kind: InlineFilePreviewKind
-): string | undefined => {
-  if (kind === 'file' || kind === 'image' || kind === 'audio') return undefined
-  return INLINE_FILE_PREVIEW_MIME_BY_KIND[kind]
-}
+): string | undefined => INLINE_FILE_PREVIEW_MIME_BY_KIND[kind]
 
 export const isPreviewableInlineFileKind = (
   kind: InlineFilePreviewKind
@@ -78,6 +80,7 @@ export const getInlineFilePreviewKind = (
 
   if (type === 'image') return 'image'
   if (type === 'audio') return 'audio'
+  if (type === 'video') return 'video'
   if (type === 'presentation') {
     // An explicit ``type: 'presentation'`` artifact must still be
     // cross-checked: pptxviewjs only supports OOXML .pptx, so a
@@ -108,6 +111,7 @@ export const getInlineFilePreviewKind = (
 
   if (mimeType.startsWith('image/')) return 'image'
   if (mimeType.startsWith('audio/')) return 'audio'
+  if (mimeType.startsWith('video/')) return 'video'
   if (PRESENTATION_MIME_TYPES.has(mimeType) || mimeType.includes('presentationml')) {
     return 'presentation'
   }
@@ -118,6 +122,7 @@ export const getInlineFilePreviewKind = (
 
   if (/\.(jpg|jpeg|png|gif|webp|svg)$/.test(filename)) return 'image'
   if (/\.(mp3|wav|ogg|opus|flac|m4a|aac)$/.test(filename)) return 'audio'
+  if (/\.(mp4|m4v|mov|webm|mpeg|mpg)$/.test(filename)) return 'video'
   // Only OOXML .pptx is previewable inline — see PRESENTATION_MIME_TYPES
   // comment. Legacy .ppt falls through to the generic 'file' kind.
   if (filename.endsWith('.pptx')) return 'presentation'

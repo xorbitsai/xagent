@@ -18,6 +18,7 @@ import {
 import { getApiUrl } from '@/lib/utils'
 import {
   AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
   resolveAgentCardPresentationCapability,
 } from '@/contexts/presentation-capabilities'
 import {
@@ -260,6 +261,7 @@ function containsPreviewFileLinkNode(node: any): boolean {
 type MarkdownRendererContextValue = {
   filesDisabled: boolean
   agentCardsEnabled: boolean
+  linksOpenInNewTab: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
   openLabel: string
@@ -309,6 +311,7 @@ function MarkdownLink({
   const {
     filesDisabled,
     agentCardsEnabled,
+    linksOpenInNewTab,
     onFileClick,
     onAgentClick,
     openLabel,
@@ -404,8 +407,17 @@ function MarkdownLink({
     return <span>{presentationChildren}</span>
   }
 
+  const opensInNewTab = linksOpenInNewTab && !!href
+    && !(href.startsWith('#') || href.toLowerCase().startsWith('mailto:'))
+
   return (
-    <a href={href || undefined} title={presentationTitle || undefined} {...props}>
+    <a
+      {...props}
+      href={href || undefined}
+      title={presentationTitle || undefined}
+      target={opensInNewTab ? '_blank' : undefined}
+      rel={opensInNewTab ? 'noopener noreferrer' : undefined}
+    >
       {presentationChildren}
     </a>
   )
@@ -498,16 +510,18 @@ export function MarkdownRenderer({
     agentCardsEnabled,
     inheritedAgentCardsEnabled,
   )
+  const linksOpenInNewTab = React.useContext(LinksOpenInNewTabCapability)
   const contextValue = React.useMemo<MarkdownRendererContextValue>(
     () => ({
       filesDisabled,
       agentCardsEnabled: resolvedAgentCardsEnabled,
+      linksOpenInNewTab,
       onFileClick,
       onAgentClick,
       openLabel: t('files.previewDialog.buttons.open'),
       loadErrorText: t('files.previewDialog.errors.loadFailed'),
     }),
-    [filesDisabled, onFileClick, onAgentClick, resolvedAgentCardsEnabled, t]
+    [filesDisabled, onFileClick, onAgentClick, resolvedAgentCardsEnabled, linksOpenInNewTab, t]
   )
   const displayContent = filesDisabled
     ? sanitizeFilesDisabledPresentationText(content)

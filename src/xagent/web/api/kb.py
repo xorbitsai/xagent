@@ -3467,23 +3467,62 @@ async def _list_collections_with_retry(
     )
 
 
+def _collection_name_unavailable_detail(
+    collection_name: str, *, advise_rename: bool = False
+) -> str:
+    """Name-conflict wording that does not confirm another tenant owns the name.
+
+    States the fact, and only adds "pick another name" when the caller knows the
+    user just supplied one. `_ensure_collection_access` cannot know: it raises
+    this both while a name is being chosen and while an existing collection is
+    being written to, from requests the server cannot tell apart, and the advice
+    is useless on a screen with no name field. Rename can know -- the new name is
+    in the request -- so it passes ``advise_rename=True``.
+    """
+    detail = f"Knowledge base name unavailable: {collection_name}."
+    return f"{detail} Please choose a different name." if advise_rename else detail
+
+
+def _rename_target_has_files_detail(collection_name: str) -> str:
+    """Storage-collision wording, for the rename dialog only.
+
+    The owning user id belongs in the log, not here: the caller who sees this may
+    not be that owner. Rename always has a name field, so this says what to do --
+    same reason the name-conflict wording above takes ``advise_rename=True`` here.
+    """
+    return (
+        f"Cannot rename to '{collection_name}': that name already has stored "
+        "files. Please choose a different name."
+    )
+
+
 async def _ensure_collection_access(
     collection_name: str,
     user: User,
     *,
     hide_missing: bool = False,
     allow_create: bool = False,
+    taken_name_is_conflict: Optional[bool] = None,
 ) -> None:
     """Enforce collection-level access semantics for KB APIs.
 
     Rules:
     - Admin users always pass.
-    - If collection exists but is not visible to current user: raise 403.
+    - If collection exists but is not visible to current user: raise 403, or 409
+      when the caller is naming a new collection (the name is merely taken -- it is
+      not an access violation). ``taken_name_is_conflict`` decides; it defaults to
+      ``allow_create`` because most creating callers do carry a user-typed name.
+      Pass it explicitly for a caller that accepts unknown names without asking
+      for one -- there a foreign name really is an access attempt, and "pick a
+      different name" is nonsense on a form with no name field.
     - If collection does not exist globally: when ``allow_create`` is True, allow
       (first ingest / config for a new collection name); otherwise raise 404, or
       403 when ``hide_missing`` is True.
     - If ``list_collections`` returns ``status != "success"``, raise 503 (do not
       infer access from an empty list after a storage read failure).
+    - ``hide_missing`` wins over ``allow_create``: it short-circuits to 403 before
+      the global lookup, so a caller passing both never reaches the 409 branch.
+      No caller passes both today.
     """
     if bool(user.is_admin):
         return
@@ -3515,6 +3554,23 @@ async def _ensure_collection_access(
             return
         raise HTTPException(
             status_code=404, detail=f"Collection not found: {collection_name}"
+        )
+
+    name_is_being_picked = (
+        allow_create if taken_name_is_conflict is None else taken_name_is_conflict
+    )
+    if name_is_being_picked:
+        # The caller wants to create this name, not reach someone else's collection:
+        # that is a naming conflict (409), not an access violation (403).
+        # NOTE: the existence check above is an unlocked read-then-branch, and it
+        # compares names case-sensitively. Two concurrent creates of the same name
+        # can therefore both pass it and collide in the storage layer instead of
+        # getting a clean 409, and "Test" and "test" count as different names. Both
+        # predate this branch: it makes the message friendlier, it is not an
+        # authoritative uniqueness check.
+        raise HTTPException(
+            status_code=409,
+            detail=_collection_name_unavailable_detail(collection_name),
         )
 
     raise HTTPException(
@@ -3604,7 +3660,12 @@ async def save_collection_config(
 
     _user, _ = _effective_knowledge_base_user(db, _user, safe_collection, action="edit")
 
-    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    # Accepts a name with no collection yet (settings are seeded before any
+    # ingest), but the body is an ``IngestionConfig`` -- no name field, so a
+    # foreign name here is an access attempt, not someone picking a name.
+    await _ensure_collection_access(
+        safe_collection, _user, allow_create=True, taken_name_is_conflict=False
+    )
 
     config_json = config.model_dump_json(exclude_unset=True)
 
@@ -6629,7 +6690,14 @@ async def check_documents_exist_api(
         if not requested:
             return {"existing_filenames": []}
 
-        await _ensure_collection_access(safe_collection, _user, allow_create=True)
+        # Read-only duplicate check: it names nothing, so it must not report a
+        # naming conflict. Only an existing collection's detail page calls it.
+        # Trade-off: ``allow_create=True`` used to wave through any lag between
+        # ``list_collections`` and the vector store, so a collection missing from
+        # the listing now answers 403 (present globally) or 404 (absent) instead
+        # of being allowed. The caller is fail-open -- it warns and uploads
+        # anyway -- so a missed duplicate warning is the whole cost.
+        await _ensure_collection_access(safe_collection, _user)
 
         # Fetch document records through the API compatibility boundary.
         records = list_document_records(
@@ -7414,21 +7482,24 @@ async def rename_collection_api(
         stage="rename_list_visible_collections",
     )
     if any(c.name == safe_new_collection for c in visible_for_user.collections):
+        # Deliberately not the vague cross-tenant wording: this collection is the
+        # caller's own, so naming it is useful -- they can go rename or delete it.
         raise HTTPException(
             status_code=409,
             detail=f"Target collection already exists: {safe_new_collection}",
         )
-    if not any(c.name == safe_new_collection for c in visible_for_user.collections):
-        all_named = await _list_collections_with_retry(
-            user_id=None,
-            is_admin=True,
-            stage="rename_list_all_collections",
+    all_named = await _list_collections_with_retry(
+        user_id=None,
+        is_admin=True,
+        stage="rename_list_all_collections",
+    )
+    if any(c.name == safe_new_collection for c in all_named.collections):
+        raise HTTPException(
+            status_code=409,
+            detail=_collection_name_unavailable_detail(
+                safe_new_collection, advise_rename=True
+            ),
         )
-        if any(c.name == safe_new_collection for c in all_named.collections):
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied for collection: {safe_new_collection}",
-            )
 
     mutation_scope = _resolve_collection_mutation_scope(
         collection_name=safe_old_collection,
@@ -7453,13 +7524,16 @@ async def rename_collection_api(
             collection_is_sanitized=True,
         )
         if old_dir.exists() and old_dir.is_dir() and new_dir.exists():
+            # The owning user id and the storage layout stay in the log: this
+            # detail is shown to the caller, who may not be that owner.
+            logger.warning(
+                "Rename blocked: %s already has files for user_%s",
+                safe_new_collection,
+                owner_id,
+            )
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "Failed to rename collection: target physical directory already "
-                    f"exists for user_{owner_id}. A collection named "
-                    f"'{safe_new_collection}' already has physical files."
-                ),
+                detail=_rename_target_has_files_detail(safe_new_collection),
             )
 
     physical_rename_results = {}

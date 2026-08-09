@@ -58,6 +58,8 @@ function getKnowledgeBaseToastCopy(
 ) {
   return {
     genericTitle,
+    nameUnavailableTitle: t("kb.errors.nameUnavailable"),
+    nameUnavailableDescription: t("kb.errors.nameUnavailableHint"),
     embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
     embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
     rollbackTitle: t("kb.errors.rollbackFailed"),
@@ -172,13 +174,15 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
   // Embedding models state
   const [embeddingModels, setEmbeddingModels] = useState<Model[]>([])
+  // Flag only: the message itself stays in i18n so it follows a language switch.
+  const [nameError, setNameError] = useState(false)
   const trimmedCollectionName = newCollectionName.trim()
-  const requiresExplicitCollectionName =
-    (activeImportTab === "file" && selectedFiles.length > 1) ||
-    (activeImportTab === "cloud" && totalCloudFiles > 1)
 
   useEffect(() => {
     if (open) {
+      // Clearing on open covers every close path (cancel, escape, overlay, the
+      // close button), which `resetState` alone does not.
+      setNameError(false)
       fetchEmbeddingModels()
     }
   }, [open])
@@ -316,6 +320,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
   }
 
+  /** Every way forward out of step 1 goes through here, so no later step ever
+   *  has to invent a collection name. Returns false when the name is missing. */
+  const requireCollectionName = () => {
+    if (trimmedCollectionName) return true
+    toast.error(t("kb.errors.nameRequired"))
+    setNameError(true)
+    setCurrentStep(1)
+    return false
+  }
+
   const resetState = () => {
     setSelectedFiles([])
     setUploadProgress(0)
@@ -350,12 +364,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       return
     }
 
-    if (selectedFiles.length > 1 && !trimmedCollectionName) {
-      toast.error(t("kb.errors.multiFileNameRequired"))
-      return
-    }
-
     setIsUploading(true)
+    // Classify on the status code, not on the backend's English wording.
+    let failedStatus: number | undefined
     setUploadProgress(0)
     setUploadProgressDetail(null)
     setIngestionResults([])
@@ -370,7 +381,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         const file = selectedFiles[i]
         const formData = new FormData()
 
-        const collectionName = trimmedCollectionName || file.name.replace(/\.[^/.]+$/, "")
+        const collectionName = trimmedCollectionName
         setCurrentUploadFileName(file.name)
         setCurrentUploadCollection(collectionName)
         setUploadProgressDetail(null)
@@ -393,6 +404,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         const parsed = await parseApiResponse(response)
 
         if (!response.ok) {
+          failedStatus = response.status
           const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
           if (errorData.status === 'error') {
             setIngestionResults(prev => [
@@ -479,7 +491,10 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const rawMessage = err instanceof Error ? err.message : t("kb.errors.uploadFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.errors.uploadFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.errors.uploadFailed")),
+        // Creating a knowledge base: the ingest endpoints answer 409 only when the
+        // chosen name is already taken.
+        { status: failedStatus, adviseRename: true }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -502,6 +517,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     }
 
     setIsWebIngesting(true)
+    let failedStatus: number | undefined
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
 
@@ -510,7 +526,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
       const formData = new FormData()
 
-      const collectionName = trimmedCollectionName || "web_collection"
+      const collectionName = trimmedCollectionName
 
       formData.append("collection", collectionName)
       formData.append("start_url", webIngestionConfig.start_url)
@@ -551,6 +567,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       setWebIngestionProgress(50)
 
       if (!response.ok) {
+        failedStatus = response.status
         const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
         if (errorData.status === 'error') {
           setWebIngestionResult(errorData as unknown as WebIngestionResult)
@@ -609,7 +626,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const rawMessage = err instanceof Error ? err.message : t("kb.errors.webIngestFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.errors.webIngestFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.errors.webIngestFailed")),
+        { status: failedStatus, adviseRename: true }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -624,6 +642,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     if (totalCloudFiles === 0) return
 
     setIsCloudConnecting(true)
+    let failedStatus: number | undefined
     setIngestionResults([])
 
     try {
@@ -632,18 +651,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         files.map(file => ({ provider, fileId: file.id, fileName: file.name }))
       )
 
-      // Determine collection name
-      if (filesToIngest.length > 1 && !trimmedCollectionName) {
-        toast.error(t("kb.errors.multiFileNameRequired"))
-        return
-      }
-
-      let collectionName = trimmedCollectionName
-      if (!collectionName && filesToIngest.length > 0) {
-        // Use first file name without extension as default collection name
-        collectionName = filesToIngest[0].fileName.replace(/\.[^/.]+$/, "")
-      }
-      if (!collectionName) collectionName = "cloud_collection"
+      const collectionName = trimmedCollectionName
 
       // Prepare separators
       let separators: string[] | undefined = undefined
@@ -683,6 +691,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const parsed = await parseApiResponse(response)
 
       if (!response.ok) {
+        failedStatus = response.status
         const errorMessage = getUploadErrorMessage(response, parsed, {
           generic: t("kb.errors.cloudIngestFailed") || "Cloud ingest failed",
           ...UPLOAD_ERROR_MESSAGES,
@@ -735,7 +744,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         getKnowledgeBaseToastCopy(
           t,
           t("kb.errors.cloudIngestFailed")
-        )
+        ),
+        { status: failedStatus, adviseRename: true }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -786,17 +796,23 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             {currentStep === 1 && (
               <div className="space-y-6 mt-4">
                 <div>
-                  <Label htmlFor="collection_name" className="text-sm font-medium">{t("kb.dialog.basicInfo.nameLabel")} {t("common.optional")}</Label>
+                  <Label htmlFor="collection_name" className="text-sm font-medium">{t("kb.dialog.basicInfo.nameLabel")} <span className="text-destructive">*</span></Label>
                   <Input
                     id="collection_name"
                     value={newCollectionName}
-                    onChange={(e) => setNewCollectionName(e.target.value)}
+                    onChange={(e) => {
+                      setNewCollectionName(e.target.value)
+                      setNameError(false)
+                    }}
                     placeholder={t("kb.dialog.basicInfo.namePlaceholder")}
                     className="mt-1.5"
+                    aria-required="true"
+                    aria-invalid={nameError}
+                    aria-describedby={nameError ? "collection_name_error" : undefined}
                   />
-                  {requiresExplicitCollectionName && !trimmedCollectionName && (
-                    <p className="mt-2 text-sm text-destructive">
-                      {t("kb.dialog.basicInfo.multiFileRequiredHint")}
+                  {nameError && (
+                    <p id="collection_name_error" className="mt-2 text-sm text-destructive">
+                      {t("kb.errors.nameRequired")}
                     </p>
                   )}
                 </div>
@@ -1029,7 +1045,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                 <div className="bg-primary/5 rounded-lg p-4 flex flex-col gap-2 border border-primary/20">
                   <div className="flex items-center gap-2 font-bold text-sm">
                     <Database className="w-4 h-4 text-primary" />
-                    {newCollectionName || "KB " + new Date().toLocaleString()}
+                    {newCollectionName}
                   </div>
                   <div className="flex items-center gap-2 text-sm text-muted-foreground ml-6">
                     <FileText className="w-4 h-4" />
@@ -1274,7 +1290,10 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
               )}
               {currentStep < 3 ? (
                 <Button
-                  onClick={() => setCurrentStep(prev => prev + 1)}
+                  onClick={() => {
+                    if (!requireCollectionName()) return
+                    setCurrentStep(prev => prev + 1)
+                  }}
                   disabled={
                     (currentStep === 2 && activeImportTab === "file" && selectedFiles.length === 0) ||
                     (currentStep === 2 && activeImportTab === "web" && !webIngestionConfig.start_url)
@@ -1287,6 +1306,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
               ) : (
                 <Button
                   onClick={() => {
+                    // Backstop for every import tab: submission must never fall
+                    // back to a derived name, whatever navigation allows.
+                    if (!requireCollectionName()) return
                     if (activeImportTab === "web") {
                       handleWebIngest()
                     } else if (activeImportTab === "cloud") {

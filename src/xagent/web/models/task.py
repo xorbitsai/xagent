@@ -134,6 +134,17 @@ class Task(Base):  # type: ignore
     control_state = Column(
         String(32), nullable=False, default="idle", server_default="idle"
     )
+    # Identity of the lease attempt that currently owns this row. Written
+    # only by acquire_task_lease_no_commit (a fresh uuid per claim) and
+    # cleared by the lease release/recovery writers. A non-NULL value does
+    # not mean that attempt is still running -- it means no writer has
+    # cleared it since. Readers that need liveness must consult runner_id
+    # and lease_expires_at, not this column.
+    #
+    # Deliberately a bare nullable column: no FK, no CHECK, no UNIQUE. It is
+    # never a WHERE predicate -- consumers read the row by primary key and
+    # compare in Python -- so an index would be pure write cost.
+    lease_attempt_id = Column(String(64), nullable=True)
 
     # Model configuration
     model_name = Column(String(255), nullable=True)  # Main model used for the task

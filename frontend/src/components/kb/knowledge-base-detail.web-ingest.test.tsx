@@ -12,11 +12,13 @@ vi.mock("@/lib/api-wrapper", () => ({
     text: null,
     isHtml: false,
   }),
+  // Mirrors api-wrapper.ts: detail wins over message. Getting this backwards
+  // silently drops the backend sentence and makes assertions about it vacuous.
   getUploadErrorMessage: (
     _response: unknown,
-    parsed: { data?: { message?: string } | null },
+    parsed: { data?: { detail?: string; message?: string } | null },
     messages: { generic: string }
-  ) => parsed?.data?.message || messages.generic,
+  ) => parsed?.data?.detail || parsed?.data?.message || messages.generic,
   isJsonRecord: (value: unknown) => typeof value === "object" && value !== null && !Array.isArray(value),
   UPLOAD_ERROR_MESSAGES: {},
 }))
@@ -119,10 +121,10 @@ vi.mock("./knowledge-base-document-list", () => ({
 
 import { KnowledgeBaseDetailContent } from "./knowledge-base-detail"
 
-function createJsonResponse(body: unknown, ok = true) {
+function createJsonResponse(body: unknown, ok = true, status?: number) {
   return {
     ok,
-    status: ok ? 200 : 500,
+    status: status ?? (ok ? 200 : 500),
     json: vi.fn().mockResolvedValue(body),
   }
 }
@@ -235,5 +237,130 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
 
     const collectionCalls = apiRequestMock.mock.calls.filter(([url]) => url === "http://api.local/api/kb/collections")
     expect(collectionCalls).toHaveLength(1)
+  })
+
+  it("relays the backend verdict for a 409 instead of rename advice", async () => {
+    // A collection can drop out of the caller's own listing while still existing
+    // globally, and then this endpoint answers 409 even though the user never
+    // typed a name here.
+    const previous = apiRequestMock.getMockImplementation()!
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/kb/ingest-web/jobs") {
+        return Promise.resolve(
+          createJsonResponse(
+            {
+              detail:
+                "Knowledge base name unavailable: demo.",
+            },
+            false,
+            409
+          )
+        )
+      }
+      return previous(url, options)
+    })
+
+    render(<KnowledgeBaseDetailContent collectionName="demo" />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kb.detail.files.addSource")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("kb.detail.files.addSource"))
+    fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
+    fireEvent.change(screen.getByLabelText("kb.dialog.webImport.basic.startUrl *"), {
+      target: { value: "https://example.com/docs" },
+    })
+    fireEvent.click(screen.getByText("kb.index.startImport"))
+
+    // This page has no name field. The backend states the fact without advising
+    // a rename, and that sentence is what the user sees.
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "kb.detail.errors.webImportFailed",
+        expect.objectContaining({
+          description:
+            "Knowledge base name unavailable: demo.",
+        })
+      )
+    })
+
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      "kb.errors.nameUnavailable",
+      expect.anything()
+    )
+  })
+})
+
+describe("KnowledgeBaseDetailContent config save", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    toastErrorMock.mockReset()
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/kb/collections") {
+        return Promise.resolve(
+          createJsonResponse({
+            collections: [
+              {
+                name: "demo",
+                documents: 0,
+                chunks: 0,
+                embeddings: 0,
+                parses: 0,
+                document_names: [],
+              },
+            ],
+          })
+        )
+      }
+      if (url === "http://api.local/api/kb/collections/demo/config") {
+        return Promise.resolve(
+          createJsonResponse(
+            { detail: "Access denied for collection: demo" },
+            false,
+            403
+          )
+        )
+      }
+      if (url.startsWith("http://api.local/api/models/")) {
+        return Promise.resolve(createJsonResponse([]))
+      }
+      if (url === "http://api.local/api/jobs/capabilities") {
+        return Promise.resolve(createJsonResponse({ kb_ingest_mode: "celery" }))
+      }
+
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("relays the denial verdict verbatim", async () => {
+    render(<KnowledgeBaseDetailContent collectionName="demo" />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kb.index.saveConfig")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("kb.index.saveConfig"))
+
+    // The settings panel has no name field, so this endpoint answers a foreign
+    // name with 403 rather than the ingest paths' "name taken" conflict.
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "kb.detail.errors.saveConfigFailed",
+        expect.objectContaining({
+          description: "Access denied for collection: demo",
+        })
+      )
+    })
+
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      "kb.errors.nameUnavailable",
+      expect.anything()
+    )
   })
 })

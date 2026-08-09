@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Final, Mapping, Sequence
 
 from .schemas import IndexMetric
+
+logger = logging.getLogger(__name__)
 
 # ------------------------- Paths -------------------------
 
@@ -162,6 +165,22 @@ MODEL_SYNONYMS: Final[Mapping[str, str]] = {
 }
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back on anything else."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Invalid %s=%r; must be positive, using %s", name, raw, default)
+        return default
+    return value
+
+
 @dataclass(frozen=True)
 class IndexPolicy:
     """Index policy configuration for embeddings tables.
@@ -178,6 +197,24 @@ class IndexPolicy:
         reindex_unindexed_ratio_threshold: Ratio threshold for triggering reindex.
         enable_immediate_reindex: Whether to reindex immediately after writes.
         enable_smart_reindex: Whether to use smart reindex based on unindexed ratio.
+        compact_fragment_threshold: Fragment count at or above which a table is
+            compacted. Catches append-heavy tables, where reads slow down with
+            the file count. Must be positive.
+        compact_stale_version_threshold: Number of versions already older than
+            ``version_retention_days`` -- that is, versions the next compaction
+            can actually delete -- at or above which a table is compacted.
+            Catches update-heavy tables such as ``collection_metadata``, whose
+            ``merge_insert`` upserts rewrite rows instead of appending: their
+            fragment count plateaus around the row count while version history,
+            and the disk it holds, grows without bound.
+            Counting only reclaimable versions is what keeps the trigger from
+            ratcheting: counting *all* versions would stay above any threshold
+            forever once crossed, since compaction cannot remove versions still
+            inside the retention window and each run commits another one.
+            Must be positive.
+        version_retention_days: Age below which old table versions are kept; the
+            safety margin that protects readers holding an older version. Must be
+            positive: zero drops every version but the latest.
     """
 
     enable_threshold_rows: int = DEFAULT_INDEX_ROW_THRESHOLD
@@ -194,8 +231,50 @@ class IndexPolicy:
     enable_immediate_reindex: bool = False
     enable_smart_reindex: bool = True
 
+    # Compaction configuration. Env overrides exist because this policy governs
+    # an always-on inline path: raising a threshold is the way to stand it down
+    # without a redeploy.
+    compact_fragment_threshold: int = field(
+        default_factory=lambda: _positive_int_env(
+            "XAGENT_KB_COMPACT_FRAGMENT_THRESHOLD", 100
+        )
+    )
+    compact_stale_version_threshold: int = field(
+        default_factory=lambda: _positive_int_env(
+            "XAGENT_KB_COMPACT_VERSION_THRESHOLD", 100
+        )
+    )
+    version_retention_days: int = field(
+        default_factory=lambda: _positive_int_env("XAGENT_KB_VERSION_RETENTION_DAYS", 7)
+    )
+
     def __post_init__(self) -> None:
-        """Initialize default parameter dicts if None."""
+        """Validate the compaction thresholds, then fill in default param dicts.
+
+        This is the only enforcement point for these bounds, so every
+        construction path goes through it.
+
+        Raises:
+            ValueError: If ``version_retention_days`` is not positive -- a zero
+                or negative window makes the backend delete every table version
+                but the latest, invalidating readers holding an older one -- or
+                if either compaction threshold is not positive, which would make
+                every table qualify on every ingestion.
+        """
+        if self.version_retention_days <= 0:
+            raise ValueError(
+                "version_retention_days must be positive; a zero window deletes "
+                "every version but the latest and invalidates concurrent readers"
+            )
+        for field_name in (
+            "compact_fragment_threshold",
+            "compact_stale_version_threshold",
+        ):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(
+                    f"{field_name} must be positive; a non-positive threshold "
+                    "makes every table qualify for compaction on every write"
+                )
         if self.hnsw_params is None:
             object.__setattr__(self, "hnsw_params", DEFAULT_HNSW_PARAMS.copy())
         if self.ivfpq_params is None:

@@ -1512,6 +1512,7 @@ def _finalize_a2a_cancel_sync(
                 control_state=TaskControlState.FAILED.value,
                 state_version=final_state_version,
                 runner_id=None,
+                lease_attempt_id=None,
                 lease_expires_at=None,
                 last_heartbeat_at=None,
                 output=None,

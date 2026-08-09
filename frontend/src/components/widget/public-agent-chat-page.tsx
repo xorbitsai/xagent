@@ -591,6 +591,11 @@ export function PublicAgentChatPage({
     capabilities: {
       agentCards: "disabled",
       voice: "disabled",
+      // Widget mode covers both the embedded iframe and direct top-level
+      // visits to the widget URL; in either case the conversation has no
+      // other home, so an in-tab navigation loses it. A "share" visitor has
+      // an ordinary full page, where in-tab navigation is expected behavior.
+      linksOpenInNewTab: authMode === "widget" ? "enabled" : "disabled",
     },
     buildWebSocketUrl: ({ baseUrl, taskId, token }) =>
       `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,

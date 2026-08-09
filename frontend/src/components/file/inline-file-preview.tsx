@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { FileText, Loader2, Volume2 } from 'lucide-react'
+import { FileText, Loader2, Video, Volume2 } from 'lucide-react'
 
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
 import { ExcelPreviewRenderer } from '@/components/file/excel-preview-renderer'
@@ -32,6 +32,75 @@ const fileNameFromSource = (source: InlineFilePreviewSource) =>
 const DEFAULT_OPEN_LABEL = 'Open'
 const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
 
+/**
+ * Resolve the URL a media element (<img>/<audio>/<video>) can load.
+ *
+ * The default in-app policy's authenticated preview route needs a Bearer
+ * header that media elements cannot send, so managed files are fetched into
+ * a blob object URL first. If that fetch fails, the public preview URL is a
+ * last-resort fallback: on Agent Builder surfaces it may also require auth,
+ * but a spinner with no recovery path is worse than attempting the
+ * anonymous endpoint.
+ *
+ * A policy that declares ``requiresBlobFetch: false`` (the public
+ * widget/share policy carries its guest token in the query string) hands
+ * the URL to the media element directly instead: a blob fetch would add no
+ * authorization there, and skipping it preserves HTTP range requests for
+ * progressive audio/video playback. Policies that do not declare the
+ * capability get the conservative blob path, which works everywhere.
+ */
+function useResolvedMediaUrl(
+  source: InlineFilePreviewSource,
+  previewUrl: string,
+  fileAccess: FileAccessPolicy
+): string {
+  const fileId = source.fileId
+  const needsBlobFetch = Boolean(fileId) && (fileAccess.requiresBlobFetch ?? true)
+  const [resolvedUrl, setResolvedUrl] = useState(needsBlobFetch ? '' : previewUrl)
+
+  useEffect(() => {
+    let objectUrl: string | null = null
+    let isCancelled = false
+
+    setResolvedUrl(needsBlobFetch ? '' : previewUrl)
+
+    const loadAuthenticatedMedia = async () => {
+      if (!needsBlobFetch || !fileId) return
+      try {
+        const response = await fileAccess.request(fileAccess.previewUrl(fileId), {
+          cache: 'no-cache',
+          headers: {
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          },
+        })
+        if (isCancelled) return
+        if (!response.ok) {
+          setResolvedUrl(previewUrl)
+          return
+        }
+        const blob = await response.blob()
+        if (isCancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setResolvedUrl(objectUrl)
+      } catch {
+        if (!isCancelled) {
+          setResolvedUrl(previewUrl)
+        }
+      }
+    }
+
+    void loadAuthenticatedMedia()
+
+    return () => {
+      isCancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [fileAccess, fileId, needsBlobFetch, previewUrl])
+
+  return resolvedUrl
+}
+
 function InlineImagePreview({
   source,
   previewUrl,
@@ -47,56 +116,7 @@ function InlineImagePreview({
   onFileClick?: (filePath: string, fileName: string) => void
   fileAccess: FileAccessPolicy
 }) {
-  const shouldFallback = Boolean(source.fileId)
-  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
-
-  useEffect(() => {
-    let objectUrl: string | null = null
-    let isCancelled = false
-
-    setResolvedUrl(shouldFallback ? '' : previewUrl)
-
-    const runFallback = async () => {
-      if (!shouldFallback) return
-      try {
-        const response = await fileAccess.request(
-          fileAccess.previewUrl(source.fileId!),
-          {
-            cache: 'no-cache',
-            headers: {
-              'Cache-Control': 'no-cache',
-              Pragma: 'no-cache',
-            },
-          }
-        )
-        if (isCancelled) return
-        if (!response.ok) {
-          // Last-resort fallback: try the public preview URL when the
-          // authenticated route fails. On Agent Builder surfaces that
-          // route may also require auth, but a spinner with no recovery
-          // path is worse than attempting the anonymous endpoint.
-          setResolvedUrl(previewUrl)
-          return
-        }
-        const blob = await response.blob()
-        if (isCancelled) return
-        objectUrl = URL.createObjectURL(blob)
-        setResolvedUrl(objectUrl)
-      } catch {
-        if (!isCancelled) {
-          // See comment above: public preview is best-effort after auth errors.
-          setResolvedUrl(previewUrl)
-        }
-      }
-    }
-
-    void runFallback()
-
-    return () => {
-      isCancelled = true
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-    }
-  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
+  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
 
   const handleClick = (event: React.MouseEvent<HTMLImageElement>) => {
     if (!onFileClick || !source.fileId) return
@@ -131,66 +151,44 @@ function InlineImagePreview({
   )
 }
 
-function InlineAudioPreview({
+function InlineMediaPreview({
   source,
   previewUrl,
   filename,
   openLabel,
+  loadErrorText,
   className,
   fileAccess,
+  icon: Icon,
+  bodyClassName,
+  spinnerClassName,
+  renderMedia,
 }: {
   source: InlineFilePreviewSource
   previewUrl: string
   filename: string
   openLabel: string
+  loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
+  icon: React.ComponentType<{ className?: string }>
+  bodyClassName: string
+  spinnerClassName: string
+  renderMedia: (
+    resolvedUrl: string,
+    media: { onError: () => void; onLoaded: () => void }
+  ) => React.ReactNode
 }) {
-  const shouldFallback = Boolean(source.fileId)
-  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
-
-  useEffect(() => {
-    let objectUrl: string | null = null
-    let isCancelled = false
-
-    setResolvedUrl(shouldFallback ? '' : previewUrl)
-
-    const loadAuthenticatedAudio = async () => {
-      if (!shouldFallback || !source.fileId) return
-      try {
-        const response = await fileAccess.request(
-          fileAccess.previewUrl(source.fileId),
-          {
-            cache: 'no-cache',
-            headers: {
-              'Cache-Control': 'no-cache',
-              Pragma: 'no-cache',
-            },
-          }
-        )
-        if (isCancelled) return
-        if (!response.ok) {
-          setResolvedUrl(previewUrl)
-          return
-        }
-        const blob = await response.blob()
-        if (isCancelled) return
-        objectUrl = URL.createObjectURL(blob)
-        setResolvedUrl(objectUrl)
-      } catch {
-        if (!isCancelled) {
-          setResolvedUrl(previewUrl)
-        }
-      }
-    }
-
-    void loadAuthenticatedAudio()
-
-    return () => {
-      isCancelled = true
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-    }
-  }, [fileAccess, previewUrl, shouldFallback, source.fileId])
+  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
+  const [failedUrl, setFailedUrl] = useState('')
+  const [loadedUrl, setLoadedUrl] = useState('')
+  // Terminal load failure only: useResolvedMediaUrl already falls back from
+  // the authenticated fetch to the public preview URL, so an error event
+  // from a media element that never loaded data means both paths are
+  // exhausted. Errors after data has loaded (e.g. a mid-playback decode
+  // hiccup) keep the player mounted — the element surfaces those itself.
+  // Keyed by URL so a later re-resolve clears the failure.
+  const failed = Boolean(resolvedUrl) && failedUrl === resolvedUrl
 
   return (
     <div
@@ -201,7 +199,7 @@ function InlineAudioPreview({
       data-inline-file-preview-wrapper
     >
       <div className="flex items-center gap-2 border-b border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        <Volume2 className="h-4 w-4 shrink-0" />
+        <Icon className="h-4 w-4 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{filename}</span>
         {resolvedUrl ? (
           <a
@@ -214,23 +212,89 @@ function InlineAudioPreview({
           </a>
         ) : null}
       </div>
-      <div className="p-3">
-        {resolvedUrl ? (
-          <audio
-            controls
-            preload="metadata"
-            src={resolvedUrl}
-            className="w-full"
-            aria-label={filename}
-            title={filename}
-          />
-        ) : (
-          <div className="flex h-14 items-center justify-center text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-          </div>
-        )}
-      </div>
+      {failed ? (
+        <div className="p-3 text-xs text-muted-foreground">{loadErrorText}</div>
+      ) : (
+        <div className={bodyClassName}>
+          {resolvedUrl ? (
+            renderMedia(resolvedUrl, {
+              onError: () => {
+                if (loadedUrl !== resolvedUrl) setFailedUrl(resolvedUrl)
+              },
+              onLoaded: () => setLoadedUrl(resolvedUrl),
+            })
+          ) : (
+            <div
+              className={cn(
+                'flex items-center justify-center text-muted-foreground',
+                spinnerClassName
+              )}
+            >
+              <Loader2 className="h-4 w-4 animate-spin" />
+            </div>
+          )}
+        </div>
+      )}
     </div>
+  )
+}
+
+type MediaWrapperProps = {
+  source: InlineFilePreviewSource
+  previewUrl: string
+  filename: string
+  openLabel: string
+  loadErrorText: string
+  className?: string
+  fileAccess: FileAccessPolicy
+}
+
+function InlineAudioPreview(props: MediaWrapperProps) {
+  const { filename } = props
+  return (
+    <InlineMediaPreview
+      {...props}
+      icon={Volume2}
+      bodyClassName="p-3"
+      spinnerClassName="h-14"
+      renderMedia={(resolvedUrl, { onError, onLoaded }) => (
+        <audio
+          controls
+          preload="metadata"
+          src={resolvedUrl}
+          className="w-full"
+          aria-label={filename}
+          title={filename}
+          onError={onError}
+          onLoadedData={onLoaded}
+        />
+      )}
+    />
+  )
+}
+
+function InlineVideoPreview(props: MediaWrapperProps) {
+  const { filename } = props
+  return (
+    <InlineMediaPreview
+      {...props}
+      icon={Video}
+      bodyClassName="flex items-center justify-center bg-black/95 p-2"
+      spinnerClassName="h-40 w-full"
+      renderMedia={(resolvedUrl, { onError, onLoaded }) => (
+        <video
+          controls
+          playsInline
+          preload="metadata"
+          src={resolvedUrl}
+          className="max-h-[360px] w-full max-w-full rounded bg-black"
+          aria-label={filename}
+          title={filename}
+          onError={onError}
+          onLoadedData={onLoaded}
+        />
+      )}
+    />
   )
 }
 
@@ -422,6 +486,21 @@ export function InlineFilePreview({
         previewUrl={previewUrl}
         filename={filename}
         openLabel={openLabel}
+        loadErrorText={loadErrorText}
+        className={className}
+        fileAccess={fileAccess}
+      />
+    )
+  }
+
+  if (kind === 'video') {
+    return (
+      <InlineVideoPreview
+        source={resolvedSource}
+        previewUrl={previewUrl}
+        filename={filename}
+        openLabel={openLabel}
+        loadErrorText={loadErrorText}
         className={className}
         fileAccess={fileAccess}
       />

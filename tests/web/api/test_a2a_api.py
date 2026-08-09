@@ -2406,6 +2406,7 @@ async def test_direct_cancel_atomically_clears_execution_lease() -> None:
             run_id="run-direct-cancel",
             state_version=6,
             runner_id=get_runner_id(),
+            lease_attempt_id="attempt-direct-cancel",
             lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
             last_heartbeat_at=datetime.now(UTC),
             agent_id=agent_id,
@@ -2440,6 +2441,7 @@ async def test_direct_cancel_atomically_clears_execution_lease() -> None:
         assert canceled.run_id == "run-direct-cancel"
         assert canceled.state_version == 7
         assert canceled.runner_id is None
+        assert canceled.lease_attempt_id is None
         assert canceled.lease_expires_at is None
         assert canceled.last_heartbeat_at is None
         assert canceled.agent_config["a2a_state"] == "TASK_STATE_CANCELED"

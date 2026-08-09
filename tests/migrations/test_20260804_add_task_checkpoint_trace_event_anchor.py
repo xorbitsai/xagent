@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from io import StringIO
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import create_engine, inspect, text
 
 from xagent.db.config import create_alembic_config
@@ -539,3 +542,84 @@ class TestUpgradePostgres:
         assert FK_NAME not in foreign_keys
         columns = {c["name"] for c in inspect(postgres_engine).get_columns("tasks")}
         assert COLUMN not in columns
+
+
+def _offline_sql(dialect_name: str, operation: str) -> str:
+    """Render one migration function in --sql mode, exactly as
+    ``alembic upgrade/downgrade --sql`` would collect it."""
+    migration = _migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name=dialect_name,
+        opts={"as_sql": True, "output_buffer": output},
+    )
+
+    with Operations.context(context):
+        getattr(migration, operation)()
+
+    return output.getvalue()
+
+
+class TestOfflineSql:
+    """The four --sql cells: upgrade/downgrade x sqlite/postgresql. These
+    render SQL from a MockConnection and touch no database."""
+
+    def test_sqlite_upgrade_emits_add_column_and_backfill(self) -> None:
+        sql = _offline_sql("sqlite", "upgrade")
+
+        assert f"ALTER TABLE tasks ADD COLUMN {COLUMN} INTEGER" in sql
+        assert "UPDATE tasks" in sql
+        assert "last_checkpoint_event_id IS NOT NULL" in sql
+        # SQLite gets no DB-level FK from this migration, offline or online.
+        assert FK_NAME not in sql
+
+    def test_postgresql_upgrade_emits_add_column_fk_and_backfill(self) -> None:
+        sql = _offline_sql("postgresql", "upgrade")
+
+        add_at = sql.index(f"ALTER TABLE tasks ADD COLUMN {COLUMN} INTEGER")
+        fk_at = sql.index(f"ALTER TABLE tasks ADD CONSTRAINT {FK_NAME} FOREIGN KEY")
+        update_at = sql.index("UPDATE tasks")
+        # The column must exist before the constraint names it, and the
+        # constraint before the backfill writes through it.
+        assert add_at < fk_at < update_at
+        assert "REFERENCES trace_events (id)" in sql
+
+    def test_sqlite_downgrade_emits_a_plain_drop_column(self) -> None:
+        """Offline SQLite drops the column directly instead of rebuilding the
+        table. That is only correct because an offline script is generated
+        for a database this migration chain built, and on SQLite such a
+        database has no foreign key on the column -- only a create_all-built
+        database does, and those never consume offline SQL. Do not carry this
+        simplification into the online branch, which can be attached to
+        either shape."""
+        sql = _offline_sql("sqlite", "downgrade")
+
+        assert f"ALTER TABLE tasks DROP COLUMN {COLUMN}" in sql
+        # A batch rebuild would show up as a temporary table plus INSERT ...
+        # SELECT, and cannot be rendered under --sql at all.
+        assert "CREATE TABLE" not in sql
+        assert "INSERT INTO" not in sql
+
+    def test_postgresql_downgrade_drops_the_constraint_before_the_column(
+        self,
+    ) -> None:
+        sql = _offline_sql("postgresql", "downgrade")
+
+        drop_fk_at = sql.index(f"ALTER TABLE tasks DROP CONSTRAINT {FK_NAME}")
+        drop_col_at = sql.index(f"ALTER TABLE tasks DROP COLUMN {COLUMN}")
+        assert drop_fk_at < drop_col_at
+
+    @pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
+    @pytest.mark.parametrize("operation", ["upgrade", "downgrade"])
+    def test_offline_sql_carries_no_bind_parameters(
+        self, dialect: str, operation: str
+    ) -> None:
+        """An operator applies --sql output with a plain SQL client, so every
+        value has to be inlined. This renders without literal_binds on
+        purpose: a bind parameter that env.py would have inlined still shows
+        up here."""
+        sql = _offline_sql(dialect, operation)
+
+        assert "%(" not in sql
+        assert ":param" not in sql
+        assert "?" not in sql

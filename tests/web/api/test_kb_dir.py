@@ -1,3 +1,4 @@
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -1380,6 +1381,164 @@ async def test_ensure_collection_access_returns_404_when_collection_absent_globa
     assert mock_list.await_count == 2
 
 
+def test_rename_collision_detail_keeps_the_owner_id_out_of_the_response():
+    """The caller of a rename need not be the user who owns the colliding files.
+
+    Regression guard: this detail is shown verbatim in the UI, so leaking the
+    owning account's internal id here would expose it to another tenant.
+    """
+    import re
+
+    from xagent.web.api.kb import _rename_target_has_files_detail
+
+    detail = _rename_target_has_files_detail("docs")
+
+    assert "docs" in detail
+    assert not re.search(r"user_\d", detail)
+    assert "user_" not in detail
+    # Renaming is the one flow with a name field, so advice is actionable here.
+    assert "choose a different name" in detail
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_access_allows_a_name_no_collection_holds():
+    """The #1139 happy path: naming something nobody has taken just returns.
+
+    Every other branch of this helper raises, so a regression that started
+    raising here too would still leave the suite green.
+    """
+    from xagent.core.tools.core.RAG_tools.core.schemas import ListCollectionsResult
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    empty = ListCollectionsResult(
+        status="success", collections=[], total_count=0, message="ok", warnings=[]
+    )
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        return_value=empty,
+    ) as mock_list:
+        await _ensure_collection_access("brand-new-name", user, allow_create=True)
+
+    assert mock_list.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_access_denies_a_taken_name_without_naming_intent():
+    """``taken_name_is_conflict=False`` keeps a taken name a denial, not a conflict.
+
+    This is the combination ``save_collection_config`` uses -- it accepts a name
+    with no collection behind it, but its body carries no name field, so a
+    foreign name is an access attempt rather than someone picking a name. Only
+    covered end to end otherwise, while the branching lives here.
+    """
+    from fastapi import HTTPException
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionInfo,
+        ListCollectionsResult,
+    )
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    def _listing(*names: str) -> ListCollectionsResult:
+        return ListCollectionsResult(
+            status="success",
+            collections=[
+                CollectionInfo(name=n, documents=1, document_names=[]) for n in names
+            ],
+            total_count=len(names),
+            message="ok",
+            warnings=[],
+        )
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        side_effect=[_listing(), _listing("someone-elses")],
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _ensure_collection_access(
+                "someone-elses",
+                user,
+                allow_create=True,
+                taken_name_is_conflict=False,
+            )
+
+    assert exc_info.value.status_code == 403
+    assert "Access denied for collection" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_access_returns_409_when_creating_taken_name():
+    """Creating a name another tenant already owns is a conflict, not a denial."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    visible = SimpleNamespace(collections=[])
+    all_collections = SimpleNamespace(collections=[SimpleNamespace(name="test")])
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        side_effect=[visible, all_collections],
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _ensure_collection_access("test", user, allow_create=True)
+
+    detail = str(exc_info.value.detail)
+    assert exc_info.value.status_code == 409
+    assert "Knowledge base name unavailable: test" in detail
+    # Must not accuse the user, nor confirm that someone else owns the name.
+    assert "Access denied" not in detail
+    # This same check also fires for writes to an existing collection, whose
+    # screens have no name field, so the wording must not advise a rename.
+    assert "choose a different name" not in detail
+
+
+@pytest.mark.asyncio
+async def test_ensure_collection_access_keeps_403_when_reaching_others_collection():
+    """Without allow_create the caller targets an existing collection: still 403."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from xagent.web.api.kb import _ensure_collection_access
+
+    user = MagicMock()
+    user.id = 1
+    user.is_admin = False
+
+    visible = SimpleNamespace(collections=[])
+    all_collections = SimpleNamespace(collections=[SimpleNamespace(name="test")])
+
+    with patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        side_effect=[visible, all_collections],
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await _ensure_collection_access("test", user, hide_missing=False)
+
+    assert exc_info.value.status_code == 403
+    assert "Access denied for collection: test" in str(exc_info.value.detail)
+
+
 def test_kb_delete_physical_cleanup_failure_preserves_uploaded_file_records(
     test_env, temp_uploads
 ):
@@ -1848,7 +2007,7 @@ def test_kb_rename_physical_rename_failure_aborts_operation(test_env, temp_uploa
             assert old_coll_dir.exists()
 
 
-def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads):
+def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads, caplog):
     """Test that rename_collection_api handles target directory already existing."""
     app, headers, user, _ = test_env
     client = TestClient(app)
@@ -1885,19 +2044,28 @@ def test_kb_rename_target_directory_exists_conflict(test_env, temp_uploads):
         mock_rename_storage.return_value = mock_rename_result
 
         # Attempt rename to existing directory
-        response = client.put(
-            f"/api/kb/collections/{old_collection_name}",
-            data={"new_name": new_collection_name},
-            headers=headers,
-        )
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.kb"):
+            response = client.put(
+                f"/api/kb/collections/{old_collection_name}",
+                data={"new_name": new_collection_name},
+                headers=headers,
+            )
 
         # Should fail with 409 (conflict)
         assert response.status_code == 409, (
             f"Expected 409, got {response.status_code}: {response.text}"
         )
         detail = response.json()["detail"]
-        assert "already exists" in detail or "in progress" in detail, (
+        assert "already has stored files" in detail or "in progress" in detail, (
             f"Expected conflict error, got: {detail}"
+        )
+        # The colliding files may belong to another account: never name it here,
+        # but keep it in the log so operators can still find the owner.
+        assert "user_" not in detail, (
+            f"Rename conflict leaked an internal account id: {detail}"
+        )
+        assert f"user_{user.id}" in caplog.text, (
+            "The owning account id must stay available to operators via the log"
         )
 
 
@@ -1943,6 +2111,60 @@ def test_kb_rename_rejects_existing_visible_target_collection(test_env):
     assert response.status_code == 409, (
         f"Expected 409 when target exists, got {response.status_code}: {response.text}"
     )
+    mock_rename_storage.assert_not_called()
+
+
+def test_kb_rename_onto_another_tenants_name_advises_a_different_name(test_env):
+    """Rename is the one flow with a name field, so its 409 says what to do.
+
+    The shared wording omits that advice because the access check cannot tell a
+    name being chosen from an existing collection being written to. Rename can:
+    the new name is in the request. Without this, the only screen with a name
+    input would report a clash and never mention renaming.
+    """
+    app, headers, _, _ = test_env
+    client = TestClient(app)
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionInfo,
+        ListCollectionsResult,
+    )
+
+    def _listing(*names: str) -> ListCollectionsResult:
+        return ListCollectionsResult(
+            status="success",
+            collections=[
+                CollectionInfo(name=name, documents=1, document_names=[])
+                for name in names
+            ],
+            total_count=len(names),
+            message="ok",
+            warnings=[],
+        )
+
+    # Visible to this user: only the source. Globally the target exists too,
+    # held by somebody else.
+    with (
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch(
+            "xagent.web.api.kb._list_collections_with_retry",
+            new_callable=AsyncMock,
+            side_effect=[_listing("mine"), _listing("mine", "theirs")],
+        ),
+        patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
+    ):
+        response = client.put(
+            "/api/kb/collections/mine",
+            data={"new_name": "theirs"},
+            headers=headers,
+        )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "Please choose a different name." in detail
+    # Still must not confirm who holds it.
+    assert "already exists" not in detail
+    assert "user_" not in detail
     mock_rename_storage.assert_not_called()
 
 
@@ -3172,6 +3394,23 @@ def test_kb_ingest_cloud_uses_unique_storage_paths_for_duplicate_filenames(
         session.close()
 
 
+def _visible_collections(*names: str):
+    """Make the caller's collection listing include ``names``.
+
+    ``/documents/check`` is read-only, so it no longer accepts a name that is
+    absent from the listing; production callers always own the collection.
+    """
+    from types import SimpleNamespace
+
+    return patch(
+        "xagent.web.api.kb._list_collections_with_retry",
+        new_callable=AsyncMock,
+        return_value=SimpleNamespace(
+            collections=[SimpleNamespace(name=name) for name in names]
+        ),
+    )
+
+
 def test_check_documents_exist_prefers_uploaded_file_filename(test_env, temp_uploads):
     """Duplicate check should prefer UploadedFile filename over legacy source path."""
     app, headers, user, TestingSessionLocal = test_env
@@ -3204,9 +3443,12 @@ def test_check_documents_exist_prefers_uploaded_file_filename(test_env, temp_upl
         ),
     ]
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
-    ) as mock_get_store:
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_get_store,
+        _visible_collections("demo"),
+    ):
         mock_store = mock_get_store.return_value
         mock_store.list_document_records.return_value = records
         response = client.post(
@@ -3225,9 +3467,12 @@ def test_check_documents_exist_accepts_unicode_collection_name(test_env, temp_up
 
     collection_name = "示例知识库集合"
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
-    ) as mock_get_store:
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store"
+        ) as mock_get_store,
+        _visible_collections(collection_name),
+    ):
         mock_store = mock_get_store.return_value
         mock_store.list_document_records.return_value = []
 

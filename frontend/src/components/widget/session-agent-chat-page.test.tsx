@@ -199,6 +199,11 @@ describe("SessionAgentChatPage", () => {
       voice: "disabled",
       taskControls: "disabled",
     })
+    // The session page always serves the widget surface, so links must leave
+    // the conversation in place by opening a new tab.
+    expect(app.provider?.transport?.capabilities).toEqual({
+      linksOpenInNewTab: "enabled",
+    })
   })
 
   it("constructs the exact active Session transport and does not leak credentials", () => {

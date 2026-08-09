@@ -19,6 +19,16 @@ export interface FileAccessPolicy {
   pdfPreviewUrl?: (fileId: string) => string
   request: FileAccessRequest
   listFiles?: (query: string) => Promise<Response>
+  /**
+   * Whether media elements must load managed files through an
+   * authenticated fetch into a blob URL. True when previewUrl requires
+   * headers a media element cannot send (the default Bearer policy);
+   * false when the URL is directly loadable (the public policy carries
+   * its guest token in the query string), which preserves HTTP range
+   * requests for progressive playback. Policies that do not declare the
+   * capability get the conservative blob path.
+   */
+  requiresBlobFetch?: boolean
 }
 
 const encodeFileId = (fileId: string) => encodeURIComponent(fileId)
@@ -45,6 +55,9 @@ const defaultFileAccessPolicy: FileAccessPolicy = {
     if (query.trim()) params.set("search", query.trim())
     return apiRequest(buildUrl(`/api/files/list?${params.toString()}`))
   },
+  // previewUrl needs the Bearer header apiRequest attaches; media elements
+  // cannot send it, so they must go through the blob fetch.
+  requiresBlobFetch: true,
 }
 
 const FileAccessContext = createContext<FileAccessPolicy>(defaultFileAccessPolicy)
@@ -110,6 +123,9 @@ export function createPublicFileAccessPolicy(accessToken: string): FileAccessPol
       headers.delete("Authorization")
       return fetch(url, { ...options, headers, credentials: "omit" })
     },
+    // The guest token rides the query string, so media elements can load
+    // previewUrl directly — no headers needed, and range requests work.
+    requiresBlobFetch: false,
   }
 }
 

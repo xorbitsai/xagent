@@ -50,9 +50,45 @@ def _rowcount(result: Any) -> int:
 
 @dataclass(frozen=True)
 class TaskLease:
+    """One runner's claim on one task row.
+
+    ``attempt_id`` names the exact acquisition that produced this lease. It
+    is minted fresh by ``acquire_task_lease_no_commit`` on every successful
+    claim and mirrored into ``tasks.lease_attempt_id`` in the same UPDATE, so
+    a holder can later prove the row still belongs to *its* attempt rather
+    than to a successor that reused the same ``(runner_id, run_id)`` tuple.
+
+    ``attempt_id is None`` is a fail-open sentinel with two distinct sources:
+
+    * a lease acquired by a worker running code from before this column
+      existed -- a rolling-restart window that closes on its own once every
+      worker has restarted; and
+    * ``_task_lease_snapshot`` in ``websocket.py``, which reconstructs an
+      ambient lease from an already-loaded task row. That one carries None
+      permanently and on purpose: every one of its fields is read from the
+      task row, so populating ``attempt_id`` from the same row would make any
+      later ``task.lease_attempt_id != lease.attempt_id`` check compare a
+      value against itself -- an always-passing fence, which is strictly
+      worse than an explicit None that callers can detect and skip. Today
+      that snapshot only feeds checkpoint fencing via
+      ``bind_task_lease_context`` and never reaches a settlement path, so
+      the permanent None also has no behavioural cost.
+
+    Consumers must therefore treat None as "cannot prove attempt identity"
+    and fall back to whatever fence they already had, never as "matches".
+
+    The existing lease writers (refresh, release, fail-and-release) do not
+    fence on this column yet, deliberately: rejecting a stale attempt there
+    turns its refresh into a LOST classification and an active cancellation,
+    which is a behavior change that belongs to the first consumer of this
+    column, with its own tests. Until then the pre-existing
+    ``(runner_id, run_id)`` fences are the only guards on those paths.
+    """
+
     task_id: int
     runner_id: str
     run_id: str | None = None
+    attempt_id: str | None = None
 
 
 _CURRENT_TASK_LEASE: ContextVar[TaskLease | None] = ContextVar(
@@ -567,6 +603,11 @@ def recover_expired_task_lease_no_commit(
         "control_state": control_state_for_status(status).value,
         "state_version": func.coalesce(Task.state_version, 0) + 1,
         "error_message": error_message,
+        # Defence in depth: the column must never outlive the attempt that
+        # wrote it. This writer already NULLs runner_id, so no live fence
+        # depends on the value -- clearing it keeps the column honest for
+        # anyone who reads it directly.
+        "lease_attempt_id": None,
     }
     if status == TaskStatus.FAILED:
         values["output"] = None
@@ -647,6 +688,7 @@ def acquire_task_lease_no_commit(
     now = utc_now()
     expires_at = task_lease_expires_at(now)
     candidate_run_id = expected_run_id or str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
     current_version = func.coalesce(Task.state_version, 0)
     running_control_state = control_state_for_status(TaskStatus.RUNNING).value
     values: dict[str, Any] = {
@@ -661,6 +703,14 @@ def acquire_task_lease_no_commit(
         "state_version": lease_state_version_case(
             TaskStatus.RUNNING, running_control_state, current_version
         ),
+        # A fresh identity for this exact claim. Every successful acquisition
+        # mints a new one; no other writer ever assigns a value here (the
+        # release/recovery writers only clear it). That is precisely what
+        # state_version cannot offer -- _apply_pause_requested_isolated bumps
+        # state_version mid-run without changing attempt ownership, so a
+        # state_version fence pinned at acquisition would reject a legitimate
+        # finalizer that had been paused.
+        "lease_attempt_id": attempt_id,
     }
     if new_run:
         values["last_checkpoint_event_id"] = None
@@ -701,6 +751,7 @@ def acquire_task_lease_no_commit(
         task_id=task_id,
         runner_id=runner,
         run_id=str(stored_run_id) if stored_run_id is not None else None,
+        attempt_id=values["lease_attempt_id"],
     )
 
 
@@ -883,6 +934,7 @@ def release_task_lease_no_commit(
         "state_version": lease_state_version_case(
             status, control_state, current_version
         ),
+        "lease_attempt_id": None,
     }
     if status in _NON_TERMINAL_RELEASE_STATUSES:
         values["error_message"] = None
@@ -930,6 +982,7 @@ def fail_and_release_task_lease_no_commit(
             state_version=func.coalesce(Task.state_version, 0) + 1,
             error_message=error_message,
             output=None,
+            lease_attempt_id=None,
         )
     )
     result = db.execute(stmt.execution_options(synchronize_session=False))
@@ -963,6 +1016,7 @@ def release_current_runner_task_lease(
             state_version=lease_state_version_case(
                 status, control_state, current_version
             ),
+            lease_attempt_id=None,
         )
     )
     if expected_run_id is not None:

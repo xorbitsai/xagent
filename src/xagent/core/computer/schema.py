@@ -105,7 +105,16 @@ class ComputerEnvironmentType(str, Enum):
     MOBILE = "mobile"
 
 
+class ComputerPerceptionMode(str, Enum):
+    """How an agent should choose targets from a computer observation."""
+
+    AUTO = "auto"
+    VISION = "vision"
+    SEMANTIC = "semantic"
+
+
 class ComputerActionType(str, Enum):
+    OBSERVE = "observe"
     SCREENSHOT = "screenshot"
     NAVIGATE = "navigate"
     CLICK = "click"
@@ -125,6 +134,21 @@ class ComputerElementSource(str, Enum):
     UI_AUTOMATION = "ui_automation"
     OMNIPARSER = "omniparser"
     VISION = "vision"
+
+
+class ComputerElementSurface(str, Enum):
+    """Structural surface that owns an observed UI element.
+
+    Surface is provenance derived by an adapter from the native element tree.
+    It describes where an element came from; it does not authorize or forbid
+    an action.
+    """
+
+    DOCUMENT = "document"
+    APPLICATION_CHROME = "application_chrome"
+    NATIVE_APP = "native_app"
+    OVERLAY = "overlay"
+    UNKNOWN = "unknown"
 
 
 class _ComputerModel(BaseModel):
@@ -186,6 +210,7 @@ class ComputerElement(_ComputerModel):
     element_id: Identifier
     source: ComputerElementSource
     bounds: NormalizedRect
+    surface: ComputerElementSurface | None = None
     label: ShortText | None = None
     role: ShortText | None = None
     text: ShortText | None = None

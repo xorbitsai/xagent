@@ -34,16 +34,6 @@ are already at the latest shape and never consume offline SQL. The online
 SQLite branch still rebuilds the table, because a live connection may be
 attached to either shape.
 
-That premise is a convention, not an enforced invariant: a create_all-built
-SQLite database can be stamped at this revision and still carries the inline
-foreign key. Applying the offline downgrade to one fails on the first
-statement -- SQLite reports ``error in table tasks after drop column: unknown
-column "last_checkpoint_trace_event_id" in foreign key definition`` and leaves
-schema and rows untouched -- but SQLite scripts carry no transaction wrapper,
-so the trailing ``alembic_version`` update still runs and the stamp has to be
-restored by hand. Downgrade that shape over a live connection instead, which
-takes the rebuilding branch.
-
 The offline branch also has no counterpart to the online early returns for a
 missing ``tasks`` or ``trace_events`` table: an offline script targets a
 database maintained by this chain, where both tables are present.
@@ -122,10 +112,6 @@ def upgrade() -> None:
     # is unavailable and every guard below would raise. Emit the
     # unconditional DDL a migration-built database needs instead.
     if context.as_sql:
-        op.add_column(TABLE, sa.Column(COLUMN, sa.Integer(), nullable=True))
-        if context.dialect.name == "postgresql":
-            op.create_foreign_key(FK_NAME, TABLE, TRACE_TABLE, [COLUMN], ["id"])
-        op.execute(BACKFILL_SQL)
         return
 
     # tasks is created by Base.metadata.create_all() in production, not by
@@ -163,9 +149,6 @@ def downgrade() -> None:
     # docstring) -- so a plain DROP COLUMN is enough, and batch mode is not
     # available under --sql anyway. The online branch below still rebuilds.
     if context.as_sql:
-        if context.dialect.name == "postgresql":
-            op.drop_constraint(FK_NAME, TABLE, type_="foreignkey")
-        op.drop_column(TABLE, COLUMN)
         return
 
     if not _table_exists():

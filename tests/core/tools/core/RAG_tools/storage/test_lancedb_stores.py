@@ -1,19 +1,22 @@
 """Tests for LanceDB-backed storage implementations."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from xagent.core.tools.core.RAG_tools.core.config import DEFAULT_INDEX_POLICY
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
+from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
     LanceDBIngestionStatusStore,
     LanceDBMainPointerStore,
     LanceDBMetadataStore,
     LanceDBPromptTemplateStore,
     LanceDBVectorIndexStore,
+    _stale_version_count,
 )
 
 
@@ -3022,3 +3025,1118 @@ def test_vis_cascade_delete_documents_unauthenticated_non_admin_returns_empty():
     )
     assert result == {}
     conn.open_table.assert_not_called()
+
+
+# ============================================================================
+# Compaction Tests (xorbitsai/xagent#1140)
+# ============================================================================
+
+
+def _mock_table_with_fragments(count: int, versions: int = 1) -> Mock:
+    table = Mock()
+    table.stats.return_value = {"fragment_stats": {"num_fragments": count}}
+    table.list_versions.return_value = _versions(stale=0, fresh=versions)
+    return table
+
+
+def _versions(*, stale: int, fresh: int) -> List[Dict[str, Any]]:
+    """Version entries shaped like LanceDB's, split either side of a 7-day window.
+
+    LanceDB reports naive timestamps in local time, so these are local too.
+    """
+    from datetime import timedelta
+
+    now = datetime.now()
+    old = [
+        {"version": i, "timestamp": now - timedelta(days=30, seconds=i)}
+        for i in range(stale)
+    ]
+    new = [
+        {"version": stale + i, "timestamp": now - timedelta(seconds=i)}
+        for i in range(fresh)
+    ]
+    return old + new
+
+
+def _mock_conn_with_tables(tmp_dir: Any = None, **tables: Mock) -> Mock:
+    """Connection whose table listing matches the tables it can open."""
+    conn = Mock()
+    conn.uri = str(tmp_dir) if tmp_dir else "memory://not-a-real-path"
+    conn.list_tables.return_value = list(tables)
+    conn.open_table.side_effect = lambda name, *a, **k: tables[name]
+    return conn
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_should_compact_triggers_on_fragmentation(mock_get_connection: Mock) -> None:
+    """Fragment count at or above the threshold marks a table for compaction."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.return_value = _mock_table_with_fragments(100)
+
+    store = LanceDBVectorIndexStore()
+
+    assert store.should_compact("collection_metadata", IndexPolicy()) is True
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_should_compact_skips_below_fragment_threshold(
+    mock_get_connection: Mock,
+) -> None:
+    """A table below the fragment threshold is left alone."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.return_value = _mock_table_with_fragments(99)
+
+    store = LanceDBVectorIndexStore()
+
+    assert store.should_compact("collection_metadata", IndexPolicy()) is False
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_should_compact_ignores_index_staleness(mock_get_connection: Mock) -> None:
+    """A barely-fragmented table is never compacted just because its index is stale.
+
+    ``optimize()`` bundles compaction with an index rebuild, so a shared
+    predicate would rebuild a large unrelated index on every ingest.
+    """
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    table = _mock_table_with_fragments(2)
+    stats = Mock()
+    stats.num_indexed_rows = 1000
+    stats.num_unindexed_rows = 50000  # blows past both smart-reindex thresholds
+    table.index_stats.return_value = stats
+    mock_get_connection.return_value = _mock_conn_with_tables(embeddings_big=table)
+
+    store = LanceDBVectorIndexStore()
+    policy = IndexPolicy()
+
+    # should_reindex still fires on staleness; compaction must not follow it.
+    assert store.should_reindex("embeddings_big", 0, policy) is True
+    assert store.should_compact("embeddings_big", policy) is False
+    assert store.compact_tables(["embeddings_big"], policy) == []
+    table.optimize.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_should_compact_returns_false_when_stats_unsupported(
+    mock_get_connection: Mock,
+) -> None:
+    """Older lancedb without ``stats()`` degrades to "do nothing", never raises."""
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import _fragment_count
+
+    table = Mock()
+    table.stats.side_effect = Exception("unsupported")
+
+    mock_conn = Mock()
+    mock_conn.open_table.return_value = table
+    mock_get_connection.return_value = mock_conn
+
+    assert _fragment_count(table) == 0
+    assert LanceDBVectorIndexStore().should_compact("documents") is False
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_trigger_reindex_keeps_recent_versions(mock_get_connection: Mock) -> None:
+    """Version pruning always leaves a non-zero safety margin for live readers."""
+    from datetime import timedelta
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_conn.open_table.return_value = mock_table
+
+    assert LanceDBVectorIndexStore().trigger_reindex("documents") is True
+    kwargs = mock_table.optimize.call_args.kwargs
+    assert kwargs["cleanup_older_than"] == timedelta(days=7)
+    assert kwargs["cleanup_older_than"] > timedelta(0)
+
+
+def test_index_policy_rejects_zero_version_retention() -> None:
+    """A zero retention window would delete every version but the latest."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    with pytest.raises(ValueError, match="version_retention_days must be positive"):
+        IndexPolicy(version_retention_days=0)
+    with pytest.raises(ValueError, match="version_retention_days must be positive"):
+        IndexPolicy(version_retention_days=-1)
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_compact_tables_only_touches_fragmented_tables(
+    mock_get_connection: Mock,
+) -> None:
+    """Only the named tables are inspected, and only fragmented ones optimized."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    fragmented = _mock_table_with_fragments(500)
+    healthy = _mock_table_with_fragments(3)
+    mock_get_connection.return_value = _mock_conn_with_tables(
+        documents=fragmented, chunks=healthy
+    )
+
+    store = LanceDBVectorIndexStore()
+    compacted = store.compact_tables(["documents", "chunks"], IndexPolicy())
+
+    assert compacted == ["documents"]
+    fragmented.optimize.assert_called_once()
+    healthy.optimize.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_compact_tables_never_opens_unrelated_tables(
+    mock_get_connection: Mock,
+) -> None:
+    """Only the caller's tables are opened, however many the database holds.
+
+    Listing names is a single cheap metadata call and is expected; opening every
+    table in the database is the cost this API exists to avoid.
+    """
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    mock_conn = _mock_conn_with_tables(
+        documents=_mock_table_with_fragments(500),
+        chunks=_mock_table_with_fragments(500),
+        parses=_mock_table_with_fragments(500),
+    )
+    mock_get_connection.return_value = mock_conn
+
+    store = LanceDBVectorIndexStore()
+    assert store.compact_tables(["documents"], IndexPolicy()) == ["documents"]
+
+    # Exact call list, not a set: it also pins how many times each table is
+    # opened (should_compact then trigger_reindex), so an extra open shows up.
+    assert [c.args[0] for c in mock_conn.open_table.call_args_list] == [
+        "documents",
+        "documents",
+    ]
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_compact_tables_skips_names_that_do_not_exist(
+    mock_get_connection: Mock,
+) -> None:
+    """A missing table is skipped without opening anything.
+
+    Callers probe both spellings of the embeddings table name, so for any
+    vendor-prefixed model id one candidate is guaranteed not to exist.
+    """
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    mock_conn = _mock_conn_with_tables(documents=_mock_table_with_fragments(500))
+    mock_get_connection.return_value = mock_conn
+
+    store = LanceDBVectorIndexStore()
+    compacted = store.compact_tables(
+        ["embeddings_BAAI_bge_large_zh_v1_5", "documents"], IndexPolicy()
+    )
+
+    assert compacted == ["documents"]
+    opened = {c.args[0] for c in mock_conn.open_table.call_args_list}
+    assert "embeddings_BAAI_bge_large_zh_v1_5" not in opened
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_compact_tables_swallows_optimize_failure(mock_get_connection: Mock) -> None:
+    """A failing optimize is reported, not raised: maintenance is not the flow."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    broken = _mock_table_with_fragments(500)
+    broken.optimize.side_effect = RuntimeError("disk full")
+    mock_get_connection.return_value = _mock_conn_with_tables(documents=broken)
+
+    assert LanceDBVectorIndexStore().compact_tables(["documents"], IndexPolicy()) == []
+    # The point of the test: optimize really was attempted and really failed.
+    broken.optimize.assert_called_once()
+
+
+def test_ingestion_compaction_hook_never_raises() -> None:
+    """Compaction failure must not break a successful ingestion."""
+    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
+        _compact_storage_if_needed,
+    )
+
+    with patch.object(
+        StorageFactory,
+        "get_vector_index_store",
+        side_effect=RuntimeError("store unavailable"),
+    ):
+        _compact_storage_if_needed("embedding-default")
+
+
+def test_ingestion_compaction_hook_scopes_to_written_tables() -> None:
+    """The hook compacts exactly the tables an ingestion writes, nothing else."""
+    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
+        _compact_storage_if_needed,
+    )
+
+    store = Mock()
+    store.compact_tables.return_value = []
+    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
+        _compact_storage_if_needed("text-embedding-v4")
+
+    names = store.compact_tables.call_args.args[0]
+    assert set(names) == {
+        "documents",
+        "parses",
+        "chunks",
+        "collection_config",
+        "collection_metadata",
+        "ingestion_runs",
+        "embeddings_text_embedding_v4",
+    }
+    assert len(names) == len(set(names))  # idempotent tag: no duplicate probe
+
+
+def test_ingestion_compaction_hook_covers_vendor_prefixed_model_ids() -> None:
+    """A vendor-prefixed id must reach the table the write path really creates.
+
+    ``to_model_tag`` is not idempotent for ids containing a slash, and the write
+    path applies it twice (CollectionHandle then upsert_embeddings), so probing
+    only the single-applied spelling silently misses the embeddings table.
+    """
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
+    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
+        _compact_storage_if_needed,
+    )
+
+    model_id = "BAAI/bge-large-zh-v1.5"
+    # Guard the premise: if to_model_tag ever becomes idempotent this test is moot.
+    assert to_model_tag(model_id) != to_model_tag(to_model_tag(model_id))
+
+    store = Mock()
+    store.compact_tables.return_value = []
+    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
+        _compact_storage_if_needed(model_id)
+
+    names = store.compact_tables.call_args.args[0]
+    assert set(names) == {
+        "documents",
+        "parses",
+        "chunks",
+        "collection_config",
+        "collection_metadata",
+        "ingestion_runs",
+        "embeddings_BAAI_bge_large_zh_v1_5",  # single-applied (legacy spelling)
+        "embeddings_baai_bge_large_zh_v1_5",  # double-applied (what writes create)
+    }
+
+
+def test_compaction_collapses_fragments_and_retains_recent_versions(
+    tmp_path: Any,
+) -> None:
+    """End-to-end against real LanceDB: files collapse, recent versions survive."""
+    import lancedb
+    import pyarrow as pa
+
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    db = lancedb.connect(str(tmp_path))
+    schema = pa.schema([pa.field("name", pa.string())])
+    table = db.create_table("documents", schema=schema)
+    for i in range(12):
+        table.add([{"name": f"c{i}"}])
+
+    store = LanceDBVectorIndexStore()
+    policy = IndexPolicy(compact_fragment_threshold=10)
+    with patch.object(store, "_get_connection", return_value=db):
+        # Append-driven table: one data file per write, so fragments are what
+        # schedule it. (Update-driven tables are covered separately below.)
+        assert store.should_reindex("documents", 0, policy) is False
+        assert store.should_compact("documents", policy) is True
+        assert store.compact_tables(["documents"], policy) == ["documents"]
+
+    handle = db.open_table("documents")
+    assert handle.stats()["fragment_stats"]["num_fragments"] == 1
+    assert len(handle.search().to_arrow()) == 12
+    # 7-day retention: nothing written during this test may be pruned.
+    assert len(handle.list_versions()) > 1
+
+
+def test_compaction_prunes_versions_outside_the_retention_window(
+    tmp_path: Any,
+) -> None:
+    """A short retention window really does delete old versions on disk."""
+    from datetime import timedelta
+
+    import lancedb
+    import pyarrow as pa
+
+    db = lancedb.connect(str(tmp_path))
+    schema = pa.schema([pa.field("name", pa.string())])
+    table = db.create_table("documents", schema=schema)
+    for i in range(12):
+        table.add([{"name": f"d{i}"}])
+    before = len(db.open_table("documents").list_versions())
+    assert before > 10
+
+    store = LanceDBVectorIndexStore()
+    with patch.object(store, "_get_connection", return_value=db):
+        assert (
+            store.trigger_reindex(
+                "documents", cleanup_older_than=timedelta(microseconds=1)
+            )
+            is True
+        )
+
+    handle = db.open_table("documents")
+    assert len(handle.list_versions()) < before
+    assert len(handle.search().to_arrow()) == 12  # data survives the pruning
+
+
+def test_compaction_preserves_live_rows_of_a_delete_add_table(
+    tmp_path: Any,
+) -> None:
+    """``ingestion_runs`` upserts by delete+add; compaction must keep the winners.
+
+    That pattern is the fastest source of fragmentation (two versions per run)
+    and the one where a wrong compaction would be most visible: superseded rows
+    must stay gone and the surviving status must be the last one written.
+    """
+    import lancedb
+    import pyarrow as pa
+
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    db = lancedb.connect(str(tmp_path))
+    schema = pa.schema(
+        [pa.field("doc_id", pa.string()), pa.field("status", pa.string())]
+    )
+    table = db.create_table("ingestion_runs", schema=schema)
+    for i in range(10):
+        table.delete(f"doc_id = 'd{i}'")
+        table.add([{"doc_id": f"d{i}", "status": "running"}])
+    # Re-run every doc: each is deleted then re-added with a terminal status.
+    for i in range(10):
+        table.delete(f"doc_id = 'd{i}'")
+        table.add([{"doc_id": f"d{i}", "status": "success"}])
+
+    store = LanceDBVectorIndexStore()
+    policy = IndexPolicy(compact_fragment_threshold=10)
+    with patch.object(store, "_get_connection", return_value=db):
+        assert store.should_compact("ingestion_runs", policy) is True
+        assert store.compact_tables(["ingestion_runs"], policy) == ["ingestion_runs"]
+
+    rows = db.open_table("ingestion_runs").search().to_arrow().to_pylist()
+    assert {r["doc_id"] for r in rows} == {f"d{i}" for i in range(10)}
+    assert all(r["status"] == "success" for r in rows)  # no tombstone resurrection
+    assert len(rows) == 10  # no duplicates from the superseded versions
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_trigger_reindex_drops_the_cached_handle(mock_get_connection: Mock) -> None:
+    """Pruning removes the versions a cached handle points at, so it must go."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_conn.open_table.return_value = Mock()
+
+    store = LanceDBVectorIndexStore()
+    store._get_table("documents")
+    assert "documents" in store._table_cache
+
+    assert store.trigger_reindex("documents") is True
+    assert "documents" not in store._table_cache
+
+
+def test_compaction_finds_the_embeddings_table_the_write_path_creates(
+    tmp_path: Any,
+) -> None:
+    """End-to-end: the real write path's table name is one the hook actually probes.
+
+    Exercises the genuine double application of ``to_model_tag`` -- the caller
+    (CollectionHandle) tags the model id, then ``upsert_embeddings`` tags it
+    again -- and asserts the ingest hook asks for that name letter for letter.
+
+    The comparison is on the probed strings, not on whether ``open_table``
+    happens to succeed: a case-insensitive filesystem (macOS) resolves the
+    wrongly-cased name to the same directory, so an open-based assertion would
+    pass locally and still miss the table on a case-sensitive production box.
+    """
+    import lancedb
+
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
+    from xagent.core.tools.core.RAG_tools.pipelines.document_ingestion import (
+        _compact_storage_if_needed,
+    )
+
+    model_id = "BAAI/bge-large-zh-v1.5"
+    db = lancedb.connect(str(tmp_path))
+    store = LanceDBVectorIndexStore()
+    probed: List[str] = []
+
+    with patch.object(store, "_get_connection", return_value=db):
+        # CollectionHandle._upsert_model_embeddings tags once, then passes on.
+        model_tag = to_model_tag(model_id)
+        for i in range(12):
+            store.upsert_embeddings(
+                model_tag,
+                [
+                    {
+                        "collection": "demo",
+                        "doc_id": "doc-1",
+                        "chunk_id": f"chunk-{i}",
+                        "parse_hash": "hash-1",
+                        "model": model_id,
+                        "vector": [0.1, 0.2],
+                        "text": f"text-{i}",
+                        "chunk_hash": f"chunk-hash-{i}",
+                        "metadata": "{}",
+                    }
+                ],
+            )
+
+        created = [n for n in db.table_names() if n.startswith("embeddings_")]
+        assert created == ["embeddings_baai_bge_large_zh_v1_5"]
+
+        from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+        real_compact_tables = store.compact_tables
+
+        def _record(names: Any, policy: Any = None) -> List[str]:
+            probed.extend(names)
+            return real_compact_tables(names, policy)
+
+        with patch.object(store, "compact_tables", _record):
+            with patch.object(
+                StorageFactory, "get_vector_index_store", return_value=store
+            ):
+                with patch(
+                    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores."
+                    "DEFAULT_INDEX_POLICY",
+                    IndexPolicy(compact_fragment_threshold=10),
+                ):
+                    _compact_storage_if_needed(model_id)
+
+        stats = db.open_table(created[0]).stats()
+
+    # The name the write path really created must be asked for verbatim.
+    assert created[0] in probed
+    assert stats["fragment_stats"]["num_fragments"] == 1  # and really got compacted
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_compact_tables_with_empty_list_does_nothing(
+    mock_get_connection: Mock,
+) -> None:
+    """Empty input is a normal boundary: no work, no connection, no error."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    assert LanceDBVectorIndexStore().compact_tables([]) == []
+    mock_conn.open_table.assert_not_called()
+    mock_conn.list_tables.assert_not_called()  # short-circuits before any I/O
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_trigger_reindex_returns_false_for_unopenable_table(
+    mock_get_connection: Mock,
+) -> None:
+    """A table that cannot even be opened reports False rather than raising.
+
+    Distinct from the covered case where an opened table's optimize() fails:
+    this is the open_table branch, which the probe-both-spellings scheme hits
+    routinely, since one of the two candidate names usually does not exist.
+    """
+    mock_conn = Mock()
+    mock_conn.open_table.side_effect = FileNotFoundError("no such table")
+    mock_get_connection.return_value = mock_conn
+
+    assert LanceDBVectorIndexStore().trigger_reindex("embeddings_nope") is False
+
+
+def test_vector_index_store_contract_defaults_to_no_compaction() -> None:
+    """A backend that does not implement compaction inherits safe no-ops.
+
+    Calls the base-class bodies unbound: VectorIndexStore has 42 abstract
+    methods, so a stub subclass would be 40 lines of noise to test two.
+    """
+    from xagent.core.tools.core.RAG_tools.storage.contracts import VectorIndexStore
+
+    backend = Mock(spec=VectorIndexStore)
+
+    assert VectorIndexStore.should_compact(backend, "documents") is False
+    assert VectorIndexStore.compact_tables(backend, ["documents"]) == []
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_maintenance_failures_never_log_at_error_level(
+    mock_get_connection: Mock,
+    caplog: Any,
+) -> None:
+    """Compaction is best-effort, so its failures stay at WARNING, never ERROR.
+
+    One unopenable table must not shout ERROR on every upload for every
+    collection, forever.
+    """
+    import logging
+
+    # Listed, so compact_tables reaches the body, but unopenable once there.
+    mock_conn = Mock()
+    mock_conn.uri = "memory://not-a-real-path"
+    mock_conn.list_tables.return_value = ["gone"]
+    mock_conn.open_table.side_effect = FileNotFoundError("no such table")
+    mock_get_connection.return_value = mock_conn
+
+    store = LanceDBVectorIndexStore()
+    with caplog.at_level(
+        logging.DEBUG, logger="xagent.core.tools.core.RAG_tools.storage.lancedb_stores"
+    ):
+        assert store.should_reindex("gone", 0, DEFAULT_INDEX_POLICY) is False
+        assert store.should_compact("gone") is False
+        assert store.trigger_reindex("gone") is False
+        assert store.compact_tables(["gone"]) == []
+
+    assert mock_conn.open_table.called  # the failing branch was really reached
+    assert [r.levelno for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_should_compact_catches_merge_insert_version_growth(tmp_path: Any) -> None:
+    """The collection_metadata case: real merge_insert upserts, no new fragments.
+
+    This is the table the whole fix exists for (229 MB in production). It is
+    only ever written through ``merge_insert(["name"])``, which rewrites the
+    matched rows instead of appending, so its fragment count stays pinned near
+    the row count and NEVER reaches the fragment threshold, however long it
+    degrades. Version history is what grows without bound and holds the disk.
+
+    Driven by real merge_insert rather than a mocked fragment count on purpose:
+    a mock said this table was fragmented, which is exactly why the gap was
+    invisible for four review rounds.
+    """
+    from datetime import datetime, timezone
+
+    import lancedb
+    import pyarrow as pa
+
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    db = lancedb.connect(str(tmp_path))
+    schema = pa.schema(
+        [
+            pa.field("name", pa.string()),
+            pa.field("description", pa.string()),
+            pa.field("updated_at", pa.timestamp("us")),
+        ]
+    )
+    rows = 20
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    table = db.create_table("collection_metadata", schema=schema)
+    table.add(
+        [{"name": f"c{i}", "description": "d", "updated_at": now} for i in range(rows)]
+    )
+
+    # Same upsert shape as MetadataStore.save_collection.
+    for i in range(120):
+        table.merge_insert(
+            "name"
+        ).when_matched_update_all().when_not_matched_insert_all().execute(
+            [
+                {
+                    "name": f"c{i % rows}",
+                    "description": f"rev-{i}",
+                    "updated_at": now,
+                }
+            ]
+        )
+
+    handle = db.open_table("collection_metadata")
+    fragments = handle.stats()["fragment_stats"]["num_fragments"]
+    assert handle.stats()["num_rows"] == rows  # updates, never appends
+
+    # Fixed expectations, not values read back from the same API the code under
+    # test uses: a self-derived threshold would pass even if counting were wrong.
+    assert len(handle.list_versions()) >= 120  # history grows one per upsert
+    assert fragments <= rows  # fragments do not
+    assert fragments < IndexPolicy().compact_fragment_threshold
+
+    store = LanceDBVectorIndexStore()
+    with patch.object(store, "_get_connection", return_value=db):
+        # Everything here was written seconds ago, so nothing is reclaimable
+        # yet and neither criterion fires -- including under the shipped default.
+        assert store.should_compact("collection_metadata", IndexPolicy()) is False
+        assert store.should_compact("collection_metadata") is False
+
+        # Age the whole history past the retention window: now the stale-version
+        # criterion is the only thing that can catch this table.
+        cutoff = datetime.now() + timedelta(minutes=1)
+        assert _stale_version_count(handle, cutoff) >= 120
+        policy = IndexPolicy(compact_stale_version_threshold=100)
+        with patch(
+            "xagent.core.tools.core.RAG_tools.storage.lancedb_stores"
+            "._stale_version_count",
+            lambda table, _cutoff: _stale_version_count(table, cutoff),
+        ):
+            assert store.should_compact("collection_metadata", policy) is True
+            assert store.compact_tables(["collection_metadata"], policy) == [
+                "collection_metadata"
+            ]
+
+    after = db.open_table("collection_metadata")
+    assert len(after.search().to_arrow()) == rows  # data intact
+
+
+def test_index_policy_rejects_non_positive_compaction_thresholds() -> None:
+    """A zero threshold would make every table qualify on every ingestion."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    for field in ("compact_fragment_threshold", "compact_stale_version_threshold"):
+        for bad in (0, -1):
+            with pytest.raises(ValueError, match=f"{field} must be positive"):
+                IndexPolicy(**{field: bad})
+
+
+def test_compaction_lock_keeps_concurrent_workers_off_one_table(
+    tmp_path: Any,
+) -> None:
+    """A table already being compacted elsewhere is skipped, not rewritten twice.
+
+    Every loser of LanceDB's commit race has already paid for a full table
+    rewrite by the time the commit is rejected. Uses a real subprocess holding
+    a real lock, so it asserts cross-process exclusion -- the thing production
+    needs -- rather than the in-process behaviour of one locking primitive.
+    """
+    import subprocess
+    import sys
+    import textwrap
+    import time
+
+    import lancedb
+    import pyarrow as pa
+
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    db = lancedb.connect(str(tmp_path))
+    table = db.create_table("documents", schema=pa.schema([pa.field("n", pa.string())]))
+    for i in range(12):
+        table.add([{"n": str(i)}])
+
+    store = LanceDBVectorIndexStore()
+    policy = IndexPolicy(compact_fragment_threshold=10)
+    ready = tmp_path / "held.flag"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            # Holds the lock through the real helper, so the test cannot drift
+            # out of step with how lock files are named.
+            textwrap.dedent(f"""
+                import time
+                from unittest.mock import Mock
+                from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+                    _compaction_lock,
+                )
+                conn = Mock()
+                conn.uri = {str(tmp_path)!r}
+                with _compaction_lock(conn, "documents") as held:
+                    assert held is True
+                    open({str(ready)!r}, "w").close()
+                    time.sleep(30)
+            """),
+        ]
+    )
+    try:
+        for _ in range(200):
+            if ready.exists():
+                break
+            time.sleep(0.05)
+        assert ready.exists(), "lock holder subprocess never started"
+
+        with patch.object(store, "_get_connection", return_value=db):
+            assert store.compact_tables(["documents"], policy) == []
+    finally:
+        holder.kill()
+        holder.wait()
+
+    # With the other process gone, the very same call goes through.
+    with patch.object(store, "_get_connection", return_value=db):
+        assert store.compact_tables(["documents"], policy) == ["documents"]
+
+
+def test_compaction_lock_is_per_table_not_per_database(tmp_path: Any) -> None:
+    """Holding one table's lock must not stop another table being compacted.
+
+    A database-wide lock would let a busy collection starve every other table.
+    """
+    import lancedb
+    import pyarrow as pa
+
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+        _compaction_lock,
+    )
+
+    db = lancedb.connect(str(tmp_path))
+    for name in ("documents", "chunks"):
+        t = db.create_table(name, schema=pa.schema([pa.field("n", pa.string())]))
+        for i in range(12):
+            t.add([{"n": str(i)}])
+
+    store = LanceDBVectorIndexStore()
+    policy = IndexPolicy(compact_fragment_threshold=10)
+
+    with _compaction_lock(db, "documents") as held:
+        assert held is True
+        with patch.object(store, "_get_connection", return_value=db):
+            assert store.compact_tables(["chunks"], policy) == ["chunks"]
+
+
+def test_compaction_lock_does_not_swallow_body_exceptions(tmp_path: Any) -> None:
+    """The lock must re-raise the caller's error, with its own type and message.
+
+    A context manager that catches around its own ``yield`` turns any failure
+    inside the ``with`` into "generator didn't stop after throw()" and loses the
+    original traceback.
+    """
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+        _compaction_lock,
+    )
+
+    conn = Mock()
+    conn.uri = str(tmp_path)
+
+    with pytest.raises(ValueError, match="real failure from trigger_reindex"):
+        with _compaction_lock(conn, "documents"):
+            raise ValueError("real failure from trigger_reindex")
+
+    # And the lock is takeable again afterwards, so the failure did not wedge it.
+    # (Only re-acquirability is asserted here; filelock also releases on __del__,
+    # so this cannot prove the explicit release ran.)
+    with _compaction_lock(conn, "documents") as acquired:
+        assert acquired is True
+
+
+def test_compaction_still_runs_when_the_uri_cannot_be_locked(tmp_path: Any) -> None:
+    """A remote URI has no lock file, and compaction must still do its work."""
+    import lancedb
+    import pyarrow as pa
+
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    db = lancedb.connect(str(tmp_path))
+    table = db.create_table("documents", schema=pa.schema([pa.field("n", pa.string())]))
+    for i in range(12):
+        table.add([{"n": str(i)}])
+
+    store = LanceDBVectorIndexStore()
+    policy = IndexPolicy(compact_fragment_threshold=10)
+
+    # Same database, but reported under a URI that cannot host a lock file.
+    unlockable = Mock(wraps=db)
+    unlockable.uri = "s3://bucket/lancedb"
+    unlockable.list_tables.return_value = ["documents"]
+    unlockable.open_table.side_effect = db.open_table
+
+    with patch.object(store, "_get_connection", return_value=unlockable):
+        assert store.compact_tables(["documents"], policy) == ["documents"]
+
+    assert db.open_table("documents").stats()["fragment_stats"]["num_fragments"] == 1
+
+
+def test_compaction_clears_the_stale_version_backlog(tmp_path: Any) -> None:
+    """After compacting, the version criterion falls back to zero.
+
+    This is the anti-ratchet guarantee. If the predicate counted *all* versions
+    instead of reclaimable ones it would stay above the threshold forever once
+    crossed -- compaction cannot delete versions still inside the retention
+    window, and each run commits one more -- so every later ingestion would
+    rewrite every table, index rebuild included. Measuring only what a
+    compaction can actually remove makes that state unreachable.
+    """
+    from datetime import timedelta
+
+    import lancedb
+    import pyarrow as pa
+
+    db = lancedb.connect(str(tmp_path))
+    table = db.create_table("documents", schema=pa.schema([pa.field("n", pa.string())]))
+    for i in range(120):
+        table.add([{"n": str(i)}])
+
+    handle = db.open_table("documents")
+    # Treat the whole history as past the retention window.
+    cutoff = datetime.now() + timedelta(minutes=1)
+    before = _stale_version_count(handle, cutoff)
+    assert before >= 120
+
+    store = LanceDBVectorIndexStore()
+    with patch.object(store, "_get_connection", return_value=db):
+        assert store.trigger_reindex(
+            "documents", cleanup_older_than=timedelta(microseconds=1)
+        )
+
+    after = _stale_version_count(db.open_table("documents"), cutoff)
+    assert after < before
+    assert after <= 2  # only what compaction itself just committed
+    assert len(db.open_table("documents").search().to_arrow()) == 120
+
+
+def test_should_compact_ignores_versions_inside_the_retention_window() -> None:
+    """Versions too young to delete must never trigger a compaction.
+
+    Counting them is what produces the ratchet: they cannot be removed, so the
+    count only grows and the predicate latches on.
+    """
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    table = Mock()
+    table.stats.return_value = {"fragment_stats": {"num_fragments": 2}}
+    table.list_versions.return_value = _versions(stale=0, fresh=5000)
+
+    store = LanceDBVectorIndexStore()
+    with patch.object(
+        store, "_get_connection", return_value=_mock_conn_with_tables(t=table)
+    ):
+        assert store.should_compact("t", IndexPolicy()) is False
+
+
+def test_should_compact_counts_only_reclaimable_versions() -> None:
+    """The threshold applies to versions older than the retention window."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    table = Mock()
+    table.stats.return_value = {"fragment_stats": {"num_fragments": 2}}
+    table.list_versions.return_value = _versions(stale=150, fresh=900)
+
+    store = LanceDBVectorIndexStore()
+    with patch.object(
+        store, "_get_connection", return_value=_mock_conn_with_tables(t=table)
+    ):
+        assert (
+            store.should_compact("t", IndexPolicy(compact_stale_version_threshold=100))
+            is True
+        )
+        # 150 stale is below this threshold even though 1050 versions exist.
+        assert (
+            store.should_compact("t", IndexPolicy(compact_stale_version_threshold=200))
+            is False
+        )
+
+
+def test_should_compact_probes_fragments_first_and_only_once() -> None:
+    """Pins the operand order of the ``or`` and bounds the probes per call.
+
+    ``or`` short-circuits only when the left side is already True, so which
+    operand comes first *is* the cost model: swap them and every ingestion pays
+    the version scan even when fragments alone settle the answer -- ~2.2 ms
+    against ~124 ms at 1000 retained versions. A doubled probe is the same bill
+    twice. Neither shows up as a failure anywhere else in the suite.
+    """
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    policy = IndexPolicy(compact_fragment_threshold=10)
+    calls: List[str] = []
+
+    def _recording_table(fragments: int) -> Mock:
+        table = Mock()
+
+        def stats() -> Dict[str, Any]:
+            calls.append("stats")
+            return {"fragment_stats": {"num_fragments": fragments}}
+
+        def list_versions() -> List[Dict[str, Any]]:
+            calls.append("list_versions")
+            return _versions(stale=0, fresh=3)
+
+        table.stats.side_effect = stats
+        table.list_versions.side_effect = list_versions
+        return table
+
+    store = LanceDBVectorIndexStore()
+
+    # Fragmented: settled by the cheap probe, so the scan is never reached.
+    with patch.object(
+        store,
+        "_get_connection",
+        return_value=_mock_conn_with_tables(t=_recording_table(50)),
+    ):
+        assert store.should_compact("t", policy) is True
+    assert calls == ["stats"]
+
+    # Healthy: both run, each exactly once, and fragments still go first.
+    calls.clear()
+    with patch.object(
+        store,
+        "_get_connection",
+        return_value=_mock_conn_with_tables(t=_recording_table(2)),
+    ):
+        assert store.should_compact("t", policy) is False
+    assert calls == ["stats", "list_versions"]
+
+
+def test_compact_tables_never_raises_from_the_connection() -> None:
+    """The "logged, never raised" promise has to cover opening the database.
+
+    ``_get_connection()`` used to sit outside every try in ``compact_tables``,
+    so an unreachable database raised straight out of a method documented as
+    best-effort; only the caller's own blanket except hid it.
+    """
+    store = LanceDBVectorIndexStore()
+    with patch.object(store, "_get_connection", side_effect=RuntimeError("no db")):
+        assert store.compact_tables(["documents"]) == []
+
+
+def test_compaction_lock_never_raises_from_release(tmp_path: Any) -> None:
+    """A failing unlock is maintenance noise, not the caller's exception."""
+    from filelock import FileLock
+
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import _compaction_lock
+
+    conn = _mock_conn_with_tables(tmp_path)
+    with patch.object(FileLock, "release", side_effect=RuntimeError("lock gone")):
+        with _compaction_lock(conn, "documents") as acquired:
+            assert acquired is True  # really locked, so release really runs
+
+
+def test_stale_version_count_returns_zero_when_unsupported() -> None:
+    """An older lancedb without list_versions degrades to "do nothing"."""
+    table = Mock()
+    table.list_versions.side_effect = Exception("unsupported")
+
+    assert _stale_version_count(table, datetime.now()) == 0
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_compact_tables_warns_when_no_candidate_is_listed(
+    mock_get_connection: Mock,
+    caplog: Any,
+) -> None:
+    """Compaction silently switching itself off must leave a trace.
+
+    list_table_names() returns [] instead of raising for any listing shape it
+    does not recognise, so a lancedb API change would disable compaction
+    permanently with no other signal.
+    """
+    import logging
+
+    mock_conn = Mock()
+    mock_conn.uri = "memory://not-a-real-path"
+    mock_conn.list_tables.return_value = []
+    mock_get_connection.return_value = mock_conn
+
+    store = LanceDBVectorIndexStore()
+    with caplog.at_level(
+        logging.DEBUG, logger="xagent.core.tools.core.RAG_tools.storage.lancedb_stores"
+    ):
+        assert store.compact_tables(["documents", "chunks"]) == []
+
+    assert any(
+        r.levelno == logging.WARNING and "documents" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_stale_version_count_judges_aware_timestamps_by_instant() -> None:
+    """An aware timestamp is judged by the instant it names, not its wall clock.
+
+    LanceDB returns naive local timestamps today; this branch is what keeps that
+    assumption from silently inverting if it ever returns aware ones. Reading a
+    far zone's wall clock instead shifts a version by most of a day, in either
+    direction depending on the offset.
+    """
+    local_now = datetime.now()
+    cutoff = local_now - timedelta(hours=6)
+
+    # A zone at least 12 hours from local, on whichever side stays legal.
+    local_offset = local_now.astimezone().utcoffset() or timedelta(0)
+    shift = (
+        timedelta(hours=-12) if local_offset >= timedelta(0) else timedelta(hours=12)
+    )
+    far = timezone(local_offset + shift)
+
+    def _aware(hours_ago: int) -> datetime:
+        return (local_now - timedelta(hours=hours_ago)).astimezone().astimezone(far)
+
+    table = Mock()
+    # One version each side of the cutoff: any constant misreading of the offset
+    # moves both by the same amount and so flips exactly one of them.
+    table.list_versions.return_value = [
+        {"version": 1, "timestamp": _aware(1)},  # inside the window
+        {"version": 2, "timestamp": _aware(11)},  # outside it
+    ]
+
+    assert _stale_version_count(table, cutoff) == 1
+
+
+def test_should_compact_measures_the_retention_window_in_local_time() -> None:
+    """The cutoff comes from local time, matching LanceDB's naive timestamps.
+
+    Deriving it from utcnow() shifts the whole window by the UTC offset. West of
+    Greenwich that marks versions still inside the window as reclaimable, and
+    compaction then deletes versions live readers are holding.
+
+    Necessarily a no-op on a machine running at UTC, where the two clocks agree.
+    """
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    policy = IndexPolicy(compact_stale_version_threshold=1, version_retention_days=7)
+    boundary = datetime.now() - timedelta(days=policy.version_retention_days)
+
+    table = Mock()
+    table.stats.return_value = {"fragment_stats": {"num_fragments": 1}}
+    # Straddle the true cutoff by a minute, so any clock skew moves both across.
+    table.list_versions.return_value = [
+        {"version": 1, "timestamp": boundary - timedelta(minutes=1)},
+        {"version": 2, "timestamp": boundary + timedelta(minutes=1)},
+    ]
+
+    store = LanceDBVectorIndexStore()
+    with patch.object(
+        store, "_get_connection", return_value=_mock_conn_with_tables(t=table)
+    ):
+        assert store.should_compact("t", policy) is True
+
+
+def test_should_compact_fires_at_exactly_the_stale_version_threshold() -> None:
+    """The comparison is >=, so the threshold value itself must trigger."""
+    from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+
+    table = Mock()
+    table.stats.return_value = {"fragment_stats": {"num_fragments": 2}}
+    table.list_versions.return_value = _versions(stale=100, fresh=5)
+
+    store = LanceDBVectorIndexStore()
+    with patch.object(
+        store, "_get_connection", return_value=_mock_conn_with_tables(t=table)
+    ):
+        assert (
+            store.should_compact("t", IndexPolicy(compact_stale_version_threshold=100))
+            is True
+        )
+        assert (
+            store.should_compact("t", IndexPolicy(compact_stale_version_threshold=101))
+            is False
+        )

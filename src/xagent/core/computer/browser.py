@@ -24,6 +24,7 @@ from .schema import (
     ComputerActionType,
     ComputerElement,
     ComputerElementSource,
+    ComputerElementSurface,
     ComputerEnvironmentType,
     ComputerObservation,
     NormalizedPoint,
@@ -180,7 +181,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             if reject_recreated_session:
                 raise ComputerFrameMismatchError(
                     "browser session changed after the expected frame was captured; "
-                    "request a fresh screenshot before another action"
+                    "request a fresh observation before another action"
                 )
         page = await session.get_page()
         requested = {
@@ -205,6 +206,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         action = batch.actions[0]
         await self._execute_action(page, action)
         if action.type not in {
+            ComputerActionType.OBSERVE,
             ComputerActionType.SCREENSHOT,
             ComputerActionType.WAIT,
         }:
@@ -314,6 +316,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                         element_id=f"dom-{index}",
                         source=ComputerElementSource.DOM,
                         bounds=raw_element["bounds"],
+                        surface=ComputerElementSurface.DOCUMENT,
                         label=raw_element.get("label"),
                         role=raw_element.get("role"),
                         text=raw_element.get("text"),
@@ -325,7 +328,10 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         return elements, bool(payload.get("truncated"))
 
     async def _execute_action(self, page: Any, action: ComputerAction) -> None:
-        if action.type is ComputerActionType.SCREENSHOT:
+        if action.type in {
+            ComputerActionType.OBSERVE,
+            ComputerActionType.SCREENSHOT,
+        }:
             return
         if action.type is ComputerActionType.NAVIGATE:
             if action.url is None:

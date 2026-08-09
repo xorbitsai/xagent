@@ -2095,6 +2095,10 @@ def _task_lease_snapshot(task: Any) -> TaskLease | None:
     if task_id is None or runner_id is None or run_id is None:
         return None
     return TaskLease(
+        # attempt_id is left at its None default on purpose: every field here
+        # comes from the task row, so reading lease_attempt_id from that same
+        # row would make any later attempt check compare a value against
+        # itself. See TaskLease's docstring in task_lease_service.py.
         task_id=int(task_id),
         runner_id=str(runner_id),
         run_id=str(run_id),

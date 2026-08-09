@@ -1959,6 +1959,9 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
     assert "Do not put user-facing final answer text in this decision" in (
         decision_prompt
     )
+    assert "private observations are evidence for reasoning" in decision_prompt
+    assert "requested computer screenshot" in decision_prompt
+    assert "artifact, file_ref, or markdown_link" in decision_prompt
     assert "future tool action" in decision_prompt
     assert "response_language" not in decision_prompt
     decision_schema = llm.calls[2]["tools"][0]["function"]["parameters"]

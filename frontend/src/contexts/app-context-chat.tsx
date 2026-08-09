@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
 import {
   AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
   resolveAgentCardPresentationCapability,
 } from "@/contexts/presentation-capabilities"
 import {
@@ -1510,6 +1511,10 @@ export interface AppProviderTransportCapabilities {
   agentCards?: TransportCapabilityState
   voice?: TransportCapabilityState
   taskControls?: TransportCapabilityState
+  // Unlike the capabilities above, this defaults closed for every transport
+  // (including "page"): only the embedded Chat Widget opts in, since that is
+  // the only surface where an in-tab navigation abandons the visitor's iframe.
+  linksOpenInNewTab?: TransportCapabilityState
 }
 
 export interface AppProviderTransportConfig {
@@ -1672,6 +1677,11 @@ export function AppProvider({
     filesDisabled,
     requestedAgentCardsEnabled,
   )
+  // Deliberately not resolveTransportCapability: that helper defaults every
+  // other capability to "enabled" for non-session transports, which is the
+  // wrong default here — this must stay off everywhere except the transports
+  // that explicitly request it.
+  const linksOpenInNewTab = transport?.capabilities?.linksOpenInNewTab === "enabled"
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.voice,
@@ -5994,48 +6004,50 @@ export function AppProvider({
 
   return (
     <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
-      <FileAccessProvider policy={transport?.fileAccess}>
-        <AppContext.Provider
-        value={{
-        state,
-        dispatch,
-        filesDisabled,
-        agentCardsEnabled,
-        voiceInputEnabled,
-        taskControlsEnabled,
-        sendMessage,
-        executeTask,
-        pauseTask,
-        resumeTask,
-        selectStep,
-        clearMessages,
-        isConnected,
-        connectionError,
-        startNewConversation,
-        isConversationResetPending:
-          state.sessionConversation.phase === "reset_requested",
-        isMessageDeliveryPending: messageDeliveryCount > 0,
-        isSessionInteractionLocked:
-          state.sessionConversation.phase === "reload_required",
-        sessionConversationState: state.sessionConversation.phase,
-        setTaskId,
-        requestStatus,
-        getFilePreviewUrl,
-        getFileDownloadUrl,
-        openFilePreview,
-        switchFilePreview,
-        closeFilePreview,
-        startReplay,
-        stopReplay,
-        setReplayPlaying,
-        setReplaySpeed,
-        setReplayProgress,
-        setPendingMessage,
-        }}
-      >
-        {children}
-        </AppContext.Provider>
-      </FileAccessProvider>
+      <LinksOpenInNewTabCapability.Provider value={linksOpenInNewTab}>
+        <FileAccessProvider policy={transport?.fileAccess}>
+          <AppContext.Provider
+          value={{
+          state,
+          dispatch,
+          filesDisabled,
+          agentCardsEnabled,
+          voiceInputEnabled,
+          taskControlsEnabled,
+          sendMessage,
+          executeTask,
+          pauseTask,
+          resumeTask,
+          selectStep,
+          clearMessages,
+          isConnected,
+          connectionError,
+          startNewConversation,
+          isConversationResetPending:
+            state.sessionConversation.phase === "reset_requested",
+          isMessageDeliveryPending: messageDeliveryCount > 0,
+          isSessionInteractionLocked:
+            state.sessionConversation.phase === "reload_required",
+          sessionConversationState: state.sessionConversation.phase,
+          setTaskId,
+          requestStatus,
+          getFilePreviewUrl,
+          getFileDownloadUrl,
+          openFilePreview,
+          switchFilePreview,
+          closeFilePreview,
+          startReplay,
+          stopReplay,
+          setReplayPlaying,
+          setReplaySpeed,
+          setReplayProgress,
+          setPendingMessage,
+          }}
+        >
+          {children}
+          </AppContext.Provider>
+        </FileAccessProvider>
+      </LinksOpenInNewTabCapability.Provider>
     </AgentCardPresentationCapability.Provider>
   )
 }

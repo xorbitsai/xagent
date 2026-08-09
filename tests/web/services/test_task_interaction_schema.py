@@ -368,6 +368,60 @@ def test_active_row_requires_protocol_version_one(db_session, fixtures) -> None:
     )
 
 
+def test_protocol_version_floor_rejects_nonsense_on_terminal_rows(
+    db_session, fixtures
+) -> None:
+    """ck_task_interaction_requests_protocol_version_floor rejects values
+    that are not version numbers at all (-1, 0) on every row, not just
+    active ones -- unlike ck_task_interaction_requests_active_protocol
+    above, which only reaches active rows.
+
+    The positive control (terminated, protocol_version=2) is the design's
+    evolution guarantee: a future-version row may exist historically, and
+    that acceptance is intentional -- do not "fix" it into a rejection.
+    """
+    task_id, anchor_id = fixtures
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="terminated",
+            protocol_version=-1,
+        ),
+        "ck_task_interaction_requests_protocol_version_floor",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="terminated",
+            protocol_version=0,
+        ),
+        "ck_task_interaction_requests_protocol_version_floor",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
+            protocol_version=-1,
+        ),
+        "ck_task_interaction_requests_protocol_version_floor",
+    )
+    assert_accepted(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="terminated",
+            protocol_version=2,
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # T-ck-11..17: paired CHECKs, plus the full-pairing positive control
 # --------------------------------------------------------------------------

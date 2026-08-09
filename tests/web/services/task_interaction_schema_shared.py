@@ -317,6 +317,7 @@ EXPECTED_CHECK_CONSTRAINT_NAMES: set[str] = {
     "ck_task_interaction_requests_resume_checkpoint_type",
     "ck_task_interaction_requests_resume_locator_format",
     "ck_task_interaction_requests_terminal_reason",
+    "ck_task_interaction_requests_protocol_version_floor",
     "ck_task_interaction_requests_active_slot_value",
     "ck_task_interaction_requests_active_slot_pairs_status",
     "ck_task_interaction_requests_active_anchor",

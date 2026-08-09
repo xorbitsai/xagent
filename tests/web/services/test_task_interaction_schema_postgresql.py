@@ -322,6 +322,54 @@ def test_active_row_requires_protocol_version_one(db_session, fixtures) -> None:
     )
 
 
+def test_protocol_version_floor_rejects_nonsense_on_terminal_rows(
+    db_session, fixtures
+) -> None:
+    """Rejects values that are not version numbers at all (-1, 0) on every
+    row, including the positive control that a future version is accepted
+    on a terminal row by design -- see the SQLite half."""
+    task_id, anchor_id = fixtures
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="terminated",
+            protocol_version=-1,
+        ),
+        "ck_task_interaction_requests_protocol_version_floor",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="terminated",
+            protocol_version=0,
+        ),
+        "ck_task_interaction_requests_protocol_version_floor",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
+            protocol_version=-1,
+        ),
+        "ck_task_interaction_requests_protocol_version_floor",
+    )
+    assert_accepted(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="terminated",
+            protocol_version=2,
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # T-ck-11..17: paired CHECKs, plus the full-pairing positive control
 # --------------------------------------------------------------------------

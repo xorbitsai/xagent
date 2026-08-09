@@ -33,6 +33,16 @@ class TaskInteractionRequest(Base):  # type: ignore
     ``uq_task_interaction_active_slot``, or every terminal row after the
     first would collide.
 
+    ``protocol_version`` is governed by two constraints:
+    ``ck_task_interaction_requests_protocol_version_floor`` (``>= 1``, every
+    row) and ``ck_task_interaction_requests_active_protocol`` (``= 1``,
+    active rows only). A terminated or answered row may carry a future
+    version by design -- that is what lets the protocol evolve without
+    forbidding a later version from ever being written as a historical row,
+    while still keeping anything that is not a version number at all out of
+    every row, and keeping the active slot pinned to the one version this
+    table currently knows how to interpret live.
+
     RESTRICT-for-active: ``resume_trace_event_id`` is
     ``ON DELETE SET NULL``, but ``ck_task_interaction_requests_active_anchor``
     requires a non-NULL anchor on every ``active`` row, so a delete that
@@ -170,6 +180,15 @@ class TaskInteractionRequest(Base):  # type: ignore
             "terminal_reason IS NULL OR terminal_reason IN "
             "('deadline_elapsed','run_superseded','answered_via_legacy_resume')",
             name="ck_task_interaction_requests_terminal_reason",
+        ),
+        # ---- numeric domain floor ----
+        # A different category from the slot-scoped "= 1" pin below: the
+        # floor rejects values that are not version numbers at all, on every
+        # row, while the slot CHECK keeps future versions out of the v1 slot
+        # without forbidding them as historical rows.
+        CheckConstraint(
+            "protocol_version >= 1",
+            name="ck_task_interaction_requests_protocol_version_floor",
         ),
         # ---- slot admission CHECKs: active_slot scoping ----
         CheckConstraint(

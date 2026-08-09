@@ -1104,7 +1104,13 @@ def interaction_handoff(
         yield handoff
     except _SWALLOWED as exc:
         savepoint.rollback()
-        signal = _DEGRADATION_SIGNALS[type(exc)]
+        # The except clause matches subclasses (isinstance semantics), so the
+        # signal lookup must too: an exact type(exc) key lookup would raise
+        # KeyError for a future subclass of a swallowed type, and KeyError is
+        # not swallowed -- the degradation path would become a crash path.
+        signal = next(
+            sig for cls, sig in _DEGRADATION_SIGNALS.items() if isinstance(exc, cls)
+        )
         register_degradation(
             signal,
             f"task {task.id} run {lease.run_id}: {type(exc).__name__}: {exc}",

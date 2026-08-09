@@ -1784,3 +1784,43 @@ def test_step_one_rejects_boolean_protocol_version_without_sql(
         stage_interaction_request(db, task_id=task_id, **kwargs)
     assert statements[before:] == []
     db.close()
+
+
+def test_cm_swallows_subclasses_of_swallowed_types(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The except clause matches subclasses, so the signal lookup must too:
+    a subclass of a swallowed type must degrade with its parent's signal
+    rather than escaping as a KeyError from inside the handler."""
+
+    from xagent.web.services import task_interaction_staging as _module
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    task = db.get(Task, task_id)
+    lease = _lease(task)
+
+    class _SubSlotTaken(InteractionSlotTaken):
+        pass
+
+    def _raise_subclass(*args: Any, **kwargs: Any) -> None:
+        raise _SubSlotTaken("subclassed slot conflict")
+
+    monkeypatch.setattr(_module, "stage_interaction_request", _raise_subclass)
+
+    with interaction_handoff(
+        db, lease, task=task, anchor=_anchor(anchor_id), now=_now()
+    ) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    caller_ran_after_with = True
+    assert caller_ran_after_with
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
+    db.close()

@@ -253,8 +253,14 @@ export function ConnectMcpDialog({
   // silently — the connector simply stays private.
   const shareConnector = async (ref: { type: string; id: number }): Promise<boolean> => {
     try {
+      // Round-7: callers await this from inside connectCatalogApp's success
+      // branch, ahead of the finally that clears catalogConnectsInFlight — an
+      // unbounded hang here would wedge the dialog's close guard open forever,
+      // one layer below the timeout that already bounds the connect POST
+      // itself. Same bound, so a hang here fails exactly as visibly.
       const response = await apiRequest(`${getApiUrl()}/api/connectors/${ref.type}/${ref.id}/share`, {
         method: "POST",
+        signal: AbortSignal.timeout(CATALOG_CONNECT_TIMEOUT_MS),
       })
       if (response.ok) return true
       toast.error(
@@ -265,7 +271,8 @@ export function ConnectMcpDialog({
       return false
     } catch (error) {
       console.error("Failed to share connector:", error)
-      toast.error(t("tools.mcp.alerts.saveFailed"))
+      const timedOut = error instanceof DOMException && error.name === "TimeoutError"
+      toast.error(timedOut ? t('tools.mcp.alerts.connectTimedOut') : t("tools.mcp.alerts.saveFailed"))
       return false
     }
   }
@@ -1356,6 +1363,15 @@ export function ConnectMcpDialog({
             </div>
             <Button
               className="font-medium bg-blue-600 hover:bg-blue-700 text-white shadow-sm px-6"
+              // Round-7: onConnectSelected commits localSelectedServers to the
+              // parent as a one-shot snapshot, with no later reconciliation.
+              // If a catalog connect is still in flight, that snapshot can be
+              // stale (missing the app the in-flight connect will add via
+              // autoSelect once it succeeds) — and requestClose()'s own guard
+              // wouldn't even close the dialog after committing it. Disable
+              // the trigger instead of letting it commit early; same signal
+              // requestClose already gates on.
+              disabled={catalogConnectsInFlight > 0}
               onClick={() => {
                 if (onConnectSelected) {
                   onConnectSelected(localSelectedServers);

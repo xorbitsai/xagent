@@ -7,6 +7,7 @@ import { ConnectMcpDialog } from "./connect-mcp-dialog"
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const toastSuccessMock = vi.hoisted(() => vi.fn())
+const useAuthMock = vi.hoisted(() => vi.fn(() => ({ token: "token", inTeam: false })))
 const translateMock = vi.hoisted(() => (key: string) => key)
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
@@ -17,7 +18,7 @@ vi.mock("@/lib/utils", async () => {
 })
 
 vi.mock("@/contexts/auth-context", () => ({
-  useAuth: () => ({ token: "token" }),
+  useAuth: useAuthMock,
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -169,6 +170,9 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       <button type="button" onClick={() => onConnectStart(builtinOauthApp())}>
         connect-builtin
       </button>
+      <button type="button" onClick={() => onConnectStart(apiKeyApp())}>
+        connect-apikey
+      </button>
       <button type="button" onClick={() => onOpenChange(false)}>
         close-settings
       </button>
@@ -259,6 +263,22 @@ function builtinOauthApp() {
   }
 }
 
+// A key-based catalog app, e.g. Google Maps: opens the real (unmocked)
+// key-entry dialog via openKeyConnect, unlike the other fixtures above which
+// all bypass it.
+function apiKeyApp() {
+  return {
+    id: "google-maps",
+    name: "Google Maps",
+    description: "",
+    icon: "",
+    is_connected: false,
+    transport: "stdio",
+    auth_type: "api_key",
+    launch_config: { required_env: ["GOOGLE_MAPS_API_KEY"] },
+  }
+}
+
 function detailResponse(id: number, name: string) {
   return {
     ok: true,
@@ -340,6 +360,7 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
     toastSuccessMock.mockReset()
+    useAuthMock.mockReturnValue({ token: "token", inTeam: false })
   })
 
   afterEach(() => {
@@ -812,6 +833,145 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     resolveChrome?.()
     await waitFor(() => {
       fireEvent.click(cancelButtons[0])
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+  })
+
+  it("disables the select-mode footer Connect button while a catalog connect is in flight", async () => {
+    // Round-7 MAJOR: this button commits localSelectedServers to the parent
+    // as a one-shot snapshot via onConnectSelected, with no later
+    // reconciliation. If fired while a connect is still pending, the
+    // snapshot can miss the app that connect will add via autoSelect once
+    // it succeeds. Disabling the trigger (rather than silently skipping the
+    // commit) prevents that snapshot from ever being taken early.
+    const onConnectSelected = vi.fn()
+    let resolveChrome: (() => void) | undefined
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        return new Promise((resolve) => {
+          resolveChrome = () => resolve({ ok: true, json: async () => ({ id: 1 }) })
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    render(
+      <ConnectMcpDialog
+        open
+        onOpenChange={vi.fn()}
+        selectedMcpServers={selectedMcpServers}
+        onConnectSelected={onConnectSelected}
+      />,
+    )
+
+    const footerConnect = screen.getByRole("button", { name: "tools.mcp.dialog.connect" })
+    expect(footerConnect).not.toBeDisabled()
+
+    fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+    await waitFor(() => expect(resolveChrome).toBeDefined())
+    expect(footerConnect).toBeDisabled()
+
+    // Disabled buttons don't fire onClick in jsdom, but assert the intent
+    // directly: no premature commit while the connect is still pending.
+    fireEvent.click(footerConnect)
+    expect(onConnectSelected).not.toHaveBeenCalled()
+
+    resolveChrome?.()
+    await waitFor(() => expect(footerConnect).not.toBeDisabled())
+  })
+
+  it("bounds the connect POST with an abort signal and surfaces a distinct timeout toast", async () => {
+    // Round-7: no prior test asserted the round-6 timeout fix actually wires
+    // a signal, or that a TimeoutError produces the dedicated toast instead
+    // of the generic saveFailed one.
+    let capturedInit: RequestInit | undefined
+    apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        capturedInit = init
+        return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("tools.mcp.alerts.connectTimedOut")
+    })
+    expect(capturedInit?.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it("times out shareConnector independently, so a hang there cannot wedge the close guard open forever", async () => {
+    // Round-7 MAJOR: shareConnector previously had no signal at all. Awaited
+    // from inside connectCatalogApp's success branch, ahead of the finally
+    // that clears catalogConnectsInFlight, an unbounded hang there would
+    // keep the dialog's close guard active permanently -- reopening the
+    // exact wedge the connect-POST timeout was added to close, one layer
+    // deeper. Drives the real api_key "share with team" path end to end.
+    const onOpenChange = vi.fn()
+    // The ownership radio (private/team) only renders for a team member.
+    useAuthMock.mockReturnValue({ token: "token", inTeam: true })
+    let connectBody: Record<string, unknown> | undefined
+    apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/google-maps/connect") {
+        connectBody = JSON.parse(init?.body as string)
+        return Promise.resolve({ ok: true, json: async () => ({ id: 42 }) })
+      }
+      if (url === "http://api.local/api/connectors/mcp/42/share") {
+        return Promise.reject(new DOMException("The operation timed out.", "TimeoutError"))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    const { container } = render(
+      <ConnectMcpDialog open onOpenChange={onOpenChange} selectedMcpServers={selectedMcpServers} />,
+    )
+    fireEvent.click(screen.getByRole("button", { name: "connect-apikey" }))
+
+    // Reach the key dialog and choose team sharing before submitting. The
+    // shared ownershipRadio JSX is rendered three times (custom API tab,
+    // custom MCP tab, and here) because this file's Tabs mock renders every
+    // TabsContent regardless of the active tab (same reason the round-6
+    // Cancel-button test needs getAllByRole) -- which leaves three elements
+    // with the same id="ownership-team", breaking the label-based
+    // accessible-name lookup getByRole(..., {name}) relies on. shareChoice
+    // is one state shared by all three instances, so which one gets clicked
+    // doesn't matter -- select by id directly instead.
+    await waitFor(() => {
+      expect(container.querySelectorAll("#ownership-team").length).toBeGreaterThan(0)
+    })
+    fireEvent.click(container.querySelectorAll("#ownership-team")[0])
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("tools.mcp.alerts.connectTimedOut")
+    })
+
+    // submitKeyConnect's own request-body wiring: env_source travels with
+    // the connect POST (env itself is omitted here since keyEnvSource
+    // defaults to "own" with an empty required_env value pre-filled).
+    expect(connectBody?.env_source).toBe("own")
+    expect(connectBody).toHaveProperty("env")
+
+    // connectingKeyApp was reset to null despite shareConnector's failure —
+    // only the main dialog's role="dialog" remains (getByRole below would
+    // throw on ambiguity if the key dialog were still open).
+    expect(screen.getAllByRole("dialog")).toHaveLength(1)
+
+    // The guard must have cleared once shareConnector's own timeout settled
+    // the catch block — not stayed wedged open by the unbounded await.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    await waitFor(() => {
       expect(onOpenChange).toHaveBeenCalledWith(false)
     })
   })

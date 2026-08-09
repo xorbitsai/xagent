@@ -191,23 +191,32 @@ ARG INSTALL_CHROME=true
 # same layer once the package is installed -- keeping them would leave
 # dl.google.com resolvable via `apt-get update` inside a running container
 # for no benefit, since the install target is unpinned "stable" anyway.
+# Both arch branches guarantee the same resolver path, so the existence
+# check is collapsed to one, after the arch selection, instead of a
+# near-duplicate per branch. arm64 is now an explicit elif (not the bare
+# else) so a genuinely unexpected architecture fails loudly here instead of
+# silently attempting the arm64 branch's Debian-chromium install.
 RUN if [ "$INSTALL_CHROME" != "true" ]; then \
         echo "INSTALL_CHROME=$INSTALL_CHROME -- skipping Chrome/Chromium install"; \
-    elif [ "$(dpkg --print-architecture)" = "amd64" ]; then \
-        curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-        && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
-            > /etc/apt/sources.list.d/google-chrome.list \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends google-chrome-stable \
-        && rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/google-chrome.list /usr/share/keyrings/google-chrome.gpg \
-        && { [ -e /opt/google/chrome/chrome ] || { echo "ERROR: google-chrome-stable no longer ships /opt/google/chrome/chrome -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; }; \
     else \
-        apt-get update \
-        && apt-get install -y --no-install-recommends chromium \
-        && rm -rf /var/lib/apt/lists/* \
-        && mkdir -p /opt/google/chrome \
-        && ln -s /usr/bin/chromium /opt/google/chrome/chrome \
-        && { [ -e /opt/google/chrome/chrome ] || { echo "ERROR: chromium install did not produce /usr/bin/chromium to symlink -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; }; \
+        if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+            curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+            && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+                > /etc/apt/sources.list.d/google-chrome.list \
+            && apt-get update \
+            && apt-get install -y --no-install-recommends google-chrome-stable \
+            && rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/google-chrome.list /usr/share/keyrings/google-chrome.gpg; \
+        elif [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+            apt-get update \
+            && apt-get install -y --no-install-recommends chromium \
+            && rm -rf /var/lib/apt/lists/* \
+            && mkdir -p /opt/google/chrome \
+            && ln -s /usr/bin/chromium /opt/google/chrome/chrome; \
+        else \
+            echo "ERROR: unsupported architecture $(dpkg --print-architecture) for the chrome connector -- add an install branch, or build with --build-arg INSTALL_CHROME=false" >&2; \
+            exit 1; \
+        fi; \
+        [ -e /opt/google/chrome/chrome ] || { echo "ERROR: the Chrome/Chromium install did not produce /opt/google/chrome/chrome -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; \
     fi
 
 # Warm the npx cache for the exact version pinned in

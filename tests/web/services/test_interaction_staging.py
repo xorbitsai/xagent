@@ -190,6 +190,34 @@ _T_P_1_CASES = [
         id="expires-at-non-utc",
     ),
     pytest.param({"request_payload": None}, ValueError, id="payload-none"),
+    pytest.param({"run_id": ""}, ValueError, id="run-id-empty"),
+]
+
+_T_P_1_ANCHOR_CASES = [
+    pytest.param(
+        {"resume_execution_id": ""},
+        {},
+        InteractionAnchorCorrupt,
+        id="anchor-execution-id-empty",
+    ),
+    pytest.param(
+        {"resume_run_partition": ""},
+        {"run_id": "run-a"},
+        InteractionAnchorCorrupt,
+        id="anchor-run-partition-empty",
+    ),
+    pytest.param(
+        {"resume_locator_format": "wrong_format"},
+        {},
+        InteractionAnchorCorrupt,
+        id="anchor-locator-format-wrong",
+    ),
+    pytest.param(
+        {"resume_checkpoint_type": "wrong_type"},
+        {},
+        InteractionAnchorCorrupt,
+        id="anchor-checkpoint-type-wrong",
+    ),
 ]
 
 
@@ -239,6 +267,42 @@ def test_step_one_rejects_missing_anchor_trace_event_id_without_sql(
     kwargs = _stage_kwargs(anchor)
     before = len(statements)
     with pytest.raises(InteractionAnchorCorrupt):
+        stage_interaction_request(db, task_id=task_id, **kwargs)
+    assert statements[before:] == []
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "anchor_override, kwargs_override, expected_exc", _T_P_1_ANCHOR_CASES
+)
+def test_step_one_rejects_anchor_field_variants_without_sql(
+    tmp_path: Path,
+    anchor_override: dict[str, Any],
+    kwargs_override: dict[str, Any],
+    expected_exc: type[Exception],
+) -> None:
+    """The remaining ``_validate_anchor_fields`` branches
+    ``test_step_one_rejects_empty_anchor_fields_without_sql`` and
+    ``test_step_one_rejects_missing_anchor_trace_event_id_without_sql`` don't
+    already cover: an empty ``resume_execution_id`` or
+    ``resume_run_partition``, and a wrong-vocabulary ``resume_locator_format``
+    or ``resume_checkpoint_type``. The run-partition case also overrides
+    ``run_id`` so the top-level ``run_id must not be empty`` check
+    (``_validate_request_fields``, checked before ``_validate_anchor_fields``
+    is ever called) doesn't fire first and mask the anchor check this case
+    means to exercise -- ``_stage_kwargs`` defaults ``run_id`` from
+    ``anchor.resume_run_partition``, so leaving it alone here would make
+    both empty together."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id, **anchor_override)
+    kwargs = _stage_kwargs(anchor, **kwargs_override)
+    before = len(statements)
+    with pytest.raises(expected_exc):
         stage_interaction_request(db, task_id=task_id, **kwargs)
     assert statements[before:] == []
     db.close()
@@ -666,7 +730,23 @@ def test_p9_replay_after_conflict(tmp_path: Path) -> None:
 
     assert a_result.created is False
     assert a_result.staged_db_id == b_result.staged_db_id
-    assert not isinstance(a_result, InteractionSlotTaken)
+
+    # a_result is a StagedInteractionRequest by construction -- it is never
+    # an InteractionSlotTaken instance, so asserting that in isolation pins
+    # nothing about this test's outcome. What actually needs pinning: A's
+    # own failed INSERT, having lost the race, must not have left a second
+    # row behind alongside B's winning one.
+    verify = session_factory()
+    row_count = verify.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(
+            TaskInteractionRequest.task_id == task_id,
+            TaskInteractionRequest.request_idempotency_key == key,
+        )
+    ).scalar_one()
+    verify.close()
+    assert row_count == 1, "the loser's own failed INSERT must not leave a second row"
 
 
 def test_p10_slot_taken_does_not_retry(tmp_path: Path) -> None:
@@ -927,10 +1007,46 @@ def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
         assert case == "replay-after-conflict"
         expect_signal = None
 
-    task = db.get(Task, task_id)
-    _mark_caller_write(db, task_id, f"caller-write-{case}")
-
     if case == "replay-after-conflict":
+        # A real REPLAY-after-conflict, not a clean insert: db's own step-3
+        # pre-read must miss before a second session commits the
+        # conflicting row, so db's own INSERT below collides and it is
+        # step 7's post-conflict re-check -- not step 4's pre-read -- that
+        # returns the existing row. Same construction as T-P-9 / T-SP-2:
+        # db's first statement on this session has to happen before the
+        # winner's commit, or this session's own later reads would just see
+        # the winner's row directly instead of missing it (see _engine's
+        # docstring on this backend's pre-outer-commit visibility gap).
+        from xagent.web.services.task_interaction_staging import (
+            _identity_lookup_stmt,
+        )
+
+        db.execute(
+            _identity_lookup_stmt(
+                task_id=task_id,
+                run_id=lease.run_id,
+                request_idempotency_key=stage_key,
+            )
+        ).first()
+
+        winner = session_factory()
+        winner_task = winner.get(Task, task_id)
+        with interaction_handoff(
+            winner, lease, task=winner_task, anchor=anchor, now=_now()
+        ) as h:
+            winner_result = h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=stage_key,
+                expires_at=_now() + timedelta(minutes=15),
+            )
+        winner.commit()
+        winner.close()
+        assert winner_result.created is True
+
+        task = db.get(Task, task_id)
+        _mark_caller_write(db, task_id, f"caller-write-{case}")
         with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
             first = h.stage(
                 kind="clarification",
@@ -940,10 +1056,15 @@ def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
                 expires_at=_now() + timedelta(minutes=15),
             )
         db.commit()
-        assert first.created is True
+        assert first.created is False
+        assert first.staged_db_id == winner_result.staged_db_id
+        assert _caller_write_survived(db, task_id, f"caller-write-{case}")
         db.close()
         assert ops_signals.active_degradations() == {}
         return
+
+    task = db.get(Task, task_id)
+    _mark_caller_write(db, task_id, f"caller-write-{case}")
 
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
         h.stage(

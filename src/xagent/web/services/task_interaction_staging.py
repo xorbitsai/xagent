@@ -22,12 +22,27 @@ Caller obligations, because none of them happen here:
   manages only its own inner savepoint (see below); ``interaction_handoff``
   manages only the outer savepoint it opens in ``__enter__``. The caller
   owns the transaction and decides when to commit or roll it back.
-* Neither one notifies, prunes, or writes any column of ``tasks``. A
-  degraded handoff still leaves whatever the caller was about to persist
-  for its own reasons (a stale attempt continuing to write its own task
-  row, for instance) untouched -- that is a fact the three eventual
-  finalizer call sites must each account for, not something this module
-  can prevent.
+* Neither one writes any *data* column of ``tasks``, and neither notifies
+  or prunes anything. The one exception is structural, not data: on
+  SQLite, ``interaction_handoff`` issues a single self-assigning,
+  zero-row ``UPDATE tasks SET id = id WHERE id = -1`` immediately before
+  opening its own outer savepoint (see that function's docstring for why).
+  ``id = -1`` can never match a row an autoincrement primary key minted,
+  so this can never touch a real row's data, and it is skipped entirely
+  on PostgreSQL, which does not need it. A degraded handoff still leaves
+  whatever the caller was about to persist for its own reasons (a stale
+  attempt continuing to write its own task row, for instance) untouched --
+  that is a fact the three eventual finalizer call sites must each account
+  for, not something this module can prevent. Those three finalizers are
+  the complete writer set this module assumes: a fourth, legacy release
+  path (``AgentServiceManager.execute_task`` in ``web/api/chat.py``) also
+  formally writes ``TaskStatus.WAITING_FOR_USER`` on a task row when
+  ``manage_task_lease`` is true, but every production call site
+  (``websocket.py``, and the Feishu/Slack/Telegram bot channels) passes
+  ``manage_task_lease=False`` -- that write path is confirmed unreachable
+  today, not merely unlikely. A caller added later that reaches it with
+  ``manage_task_lease=True`` would make it a fourth writer this module's
+  finalizer accounting does not yet account for.
 * If ``stage_interaction_request`` raises ``InteractionOwnerStateError``,
   the session is left mid-transaction with no savepoint of its own to roll
   back to (the failure happened before this function opened one) -- the
@@ -52,9 +67,26 @@ non-positive TTL, a ``None`` payload past ``JSON(none_as_null=True))``) that
 also violates a CHECK: both land on the same ``else`` branch. The backstop
 is the database's constraint set, not the primary defense; the primary
 defense is this validation block, and it must reject everything the INSERT
-could reject before the INSERT is ever issued. Adding a column CHECK to
+could reject except the two concurrent-parent-deletion cells documented
+below, before the INSERT is ever issued. Adding a column CHECK to
 ``TaskInteractionRequest`` without adding the matching Python check here
 reopens that misclassification funnel by one more case.
+
+Two cells this validation block cannot close, by construction: the parent
+``tasks`` row (``fk_task_interaction_requests_task_id``) or the anchor's
+``trace_events`` row (``fk_task_interaction_requests_resume_trace_event_id``)
+being deleted concurrently, some time between whatever read gave the
+caller its ``task_id`` / the anchor's ``trace_event_id`` and this call's
+own INSERT. Neither has a Python precondition here -- nothing in this
+function's own arguments could detect a row disappearing out from under
+it -- and both surface as a foreign-key ``IntegrityError`` that step 7's
+re-check, finding no matching identity row, classifies as
+``InteractionSlotTaken`` along with everything else in the
+misclassification funnel above. Closing that gap is not this validation
+block's job: it belongs to whatever serializes deletion against staging
+(the task-deletion path's own locking, and the trace-event pruning job's
+own protection set for rows a live anchor could still name), not to a
+plain-Python check inside this primitive.
 
 Concurrency note (inherited, not introduced here): on PostgreSQL, an
 ``IntegrityError`` poisons the rest of the transaction
@@ -155,7 +187,10 @@ class InteractionAnchorCorrupt(InteractionHandoffError):
 class InteractionAttemptMismatch(InteractionHandoffError):
     """The caller's lease no longer names the task's current attempt.
 
-    Raised by ``interaction_handoff.__enter__`` when
+    Raised by ``_InteractionHandoff.stage()``, at the start of the call,
+    before any staging SQL is issued -- not by ``interaction_handoff``'s
+    ``__enter__`` (see ``stage()``'s own docstring for why this
+    precondition has to live there). Raised when
     ``lease.attempt_id is not None`` and it disagrees with
     ``task.lease_attempt_id``. See ``TaskLease.attempt_id``'s docstring
     (``task_lease_service.py``) for the ``is not None`` gate: a permanent
@@ -319,8 +354,9 @@ class StagedInteractionRequest:
 def _validate_anchor_fields(anchor: InteractionAnchor) -> None:
     """The plain-Python half of anchor validation, shared by
     ``stage_interaction_request``'s own pre-INSERT check and
-    ``interaction_handoff``'s ``__enter__`` precondition, so the two never
-    drift into checking different things for the same dataclass.
+    ``_InteractionHandoff.stage()``'s own precondition check -- both now run
+    at the start of their respective calls, not in ``__enter__`` -- so the
+    two never drift into checking different things for the same dataclass.
 
     Every field checked here backs a real CHECK constraint on
     ``task_interaction_requests`` (see the audit in this PR's design
@@ -436,8 +472,23 @@ def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.
     plain expiry when a row is both (``run_id <> :reclaim_run_id`` is
     checked before falling through to ``deadline_elapsed``).
 
-    The one ``sa.text`` in this module, and it must stay parameterized via
-    ``.bindparams`` -- see the module docstring's statement-discipline note.
+    One of two ``sa.text`` usages in this module -- the other is
+    ``interaction_handoff``'s SQLite-only savepoint guard, which needs no
+    parameter because its predicate is a hardcoded constant, not caller
+    input. This one carries caller input (``run_id``) and must stay
+    parameterized via ``.bindparams`` -- see the module docstring's
+    statement-discipline note.
+
+    This UPDATE is also the shape the next status-writing statement on this
+    table needs to follow: it writes ``status`` and ``terminated_at``
+    together, because
+    ``ck_task_interaction_requests_terminated_at_pairs_status`` enforces
+    ``(status = 'terminated') = (terminated_at IS NOT NULL)`` on every row
+    -- setting one without the other fails at the database, not just in
+    review. A future answering statement (writing ``status='answered'``) is
+    bound by the same discipline in the other direction: it must write
+    neither ``terminated_at`` nor ``terminal_reason``, since neither column
+    pairs with ``answered`` in any CHECK on this table.
     """
 
     return (
@@ -674,6 +725,25 @@ class _InteractionHandoff:
         This is a plain Python object comparison, not a SQL expression: the
         `` == None`` -> ``IS NULL`` folding that affects a SQLAlchemy
         column comparison compiled to SQL does not apply here.
+
+        This reads ``self.task.lease_attempt_id`` from whatever snapshot of
+        the task row the caller already loaded -- it is not itself a SQL
+        read, and it does not take a lock. Whether the comparison is safe
+        against a concurrent attempt change depends on the backend, not on
+        this line: on PostgreSQL, a caller that loaded ``task`` with its own
+        ``SELECT ... FOR UPDATE`` genuinely blocks a concurrent writer for
+        as long as that lock is held. On SQLite, SQLAlchemy silently drops
+        ``with_for_update()`` -- the dialect does not support it -- so no
+        row lock is ever actually taken there (the same fact
+        ``get_next_expired_task_lease_candidate_for_update`` in
+        ``task_lease_service.py`` documents for its own row-lock read).
+        What keeps this comparison's window closed on SQLite instead is
+        single-writer semantics: SQLite's database-wide writer lock
+        serializes every write regardless of which row it targets. That
+        makes this a TOCTOU (time-of-check-to-time-of-use) gap that happens
+        to stay closed because nothing else can be writing concurrently,
+        not a genuine row-level lock -- a caller that assumes real row
+        locking here is assuming something SQLite does not provide.
         """
 
         if (
@@ -764,6 +834,24 @@ def interaction_handoff(
     SQLite's database-wide writer lock (or, on PostgreSQL, ordinary row
     locks) for the whole span, not just an instant.
 
+    This handoff fails closed, on purpose, and does not inherit the
+    silent-discard shape a sibling primitive in this package uses.
+    ``trace_event_staging.stage_trace_event_row`` / its caller
+    ``DatabaseTraceHandler._save_trace_event`` (``web/api/trace_handlers.py``)
+    has a branch that discovers the parent task row is gone and, for a
+    non-required event, logs at debug and returns without raising -- a
+    deliberate silent discard, scoped to that primitive's best-effort trace
+    events. This module has no equivalent branch anywhere: every one of the
+    five swallowed exceptions below is swallowed because it is a named,
+    expected outcome with its own degradation signal, never because the
+    underlying data (the task, the anchor, the request row) turned out to
+    be missing or unreadable. A caller with a missing task or a broken
+    anchor gets an exception here -- ``InteractionAnchorCorrupt`` or a
+    database error, not a quiet no-op -- because a blocking interaction
+    request that is silently never staged strands the caller's turn
+    exactly the way this module's degrade-instead-of-losing-the-turn design
+    exists to prevent.
+
     Nesting, exactly:
 
         savepoint = db.begin_nested()        # this function's own
@@ -847,11 +935,12 @@ def interaction_handoff(
     no DML of its own before entering this context manager, which would
     make every one of the five swallowed exceptions' rollback silently do
     nothing -- the half-written garbage this context manager exists to
-    prevent. The zero-row UPDATE issued immediately below, before the
-    savepoint opens, is the fix: see the comment there for the reproduction,
-    the SQLAlchemy-documented pysqlite recipe that was considered and
-    rejected instead, and why. PostgreSQL was checked directly and does not
-    share this behavior at all.
+    prevent. The zero-row, single-column, SQLite-only ``UPDATE`` issued
+    immediately below, before the savepoint opens, is the fix: see the
+    comment there for the reproduction, the SQLAlchemy-documented pysqlite
+    recipe that was considered and rejected instead, and why. It is gated
+    on the session's own dialect and skipped entirely on PostgreSQL, which
+    was checked directly and does not share this behavior at all.
 
     In the wiring-window while ``lease.attempt_id is None`` is still
     possible (see ``_assert_current_attempt``'s docstring), this handoff's
@@ -863,13 +952,14 @@ def interaction_handoff(
     rolling-restart window at once.
     """
 
-    # A zero-row UPDATE, issued deliberately before this function's own
-    # savepoint opens. This statement's only purpose is to be a real DML
-    # statement: it touches no row (task.id == -1 can never match one) and
-    # its rowcount is never read. Removing it silently breaks the
-    # swallow-and-rollback contract this function exists to provide,
-    # whenever a caller enters this context manager without a prior write
-    # of its own on the same session -- exactly this file's own
+    # A zero-row, SQLite-only, single-column UPDATE, issued deliberately
+    # before this function's own savepoint opens. This statement's only
+    # purpose is to be a real DML statement: it touches no row (id = -1 can
+    # never match one an autoincrement primary key minted) and its rowcount
+    # is never read. Removing it silently breaks the swallow-and-rollback
+    # contract this function exists to provide, whenever a caller enters
+    # this context manager without a prior write of its own on the same
+    # session -- exactly this file's own
     # test_cm4_with_exit_does_not_commit_outer_transaction shape.
     #
     # Reproduction: on SQLite, a session whose first write-adjacent
@@ -881,7 +971,9 @@ def interaction_handoff(
     # stage_interaction_request's own inner savepoint, whose reclaim UPDATE
     # -- a real DML -- always runs first); this function's outer savepoint
     # has no such statement ahead of it otherwise. PostgreSQL does not
-    # share this behavior at all.
+    # share this behavior at all, so this guard is gated to SQLite; issuing
+    # it unconditionally on PostgreSQL would do nothing useful there while
+    # adding a statement to every handoff.
     #
     # The standard fix, and why it was not used: SQLAlchemy's documented
     # pysqlite recipe (disable pysqlite's own isolation_level, issue an
@@ -910,7 +1002,29 @@ def interaction_handoff(
     # batch, once real caller topology and deployment concurrency
     # assumptions exist, should revisit whether the engine-level recipe
     # becomes worth its cost at that point.
-    db.execute(sa.update(Task).where(Task.id == -1))
+    #
+    # Written as raw SQL via sa.text(), not sa.update(Task), specifically to
+    # keep its SET clause to exactly the one column named ("id = id", a
+    # self-assignment): sa.update(Task).where(Task.id == -1), with no
+    # .values() at all, compiles to a SET clause naming every column
+    # SQLAlchemy maps on Task -- all 44 of them, including runner_id and
+    # lease_attempt_id -- because Core has nothing to narrow the SET clause
+    # to without an explicit .values(). Even sa.update(Task).where(...)
+    # .values(id=-1) does not get down to one column: Task.updated_at
+    # carries onupdate=func.now(), which SQLAlchemy Core appends to any
+    # UPDATE on this table whenever the column is not given an explicit
+    # value, so that form still compiles to two SET columns (id,
+    # updated_at) on both backends -- confirmed directly. Raw text is the
+    # only way to name exactly one column and nothing else; the same
+    # bypass-the-onupdate-handler technique is already used for the same
+    # reason by acquire_runtime_key_transition_fence in
+    # services/api_keys.py. This module's own module-docstring invariant
+    # ("neither one writes any data column of tasks") depends on the SET
+    # clause never growing back to include a real data column -- do not
+    # replace this with sa.update(Task) in any form without re-verifying
+    # what it compiles to.
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(sa.text("UPDATE tasks SET id = id WHERE id = -1"))
 
     # Session.begin_nested() always flushes first (it has to, in order to
     # establish the SAVEPOINT after whatever is already pending): a doomed

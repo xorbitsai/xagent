@@ -1,15 +1,15 @@
-"""Contract tests for ``stage_interaction_request`` (the T-P group).
-
-The context manager (``interaction_handoff``) and its own tests (T-CM,
-T-SP) land in a follow-up commit -- this file's own docstring will grow to
-describe both once they do.
+"""Contract tests for ``stage_interaction_request`` and ``interaction_handoff``
+(SQLite half; always runs). The PostgreSQL half
+(``test_interaction_staging_postgresql.py``) re-runs only the savepoint
+containment group -- see that file's module docstring for why the rest is
+not duplicated there.
 
 Each test builds its own file-backed sqlite database under ``tmp_path``
 rather than the process-wide singleton, for the same reason
-``test_trace_event_staging.py`` does: T-P-9 needs two independent sessions
-with genuine transaction isolation between them (REPLAY-after-conflict),
-which an in-memory database shared over one pooled connection does not
-give.
+``test_trace_event_staging.py`` does: several tests here need two
+independent sessions with genuine transaction isolation between them
+(REPLAY-after-conflict), which an in-memory database shared over one pooled
+connection does not give.
 """
 
 from __future__ import annotations
@@ -42,8 +42,10 @@ from xagent.web.services.task_interaction_staging import (
     InteractionRequestClosed,
     InteractionRunPartitionMismatch,
     InteractionSlotTaken,
+    interaction_handoff,
     stage_interaction_request,
 )
+from xagent.web.services.task_lease_service import TaskLease
 
 _key_counter = count()
 
@@ -819,4 +821,511 @@ def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
     assert row.status == "terminated"
     assert row.terminal_reason == "run_superseded"
     db.rollback()
+    db.close()
+
+
+# --------------------------------------------------------------------------
+# T-CM group -- the context manager
+# --------------------------------------------------------------------------
+
+
+def _lease(
+    task_id: int, *, run_id: str = "run-a", attempt_id: str | None = None
+) -> TaskLease:
+    return TaskLease(
+        task_id=task_id, runner_id="runner-1", run_id=run_id, attempt_id=attempt_id
+    )
+
+
+def _mark_caller_write(db: Session, task_id: int, title: str) -> None:
+    db.execute(sa.update(Task).where(Task.id == task_id).values(title=title))
+
+
+def _caller_write_survived(db: Session, task_id: int, title: str) -> bool:
+    return (
+        db.execute(sa.select(Task.title).where(Task.id == task_id)).scalar_one()
+        == title
+    )
+
+
+def _force_attempt_mismatch(db: Session, task_id: int) -> TaskLease:
+    db.execute(
+        sa.update(Task)
+        .where(Task.id == task_id)
+        .values(lease_attempt_id="attempt-current")
+    )
+    return _lease(task_id, attempt_id="attempt-stale")
+
+
+_T_CM_1_CASES = [
+    "slot-taken",
+    "request-closed",
+    "anchor-corrupt",
+    "attempt-mismatch",
+    "run-partition-mismatch",
+    "replay-after-conflict",
+]
+
+
+@pytest.mark.parametrize("case", _T_CM_1_CASES)
+def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
+    """T-CM-1, widened to six cells: the four exceptions the book's design
+    names, plus InteractionRunPartitionMismatch (swallowed under PR-C2a's
+    F-3 override, see the CM's docstring), plus REPLAY-after-conflict as
+    the successful-return control. Every cell: (a) the with-block exits
+    without the exception escaping; (b) exactly the swallowed exceptions
+    register a degradation and log; (c) the caller's own pre-with pending
+    write survives and commits alongside the caller."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+
+    stage_key = _next_key()
+
+    if case == "slot-taken":
+        stage_interaction_request(
+            db,
+            task_id=task_id,
+            **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
+        )
+        db.commit()
+        expect_signal = ops_signals.INTERACTION_HANDOFF_DEGRADED
+    elif case == "request-closed":
+        r = stage_interaction_request(
+            db,
+            task_id=task_id,
+            **_stage_kwargs(anchor, request_idempotency_key=stage_key),
+        )
+        db.commit()
+        db.execute(
+            sa.update(TaskInteractionRequest)
+            .where(TaskInteractionRequest.id == r.staged_db_id)
+            .values(
+                status="terminated",
+                active_slot=None,
+                terminal_reason="deadline_elapsed",
+                terminated_at=_now(),
+            )
+        )
+        db.commit()
+        expect_signal = ops_signals.INTERACTION_HANDOFF_DEGRADED
+    elif case == "anchor-corrupt":
+        anchor = _anchor(anchor_id, resume_event_id="")
+        expect_signal = ops_signals.INTERACTION_HANDOFF_DEGRADED
+    elif case == "attempt-mismatch":
+        lease = _force_attempt_mismatch(db, task_id)
+        db.commit()
+        expect_signal = ops_signals.INTERACTION_HANDOFF_DEGRADED
+    elif case == "run-partition-mismatch":
+        anchor = _anchor(anchor_id, run_partition="some-other-run")
+        expect_signal = ops_signals.INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED
+    else:
+        assert case == "replay-after-conflict"
+        expect_signal = None
+
+    task = db.get(Task, task_id)
+    _mark_caller_write(db, task_id, f"caller-write-{case}")
+
+    if case == "replay-after-conflict":
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            first = h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=stage_key,
+                expires_at=_now() + timedelta(minutes=15),
+            )
+        db.commit()
+        assert first.created is True
+        db.close()
+        assert ops_signals.active_degradations() == {}
+        return
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=stage_key,
+            expires_at=_now() + timedelta(minutes=15),
+        )
+
+    db.commit()
+    assert _caller_write_survived(db, task_id, f"caller-write-{case}")
+    signals = ops_signals.active_degradations()
+    assert expect_signal in signals
+    db.close()
+
+
+def test_cm2_owner_state_error_propagates_uncaught(tmp_path: Path) -> None:
+    """T-CM-2: InteractionOwnerStateError is the one exception this module
+    raises that is never swallowed -- it propagates out of the with-block,
+    and the CM's own savepoint has already been rolled back by the time it
+    does.
+
+    The doomed write is added *inside* the with-block, right before
+    ``stage()`` -- not before ``interaction_handoff`` is even entered --
+    so its flush happens inside ``stage_interaction_request``'s own step-3
+    flush, reached through the CM's ``except`` clause around ``yield``, the
+    same path a real caller's own pending write would take. Adding it
+    before the ``with`` line instead would only exercise the CM's *other*
+    IntegrityError guard, the one around its own ``db.begin_nested()`` --
+    a real gap an earlier version of this test had, which a
+    _SWALLOWED-widening mutation could pass right through undetected."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with pytest.raises(InteractionOwnerStateError) as excinfo:
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            doomed = Task(user_id=10**9, title=None)
+            db.add(doomed)
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+    assert not isinstance(excinfo.value, IntegrityError)
+    assert db.in_transaction()
+    db.rollback()
+    db.close()
+
+
+def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    task = db.get(Task, task_id)
+
+    # attempt_id is None -> assertion is skipped even though task's own
+    # lease_attempt_id disagrees.
+    db.execute(
+        sa.update(Task).where(Task.id == task_id).values(lease_attempt_id="whatever")
+    )
+    db.commit()
+    lease = _lease(task_id, attempt_id=None)
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        result = h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+    assert result.created is True
+    assert ops_signals.active_degradations() == {}
+    db.close()
+
+
+def test_cm6_assertions_precede_any_staging_statement(tmp_path: Path) -> None:
+    """T-CM-6 (post-fix form): the attempt and anchor assertions run at the
+    very start of ``stage()``, before the reclaim UPDATE and before the
+    INSERT's own savepoint -- so a mismatched attempt never reaches SQL and
+    never leaves a row behind. A mutation that ran the assertions after
+    stage_interaction_request's own work would let a stale attempt's
+    request through and this test would catch it via the row count."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _force_attempt_mismatch(db, task_id)
+    db.commit()
+    task = db.get(Task, task_id)
+
+    before = len(statements)
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    issued = statements[before:]
+    assert not any(
+        s.strip()
+        .upper()
+        .startswith(
+            (
+                "INSERT INTO task_interaction_requests".upper(),
+                "UPDATE task_interaction_requests".upper(),
+            )
+        )
+        for s in issued
+    ), issued
+    db.commit()
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0
+    db.close()
+
+
+@pytest.mark.parametrize("case", ["attempt-mismatch", "anchor-corrupt"])
+def test_v_n4_degrade_still_lets_caller_commit_run(tmp_path: Path, case: str) -> None:
+    """v-n4, made executable: after a degrade, code placed *after* the
+    with-block -- standing in for the caller's own commit -- still runs and
+    its effects are durable. This is the invariant the generator-yield
+    finding rescued: before the fix, __enter__ raised
+    RuntimeError('generator didn't yield') and nothing after the with-block
+    ever executed."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    task = db.get(Task, task_id)
+
+    if case == "attempt-mismatch":
+        anchor = _anchor(anchor_id)
+        lease = _force_attempt_mismatch(db, task_id)
+        db.commit()
+    else:
+        anchor = _anchor(anchor_id, resume_event_id="")
+        lease = _lease(task_id)
+
+    ran_after_with = False
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    # This line standing in for "the caller's own commit" -- reaching it at
+    # all is the assertion.
+    ran_after_with = True
+    db.execute(
+        sa.update(Task).where(Task.id == task_id).values(title="post-with-write")
+    )
+    db.commit()
+
+    assert ran_after_with is True
+    db2 = session_factory()
+    assert (
+        db2.execute(sa.select(Task.title).where(Task.id == task_id)).scalar_one()
+        == "post-with-write"
+    )
+    db2.close()
+    db.close()
+
+
+def test_cm4_no_notification_and_no_outer_commit() -> None:
+    import ast
+
+    from xagent.web.services import task_interaction_staging
+
+    tree = ast.parse(Path(task_interaction_staging.__file__).read_text())
+    roots = ("notify", "notification", "dispatch", "publish", "broadcast")
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(a.name.split(".")[-1] for a in node.names)
+            names.update(a.asname for a in node.names if a.asname)
+    offenders = sorted(n for n in names if any(r in n.lower() for r in roots))
+    assert offenders == [], offenders
+
+
+def test_cm4_with_exit_does_not_commit_outer_transaction(tmp_path: Path) -> None:
+    """The CM must not itself commit the caller's outer transaction, checked
+    three ways: (a) ``db.in_transaction()`` is still true right after the
+    ``with`` exits; (b) the row is not visible to a second connection before
+    the caller's own commit; (c) rolling back instead of committing removes
+    the row entirely -- from both this session's own point of view and a
+    fresh session's.
+
+    (b) and (c) are the regression pin for a real bug found and fixed while
+    building this module: on SQLite, a session whose first write-adjacent
+    statement is ``interaction_handoff``'s own outer ``db.begin_nested()`` --
+    exactly this test's shape, where the only earlier statement on ``db`` is
+    a plain SELECT -- breaks pysqlite's transaction tracking badly enough
+    that the savepoint's release becomes a real, permanent commit; a
+    rollback afterward silently does nothing. See the zero-row UPDATE
+    ``interaction_handoff`` issues immediately before opening its savepoint,
+    and that function's docstring, for the fix and the full explanation.
+    Without it, this test fails at (b) (the row leaks to another connection
+    before commit) and, worse, at (c) even after ``db.rollback()``."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    assert db.in_transaction()
+
+    other = session_factory()
+    visible_before_commit = other.execute(
+        sa.select(TaskInteractionRequest.id).where(
+            TaskInteractionRequest.task_id == task_id
+        )
+    ).first()
+    assert visible_before_commit is None, (
+        "the row must not be visible before the caller commits"
+    )
+    other.close()
+
+    db.rollback()
+    assert (
+        db.execute(
+            sa.select(TaskInteractionRequest.id).where(
+                TaskInteractionRequest.task_id == task_id
+            )
+        ).first()
+        is None
+    ), "a caller rollback must remove the staged row from this session's own view"
+    db.close()
+
+    fresh = session_factory()
+    assert (
+        fresh.execute(
+            sa.select(TaskInteractionRequest.id).where(
+                TaskInteractionRequest.task_id == task_id
+            )
+        ).first()
+        is None
+    ), "a caller rollback must remove the staged row entirely, not just locally"
+    fresh.close()
+
+
+# --------------------------------------------------------------------------
+# T-SP group -- savepoint containment (SQLite half; PostgreSQL half repeats
+# this group in test_interaction_staging_postgresql.py)
+# --------------------------------------------------------------------------
+
+
+def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    stage_interaction_request(
+        db,
+        task_id=task_id,
+        **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
+    )
+    db.commit()
+    _mark_caller_write(db, task_id, "sp1-write")
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+    assert _caller_write_survived(db, task_id, "sp1-write")
+    db.close()
+
+
+def test_sp2_replay_after_conflict_commits_cleanly(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    key = _next_key()
+
+    a = session_factory()
+    b = session_factory()
+    from xagent.web.services.task_interaction_staging import _identity_lookup_stmt
+
+    a.execute(
+        _identity_lookup_stmt(
+            task_id=task_id, run_id="run-a", request_idempotency_key=key
+        )
+    ).first()
+
+    task_b = b.get(Task, task_id)
+    with interaction_handoff(b, lease, task=task_b, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=key,
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    b.commit()
+    b.close()
+
+    task_a = a.get(Task, task_id)
+    _mark_caller_write(a, task_id, "sp2-write")
+    with interaction_handoff(a, lease, task=task_a, anchor=anchor, now=_now()) as h:
+        result = h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=key,
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    a.commit()
+    assert result.created is False
+    assert _caller_write_survived(a, task_id, "sp2-write")
+    a.close()
+
+
+def test_sp3_clean_stage_commits_with_caller(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+    _mark_caller_write(db, task_id, "sp3-write")
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        result = h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+    assert _caller_write_survived(db, task_id, "sp3-write")
+    other = session_factory()
+    row = other.get(TaskInteractionRequest, result.staged_db_id)
+    assert row is not None
+    other.close()
     db.close()

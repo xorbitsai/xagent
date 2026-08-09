@@ -1,66 +1,95 @@
-"""Stage one interaction request row into a session the caller already owns.
+"""Stage one blocking task interaction request into a session the caller
+already owns, and hand it off under a savepoint this module controls.
 
-``stage_interaction_request`` does the plain-Python validation, the
-caller's own flush, a keyed idempotency pre-read, the reclaim UPDATE that
-retires a stale or superseded active row, and the active-row INSERT under a
-savepoint this function owns.
+Two production entry points, sharing one module because they share every
+exception type and one nesting invariant that must never be split across a
+file boundary:
+
+* ``stage_interaction_request`` -- plain-Python validation, the caller's own
+  flush, a keyed idempotency pre-read, the reclaim UPDATE that retires a
+  stale or superseded active row, and the active-row INSERT under a
+  savepoint this function owns.
+* ``interaction_handoff`` -- a context manager that opens the outer
+  savepoint the whole handoff lives in, asserts the caller's lease still
+  owns the task row and that the anchor it was given is self-consistent,
+  and degrades on a closed set of expected failures instead of losing the
+  caller's turn.
 
 Caller obligations, because none of them happen here:
 
-* This function joins the ``Session`` passed in; it never calls
-  ``db.commit()`` or the outer ``db.rollback()``. It manages only its own
-  inner savepoint (see below) -- the caller owns the transaction and
-  decides when to commit or roll it back.
-* It never notifies, prunes, or writes any column of ``tasks``.
-* If this function raises ``InteractionOwnerStateError``, the session is
-  left mid-transaction with no savepoint of its own to roll back to (the
-  failure happened before this function opened one) -- the caller must
-  roll back the whole transaction before issuing another statement on it.
-  Every other exception this function raises is contained by its own inner
-  savepoint.
+* Both entry points join the ``Session`` passed in; neither ever calls
+  ``db.commit()`` or the outer ``db.rollback()``. ``stage_interaction_request``
+  manages only its own inner savepoint (see below); ``interaction_handoff``
+  manages only the outer savepoint it opens in ``__enter__``. The caller
+  owns the transaction and decides when to commit or roll it back.
+* Neither one notifies, prunes, or writes any column of ``tasks``. A
+  degraded handoff still leaves whatever the caller was about to persist
+  for its own reasons (a stale attempt continuing to write its own task
+  row, for instance) untouched -- that is a fact the three eventual
+  finalizer call sites must each account for, not something this module
+  can prevent.
+* If ``stage_interaction_request`` raises ``InteractionOwnerStateError``,
+  the session is left mid-transaction with no savepoint of its own to roll
+  back to (the failure happened before this function opened one) -- the
+  caller must roll back the whole transaction before issuing another
+  statement on it. Every other exception this module raises during a call
+  wrapped by ``interaction_handoff`` is contained by that context manager's
+  own savepoint; called outside it, the same rollback obligation applies.
 
 Zero production callers as of this module's introduction: a static test
 (``tests/web/services/test_interaction_staging_production_gate.py``) asserts
-that no production module calls this function. See that test's docstring
-for the removal condition.
+that no production module imports or calls either entry point. See that
+test's docstring for the removal condition.
 
 Every rejection the database's 23 CHECK constraints could raise on the
-INSERT is rejected in plain Python first, inside this function's own
-validation block, because the post-conflict re-check (step 7 below)
-classifies any ``IntegrityError`` that does not match the caller's own
-identity key as a slot conflict -- ``InteractionSlotTaken``. That re-check
-cannot tell a real slot conflict apart from a programming error (an
-out-of-vocabulary ``origin``, a non-positive TTL, a ``None`` payload past
-``JSON(none_as_null=True))``) that also violates a CHECK: both land on the
-same ``else`` branch. The backstop is the database's constraint set, not
-the primary defense; the primary defense is this validation block, and it
-must reject everything the INSERT could reject before the INSERT is ever
-issued. Adding a column CHECK to ``TaskInteractionRequest`` without adding
-the matching Python check here reopens that misclassification funnel by
-one more case.
+INSERT is rejected in plain Python first, inside
+``stage_interaction_request``'s validation block, because the post-conflict
+re-check (step 7 below) classifies any ``IntegrityError`` that does not
+match the caller's own identity key as a slot conflict --
+``InteractionSlotTaken``. That re-check cannot tell a real slot conflict
+apart from a programming error (an out-of-vocabulary ``origin``, a
+non-positive TTL, a ``None`` payload past ``JSON(none_as_null=True))``) that
+also violates a CHECK: both land on the same ``else`` branch. The backstop
+is the database's constraint set, not the primary defense; the primary
+defense is this validation block, and it must reject everything the INSERT
+could reject before the INSERT is ever issued. Adding a column CHECK to
+``TaskInteractionRequest`` without adding the matching Python check here
+reopens that misclassification funnel by one more case.
 
 Concurrency note (inherited, not introduced here): on PostgreSQL, an
 ``IntegrityError`` poisons the rest of the transaction
 (``InFailedSqlTransaction``) until something rolls back at least to the
 savepoint that was open when it fired; SQLite instead lets the session keep
-issuing statements. This function's own inner ``db.begin_nested()`` around
-the INSERT is what makes the post-conflict re-check possible on both
-backends -- see the function's docstring for why a savepoint shared with
-the caller does not work.
+issuing statements. ``stage_interaction_request``'s own inner
+``db.begin_nested()`` around the INSERT is what makes the post-conflict
+re-check possible on both backends -- see the function's docstring for why
+a savepoint shared with the caller (or with ``interaction_handoff``'s own
+savepoint) does not work.
 """
 
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ..models.task import Task
 from ..models.task_interaction import TaskInteractionRequest
+from .ops_signals import (
+    INTERACTION_HANDOFF_DEGRADED,
+    INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED,
+    register_degradation,
+)
 from .task_command_transport import COMMAND_ID_PATTERN
+from .task_lease_service import TaskLease
+
+logger = logging.getLogger(__name__)
 
 _KIND_VOCABULARY = frozenset({"clarification"})
 _ORIGIN_VOCABULARY = frozenset(
@@ -192,6 +221,31 @@ class InteractionOwnerStateError(InteractionHandoffError):
 # called for propagating it unchanged, the same as InteractionOwnerStateError
 # below it). See interaction_handoff's docstring for the reasoning and the
 # re-adjudication obligation this override carries forward.
+_SWALLOWED: tuple[type[BaseException], ...] = (
+    InteractionSlotTaken,
+    InteractionRequestClosed,
+    InteractionAnchorCorrupt,
+    InteractionAttemptMismatch,
+    InteractionRunPartitionMismatch,
+)
+
+# Which ops_signals name a given swallowed exception type registers.
+# InteractionRunPartitionMismatch gets its own signal, distinct from the
+# other four's shared INTERACTION_HANDOFF_DEGRADED, precisely because it is
+# the one override the reachability-free state of this PR cannot validate --
+# see interaction_handoff's docstring. Keeping it separately addressable in
+# /health lets the first wiring PR tell "a run-partition anchor went stale"
+# apart from every other reason a handoff degraded, without having to
+# reparse log lines to do it.
+_DEGRADATION_SIGNALS: dict[type[BaseException], str] = {
+    InteractionSlotTaken: INTERACTION_HANDOFF_DEGRADED,
+    InteractionRequestClosed: INTERACTION_HANDOFF_DEGRADED,
+    InteractionAnchorCorrupt: INTERACTION_HANDOFF_DEGRADED,
+    InteractionAttemptMismatch: INTERACTION_HANDOFF_DEGRADED,
+    InteractionRunPartitionMismatch: INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED,
+}
+
+
 # ---------------------------------------------------------------------------
 # Data carriers
 # ---------------------------------------------------------------------------
@@ -581,3 +635,321 @@ def stage_interaction_request(
             status="active",
             active_slot=1,
         )
+
+
+# ---------------------------------------------------------------------------
+# The handoff context manager
+# ---------------------------------------------------------------------------
+
+
+class _InteractionHandoff:
+    """The object ``interaction_handoff`` yields. Constructed once per
+    ``with`` block; ``stage`` may be called zero or more times inside it.
+    """
+
+    def __init__(
+        self,
+        db: Session,
+        lease: TaskLease,
+        *,
+        task: Task,
+        anchor: InteractionAnchor,
+        now: datetime,
+    ) -> None:
+        self.db = db
+        self.lease = lease
+        self.task = task
+        self.anchor = anchor
+        self.now = now
+
+    def _assert_current_attempt(self) -> None:
+        """``lease.attempt_id is None`` is a fail-open sentinel (a
+        pre-attempt-column lease, or the permanent-``None`` ambient snapshot
+        ``_task_lease_snapshot`` builds in ``websocket.py``) and must be
+        treated as "cannot prove attempt identity", not as "matches" --
+        skipping this assertion, never failing it. See
+        ``TaskLease.attempt_id``'s docstring (``task_lease_service.py``) for
+        the two distinct sources of that ``None``.
+
+        This is a plain Python object comparison, not a SQL expression: the
+        `` == None`` -> ``IS NULL`` folding that affects a SQLAlchemy
+        column comparison compiled to SQL does not apply here.
+        """
+
+        if (
+            self.lease.attempt_id is not None
+            and self.task.lease_attempt_id != self.lease.attempt_id
+        ):
+            raise InteractionAttemptMismatch(
+                f"task {self.task.id}'s current attempt "
+                f"({self.task.lease_attempt_id!r}) does not match this "
+                f"lease's attempt ({self.lease.attempt_id!r})"
+            )
+
+    def _assert_anchor_consistent(self) -> None:
+        """Re-validates the same structural rules
+        ``stage_interaction_request`` validates before its own INSERT (see
+        ``_validate_anchor_fields``), so a corrupt anchor is caught before
+        any staging SQL is issued, even on the very first ``stage`` call."""
+
+        _validate_anchor_fields(self.anchor)
+
+    def stage(
+        self,
+        *,
+        kind: str,
+        protocol_version: int,
+        request_payload: Any,
+        request_idempotency_key: str,
+        expires_at: datetime,
+    ) -> StagedInteractionRequest:
+        """Stage one interaction request for this handoff's task, run, and
+        anchor. ``run_id`` is always this handoff's ``lease.run_id`` --
+        callers cannot stage a request under a different run through this
+        method, which is what keeps the reclaim UPDATE's cross-run
+        supersession branch meaningful. ``origin`` is always
+        ``task.source or "internal"``, computed here rather than left to the
+        caller (see ``TaskInteractionRequest.origin``'s column comment).
+
+        The attempt and anchor assertions run first, in that order, before
+        any statement this call could issue -- see ``interaction_handoff``'s
+        docstring for why they live here rather than in ``__enter__``.
+        """
+
+        self._assert_current_attempt()
+        self._assert_anchor_consistent()
+        if self.lease.run_id is None:
+            raise ValueError(
+                "lease has no run_id; cannot stage an interaction request without one"
+            )
+        return stage_interaction_request(
+            self.db,
+            task_id=int(self.task.id),
+            run_id=self.lease.run_id,
+            anchor=self.anchor,
+            kind=kind,
+            protocol_version=protocol_version,
+            origin=(str(self.task.source) if self.task.source else "internal"),
+            request_payload=request_payload,
+            request_idempotency_key=request_idempotency_key,
+            expires_at=expires_at,
+            now=self.now,
+        )
+
+
+@contextmanager
+def interaction_handoff(
+    db: Session,
+    lease: TaskLease,
+    *,
+    task: Task,
+    anchor: InteractionAnchor,
+    now: datetime,
+) -> Iterator[_InteractionHandoff]:
+    """Open the savepoint one interaction handoff lives in and degrade --
+    instead of losing the caller's turn -- on a closed set of expected
+    failures, including the caller's lease no longer owning the task's
+    current attempt and the resume anchor it was given being inconsistent.
+
+    Caller obligations: none. Unlike ``stage_interaction_request``, this
+    context manager leaves nothing for its caller to do beyond the
+    surrounding transaction's own commit/rollback -- the anchor's database
+    read (the other half described in ``InteractionAnchor``'s docstring)
+    has already happened before this is ever called, and the attempt and
+    anchor assertions that used to be caller obligations are now checked by
+    ``handoff.stage()`` itself, on every call. The one obligation that
+    remains is structural, not sequential: the ``with`` block must be the
+    transaction's last word before the caller commits -- no I/O in between
+    -- because every write inside it, including the reclaim UPDATE, holds
+    SQLite's database-wide writer lock (or, on PostgreSQL, ordinary row
+    locks) for the whole span, not just an instant.
+
+    Nesting, exactly:
+
+        savepoint = db.begin_nested()        # this function's own
+        yield handoff                        # caller calls handoff.stage()
+                                              # zero or more times; each
+                                              # call asserts attempt and
+                                              # anchor validity first, then
+                                              # opens and closes its *own*
+                                              # inner savepoint (see
+                                              # stage_interaction_request)
+        normal exit         -> savepoint.commit()
+        one of five expected failures
+                             -> savepoint.rollback(), register a
+                                degradation signal, log, and swallow
+        anything else        -> savepoint.rollback(), re-raise unchanged
+
+    The attempt and anchor assertions live inside ``handoff.stage()``,
+    called from the caller's ``with``-body, not in this function before
+    ``yield``. That placement is forced by what a ``@contextmanager``
+    generator can and cannot do, not a style preference: a ``with``
+    statement always runs its body once ``__enter__`` succeeds -- there is
+    no way for ``__enter__`` to succeed and have the body silently skipped.
+    ``__enter__`` succeeding, for a generator-based context manager, means
+    the generator reached its ``yield``. If an assertion raised and was
+    caught *before* ``yield``, the only way to make ``with`` proceed as if
+    nothing happened would be to swallow it and fall out of the generator
+    without yielding -- but a generator that returns instead of yielding
+    makes ``next()`` raise ``StopIteration``, and ``contextlib`` turns that
+    into ``RuntimeError("generator didn't yield")`` from ``__enter__``. That
+    error is not one of the five swallowed types, so it would propagate to
+    the caller anyway, defeating the whole point of swallowing it in the
+    first place -- and because it fires from ``__enter__``, the caller's own
+    code after the ``with`` block (its commit, most importantly) never
+    runs. Checking both preconditions inside ``stage()`` instead means a
+    failure surfaces from *inside* the ``with``-body, at a point the
+    surrounding ``try``/``except`` here is actually able to intercept via
+    the generator's normal exception-resumption path, so ``with`` completes
+    normally and everything after it, including the caller's commit, still
+    executes. Both assertions run first, before any statement ``stage``
+    could otherwise issue -- this PR's mutation tests pin that ordering.
+
+    Five expected failures are swallowed:
+    ``InteractionSlotTaken``, ``InteractionRequestClosed``,
+    ``InteractionAnchorCorrupt``, ``InteractionAttemptMismatch``, and
+    ``InteractionRunPartitionMismatch``. Every other exception -- including
+    ``InteractionOwnerStateError`` -- propagates unchanged, after this
+    savepoint is rolled back.
+
+    ``InteractionRunPartitionMismatch`` is a deliberate, scoped override of
+    this primitive's own default. Read literally, the design that produced
+    ``stage_interaction_request`` calls for this exception to propagate
+    unchanged, the same as ``InteractionOwnerStateError`` -- on the
+    reasoning that a confirmed identity mismatch between a run and its own
+    resume anchor is closer to "something is structurally wrong" than to an
+    ordinary race. PR-C2a overrides that default and swallows it here
+    instead, registering its own dedicated signal
+    (``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED``, kept separate from the
+    other four's shared ``INTERACTION_HANDOFF_DEGRADED`` so it stays
+    individually addressable on ``/health``) and a structured log line
+    naming the task, the lease's run, and the anchor's run partition. This
+    override ships with zero production callers and therefore zero
+    real-world reachability data for it: **the first wiring PR -- the one
+    that removes the zero-production-caller AST gate -- must re-adjudicate
+    this policy once a real reachability picture exists**, not carry it
+    forward unexamined.
+
+    Every degradation signal this module registers is sticky: nothing
+    clears it once set (``ops_signals.py`` has no automatic-clear path, by
+    design -- see that module's docstring). ``/health`` reports a
+    degradation from an hour-old, already-recovered handoff exactly the
+    same as one from a second ago. This module inherits that behavior; it
+    does not introduce it.
+
+    A SQLite-only correctness gap, found and fixed while building this
+    module: a session whose first write-adjacent statement is a bare
+    SAVEPOINT breaks pysqlite's transaction tracking badly enough that the
+    savepoint's later release becomes a permanent commit and a subsequent
+    ``Session.rollback()`` does not undo it, confirmed directly (not even
+    from that same session's own point of view). This function's own outer
+    savepoint is exactly that first statement whenever a caller has issued
+    no DML of its own before entering this context manager, which would
+    make every one of the five swallowed exceptions' rollback silently do
+    nothing -- the half-written garbage this context manager exists to
+    prevent. The zero-row UPDATE issued immediately below, before the
+    savepoint opens, is the fix: see the comment there for the reproduction,
+    the SQLAlchemy-documented pysqlite recipe that was considered and
+    rejected instead, and why. PostgreSQL was checked directly and does not
+    share this behavior at all.
+
+    In the wiring-window while ``lease.attempt_id is None`` is still
+    possible (see ``_assert_current_attempt``'s docstring), this handoff's
+    identity key is already run-scoped (``uq_task_interaction_request_identity``
+    covers ``task_id, run_id, request_idempotency_key``), which is weaker
+    protection against a stale worker than the task-scoped identity an
+    earlier design considered: both the attempt fence and the stale-worker
+    protection a task-scoped key would have given are absent for the same
+    rolling-restart window at once.
+    """
+
+    # A zero-row UPDATE, issued deliberately before this function's own
+    # savepoint opens. This statement's only purpose is to be a real DML
+    # statement: it touches no row (task.id == -1 can never match one) and
+    # its rowcount is never read. Removing it silently breaks the
+    # swallow-and-rollback contract this function exists to provide,
+    # whenever a caller enters this context manager without a prior write
+    # of its own on the same session -- exactly this file's own
+    # test_cm4_with_exit_does_not_commit_outer_transaction shape.
+    #
+    # Reproduction: on SQLite, a session whose first write-adjacent
+    # statement is a bare SAVEPOINT breaks pysqlite's transaction tracking.
+    # The savepoint's later release becomes a permanent commit at the
+    # engine level, and a subsequent Session.rollback() does not undo it --
+    # confirmed directly, including from that same session's own point of
+    # view. A caller's own prior write avoids this (and so does
+    # stage_interaction_request's own inner savepoint, whose reclaim UPDATE
+    # -- a real DML -- always runs first); this function's outer savepoint
+    # has no such statement ahead of it otherwise. PostgreSQL does not
+    # share this behavior at all.
+    #
+    # The standard fix, and why it was not used: SQLAlchemy's documented
+    # pysqlite recipe (disable pysqlite's own isolation_level, issue an
+    # explicit BEGIN on the engine's "begin" event -- see
+    # https://docs.sqlalchemy.org/en/20/dialects/sqlite.html#serializable-isolation-savepoints-transactional-ddl)
+    # does fix this, confirmed directly. It also breaks a scenario this PR's
+    # own tests require: two sessions racing on the same identity key
+    # (REPLAY-after-conflict, T-P-9/T-SP-2), where the first session reads
+    # before the second commits and then tries to write afterward, fails
+    # with sqlite3.OperationalError ("database is locked", sqlite_errorcode
+    # 517 / SQLITE_BUSY_SNAPSHOT) instead of the IntegrityError this
+    # primitive is built to classify -- a WAL snapshot conflict, not
+    # ordinary lock contention, so busy_timeout cannot wait it out. That
+    # recipe is also not present in this codebase's actual SQLite engine
+    # configuration (apply_sqlite_concurrency_pragmas, xagent/db/sqlite.py),
+    # and applying it there instead -- the only way to make it available
+    # without every caller opting in individually -- would change
+    # transaction behavior for every other user of db.begin_nested() in
+    # this codebase, a blast radius well beyond one staging primitive, and
+    # would need its own resolution for the busy_timeout/snapshot-conflict
+    # tradeoff for genuine concurrent callers before it could ship anywhere.
+    # That is a SQLite concurrency-model decision, not a staging-primitive
+    # one. The dummy-DML fix below is the scoped alternative: local to this
+    # function, changes nothing about how any other caller's session
+    # behaves, and does not touch engine configuration at all. The wiring
+    # batch, once real caller topology and deployment concurrency
+    # assumptions exist, should revisit whether the engine-level recipe
+    # becomes worth its cost at that point.
+    db.execute(sa.update(Task).where(Task.id == -1))
+
+    # Session.begin_nested() always flushes first (it has to, in order to
+    # establish the SAVEPOINT after whatever is already pending): a doomed
+    # caller write that stage_interaction_request's own flush would
+    # otherwise catch and turn into InteractionOwnerStateError can just as
+    # well surface right here, before this function's own savepoint even
+    # exists to roll back. Same exception, same reasoning, only fired one
+    # statement earlier than the primitive's own docstring describes.
+    try:
+        savepoint = db.begin_nested()
+    except IntegrityError as exc:
+        raise InteractionOwnerStateError(
+            "caller's pending writes failed to flush while opening the "
+            "interaction handoff's savepoint"
+        ) from exc
+    handoff = _InteractionHandoff(db, lease, task=task, anchor=anchor, now=now)
+    try:
+        yield handoff
+    except _SWALLOWED as exc:
+        savepoint.rollback()
+        signal = _DEGRADATION_SIGNALS[type(exc)]
+        register_degradation(
+            signal,
+            f"task {task.id} run {lease.run_id}: {type(exc).__name__}: {exc}",
+        )
+        logger.error(
+            "interaction handoff degraded",
+            extra={
+                "task_id": task.id,
+                "lease_run_id": lease.run_id,
+                "lease_attempt_id": lease.attempt_id,
+                "anchor_run_partition": anchor.resume_run_partition,
+                "exception_type": type(exc).__name__,
+                "degradation_signal": signal,
+            },
+        )
+        return
+    except BaseException:
+        savepoint.rollback()
+        raise
+    else:
+        savepoint.commit()

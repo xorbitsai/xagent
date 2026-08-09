@@ -35,6 +35,17 @@ INTERACTION_ROLLOUT_SCHEMA_ABSENT = "interaction_rollout_schema_absent"
 # data being fixed. Auto-clearing would assert "the data got fixed" without
 # evidence for it.
 INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE = "interaction_rollout_unknown_task_source"
+# interaction_handoff (task_interaction_staging.py) degrades instead of
+# losing a caller's turn on four expected failures, sharing this signal.
+INTERACTION_HANDOFF_DEGRADED = "interaction_handoff_degraded"
+# A fifth, separately addressable signal for InteractionRunPartitionMismatch
+# specifically: PR-C2a's degrade-instead-of-propagate policy for that one
+# exception is an override with zero production reachability data behind it
+# (see interaction_handoff's docstring), so it stays distinguishable on
+# /health from the other four rather than folded into the signal above.
+INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
+    "interaction_run_partition_mismatch_degraded"
+)
 
 _signals: dict[str, str] = {}
 _lock = threading.Lock()

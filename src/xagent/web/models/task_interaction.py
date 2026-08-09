@@ -54,8 +54,11 @@ class TaskInteractionRequest(Base):  # type: ignore
     ``payload is None`` in Python, since a legitimate JSON ``null`` answer
     value must still read as answered.
 
-    ``terminal_reason`` vocabulary: the three members each have a named
-    writer path. ``answered_via_legacy_resume`` is
+    ``terminal_reason`` vocabulary: each of the three members is spoken for
+    by exactly one intended writer, and none of those writers exists yet.
+    ``deadline_elapsed`` and ``run_superseded`` are the two reclaim
+    branches, arriving with the staging primitive; ``answered_via_legacy_resume``
+    arrives with the transitional close on the legacy answer path. It is
     not the same outcome as ``answered`` -- that path recovers a free-text
     chat message, not a protocol v1 structured response, and synthesizing a
     payload for it would fabricate a contract the client never produced.
@@ -192,6 +195,10 @@ class TaskInteractionRequest(Base):  # type: ignore
             name="ck_task_interaction_requests_terminal_pairs_status",
         ),
         CheckConstraint(
+            "(status = 'terminated') = (terminated_at IS NOT NULL)",
+            name="ck_task_interaction_requests_terminated_at_pairs_status",
+        ),
+        CheckConstraint(
             "status <> 'answered' OR response_payload IS NOT NULL",
             name="ck_task_interaction_requests_answered_pairs_response",
         ),
@@ -221,7 +228,10 @@ class TaskInteractionRequest(Base):  # type: ignore
             "expires_at > created_at",
             name="ck_task_interaction_requests_expiry_after_creation",
         ),
-        # ---- empty-string CHECKs: NOT NULL alone does not stop an "or ''" write ----
+        # ---- empty-string CHECKs ----
+        # NOT NULL alone does not stop an "or ''" write; on the one nullable
+        # column here, neither does its pairing CHECK -- '' satisfies
+        # "IS NOT NULL" while naming no one.
         CheckConstraint(
             "run_id <> ''", name="ck_task_interaction_requests_run_id_nonempty"
         ),
@@ -240,6 +250,10 @@ class TaskInteractionRequest(Base):  # type: ignore
         CheckConstraint(
             "request_idempotency_key <> ''",
             name="ck_task_interaction_requests_request_idempotency_key_nonempty",
+        ),
+        CheckConstraint(
+            "responder_identity <> ''",
+            name="ck_task_interaction_requests_responder_identity_nonempty",
         ),
         # Deleted: ck_task_interaction_requests_run_partition_matches. Forcing
         # run_id == resume_run_partition would turn the kind of corruption

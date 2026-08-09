@@ -206,8 +206,9 @@ class Task(Base):  # type: ignore
     error_message = Column(Text, nullable=True)
 
     # Call origin classifier: 'internal' (web UI / WS / legacy),
-    # 'sdk' (POST /v1/chat/tasks), 'trigger' (agent triggers),
-    # 'widget' (embedded chat widget), or 'shared_link' (public share chat).
+    # 'sdk' (POST /v1/chat/tasks), 'a2a' (agent-to-agent calls),
+    # 'trigger' (agent triggers), 'widget' (embedded chat widget), or
+    # 'shared_link' (public share chat).
     # Default 'internal' so legacy code paths -- which never specify
     # this field on Task(...) -- are auto-classified correctly. Both
     # ``default`` (Python-level, fires on ORM INSERT) and

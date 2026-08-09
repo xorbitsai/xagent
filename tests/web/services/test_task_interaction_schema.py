@@ -224,11 +224,20 @@ def test_kind_rejects_unknown_literal(db_session, fixtures) -> None:
     assert_rejected(db_session, row, "ck_task_interaction_requests_kind")
 
 
-def test_origin_accepts_a2a(db_session, fixtures) -> None:
-    """origin's vocabulary includes 'a2a'."""
+@pytest.mark.parametrize(
+    "origin", ["internal", "sdk", "a2a", "trigger", "widget", "shared_link"]
+)
+def test_origin_accepts_every_vocabulary_member(db_session, fixtures, origin) -> None:
+    """Every member of the origin vocabulary is accepted. Parametrized
+    rather than a single case because only 'a2a' and the 'internal' default
+    were exercised before -- a typo in any other IN-list entry would have
+    passed both suites.
+    """
     task_id, anchor_id = fixtures
-    row = make_row(task_id=task_id, resume_trace_event_id=anchor_id, origin="a2a")
-    assert_accepted(db_session, row)
+    assert_accepted(
+        db_session,
+        make_row(task_id=task_id, resume_trace_event_id=anchor_id, origin=origin),
+    )
 
 
 def test_origin_rejects_unknown_literal(db_session, fixtures) -> None:
@@ -389,6 +398,45 @@ def test_terminated_status_and_terminal_reason_are_paired_both_ways(
     )
 
 
+def test_terminated_status_and_terminated_at_are_paired_both_ways(
+    db_session, fixtures
+) -> None:
+    """status='terminated' iff terminated_at IS NOT NULL. The answered case
+    is the one worth pinning: answered and terminated are distinct terminal
+    statuses, and nothing stamps terminated_at on an answered row.
+    """
+    task_id, anchor_id = fixtures
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="terminated",
+            terminated_at=None,
+        ),
+        "ck_task_interaction_requests_terminated_at_pairs_status",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            terminated_at=datetime.now(timezone.utc),
+        ),
+        "ck_task_interaction_requests_terminated_at_pairs_status",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
+            terminated_at=datetime.now(timezone.utc),
+        ),
+        "ck_task_interaction_requests_terminated_at_pairs_status",
+    )
+
+
 def test_answered_requires_response_payload(db_session, fixtures) -> None:
     task_id, anchor_id = fixtures
     row = make_row(
@@ -537,6 +585,23 @@ def test_empty_string_is_rejected(db_session, fixtures, column) -> None:
     task_id, anchor_id = fixtures
     row = make_row(task_id=task_id, resume_trace_event_id=anchor_id, **{column: ""})
     assert_rejected(db_session, row, f"ck_task_interaction_requests_{column}_nonempty")
+
+
+def test_responder_identity_rejects_empty_string(db_session, fixtures) -> None:
+    """'' satisfies the responder pairing CHECK but names no responder:
+    the identity format is a namespaced "user:{id}" / "guest:{guest_id}".
+    """
+    task_id, anchor_id = fixtures
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
+            responder_identity="",
+        ),
+        "ck_task_interaction_requests_responder_identity_nonempty",
+    )
 
 
 def test_run_id_may_differ_from_resume_run_partition(db_session, fixtures) -> None:
@@ -830,6 +895,12 @@ def test_created_columns_match_the_frozen_shape(db_session) -> None:
     assert set(columns) == EXPECTED_COLUMNS
     for name, expected_nullable in EXPECTED_NULLABLE.items():
         assert columns[name]["nullable"] == expected_nullable, name
+    string_columns = {
+        name
+        for name, column in columns.items()
+        if getattr(column["type"], "length", None) is not None
+    }
+    assert set(EXPECTED_STRING_LENGTHS) == string_columns
     for name, expected_length in EXPECTED_STRING_LENGTHS.items():
         assert columns[name]["type"].length == expected_length, name
 

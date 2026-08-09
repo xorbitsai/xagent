@@ -107,14 +107,14 @@ def make_row(
 
     Defaults build a self-consistent row for ``status`` ("active" by
     default): "active" gets active_slot=1, protocol_version=1, and a
-    non-null anchor; "terminated" gets active_slot=None and a valid
-    terminal_reason; "answered" gets active_slot=None, a response_payload,
-    responded_at and responder_identity. Any keyword in ``overrides``
-    replaces the corresponding default outright, including fields the
-    ``status``-specific defaults above set -- callers isolating a single
-    CHECK only need to pass the field(s) that CHECK inspects and rely on
-    these defaults to keep every *other* CHECK satisfied for the row's
-    status.
+    non-null anchor; "terminated" gets active_slot=None, a valid
+    terminal_reason, and terminated_at; "answered" gets active_slot=None,
+    a response_payload, responded_at and responder_identity. Any keyword in
+    ``overrides`` replaces the corresponding default outright, including
+    fields the ``status``-specific defaults above set -- callers isolating
+    a single CHECK only need to pass the field(s) that CHECK inspects and
+    rely on these defaults to keep every *other* CHECK satisfied for the
+    row's status.
 
     request_idempotency_key gets a fresh value on every call so identity
     tests (T-uq-4/T-uq-5) only collide when a test deliberately repeats one
@@ -149,6 +149,7 @@ def make_row(
         row["active_slot"] = 1
     elif status == "terminated":
         row["terminal_reason"] = "deadline_elapsed"
+        row["terminated_at"] = now
     elif status == "answered":
         row["response_payload"] = {"answer": "example"}
         row["responded_at"] = now
@@ -273,15 +274,22 @@ EXPECTED_NULLABLE: dict[str, bool] = {
     "terminated_at": True,
 }
 
-# column -> VARCHAR length, for the string columns the task book pins.
+# column -> VARCHAR length. Every string column on the table, closed by the
+# set assertion in test_created_columns_match_the_frozen_shape: iterating a
+# partial dict pins only what it happens to list.
 EXPECTED_STRING_LENGTHS: dict[str, int] = {
     "run_id": 64,
+    "kind": 32,
+    "status": 32,
+    "origin": 20,
     "request_idempotency_key": 64,
-    "resume_run_partition": 64,
     "resume_event_id": 255,
     "resume_execution_id": 255,
+    "resume_locator_format": 32,
+    "resume_checkpoint_type": 64,
+    "resume_run_partition": 64,
     "responder_identity": 255,
-    "origin": 20,
+    "terminal_reason": 32,
 }
 
 TIMESTAMP_COLUMNS: tuple[str, ...] = (
@@ -314,6 +322,7 @@ EXPECTED_CHECK_CONSTRAINT_NAMES: set[str] = {
     "ck_task_interaction_requests_active_anchor",
     "ck_task_interaction_requests_active_protocol",
     "ck_task_interaction_requests_terminal_pairs_status",
+    "ck_task_interaction_requests_terminated_at_pairs_status",
     "ck_task_interaction_requests_answered_pairs_response",
     "ck_task_interaction_requests_unanswered_has_no_response",
     "ck_task_interaction_requests_answered_pairs_responded_at",
@@ -325,6 +334,7 @@ EXPECTED_CHECK_CONSTRAINT_NAMES: set[str] = {
     "ck_task_interaction_requests_resume_execution_id_nonempty",
     "ck_task_interaction_requests_resume_run_partition_nonempty",
     "ck_task_interaction_requests_request_idempotency_key_nonempty",
+    "ck_task_interaction_requests_responder_identity_nonempty",
 }
 
 # constraint name -> (referred_table, referred_columns, ondelete)

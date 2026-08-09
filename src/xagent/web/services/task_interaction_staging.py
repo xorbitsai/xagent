@@ -679,7 +679,8 @@ def stage_interaction_request(
         )
 
     db.execute(
-        _reclaim_stale_slot_stmt(task_id=resolved_task_id, run_id=run_id, now=now)
+        _reclaim_stale_slot_stmt(task_id=resolved_task_id, run_id=run_id, now=now),
+        execution_options={"synchronize_session": False},
     )
 
     row = {
@@ -1109,7 +1110,8 @@ def interaction_handoff(
         # KeyError for a future subclass of a swallowed type, and KeyError is
         # not swallowed -- the degradation path would become a crash path.
         signal = next(
-            sig for cls, sig in _DEGRADATION_SIGNALS.items() if isinstance(exc, cls)
+            (sig for cls, sig in _DEGRADATION_SIGNALS.items() if isinstance(exc, cls)),
+            INTERACTION_HANDOFF_DEGRADED,
         )
         register_degradation(
             signal,

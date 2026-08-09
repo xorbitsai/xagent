@@ -1800,7 +1800,7 @@ def test_cm_swallows_subclasses_of_swallowed_types(
     task_id, anchor_id = _seed(session_factory)
     db = session_factory()
     task = db.get(Task, task_id)
-    lease = _lease(task)
+    lease = _lease(task_id)
 
     class _SubSlotTaken(InteractionSlotTaken):
         pass
@@ -1824,3 +1824,21 @@ def test_cm_swallows_subclasses_of_swallowed_types(
     assert caller_ran_after_with
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
     db.close()
+
+
+def test_every_swallowed_type_has_a_degradation_signal() -> None:
+    """Structural pin for the fallback in the CM's signal lookup: the
+    fallback exists so a mapping gap degrades generically instead of
+    crashing, and this test exists so such a gap cannot ship unnoticed."""
+
+    from xagent.web.services.task_interaction_staging import (
+        _DEGRADATION_SIGNALS,
+        _SWALLOWED,
+    )
+
+    unmapped = [
+        cls.__name__
+        for cls in _SWALLOWED
+        if not any(issubclass(cls, mapped) for mapped in _DEGRADATION_SIGNALS)
+    ]
+    assert unmapped == []

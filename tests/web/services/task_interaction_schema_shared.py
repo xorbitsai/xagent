@@ -37,7 +37,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from itertools import count
+from typing import Any
 
+import sqlalchemy as sa
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -428,3 +430,105 @@ EXPECTED_NONUNIQUE_INDEXES: dict[str, tuple[str, ...]] = {
     "ix_task_interaction_requests_task_status": ("status", "task_id"),
     "ix_task_interaction_requests_resume_trace_event_id": ("resume_trace_event_id",),
 }
+
+
+# ---------------------------------------------------------------------------
+# create_all/migration parity: full name-and-expression inventory, used by
+# tests/migrations/test_task_interaction_requests_schema_parity.py. Placed
+# here rather than in a new module because the parity suite's expectations
+# are the same constraint inventory the EXPECTED_* literals above already
+# pin -- a second module would create a second place that fact lives.
+# ---------------------------------------------------------------------------
+
+TABLE_NAME = "task_interaction_requests"
+
+
+def reflect_full_inventory(engine: sa.engine.Engine) -> dict[str, Any]:
+    """Name-and-expression inventory of task_interaction_requests.
+
+    Both sides of a parity comparison must be reflected from the same
+    backend: PostgreSQL rewrites CHECK expressions on the way in
+    (`status::text = ANY (ARRAY[...])`) while SQLite stores them
+    verbatim, so the two backends' sqltext values are not comparable to
+    each other or to the model's literal. Comparing two schemas built on
+    the *same* backend keeps the rewrite on both sides, which is what
+    makes the difference attributable to the migration.
+    """
+    inspector = sa.inspect(engine)
+
+    checks: dict[str, str] = {
+        c["name"]: c["sqltext"] for c in inspector.get_check_constraints(TABLE_NAME)
+    }
+    unique: dict[str, tuple[str, ...]] = {
+        c["name"]: tuple(sorted(c["column_names"]))
+        for c in inspector.get_unique_constraints(TABLE_NAME)
+    }
+    foreign_keys: dict[str, tuple[str, tuple[str, ...], str | None]] = {
+        f["name"]: (
+            f["referred_table"],
+            tuple(f["constrained_columns"]),
+            (f.get("options") or {}).get("ondelete"),
+        )
+        for f in inspector.get_foreign_keys(TABLE_NAME)
+    }
+    # PostgreSQL's get_indexes() also reports the backing index for each
+    # UNIQUE constraint (unique=True); SQLite's does not (see
+    # EXPECTED_NONUNIQUE_INDEXES above). Grouping by the unique flag first
+    # keeps a name collision on the unique-backed side from being misread
+    # as a problem with the plain indexes.
+    indexes: dict[str, dict[str, tuple[str, ...]]] = {"unique": {}, "nonunique": {}}
+    for idx in inspector.get_indexes(TABLE_NAME):
+        bucket = "unique" if idx["unique"] else "nonunique"
+        indexes[bucket][idx["name"]] = tuple(sorted(idx["column_names"]))
+    columns: dict[str, tuple[str, bool]] = {
+        c["name"]: (str(c["type"]), bool(c["nullable"]))
+        for c in inspector.get_columns(TABLE_NAME)
+    }
+
+    return {
+        "checks": checks,
+        "unique": unique,
+        "foreign_keys": foreign_keys,
+        "indexes": indexes,
+        "columns": columns,
+    }
+
+
+def _diff_map(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any] | None:
+    missing = sorted(set(left) - set(right))
+    extra = sorted(set(right) - set(left))
+    changed = {
+        name: (left[name], right[name])
+        for name in set(left) & set(right)
+        if left[name] != right[name]
+    }
+    if not missing and not extra and not changed:
+        return None
+    return {"missing": missing, "extra": extra, "changed": changed}
+
+
+def diff_full_inventory(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Dimension-by-dimension difference between two reflect_full_inventory()
+    results. Returns only the dimensions that actually differ, so two
+    identical inventories produce an empty dict -- callers assert
+    ``not diff_full_inventory(a, b)``.
+
+    Compares names *and* values (CHECK sqltext, FK target/ondelete, column
+    type/nullable, index columns) in the same pass: a name-only comparison
+    would accept a constraint whose predicate was silently weakened while
+    keeping its name, which is exactly the case
+    test_expression_dimension_is_actually_compared exists to guard against.
+    """
+    report: dict[str, Any] = {}
+    for dim in ("checks", "unique", "foreign_keys", "columns"):
+        diff = _diff_map(left[dim], right[dim])
+        if diff is not None:
+            report[dim] = diff
+    index_report: dict[str, Any] = {}
+    for bucket in ("unique", "nonunique"):
+        diff = _diff_map(left["indexes"][bucket], right["indexes"][bucket])
+        if diff is not None:
+            index_report[bucket] = diff
+    if index_report:
+        report["indexes"] = index_report
+    return report

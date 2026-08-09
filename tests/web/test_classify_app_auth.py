@@ -32,6 +32,21 @@ def test_key_based_needs_command_and_required_env():
     )
 
 
+def test_key_based_is_not_transport_gated_unlike_keyless():
+    # Round-4 MAJOR-1 (deferred to #1203): unlike keyless, api_key has no
+    # transport constraint -- a command+required_env shape on a remote
+    # transport still classifies api_key, and the downstream provisioner
+    # then hardcodes transport="stdio" regardless. Pinning today's actual
+    # behavior as a deliberate, visible contract (not an accident) so it
+    # fails loudly whenever #1203 changes it, instead of silently drifting.
+    assert (
+        classify_app_auth(
+            "streamable_http", {"command": "npx", "required_env": ["KEY"]}
+        )
+        == "api_key"
+    )
+
+
 def test_remote_mcp_oauth_shape_is_mcp_oauth():
     for transport in ("sse", "websocket", "streamable_http"):
         assert (

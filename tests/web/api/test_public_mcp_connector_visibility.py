@@ -1361,6 +1361,75 @@ def test_admin_update_app_enforces_auth_classification() -> None:
             pass
 
 
+def test_admin_put_removing_required_env_transitions_api_key_row_to_connectable_keyless() -> (
+    None
+):
+    """Round-4 MINOR-7b / round-5 m4: this loosening is real and previously
+    untested via PUT (only the CREATE/POST acceptance of a fresh keyless
+    shape was covered). An admin-created stdio row with required_env
+    classifies api_key; removing required_env via PUT is a legitimate
+    transition to keyless (not the genuinely partial shape rejected in
+    test_admin_update_app_enforces_auth_classification above, which drops
+    command instead) -- the write-time validator must accept it (200, not
+    422), and the resulting row must actually be connectable through the
+    real user-facing endpoint afterward, not just pass admin validation.
+    """
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "required_env": ["KEY"]},
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        from xagent.web.mcp_apps import classify_app_auth
+
+        assert (
+            classify_app_auth("stdio", {"command": "npx", "required_env": ["KEY"]})
+            == "api_key"
+        )
+
+        updated = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx"},
+            },
+        )
+        assert updated.status_code == 200
+        assert classify_app_auth("stdio", {"command": "npx"}) == "keyless"
+
+        # Connectable through the real endpoint post-transition, with no env
+        # at all -- the keyless shape's defining behavior.
+        connected = client.post(
+            "/api/mcp/apps/transitioning-app/connect",
+            headers=admin_headers,
+            json={"is_active": True},
+        )
+        assert connected.status_code == 200
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_admin_update_grandfathers_a_preexisting_bad_shape_row_for_unrelated_edits() -> (
     None
 ):

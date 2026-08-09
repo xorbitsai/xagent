@@ -669,6 +669,110 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     })
   })
 
+  it("does not let an mcp_oauth popup's timeout-cleanup clobber a different app's in-flight keyless connect", async () => {
+    // Round-5 M1: the previous fix (test above) only covered keyless<->keyless.
+    // loadingApps is shared across every connect *mechanism*, not just every
+    // app, so a cross-mechanism sequence — start an OAuth popup connect,
+    // switch apps, start a keyless connect, then let the OAuth popup's own
+    // cleanup fire — has to be tested separately.
+    //
+    // Fake timers are enabled only from the connect-granola click onward
+    // (its setInterval poll must be created under them to be advanceable) —
+    // not from the start, because @testing-library's async queries
+    // (findByText/waitFor) poll via real timers and hang forever once fake
+    // timers are active. Everything after that point uses fireEvent + act
+    // flushes instead of findBy*/waitFor for the same reason.
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    let resolveChrome: (() => void) | undefined
+    // The default tab (activeLocation="remote", no search/category/status)
+    // fetches the exact same URL — "?location=remote" — that the mcp_oauth
+    // popup-closed handler later uses to check whether the connect actually
+    // completed. Distinguish them by call order: 1st = the initial catalog
+    // render (needs a Chrome card to click), 2nd+ = the post-popup-close check.
+    let remoteListCalls = 0
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url === "http://api.local/api/mcp/apps?location=remote") {
+          remoteListCalls += 1
+          if (remoteListCalls === 1) {
+            return Promise.resolve({
+              ok: true,
+              json: async () => [
+                { id: "granola", name: "Granola", description: "", icon: "", is_connected: false, transport: "streamable_http", auth_type: "mcp_oauth" },
+                { id: "chrome", name: "Chrome", description: "", icon: "", is_connected: false, transport: "stdio", auth_type: "keyless" },
+              ],
+            })
+          }
+          return Promise.resolve({
+            ok: true,
+            json: async () => [{ id: "granola", name: "Granola", description: "", icon: "", is_connected: false }],
+          })
+        }
+        if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+          return new Promise((resolve) => {
+            resolveChrome = () => resolve({ ok: true, json: async () => ({ id: 1 }) })
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog open onOpenChange={vi.fn()} selectedMcpServers={selectedMcpServers} />,
+      )
+      // Real timers here: findByText's polling would hang under fake ones.
+      await screen.findByText("Chrome")
+
+      vi.useFakeTimers()
+
+      // Start Granola's OAuth popup connect (loadingApps gains "granola").
+      // Its checkPopup setInterval is created here, under fake timers.
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      // Switch to Chrome and start its keyless connect — a real, reachable
+      // sequence, since closing the settings dialog is not guarded against
+      // an in-flight OAuth popup wait (only the whole-catalog dialog's close
+      // is guarded, and only for the keyless/key-based POST itself). Select
+      // the Chrome card so isConnecting (derived from selectedApp) reflects it.
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "close-settings" }))
+        fireEvent.click(screen.getByText("Chrome"))
+        fireEvent.click(screen.getByRole("button", { name: "connect-chrome" }))
+      })
+      // resolveChrome is captured synchronously inside apiRequestMock, before
+      // connectCatalogApp's first await — no wait needed.
+      expect(resolveChrome).toBeDefined()
+      expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("connecting")
+
+      // Granola's popup "times out" (closed by the user without completing
+      // auth) and its poll fires, clearing "granola" from loadingApps. Under
+      // the pre-fix single-slot state this unconditionally cleared to null,
+      // silently dropping Chrome's spinner/disabled state mid-flight.
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500)
+      })
+      expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("connecting")
+
+      // Chrome's own request finishing still clears it normally.
+      await act(async () => {
+        resolveChrome?.()
+      })
+      expect(screen.getByTestId("settings-is-connecting")).toHaveTextContent("idle")
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
   it("surfaces the backend error and closes the popup when oauth/connect fails", async () => {
     const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
     const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)

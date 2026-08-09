@@ -31,7 +31,10 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("launch_config", sa.JSON),
 )
 
-APP_ID = "chrome"
+# Vendor-scoped, not the generic "chrome" -- see builtin_mcp_registry.py's
+# chrome row for why (collision with user-created servers literally named
+# "chrome"/"Chrome").
+APP_ID = "chrome-devtools"
 
 ROW = {
     "app_id": APP_ID,
@@ -79,6 +82,17 @@ def upgrade() -> None:
     if APP_ID in existing:
         return
 
+    # is_visible_in_connector is load-bearing for the release gate this row
+    # ships behind, so its absence must fail loudly rather than let the
+    # column-filter below silently drop it and fall back to the table
+    # default (TRUE) -- seeding the row visible, the opposite of intent.
+    # Unreachable through any normal `alembic upgrade head` (the migration
+    # that adds the column is a real ancestor in this chain), so this is a
+    # defensive assertion, not a path this test suite needs to exercise.
+    assert "is_visible_in_connector" in columns, (
+        "public_mcp_apps.is_visible_in_connector is missing; the chrome row "
+        "must not seed visible"
+    )
     row = {k: v for k, v in ROW.items() if k in columns}
     bind.execute(sa.insert(PUBLIC_MCP_APPS_TABLE), [row])
 

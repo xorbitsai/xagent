@@ -2330,9 +2330,13 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
     Scope: wired into the api_key/keyless path (_ensure_catalog_app_server)
     and the remote-MCP OAuth path (_ensure_catalog_mcp_oauth_server) only.
     The builtin_oauth provider-redirect flow (auth.py generic_oauth_callback
-    -> _ensure_user_mcp_server) does NOT run this check — latent while every
-    oauth-transport catalog row ships visible, but hiding one of those would
-    not block new connections through that flow.
+    -> _ensure_user_mcp_server) does NOT run this check. This is a config
+    action away from mattering, not just a future refactor: is_visible_in_
+    connector is freely admin-mutable via PATCH on any catalog app, so the
+    moment an operator hides an existing builtin_oauth row using this same
+    release-gate idiom, new connections reopen through this third path with
+    no code change. Tracked in #1203 — do not apply the hidden-as-release-
+    gate pattern to an oauth-transport row until that closes.
 
     Blast radius: this fires on every connect call, before the caller's
     existing association is looked up — so on a hidden app it also blocks

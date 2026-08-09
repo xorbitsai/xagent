@@ -162,6 +162,17 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
     && rm -rf /var/lib/apt/lists/*
 
 # Browser for the built-in "chrome" MCP connector (chrome-devtools-mcp).
+# Gated behind INSTALL_CHROME (default on, so the published image is
+# unchanged) rather than tying this to is_visible_in_connector: that flag is
+# a mutable DB boolean an admin can flip at runtime with no image rebuild, so
+# it cannot gate what ships in the image. A build ARG is the actual release
+# gate for the image; deployments that never intend to enable this connector
+# can pass --build-arg INSTALL_CHROME=false to drop both the image size and
+# the added attack surface (a root, --no-sandbox-capable browser) entirely.
+# Also note the container has no USER directive anywhere (root throughout,
+# pre-existing and out of scope here) -- see the follow-up issue tracking
+# both that and the security review this connector needs before unhiding.
+ARG INSTALL_CHROME=true
 # Distinct from the Playwright Chromium below, which chrome-devtools-mcp does
 # not detect. Its default "stable" channel resolution checks exactly
 # /opt/google/chrome/chrome on Linux, so guarantee that path exists on every
@@ -176,13 +187,19 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
 #     loop, not a working fallback.)
 #   - arm64: Google publishes no arm64 Chrome at all; Debian's Chromium is
 #     CDP-compatible with chrome-devtools-mcp, symlinked into the same path
-RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+# The apt keyring/source list added for the amd64 branch are removed in the
+# same layer once the package is installed -- keeping them would leave
+# dl.google.com resolvable via `apt-get update` inside a running container
+# for no benefit, since the install target is unpinned "stable" anyway.
+RUN if [ "$INSTALL_CHROME" != "true" ]; then \
+        echo "INSTALL_CHROME=$INSTALL_CHROME -- skipping Chrome/Chromium install"; \
+    elif [ "$(dpkg --print-architecture)" = "amd64" ]; then \
         curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
         && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
             > /etc/apt/sources.list.d/google-chrome.list \
         && apt-get update \
         && apt-get install -y --no-install-recommends google-chrome-stable \
-        && rm -rf /var/lib/apt/lists/* \
+        && rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/google-chrome.list /usr/share/keyrings/google-chrome.gpg \
         && { [ -e /opt/google/chrome/chrome ] || { echo "ERROR: google-chrome-stable no longer ships /opt/google/chrome/chrome -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; }; \
     else \
         apt-get update \
@@ -199,7 +216,12 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
 # cache resolves fully offline (verified with npm_config_offline=true).
 # The backend runs as root, so build-time root's cache is the one the MCP
 # launch path reads. `--help` exercises resolution without starting Chrome.
-RUN npx -y chrome-devtools-mcp@1.6.0 --help > /dev/null
+# Skipped along with the browser install above: warming the cache without a
+# browser to run against buys nothing (the connector 404s on connect either
+# way while hidden, and every call would fail at launch without a browser).
+RUN if [ "$INSTALL_CHROME" = "true" ]; then \
+        npx -y chrome-devtools-mcp@1.6.0 --help > /dev/null; \
+    fi
 
 COPY docker/entrypoint.sh /opt/xagent/deploy/entrypoint.sh
 RUN chmod +x /opt/xagent/deploy/entrypoint.sh

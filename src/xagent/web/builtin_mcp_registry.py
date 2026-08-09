@@ -560,7 +560,20 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
-            "app_id": "chrome",
+            # "chrome-devtools", not the generic "chrome", matching the
+            # upstream package name and the vendor-scoped ids every other
+            # seeded app uses. Known, accepted caveat: api/mcp.py couples
+            # catalog apps to user-server names by normalized id AND display
+            # name (_is_reserved_catalog_name rejects creating/renaming a
+            # server to either; library_names hides user servers whose name
+            # matches a catalog app name) -- and the display name below is
+            # deliberately kept as the friendlier "Chrome", so a user-created
+            # server literally named "chrome"/"Chrome" is still rejected on
+            # create/rename and suppressed from the local listing. Product
+            # chose the display name over freeing that (plausible but niche)
+            # name; scoping the id at least keeps the shared server row and
+            # connect-flow naming collision-free.
+            "app_id": "chrome-devtools",
             "name": "Chrome",
             "description": "Automate a Chrome browser: open pages, read content, fill forms, take screenshots, and inspect network requests.",
             "icon": "https://www.google.com/s2/favicons?domain=chrome.google.com&sz=128",

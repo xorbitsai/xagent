@@ -60,11 +60,11 @@ def test_upgrade_inserts_chrome(tmp_path):
         _create_table(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        assert "chrome" in _app_ids(connection)
+        assert "chrome-devtools" in _app_ids(connection)
         row = connection.execute(
             text(
                 "SELECT transport, launch_config, is_visible_in_connector "
-                "FROM public_mcp_apps WHERE app_id='chrome'"
+                "FROM public_mcp_apps WHERE app_id='chrome-devtools'"
             )
         ).first()
         assert row[0] == "stdio"
@@ -86,7 +86,7 @@ def test_upgrade_is_idempotent(tmp_path):
             migration.upgrade()
             migration.upgrade()  # second run must not raise or duplicate
         rows = connection.execute(
-            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='chrome'")
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='chrome-devtools'")
         ).scalar()
         assert rows == 1
 
@@ -98,7 +98,7 @@ def test_seed_row_matches_registry():
 
     migration = _load_migration_module()
     registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "chrome"
+        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "chrome-devtools"
     )
     assert migration.ROW == registry_row
 
@@ -124,7 +124,7 @@ def test_downgrade_removes_chrome(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
-        assert "chrome" not in _app_ids(connection)
+        assert "chrome-devtools" not in _app_ids(connection)
 
 
 def test_dockerfile_npx_cache_pin_matches_registry():
@@ -141,7 +141,7 @@ def test_dockerfile_npx_cache_pin_matches_registry():
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "chrome"
+        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "chrome-devtools"
     )
     registry_specs = {
         arg

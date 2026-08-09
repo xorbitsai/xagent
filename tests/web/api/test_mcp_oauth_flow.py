@@ -1584,6 +1584,45 @@ async def test_connect_app_rejects_non_mcp_oauth_catalog_app(db_session):
 
 
 @pytest.mark.asyncio
+async def test_connect_app_rejects_hidden_mcp_oauth_app(db_session):
+    """Round-5 m8: the hidden-app gate is wired into this path
+    (_ensure_catalog_mcp_oauth_server -> _reject_hidden_catalog_app) but had
+    no coverage here — this call site could be deleted and the suite would
+    stay green. Mirrors test_connect_rejects_hidden_app in
+    test_mcp_apps_connect.py, for the mcp_oauth connect path instead of the
+    api_key/keyless one."""
+    db, user, _ = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="hidden-remote-notes",
+            name="Hidden Remote Notes",
+            transport="streamable_http",
+            is_visible_in_connector=False,
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+    )
+    db.commit()
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await connect_mcp_oauth_app(
+            "hidden-remote-notes",
+            MCPOAuthConnectRequest(redirect_after="/mcp"),
+            user,
+            db,
+        )
+    assert exc.value.status_code == 404
+
+    # The gate fired before provisioning: no shared server row was created.
+    assert (
+        db.query(MCPServer).filter(MCPServer.name == "hidden-remote-notes").first()
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_connect_app_rejects_unknown_app_id(db_session):
     db, user, _ = db_session
 

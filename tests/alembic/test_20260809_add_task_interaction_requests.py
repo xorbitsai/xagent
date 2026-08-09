@@ -160,14 +160,43 @@ def postgresql_engine_factory():
     try:
         yield _make
     finally:
-        for _dbname, engine in minted:
-            engine.dispose()
-        for dbname, _engine in minted:
-            admin_conn = _admin_connection()
+        for dbname, engine in minted:
             try:
-                admin_conn.cursor().execute(f'DROP DATABASE IF EXISTS "{dbname}"')
+                engine.dispose()
+            except Exception as exc:  # noqa: BLE001
+                # Never stop here: an engine that will not dispose must not
+                # block the drops below, or every database after it leaks.
+                print(f"could not dispose the engine for {dbname}: {exc!r}")
+
+        undropped: list[str] = []
+        if minted:
+            try:
+                admin_conn = _admin_connection()
+            except Exception as exc:
+                raise RuntimeError(
+                    "cannot reach the PostgreSQL server to drop the "
+                    "disposable databases this fixture created; drop them "
+                    "by hand: " + ", ".join(name for name, _ in minted)
+                ) from exc
+            try:
+                # One autocommit connection serves every drop: a failed
+                # DROP DATABASE leaves it usable, so a database still in
+                # use costs its own name, not the rest of the list.
+                for dbname, _engine in minted:
+                    try:
+                        admin_conn.cursor().execute(
+                            f'DROP DATABASE IF EXISTS "{dbname}"'
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        undropped.append(f"{dbname} ({exc!r})")
             finally:
                 admin_conn.close()
+
+        if undropped:
+            raise RuntimeError(
+                "disposable databases left behind on the server; drop them "
+                "by hand: " + "; ".join(undropped)
+            )
 
 
 def _pg_index_names(connection) -> set[str]:

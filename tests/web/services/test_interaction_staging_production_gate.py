@@ -22,7 +22,7 @@ own docstrings and this module's own definitions of the two gated names,
 forcing every future mention of ``stage_interaction_request`` or
 ``interaction_handoff`` in prose to dodge the scanner. See
 ``test_trace_event_staging.py::test_trace_event_staging_module_sends_no_notifications``
-for the precedent this follows -- PR-A's own review moved that check from
+for the precedent this follows -- the trace staging work moved that check from
 substring to AST for the identical reason.
 """
 

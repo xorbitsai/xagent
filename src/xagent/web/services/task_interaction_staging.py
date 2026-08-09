@@ -227,7 +227,7 @@ class InteractionRunPartitionMismatch(InteractionHandoffError):
     at all, which the post-conflict re-check would then misclassify as a
     slot conflict instead of surfacing as the corruption it actually is.
 
-    PR-C2a deliberately swallows this exception -- see ``_SWALLOWED`` and
+    The handoff layer deliberately swallows this exception -- see ``_SWALLOWED`` and
     ``interaction_handoff``'s docstring for the reasoning and for why that
     is a scoped override of this primitive's own default, not this
     primitive's design intent.
@@ -265,7 +265,7 @@ class InteractionOwnerStateError(InteractionHandoffError):
 # purpose, in the same line reviewers already read, before it starts being
 # swallowed.
 #
-# PR-C2a note: InteractionRunPartitionMismatch's presence in this tuple is a
+# Note: InteractionRunPartitionMismatch's presence in this tuple is a
 # deliberate override of this primitive's literal design default (which
 # called for propagating it unchanged, the same as InteractionOwnerStateError
 # below it). See interaction_handoff's docstring for the reasoning and the
@@ -304,11 +304,10 @@ _DEGRADATION_SIGNALS: dict[type[BaseException], str] = {
 class InteractionAnchor:
     """The resume anchor a caller is staging an interaction request against.
 
-    This is not ``trace_event_staging.StagedCheckpointAnchor``. That type is
-    PR-A's return value for the shell's pointer UPDATE and carries only
-    ``checkpoint_event_id`` / ``trace_event_id``; PR-A's own review already
-    confirmed this module does not consume it, and it is not reused or
-    subclassed here.
+    This is not ``trace_event_staging.StagedCheckpointAnchor``. That type
+    exists for the trace shell's pointer UPDATE and carries only
+    ``checkpoint_event_id`` / ``trace_event_id``; this module does not
+    consume it, and it is not reused or subclassed here.
 
     Represents only half of anchor resolution. The other half -- a database
     read against ``trace_events`` by primary key, layered into
@@ -395,6 +394,18 @@ def _validate_anchor_fields(anchor: InteractionAnchor) -> None:
         )
     if anchor.trace_event_id is None:
         raise InteractionAnchorCorrupt("anchor.trace_event_id must not be None")
+    if isinstance(anchor.trace_event_id, bool) or not isinstance(
+        anchor.trace_event_id, int
+    ):
+        raise InteractionAnchorCorrupt(
+            "anchor.trace_event_id must be an integer row id, got "
+            f"{anchor.trace_event_id!r}"
+        )
+    if anchor.trace_event_id <= 0:
+        raise InteractionAnchorCorrupt(
+            "anchor.trace_event_id must be a positive row id, got "
+            f"{anchor.trace_event_id!r}"
+        )
 
 
 def _validate_request_fields(
@@ -431,7 +442,7 @@ def _validate_request_fields(
         raise ValueError(
             f"kind must be one of {sorted(_KIND_VOCABULARY)}, got {kind!r}"
         )
-    if protocol_version != _PROTOCOL_VERSION:
+    if isinstance(protocol_version, bool) or protocol_version != _PROTOCOL_VERSION:
         raise ValueError(
             f"protocol_version must be {_PROTOCOL_VERSION}, got {protocol_version!r}"
         )
@@ -954,7 +965,7 @@ def interaction_handoff(
     unchanged, the same as ``InteractionOwnerStateError`` -- on the
     reasoning that a confirmed identity mismatch between a run and its own
     resume anchor is closer to "something is structurally wrong" than to an
-    ordinary race. PR-C2a overrides that default and swallows it here
+    ordinary race. The handoff overrides that default and swallows it here
     instead, registering its own dedicated signal
     (``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED``, kept separate from the
     other four's shared ``INTERACTION_HANDOFF_DEGRADED`` so it stays

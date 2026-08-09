@@ -1231,7 +1231,7 @@ _T_CM_1_CASES = [
 @pytest.mark.parametrize("case", _T_CM_1_CASES)
 def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
     """T-CM-1, widened to six cells: the four exceptions the book's design
-    names, plus InteractionRunPartitionMismatch (swallowed under PR-C2a's
+    names, plus InteractionRunPartitionMismatch (swallowed under this module's
     F-3 override, see the CM's docstring), plus REPLAY-after-conflict as
     the successful-return control. Every cell: (a) the with-block exits
     without the exception escaping; (b) exactly the swallowed exceptions
@@ -1740,4 +1740,47 @@ def test_sp3_clean_stage_commits_with_caller(tmp_path: Path) -> None:
     row = other.get(TaskInteractionRequest, result.staged_db_id)
     assert row is not None
     other.close()
+    db.close()
+
+
+@pytest.mark.parametrize("bad_id", _T_P_TASK_ID_CASES)
+def test_step_one_rejects_non_integer_anchor_row_ids_without_sql(
+    tmp_path: Path, bad_id: Any
+) -> None:
+    """The anchor's row id is a database identity: a bool coerces to a valid
+    foreign key pointing at a different trace row, so it is rejected before
+    any SQL, on the same footing as ``task_id``. Classified as anchor
+    corruption, consistent with the ``None`` case."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(bad_id)
+    kwargs = _stage_kwargs(anchor)
+    before = len(statements)
+    with pytest.raises(InteractionAnchorCorrupt):
+        stage_interaction_request(db, task_id=task_id, **kwargs)
+    assert statements[before:] == []
+    db.close()
+
+
+def test_step_one_rejects_boolean_protocol_version_without_sql(
+    tmp_path: Path,
+) -> None:
+    """``True == 1`` in Python, so the equality check alone would admit a
+    bool; the strict guard keeps the vocabulary genuinely integer-valued."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    kwargs = _stage_kwargs(anchor, protocol_version=True)
+    before = len(statements)
+    with pytest.raises(ValueError):
+        stage_interaction_request(db, task_id=task_id, **kwargs)
+    assert statements[before:] == []
     db.close()

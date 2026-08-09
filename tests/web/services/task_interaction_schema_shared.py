@@ -38,6 +38,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from itertools import count
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -174,6 +175,30 @@ def assert_accepted(db: Session, row: dict[str, object]) -> TaskInteractionReque
     return obj
 
 
+def _assert_constraint_named_in_error(
+    exc: IntegrityError, constraint_name: str, dialect_name: str | None
+) -> None:
+    """Shared match logic between ``assert_rejected`` and
+    ``assert_update_rejected``: SQLite names columns instead of the
+    constraint for a UNIQUE violation (see the module docstring), so that
+    case checks column names on SQLite and falls back to name-substring
+    matching everywhere else.
+    """
+    text = str(exc)
+    sqlite_columns = _UNIQUE_CONSTRAINT_COLUMNS.get(constraint_name)
+    if sqlite_columns is not None and dialect_name == "sqlite":
+        for column in sqlite_columns:
+            qualified = f"task_interaction_requests.{column}"
+            assert qualified in text, (
+                f"expected column {qualified!r} in the SQLite UNIQUE "
+                f"violation text for {constraint_name!r}, got: {text}"
+            )
+    else:
+        assert constraint_name in text, (
+            f"expected {constraint_name!r} in the IntegrityError text, got: {text}"
+        )
+
+
 def assert_rejected(db: Session, row: dict[str, object], constraint_name: str) -> None:
     """Insert ``row``, expect IntegrityError naming ``constraint_name``, and
     roll back immediately so the session stays usable for the caller's next
@@ -184,26 +209,70 @@ def assert_rejected(db: Session, row: dict[str, object], constraint_name: str) -
     try:
         db.commit()
     except IntegrityError as exc:
-        text = str(exc)
-        sqlite_columns = _UNIQUE_CONSTRAINT_COLUMNS.get(constraint_name)
-        if (
-            sqlite_columns is not None
-            and db.bind is not None
-            and (db.bind.dialect.name == "sqlite")
-        ):
-            for column in sqlite_columns:
-                qualified = f"task_interaction_requests.{column}"
-                assert qualified in text, (
-                    f"expected column {qualified!r} in the SQLite UNIQUE "
-                    f"violation text for {constraint_name!r}, got: {text}"
-                )
-        else:
-            assert constraint_name in text, (
-                f"expected {constraint_name!r} in the IntegrityError text, got: {text}"
-            )
+        dialect_name = db.bind.dialect.name if db.bind is not None else None
+        _assert_constraint_named_in_error(exc, constraint_name, dialect_name)
     else:
         raise AssertionError(
             f"expected IntegrityError naming {constraint_name!r}; insert succeeded"
+        )
+    finally:
+        db.rollback()
+
+
+def assert_update_accepted(
+    db: Session, row_id: int, values: dict[str, object]
+) -> TaskInteractionRequest:
+    """Apply ``values`` to one existing row in a single UPDATE statement,
+    commit, and return the refreshed row.
+
+    The positive half of the UPDATE-path pairing tests, mirroring
+    ``assert_accepted``'s role for the INSERT path: without at least one
+    accepted transition, a suite made entirely of ``assert_update_rejected``
+    calls could pass even if every UPDATE were unconditionally rejected.
+    """
+    db.execute(
+        update(TaskInteractionRequest)
+        .where(TaskInteractionRequest.id == row_id)
+        .values(**values)
+    )
+    db.commit()
+    obj = db.get(TaskInteractionRequest, row_id)
+    assert obj is not None
+    db.refresh(obj)
+    return obj
+
+
+def assert_update_rejected(
+    db: Session, row_id: int, values: dict[str, object], constraint_name: str
+) -> None:
+    """Apply ``values`` to one existing row in a single UPDATE statement and
+    expect ``constraint_name`` to reject it.
+
+    One statement, one violated CHECK: when a single UPDATE violates more
+    than one, the two backends do not agree on which name surfaces
+    (measured: transitioning an ``answered`` row straight to ``terminated``
+    in one UPDATE, without clearing ``response_payload`` or
+    ``responded_at``, violates both
+    ``ck_task_interaction_requests_response_pairs_status`` and
+    ``ck_task_interaction_requests_responded_at_pairs_status`` at once --
+    SQLite reports ``response_pairs_status`` where PostgreSQL reports
+    ``responded_at_pairs_status`` for the identical statement), and a
+    name-matching assertion would flap depending on which one the caller
+    happened to construct.
+    """
+    try:
+        db.execute(
+            update(TaskInteractionRequest)
+            .where(TaskInteractionRequest.id == row_id)
+            .values(**values)
+        )
+        db.commit()
+    except IntegrityError as exc:
+        dialect_name = db.bind.dialect.name if db.bind is not None else None
+        _assert_constraint_named_in_error(exc, constraint_name, dialect_name)
+    else:
+        raise AssertionError(
+            f"expected IntegrityError naming {constraint_name!r}; update succeeded"
         )
     finally:
         db.rollback()

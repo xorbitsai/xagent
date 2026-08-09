@@ -16,7 +16,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import DateTime, inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from tests.web.services.task_interaction_schema_shared import (
@@ -30,6 +30,8 @@ from tests.web.services.task_interaction_schema_shared import (
     TIMESTAMP_COLUMNS,
     assert_accepted,
     assert_rejected,
+    assert_update_accepted,
+    assert_update_rejected,
     make_row,
     make_task,
     make_trace_event,
@@ -378,6 +380,8 @@ def test_protocol_version_floor_rejects_nonsense_on_terminal_rows(
 def test_terminated_status_and_terminal_reason_are_paired_both_ways(
     db_session, fixtures
 ) -> None:
+    """status='terminated' iff terminal_reason IS NOT NULL. The answered
+    case is the one worth pinning -- see the SQLite half."""
     task_id, anchor_id = fixtures
     assert_rejected(
         db_session,
@@ -394,6 +398,16 @@ def test_terminated_status_and_terminal_reason_are_paired_both_ways(
         make_row(
             task_id=task_id,
             resume_trace_event_id=anchor_id,
+            terminal_reason="deadline_elapsed",
+        ),
+        "ck_task_interaction_requests_terminal_pairs_status",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
             terminal_reason="deadline_elapsed",
         ),
         "ck_task_interaction_requests_terminal_pairs_status",
@@ -819,20 +833,98 @@ def test_expires_at_round_trips_as_utc(db_session, fixtures) -> None:
 
 
 # --------------------------------------------------------------------------
-# T-shape: create_all shape
+# T-update: the paired CHECKs against an UPDATE, not just an INSERT
 # --------------------------------------------------------------------------
 
 
-def test_table_is_registered_in_metadata() -> None:
-    import xagent.web.models as models
+def test_answered_transition_in_one_statement_is_accepted(db_session, fixtures) -> None:
+    """Positive control for the UPDATE-path tests below -- see the SQLite
+    half."""
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    updated = assert_update_accepted(
+        db_session,
+        row.id,
+        {
+            "status": "answered",
+            "active_slot": None,
+            "response_payload": {"answer": "example"},
+            "responded_at": datetime.now(timezone.utc),
+            "responder_identity": "user:1",
+        },
+    )
+    assert updated.status == "answered"
 
-    assert "task_interaction_requests" in models.Base.metadata.tables
+
+def test_answering_without_clearing_the_slot_is_rejected(db_session, fixtures) -> None:
+    """Answering a row while forgetting to clear active_slot -- see the
+    SQLite half."""
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    assert_update_rejected(
+        db_session,
+        row.id,
+        {
+            "status": "answered",
+            "response_payload": {"answer": "example"},
+            "responded_at": datetime.now(timezone.utc),
+            "responder_identity": "user:1",
+        },
+        "ck_task_interaction_requests_active_slot_pairs_status",
+    )
+
+
+def test_clearing_the_slot_without_leaving_active_is_rejected(
+    db_session, fixtures
+) -> None:
+    """The other direction of the same CHECK -- see the SQLite half."""
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    assert_update_rejected(
+        db_session,
+        row.id,
+        {"active_slot": None},
+        "ck_task_interaction_requests_active_slot_pairs_status",
+    )
+
+
+def test_terminating_without_a_timestamp_is_rejected(db_session, fixtures) -> None:
+    """Terminating a row while leaving terminated_at NULL -- see the
+    SQLite half."""
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    assert_update_rejected(
+        db_session,
+        row.id,
+        {
+            "status": "terminated",
+            "active_slot": None,
+            "terminal_reason": "deadline_elapsed",
+        },
+        "ck_task_interaction_requests_terminated_at_pairs_status",
+    )
+
+
+# --------------------------------------------------------------------------
+# T-shape: create_all shape
+# --------------------------------------------------------------------------
 
 
 def test_created_columns_match_the_frozen_shape(db_session) -> None:
     inspector = inspect(get_engine())
     columns = {c["name"]: c for c in inspector.get_columns("task_interaction_requests")}
     assert set(columns) == EXPECTED_COLUMNS
+    # Closes EXPECTED_NULLABLE the same way EXPECTED_STRING_LENGTHS is closed
+    # below -- see the SQLite half.
+    assert set(EXPECTED_NULLABLE) == set(columns)
     for name, expected_nullable in EXPECTED_NULLABLE.items():
         assert columns[name]["nullable"] == expected_nullable, name
     string_columns = {
@@ -849,9 +941,18 @@ def test_all_timestamp_columns_are_timezone_aware(db_session) -> None:
     """Unlike the SQLite half, PostgreSQL's reflection actually reports
     this: str(column["type"]) prints "TIMESTAMP" either way, but
     column["type"].timezone distinguishes timestamp with time zone from
-    timestamp without time zone (verified against information_schema)."""
+    timestamp without time zone (verified against information_schema).
+
+    The set comparison closes the inventory the same way the SQLite half's
+    declared-column version does: TIMESTAMP_COLUMNS must name exactly the
+    reflected DateTime-typed columns, not merely a subset of them.
+    """
     inspector = inspect(get_engine())
     columns = {c["name"]: c for c in inspector.get_columns("task_interaction_requests")}
+    reflected_datetime_columns = {
+        name for name, column in columns.items() if isinstance(column["type"], DateTime)
+    }
+    assert reflected_datetime_columns == set(TIMESTAMP_COLUMNS)
     for name in TIMESTAMP_COLUMNS:
         assert columns[name]["type"].timezone is True, name
 
@@ -889,17 +990,3 @@ def test_constraint_names_match_the_frozen_inventory(db_session) -> None:
         if not idx["unique"]
     }
     assert nonunique_indexes == EXPECTED_NONUNIQUE_INDEXES
-
-
-def test_no_constraint_name_exceeds_the_postgres_identifier_limit() -> None:
-    """Structural guard for a real bug on this exact backend: SQLAlchemy
-    raises IdentifierError at create_all time for an explicitly given name
-    over 63 characters rather than truncating it -- see the SQLite half.
-    """
-    table = TaskInteractionRequest.__table__
-    names = [c.name for c in table.constraints if c.name is not None]
-    names += [ix.name for ix in table.indexes if ix.name is not None]
-    too_long = [name for name in names if len(name) > 63]
-    assert too_long == [], (
-        f"constraint/index name(s) exceed PostgreSQL's 63-char identifier limit: {too_long}"
-    )

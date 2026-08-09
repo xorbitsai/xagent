@@ -13,10 +13,13 @@ hand-written literals.
 
 from __future__ import annotations
 
+import ast
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import DateTime, inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from tests.web.services.task_interaction_schema_shared import (
@@ -30,6 +33,8 @@ from tests.web.services.task_interaction_schema_shared import (
     TIMESTAMP_COLUMNS,
     assert_accepted,
     assert_rejected,
+    assert_update_accepted,
+    assert_update_rejected,
     make_row,
     make_task,
     make_trace_event,
@@ -430,6 +435,10 @@ def test_protocol_version_floor_rejects_nonsense_on_terminal_rows(
 def test_terminated_status_and_terminal_reason_are_paired_both_ways(
     db_session, fixtures
 ) -> None:
+    """status='terminated' iff terminal_reason IS NOT NULL. The answered
+    case is the one worth pinning: answered and terminated are distinct
+    terminal statuses, and nothing sets terminal_reason on an answered row.
+    """
     task_id, anchor_id = fixtures
     assert_rejected(
         db_session,
@@ -446,6 +455,16 @@ def test_terminated_status_and_terminal_reason_are_paired_both_ways(
         make_row(
             task_id=task_id,
             resume_trace_event_id=anchor_id,
+            terminal_reason="deadline_elapsed",
+        ),
+        "ck_task_interaction_requests_terminal_pairs_status",
+    )
+    assert_rejected(
+        db_session,
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            status="answered",
             terminal_reason="deadline_elapsed",
         ),
         "ck_task_interaction_requests_terminal_pairs_status",
@@ -937,6 +956,99 @@ def test_expires_at_round_trips_as_utc(db_session, fixtures) -> None:
 
 
 # --------------------------------------------------------------------------
+# T-update: the paired CHECKs against an UPDATE, not just an INSERT
+# --------------------------------------------------------------------------
+
+
+def test_answered_transition_in_one_statement_is_accepted(db_session, fixtures) -> None:
+    """Positive control for the UPDATE-path tests below: without it, the
+    rejection tests could pass even if every UPDATE were rejected --
+    active-to-answered included -- and nothing would prove the paired
+    CHECKs actually admit the transition they exist to protect.
+    """
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    updated = assert_update_accepted(
+        db_session,
+        row.id,
+        {
+            "status": "answered",
+            "active_slot": None,
+            "response_payload": {"answer": "example"},
+            "responded_at": datetime.now(timezone.utc),
+            "responder_identity": "user:1",
+        },
+    )
+    assert updated.status == "answered"
+
+
+def test_answering_without_clearing_the_slot_is_rejected(db_session, fixtures) -> None:
+    """A writer answering a row in one statement while forgetting to clear
+    active_slot leaves the row 'answered' but still occupying the active
+    slot -- ck_task_interaction_requests_active_slot_pairs_status rejects
+    it.
+    """
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    assert_update_rejected(
+        db_session,
+        row.id,
+        {
+            "status": "answered",
+            "response_payload": {"answer": "example"},
+            "responded_at": datetime.now(timezone.utc),
+            "responder_identity": "user:1",
+        },
+        "ck_task_interaction_requests_active_slot_pairs_status",
+    )
+
+
+def test_clearing_the_slot_without_leaving_active_is_rejected(
+    db_session, fixtures
+) -> None:
+    """The other direction of the same CHECK: clearing active_slot while
+    status stays 'active' is a row that has vacated its slot without
+    actually leaving the active state.
+    """
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    assert_update_rejected(
+        db_session,
+        row.id,
+        {"active_slot": None},
+        "ck_task_interaction_requests_active_slot_pairs_status",
+    )
+
+
+def test_terminating_without_a_timestamp_is_rejected(db_session, fixtures) -> None:
+    """Terminating a row in one statement while leaving terminated_at NULL
+    is rejected by ck_task_interaction_requests_terminated_at_pairs_status,
+    the mid-transition shape a writer could produce by setting status and
+    terminal_reason but forgetting the timestamp.
+    """
+    task_id, anchor_id = fixtures
+    row = assert_accepted(
+        db_session, make_row(task_id=task_id, resume_trace_event_id=anchor_id)
+    )
+    assert_update_rejected(
+        db_session,
+        row.id,
+        {
+            "status": "terminated",
+            "active_slot": None,
+            "terminal_reason": "deadline_elapsed",
+        },
+        "ck_task_interaction_requests_terminated_at_pairs_status",
+    )
+
+
+# --------------------------------------------------------------------------
 # T-shape: create_all shape
 # --------------------------------------------------------------------------
 
@@ -981,6 +1093,10 @@ def test_created_columns_match_the_frozen_shape(db_session) -> None:
     inspector = inspect(get_engine())
     columns = {c["name"]: c for c in inspector.get_columns("task_interaction_requests")}
     assert set(columns) == EXPECTED_COLUMNS
+    # Closes EXPECTED_NULLABLE the same way EXPECTED_STRING_LENGTHS is closed
+    # below: iterating a partial dict only pins what it happens to list, so a
+    # new column that skips EXPECTED_NULLABLE would otherwise pass silently.
+    assert set(EXPECTED_NULLABLE) == set(columns)
     for name, expected_nullable in EXPECTED_NULLABLE.items():
         assert columns[name]["nullable"] == expected_nullable, name
     string_columns = {
@@ -1012,8 +1128,18 @@ def test_all_timestamp_columns_are_timezone_aware() -> None:
     same invariant (all five timestamp columns are declared timezone-aware)
     against TaskInteractionRequest.__table__ directly instead, which is
     what actually governs bind/result timezone handling at runtime.
+
+    The set comparison below closes the inventory the same way
+    EXPECTED_STRING_LENGTHS is closed in test_created_columns_match_the_
+    frozen_shape: TIMESTAMP_COLUMNS must name exactly the columns declared
+    as DateTime, not merely be a subset of them, or a new DateTime column
+    could go unpinned.
     """
     table = TaskInteractionRequest.__table__
+    declared_datetime_columns = {
+        column.name for column in table.columns if isinstance(column.type, DateTime)
+    }
+    assert declared_datetime_columns == set(TIMESTAMP_COLUMNS)
     for name in TIMESTAMP_COLUMNS:
         assert table.c[name].type.timezone is True, name
 
@@ -1069,4 +1195,100 @@ def test_no_constraint_name_exceeds_the_postgres_identifier_limit() -> None:
     too_long = [name for name in names if len(name) > 63]
     assert too_long == [], (
         f"constraint/index name(s) exceed PostgreSQL's 63-char identifier limit: {too_long}"
+    )
+
+
+# --------------------------------------------------------------------------
+# T-origin-drift: origin's IN-list against every task-source literal in the
+# tree (see the model class docstring: it is a frozen superset of
+# Task.source, not a mirror -- retiring a Task.source value must not narrow
+# this CHECK, and this scan is what would notice a write using a value the
+# CHECK does not know about).
+# --------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SCAN_ROOT = _REPO_ROOT / "src" / "xagent"
+
+# (module path suffix, literal) pairs where source=/task_source= names
+# something other than Task.source. Each entry needs a reason, and a new
+# entry is a prompt to check whether the write really is a task source.
+_UNRELATED_SOURCE_LITERALS = {
+    ("skills/personal_db.py", "personal"),  # SkillRecord.source
+    ("services/tool_credentials.py", "db"),  # local var: credential origin
+}
+
+
+def _origin_vocabulary() -> set[str]:
+    """Read the origin IN-list from the model's own CheckConstraint instead
+    of hand-copying it here -- a hand copy could drift from the CHECK
+    independently of anything this test is meant to catch.
+    """
+    for constraint in TaskInteractionRequest.__table__.constraints:
+        if getattr(constraint, "name", None) == "ck_task_interaction_requests_origin":
+            match = re.search(r"IN \(([^)]*)\)", str(constraint.sqltext))
+            assert match, f"could not parse the origin IN-list: {constraint.sqltext}"
+            return {piece.strip().strip("'") for piece in match.group(1).split(",")}
+    raise AssertionError(
+        "ck_task_interaction_requests_origin CHECK not found on the table"
+    )
+
+
+def _source_literal_hits(tree: ast.AST) -> list[tuple[int, str]]:
+    """Every source=/task_source= keyword argument or plain assignment
+    whose value is a bare string constant. Deliberately narrow: a literal
+    built from a ternary or an f-string is not caught, since every real
+    task-source write in the tree uses a bare string literal (see
+    _UNRELATED_SOURCE_LITERALS for the one file where that narrowness is
+    load-bearing -- its non-Task.source ternary assignments fall outside
+    this scan on purpose).
+    """
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("source", "task_source")
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            hits.append((node.lineno, node.value.value))
+        elif isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if (
+                    kw.arg in ("source", "task_source")
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                ):
+                    hits.append((node.lineno, kw.value.value))
+    return hits
+
+
+def _is_excluded(relative_path: str, literal: str) -> bool:
+    return any(
+        relative_path.endswith(suffix) and literal == excluded_literal
+        for suffix, excluded_literal in _UNRELATED_SOURCE_LITERALS
+    )
+
+
+def test_every_task_source_literal_is_in_the_origin_vocabulary() -> None:
+    """Every source=/task_source= string literal written anywhere under
+    src/xagent must be a member of this table's origin IN-list, or a row
+    recording that write would be unwritable by the CHECK. Excludes the
+    handful of unrelated same-named locals/kwargs pinned in
+    _UNRELATED_SOURCE_LITERALS.
+    """
+    vocabulary = _origin_vocabulary()
+    violations: list[tuple[str, int, str]] = []
+    for path in sorted(_SCAN_ROOT.rglob("*.py")):
+        relative = path.resolve().relative_to(_REPO_ROOT).as_posix()
+        tree = ast.parse(path.read_text(), filename=relative)
+        for lineno, literal in _source_literal_hits(tree):
+            if _is_excluded(relative, literal):
+                continue
+            if literal not in vocabulary:
+                violations.append((relative, lineno, literal))
+    assert violations == [], (
+        f"found a source=/task_source= literal outside the origin CHECK's "
+        f"IN-list vocabulary {sorted(vocabulary)}: {violations}"
     )

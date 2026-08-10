@@ -47,7 +47,7 @@ CREATE TABLE, two CREATE INDEX) and its downgrade is one DROP TABLE, so
 that risk has no known failure mode here.
 
 Revision ID: 20260809_add_task_interaction_requests
-Revises: 20260808_add_task_lease_attempt_id
+Revises: 20260806_seed_chrome_mcp_app
 Create Date: 2026-08-09
 
 """
@@ -58,7 +58,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260809_add_task_interaction_requests"
-down_revision: Union[str, None] = "20260808_add_task_lease_attempt_id"
+down_revision: Union[str, None] = "20260806_seed_chrome_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

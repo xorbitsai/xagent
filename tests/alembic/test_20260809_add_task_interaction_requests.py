@@ -30,7 +30,7 @@ MIGRATION_PATH = (
     / "src/xagent/migrations/versions/20260809_add_task_interaction_requests.py"
 )
 REVISION = "20260809_add_task_interaction_requests"
-DOWN_REVISION = "20260808_add_task_lease_attempt_id"
+DOWN_REVISION = "20260806_seed_chrome_mcp_app"
 TABLE = "task_interaction_requests"
 PARENT_TABLES = ("tasks", "trace_events", "users")
 

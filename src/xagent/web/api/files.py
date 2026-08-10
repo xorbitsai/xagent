@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, cast
@@ -13,6 +14,8 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -30,6 +33,7 @@ from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
+from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, JWT_ALGORITHM, JWT_SECRET_KEY
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..config import (
     BINARY_EXTENSIONS,
@@ -65,6 +69,7 @@ from ..services.uploaded_file_store import (
     delete_registered_preview_caches,
     register_local_uploads_sync,
 )
+from .auth import create_access_token
 from .legacy_file import (
     infer_user_id_from_legacy_path,
     is_valid_uuid,
@@ -196,10 +201,11 @@ async def _inline_preview_response(
     media type is served as-is.
 
     ``extra_headers`` lets a caller layer route-specific headers (e.g. the
-    public/tokened route's ``Cache-Control``) without changing behavior for
-    other callers — this helper is shared by both the authenticated and
-    public preview endpoints, and the authenticated in-app path relies on
-    normal browser caching for repeatedly-rendered chat images.
+    public/tokened route's or a ticket-authenticated request's
+    ``Cache-Control``) without changing behavior for other callers — this
+    helper is shared by the authenticated, public, and ticket-authenticated
+    preview endpoints, and the plain Bearer-authenticated in-app path relies
+    on normal browser caching for repeatedly-rendered chat images.
     """
 
     if media_type == "image/svg+xml":
@@ -1453,12 +1459,116 @@ async def download_file(
     )
 
 
+# Media elements (<video>/<audio>) cannot attach an Authorization header, so
+# the authenticated preview route also accepts a short-lived, file-scoped
+# ticket via the ``ticket`` query param as an alternative to the Bearer
+# header. This lets those elements load the route's URL directly instead of
+# blob-fetching the whole file first, which restores HTTP range requests
+# (seek-before-download, progressive playback) on the authenticated path —
+# the public/tokened route already gets this by carrying its own token in
+# the query string; see ``createPublicFileAccessPolicy`` on the frontend.
+#
+# The ticket only proves "a recent Bearer-authenticated request minted this
+# for this exact file_id" — it resolves the *same* User the Bearer header
+# would, so it grants no privilege beyond what that user's own Bearer token
+# already grants, and _check_file_access/_is_admin_user below still enforce
+# ownership exactly as they do for the Bearer path. Binding the ticket to one
+# file_id means a leaked ticket can only be replayed against that one file,
+# not enumerated against others. TTL matches the user's own access token,
+# since the ticket's authority is strictly narrower (one file, read-only,
+# inline preview) than the Bearer token it stands in for.
+FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
+FILE_STREAM_TICKET_TTL_SECONDS = ACCESS_TOKEN_EXPIRE_MINUTES * 60
+
+# A ticket rides in the query string of a URL a media element auto-fetches
+# on render, so — like the public/tokened preview route — it must never be
+# written to browser disk cache, where it could outlive its own TTL's
+# intent of being "short-lived".
+_TICKET_PREVIEW_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
+
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
+    try:
+        claims = jwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+
+    if (
+        claims.get("type") != FILE_STREAM_TICKET_TYPE
+        or claims.get("file_id") != file_id
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+
+    username = claims.get("sub")
+    user_id = claims.get("user_id")
+    if username is None or user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+
+    user = db.query(User).filter(User.username == username, User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+    return user
+
+
+def _user_from_bearer_or_stream_ticket(
+    file_id: str,
+    ticket: Optional[str] = Query(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    db: Session = Depends(get_db),
+) -> User:
+    if ticket:
+        return _user_from_stream_ticket(db, ticket, file_id)
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return get_current_user(credentials, db)
+
+
+@file_router.get("/stream-tickets/{file_id:path}", response_model=None)
+async def issue_preview_stream_ticket(
+    file_id: str,
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """Mint a short-lived ticket for streaming this one file via query param.
+
+    Deliberately a sibling route under its own ``/stream-tickets/`` prefix
+    rather than a suffix nested under ``/preview/{file_id:path}``: the
+    ``:path`` converter matches slashes, and a legacy ``file_id`` can be an
+    arbitrary relative path (e.g. ``web_task_235/output/ticket``) — nesting
+    would risk a real file literally named ``ticket`` colliding with this
+    endpoint. A disjoint URL prefix makes that collision structurally
+    impossible regardless of ``file_id`` content.
+
+    Authorization for the file itself is deferred to (and fully enforced
+    by) ``preview_file`` when the ticket is redeemed — this endpoint only
+    needs to know a Bearer-authenticated user is asking, the same
+    precondition ``preview_file`` already requires today.
+    """
+    ticket = create_access_token(
+        {
+            "type": FILE_STREAM_TICKET_TYPE,
+            "sub": user.username,
+            "user_id": user.id,
+            "file_id": file_id,
+        },
+        expires_delta=timedelta(seconds=FILE_STREAM_TICKET_TTL_SECONDS),
+    )
+    return {"path": f"/api/files/preview/{quote(file_id, safe='')}?ticket={ticket}"}
+
+
 @file_router.get("/preview/{file_id:path}", response_model=None)
 async def preview_file(
     file_id: str,
-    user: User = Depends(get_current_user),
+    ticket: Optional[str] = Query(default=None),
+    user: User = Depends(_user_from_bearer_or_stream_ticket),
     db: Session = Depends(get_db),
 ) -> Any:
+    cache_headers = _TICKET_PREVIEW_CACHE_HEADERS if ticket else None
     file_record, full_path, owner_user_id = _resolve_file_path(
         db, file_id, _user_id_value(user)
     )
@@ -1470,7 +1580,7 @@ async def preview_file(
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
         local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
-        if _preview_can_redirect(full_path, media_type):
+        if not ticket and _preview_can_redirect(full_path, media_type):
             redirect_response = _durable_redirect_response(
                 file_ref,
                 filename=file_name,
@@ -1506,6 +1616,7 @@ async def preview_file(
                 filename=file_name,
                 media_type=media_type,
                 file_id=file_id if is_valid_uuid(file_id) else None,
+                extra_headers=cache_headers,
             )
     else:
         # For legacy files without records, check ownership
@@ -1519,7 +1630,7 @@ async def preview_file(
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    if _preview_can_redirect(full_path, media_type):
+    if not ticket and _preview_can_redirect(full_path, media_type):
         accel_response = _accel_redirect_response(
             full_path,
             owner_user_id=owner_user_id,
@@ -1535,6 +1646,7 @@ async def preview_file(
         filename=file_name,
         media_type=media_type,
         file_id=file_id if is_valid_uuid(file_id) else None,
+        extra_headers=cache_headers,
     )
 
 

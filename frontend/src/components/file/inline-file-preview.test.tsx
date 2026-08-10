@@ -328,6 +328,88 @@ describe('InlineFilePreview', () => {
     expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
+  it('streams video directly from a minted ticket under the default policy', async () => {
+    // The default policy's getStreamingUrl mints a ticket via a dedicated
+    // endpoint; when that succeeds the media element loads the ticketed
+    // URL directly instead of blob-fetching the whole file.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video.getAttribute('src')).toBe(
+      'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket'
+    )
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/stream-tickets/video-file-id'
+    )
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to blob fetch when ticket minting fails', async () => {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return { ok: false, status: 500 }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    await waitFor(() => {
+      expect(video.getAttribute('src')).toMatch(/^blob:/)
+    })
+    expect(apiRequestMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not attempt to mint a streaming ticket for images', async () => {
+    // Images have no seek/progressive-loading need, so the extra ticket
+    // round trip is pure overhead -- only audio/video opt into it.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        throw new Error('images must not request a streaming ticket')
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['image-bytes'], { type: 'image/png' }),
+      }
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'image', fileId: 'image-file-id', filename: 'chart.png' }}
+      />
+    )
+
+    const image = await screen.findByAltText('chart.png')
+    await waitFor(() => {
+      expect(image.getAttribute('src')).toMatch(/^blob:/)
+    })
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
   it('falls back to the public video preview when authenticated loading fails', async () => {
     apiRequestMock.mockResolvedValue({ ok: false, status: 401 })
 

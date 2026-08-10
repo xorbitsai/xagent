@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 
 import React from "react"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -49,6 +49,27 @@ function DefaultFileAccessProbe() {
   )
 }
 
+function StreamingUrlProbe() {
+  const fileAccess = useFileAccess()
+  const [result, setResult] = React.useState<string>("pending")
+
+  return (
+    <button
+      type="button"
+      data-testid="streaming"
+      data-result={result}
+      onClick={() => {
+        fileAccess
+          .getStreamingUrl?.("file/id")
+          .then((url) => setResult(url))
+          .catch((error: Error) => setResult(`error:${error.message}`))
+      }}
+    >
+      streaming
+    </button>
+  )
+}
+
 describe("FileAccessProvider", () => {
   afterEach(() => {
     cleanup()
@@ -78,6 +99,55 @@ describe("FileAccessProvider", () => {
     expect(apiRequestMock).toHaveBeenCalledWith(
       "/api/files/list?page=1&size=20&search=report",
     )
+  })
+
+  it("mints a streaming URL from the ticket endpoint's response path", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        path: "/api/files/preview/file%2Fid?ticket=signed-ticket",
+      }),
+    })
+    render(
+      <FileAccessProvider>
+        <StreamingUrlProbe />
+      </FileAccessProvider>,
+    )
+
+    screen.getByTestId("streaming").click()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("streaming")).toHaveAttribute(
+        "data-result",
+        "/api/files/preview/file%2Fid?ticket=signed-ticket",
+      )
+    })
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "/api/files/stream-tickets/file%2Fid",
+    )
+  })
+
+  it("rejects the streaming URL promise when ticket minting fails", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 500 })
+    render(
+      <FileAccessProvider>
+        <StreamingUrlProbe />
+      </FileAccessProvider>,
+    )
+
+    screen.getByTestId("streaming").click()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("streaming")).toHaveAttribute(
+        "data-result",
+        "error:Failed to mint stream ticket: 500",
+      )
+    })
+  })
+
+  it("does not expose getStreamingUrl on the public policy", () => {
+    const policy = createPublicFileAccessPolicy("guest-token")
+    expect(policy.getStreamingUrl).toBeUndefined()
   })
 
   it("keeps public file URLs and requests scoped to each provider", async () => {

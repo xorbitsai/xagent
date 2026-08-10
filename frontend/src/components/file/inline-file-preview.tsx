@@ -35,36 +35,53 @@ const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
 /**
  * Resolve the URL a media element (<img>/<audio>/<video>) can load.
  *
- * The default in-app policy's authenticated preview route needs a Bearer
- * header that media elements cannot send, so managed files are fetched into
- * a blob object URL first. If that fetch fails, the public preview URL is a
- * last-resort fallback: on Agent Builder surfaces it may also require auth,
- * but a spinner with no recovery path is worse than attempting the
- * anonymous endpoint.
+ * Three strategies, tried in this order:
  *
- * A policy that declares ``requiresBlobFetch: false`` (the public
- * widget/share policy carries its guest token in the query string) hands
- * the URL to the media element directly instead: a blob fetch would add no
- * authorization there, and skipping it preserves HTTP range requests for
- * progressive audio/video playback. Policies that do not declare the
- * capability get the conservative blob path, which works everywhere.
+ * 1. ``fileAccess.getStreamingUrl`` (only the default in-app policy
+ *    implements this, and only when ``allowStreaming`` is true): mints a
+ *    short-lived, file-scoped ticket and hands the media element a direct
+ *    URL, preserving HTTP range requests for progressive playback. Falls
+ *    through to (2) if minting fails (e.g. offline) rather than leaving
+ *    the player on a permanent spinner.
+ * 2. Blob fetch: the default policy's authenticated preview route needs a
+ *    Bearer header that media elements cannot send, so managed files are
+ *    fetched into a blob object URL. If that fetch fails, the public
+ *    preview URL is a last-resort fallback: on Agent Builder surfaces it
+ *    may also require auth, but a spinner with no recovery path is worse
+ *    than attempting the anonymous endpoint.
+ * 3. Direct src: a policy that declares ``requiresBlobFetch: false`` (the
+ *    public widget/share policy carries its guest token in the query
+ *    string) hands the URL to the media element directly — a blob fetch
+ *    would add no authorization there, and skipping it also preserves
+ *    range requests. Policies that declare neither capability get the
+ *    conservative blob path, which works everywhere.
+ *
+ * ``allowStreaming`` restricts strategy (1) to audio/video: images have no
+ * seek-before-download or progressive-loading need, so paying an extra
+ * network round trip to mint a ticket before every image load would be
+ * pure overhead with no benefit.
  */
 function useResolvedMediaUrl(
   source: InlineFilePreviewSource,
   previewUrl: string,
-  fileAccess: FileAccessPolicy
+  fileAccess: FileAccessPolicy,
+  allowStreaming: boolean
 ): string {
   const fileId = source.fileId
+  const canStream =
+    allowStreaming && Boolean(fileId) && Boolean(fileAccess.getStreamingUrl)
   const needsBlobFetch = Boolean(fileId) && (fileAccess.requiresBlobFetch ?? true)
-  const [resolvedUrl, setResolvedUrl] = useState(needsBlobFetch ? '' : previewUrl)
+  const [resolvedUrl, setResolvedUrl] = useState(
+    canStream || needsBlobFetch ? '' : previewUrl
+  )
 
   useEffect(() => {
     let objectUrl: string | null = null
     let isCancelled = false
 
-    setResolvedUrl(needsBlobFetch ? '' : previewUrl)
+    setResolvedUrl(canStream || needsBlobFetch ? '' : previewUrl)
 
-    const loadAuthenticatedMedia = async () => {
+    const loadBlobOrDirect = async () => {
       if (!needsBlobFetch || !fileId) return
       try {
         const response = await fileAccess.request(fileAccess.previewUrl(fileId), {
@@ -90,13 +107,30 @@ function useResolvedMediaUrl(
       }
     }
 
-    void loadAuthenticatedMedia()
+    const loadMedia = async () => {
+      if (!fileId) return
+      if (canStream && fileAccess.getStreamingUrl) {
+        try {
+          const streamingUrl = await fileAccess.getStreamingUrl(fileId)
+          if (isCancelled) return
+          setResolvedUrl(streamingUrl)
+          return
+        } catch {
+          // Ticket minting failed -- fall through to the blob/direct path
+          // below instead of a permanent spinner.
+        }
+      }
+      if (isCancelled) return
+      await loadBlobOrDirect()
+    }
+
+    void loadMedia()
 
     return () => {
       isCancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [fileAccess, fileId, needsBlobFetch, previewUrl])
+  }, [fileAccess, fileId, canStream, needsBlobFetch, previewUrl])
 
   return resolvedUrl
 }
@@ -116,7 +150,7 @@ function InlineImagePreview({
   onFileClick?: (filePath: string, fileName: string) => void
   fileAccess: FileAccessPolicy
 }) {
-  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
+  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess, false)
 
   const handleClick = (event: React.MouseEvent<HTMLImageElement>) => {
     if (!onFileClick || !source.fileId) return
@@ -179,7 +213,7 @@ function InlineMediaPreview({
     media: { onError: () => void; onLoaded: () => void }
   ) => React.ReactNode
 }) {
-  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess)
+  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess, true)
   const [failedUrl, setFailedUrl] = useState('')
   const [loadedUrl, setLoadedUrl] = useState('')
   // Terminal load failure only: useResolvedMediaUrl already falls back from

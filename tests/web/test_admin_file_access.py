@@ -601,3 +601,247 @@ class TestAdminFileAccess:
         # that exactly, not just "not the public value" -- a regression that
         # set some other Cache-Control here would slip past a weaker check.
         assert "cache-control" not in response.headers
+
+    def test_stream_ticket_authorizes_preview_without_bearer_header(
+        self, test_db, temp_uploads_dir
+    ):
+        # A media element (<video>/<audio>) cannot send an Authorization
+        # header, so it loads the preview URL directly using a ticket minted
+        # by a Bearer-authenticated request instead.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=90,
+            user_id=regular_user_id,
+            title="Stream ticket test",
+            description="stream ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers=user_headers,
+        )
+        assert ticket_response.status_code == 200
+        path = ticket_response.json()["path"]
+        assert path.startswith(f"/api/files/preview/{uploaded_file.file_id}?ticket=")
+
+        preview_response = client.get(path)
+
+        assert preview_response.status_code == 200
+        assert preview_response.content == b"video bytes"
+        assert preview_response.headers["cache-control"] == "private, no-store"
+
+    def test_stream_ticket_cannot_be_replayed_against_a_different_file(
+        self, test_db, temp_uploads_dir
+    ):
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=91,
+            user_id=regular_user_id,
+            title="Stream ticket scope test",
+            description="stream ticket scope test",
+        )
+        session.add(task)
+        session.commit()
+
+        clip = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+        other_clip = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "other.mp4",
+            "other video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{clip.file_id}", headers=user_headers
+        )
+        ticket = ticket_response.json()["path"].split("ticket=")[1]
+
+        response = client.get(
+            f"/api/files/preview/{other_clip.file_id}", params={"ticket": ticket}
+        )
+
+        assert response.status_code == 401
+
+    def test_stream_ticket_cannot_bypass_file_ownership_check(
+        self, test_db, temp_uploads_dir
+    ):
+        # Minting a ticket never checks ownership -- it defers to the same
+        # _check_file_access the Bearer path enforces at redemption time. A
+        # ticket minted for a file the caller doesn't own must still 403
+        # rather than leak the file.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        another_user = User(
+            username="another_ticket_user",
+            password_hash=hash_password("another"),
+            is_admin=False,
+        )
+        session.add(another_user)
+        session.commit()
+
+        another_user_id = int(cast(Any, another_user.id))
+        task = Task(
+            id=92,
+            user_id=another_user_id,
+            title="Owner-only file",
+            description="owner-only file",
+        )
+        session.add(task)
+        session.commit()
+
+        owners_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            another_user_id,
+            int(cast(Any, task.id)),
+            "private.mp4",
+            "private video bytes",
+        )
+
+        client = TestClient(test_app)
+        regular_user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{owners_file.file_id}",
+            headers=regular_user_headers,
+        )
+        assert ticket_response.status_code == 200
+        ticket = ticket_response.json()["path"].split("ticket=")[1]
+
+        response = client.get(
+            f"/api/files/preview/{owners_file.file_id}", params={"ticket": ticket}
+        )
+
+        assert response.status_code == 403
+
+    def test_preview_rejects_garbage_ticket(self, test_db, temp_uploads_dir):
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=93,
+            user_id=regular_user_id,
+            title="Garbage ticket test",
+            description="garbage ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": "not-a-real-jwt"},
+        )
+
+        assert response.status_code == 401
+
+    def test_preview_rejects_expired_ticket(self, test_db, temp_uploads_dir):
+        from datetime import datetime, timedelta, timezone
+
+        import jwt as pyjwt
+
+        from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=94,
+            user_id=regular_user_id,
+            title="Expired ticket test",
+            description="expired ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        expired_ticket = pyjwt.encode(
+            {
+                "type": "file_stream_ticket",
+                "sub": regular_user.username,
+                "user_id": regular_user.id,
+                "file_id": uploaded_file.file_id,
+                "exp": datetime.now(timezone.utc) - timedelta(minutes=1),
+            },
+            JWT_SECRET_KEY,
+            algorithm=JWT_ALGORITHM,
+        )
+
+        client = TestClient(test_app)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": expired_ticket},
+        )
+
+        assert response.status_code == 401
+
+    def test_preview_requires_bearer_or_ticket(self, test_db, temp_uploads_dir):
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=95,
+            user_id=regular_user_id,
+            title="No credential test",
+            description="no credential test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        response = client.get(f"/api/files/preview/{uploaded_file.file_id}")
+
+        assert response.status_code == 401

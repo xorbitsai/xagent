@@ -29,6 +29,14 @@ export interface FileAccessPolicy {
    * capability get the conservative blob path.
    */
   requiresBlobFetch?: boolean
+  /**
+   * Mint a short-lived, file-scoped ticket and return a URL a media
+   * element can load directly, preserving HTTP range requests even under
+   * a policy whose previewUrl otherwise requires an Authorization header.
+   * When present, this takes priority over requiresBlobFetch; failure
+   * (e.g. offline) falls back to that capability instead.
+   */
+  getStreamingUrl?: (fileId: string) => Promise<string>
 }
 
 const encodeFileId = (fileId: string) => encodeURIComponent(fileId)
@@ -56,8 +64,19 @@ const defaultFileAccessPolicy: FileAccessPolicy = {
     return apiRequest(buildUrl(`/api/files/list?${params.toString()}`))
   },
   // previewUrl needs the Bearer header apiRequest attaches; media elements
-  // cannot send it, so they must go through the blob fetch.
+  // cannot send it, so they must go through the blob fetch unless a
+  // streaming ticket is available (see getStreamingUrl below).
   requiresBlobFetch: true,
+  getStreamingUrl: async (fileId) => {
+    const response = await apiRequest(
+      buildUrl(`/api/files/stream-tickets/${encodeFileId(fileId)}`),
+    )
+    if (!response.ok) {
+      throw new Error(`Failed to mint stream ticket: ${response.status}`)
+    }
+    const data: { path: string } = await response.json()
+    return buildUrl(data.path)
+  },
 }
 
 const FileAccessContext = createContext<FileAccessPolicy>(defaultFileAccessPolicy)

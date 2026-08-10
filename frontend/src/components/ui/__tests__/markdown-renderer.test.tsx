@@ -789,6 +789,10 @@ describe('MarkdownRenderer', () => {
   })
 
   it('keeps a playing audio element mounted when surrounding page callbacks update', async () => {
+    // The mocked response has no .json(), so the leading stream-ticket
+    // mint attempt (useResolvedMediaUrl's strategy 1, audio/video only)
+    // throws and falls through to the blob fetch -- two calls per load,
+    // not one, but still none on rerender.
     apiRequestMock.mockResolvedValue({
       ok: true,
       blob: async () => new Blob(['audio-bytes'], { type: 'audio/mpeg' }),
@@ -799,6 +803,7 @@ describe('MarkdownRenderer', () => {
     )
 
     const audioBeforeUpdate = await screen.findByLabelText('podcast.mp3')
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(2))
 
     // Trace and task events update the surrounding chat message and create new
     // callback props. The media DOM node must survive that rerender so the
@@ -806,7 +811,7 @@ describe('MarkdownRenderer', () => {
     rerender(<MarkdownRenderer content={content} onFileClick={vi.fn()} />)
 
     expect(await screen.findByLabelText('podcast.mp3')).toBe(audioBeforeUpdate)
-    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+    expect(apiRequestMock).toHaveBeenCalledTimes(2)
   })
 
   it('prefers link label over generic file id when determining preview kind', async () => {

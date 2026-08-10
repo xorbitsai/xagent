@@ -224,6 +224,12 @@ def _reset_ops_signals():
 # --------------------------------------------------------------------------
 
 
+# A payload json.dumps cannot walk without recursing forever -- built once,
+# module level, since a circular structure cannot be expressed as a literal
+# inline in a pytest.param call.
+_circular_payload: dict[str, Any] = {}
+_circular_payload["self"] = _circular_payload
+
 _T_P_1_CASES = [
     pytest.param({"kind": "approval"}, ValueError, id="illegal-kind"),
     pytest.param({"kind": 123}, ValueError, id="kind-not-str"),
@@ -248,6 +254,21 @@ _T_P_1_CASES = [
         id="expires-at-non-utc",
     ),
     pytest.param({"request_payload": None}, ValueError, id="payload-none"),
+    pytest.param(
+        {"request_payload": {"when": datetime.now(timezone.utc)}},
+        ValueError,
+        id="payload-not-json-serializable-datetime",
+    ),
+    pytest.param(
+        {"request_payload": _circular_payload},
+        ValueError,
+        id="payload-not-json-serializable-circular",
+    ),
+    pytest.param(
+        {"request_payload": {"value": float("nan")}},
+        ValueError,
+        id="payload-not-json-serializable-nan",
+    ),
     pytest.param({"run_id": ""}, ValueError, id="run-id-empty"),
     pytest.param({"run_id": "x" * 65}, ValueError, id="run-id-too-long"),
     # A list, not any non-str: it has a __len__ (so it would have survived
@@ -1477,6 +1498,41 @@ def test_cm2_owner_state_error_propagates_uncaught(tmp_path: Path) -> None:
                 expires_at=_now() + timedelta(minutes=15),
             )
     assert not isinstance(excinfo.value, IntegrityError)
+    assert db.in_transaction()
+    db.rollback()
+    db.close()
+
+
+def test_cm2b_non_serializable_payload_propagates_through_handoff(
+    tmp_path: Path,
+) -> None:
+    """A request_payload the JSON-serialization probe rejects raises
+    ValueError from stage_interaction_request's own validation block, before
+    any staging SQL is issued -- and, called through interaction_handoff,
+    that ValueError is not one of the six swallowed types, so it propagates
+    out of the with-block uncaught, the same as InteractionOwnerStateError
+    and InteractionHandoffMisuse. A caller must see this as a loud
+    programming-error failure, not a silently degraded turn."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with pytest.raises(ValueError, match="not JSON-serializable"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"self": _circular_payload},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+
+    assert ops_signals.active_degradations() == {}
     assert db.in_transaction()
     db.rollback()
     db.close()

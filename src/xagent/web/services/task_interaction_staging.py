@@ -76,14 +76,24 @@ ever issued. Adding a column CHECK to ``TaskInteractionRequest`` without
 adding the matching Python check here reopens that misclassification
 funnel by one more case.
 
-Two mechanisms, not one: a CHECK violation surfaces as an ``IntegrityError``
-and lands in the misclassification funnel above; a column-length violation
-surfaces as a ``DataError`` on PostgreSQL -- not an ``IntegrityError``, so
-the conflict classifier never sees it, and not in ``_SWALLOWED``, so it
-would escape the handoff entirely -- and is silently accepted on SQLite,
-which does not enforce ``VARCHAR`` length. That asymmetry is why the length
-caps are derived from the model's own column types rather than written as
-literals.
+Three mechanisms, not one. A CHECK violation surfaces as an
+``IntegrityError`` and lands in the misclassification funnel above. A
+column-length violation surfaces as a ``DataError`` on PostgreSQL -- not an
+``IntegrityError``, so the conflict classifier never sees it, and not in
+``_SWALLOWED``, so it would escape the handoff entirely -- and is silently
+accepted on SQLite, which does not enforce ``VARCHAR`` length. That
+asymmetry is why the length caps are derived from the model's own column
+types rather than written as literals. A value ``request_payload`` cannot
+serialize at all is the third: SQLAlchemy's JSON type serializes at bind
+time, inside the INSERT, well past this validation block, and a value that
+fails there raises ``StatementError`` on both backends -- not
+``IntegrityError``, so it would also escape the conflict classifier and
+``_SWALLOWED`` the same way a length violation does. ``request_payload`` is
+probed with ``json.dumps(..., allow_nan=False)`` in this validation block
+for exactly this reason, before the INSERT is ever issued (see that check's
+own comment for why ``allow_nan=False`` is load-bearing: the two backends
+diverge on ``NaN``/``Infinity`` in a way plain ``json.dumps`` would not
+catch).
 
 Two cells this validation block cannot close, by construction: the parent
 ``tasks`` row (``fk_task_interaction_requests_task_id``) or the anchor's
@@ -114,6 +124,7 @@ savepoint) does not work.
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -536,6 +547,47 @@ def _validate_request_fields(
         raise ValueError("request_idempotency_key must be 1-64 URL-safe characters")
     if request_payload is None:
         raise ValueError("request_payload must not be None")
+    # A value that cannot be JSON-serialized at all never reaches this
+    # block's other checks -- it would sail through every one of them (it is
+    # not None, and nothing else here inspects its shape) and fail instead
+    # at bind time, inside the INSERT, as a StatementError on both backends.
+    # StatementError is not IntegrityError, so the post-conflict re-check
+    # would never see it, and it is not in _SWALLOWED either, so it would
+    # escape interaction_handoff entirely instead of degrading like every
+    # other expected failure this module knows how to name. Probing here,
+    # before the INSERT is ever issued, turns that crash into the same
+    # ValueError every other row-13-and-earlier violation raises.
+    #
+    # allow_nan=False is load-bearing, not a strictness knob: the default
+    # json.dumps happily renders float('nan') / float('inf') as the bare
+    # (non-JSON) tokens NaN / Infinity, which round-trips through Python's
+    # own json.loads but is not valid JSON text. The two backends then
+    # diverge on what a real INSERT does with it -- SQLite has no native
+    # JSON type and stores the column as TEXT, so it stores that invalid
+    # JSON verbatim with no complaint at all; PostgreSQL's jsonb parser
+    # rejects it, raising DataError, not StatementError. Passing
+    # allow_nan=False makes this probe raise ValueError for NaN/Infinity
+    # before either of those divergent, backend-specific outcomes is ever
+    # reached, so this validation block rejects the payload the same way
+    # regardless of which backend the caller happens to be running against.
+    #
+    # A payload that is valid JSON but serializes twice (e.g. a dict whose
+    # value is itself already a JSON string) is accepted here: this probe
+    # only checks that request_payload itself is JSON-serializable, not that
+    # its values are not already-serialized JSON text -- double-serialization
+    # is a caller-shape question this primitive does not adjudicate, and it
+    # is well within the size this table's clarification payloads are
+    # expected to carry.
+    #
+    # If this engine is ever configured with a custom json_serializer (it is
+    # not, today -- see xagent/db/sqlite.py and the engine construction this
+    # module's callers use), this probe must derive from that serializer
+    # rather than calling json.dumps directly, or the two could accept
+    # different payloads.
+    try:
+        json.dumps(request_payload, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"request_payload is not JSON-serializable: {exc}") from exc
     utc_offset = expires_at.utcoffset()
     if expires_at.tzinfo is None or utc_offset is None:
         raise ValueError("expires_at must be an aware UTC datetime")

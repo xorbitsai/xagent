@@ -168,6 +168,13 @@ _MAX_LENGTHS: dict[str, int] = {
     # silently stored on SQLite and raises DataError -- not IntegrityError
     # -- on PostgreSQL, so it never enters the conflict classifier and
     # never reaches the swallowed set.
+    #
+    # This derivation assumes every one of these columns is a String(N).
+    # A Text column has no length cap at all -- .type.length reports None
+    # for one -- which would make the length check built from this dict a
+    # silent no-op for that field instead of raising at construction time.
+    # Re-derive this dict's shape if any of these locator columns ever
+    # widens from String(N) to Text.
     name: TaskInteractionRequest.__table__.c[name].type.length
     for name in (
         "run_id",
@@ -648,6 +655,12 @@ def _validate_request_fields(
         raise ValueError("now must be UTC (utcoffset must be zero)")
     if expires_at <= now:
         raise ValueError("expires_at must be after now")
+    # Unlike request_idempotency_key just above (normalized with .strip()),
+    # run_id is never stripped. It arrives from the service's own lease --
+    # not from caller-shaped input -- and is compared verbatim, below,
+    # against anchor.resume_run_partition. Normalizing either side of that
+    # comparison would risk masking a real mismatch between the two instead
+    # of surfacing it as InteractionRunPartitionMismatch.
     if not isinstance(run_id, str):
         raise ValueError(f"run_id must be a str, got {type(run_id).__name__}")
     if not run_id:

@@ -294,14 +294,29 @@ class InteractionOwnerStateError(InteractionHandoffError):
 
 
 class InteractionHandoffMisuse(InteractionHandoffError):
-    """``stage()`` was called more than once inside one handoff.
+    """Raised for either of two ways a caller can misuse the ``with``
+    block, both caught only once the block's body has finished running:
 
-    Deliberately absent from ``_SWALLOWED``: the schema allows exactly one
-    active interaction row per task, so a second ``stage()`` in the same
-    handoff can only fail -- and the handler that would swallow it rolls
-    back the outer savepoint, discarding the first call's row while
-    reporting success. This is a caller bug, classified the same way
-    ``InteractionOwnerStateError`` is: propagate, do not degrade.
+    * ``stage()`` was called more than once inside one handoff. The schema
+      allows exactly one active interaction row per task, so a second
+      ``stage()`` in the same handoff can only fail -- and the handler that
+      would swallow it rolls back the outer savepoint, discarding the first
+      call's row while reporting success.
+    * The caller committed or rolled back the session from inside the
+      ``with`` block -- violating ``interaction_handoff``'s "no I/O in
+      between" obligation -- after ``stage()`` had already succeeded. Both
+      operations end the whole transaction, deactivating this context
+      manager's own outer savepoint along with it; by the time the block
+      exits normally, that savepoint no longer exists to commit. Raising
+      here instead of silently skipping the now-impossible commit matters
+      because skipping would report success for a row whose containment is
+      gone -- the caller's own commit already decided that row's fate one
+      way or the other, and this context manager has no way left to tell
+      which.
+
+    Deliberately absent from ``_SWALLOWED`` in both cases: these are caller
+    bugs, classified the same way ``InteractionOwnerStateError`` is --
+    propagate, do not degrade.
     """
 
 
@@ -1322,4 +1337,10 @@ def interaction_handoff(
             savepoint.rollback()
         raise
     else:
+        if not savepoint.is_active:
+            raise InteractionHandoffMisuse(
+                "the caller committed or rolled back inside the "
+                "interaction_handoff block; the savepoint that contains the "
+                "staged interaction row no longer exists"
+            )
         savepoint.commit()

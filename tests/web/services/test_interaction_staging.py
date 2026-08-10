@@ -1712,6 +1712,49 @@ def test_cm8_degradation_registers_even_after_caller_deactivates_savepoint(
     db.close()
 
 
+@pytest.mark.parametrize("caller_action", ["rollback", "commit"])
+def test_cm8b_normal_exit_after_caller_deactivates_savepoint_raises_misuse(
+    tmp_path: Path, caller_action: str
+) -> None:
+    """T-CM-8's success-path twin: ``h.stage()`` succeeds first, then the
+    caller violates the "no I/O in between" contract by calling
+    ``db.rollback()`` or ``db.commit()`` from inside the with-block. Both
+    end the whole transaction, deactivating this context manager's own
+    outer savepoint the same way T-CM-8 does for the swallowed-exception
+    path -- but here the block's body raises nothing, so the generator
+    resumes at the normal-exit branch, where the savepoint no longer exists
+    to commit. Raising ``InteractionHandoffMisuse`` there instead of
+    silently skipping the now-impossible commit is what this commit fixes:
+    silently skipping would report success for a row whose containment is
+    already gone (see that exception's own docstring)."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with pytest.raises(InteractionHandoffMisuse):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+            if caller_action == "rollback":
+                db.rollback()
+            else:
+                db.commit()
+
+    # Not swallowed: no degradation signal, same as InteractionOwnerStateError.
+    assert ops_signals.active_degradations() == {}
+    db.close()
+
+
 def test_cm9_out_of_vocabulary_task_source_degrades(tmp_path: Path) -> None:
     """T-CM-9: ``origin`` is a frozen copy of ``task.source`` -- an audit
     column recording which surface raised the interaction. A ``task.source``

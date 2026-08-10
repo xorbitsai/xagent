@@ -7,6 +7,7 @@ on:
     paths:
       - 'src/xagent/migrations/**'
       - 'tests/migrations/**'
+      - 'tests/alembic/**'
       - '.github/workflows/test-migrations.yml'
       - 'src/xagent/db/**'
       - 'src/xagent/web/services/gmail_provisioning.py'
@@ -57,6 +58,7 @@ jobs:
           RELEVANT_PATHS=(
             src/xagent/migrations
             tests/migrations
+            tests/alembic
             .github/workflows/test-migrations.yml
             src/xagent/db
             src/xagent/web/services/gmail_provisioning.py
@@ -239,6 +241,20 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_task_status_storage_postgresql.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_requests migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20260809_add_task_interaction_requests.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_requests create_all/migration parity (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_task_interaction_requests_schema_parity.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

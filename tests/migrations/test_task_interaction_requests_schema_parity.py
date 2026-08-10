@@ -140,6 +140,7 @@ def test_sqlite_migration_schema_matches_create_all(tmp_path) -> None:
     assert len(right["checks"]) == len(EXPECTED_CHECK_CONSTRAINT_NAMES)
 
 
+@pytest.mark.postgresql
 def test_postgresql_migration_schema_matches_create_all(
     postgresql_engine_factory,
 ) -> None:

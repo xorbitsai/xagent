@@ -269,6 +269,7 @@ def test_upgrade_is_a_no_op_against_a_create_all_built_table() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgresql
 def test_postgresql_online_upgrade_builds_the_table_and_downgrade_removes_it(
     postgresql_engine_factory,
 ) -> None:
@@ -304,6 +305,7 @@ def test_postgresql_online_upgrade_builds_the_table_and_downgrade_removes_it(
         assert TABLE not in sa.inspect(connection).get_table_names()
 
 
+@pytest.mark.postgresql
 def test_postgresql_online_upgrade_is_idempotent(postgresql_engine_factory) -> None:
     migration = _load_migration_module()
     engine = postgresql_engine_factory("idempotent-upgrade")
@@ -322,6 +324,7 @@ def test_postgresql_online_upgrade_is_idempotent(postgresql_engine_factory) -> N
         assert checks == CHECK_NAMES
 
 
+@pytest.mark.postgresql
 def test_postgresql_online_downgrade_is_idempotent(postgresql_engine_factory) -> None:
     migration = _load_migration_module()
     engine = postgresql_engine_factory("idempotent-downgrade")
@@ -338,6 +341,7 @@ def test_postgresql_online_downgrade_is_idempotent(postgresql_engine_factory) ->
         assert TABLE not in sa.inspect(connection).get_table_names()
 
 
+@pytest.mark.postgresql
 def test_postgresql_downgrade_leaves_no_residue(postgresql_engine_factory) -> None:
     """PostgreSQL counterpart of test_downgrade_leaves_no_residue in
     test_task_interaction_requests_schema_parity.py (SQLite only, tables
@@ -394,6 +398,7 @@ def test_postgresql_downgrade_leaves_no_residue(postgresql_engine_factory) -> No
     assert index_names_after == index_names_before
 
 
+@pytest.mark.postgresql
 def test_postgresql_upgrade_targets_the_search_path_schema_past_a_stale_shadow(
     postgresql_engine_factory,
 ) -> None:

@@ -222,19 +222,33 @@ const nodeText = (children: React.ReactNode): string => {
 
 function resolvePreviewableFileLink({
   fileNameFromPath,
-  fileName,
+  detectionName,
+  displayName,
 }: {
   fileNameFromPath: string
-  fileName: string
+  /**
+   * Name checked for a recognizable media extension. Prefers the link
+   * title over the visible label/alt text: the backend injects the real
+   * filename into the title precisely so it survives even when the model
+   * rewrites the label into descriptive prose that drops the extension.
+   */
+  detectionName: string
+  /**
+   * Name shown to the user (header text, aria-label). Prefers the visible
+   * label/alt text over the title, so the model's own — possibly
+   * localized — wording is what the user sees; the title is an internal
+   * detection hint, not display text.
+   */
+  displayName: string
 }): { previewKind: PreviewableInlineFileKind; displayFilename: string } | null {
   const pathKind = getInlineFilePreviewKind({ filename: fileNameFromPath })
   if (isPreviewableInlineFileKind(pathKind)) {
-    return { previewKind: pathKind, displayFilename: fileName }
+    return { previewKind: pathKind, displayFilename: displayName }
   }
 
-  const labelKind = getInlineFilePreviewKind({ filename: fileName })
-  if (isPreviewableInlineFileKind(labelKind)) {
-    return { previewKind: labelKind, displayFilename: fileName }
+  const detectionKind = getInlineFilePreviewKind({ filename: detectionName })
+  if (isPreviewableInlineFileKind(detectionKind)) {
+    return { previewKind: detectionKind, displayFilename: displayName }
   }
 
   return null
@@ -247,8 +261,16 @@ function containsPreviewFileLinkNode(node: any): boolean {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
     const title = typeof node.properties?.title === 'string' ? node.properties.title : ''
-    const label = title || hastText(node)
-    if (resolvePreviewableFileLink({ fileNameFromPath, fileName: label })) return true
+    const detectionName = title || hastText(node)
+    if (
+      resolvePreviewableFileLink({
+        fileNameFromPath,
+        detectionName,
+        displayName: detectionName,
+      })
+    ) {
+      return true
+    }
   }
   const src = node.properties?.src
   if (typeof src === 'string' && src.startsWith('file:')) {
@@ -329,8 +351,13 @@ function MarkdownLink({
   if (href && href.startsWith('file:')) {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
-    const fileName = title || linkText || fileNameFromPath
-    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const detectionName = title || linkText || fileNameFromPath
+    const displayName = linkText || title || fileNameFromPath
+    const preview = resolvePreviewableFileLink({
+      fileNameFromPath,
+      detectionName,
+      displayName,
+    })
     const fileId = resolveInlineFileId(filePath)
 
     if (filesDisabled) {
@@ -443,18 +470,23 @@ function MarkdownImage({
   if (resolvedSrc.startsWith('file:')) {
     const filePath = resolvedSrc.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
-    const fileName = title || alt || fileNameFromPath
-    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const detectionName = title || alt || fileNameFromPath
+    const displayName = alt || title || fileNameFromPath
+    const preview = resolvePreviewableFileLink({
+      fileNameFromPath,
+      detectionName,
+      displayName,
+    })
     const previewKind = preview?.previewKind ?? 'image'
     if (filesDisabled) {
-      return <span>{presentationTitle || presentationAlt || sanitizeFilesDisabledPresentationText(fileName)}</span>
+      return <span>{presentationTitle || presentationAlt || sanitizeFilesDisabledPresentationText(displayName)}</span>
     }
 
     return (
       <InlineFilePreview
         source={{
           fileId: resolveInlineFileId(filePath),
-          filename: preview?.displayFilename ?? fileName,
+          filename: preview?.displayFilename ?? displayName,
           type: previewKind,
           mimeType: getInlineFilePreviewMimeType(previewKind),
         }}

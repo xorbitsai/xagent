@@ -154,7 +154,11 @@ def test_reconcile_unlinks_record_with_invalid_file_id():
         db.close()
 
 
-def test_reconcile_rewrites_label_to_filename_when_extension_is_missing():
+def test_reconcile_adds_title_and_keeps_label_when_extension_is_missing():
+    # The primary mechanism as of #1202: the model's own (localized) label
+    # survives untouched in the persisted transcript; the real filename
+    # rides in the link *title* instead, which the frontend already prefers
+    # for type detection over the label.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -172,12 +176,12 @@ def test_reconcile_rewrites_label_to_filename_when_extension_is_missing():
             content="[下载视频（MP4）](file:real-id)",
         )
 
-        assert content == "[generated_video.mp4](file:real-id)"
+        assert content == '[下载视频（MP4）](file:real-id "generated_video.mp4")'
     finally:
         db.close()
 
 
-def test_reconcile_rewrites_label_to_filename_for_audio_when_extension_is_missing():
+def test_reconcile_adds_title_for_audio_when_extension_is_missing():
     db, user, task = _create_context()
     try:
         _add_file(
@@ -196,16 +200,16 @@ def test_reconcile_rewrites_label_to_filename_for_audio_when_extension_is_missin
             content="[下载音频（MP3）](file:real-id)",
         )
 
-        assert content == "[generated_podcast.mp3](file:real-id)"
+        assert content == '[下载音频（MP3）](file:real-id "generated_podcast.mp3")'
     finally:
         db.close()
 
 
-def test_reconcile_rewrites_label_for_m4v_extension():
+def test_reconcile_adds_title_for_m4v_extension():
     # Regression test: the frontend's video regex
     # (inline-file-preview-utils.ts) recognizes .m4v, and
-    # artifact_type_for_filename must agree or this rewrite silently
-    # no-ops for .m4v the same way it used to for all audio extensions.
+    # artifact_type_for_filename must agree or this silently no-ops for
+    # .m4v the same way it used to for all audio extensions.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -224,12 +228,12 @@ def test_reconcile_rewrites_label_for_m4v_extension():
             content="[下载视频（M4V）](file:real-id)",
         )
 
-        assert content == "[generated_video.m4v](file:real-id)"
+        assert content == '[下载视频（M4V）](file:real-id "generated_video.m4v")'
     finally:
         db.close()
 
 
-def test_reconcile_rewrites_label_case_insensitively():
+def test_reconcile_adds_title_case_insensitively():
     db, user, task = _create_context()
     try:
         _add_file(
@@ -247,7 +251,33 @@ def test_reconcile_rewrites_label_case_insensitively():
             content="[下载视频](file:real-id)",
         )
 
-        assert content == "[CLIP.MP4](file:real-id)"
+        assert content == '[下载视频](file:real-id "CLIP.MP4")'
+    finally:
+        db.close()
+
+
+def test_reconcile_self_heals_stale_title_to_current_filename():
+    # The title is always overwritten (when the label doesn't already
+    # reveal the type), so a stale title from before a rename can never
+    # linger and point at the wrong file.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="renamed_video.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[下载视频（MP4）](file:real-id "old_video_name.mp4")',
+        )
+
+        assert content == '[下载视频（MP4）](file:real-id "renamed_video.mp4")'
     finally:
         db.close()
 
@@ -332,11 +362,11 @@ def test_reconcile_keeps_mismatched_label_that_already_has_media_extension():
         db.close()
 
 
-def test_reconcile_skips_label_rewrite_for_filename_with_unsafe_chars():
-    # A real filename containing "]" must never be substituted into the
-    # label unescaped -- it would terminate the markdown link early and
-    # drop the file reference entirely, which is worse than leaving the
-    # model's prose label (and its plain-download fallback) in place.
+def test_reconcile_uses_title_for_filename_with_bracket_characters():
+    # A "]" or "[" has no special meaning inside a quoted title (unlike a
+    # label, which the "]" would terminate early), so a bracket-bearing
+    # filename now takes the title path instead of degrading to a plain
+    # download link the way it did before titles existed.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -354,15 +384,41 @@ def test_reconcile_skips_label_rewrite_for_filename_with_unsafe_chars():
             content="[下载视频（MP4）](file:real-id)",
         )
 
-        assert content == "[下载视频（MP4）](file:real-id)"
+        assert content == '[下载视频（MP4）](file:real-id "clip ].mp4")'
     finally:
         db.close()
 
 
-def test_reconcile_skips_label_rewrite_for_filename_with_control_chars():
+def test_reconcile_falls_back_to_label_rewrite_for_filename_with_quote():
+    # A literal double quote can't safely become a title (it would
+    # terminate the title clause early), but has no special meaning in a
+    # label -- falls back to the pre-title label-rewrite mechanism.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename='clip".mp4',
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（MP4）](file:real-id)",
+        )
+
+        assert content == '[clip".mp4](file:real-id)'
+    finally:
+        db.close()
+
+
+def test_reconcile_skips_rewrite_for_filename_unsafe_for_both_title_and_label():
     # A filename containing a blank line would split the paragraph before
-    # CommonMark ever parses the inline link -- same failure mode as "]",
-    # through a different character class.
+    # CommonMark ever parses the inline link, whether substituted into a
+    # label or a title -- leave the reference untouched in that case.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -385,10 +441,11 @@ def test_reconcile_skips_label_rewrite_for_filename_with_control_chars():
         db.close()
 
 
-def test_reconcile_rewrites_label_for_image_syntax_video_reference():
+def test_reconcile_adds_title_for_image_syntax_video_reference():
     # A model may wrap a video in image syntax. The frontend's image
-    # renderer resolves the preview kind from the label, so restoring the
-    # filename there turns a would-be broken <img> into a video player.
+    # renderer resolves the preview kind from title/alt, so adding the
+    # title turns a would-be broken <img> into a video player while the
+    # model's alt text stays untouched.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -406,7 +463,7 @@ def test_reconcile_rewrites_label_for_image_syntax_video_reference():
             content="![预览视频](file:real-id)",
         )
 
-        assert content == "![generated_video.mp4](file:real-id)"
+        assert content == '![预览视频](file:real-id "generated_video.mp4")'
     finally:
         db.close()
 
@@ -437,7 +494,10 @@ def test_reconcile_keeps_alt_text_for_image_syntax_image_reference():
         db.close()
 
 
-def test_reconcile_rewrites_empty_label_to_filename_for_media():
+def test_reconcile_adds_title_for_empty_label_media_reference():
+    # The frontend falls back to the title when the label is empty
+    # (fileName = title || linkText || fileNameFromPath), so an empty label
+    # still gets a working preview once the title carries the filename.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -455,7 +515,65 @@ def test_reconcile_rewrites_empty_label_to_filename_for_media():
             content="[](file:real-id)",
         )
 
-        assert content == "[generated_video.mp4](file:real-id)"
+        assert content == '[](file:real-id "generated_video.mp4")'
+    finally:
+        db.close()
+
+
+def test_reconcile_title_injection_is_idempotent():
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video.mp4",
+        )
+
+        once = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（MP4）](file:real-id)",
+        )
+        twice = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content=once,
+        )
+
+        assert once == '[下载视频（MP4）](file:real-id "generated_video.mp4")'
+        assert twice == once
+    finally:
+        db.close()
+
+
+def test_reconcile_round_trips_single_quote_title_for_non_media_reference():
+    # Title syntax also allows single quotes. Non-media references don't
+    # go through the title-injection logic at all, so this exercises pure
+    # input parsing: the parsed title is preserved and re-serialized with
+    # the double-quote delimiter this function always writes.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="report.pdf",
+            mime_type="application/pdf",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[report](file:real-id 'annual_report_2024.pdf')",
+        )
+
+        assert content == '[report](file:real-id "annual_report_2024.pdf")'
     finally:
         db.close()
 

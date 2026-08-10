@@ -841,9 +841,9 @@ describe('MarkdownRenderer', () => {
   })
 
   it('renders image-syntax video references as an inline video preview', async () => {
-    // The backend restores the filename as the label even for ![...] refs
-    // pointing at media files; the image renderer then resolves the video
-    // kind from the label instead of falling back to a broken <img>.
+    // The image renderer resolves the video kind from alt/title text
+    // instead of falling back to a broken <img> for ![...] refs pointing
+    // at media files.
     apiRequestMock.mockResolvedValue({
       ok: true,
       blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
@@ -852,6 +852,38 @@ describe('MarkdownRenderer', () => {
     render(<MarkdownRenderer content={content} />)
 
     const video = await screen.findByLabelText('puppy_drinking.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+  })
+
+  it('detects video via the link title while displaying the model label', async () => {
+    // The backend (file_reference_output_service.reconcile_assistant_file_
+    // references) adds the real filename as the link *title* rather than
+    // overwriting the label, so a localized label survives while the
+    // frontend still detects the media type from the title.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content =
+      '[下载视频（MP4）](file:550e8400-e29b-41d4-a716-446655440000 "puppy_drinking.mp4")'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('下载视频（MP4）')
+    expect(video.tagName.toLowerCase()).toBe('video')
+    expect(screen.queryByLabelText('puppy_drinking.mp4')).not.toBeInTheDocument()
+    expect(screen.getByText('下载视频（MP4）')).toBeInTheDocument()
+  })
+
+  it('detects video via the image title while displaying the model alt text', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content =
+      '![预览视频](file:550e8400-e29b-41d4-a716-446655440000 "puppy_drinking.mp4")'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('预览视频')
     expect(video.tagName.toLowerCase()).toBe('video')
   })
 

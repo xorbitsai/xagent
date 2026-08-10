@@ -18,7 +18,10 @@ from ..models.uploaded_file import UploadedFile
 logger = logging.getLogger(__name__)
 
 _MARKDOWN_FILE_REFERENCE_RE = re.compile(
-    r"(?P<image>!)?\[(?P<label>[^\]]*)\]\((?P<target>file:[^)\s]+)\)"
+    r"(?P<image>!)?\[(?P<label>[^\]]*)\]\("
+    r"(?P<target>file:[^)\s]+)"
+    r"(?:\s+\"(?P<dtitle>[^\"]*)\"|\s+'(?P<stitle>[^']*)')?"
+    r"\)"
 )
 
 # ``artifact_type_for_filename`` only knows image/video/office extensions
@@ -61,7 +64,20 @@ def _is_inline_preview_media(filename: str) -> bool:
 # label boundary at the escaped bracket. Skipping the rewrite for these
 # filenames is the safe, idempotent choice; the link still falls back to a
 # plain download label.
+#
+# Used as the fallback path when a filename is unsafe for the *title*
+# (below) — the two hazards are mostly disjoint, so a filename can safely
+# carry a title while remaining unsafe as a label (or vice versa).
 _UNSAFE_LABEL_RE = re.compile(r"[\[\]\\\x00-\x1f\x7f]")
+
+# The primary mechanism (see ``reconcile_assistant_file_references``): carry
+# the real filename in the link *title* rather than overwriting the label,
+# so the model's own (possibly localized) prose survives in the persisted
+# transcript. A title is delimited by a double quote here, so an embedded
+# ``"`` would terminate it early — same class of hazard as ``]`` for a
+# label, same reasoning for why skipping beats escaping. Control characters
+# are unsafe for the same paragraph-splitting reason as `_UNSAFE_LABEL_RE`.
+_UNSAFE_TITLE_RE = re.compile(r'["\x00-\x1f\x7f]')
 
 
 def load_assistant_file_reference_records(
@@ -161,17 +177,57 @@ def reconcile_assistant_file_references(
             return label
 
         display_label = label
+        display_title = match.group("dtitle")
+        if display_title is None:
+            display_title = match.group("stitle")
         filename = str(record.filename or "")
         # Applies to ``![...]`` references too: _is_inline_preview_media only
         # matches video/audio, so genuine image alt text is never touched,
-        # while a model that wraps a video in image syntax still gets a label
-        # the frontend can classify (its image renderer resolves the preview
-        # kind from the label and would otherwise fall back to a broken img).
-        if _is_inline_preview_media(filename) and not _UNSAFE_LABEL_RE.search(filename):
+        # while a model that wraps a video in image syntax still gets a
+        # title the frontend can classify (its image renderer resolves the
+        # preview kind from title/alt and would otherwise fall back to a
+        # broken img).
+        if _is_inline_preview_media(filename):
             suffix = Path(filename).suffix.casefold()
-            if suffix and not label.strip().casefold().endswith(suffix):
-                display_label = filename
+            # Only intervene when the label alone can't already be
+            # classified by the frontend -- mirrors the pre-title behavior
+            # exactly, just preferring a title over overwriting the label
+            # when intervention is needed. A label that already reveals the
+            # type is left alone even if it names a different file than the
+            # record (see test_reconcile_keeps_mismatched_label_...): there
+            # is no signal that a coincidental extension match is wrong.
+            label_reveals_type = bool(suffix) and label.strip().casefold().endswith(
+                suffix
+            )
+            if not label_reveals_type:
+                if not _UNSAFE_TITLE_RE.search(filename):
+                    # Primary mechanism: carry the real filename in the
+                    # title so the frontend can still detect the media
+                    # type, while the model's own (possibly localized)
+                    # label survives untouched in the persisted transcript.
+                    # Always overwrites any parsed title so this stays
+                    # idempotent and self-heals if the canonical filename
+                    # ever changes.
+                    display_title = filename
+                elif not _UNSAFE_LABEL_RE.search(filename):
+                    # Filename has a quote character and can't safely
+                    # become a title. Fall back to the pre-title mechanism:
+                    # overwrite the label itself. Drop any parsed title
+                    # too, so a stale title never survives alongside a
+                    # freshly rewritten label.
+                    display_title = None
+                    display_label = filename
+                # else: unsafe for both title and label -- leave the
+                # reference untouched; it degrades to a plain download
+                # link on the frontend, same as any other undetectable
+                # file type.
 
+        # A pass-through title (parsed from single-quote syntax, which
+        # allows an embedded double quote) could be unsafe to re-emit with
+        # the double-quote delimiter this function always writes. Drop it
+        # rather than escape it -- same reasoning as `_UNSAFE_LABEL_RE`.
+        if display_title and not _UNSAFE_TITLE_RE.search(display_title):
+            return f'{prefix}[{display_label}]({canonical_ref} "{display_title}")'
         return f"{prefix}[{display_label}]({canonical_ref})"
 
     return _MARKDOWN_FILE_REFERENCE_RE.sub(replacement, content)

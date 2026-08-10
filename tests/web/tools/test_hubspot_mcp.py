@@ -219,9 +219,52 @@ def test_list_forms_returns_raw_results(monkeypatch):
         "status": "success",
         "forms": [{"id": "f1", "name": "Contact Us"}],
         "has_more": False,
+        "after": None,
     }
     assert mock_request.call_args.kwargs["url"].endswith("/marketing/v3/forms")
     assert mock_request.call_args.kwargs["params"] == {"limit": 5}
+
+
+def test_list_forms_clamps_limit_to_valid_range(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_list_forms(limit=0)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 1
+
+    hubspot.hubspot_list_forms(limit=1000)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 100
+
+
+def test_list_forms_reports_has_more_and_passes_after_cursor(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [{"id": "f1"}],
+                "paging": {"next": {"after": "cursor-1"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_forms(after="cursor-0"))
+
+    assert result["has_more"] is True
+    assert result["after"] == "cursor-1"
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-0"
+
+
+def test_list_forms_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_list_forms())
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
 
 
 def test_get_form_submissions_reports_has_more(monkeypatch):
@@ -239,9 +282,48 @@ def test_get_form_submissions_reports_has_more(monkeypatch):
 
     assert result["status"] == "success"
     assert result["has_more"] is True
+    assert result["after"] == "cursor-1"
     assert mock_request.call_args.kwargs["url"].endswith(
         "/form-integrations/v1/submissions/forms/form-1"
     )
+
+
+def test_get_form_submissions_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_get_form_submissions("form-1"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
+def test_get_analytics_report_rejects_invalid_report_type(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_analytics_report("not-a-real-type"))
+
+    assert result["status"] == "error"
+    assert "report_type must be one of" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_analytics_report_accepts_all_documented_report_types(monkeypatch):
+    """Every documented dimension and content object type must pass the
+    allowlist - a wrong entry here actively blocks valid HubSpot values."""
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    for report_type in sorted(hubspot._VALID_ANALYTICS_REPORT_TYPES):
+        result = json.loads(hubspot.hubspot_get_analytics_report(report_type))
+        assert result["status"] == "success", report_type
+        assert mock_request.call_args.kwargs["url"].endswith(
+            f"/analytics/v2/reports/{report_type}/total"
+        )
 
 
 def test_get_analytics_report_rejects_invalid_breakdown(monkeypatch):
@@ -261,18 +343,31 @@ def test_get_analytics_report_passes_date_range(monkeypatch):
 
     result = json.loads(
         hubspot.hubspot_get_analytics_report(
-            "sources", "day", start_date="20260101", end_date="20260131"
+            "sources", "daily", start_date="20260101", end_date="20260131"
         )
     )
 
     assert result == {"status": "success", "report": {"totals": {}}}
     assert mock_request.call_args.kwargs["url"].endswith(
-        "/analytics/v2/reports/sources/day"
+        "/analytics/v2/reports/sources/daily"
     )
     assert mock_request.call_args.kwargs["params"] == {
         "start": "20260101",
         "end": "20260131",
     }
+
+
+def test_get_analytics_report_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_get_analytics_report("sources"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
 
 
 def test_list_marketing_emails_returns_raw_results(monkeypatch):
@@ -287,8 +382,51 @@ def test_list_marketing_emails_returns_raw_results(monkeypatch):
         "status": "success",
         "emails": [{"id": "e1"}],
         "has_more": False,
+        "after": None,
     }
     assert mock_request.call_args.kwargs["url"].endswith("/marketing/v3/emails")
+
+
+def test_list_marketing_emails_clamps_limit_to_valid_range(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_list_marketing_emails(limit=0)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 1
+
+    hubspot.hubspot_list_marketing_emails(limit=1000)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 100
+
+
+def test_list_marketing_emails_reports_has_more_and_after(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [{"id": "e1"}],
+                "paging": {"next": {"after": "cursor-1"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_marketing_emails(after="cursor-0"))
+
+    assert result["has_more"] is True
+    assert result["after"] == "cursor-1"
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-0"
+
+
+def test_list_marketing_emails_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_list_marketing_emails())
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
 
 
 def test_get_marketing_email_statistics_passes_email_ids(monkeypatch):
@@ -299,8 +437,36 @@ def test_get_marketing_email_statistics_passes_email_ids(monkeypatch):
 
     result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1, e2"))
 
-    assert result == {"status": "success", "statistics": [{"id": "e1"}]}
+    assert result == {
+        "status": "success",
+        "statistics": {"results": [{"id": "e1"}]},
+    }
     assert mock_request.call_args.kwargs["params"] == {"emailIds": ["e1", "e2"]}
+    assert mock_request.call_args.kwargs["method"] == "GET"
+
+
+def test_get_marketing_email_statistics_rejects_empty_email_ids(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_marketing_email_statistics(" , "))
+
+    assert result["status"] == "error"
+    assert "at least one email id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_marketing_email_statistics_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
 
 
 def test_list_campaigns_returns_raw_results(monkeypatch):
@@ -315,8 +481,51 @@ def test_list_campaigns_returns_raw_results(monkeypatch):
         "status": "success",
         "campaigns": [{"id": "c1"}],
         "has_more": False,
+        "after": None,
     }
     assert mock_request.call_args.kwargs["url"].endswith("/marketing/v3/campaigns")
+
+
+def test_list_campaigns_clamps_limit_to_valid_range(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_list_campaigns(limit=0)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 1
+
+    hubspot.hubspot_list_campaigns(limit=1000)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 100
+
+
+def test_list_campaigns_reports_has_more_and_after(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [{"id": "c1"}],
+                "paging": {"next": {"after": "cursor-1"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_campaigns(after="cursor-0"))
+
+    assert result["has_more"] is True
+    assert result["after"] == "cursor-1"
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-0"
+
+
+def test_list_campaigns_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_list_campaigns())
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
 
 
 def test_get_campaign_metrics_passes_date_range(monkeypatch):
@@ -337,3 +546,16 @@ def test_get_campaign_metrics_passes_date_range(monkeypatch):
         "startDate": "2026-01-01",
         "endDate": "2026-01-31",
     }
+
+
+def test_get_campaign_metrics_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_get_campaign_metrics("campaign-1"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]

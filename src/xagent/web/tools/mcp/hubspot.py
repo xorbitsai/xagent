@@ -61,7 +61,25 @@ _NOTE_ASSOCIATION_TYPE_IDS = {"contact": 202, "company": 190, "deal": 214}
 
 _ASSOCIATION_PAGE_SIZE = 100
 
-_VALID_ANALYTICS_BREAKDOWNS = {"total", "day", "week", "month"}
+_VALID_ANALYTICS_BREAKDOWNS = {"total", "daily", "weekly", "monthly"}
+# Union of the two documented /analytics/v2/reports variants: breakdowns
+# (totals, sessions, sources, ...) and content object types (forms, pages,
+# ...). Both share the same URL shape.
+_VALID_ANALYTICS_REPORT_TYPES = {
+    "totals",
+    "sessions",
+    "sources",
+    "geolocation",
+    "utm-campaigns",
+    "utm-contents",
+    "utm-mediums",
+    "utm-sources",
+    "utm-terms",
+    "event-completions",
+    "forms",
+    "pages",
+    "social-assists",
+}
 
 
 def _success(**payload: Any) -> str:
@@ -409,41 +427,55 @@ def hubspot_create_note(
 
 
 @mcp.tool()
-def hubspot_list_forms(limit: int = 20) -> str:
+def hubspot_list_forms(limit: int = 20, after: str | None = None) -> str:
     """
     List HubSpot marketing forms, including id and full form metadata
     (name, field groups, etc.). Returns at most `limit` forms (max 100);
     `has_more` is true when the portal has additional forms beyond the
-    result. Use hubspot_get_form_submissions to pull the submissions
+    result, and `after` is the cursor to pass back in to fetch the next
+    page. Use hubspot_get_form_submissions to pull the submissions
     collected by a specific form.
     """
     try:
-        result = _request(
-            "GET", "/marketing/v3/forms", params={"limit": max(1, min(limit, 100))}
+        params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        if after:
+            params["after"] = after
+        result = _request("GET", "/marketing/v3/forms", params=params)
+        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+        return _success(
+            forms=result.get("results", []),
+            has_more=bool(next_after),
+            after=next_after,
         )
-        has_more = bool((result.get("paging") or {}).get("next"))
-        return _success(forms=result.get("results", []), has_more=has_more)
     except Exception as e:
         logger.error(f"Error listing forms: {e}")
         return _error(str(e))
 
 
 @mcp.tool()
-def hubspot_get_form_submissions(form_id: str, limit: int = 20) -> str:
+def hubspot_get_form_submissions(
+    form_id: str, limit: int = 20, after: str | None = None
+) -> str:
     """
     Get recent submissions for a HubSpot form, including submitted field
     values, submission timestamp, and page URL. Returns at most `limit`
     submissions (max 50); `has_more` is true when the form has additional
-    submissions beyond the result.
+    submissions beyond the result, and `after` is the cursor to pass back
+    in to fetch the next page.
     """
     try:
+        params: dict[str, Any] = {"limit": max(1, min(limit, 50))}
+        if after:
+            params["after"] = after
         result = _request(
-            "GET",
-            f"/form-integrations/v1/submissions/forms/{form_id}",
-            params={"limit": max(1, min(limit, 50))},
+            "GET", f"/form-integrations/v1/submissions/forms/{form_id}", params=params
         )
-        has_more = bool((result.get("paging") or {}).get("next"))
-        return _success(submissions=result.get("results", []), has_more=has_more)
+        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+        return _success(
+            submissions=result.get("results", []),
+            has_more=bool(next_after),
+            after=next_after,
+        )
     except Exception as e:
         logger.error(f"Error getting form submissions: {e}")
         return _error(str(e))
@@ -458,10 +490,12 @@ def hubspot_get_analytics_report(
 ) -> str:
     """
     Get a HubSpot traffic analytics report. `report_type` is a HubSpot
-    analytics dimension such as "sources", "utm-campaigns", "landing-pages",
-    "pages", or "geolocation". `breakdown` is "total", "day", "week", or
-    "month". `start_date`/`end_date` are optional "YYYYMMDD" strings that
-    limit the reporting window.
+    analytics dimension ("totals", "sessions", "sources", "geolocation",
+    "utm-campaigns", "utm-contents", "utm-mediums", "utm-sources",
+    "utm-terms") or content object type ("event-completions", "forms",
+    "pages", "social-assists"). `breakdown` is "total", "daily", "weekly",
+    or "monthly". `start_date`/`end_date` are optional "YYYYMMDD" strings
+    that limit the reporting window.
 
     Note: this covers HubSpot's traffic/analytics dimensions, not
     custom reports or dashboards built in the HubSpot report editor -
@@ -470,6 +504,10 @@ def hubspot_get_analytics_report(
     not supported by this HubSpot API.
     """
     try:
+        if report_type not in _VALID_ANALYTICS_REPORT_TYPES:
+            raise ValueError(
+                f"report_type must be one of {sorted(_VALID_ANALYTICS_REPORT_TYPES)}"
+            )
         if breakdown not in _VALID_ANALYTICS_BREAKDOWNS:
             raise ValueError(
                 f"breakdown must be one of {sorted(_VALID_ANALYTICS_BREAKDOWNS)}"
@@ -489,20 +527,26 @@ def hubspot_get_analytics_report(
 
 
 @mcp.tool()
-def hubspot_list_marketing_emails(limit: int = 20) -> str:
+def hubspot_list_marketing_emails(limit: int = 20, after: str | None = None) -> str:
     """
     List HubSpot marketing emails, including id and full email metadata
     (name, subject, state, publish date, etc.). Returns at most `limit`
     emails (max 100); `has_more` is true when the portal has additional
-    emails beyond the result. Use hubspot_get_marketing_email_statistics
-    for performance metrics on a specific email.
+    emails beyond the result, and `after` is the cursor to pass back in to
+    fetch the next page. Use hubspot_get_marketing_email_statistics for
+    performance metrics on a specific email.
     """
     try:
-        result = _request(
-            "GET", "/marketing/v3/emails", params={"limit": max(1, min(limit, 100))}
+        params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        if after:
+            params["after"] = after
+        result = _request("GET", "/marketing/v3/emails", params=params)
+        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+        return _success(
+            emails=result.get("results", []),
+            has_more=bool(next_after),
+            after=next_after,
         )
-        has_more = bool((result.get("paging") or {}).get("next"))
-        return _success(emails=result.get("results", []), has_more=has_more)
     except Exception as e:
         logger.error(f"Error listing marketing emails: {e}")
         return _error(str(e))
@@ -519,6 +563,10 @@ def hubspot_get_marketing_email_statistics(email_ids: str) -> str:
         ids = [
             email_id.strip() for email_id in email_ids.split(",") if email_id.strip()
         ]
+        if not ids:
+            # Without this, an empty emailIds list is dropped from the query
+            # entirely and HubSpot returns statistics for every email.
+            raise ValueError("email_ids must contain at least one email id")
         result = _request(
             "GET",
             "/marketing/v3/emails/statistics/list",
@@ -527,29 +575,33 @@ def hubspot_get_marketing_email_statistics(email_ids: str) -> str:
             # shape rather than a single comma-joined value.
             params={"emailIds": ids},
         )
-        return _success(statistics=result.get("results", result))
+        return _success(statistics=result)
     except Exception as e:
         logger.error(f"Error getting marketing email statistics: {e}")
         return _error(str(e))
 
 
 @mcp.tool()
-def hubspot_list_campaigns(limit: int = 20) -> str:
+def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
     """
     List HubSpot marketing campaigns, including id and full campaign
     properties (name, status, date range, etc.). Returns at most `limit`
     campaigns (max 100); `has_more` is true when the portal has additional
-    campaigns beyond the result. Use hubspot_get_campaign_metrics for
+    campaigns beyond the result, and `after` is the cursor to pass back in
+    to fetch the next page. Use hubspot_get_campaign_metrics for
     performance metrics on a specific campaign.
     """
     try:
-        result = _request(
-            "GET",
-            "/marketing/v3/campaigns",
-            params={"limit": max(1, min(limit, 100))},
+        params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        if after:
+            params["after"] = after
+        result = _request("GET", "/marketing/v3/campaigns", params=params)
+        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+        return _success(
+            campaigns=result.get("results", []),
+            has_more=bool(next_after),
+            after=next_after,
         )
-        has_more = bool((result.get("paging") or {}).get("next"))
-        return _success(campaigns=result.get("results", []), has_more=has_more)
     except Exception as e:
         logger.error(f"Error listing campaigns: {e}")
         return _error(str(e))

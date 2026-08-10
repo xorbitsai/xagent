@@ -17,7 +17,10 @@ setup_proxy_env()
 mcp = FastMCP("hubspot-mcp")
 
 HUBSPOT_BASE_URL = "https://api.hubapi.com"
-DEFAULT_TIMEOUT_SECONDS = 30
+# Association listing (e.g. contact-to-deal) can be slow to respond on
+# portals with tens of thousands of contacts; 30s was observed timing out
+# on those pulls.
+DEFAULT_TIMEOUT_SECONDS = 90
 
 DEFAULT_CONTACT_PROPERTIES = [
     "email",

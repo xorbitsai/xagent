@@ -12,10 +12,11 @@ The gate is removable only by the change that wires all three finalizers, adds
 the Task-side protocol marker, and switches the read surface together. Removing
 it piecemeal recreates the divergence it was written to prevent.
 
-Being on the wiring batch's list of changes to make together does not, on its
-own, grant permission to remove this gate: the condition above -- all three
-finalizers, the protocol marker, and the read surface, together, in one
-change -- is what actually retires it, not mere membership in that batch.
+Being part of the change that wires the first production caller does not, on
+its own, grant permission to remove this gate: the condition above -- all
+three finalizers, the protocol marker, and the read surface, together, in
+one change -- is what actually retires it, not mere membership in that
+change.
 
 AST, not substring grep: a source-text scan would also match this test file's
 own docstrings and this module's own definitions of the two gated names,
@@ -24,6 +25,10 @@ forcing every future mention of ``stage_interaction_request`` or
 ``test_trace_event_staging.py::test_trace_event_staging_module_sends_no_notifications``
 for the precedent this follows -- the trace staging work moved that check from
 substring to AST for the identical reason.
+
+Dynamic access is out of scope: ``importlib.import_module(...)`` plus
+``getattr(...)`` matches none of the node shapes above. The gate pins the
+ordinary import-and-call surface, not every conceivable route.
 """
 
 from __future__ import annotations

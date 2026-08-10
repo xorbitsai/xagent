@@ -632,7 +632,7 @@ def test_p5_same_run_tombstone_stays_closed(tmp_path: Path) -> None:
 
 
 def test_p5b_identity_is_run_scoped_not_task_scoped(tmp_path: Path) -> None:
-    """§7.1: the same idempotency key used by two different runs on the same
+    """The same idempotency key used by two different runs on the same
     task must not be conflated -- each run's step-4 pre-read must only ever
     see rows from its own run. Regression for a step-4 predicate that
     forgets run_id and falls back to task-scoped identity: without run_id in
@@ -1131,7 +1131,7 @@ def test_p11_replay_ignores_expiry(tmp_path: Path) -> None:
 def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """M-3 regression: the reclaim UPDATE (step 5) stays in the outer
+    """Regression pin: the reclaim UPDATE (step 5) stays in the outer
     transaction, not the inner savepoint that wraps the INSERT (step 6), so
     an INSERT-time conflict on this same call does not undo a genuine
     reclaim that same call already performed.
@@ -1154,13 +1154,13 @@ def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
     concurrent interleaving with a write already in flight is not
     constructible on this backend at all.
 
-    So this drives the interleaving directly instead -- sanctioned by this
-    PR's own design record (§3.3 A-2: construct REPLAY-after-conflict with
-    two sessions *or* by calling the primitive's internals directly) -- by
-    forcing the INSERT's own flush to fail exactly once, without a second
-    connection: what matters for this mutation is only where the reclaim
-    statement sits relative to the inner savepoint boundary, not why the
-    INSERT failed.
+    So this drives the interleaving directly instead -- constructing
+    REPLAY-after-conflict via two racing sessions or by calling the
+    primitive's internals directly are both valid, and this uses the
+    latter -- by forcing the INSERT's own flush to fail exactly once,
+    without a second connection: what matters for this mutation is only
+    where the reclaim statement sits relative to the inner savepoint
+    boundary, not why the INSERT failed.
     """
 
     engine = _engine(tmp_path)
@@ -1260,8 +1260,8 @@ _T_CM_1_CASES = [
 
 @pytest.mark.parametrize("case", _T_CM_1_CASES)
 def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
-    """T-CM-1, widened to six cells: the four exceptions the book's design
-    names, plus InteractionRunPartitionMismatch (swallowed under this module's
+    """T-CM-1, widened to six cells: the four dedicated exception types,
+    plus InteractionRunPartitionMismatch (swallowed under this module's
     F-3 override, see the CM's docstring), plus REPLAY-after-conflict as
     the successful-return control. Every cell: (a) the with-block exits
     without the exception escaping; (b) exactly the swallowed exceptions

@@ -1,8 +1,8 @@
 """Savepoint containment (T-SP group) on PostgreSQL.
 
 Companion to test_interaction_staging.py, which carries every other group
-(T-P, T-CM, T-GATE) plus its own copy of T-SP for SQLite. Per this PR's own
-cut-line decision: T-P validates Python-side validation and statement
+(T-P, T-CM, T-GATE) plus its own copy of T-SP for SQLite. Per this suite's
+own cut-line decision: T-P validates Python-side validation and statement
 sequencing, both dialect-independent; the full 23-CHECK constraint set is
 already pinned on both backends by test_task_interaction_schema.py /
 test_task_interaction_schema_postgresql.py (50 PostgreSQL tests), so
@@ -17,15 +17,14 @@ does not.
 Fixture pattern: originally the same init_db + Base.metadata.drop_all/
 create_all against the whole XAGENT_TEST_POSTGRES_URL database that
 test_task_interaction_schema_postgresql.py uses -- an existing convention,
-not invented for this PR. Switched to a disposable, uniquely-named schema
-instead (CREATE SCHEMA / DROP SCHEMA CASCADE, matching this PR's own design
-audit probes -- see task_interaction_staging.py's module history) after
-init_db()'s automatic-upgrade check started failing here with the shared
-XAGENT_TEST_POSTGRES_URL database's alembic_version stamped to a migration
-this worktree doesn't recognize (confirmed independent of this PR: the
-same failure reproduces against test_task_interaction_schema_postgresql.py
-unchanged). That table lives in the database's default schema, is global
-to the whole server-side database, and is not itself disposable -- another
+not invented here. Switched to a disposable, uniquely-named schema instead
+(CREATE SCHEMA / DROP SCHEMA CASCADE) after init_db()'s automatic-upgrade
+check started failing here with the shared XAGENT_TEST_POSTGRES_URL
+database's alembic_version stamped to a migration this worktree doesn't
+recognize (confirmed independently: the same failure reproduces against
+test_task_interaction_schema_postgresql.py unchanged). That table lives in
+the database's default schema, is global to the whole server-side database,
+and is not itself disposable -- another
 worktree pointed at the same local Postgres instance had stamped it while
 running its own migrations. Base.metadata.create_all() against a private
 schema never touches alembic_version at all, sidestepping that contention

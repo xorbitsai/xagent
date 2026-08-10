@@ -331,12 +331,12 @@ _SWALLOWED: tuple[type[BaseException], ...] = (
 
 # Which ops_signals name a given swallowed exception type registers.
 # InteractionRunPartitionMismatch gets its own signal, distinct from the
-# other four's shared INTERACTION_HANDOFF_DEGRADED, precisely because it is
-# the one override the reachability-free state of this PR cannot validate --
-# see interaction_handoff's docstring. Keeping it separately addressable in
-# /health lets the first wiring PR tell "a run-partition anchor went stale"
-# apart from every other reason a handoff degraded, without having to
-# reparse log lines to do it.
+# other five's shared INTERACTION_HANDOFF_DEGRADED, precisely because it is
+# the one override that cannot be validated at this layer -- see
+# interaction_handoff's docstring. Keeping it separately addressable in
+# /health lets the change that wires the first production caller tell "a
+# run-partition anchor went stale" apart from every other reason a handoff
+# degraded, without having to reparse log lines to do it.
 _DEGRADATION_SIGNALS: dict[type[BaseException], str] = {
     InteractionSlotTaken: INTERACTION_HANDOFF_DEGRADED,
     InteractionRequestClosed: INTERACTION_HANDOFF_DEGRADED,
@@ -364,7 +364,7 @@ class InteractionAnchor:
     Represents only half of anchor resolution. The other half -- a database
     read against ``trace_events`` by primary key, layered into
     absence/unavailable/corrupt outcomes with a legacy-column fallback -- is
-    a caller obligation that belongs to the batch that wires a production
+    a caller obligation that belongs to the change that wires a production
     reader, because it is a DB read that must happen outside any savepoint
     this module opens. What this dataclass carries is the *result* of that
     read once the caller already has one in hand: the fields both
@@ -424,8 +424,8 @@ def _validate_anchor_fields(anchor: InteractionAnchor) -> None:
     two never drift into checking different things for the same dataclass.
 
     Every field checked here backs a real CHECK constraint on
-    ``task_interaction_requests`` (see the audit in this PR's design
-    record); a corrupt anchor caught here never reaches SQL.
+    ``task_interaction_requests``; a corrupt anchor caught here never
+    reaches SQL.
     """
 
     if not anchor.resume_event_id:
@@ -697,9 +697,9 @@ def stage_interaction_request(
        on both backends, on both the exception exit path and the successful
        REPLAY-after-conflict exit path, because a savepoint that something
        else already rolled back cannot be committed or rolled back again.
-       Measured directly against this tree; see this PR's mutation test for
-       the primitive's own savepoint (M-1), which reproduces the same
-       failure by making that same mistake on purpose.
+       Measured directly against this tree; pinned by the primitive's
+       savepoint mutation test, which reproduces the same failure by making
+       that same mistake on purpose.
     6. On ``IntegrityError``, roll back only this inner savepoint and
        re-check identity with the same SELECT step 3 used. A hit whose
        ``status`` is ``active`` is a REPLAY-after-conflict: another session
@@ -717,9 +717,25 @@ def stage_interaction_request(
        conflict from a programming error that also violates some other
        CHECK, is why step 1's validation list must be complete.
 
+    The post-conflict re-check assumes READ COMMITTED. It re-reads the
+    identity key after rolling back the inner savepoint, and needs a fresh
+    snapshot to see the row the winning session committed between this
+    call's pre-read and its own INSERT. Under REPEATABLE READ or
+    SERIALIZABLE the re-read reuses this transaction's original snapshot,
+    does not see that row, and classifies a legitimate replay as
+    ``InteractionSlotTaken`` -- measured on PostgreSQL 16 at both levels.
+    That is a degradation, not a corruption: ``InteractionSlotTaken`` is
+    swallowed, so the caller's turn survives and the question is lost.
+    READ COMMITTED is PostgreSQL's default and this codebase sets no
+    ``isolation_level`` on its engine; the change that wires the first
+    production caller should assert that rather than continue to assume it.
+
     This function's reclaim UPDATE assumes the caller has already proven it
     holds the task's current attempt; bypassing that precondition to call it
-    directly lets a dead run silently displace a live run's question.
+    directly lets a dead run silently displace a live run's question -- the
+    live run's own next staging attempt then surfaces as
+    ``InteractionSlotTaken`` or ``InteractionRequestClosed``, not as the
+    precondition violation that actually caused it.
     """
 
     if isinstance(task_id, bool) or not isinstance(task_id, int):
@@ -877,8 +893,16 @@ class _InteractionHandoff:
         column comparison compiled to SQL does not apply here.
 
         This reads ``self.task.lease_attempt_id`` from whatever snapshot of
-        the task row the caller already loaded -- it is not itself a SQL
-        read, and it does not take a lock. Whether the comparison is safe
+        the task row the caller already loaded. Whether that attribute
+        access itself touches the database is conditional on the object's
+        own session-bound state, not a fixed property of this line: if
+        SQLAlchemy has expired ``task`` (its default behavior after every
+        commit) the access issues its own lazy-load ``SELECT`` before
+        returning a value; if ``task`` is detached from any session
+        entirely it raises ``DetachedInstanceError`` instead -- neither is
+        swallowed here. When the attribute is already loaded and unexpired,
+        this line takes no lock and issues no SQL of its own. Whether the
+        comparison is safe
         against a concurrent attempt change depends on the backend, not on
         this line: on PostgreSQL, a caller that loaded ``task`` with its own
         ``SELECT ... FOR UPDATE`` genuinely blocks a concurrent writer for
@@ -1005,7 +1029,7 @@ def interaction_handoff(
     non-required event, logs at debug and returns without raising -- a
     deliberate silent discard, scoped to that primitive's best-effort trace
     events. This module has no equivalent branch anywhere: every one of the
-    five swallowed exceptions below is swallowed because it is a named,
+    six swallowed exceptions below is swallowed because it is a named,
     expected outcome with its own degradation signal, never because the
     underlying data (the task, the anchor, the request row) turned out to
     be missing or unreadable. A caller with a missing task or a broken
@@ -1026,7 +1050,7 @@ def interaction_handoff(
                                               # savepoint (see
                                               # stage_interaction_request)
         normal exit         -> savepoint.commit()
-        one of five expected failures
+        one of six expected failures
                              -> savepoint.rollback(), register a
                                 degradation signal, log, and swallow
         anything else        -> savepoint.rollback(), re-raise unchanged
@@ -1044,7 +1068,7 @@ def interaction_handoff(
     without yielding -- but a generator that returns instead of yielding
     makes ``next()`` raise ``StopIteration``, and ``contextlib`` turns that
     into ``RuntimeError("generator didn't yield")`` from ``__enter__``. That
-    error is not one of the five swallowed types, so it would propagate to
+    error is not one of the six swallowed types, so it would propagate to
     the caller anyway, defeating the whole point of swallowing it in the
     first place -- and because it fires from ``__enter__``, the caller's own
     code after the ``with`` block (its commit, most importantly) never
@@ -1054,13 +1078,14 @@ def interaction_handoff(
     the generator's normal exception-resumption path, so ``with`` completes
     normally and everything after it, including the caller's commit, still
     executes. Both assertions run first, before any statement ``stage``
-    could otherwise issue -- this PR's mutation tests pin that ordering.
+    could otherwise issue -- mutation tests pin that ordering.
 
-    Five expected failures are swallowed:
+    Six expected failures are swallowed:
     ``InteractionSlotTaken``, ``InteractionRequestClosed``,
-    ``InteractionAnchorCorrupt``, ``InteractionAttemptMismatch``, and
-    ``InteractionRunPartitionMismatch``. Every other exception -- including
-    ``InteractionOwnerStateError`` -- propagates unchanged, after this
+    ``InteractionAnchorCorrupt``, ``InteractionAttemptMismatch``,
+    ``InteractionRunPartitionMismatch``, and ``InteractionOriginUnknown``.
+    Every other exception -- including ``InteractionOwnerStateError`` and
+    ``InteractionHandoffMisuse`` -- propagates unchanged, after this
     savepoint is rolled back.
 
     ``InteractionRunPartitionMismatch`` is a deliberate, scoped override of
@@ -1072,14 +1097,14 @@ def interaction_handoff(
     ordinary race. The handoff overrides that default and swallows it here
     instead, registering its own dedicated signal
     (``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED``, kept separate from the
-    other four's shared ``INTERACTION_HANDOFF_DEGRADED`` so it stays
+    other five's shared ``INTERACTION_HANDOFF_DEGRADED`` so it stays
     individually addressable on ``/health``) and a structured log line
     naming the task, the lease's run, and the anchor's run partition. This
     override ships with zero production callers and therefore zero
-    real-world reachability data for it: **the first wiring PR -- the one
-    that removes the zero-production-caller AST gate -- must re-adjudicate
-    this policy once a real reachability picture exists**, not carry it
-    forward unexamined.
+    real-world reachability data for it: **the change that wires the first
+    production caller -- the one that removes the zero-production-caller
+    AST gate -- must re-adjudicate this policy once a real reachability
+    picture exists**, not carry it forward unexamined.
 
     Every degradation signal this module registers is sticky: nothing
     clears it once set (``ops_signals.py`` has no automatic-clear path, by
@@ -1096,7 +1121,7 @@ def interaction_handoff(
     from that same session's own point of view). This function's own outer
     savepoint is exactly that first statement whenever a caller has issued
     no DML of its own before entering this context manager, which would
-    make every one of the five swallowed exceptions' rollback silently do
+    make every one of the six swallowed exceptions' rollback silently do
     nothing -- the half-written garbage this context manager exists to
     prevent. The zero-row, single-column, SQLite-only ``UPDATE`` issued
     immediately below, before the savepoint opens, is the fix: see the
@@ -1142,9 +1167,9 @@ def interaction_handoff(
     # pysqlite recipe (disable pysqlite's own isolation_level, issue an
     # explicit BEGIN on the engine's "begin" event -- see
     # https://docs.sqlalchemy.org/en/20/dialects/sqlite.html#serializable-isolation-savepoints-transactional-ddl)
-    # does fix this, confirmed directly. It also breaks a scenario this PR's
-    # own tests require: two sessions racing on the same identity key
-    # (REPLAY-after-conflict, T-P-9/T-SP-2), where the first session reads
+    # does fix this, confirmed directly. It also breaks a scenario this
+    # module's own tests require: two sessions racing on the same identity
+    # key (REPLAY-after-conflict, T-P-9/T-SP-2), where the first session reads
     # before the second commits and then tries to write afterward, fails
     # with sqlite3.OperationalError ("database is locked", sqlite_errorcode
     # 517 / SQLITE_BUSY_SNAPSHOT) instead of the IntegrityError this

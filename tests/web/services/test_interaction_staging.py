@@ -484,6 +484,44 @@ def test_p3_clean_stage_is_not_visible_before_commit(tmp_path: Path) -> None:
     assert visible_after is not None
 
 
+def test_p3b_stale_caller_clock_does_not_misclassify_as_slot_taken(
+    tmp_path: Path,
+) -> None:
+    """A caller clock running 20 minutes behind wall-clock time must not
+    make a legitimate 15-minute TTL misclassify as InteractionSlotTaken.
+
+    Before created_at was bound to the caller's own now (see the model's
+    "Clock source" docstring on ck_task_interaction_requests_expiry_after_creation),
+    created_at came from server_default=func.now() -- real wall-clock time --
+    while expires_at was computed from the caller's stale now. A caller
+    running behind produces an expires_at that lands *before* the server's
+    real created_at, which the database's CHECK rejects as an
+    IntegrityError on the INSERT. Because this table was otherwise empty,
+    step 7's post-conflict re-check found no identity row at this call's own
+    identity and misclassified that CHECK violation as InteractionSlotTaken
+    -- the false diagnosis this test pins: a stale-but-internally-consistent
+    caller clock silently swallowed the caller's turn instead of staging its
+    request. Binding created_at to the same caller now used for expires_at
+    retires this on both backends: both operands now come from one clock, so
+    a stale caller now is accepted exactly like a fresh one."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+
+    stale_now = _now() - timedelta(minutes=20)
+    kwargs = _stage_kwargs(
+        anchor, now=stale_now, expires_at=stale_now + timedelta(minutes=15)
+    )
+    result = stage_interaction_request(db, task_id=task_id, **kwargs)
+    assert result.created is True
+    assert result.status == "active"
+    db.commit()
+    db.close()
+
+
 def test_p4_precheck_branches(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     statements = _count_cursor_executions(engine)

@@ -789,6 +789,7 @@ def stage_interaction_request(
 
     row = {
         "task_id": resolved_task_id,
+        "created_at": now,
         "run_id": run_id,
         "kind": kind,
         "protocol_version": protocol_version,

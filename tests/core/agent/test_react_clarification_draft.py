@@ -229,3 +229,147 @@ async def test_reentry_without_new_message_returns_stable_draft_and_sends_nothin
     assert resumed_llm.calls == []
     assert len(resumed_runtime.outbound_messages) == 0
     assert resumed["clarification_draft"] == first["clarification_draft"]
+
+
+@pytest.mark.asyncio
+async def test_marker_survives_trace_serialization_of_a_dirty_interaction_id() -> None:
+    """A marker computed before a control-character injection matches
+    the marker recomputed after the injected request round-trips through the
+    real trace serializer and a JSON encode/decode cycle -- ``_marker_clean``
+    and ``clean_string`` share a domain, so persistence cannot desync them.
+    """
+
+    import json
+
+    from xagent.core.agent.checkpoint import TraceCheckpointStore
+    from xagent.web.api.trace_handlers import DatabaseTraceHandler
+
+    class RecordingTraceBackend:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(
+            self,
+            event_type: Any,
+            *,
+            task_id: str | None = None,
+            data: dict[str, Any] | None = None,
+            require_persisted: bool = False,
+        ) -> str:
+            del event_type, require_persisted
+            self.events.append({"task_id": task_id, "data": dict(data or {})})
+            return f"event-{len(self.events)}"
+
+    tool = ResumableTool()
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(execution_id="exec-tp4")
+    context.add_user_message("Run the gated action.")
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "wait-call",
+                        "function": {
+                            "name": "approval_gate",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+    assert result["status"] == "waiting_for_user"
+
+    assert pattern.waiting_for_user_request is not None
+    pattern.waiting_for_user_request["requests"][0]["interaction_id"] += "\x01"
+
+    marker_before = draft_from_waiting_request(
+        pattern.waiting_for_user_request,
+        execution_id=context.execution_id,
+        step_id=None,
+    ).turn_marker
+
+    backend = RecordingTraceBackend()
+    store = TraceCheckpointStore(backend)
+    await store.checkpoint(
+        type="checkpoint",
+        label="waiting_for_user",
+        execution_id="exec-tp4",
+        pattern="ReActPattern",
+        pattern_state=pattern.get_state(),
+        status="waiting_for_user",
+    )
+    event_payload = backend.events[0]["data"]
+    handler = DatabaseTraceHandler(1)
+    serialized = handler._serialize_data_for_json(event_payload)
+    assert "_serialization_error" not in serialized
+
+    restored_event_payload = json.loads(json.dumps(serialized))
+    restored_state = restored_event_payload["snapshot"]["pattern_state"]
+
+    resumed_pattern = ReActPattern(max_iterations=2)
+    resumed_pattern.load_state(restored_state)
+
+    marker_after = draft_from_waiting_request(
+        resumed_pattern.waiting_for_user_request,
+        execution_id="exec-tp4",
+        step_id=None,
+    ).turn_marker
+
+    assert marker_after == marker_before
+
+
+def test_marker_distinguishes_requests_with_ambiguous_raw_concatenation() -> None:
+    """Two request sets whose raw values would collide under naive
+    ``"|"``-joining (a ``tool_call_id`` containing ``|`` vs. an
+    ``interaction_id`` containing ``|``) still produce distinct markers,
+    because every component carries its own length prefix.
+    """
+
+    request_a = {
+        "kind": "tool_waiting_for_user",
+        "requests": [
+            {
+                "tool_call_id": "a|b",
+                "tool_name": "t",
+                "interaction_id": "c\nd",
+                "message": "m",
+                "message_type": "question",
+                "interactions": [],
+            }
+        ],
+        "message": "m",
+        "message_type": "question",
+        "interactions": [],
+        "task_text": None,
+        "message_count": 1,
+    }
+    request_b = {
+        "kind": "tool_waiting_for_user",
+        "requests": [
+            {
+                "tool_call_id": "a",
+                "tool_name": "t",
+                "interaction_id": "b|c\nd",
+                "message": "m",
+                "message_type": "question",
+                "interactions": [],
+            }
+        ],
+        "message": "m",
+        "message_type": "question",
+        "interactions": [],
+        "task_text": None,
+        "message_count": 1,
+    }
+
+    draft_a = draft_from_waiting_request(request_a, execution_id="e", step_id=None)
+    draft_b = draft_from_waiting_request(request_b, execution_id="e", step_id=None)
+
+    assert draft_a is not None and draft_b is not None
+    # Naive "|"-joining without a length prefix would collapse both raw
+    # concatenations to "a|b|c\nd" -- the markers must still differ.
+    assert draft_a.turn_marker != draft_b.turn_marker

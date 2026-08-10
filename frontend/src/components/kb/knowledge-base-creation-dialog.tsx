@@ -29,6 +29,8 @@ import {
   normalizeKnowledgeBaseIngestionResult,
 } from "@/lib/kb-ingest-feedback"
 import { useI18n } from "@/contexts/i18n-context"
+import type { TranslationKey } from "@/i18n/translations"
+import { useAuth } from "@/contexts/auth-context"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
 import {
@@ -46,6 +48,8 @@ import {
   ChevronUp,
   ArrowRight,
   ArrowLeft,
+  User,
+  Users,
 } from "lucide-react"
 import { toast } from "@/components/ui/sonner"
 import { CloudConnectDialog, CloudFile } from "./cloud-connect-dialog"
@@ -104,6 +108,111 @@ function buildWebIngestionErrorResult(
   }
 }
 
+/** Carries the response status out of a helper, so a failure detected before
+ *  the ingest request reaches the same toast classifier one detected during it
+ *  does — otherwise a reserve-time 409 loses the "pick another name" advice. */
+class RequestFailure extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message)
+  }
+}
+
+const failureStatus = (error: unknown, fromIngest?: number) =>
+  fromIngest ?? (error instanceof RequestFailure ? error.status : undefined)
+
+const SELECTABLE_CARD_SIZES = {
+  sm: { card: "p-4 gap-1", icon: "w-5 h-5 mb-1", label: "text-sm" },
+  md: { card: "p-6 gap-2", icon: "w-6 h-6 mb-2", label: "text-base" },
+}
+
+interface SelectableCardOption<T extends string> {
+  value: T
+  id?: string
+  icon: React.ComponentType<{ className?: string }>
+  label: string
+  description: string
+}
+
+/** Cards standing in for radios: a Card gives none of the keyboard behaviour a
+ *  radio group gets for free, so the tab stop follows the selection and the
+ *  arrow keys move it. */
+function SelectableCardGroup<T extends string>({
+  options,
+  selected,
+  onSelect,
+  size = "sm",
+  className,
+  "aria-label": ariaLabel,
+  "aria-labelledby": ariaLabelledBy,
+}: {
+  options: ReadonlyArray<SelectableCardOption<T>>
+  selected: T
+  onSelect: (value: T) => void
+  size?: keyof typeof SELECTABLE_CARD_SIZES
+  className?: string
+  "aria-label"?: string
+  "aria-labelledby"?: string
+}) {
+  const styles = SELECTABLE_CARD_SIZES[size]
+
+  // One handler on the group: keydown bubbles, and the card's position among its
+  // siblings is the index into `options`. Resolve through `closest` so a key
+  // pressed while the icon or a label holds focus still finds its card.
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const cards = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'))
+    const card = (event.target as HTMLElement).closest('[role="radio"]')
+    const index = card ? cards.indexOf(card as HTMLElement) : -1
+    if (index < 0) return
+
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault()
+      onSelect(options[index].value)
+      return
+    }
+
+    const step = event.key === "ArrowRight" || event.key === "ArrowDown"
+      ? 1
+      : event.key === "ArrowLeft" || event.key === "ArrowUp"
+        ? -1
+        : 0
+    const jump = event.key === "Home" ? 0 : event.key === "End" ? options.length - 1 : -1
+    if (step === 0 && jump < 0) return
+    event.preventDefault()
+    const next = step === 0 ? jump : (index + step + options.length) % options.length
+    onSelect(options[next].value)
+    cards[next].focus()
+  }
+
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      aria-labelledby={ariaLabelledBy}
+      className={className}
+      onKeyDown={handleKeyDown}
+    >
+      {options.map((option) => {
+        const isSelected = option.value === selected
+        return (
+          <Card
+            key={option.value}
+            id={option.id}
+            role="radio"
+            tabIndex={isSelected ? 0 : -1}
+            aria-checked={isSelected}
+            className={`${styles.card} cursor-pointer flex flex-col items-center justify-center border-2 transition-colors text-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${isSelected ? "border-primary bg-primary/5" : "border-border hover:bg-muted"}`}
+            onClick={() => onSelect(option.value)}
+          >
+            <option.icon className={`${styles.icon} text-primary`} />
+            <span className={`font-bold ${styles.label}`}>{option.label}</span>
+            <span className="text-xs text-muted-foreground">{option.description}</span>
+          </Card>
+        )
+      })}
+    </div>
+  )
+}
+
 interface KnowledgeBaseCreationDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -112,10 +221,12 @@ interface KnowledgeBaseCreationDialogProps {
 
 export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: KnowledgeBaseCreationDialogProps) {
   const { t } = useI18n()
+  const { inTeam } = useAuth()
 
   // State from KnowledgeBasePage
   const [newCollectionName, setNewCollectionName] = useState("")
   const [newCollectionDescription, setNewCollectionDescription] = useState("")
+  const [ownership, setOwnership] = useState<"personal" | "team">("personal")
   const [activeImportTab, setActiveImportTab] = useState<"file" | "web" | "cloud">("file")
   const [currentStep, setCurrentStep] = useState(1)
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false)
@@ -174,15 +285,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
   // Embedding models state
   const [embeddingModels, setEmbeddingModels] = useState<Model[]>([])
-  // Flag only: the message itself stays in i18n so it follows a language switch.
-  const [nameError, setNameError] = useState(false)
+  // The i18n key, not the message: rendering it through `t` follows a language switch.
+  const [nameError, setNameError] = useState<TranslationKey | null>(null)
   const trimmedCollectionName = newCollectionName.trim()
 
   useEffect(() => {
     if (open) {
       // Clearing on open covers every close path (cancel, escape, overlay, the
       // close button), which `resetState` alone does not.
-      setNameError(false)
+      setNameError(null)
+      setOwnership("personal")
       fetchEmbeddingModels()
     }
   }, [open])
@@ -320,18 +432,77 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
   }
 
+  /** Step 1 is the only step showing the name field, so a rejected name has to
+   *  send the user back there rather than leave them on a later step. */
+  const rejectName = (messageKey: TranslationKey) => {
+    setNameError(messageKey)
+    setCurrentStep(1)
+  }
+
   /** Every way forward out of step 1 goes through here, so no later step ever
    *  has to invent a collection name. Returns false when the name is missing. */
   const requireCollectionName = () => {
     if (trimmedCollectionName) return true
     toast.error(t("kb.errors.nameRequired"))
-    setNameError(true)
-    setCurrentStep(1)
+    rejectName("kb.errors.nameRequired")
     return false
+  }
+
+  /** Ownership is resolved before the first byte is written (`reserve-team` is
+   *  a promote over an empty collection), so a team knowledge base has to claim
+   *  its name before the ingest or the files land in personal storage.
+   *
+   *  Gated on `ownership`, not `inTeam`: the server is the authority on team
+   *  membership, and a stale `inTeam` must not silently turn a requested team
+   *  knowledge base into a personal one. Sets `claimed` before awaiting: a
+   *  request that throws may still have committed server-side, and releasing a
+   *  claim that never existed is a harmless 404. */
+  const reserveTeamName = async (collection: string, claimed: { current: boolean }) => {
+    if (ownership !== "team") return
+    claimed.current = true
+    const response = await apiRequest(
+      `${getApiUrl()}/api/knowledge-bases/${encodeURIComponent(collection)}/reserve-team`,
+      { method: "POST" },
+    )
+    if (response.ok) return
+    if (response.status < 500) claimed.current = false
+    // Taken by another collection, a teammate's reservation, or a leaked claim
+    // of our own: the client cannot tell them apart, so just advise a rename.
+    if (response.status === 409) {
+      rejectName("kb.errors.nameUnavailableHint")
+      throw new RequestFailure(t("kb.errors.nameUnavailable"), response.status)
+    }
+    const parsed = await parseApiResponse(response)
+    const detail = isJsonRecord(parsed.data) && typeof parsed.data.detail === "string"
+      ? parsed.data.detail
+      : null
+    throw new RequestFailure(detail || t("kb.ownership.reserveFailed"), response.status)
+  }
+
+  /** Best-effort, fire-and-forget: a failed ingest gives the name back so a
+   *  teammate's later knowledge base under it is not resolved into team storage.
+   *  409 means data exists behind the claim (keeping it is correct) and 404
+   *  means there was no claim; anything else leaks the claim, which only the
+   *  creator can reuse — reserving the same name again answers 204 — so warn
+   *  and move on rather than retry.
+   *  ponytail: no retry/settle tracking; a leaked claim is recoverable by the
+   *  creator and blocks teammates with an explicit 409 server-side. */
+  const releaseTeamName = async (collection: string) => {
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/knowledge-bases/${encodeURIComponent(collection)}/release-team-claim`,
+        { method: "POST" },
+      )
+      if (response.ok || response.status === 409 || response.status === 404) return
+    } catch {
+      // Fall through to the warning: the claim state is unknown either way.
+    }
+    toast.warning(t("kb.ownership.releaseFailed", { name: collection }))
   }
 
   const resetState = () => {
     setSelectedFiles([])
+    setOwnership("personal")
     setUploadProgress(0)
     setIngestionResults([])
     setWebIngestionResult(null)
@@ -372,16 +543,19 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     setIngestionResults([])
     setCompletedUploadCount(0)
 
+    const collectionName = trimmedCollectionName
     const successfulCollections: string[] = []
+    const teamClaimed = { current: false }
 
     try {
       const apiUrl = getApiUrl()
       const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
+      // Once, before the loop: every file shares one collection.
+      await reserveTeamName(collectionName, teamClaimed)
       for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i]
         const formData = new FormData()
 
-        const collectionName = trimmedCollectionName
         setCurrentUploadFileName(file.name)
         setCurrentUploadCollection(collectionName)
         setUploadProgressDetail(null)
@@ -494,11 +668,14 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         getKnowledgeBaseToastCopy(t, t("kb.errors.uploadFailed")),
         // Creating a knowledge base: the ingest endpoints answer 409 only when the
         // chosen name is already taken.
-        { status: failedStatus, adviseRename: true }
+        { status: failureStatus(err, failedStatus), adviseRename: true }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
       })
+      // Not awaited: the failure is already on screen, and a slow release must
+      // not keep the button reading "Processing".
+      if (teamClaimed.current) void releaseTeamName(collectionName)
       if (successfulCollections.length > 0) {
         onSuccess?.(successfulCollections)
       }
@@ -521,12 +698,14 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
 
+    const collectionName = trimmedCollectionName
+    const teamClaimed = { current: false }
+
     try {
       const apiUrl = getApiUrl()
       const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
+      await reserveTeamName(collectionName, teamClaimed)
       const formData = new FormData()
-
-      const collectionName = trimmedCollectionName
 
       formData.append("collection", collectionName)
       formData.append("start_url", webIngestionConfig.start_url)
@@ -627,11 +806,12 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
         getKnowledgeBaseToastCopy(t, t("kb.errors.webIngestFailed")),
-        { status: failedStatus, adviseRename: true }
+        { status: failureStatus(err, failedStatus), adviseRename: true }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
       })
+      if (teamClaimed.current) void releaseTeamName(collectionName)
     } finally {
       setIsWebIngesting(false)
       setWebIngestionProgress(0)
@@ -645,13 +825,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     let failedStatus: number | undefined
     setIngestionResults([])
 
+    const collectionName = trimmedCollectionName
+    const teamClaimed = { current: false }
+
     try {
       // Aggregate all selected files from all providers
       const filesToIngest = Object.entries(cloudSelections).flatMap(([provider, files]) =>
         files.map(file => ({ provider, fileId: file.id, fileName: file.name }))
       )
 
-      const collectionName = trimmedCollectionName
+      await reserveTeamName(collectionName, teamClaimed)
 
       // Prepare separators
       let separators: string[] | undefined = undefined
@@ -745,11 +928,12 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           t,
           t("kb.errors.cloudIngestFailed")
         ),
-        { status: failedStatus, adviseRename: true }
+        { status: failureStatus(error, failedStatus), adviseRename: true }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
       })
+      if (teamClaimed.current) void releaseTeamName(collectionName)
     } finally {
       setIsCloudConnecting(false)
     }
@@ -783,6 +967,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             <div className="mt-6">
               <Stepper
                 currentStep={currentStep}
+                contentClassName="pt-6"
                 steps={[
                   { label: t("kb.dialog.steps.nameIt"), content: <div /> },
                   { label: t("kb.dialog.steps.addContent"), content: <div /> },
@@ -794,7 +979,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
           <div className="flex-1 overflow-y-auto px-6 pb-6">
             {currentStep === 1 && (
-              <div className="space-y-6 mt-4">
+              <div className="space-y-6">
                 <div>
                   <Label htmlFor="collection_name" className="text-sm font-medium">{t("kb.dialog.basicInfo.nameLabel")} <span className="text-destructive">*</span></Label>
                   <Input
@@ -802,17 +987,17 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                     value={newCollectionName}
                     onChange={(e) => {
                       setNewCollectionName(e.target.value)
-                      setNameError(false)
+                      setNameError(null)
                     }}
                     placeholder={t("kb.dialog.basicInfo.namePlaceholder")}
                     className="mt-1.5"
                     aria-required="true"
-                    aria-invalid={nameError}
+                    aria-invalid={nameError !== null}
                     aria-describedby={nameError ? "collection_name_error" : undefined}
                   />
                   {nameError && (
                     <p id="collection_name_error" className="mt-2 text-sm text-destructive">
-                      {t("kb.errors.nameRequired")}
+                      {t(nameError)}
                     </p>
                   )}
                 </div>
@@ -826,38 +1011,69 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                     className="mt-1.5 h-32"
                   />
                 </div>
+                {/* Also rendered once Team is chosen, whatever `inTeam` says
+                    afterwards: losing membership mid-dialog would otherwise take
+                    the control away while every submit still tried to reserve,
+                    leaving no way back to Personal short of reopening. */}
+                {(inTeam || ownership === "team") && (
+                  <div className="space-y-1.5">
+                    <Label id="kb-ownership-label">{t("kb.ownership.label")}</Label>
+                    <SelectableCardGroup
+                      aria-labelledby="kb-ownership-label"
+                      className="grid grid-cols-2 gap-4"
+                      selected={ownership}
+                      onSelect={setOwnership}
+                      options={[
+                        {
+                          value: "personal",
+                          id: "kb-ownership-personal",
+                          icon: User,
+                          label: t("kb.ownership.personal"),
+                          description: t("kb.ownership.personalDesc"),
+                        },
+                        {
+                          value: "team",
+                          id: "kb-ownership-team",
+                          icon: Users,
+                          label: t("kb.ownership.team"),
+                          description: t("kb.ownership.teamDesc"),
+                        },
+                      ]}
+                    />
+                  </div>
+                )}
               </div>
             )}
 
             {currentStep === 2 && (
-              <div className="space-y-6 mt-4">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                  <Card
-                    className={`p-6 cursor-pointer flex flex-col items-center justify-center gap-2 transition-all text-center ${activeImportTab === 'file' ? 'border-primary bg-primary/5 border-2' : 'hover:bg-muted'}`}
-                    onClick={() => setActiveImportTab('file')}
-                  >
-                    <Upload className="w-6 h-6 text-primary mb-2" />
-                    <span className="font-bold text-base">{t("kb.dialog.tabs.file")}</span>
-                    <span className="text-xs text-muted-foreground">{t("kb.dialog.fileUpload.supportedFormats")}</span>
-                  </Card>
-                  <Card
-                    className={`p-6 cursor-pointer flex flex-col items-center justify-center gap-2 transition-all text-center ${activeImportTab === 'web' ? 'border-primary bg-primary/5 border-2' : 'hover:bg-muted'}`}
-                    onClick={() => setActiveImportTab('web')}
-                  >
-                    <Globe className="w-6 h-6 text-primary mb-2" />
-                    <span className="font-bold text-base">{t("kb.dialog.tabs.web")}</span>
-                    <span className="text-xs text-muted-foreground">{t("kb.dialog.tabs.webDesc")}</span>
-                  </Card>
-                  <Card
-                    className={`p-6 cursor-pointer flex flex-col items-center justify-center gap-2 transition-all text-center ${activeImportTab === 'cloud' ? 'border-primary bg-primary/5 border-2' : 'hover:bg-muted'}`}
-                    onClick={() => setActiveImportTab('cloud')}
-                  >
-                    <Cloud className="w-6 h-6 text-primary mb-2" />
-                    <span className="font-bold text-base">{t("kb.dialog.tabs.cloud")}</span>
-                    <span className="text-xs text-muted-foreground">{t("kb.dialog.tabs.cloudDesc")}</span>
-                  </Card>
-
-                </div>
+              <div className="space-y-6">
+                <SelectableCardGroup
+                  aria-label={t("kb.dialog.steps.addContentTitle")}
+                  className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6"
+                  size="md"
+                  selected={activeImportTab}
+                  onSelect={setActiveImportTab}
+                  options={[
+                    {
+                      value: "file",
+                      icon: Upload,
+                      label: t("kb.dialog.tabs.file"),
+                      description: t("kb.dialog.fileUpload.supportedFormats"),
+                    },
+                    {
+                      value: "web",
+                      icon: Globe,
+                      label: t("kb.dialog.tabs.web"),
+                      description: t("kb.dialog.tabs.webDesc"),
+                    },
+                    {
+                      value: "cloud",
+                      icon: Cloud,
+                      label: t("kb.dialog.tabs.cloud"),
+                      description: t("kb.dialog.tabs.cloudDesc"),
+                    },
+                  ]}
+                />
 
                 {activeImportTab === 'file' && (
                   <div className="space-y-4 w-full bg-white rounded-lg p-4 border border-dashed">
@@ -930,7 +1146,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                       {cloudProviders.map((provider) => (
                         <Card
                           key={provider.id}
-                          className={`p-4 cursor-pointer transition-all hover:border-blue-500 relative ${cloudSelections[provider.id]?.length > 0 ? "border-blue-500 border-2" : ""}`}
+                          className={`p-4 cursor-pointer border-2 transition-colors hover:border-blue-500 relative ${cloudSelections[provider.id]?.length > 0 ? "border-blue-500" : "border-transparent"}`}
                           onClick={() => {
                             setSelectedCloudProvider(provider.id)
                             setIsCloudDialogOpen(true)
@@ -1041,7 +1257,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             )}
 
             {currentStep === 3 && (
-              <div className="space-y-6 mt-4">
+              <div className="space-y-6">
                 <div className="bg-primary/5 rounded-lg p-4 flex flex-col gap-2 border border-primary/20">
                   <div className="flex items-center gap-2 font-bold text-sm">
                     <Database className="w-4 h-4 text-primary" />

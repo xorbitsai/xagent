@@ -1891,13 +1891,18 @@ const zh = {
   },
   kb: {
     ownership: {
+      label: "归属",
       personal: "个人",
       team: "团队",
+      personalDesc: "仅你自己可见",
+      teamDesc: "团队成员都可见",
       makeTeam: "转为团队知识库",
       makePersonal: "转回个人",
       teamSuccess: "知识库已共享给团队。",
       personalSuccess: "知识库已转回个人。",
       failed: "更新知识库归属失败",
+      reserveFailed: "无法为团队登记该名称",
+      releaseFailed: "名称“{name}”的团队登记未能释放，用你的账号再次创建会沿用这条登记。",
     },
     errors: {
       loadFailed: "知识库加载失败",

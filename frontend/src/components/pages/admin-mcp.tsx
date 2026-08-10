@@ -688,6 +688,7 @@ export default function AdminMcpPage() {
             </>
           ) : (
             <Stepper
+              contentClassName="pt-6"
               steps={[
                 {
                   label: t("adminMcp.modal.step1"),

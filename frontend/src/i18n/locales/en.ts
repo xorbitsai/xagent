@@ -1891,13 +1891,18 @@ Build when you need.`,
   },
   kb: {
     ownership: {
+      label: "Ownership",
       personal: "Personal",
       team: "Team",
+      personalDesc: "Only you can see it",
+      teamDesc: "Everyone on your team can see it",
       makeTeam: "Share with team",
       makePersonal: "Make personal",
       teamSuccess: "Knowledge base shared with your team.",
       personalSuccess: "Knowledge base is personal again.",
       failed: "Failed to update knowledge base ownership",
+      reserveFailed: "Failed to reserve this name for your team",
+      releaseFailed: "The team reservation for \"{name}\" was not released. Creating it again under your account reuses it.",
     },
     errors: {
       loadFailed: "Failed to load knowledge base",

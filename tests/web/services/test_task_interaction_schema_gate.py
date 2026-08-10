@@ -17,27 +17,13 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from tests.web.services.task_interaction_schema_shared import (
+    tables_excluding_interaction_requests,
+)
 from xagent.web.models.database import Base
-from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services.task_interaction_schema import (
     interaction_requests_table_exists,
 )
-
-
-def _tables_excluding_target() -> list:
-    """Every table this repo's models declare, except the interaction table.
-
-    Building a database from this filtered set reproduces the shape of a
-    deployment upgraded through every migration except the (unmerged) one
-    that creates task_interaction_requests -- the table has no inbound
-    foreign keys, so excluding it cannot break create order (verified in the
-    audit: 52 of 53 tables created, zero inbound FKs to the target).
-    """
-    return [
-        table
-        for table in Base.metadata.sorted_tables
-        if table.name != TaskInteractionRequest.__tablename__
-    ]
 
 
 def _postgres_url() -> str | None:
@@ -64,7 +50,9 @@ def test_sqlite_full_create_all_has_the_table(tmp_path) -> None:
 
 def test_sqlite_filtered_create_all_lacks_the_table(tmp_path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'filtered.db'}")
-    Base.metadata.create_all(bind=engine, tables=_tables_excluding_target())
+    Base.metadata.create_all(
+        bind=engine, tables=tables_excluding_interaction_requests()
+    )
     session = sessionmaker(bind=engine)()
     try:
         assert interaction_requests_table_exists(session) is False
@@ -106,7 +94,9 @@ def test_postgres_full_create_all_has_the_table(postgres_engine) -> None:
 
 @pytest.mark.postgresql
 def test_postgres_filtered_create_all_lacks_the_table(postgres_engine) -> None:
-    Base.metadata.create_all(bind=postgres_engine, tables=_tables_excluding_target())
+    Base.metadata.create_all(
+        bind=postgres_engine, tables=tables_excluding_interaction_requests()
+    )
     session = sessionmaker(bind=postgres_engine)()
     try:
         assert interaction_requests_table_exists(session) is False

@@ -42,6 +42,7 @@ from tests.web.services.task_interaction_schema_shared import (
     make_task,
     make_trace_event,
     make_user,
+    tables_excluding_interaction_requests,
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.api.admin_users import _purge_user_task_rows
@@ -178,14 +179,6 @@ def sqlite_fk_on_session(tmp_path):
     engine.dispose()
 
 
-def _tables_excluding_interaction_requests() -> list:
-    return [
-        table
-        for table in Base.metadata.sorted_tables
-        if table.name != TaskInteractionRequest.__tablename__
-    ]
-
-
 @pytest.fixture
 def sqlite_fk_on_session_without_interaction_table(tmp_path):
     """Same shape as sqlite_fk_on_session, minus task_interaction_requests
@@ -202,7 +195,7 @@ def sqlite_fk_on_session_without_interaction_table(tmp_path):
 
     reset_checkpoint_anchor_fk_create_rule()
     Base.metadata.create_all(
-        bind=engine, tables=_tables_excluding_interaction_requests()
+        bind=engine, tables=tables_excluding_interaction_requests()
     )
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()
@@ -272,7 +265,7 @@ def postgres_session_without_interaction_table():
         conn.execute(text("CREATE SCHEMA public"))
     reset_checkpoint_anchor_fk_create_rule()
     Base.metadata.create_all(
-        bind=engine, tables=_tables_excluding_interaction_requests()
+        bind=engine, tables=tables_excluding_interaction_requests()
     )
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()

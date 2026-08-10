@@ -61,6 +61,8 @@ _NOTE_ASSOCIATION_TYPE_IDS = {"contact": 202, "company": 190, "deal": 214}
 
 _ASSOCIATION_PAGE_SIZE = 100
 
+_VALID_ANALYTICS_BREAKDOWNS = {"total", "day", "week", "month"}
+
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
@@ -403,6 +405,176 @@ def hubspot_create_note(
         return _success(note=note)
     except Exception as e:
         logger.error(f"Error creating note: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_forms(limit: int = 20) -> str:
+    """
+    List HubSpot marketing forms, including id and full form metadata
+    (name, field groups, etc.). Returns at most `limit` forms (max 100);
+    `has_more` is true when the portal has additional forms beyond the
+    result. Use hubspot_get_form_submissions to pull the submissions
+    collected by a specific form.
+    """
+    try:
+        result = _request(
+            "GET", "/marketing/v3/forms", params={"limit": max(1, min(limit, 100))}
+        )
+        has_more = bool((result.get("paging") or {}).get("next"))
+        return _success(forms=result.get("results", []), has_more=has_more)
+    except Exception as e:
+        logger.error(f"Error listing forms: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_get_form_submissions(form_id: str, limit: int = 20) -> str:
+    """
+    Get recent submissions for a HubSpot form, including submitted field
+    values, submission timestamp, and page URL. Returns at most `limit`
+    submissions (max 50); `has_more` is true when the form has additional
+    submissions beyond the result.
+    """
+    try:
+        result = _request(
+            "GET",
+            f"/form-integrations/v1/submissions/forms/{form_id}",
+            params={"limit": max(1, min(limit, 50))},
+        )
+        has_more = bool((result.get("paging") or {}).get("next"))
+        return _success(submissions=result.get("results", []), has_more=has_more)
+    except Exception as e:
+        logger.error(f"Error getting form submissions: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_get_analytics_report(
+    report_type: str,
+    breakdown: str = "total",
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> str:
+    """
+    Get a HubSpot traffic analytics report. `report_type` is a HubSpot
+    analytics dimension such as "sources", "utm-campaigns", "landing-pages",
+    "pages", or "geolocation". `breakdown` is "total", "day", "week", or
+    "month". `start_date`/`end_date` are optional "YYYYMMDD" strings that
+    limit the reporting window.
+
+    Note: this covers HubSpot's traffic/analytics dimensions, not
+    custom reports or dashboards built in the HubSpot report editor -
+    HubSpot has no public API to read those. Requires a Marketing Hub
+    Basic, Professional, or Enterprise account; Free/Starter accounts are
+    not supported by this HubSpot API.
+    """
+    try:
+        if breakdown not in _VALID_ANALYTICS_BREAKDOWNS:
+            raise ValueError(
+                f"breakdown must be one of {sorted(_VALID_ANALYTICS_BREAKDOWNS)}"
+            )
+        params: dict[str, Any] = {}
+        if start_date:
+            params["start"] = start_date
+        if end_date:
+            params["end"] = end_date
+        result = _request(
+            "GET", f"/analytics/v2/reports/{report_type}/{breakdown}", params=params
+        )
+        return _success(report=result)
+    except Exception as e:
+        logger.error(f"Error getting analytics report: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_marketing_emails(limit: int = 20) -> str:
+    """
+    List HubSpot marketing emails, including id and full email metadata
+    (name, subject, state, publish date, etc.). Returns at most `limit`
+    emails (max 100); `has_more` is true when the portal has additional
+    emails beyond the result. Use hubspot_get_marketing_email_statistics
+    for performance metrics on a specific email.
+    """
+    try:
+        result = _request(
+            "GET", "/marketing/v3/emails", params={"limit": max(1, min(limit, 100))}
+        )
+        has_more = bool((result.get("paging") or {}).get("next"))
+        return _success(emails=result.get("results", []), has_more=has_more)
+    except Exception as e:
+        logger.error(f"Error listing marketing emails: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_get_marketing_email_statistics(email_ids: str) -> str:
+    """
+    Get send/open/click/bounce statistics for HubSpot marketing emails.
+    `email_ids` is a single email id, or a comma-separated list of ids to
+    fetch statistics for multiple emails at once.
+    """
+    try:
+        result = _request(
+            "GET",
+            "/marketing/v3/emails/statistics/list",
+            params={"emailIds": email_ids},
+        )
+        return _success(statistics=result.get("results", result))
+    except Exception as e:
+        logger.error(f"Error getting marketing email statistics: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_campaigns(limit: int = 20) -> str:
+    """
+    List HubSpot marketing campaigns, including id and full campaign
+    properties (name, status, date range, etc.). Returns at most `limit`
+    campaigns (max 100); `has_more` is true when the portal has additional
+    campaigns beyond the result. Use hubspot_get_campaign_metrics for
+    performance metrics on a specific campaign.
+    """
+    try:
+        result = _request(
+            "GET",
+            "/marketing/v3/campaigns",
+            params={"limit": max(1, min(limit, 100))},
+        )
+        has_more = bool((result.get("paging") or {}).get("next"))
+        return _success(campaigns=result.get("results", []), has_more=has_more)
+    except Exception as e:
+        logger.error(f"Error listing campaigns: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_get_campaign_metrics(
+    campaign_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> str:
+    """
+    Get attribution metrics for a HubSpot marketing campaign, such as
+    sessions, new contacts, and influenced contacts. `start_date`/
+    `end_date` are optional "YYYY-MM-DD" strings that limit the reporting
+    window.
+    """
+    try:
+        params: dict[str, Any] = {}
+        if start_date:
+            params["startDate"] = start_date
+        if end_date:
+            params["endDate"] = end_date
+        result = _request(
+            "GET",
+            f"/marketing/v3/campaigns/{campaign_id}/reports/metrics",
+            params=params,
+        )
+        return _success(metrics=result)
+    except Exception as e:
+        logger.error(f"Error getting campaign metrics: {e}")
         return _error(str(e))
 
 

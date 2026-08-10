@@ -297,10 +297,10 @@ def test_get_marketing_email_statistics_passes_email_ids(monkeypatch):
     )
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
 
-    result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1,e2"))
+    result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1, e2"))
 
     assert result == {"status": "success", "statistics": [{"id": "e1"}]}
-    assert mock_request.call_args.kwargs["params"] == {"emailIds": "e1,e2"}
+    assert mock_request.call_args.kwargs["params"] == {"emailIds": ["e1", "e2"]}
 
 
 def test_list_campaigns_returns_raw_results(monkeypatch):

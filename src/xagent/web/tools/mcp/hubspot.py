@@ -516,10 +516,16 @@ def hubspot_get_marketing_email_statistics(email_ids: str) -> str:
     fetch statistics for multiple emails at once.
     """
     try:
+        ids = [
+            email_id.strip() for email_id in email_ids.split(",") if email_id.strip()
+        ]
         result = _request(
             "GET",
             "/marketing/v3/emails/statistics/list",
-            params={"emailIds": email_ids},
+            # HubSpot's emailIds is an array param: requests serializes a
+            # list value as repeated "emailIds=<id>" pairs, matching that
+            # shape rather than a single comma-joined value.
+            params={"emailIds": ids},
         )
         return _success(statistics=result.get("results", result))
     except Exception as e:

@@ -15,6 +15,75 @@ from sqlalchemy.sql import func
 
 from .database import Base
 
+# ---------------------------------------------------------------------------
+# Column-domain constants for this table's `origin` and `protocol_version`
+# columns.
+#
+# Attribution: these four names -- the vocabulary, the protocol version, the
+# normalizer, and the literal-subset constant -- live here rather than in an
+# interaction-rollout gate module or anywhere else, because they define what
+# a row in ``task_interaction_requests`` *means*, not whether some rollout
+# gate currently lets a new native row through. ``origin`` and
+# ``protocol_version`` are columns on this table; ``INTERACTION_ORIGIN_VOCABULARY``
+# mirrors the ``ck_task_interaction_requests_origin`` CHECK a few lines
+# below, and ``INTERACTION_PROTOCOL_VERSION`` mirrors
+# ``ck_task_interaction_requests_active_protocol``. A rollout gate built on
+# top of these names can be deleted outright and this table's column-domain
+# mapping still has to exist for whatever reads or writes rows here -- so
+# the mapping is owned by the table, not by whichever gate happens to
+# consume it today.
+#
+# Two call surfaces, two normalization rules, by design: ``Task.source`` is
+# a value written by application code and persisted, so an unexpected
+# reading of it (extra whitespace, wrong case) is itself a fact worth
+# surfacing -- ``normalize_interaction_origin`` below does not strip or
+# lowercase, so a stray ``" SDK "`` reads back as unknown instead of being
+# silently folded into the known ``"sdk"`` bucket. The
+# ``XAGENT_INTERACTION_NATIVE_SOURCES`` environment variable parsed in
+# ``config.py`` is a human-typed operator input and *is* stripped and
+# lowercased there. Do not unify the two -- each rule is pinned by its own
+# tests and guards a different kind of input.
+# ---------------------------------------------------------------------------
+INTERACTION_ORIGIN_VOCABULARY = frozenset(
+    {"internal", "sdk", "a2a", "trigger", "widget", "shared_link"}
+)
+INTERACTION_PROTOCOL_VERSION = 1
+
+# ``Task.source`` literals actually written by producers today -- a proper
+# subset of INTERACTION_ORIGIN_VOCABULARY, never an alias for it. The
+# vocabulary can (and does, via "internal") contain a value no call site
+# ever passes explicitly, produced instead by the column default and by
+# normalize_interaction_origin's falsy fallback below. Retiring a
+# ``Task.source`` value -- stop producing it, keep reading rows that
+# already carry it -- is a legitimate, expected move, and doing so narrows
+# this constant without narrowing INTERACTION_ORIGIN_VOCABULARY or the
+# origin CHECK. Because of that this constant must only ever be asserted as
+# a subset of the vocabulary, never as equal to it.
+TASK_SOURCE_LITERALS = frozenset({"a2a", "sdk", "shared_link", "trigger", "widget"})
+
+
+def normalize_interaction_origin(source: str | None) -> str | None:
+    """Map a ``Task.source`` reading to an origin vocabulary member.
+
+    Returns ``None`` for anything not recognized -- callers must treat that
+    as "unknown", not silently fall back to ``"internal"`` or any other
+    bucket. Deliberately does not ``strip()`` or ``.lower()`` the input (see
+    the module-level comment above): a value that only matches after
+    normalization is exactly the signal this function exists to preserve.
+
+    - ``None`` or ``""`` (falsy) -> ``"internal"``, matching this column's
+      default for rows that predate this vocabulary.
+    - An exact (byte-for-byte) match against
+      :data:`INTERACTION_ORIGIN_VOCABULARY` -> that value.
+    - Anything else, including whitespace-only strings and near-matches
+      that only differ in case or surrounding whitespace -> ``None``.
+    """
+    if not source:
+        return "internal"
+    if source in INTERACTION_ORIGIN_VOCABULARY:
+        return source
+    return None
+
 
 class TaskInteractionRequest(Base):  # type: ignore
     """One blocking interaction request raised by a task and its lifecycle to answer or expiry.

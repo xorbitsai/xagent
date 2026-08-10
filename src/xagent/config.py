@@ -38,6 +38,8 @@ FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
+INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
+INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -221,6 +223,46 @@ def get_agent_runtime() -> Literal["v1", "v2"]:
         return "v2"
     logger.warning("Invalid %s=%r; falling back to v1", AGENT_RUNTIME, runtime)
     return "v1"
+
+
+def get_interaction_protocol_mode() -> str:
+    """Raw XAGENT_INTERACTION_PROTOCOL_MODE reading: stripped and lowercased.
+
+    Returns the env value normalized for whitespace and case, or "legacy" if
+    the variable is unset or blank. Does not check that the result is one
+    of the three valid modes -- validating the parsed value and building a
+    policy out of it belongs to the interaction rollout policy owner
+    (``web/services/interaction_rollout.py``), not to this module. Unlike
+    ``get_agent_runtime`` above, an unrecognized value is not this
+    function's problem to warn about or fall back from.
+    """
+    value = os.getenv(INTERACTION_PROTOCOL_MODE)
+    if value is None or not value.strip():
+        return "legacy"
+    return value.strip().lower()
+
+
+def get_interaction_native_sources() -> list[str]:
+    """Raw XAGENT_INTERACTION_NATIVE_SOURCES reading: a normalized token list.
+
+    Comma-splits the env value, strips and lowercases each token, and skips
+    blank tokens -- the same shape ``get_external_upload_dirs`` below uses
+    for its own comma-separated list. Duplicate tokens are preserved and
+    tokens are not checked against any vocabulary here: deduplication and
+    vocabulary validation need to raise two distinguishable errors, and
+    producing those belongs to the interaction rollout policy owner, not to
+    this module.
+    """
+    raw = os.getenv(INTERACTION_NATIVE_SOURCES, "")
+    if not raw:
+        return []
+
+    result: list[str] = []
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if token:
+            result.append(token)
+    return result
 
 
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:

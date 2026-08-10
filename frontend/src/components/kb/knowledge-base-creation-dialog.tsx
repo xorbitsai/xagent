@@ -108,9 +108,8 @@ function buildWebIngestionErrorResult(
   }
 }
 
-/** Carries the response status out of a helper, so a failure detected before
- *  the ingest request reaches the same toast classifier one detected during it
- *  does — otherwise a reserve-time 409 loses the "pick another name" advice. */
+/** Carries the response status into the toast classifier, so a reserve-time
+ *  409 keeps the "pick another name" advice. */
 class RequestFailure extends Error {
   constructor(message: string, readonly status?: number) {
     super(message)
@@ -133,9 +132,8 @@ interface SelectableCardOption<T extends string> {
   description: string
 }
 
-/** Cards standing in for radios: a Card gives none of the keyboard behaviour a
- *  radio group gets for free, so the tab stop follows the selection and the
- *  arrow keys move it. */
+/** Cards standing in for radios, with the APG radiogroup keyboard behaviour
+ *  (roving tab stop, arrows, Home/End) written out. */
 function SelectableCardGroup<T extends string>({
   options,
   selected,
@@ -155,9 +153,8 @@ function SelectableCardGroup<T extends string>({
 }) {
   const styles = SELECTABLE_CARD_SIZES[size]
 
-  // One handler on the group: keydown bubbles, and the card's position among its
-  // siblings is the index into `options`. Resolve through `closest` so a key
-  // pressed while the icon or a label holds focus still finds its card.
+  // One bubbling handler on the group; `closest` finds the card even when a
+  // nested icon or label holds focus.
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const cards = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'))
     const card = (event.target as HTMLElement).closest('[role="radio"]')
@@ -448,15 +445,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     return false
   }
 
-  /** Ownership is resolved before the first byte is written (`reserve-team` is
-   *  a promote over an empty collection), so a team knowledge base has to claim
-   *  its name before the ingest or the files land in personal storage.
-   *
-   *  Gated on `ownership`, not `inTeam`: the server is the authority on team
-   *  membership, and a stale `inTeam` must not silently turn a requested team
-   *  knowledge base into a personal one. Sets `claimed` before awaiting: a
-   *  request that throws may still have committed server-side, and releasing a
-   *  claim that never existed is a harmless 404. */
+  /** Claim the name before the first ingest byte, or the files land in personal
+   *  storage. Gated on `ownership`, not `inTeam` — the server owns membership.
+   *  `claimed` is set before the await: a thrown request may have committed. */
   const reserveTeamName = async (collection: string, claimed: { current: boolean }) => {
     if (ownership !== "team") return
     claimed.current = true
@@ -479,14 +470,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     throw new RequestFailure(detail || t("kb.ownership.reserveFailed"), response.status)
   }
 
-  /** Best-effort, fire-and-forget: a failed ingest gives the name back so a
-   *  teammate's later knowledge base under it is not resolved into team storage.
-   *  409 means data exists behind the claim (keeping it is correct) and 404
-   *  means there was no claim; anything else leaks the claim, which only the
-   *  creator can reuse — reserving the same name again answers 204 — so warn
-   *  and move on rather than retry.
-   *  ponytail: no retry/settle tracking; a leaked claim is recoverable by the
-   *  creator and blocks teammates with an explicit 409 server-side. */
+  /** Best-effort release, no retry: 409 means data exists (keep the claim),
+   *  404 means there was no claim, anything else just warns — a leaked claim
+   *  stays reusable by its creator and blocks teammates server-side. */
   const releaseTeamName = async (collection: string) => {
     try {
       const response = await apiRequest(
@@ -673,9 +659,11 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       toast.error(toastContent.title, {
         description: toastContent.description,
       })
-      // Not awaited: the failure is already on screen, and a slow release must
-      // not keep the button reading "Processing".
-      if (teamClaimed.current) void releaseTeamName(collectionName)
+      // Fire-and-forget, and only when nothing landed: once any file succeeded
+      // the collection has data and the claim must stay.
+      if (teamClaimed.current && successfulCollections.length === 0) {
+        void releaseTeamName(collectionName)
+      }
       if (successfulCollections.length > 0) {
         onSuccess?.(successfulCollections)
       }
@@ -827,6 +815,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
     const collectionName = trimmedCollectionName
     const teamClaimed = { current: false }
+    let succeededCloudFiles = 0
 
     try {
       // Aggregate all selected files from all providers
@@ -906,6 +895,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         : []
       setIngestionResults(results)
 
+      succeededCloudFiles = results.filter(result => result.status === "success").length
       const failedResults = results.filter(result => result.status !== "success")
       if (failedResults.length > 0) {
         throw new Error(failedResults[0].message || t("kb.errors.cloudIngestFailed"))
@@ -933,7 +923,10 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       toast.error(toastContent.title, {
         description: toastContent.description,
       })
-      if (teamClaimed.current) void releaseTeamName(collectionName)
+      // Same zero-success gate as the file path.
+      if (teamClaimed.current && succeededCloudFiles === 0) {
+        void releaseTeamName(collectionName)
+      }
     } finally {
       setIsCloudConnecting(false)
     }
@@ -976,9 +969,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             </div>
           </div>
 
-          {/* This dialog renders its step bodies here, outside the Stepper, so
-              the gap the stepper's dropped `mb-6` used to provide lives on the
-              real content container — not on the Stepper's empty tabpanel. */}
+          {/* Step bodies render here, outside the Stepper, so the spacing the
+              stepper's dropped `mb-6` provided lives on this container. */}
           <div className="flex-1 overflow-y-auto px-6 pt-6 pb-6">
             {currentStep === 1 && (
               <div className="space-y-6">
@@ -1013,10 +1005,8 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                     className="mt-1.5 h-32"
                   />
                 </div>
-                {/* Also rendered once Team is chosen, whatever `inTeam` says
-                    afterwards: losing membership mid-dialog would otherwise take
-                    the control away while every submit still tried to reserve,
-                    leaving no way back to Personal short of reopening. */}
+                {/* Stays rendered once Team is chosen, so losing `inTeam`
+                    mid-dialog cannot strand the user on Team. */}
                 {(inTeam || ownership === "team") && (
                   <div className="space-y-1.5">
                     <Label id="kb-ownership-label">{t("kb.ownership.label")}</Label>

@@ -729,10 +729,21 @@ describe("KnowledgeBaseCreationDialog ownership", () => {
     expect(team.getAttribute("tabindex")).toBe("0")
     expect(document.activeElement).toBe(team)
 
-    fireEvent.keyDown(team, { key: " " })
-    expect(team.getAttribute("aria-checked")).toBe("true")
     fireEvent.keyDown(team, { key: "ArrowRight" })
     expect(personal.getAttribute("aria-checked")).toBe("true")
+
+    // Space and Enter select the card under focus, not the current selection.
+    fireEvent.keyDown(team, { key: " " })
+    expect(team.getAttribute("aria-checked")).toBe("true")
+    fireEvent.keyDown(personal, { key: "Enter" })
+    expect(personal.getAttribute("aria-checked")).toBe("true")
+
+    fireEvent.keyDown(personal, { key: "End" })
+    expect(team.getAttribute("aria-checked")).toBe("true")
+    expect(document.activeElement).toBe(team)
+    fireEvent.keyDown(team, { key: "Home" })
+    expect(personal.getAttribute("aria-checked")).toBe("true")
+    expect(document.activeElement).toBe(personal)
   })
 
   it("reserves the name exactly once before a multi-file team ingest", async () => {
@@ -838,6 +849,63 @@ describe("KnowledgeBaseCreationDialog ownership", () => {
     expect(toastErrorMock).toHaveBeenCalled()
     // A clean release says nothing: the ingest error is what the user needs.
     expect(toastWarningMock).not.toHaveBeenCalled()
+  })
+
+  it("keeps the claim when part of a multi-file upload already landed", async () => {
+    // File 1 put data behind the claim, so the failure of file 2 must not
+    // release the name out from under a live team collection.
+    let ingestCalls = 0
+    mockRoute(
+      (url) => url === "http://api.local/api/kb/ingest/jobs",
+      () => {
+        ingestCalls += 1
+        return ingestCalls === 1
+          ? createJsonResponse(
+              createSucceededJob({
+                status: "success",
+                collection: "team-docs",
+                document_count: 1,
+                chunks_count: 1,
+                message: "ok",
+              })
+            )
+          : createJsonResponse({ detail: "ingest exploded" }, false, 500)
+      }
+    )
+    const onSuccess = vi.fn()
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={onSuccess} />
+    )
+    nameAndChooseTeam(container)
+    await goToStep3(container, "file", 2)
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      expect(onSuccess).toHaveBeenCalledWith(["team-docs"])
+    })
+    expect(toastErrorMock).toHaveBeenCalled()
+    expect(callsTo(RELEASE_URL)).toHaveLength(0)
+  })
+
+  it.each([
+    ["a network error", () => Promise.reject(new Error("connection reset"))],
+    ["a 5xx", () => Promise.resolve(createJsonResponse({ detail: "boom" }, false, 503))],
+  ])("releases an ambiguous claim when the reserve dies with %s", async (_label, respond) => {
+    // A thrown or 5xx reserve may still have committed server-side, so the
+    // ingest must not start and the possible claim is given back.
+    mockRoute((url) => url === RESERVE_URL, respond)
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+    nameAndChooseTeam(container)
+    await goToStep3(container, "file")
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      expect(callsTo(RELEASE_URL)).toHaveLength(1)
+    })
+    expect(toastErrorMock).toHaveBeenCalled()
+    expect(callsTo("http://api.local/api/kb/ingest/jobs")).toHaveLength(0)
   })
 
   it("warns without clobbering the ingest error when the release also fails", async () => {

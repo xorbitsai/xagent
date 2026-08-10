@@ -2317,3 +2317,97 @@ def test_every_swallowed_type_has_a_degradation_signal() -> None:
         if not any(issubclass(cls, mapped) for mapped in _DEGRADATION_SIGNALS)
     ]
     assert unmapped == []
+
+
+def test_cm11_swallow_handler_survives_a_non_object_anchor(tmp_path: Path) -> None:
+    """Regression pin for ``_safe()``. A caller passing a dict as ``anchor``
+    (not an ``InteractionAnchor`` at all -- the same shape
+    ``test_step_one_rejects_wrong_type_anchor_without_sql`` uses against
+    ``stage_interaction_request`` directly) makes ``_validate_anchor_fields``
+    raise ``InteractionAnchorCorrupt`` from its own ``isinstance`` guard,
+    before ever touching ``anchor.resume_run_partition``. But the *swallow
+    handler* in ``interaction_handoff`` used to read that exact attribute
+    straight off the same object while building its log line -- a dict has
+    no ``resume_run_partition``, so that read crashed with ``AttributeError``
+    and replaced the swallowed ``InteractionAnchorCorrupt`` instead of
+    degrading. This pins that a dict anchor degrades the same way every
+    other ``InteractionAnchorCorrupt`` does: no exception escapes, the
+    shared signal registers, and no row is written."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+    bad_anchor = {"trace_event_id": anchor_id}
+
+    with interaction_handoff(db, lease, task=task, anchor=bad_anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    caller_ran_after_with = True
+    assert caller_ran_after_with
+    db.commit()
+
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0
+    db.close()
+
+
+def test_handoff_never_writes_any_task_column(tmp_path: Path) -> None:
+    """The module docstring's own invariant: neither entry point writes any
+    *data* column of ``tasks``. The SQLite-only savepoint guard
+    (``interaction_handoff``'s zero-row ``UPDATE tasks SET id = id WHERE id
+    = -1``) is written with ``sa.text()`` specifically so its SET clause
+    names exactly one column, a self-assignment matching zero rows --
+    ``sa.update(Task)`` with no ``.values()`` at all would instead compile a
+    SET clause naming every column SQLAlchemy maps on ``Task`` (lease-fencing
+    columns included), and even ``.values(id=-1)`` alone still picks up
+    ``updated_at`` from its ``onupdate=func.now()``. This pins that a
+    successful handoff+stage leaves the task row's every column
+    byte-identical -- not just that ``lease_attempt_id``/``updated_at``
+    happen to survive -- by snapshotting the whole row before and after."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    before = {
+        column.name: getattr(task, column.name) for column in Task.__table__.columns
+    }
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        staged = h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+    assert staged.created is True
+    db.close()
+
+    fresh = session_factory()
+    fresh_task = fresh.get(Task, task_id)
+    after = {
+        column.name: getattr(fresh_task, column.name)
+        for column in Task.__table__.columns
+    }
+    fresh.close()
+
+    assert after == before

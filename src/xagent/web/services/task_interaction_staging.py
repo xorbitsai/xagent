@@ -1111,6 +1111,26 @@ class _InteractionHandoff:
         )
 
 
+def _safe(obj: Any, name: str) -> Any:
+    """Best-effort attribute read for the swallow handler's own logging.
+
+    By definition, the objects logged there (``task``, ``lease``, ``anchor``)
+    may already be invalid or stale -- that is often exactly what the
+    exception that brought us here proves (a corrupt anchor may not even be
+    an ``InteractionAnchor`` at all; see ``_validate_anchor_fields``'s own
+    ``isinstance`` check). Catches all exceptions, not just
+    ``AttributeError``: a detached ``task`` row raises
+    ``DetachedInstanceError``, a ``SQLAlchemyError`` subclass, not an
+    ``AttributeError``, so a bare ``getattr(obj, name, None)`` would not
+    catch it and would crash the logging it was meant to protect.
+    """
+
+    try:
+        return getattr(obj, name, None)
+    except Exception:
+        return None
+
+
 @contextmanager
 def interaction_handoff(
     db: Session,
@@ -1385,15 +1405,16 @@ def interaction_handoff(
         try:
             register_degradation(
                 signal,
-                f"task {task.id} run {lease.run_id}: {type(exc).__name__}: {exc}",
+                f"task {_safe(task, 'id')} run {_safe(lease, 'run_id')}: "
+                f"{type(exc).__name__}: {exc}",
             )
             logger.error(
                 "interaction handoff degraded",
                 extra={
-                    "task_id": task.id,
-                    "lease_run_id": lease.run_id,
-                    "lease_attempt_id": lease.attempt_id,
-                    "anchor_run_partition": anchor.resume_run_partition,
+                    "task_id": _safe(task, "id"),
+                    "lease_run_id": _safe(lease, "run_id"),
+                    "lease_attempt_id": _safe(lease, "attempt_id"),
+                    "anchor_run_partition": _safe(anchor, "resume_run_partition"),
                     "exception_type": type(exc).__name__,
                     "degradation_signal": signal,
                 },

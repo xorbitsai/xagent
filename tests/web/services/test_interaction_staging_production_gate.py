@@ -26,9 +26,26 @@ forcing every future mention of ``stage_interaction_request`` or
 for the precedent this follows -- the trace staging work moved that check from
 substring to AST for the identical reason.
 
-Dynamic access is out of scope: ``importlib.import_module(...)`` plus
-``getattr(...)`` matches none of the node shapes above. The gate pins the
-ordinary import-and-call surface, not every conceivable route.
+Known blind spots, not fixed here because closing them is out of scope for
+a static AST scan of one package tree:
+
+(a) Dynamic access: ``importlib.import_module(...)`` plus ``getattr(...)``
+    matches none of the node shapes above. The gate pins the ordinary
+    import-and-call surface, not every conceivable route.
+(b) A gated name reached through an alias chain the AST walk does not
+    resolve -- e.g. re-exporting ``stage_interaction_request`` under a
+    different name from a third module and importing *that* name
+    elsewhere. ``_production_uses`` matches names as written, not values
+    traced through re-assignment.
+(c) The primitive-module exclusion in ``_production_modules`` is
+    stem-keyed (``path.stem != PRIMITIVE_MODULE``), not path-keyed: any
+    other file anywhere under this package that happened to also be named
+    ``task_interaction_staging.py`` would be excluded from the scan right
+    alongside the real one, on filename alone.
+(d) The scan root is ``xagent.__path__`` (``src/xagent``), not the
+    repository root -- a caller under the top-level ``scripts/`` directory
+    (outside that tree) is invisible to this gate entirely, positive
+    controls and all.
 """
 
 from __future__ import annotations
@@ -61,6 +78,16 @@ def _production_uses(source: str) -> set[str]:
             # "task_interaction_staging").
             if (node.module or "").split(".")[-1] == PRIMITIVE_MODULE:
                 found.update(a.name for a in node.names if a.name in GATED_NAMES)
+                # ``from ...task_interaction_staging import *`` names neither
+                # gated name explicitly -- the loop above finds nothing --
+                # but it binds both of them into the importing module's
+                # namespace all the same. Scoped to a module-path match
+                # (not every star import in the codebase, which says
+                # nothing about this primitive at all): both gated names
+                # count as found whenever this specific module is the one
+                # being star-imported.
+                if any(a.name == "*" for a in node.names):
+                    found.update(GATED_NAMES)
             found.update(a.name for a in node.names if a.name == PRIMITIVE_MODULE)
         elif isinstance(node, ast.Import):
             found.update(
@@ -88,7 +115,15 @@ def _production_modules() -> list[Path]:
     ``__path__`` instead, which every package (namespace or regular) has."""
 
     root = Path(next(iter(xagent.__path__)))
-    return [path for path in root.rglob("*.py") if path.stem != PRIMITIVE_MODULE]
+    modules = [path for path in root.rglob("*.py") if path.stem != PRIMITIVE_MODULE]
+    # A scan set that came back empty would make test_no_production_module_
+    # imports_or_calls_the_gated_names pass vacuously -- offenders would stay
+    # {} not because nothing was found, but because nothing was scanned.
+    # xagent.__path__ resolving to the wrong root (a packaging change, a
+    # broken install) is exactly the failure mode this catches before it
+    # can masquerade as "gate still clean".
+    assert modules, "production scan set is empty"
+    return modules
 
 
 # --------------------------------------------------------------------------
@@ -153,6 +188,18 @@ def test_detects_module_import_and_attribute_call() -> None:
 def test_detects_bare_module_import() -> None:
     source = "import xagent.web.services.task_interaction_staging\n"
     assert _production_uses(source) == {"task_interaction_staging"}
+
+
+def test_detects_star_import() -> None:
+    """``from ...task_interaction_staging import *`` names neither gated
+    name in its own ``ast.ImportFrom.names`` list -- a plain per-alias scan
+    finds nothing there and would let this shape through as a false
+    negative, even though it binds both names into the importing module's
+    namespace. No call site is needed to expose the gap: the import alone
+    must report both gated names found."""
+
+    source = "from xagent.web.services.task_interaction_staging import *\n"
+    assert _production_uses(source) == GATED_NAMES
 
 
 # --------------------------------------------------------------------------

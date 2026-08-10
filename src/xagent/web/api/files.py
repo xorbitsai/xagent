@@ -220,9 +220,13 @@ async def _inline_preview_response(
             filename=Path(filename).with_suffix(".png").name,
             media_type="image/png",
             headers={
+                **(extra_headers or {}),
+                # These two win over any same-named extra_headers entry: they
+                # are security invariants (the second prevents this rasterized
+                # PNG from being sniffed back into script-executable content),
+                # not caller-tunable behavior.
                 "Content-Disposition": "inline",
                 "X-Content-Type-Options": "nosniff",
-                **(extra_headers or {}),
             },
         )
     return FileResponse(
@@ -230,9 +234,10 @@ async def _inline_preview_response(
         filename=filename,
         media_type=media_type,
         headers={
+            **(extra_headers or {}),
+            # See the invariant note in the SVG branch above.
             "Content-Disposition": "inline",
             "X-Content-Type-Options": "nosniff",
-            **(extra_headers or {}),
         },
     )
 

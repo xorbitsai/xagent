@@ -1926,6 +1926,39 @@ def test_cm8b_normal_exit_after_caller_deactivates_savepoint_raises_misuse(
     db.close()
 
 
+@pytest.mark.parametrize("caller_action", ["rollback", "commit"])
+def test_cm8c_normal_exit_after_deactivation_without_a_stage_call_names_no_row(
+    tmp_path: Path, caller_action: str
+) -> None:
+    """T-CM-8b's zero-``stage()``-call twin: calling ``h.stage()`` zero
+    times is legal on its own (a caller may decide not to ask), but a
+    caller that never calls it and still commits or rolls back from inside
+    the ``with`` block deactivates this context manager's own outer
+    savepoint the same way T-CM-8b's does -- the misuse detection does not
+    require a prior ``stage()`` call to fire. The two variants must not
+    share a message that claims a staged row exists when ``handoff._staged``
+    is still ``False``: this pins the "no interaction row was staged"
+    wording for that case, while T-CM-8b pins the other."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with pytest.raises(InteractionHandoffMisuse, match="no interaction row was staged"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()):
+            if caller_action == "rollback":
+                db.rollback()
+            else:
+                db.commit()
+
+    assert ops_signals.active_degradations() == {}
+    db.close()
+
+
 def test_cm9_out_of_vocabulary_task_source_degrades(tmp_path: Path) -> None:
     """T-CM-9: ``origin`` is a frozen copy of ``task.source`` -- an audit
     column recording which surface raised the interaction. A ``task.source``

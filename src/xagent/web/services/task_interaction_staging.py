@@ -59,7 +59,7 @@ test's docstring for the removal condition.
 Every rejection the database's 23 CHECK constraints could raise on the
 INSERT is rejected in plain Python first, inside
 ``stage_interaction_request``'s validation block, because the post-conflict
-re-check (step 7 below) classifies any ``IntegrityError`` for which no row
+re-check (step 6 below) classifies any ``IntegrityError`` for which no row
 exists at the caller's own identity as a slot conflict --
 ``InteractionSlotTaken`` (a re-check hit that does exist there, but is
 already ``answered`` or ``terminated``, raises ``InteractionRequestClosed``
@@ -102,7 +102,7 @@ being deleted concurrently, some time between whatever read gave the
 caller its ``task_id`` / the anchor's ``trace_event_id`` and this call's
 own INSERT. Neither has a Python precondition here -- nothing in this
 function's own arguments could detect a row disappearing out from under
-it -- and both surface as a foreign-key ``IntegrityError`` that step 7's
+it -- and both surface as a foreign-key ``IntegrityError`` that step 6's
 re-check, finding no matching identity row, classifies as
 ``InteractionSlotTaken`` along with everything else in the
 misclassification funnel above. Closing that gap is not this validation
@@ -189,7 +189,7 @@ class InteractionHandoffError(RuntimeError):
 class InteractionSlotTaken(InteractionHandoffError):
     """The active-row INSERT collided with another request's active slot.
 
-    Raised only when the post-conflict re-check (step 7) finds no row at all
+    Raised only when the post-conflict re-check (step 6) finds no row at all
     at the caller's own ``(task_id, run_id, request_idempotency_key)`` after
     an ``IntegrityError`` -- there is no identity row to explain the
     conflict, so it must have been the active-slot unique. A re-check hit
@@ -209,9 +209,9 @@ class InteractionRequestClosed(InteractionHandoffError):
 
     Raised when ``(task_id, run_id, request_idempotency_key)`` names a row
     whose ``status`` is ``answered`` or ``terminated`` rather than
-    ``active`` -- both by the idempotency pre-read (step 4, before this
+    ``active`` -- both by the idempotency pre-read (step 3, before this
     call's own INSERT is ever attempted) and by the post-conflict re-check
-    (step 7, when this call's own INSERT collided with a row that turns out
+    (step 6, when this call's own INSERT collided with a row that turns out
     to already be closed rather than merely active elsewhere). Both reads
     share ``_identity_lookup_stmt``, so the two call sites classify the same
     row state identically. Identity is scoped by ``run_id``: a key that was
@@ -305,15 +305,18 @@ class InteractionHandoffMisuse(InteractionHandoffError):
       call's row while reporting success.
     * The caller committed or rolled back the session from inside the
       ``with`` block -- violating ``interaction_handoff``'s "no I/O in
-      between" obligation -- after ``stage()`` had already succeeded. Both
-      operations end the whole transaction, deactivating this context
-      manager's own outer savepoint along with it; by the time the block
-      exits normally, that savepoint no longer exists to commit. Raising
-      here instead of silently skipping the now-impossible commit matters
-      because skipping would report success for a row whose containment is
-      gone -- the caller's own commit already decided that row's fate one
-      way or the other, and this context manager has no way left to tell
-      which.
+      between" obligation -- whether or not ``stage()`` had already
+      succeeded (zero calls is otherwise legal on its own -- see
+      ``_InteractionHandoff``'s own docstring). Both operations end the
+      whole transaction, deactivating this context manager's own outer
+      savepoint along with it; by the time the block exits normally, that
+      savepoint no longer exists to commit. Raising here instead of
+      silently skipping the now-impossible commit matters because skipping
+      would report success for a row whose containment is gone -- the
+      caller's own commit already decided that row's fate one way or the
+      other, and this context manager has no way left to tell which. The
+      message differs by whether ``stage()`` was actually called; the
+      exception type does not.
 
     Deliberately absent from ``_SWALLOWED`` in both cases: these are caller
     bugs, classified the same way ``InteractionOwnerStateError`` is --
@@ -442,13 +445,13 @@ class StagedInteractionRequest:
 
     ``created`` is ``True`` only on the clean-INSERT path. It is ``False``
     on every replay path: a pre-existing ``active`` row hit by the
-    idempotency pre-read (step 4, before any reclaim or INSERT was even
+    idempotency pre-read (step 3, before any reclaim or INSERT was even
     attempted) and a pre-existing ``active`` row hit by the post-conflict
-    re-check (step 7, after this call's own INSERT lost a race). Both
+    re-check (step 6, after this call's own INSERT lost a race). Both
     replay paths return the *other* request's row, not a new one --
     ``status`` and ``active_slot`` describe that row as it stood at the
-    moment this call read it, which on the step-4 path may already be
-    expired (see ``stage_interaction_request``'s docstring on why step 4
+    moment this call read it, which on the step-3 path may already be
+    expired (see ``stage_interaction_request``'s docstring on why step 3
     does not consult ``expires_at``).
     """
 
@@ -535,10 +538,11 @@ def _validate_request_fields(
     caught by a CHECK constraint on the INSERT. See the module docstring's
     misclassification-funnel paragraph for why this list must stay complete.
 
-    Row 13 of that list: ``now`` must be validated as an aware UTC datetime
-    the same way ``expires_at`` is (row 6) -- not normalized, only rejected
-    if it fails. ``now`` has no CHECK constraint of its own to back this up
-    (unlike every other row here), but it is not a free pass: the reclaim
+    ``now`` must be validated as an aware UTC datetime the same way
+    ``expires_at`` is, immediately above it in this same function -- not
+    normalized, only rejected if it fails. ``now`` has no CHECK constraint
+    of its own to back this up (unlike every other value this function
+    checks), but it is not a free pass: the reclaim
     UPDATE (``_reclaim_stale_slot_stmt``) persists this exact value into
     ``terminated_at`` and ``updated_at`` on every row it reclaims, so a
     naive or non-UTC ``now`` would otherwise reach SQL and get silently
@@ -668,7 +672,7 @@ def _identity_lookup_stmt(
     *, task_id: int, run_id: str, request_idempotency_key: str
 ) -> sa.Select[Any]:
     """The identical Core SELECT used by both the idempotency pre-read (step
-    4) and the post-conflict re-check (step 7). Written once so the two
+    3) and the post-conflict re-check (step 6). Written once so the two
     statements cannot drift apart at the edges of what they match."""
 
     return sa.select(
@@ -683,7 +687,7 @@ def _identity_lookup_stmt(
 
 
 def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.Update:
-    """The reclaim UPDATE (step 5). Stays in the caller's outer transaction,
+    """The reclaim UPDATE (step 4). Stays in the caller's outer transaction,
     not this function's inner savepoint -- it dies with the whole handoff on
     rollback, and the post-conflict re-check must not have undone it.
 
@@ -1169,12 +1173,17 @@ def interaction_handoff(
     six swallowed exceptions below is swallowed because it is a named,
     expected outcome with its own degradation signal, never because the
     underlying data (the task, the anchor, the request row) turned out to
-    be missing or unreadable. A caller with a missing task or a broken
-    anchor gets an exception here -- ``InteractionAnchorCorrupt`` or a
-    database error, not a quiet no-op -- because a blocking interaction
-    request that is silently never staged strands the caller's turn
-    exactly the way this module's degrade-instead-of-losing-the-turn design
-    exists to prevent.
+    be missing or unreadable. A broken anchor is itself one of those six:
+    ``InteractionAnchorCorrupt`` degrades the same way the other five do --
+    it registers ``INTERACTION_HANDOFF_DEGRADED``, with a message naming the
+    specific corrupt field, and the ``with`` block exits without staging a
+    row, not by raising. A caller with a missing task still gets an
+    exception here -- ``ObjectDeletedError`` from the first stale
+    ``task.<attr>`` access, or another database error, not a quiet no-op --
+    because neither is one of the six named outcomes this module degrades
+    on, and a blocking interaction request that is silently never staged
+    would otherwise strand the caller's turn exactly the way this module's
+    degrade-instead-of-losing-the-turn design exists to prevent.
 
     Nesting, exactly:
 
@@ -1439,9 +1448,24 @@ def interaction_handoff(
         raise
     else:
         if not savepoint.is_active:
+            # handoff._staged tells the two ways this misuse can happen
+            # apart: a caller can violate the no-I/O-in-between obligation
+            # either after a successful stage() (there is a real staged row
+            # whose containment just vanished) or without ever calling
+            # stage() at all (zero calls is otherwise legal -- see
+            # _InteractionHandoff's own docstring -- so nothing was staged,
+            # but the caller's own commit/rollback still deactivated this
+            # savepoint the same way). Same exception type either way; only
+            # the message should claim a staged row exists when one does.
+            if handoff._staged:
+                raise InteractionHandoffMisuse(
+                    "the caller committed or rolled back inside the "
+                    "interaction_handoff block; the savepoint that contains "
+                    "the staged interaction row no longer exists"
+                )
             raise InteractionHandoffMisuse(
                 "the caller committed or rolled back inside the "
-                "interaction_handoff block; the savepoint that contains the "
-                "staged interaction row no longer exists"
+                "interaction_handoff block; no interaction row was staged, "
+                "but the handoff's savepoint no longer exists"
             )
         savepoint.commit()

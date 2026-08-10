@@ -1,0 +1,378 @@
+"""Behavior tests for ``supersede_legacy_question_rows``.
+
+Covers the SQLite-reachable half of the eight pinned cells: whole-set
+rewrite semantics with negative controls (role and cross-task isolation),
+idempotency, the degrade/propagate split on the catch clause, signal
+pairing, and transcript-field invariance. The PostgreSQL-only cell
+(savepoint necessity under an aborted transaction) lives in
+``test_supersede_savepoint_postgresql.py`` -- SQLite does not poison an
+open transaction after a failed statement, so that mutation cannot be
+proven red here (see that file's module docstring).
+"""
+
+from __future__ import annotations
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.exc import InvalidRequestError, OperationalError
+from sqlalchemy.orm import Query, sessionmaker
+
+from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.user import User
+from xagent.web.services import ops_signals
+from xagent.web.services.chat_history_service import (
+    persist_assistant_message,
+    supersede_legacy_question_rows,
+)
+
+
+def _create_db_session():
+    engine = create_engine("sqlite:///:memory:")
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    return SessionLocal()
+
+
+def _create_task(db_session, username="tester"):
+    user = User(username=username, password_hash="hashed_password", is_admin=False)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    task = Task(
+        user_id=int(user.id),
+        title="Chat task",
+        description="Task chat",
+        status=TaskStatus.PENDING,
+    )
+    db_session.add(task)
+    db_session.commit()
+    db_session.refresh(task)
+    return task
+
+
+@pytest.fixture(autouse=True)
+def _clean_signal():
+    ops_signals.clear_degradation(ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED)
+    yield
+    ops_signals.clear_degradation(ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED)
+
+
+def test_supersede_zeroes_the_whole_waiting_set_with_negative_controls():
+    """Two simultaneously waiting questions on the same task both flip;
+    a same-task row with ``role='user'`` and a same-shaped row on a
+    different task are untouched -- the negative controls prove the
+    ``role`` and ``task_id`` predicate legs actually gate the update,
+    not just the ``message_type`` leg."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        other_task = _create_task(db, username="other-tester")
+
+        first = persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "First question",
+            message_type="question",
+        )
+        second = persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "Second question",
+            message_type="question",
+        )
+        # Adversarial negative control: role='user' but message_type
+        # matches -- if the helper's predicate ever dropped the role leg,
+        # this row would wrongly flip too.
+        user_row = TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(task.user_id),
+            role="user",
+            content="not actually a question",
+            message_type="question",
+        )
+        db.add(user_row)
+        db.commit()
+        db.refresh(user_row)
+
+        other_question = persist_assistant_message(
+            db,
+            int(other_task.id),
+            int(other_task.user_id),
+            "Other task question",
+            message_type="question",
+        )
+
+        updated = supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert updated == 2
+        db.refresh(first)
+        db.refresh(second)
+        db.refresh(user_row)
+        db.refresh(other_question)
+        assert first.message_type == "question_superseded"
+        assert second.message_type == "question_superseded"
+        assert user_row.message_type == "question"
+        assert other_question.message_type == "question"
+    finally:
+        db.close()
+
+
+def test_supersede_is_idempotent_on_a_second_call():
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        row = persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        first_pass = supersede_legacy_question_rows(db, task_id=int(task.id))
+        second_pass = supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert first_pass == 1
+        assert second_pass == 0
+        db.refresh(row)
+        assert row.message_type == "question_superseded"
+    finally:
+        db.close()
+
+
+def test_supersede_degrades_on_dbapi_error_and_lets_the_caller_commit(monkeypatch):
+    """A DBAPIError inside the savepoint is swallowed: the helper returns
+    0, registers the degradation signal, the legacy row is left exactly
+    as it was, and -- the point of the savepoint -- the caller's own
+    transaction can still commit afterward."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        row = persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        boom = OperationalError(
+            "UPDATE task_chat_messages", {}, Exception("connection reset")
+        )
+
+        def failing_update(self, *args, **kwargs):
+            raise boom
+
+        monkeypatch.setattr(Query, "update", failing_update)
+        result = supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert result == 0
+        signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
+        assert signal_name in ops_signals.active_degradations()
+        detail = ops_signals.active_degradations()[signal_name]
+        # Exact match, not a substring check: the detail is a composed
+        # "task_id=<id> exception_type=<class name>" string with nothing
+        # else in it -- no exception free-text, which could leak DB
+        # connection info into a process-wide, unauthenticated-adjacent
+        # registry (see ops_signals.py's own docstring on that boundary).
+        assert detail == f"task_id={task.id} exception_type=OperationalError"
+
+        # The point of the savepoint: the caller's transaction is still
+        # usable and can commit after the swallow.
+        db.commit()
+
+        db.refresh(row)
+        assert row.message_type == "question"
+    finally:
+        db.close()
+
+
+def test_supersede_propagates_a_non_dbapi_sqlalchemy_error(monkeypatch):
+    """``InvalidRequestError`` is a ``SQLAlchemyError`` but not a
+    ``DBAPIError`` -- it must come straight out of the helper, and the
+    catch clause must not register the degradation signal for it."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        def failing_update(self, *args, **kwargs):
+            raise InvalidRequestError("bad bulk update usage")
+
+        monkeypatch.setattr(Query, "update", failing_update)
+        with pytest.raises(InvalidRequestError):
+            supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
+        assert signal_name not in ops_signals.active_degradations()
+
+        # The savepoint still rolled back cleanly on the way out; the
+        # session is not wedged.
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_supersede_clears_the_signal_on_the_next_successful_call(monkeypatch):
+    """One failure registers the signal; a subsequent successful call on
+    the same or another task clears it -- registration and clearing are
+    both keyed on the signal name, not on the task."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        boom = OperationalError(
+            "UPDATE task_chat_messages", {}, Exception("connection reset")
+        )
+
+        def failing_update(self, *args, **kwargs):
+            raise boom
+
+        monkeypatch.setattr(Query, "update", failing_update)
+        first_result = supersede_legacy_question_rows(db, task_id=int(task.id))
+        monkeypatch.undo()
+
+        signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
+        assert first_result == 0
+        assert signal_name in ops_signals.active_degradations()
+
+        second_result = supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert second_result == 1
+        assert signal_name not in ops_signals.active_degradations()
+    finally:
+        db.close()
+
+
+def test_supersede_never_commits_and_the_caller_can_still_roll_back(monkeypatch):
+    """The helper never calls ``db.commit()`` itself -- it only stages the
+    UPDATE inside the caller's own open transaction, inside its own
+    SAVEPOINT, and leaves committing to the caller.
+
+    Proven two ways: a commit spy on the session records zero calls
+    during a successful supersede, and a second write the caller stages
+    *after* calling the helper can still be rolled back cleanly
+    afterward -- proving the helper left the session as a normal, live,
+    abortable transaction rather than doing anything (an early commit, a
+    wedged connection) that would have taken that ability away from the
+    caller.
+
+    That second write is a fresh row, not the supersede's own row. On
+    real ACID PostgreSQL a caller-issued ``db.rollback()`` after this
+    point would undo the supersede's own UPDATE too, since a released
+    SAVEPOINT only discards the ability to roll back *to* that point --
+    it does not commit anything. On this SQLite test engine it does not:
+    the stock pysqlite driver has a long-documented quirk where SQL text
+    it does not itself parse as starting a transaction (``SAVEPOINT``,
+    ``RELEASE``) can leave its own implicit transaction bookkeeping out
+    of sync with the server, so a RELEASEd savepoint's write has been
+    observed to survive a later top-level ``ROLLBACK`` here -- a fact
+    about this driver, not about ``supersede_legacy_question_rows``.
+    Asserting on the supersede's own row here would be asserting a false
+    thing on this backend; the second-write check proves the same
+    "helper stays out of the caller's transaction control" property
+    without depending on that driver quirk.
+    """
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        commit_calls = 0
+        original_commit = db.commit
+
+        def spy_commit():
+            nonlocal commit_calls
+            commit_calls += 1
+            return original_commit()
+
+        monkeypatch.setattr(db, "commit", spy_commit)
+
+        updated = supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert updated == 1
+        assert commit_calls == 0
+
+        sentinel = TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(task.user_id),
+            role="assistant",
+            content="staged after supersede",
+            message_type="assistant_message",
+        )
+        db.add(sentinel)
+        db.flush()
+        sentinel_id = sentinel.id
+
+        db.rollback()
+
+        assert (
+            db.query(TaskChatMessage).filter(TaskChatMessage.id == sentinel_id).first()
+            is None
+        )
+    finally:
+        db.close()
+
+
+def test_supersede_touches_only_the_message_type_column():
+    """Every other transcript field on the row is unchanged: no delete, no
+    content rewrite, no interactions/attachments/turn_id/user_id/id/
+    created_at drift."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        row = persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+            interactions=[{"type": "text_input", "label": "Q"}],
+        )
+        before = {
+            "id": row.id,
+            "content": row.content,
+            "interactions": row.interactions,
+            "attachments": row.attachments,
+            "turn_id": row.turn_id,
+            "user_id": row.user_id,
+            "created_at": row.created_at,
+        }
+
+        supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        db.refresh(row)
+        assert row.message_type == "question_superseded"
+        assert row.id == before["id"]
+        assert row.content == before["content"]
+        assert row.interactions == before["interactions"]
+        assert row.attachments == before["attachments"]
+        assert row.turn_id == before["turn_id"]
+        assert row.user_id == before["user_id"]
+        assert row.created_at == before["created_at"]
+    finally:
+        db.close()

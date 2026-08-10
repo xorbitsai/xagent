@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from ...core.agent.transcript import (
@@ -15,6 +15,11 @@ from ...core.agent.transcript import (
 )
 from ..models.chat_message import TaskChatMessage
 from .file_reference_output_service import reconcile_assistant_file_references
+from .ops_signals import (
+    CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
+    clear_degradation,
+    register_degradation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,8 @@ DELIVERY_PENDING = "pending"
 DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
+
+_SUPERSEDED_MESSAGE_TYPE = "question_superseded"
 
 
 @dataclass(frozen=True)
@@ -287,6 +294,101 @@ def mark_user_message_delivery_sync(
         )
         db.commit()
         return transition
+
+
+def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
+    """Mark every still-pending assistant question row on a task as superseded.
+
+    Rewrites ``message_type`` from ``"question"`` to
+    ``"question_superseded"`` for every row on ``task_id`` where
+    ``role == "assistant"``. It only rewrites that one column: it never
+    deletes rows, never touches ``content`` or ``interactions``, and never
+    writes the reverse direction. Like ``mark_user_message_delivery``, it
+    does not commit or roll back ``db`` — the caller owns the transaction.
+    This function expects to run inside a finishing transaction that
+    already holds a lock on the task's ``tasks`` row (see the paragraph on
+    concurrency below).
+
+    ``TaskChatMessage``'s only unique constraint is on
+    ``(task_id, role, turn_id)``. This update never touches any of those
+    three columns, so on the normal path it has no constraint-failure
+    surface to hit — the ``except DBAPIError`` clause below exists for
+    database-layer failures (a dropped connection, a statement timeout),
+    not for a unique-index collision this statement cannot cause.
+
+    The WHERE predicate is exactly the three-condition filter
+    ``get_latest_waiting_question`` runs before its own ``ORDER BY``:
+    ``task_id``, ``role == "assistant"``, ``message_type == "question"``.
+    A static guard pins the two predicate sets equal; changing one side
+    without the other makes that guard fail.
+
+    The update is deliberately unordered and untargeted — it rewrites the
+    whole matching set instead of picking one row with
+    ``ORDER BY id DESC LIMIT 1``. Under two simultaneously waiting
+    questions, an ordered pick would only relabel the winner and leave the
+    loser row stuck as ``"question"`` forever, which is worse than not
+    superseding at all. Collapsing the whole set removes that failure mode
+    structurally.
+
+    A rowcount of zero is a normal outcome, not a failure — it happens
+    whenever the mid-turn write path already swallowed its own error,
+    whenever a reentrant call already zeroed the set on an earlier pass, or
+    whenever an empty projection meant no assistant question row was ever
+    persisted. None of those cases should raise or alert.
+
+    The update runs inside its own SAVEPOINT (``db.begin_nested()``). That
+    is not defensive programming: on PostgreSQL, one failed statement
+    marks the whole enclosing transaction aborted, so without a savepoint,
+    swallowing a database error here would only relocate the crash to the
+    caller's next flush or commit. The savepoint is what lets a failed
+    supersede degrade instead of taking the caller's transaction down with
+    it. The catch clause is narrowed to ``sqlalchemy.exc.DBAPIError`` —
+    the database telling us the statement failed — and nothing broader;
+    programming errors such as ``InvalidRequestError`` or a bad argument
+    are left to propagate.
+
+    Serializing this function against a concurrent call to ``respond()``
+    on the same task is not this function's job — it relies on whatever
+    already holds the task locked for the caller's finishing transaction:
+    a real row lock on PostgreSQL, and the single-writer model on SQLite.
+    A green unit test against SQLite does not exercise the PostgreSQL row
+    lock.
+
+    Callers must place the call site outside the ``interaction_handoff``
+    with-block (or inside it without issuing their own commit); on the
+    path that follows ``persist_assistant_message_no_commit``, callers
+    must issue an explicit ``db.flush()`` afterward rather than relying on
+    autoflush to make the pending row visible to this update.
+
+    Returns the number of rows updated. The return value exists only for
+    logging; callers must not branch on it.
+    """
+
+    try:
+        with db.begin_nested():
+            updated = (
+                db.query(TaskChatMessage)
+                .filter(
+                    TaskChatMessage.task_id == task_id,
+                    TaskChatMessage.role == "assistant",
+                    TaskChatMessage.message_type == "question",
+                )
+                .update(
+                    {TaskChatMessage.message_type: _SUPERSEDED_MESSAGE_TYPE},
+                    synchronize_session=False,
+                )
+            )
+    except DBAPIError as exc:
+        logger.error("Failed to supersede legacy question rows for task %s", task_id)
+        register_degradation(
+            CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
+            f"task_id={task_id} exception_type={type(exc).__name__}",
+        )
+        return 0
+
+    clear_degradation(CLARIFICATION_LEGACY_SUPERSEDE_FAILED)
+    logger.info("Superseded %s legacy question row(s) for task %s", updated, task_id)
+    return updated
 
 
 def persist_user_message(

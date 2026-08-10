@@ -1174,7 +1174,6 @@ def interaction_handoff(
     try:
         yield handoff
     except _SWALLOWED as exc:
-        savepoint.rollback()
         # The except clause matches subclasses (isinstance semantics), so the
         # signal lookup must too: an exact type(exc) key lookup would raise
         # KeyError for a future subclass of a swallowed type, and KeyError is
@@ -1198,9 +1197,18 @@ def interaction_handoff(
                 "degradation_signal": signal,
             },
         )
+        # Registration and logging run first, and the rollback is
+        # guarded: a caller that violated the never-commit-or-rollback-
+        # inside-this-block contract has already deactivated this
+        # savepoint, and an unguarded rollback would raise
+        # ResourceClosedError -- replacing the swallowed exception and
+        # skipping the degradation signal entirely.
+        if savepoint.is_active:
+            savepoint.rollback()
         return
     except BaseException:
-        savepoint.rollback()
+        if savepoint.is_active:
+            savepoint.rollback()
         raise
     else:
         savepoint.commit()

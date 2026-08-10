@@ -1561,6 +1561,53 @@ def test_cm7_second_stage_in_one_handoff_is_rejected(tmp_path: Path) -> None:
     db.close()
 
 
+@pytest.mark.parametrize("caller_action", ["rollback", "commit"])
+def test_cm8_degradation_registers_even_after_caller_deactivates_savepoint(
+    tmp_path: Path, caller_action: str
+) -> None:
+    """T-CM-8: a caller that violates the "no I/O in between" contract by
+    calling ``db.rollback()`` or ``db.commit()`` from inside the with-block
+    (both end the whole transaction, deactivating this CM's own outer
+    savepoint along with it) must not turn a swallowed exception into an
+    unrelated crash, and must not lose the degradation signal either.
+
+    Registration and logging now run before the guarded rollback
+    (``if savepoint.is_active: savepoint.rollback()``): the savepoint this
+    handler would otherwise try to roll back a second time is already
+    inactive by the time ``h.stage()`` raises, so the guard skips it, the
+    swallowed exception still does not escape, and the signal is still
+    registered -- the ordering this test pins is what makes that possible;
+    an unguarded ``savepoint.rollback()`` here would raise
+    ``ResourceClosedError`` in its place, both replacing the swallowed
+    exception and skipping the degradation signal."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _force_attempt_mismatch(db, task_id)
+    db.commit()
+    task = db.get(Task, task_id)
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        if caller_action == "rollback":
+            db.rollback()
+        else:
+            db.commit()
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+
+    signals = ops_signals.active_degradations()
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in signals
+    db.close()
+
+
 @pytest.mark.parametrize("case", ["attempt-mismatch", "anchor-corrupt"])
 def test_v_n4_degrade_still_lets_caller_commit_run(tmp_path: Path, case: str) -> None:
     """v-n4, made executable: after a degrade, code placed *after* the

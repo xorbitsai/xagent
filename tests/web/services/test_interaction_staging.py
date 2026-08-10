@@ -226,12 +226,15 @@ def _reset_ops_signals():
 
 _T_P_1_CASES = [
     pytest.param({"kind": "approval"}, ValueError, id="illegal-kind"),
+    pytest.param({"kind": 123}, ValueError, id="kind-not-str"),
     pytest.param({"protocol_version": 2}, ValueError, id="protocol-not-1"),
     pytest.param({"origin": "email"}, ValueError, id="illegal-origin"),
+    pytest.param({"origin": 123}, ValueError, id="origin-not-str"),
     pytest.param(
         {"request_idempotency_key": "has a space"}, ValueError, id="key-bad-pattern"
     ),
     pytest.param({"request_idempotency_key": ""}, ValueError, id="key-empty"),
+    pytest.param({"request_idempotency_key": 123}, ValueError, id="key-not-str"),
     pytest.param(
         {"expires_at": _now() - timedelta(minutes=1)}, ValueError, id="ttl-non-positive"
     ),
@@ -247,6 +250,13 @@ _T_P_1_CASES = [
     pytest.param({"request_payload": None}, ValueError, id="payload-none"),
     pytest.param({"run_id": ""}, ValueError, id="run-id-empty"),
     pytest.param({"run_id": "x" * 65}, ValueError, id="run-id-too-long"),
+    # A list, not any non-str: it has a __len__ (so it would have survived
+    # the length check added for run_id above without crashing there) and
+    # will never == anchor.resume_run_partition (a str), so before the
+    # isinstance guard this misclassified as InteractionRunPartitionMismatch
+    # instead of failing loudly on the real problem -- a caller passing the
+    # wrong type.
+    pytest.param({"run_id": ["not", "a", "string"]}, ValueError, id="run-id-not-str"),
     pytest.param({"now": datetime.now()}, ValueError, id="now-naive"),
     pytest.param(
         {"now": _now().replace(tzinfo=timezone(timedelta(hours=8)))},

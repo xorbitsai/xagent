@@ -510,6 +510,8 @@ def _validate_request_fields(
     Returns the normalized (stripped) idempotency key.
     """
 
+    if not isinstance(kind, str):
+        raise ValueError(f"kind must be a str, got {type(kind).__name__}")
     if kind not in _KIND_VOCABULARY:
         raise ValueError(
             f"kind must be one of {sorted(_KIND_VOCABULARY)}, got {kind!r}"
@@ -518,9 +520,16 @@ def _validate_request_fields(
         raise ValueError(
             f"protocol_version must be {_PROTOCOL_VERSION}, got {protocol_version!r}"
         )
+    if not isinstance(origin, str):
+        raise ValueError(f"origin must be a str, got {type(origin).__name__}")
     if origin not in _ORIGIN_VOCABULARY:
         raise ValueError(
             f"origin must be one of {sorted(_ORIGIN_VOCABULARY)}, got {origin!r}"
+        )
+    if not isinstance(request_idempotency_key, str):
+        raise ValueError(
+            "request_idempotency_key must be a str, got "
+            f"{type(request_idempotency_key).__name__}"
         )
     normalized_key = request_idempotency_key.strip()
     if COMMAND_ID_PATTERN.fullmatch(normalized_key) is None:
@@ -539,6 +548,8 @@ def _validate_request_fields(
         raise ValueError("now must be UTC (utcoffset must be zero)")
     if expires_at <= now:
         raise ValueError("expires_at must be after now")
+    if not isinstance(run_id, str):
+        raise ValueError(f"run_id must be a str, got {type(run_id).__name__}")
     if not run_id:
         raise ValueError("run_id must not be empty")
     if len(run_id) > _MAX_LENGTHS["run_id"]:
@@ -1175,8 +1186,8 @@ def interaction_handoff(
     # clause never growing back to include a real data column -- do not
     # replace this with sa.update(Task) in any form without re-verifying
     # what it compiles to.
-    if db.get_bind().dialect.name == "sqlite":
-        db.execute(sa.text("UPDATE tasks SET id = id WHERE id = -1"))
+    if db.get_bind(Task).dialect.name == "sqlite":
+        db.execute(sa.text(f"UPDATE {Task.__tablename__} SET id = id WHERE id = -1"))
 
     # Session.begin_nested() always flushes first (it has to, in order to
     # establish the SAVEPOINT after whatever is already pending): a doomed

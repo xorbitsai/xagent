@@ -4,6 +4,7 @@ from typing import Any, Collection
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
@@ -79,6 +80,25 @@ class Task(Base):  # type: ignore
             "lease_expires_at",
             "id",
         ),
+        # The task-level marker for the protocol version of the interaction
+        # row this task's readers should expect. NULL means "no v1 row was
+        # staged for the current wait" and readers fall back to the legacy
+        # transcript path; 1 means a protocol v1 interaction row exists.
+        #
+        # Only create_all-built databases and PostgreSQL carry this CHECK.
+        # The SQLite migration branch cannot emit it: adding a constraint to
+        # an existing table raises NotImplementedError on that dialect both
+        # online and offline, and the batch_alter_table workaround cannot run
+        # in --sql mode on either dialect, which the offline-SQL requirement
+        # rules out. SQLite is development and test only; production is
+        # PostgreSQL, and create_all-built SQLite test databases do carry the
+        # CHECK, so the constraint's behaviour stays covered by tests. The
+        # asymmetry is asserted as expected, not merely left uncovered -- see
+        # tests/migrations/test_task_interaction_protocol_version_parity.py.
+        CheckConstraint(
+            "interaction_protocol_version IS NULL OR interaction_protocol_version = 1",
+            name="ck_tasks_interaction_protocol_version",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -145,6 +165,15 @@ class Task(Base):  # type: ignore
     # never a WHERE predicate -- consumers read the row by primary key and
     # compare in Python -- so an index would be pure write cost.
     lease_attempt_id = Column(String(64), nullable=True)
+
+    # Protocol version of the interaction row that backs this task's current
+    # wait. Written by the three wait finalizers (1 when a row was staged,
+    # NULL when staging degraded) and cleared by the three legacy-resume
+    # injection sites. Readers must gate on status == WAITING_FOR_USER first:
+    # a task that left the waiting state by a path with no injection site
+    # (cancel, delete, failure, TTL reclaim, admin cleanup) can still carry a
+    # stale 1, and the next wait overwrites it either way.
+    interaction_protocol_version = Column(Integer, nullable=True)
 
     # Model configuration
     model_name = Column(String(255), nullable=True)  # Main model used for the task

@@ -294,6 +294,20 @@ class InteractionHandoffMisuse(InteractionHandoffError):
     """
 
 
+class InteractionOriginUnknown(InteractionHandoffError):
+    """``task.source`` names a value outside the frozen origin vocabulary.
+
+    ``origin`` is a frozen copy of ``task.source`` and an audit column: it
+    records which source surface an interaction was raised on behalf of.
+    Substituting ``"internal"`` for an unrecognised value would write a
+    false provenance into that column, so this degrades instead -- the row
+    is not written, and the drift is reported. Unlike the ``ValueError``
+    ``stage_interaction_request`` raises for a caller-supplied ``origin``,
+    this names a value read out of a persisted row: data drift, not a
+    programming error.
+    """
+
+
 # Explicit tuple, not `isinstance(exc, InteractionHandoffError)`: dispatching
 # off the common base class would make any *future* subclass of it
 # automatically swallowed the moment it is defined -- a fail-open default.
@@ -312,6 +326,7 @@ _SWALLOWED: tuple[type[BaseException], ...] = (
     InteractionAnchorCorrupt,
     InteractionAttemptMismatch,
     InteractionRunPartitionMismatch,
+    InteractionOriginUnknown,
 )
 
 # Which ops_signals name a given swallowed exception type registers.
@@ -328,6 +343,7 @@ _DEGRADATION_SIGNALS: dict[type[BaseException], str] = {
     InteractionAnchorCorrupt: INTERACTION_HANDOFF_DEGRADED,
     InteractionAttemptMismatch: INTERACTION_HANDOFF_DEGRADED,
     InteractionRunPartitionMismatch: INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED,
+    InteractionOriginUnknown: INTERACTION_HANDOFF_DEGRADED,
 }
 
 
@@ -922,6 +938,12 @@ class _InteractionHandoff:
             raise ValueError(
                 "lease has no run_id; cannot stage an interaction request without one"
             )
+        origin = str(self.task.source) if self.task.source else "internal"
+        if origin not in _ORIGIN_VOCABULARY:
+            raise InteractionOriginUnknown(
+                f"task {self.task.id}'s source {origin!r} is outside the "
+                f"origin vocabulary {sorted(_ORIGIN_VOCABULARY)}"
+            )
         return stage_interaction_request(
             self.db,
             task_id=int(self.task.id),
@@ -929,7 +951,7 @@ class _InteractionHandoff:
             anchor=self.anchor,
             kind=kind,
             protocol_version=protocol_version,
-            origin=(str(self.task.source) if self.task.source else "internal"),
+            origin=origin,
             request_payload=request_payload,
             request_idempotency_key=request_idempotency_key,
             expires_at=expires_at,

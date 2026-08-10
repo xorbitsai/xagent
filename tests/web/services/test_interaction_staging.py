@@ -1608,6 +1608,47 @@ def test_cm8_degradation_registers_even_after_caller_deactivates_savepoint(
     db.close()
 
 
+def test_cm9_out_of_vocabulary_task_source_degrades(tmp_path: Path) -> None:
+    """T-CM-9: ``origin`` is a frozen copy of ``task.source`` -- an audit
+    column recording which surface raised the interaction. A ``task.source``
+    outside the frozen origin vocabulary (drift: e.g. a value some other,
+    newer code path started writing after this vocabulary was fixed) must
+    not be silently coerced to ``"internal"``, which would write a false
+    provenance. It degrades instead: no row is written, no exception
+    escapes, and the shared handoff signal is registered -- the same
+    treatment as the other four originally-swallowed types."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+
+    db.execute(sa.update(Task).where(Task.id == task_id).values(source="web"))
+    db.commit()
+    task = db.get(Task, task_id)
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0
+    db.close()
+
+
 @pytest.mark.parametrize("case", ["attempt-mismatch", "anchor-corrupt"])
 def test_v_n4_degrade_still_lets_caller_commit_run(tmp_path: Path, case: str) -> None:
     """v-n4, made executable: after a degrade, code placed *after* the

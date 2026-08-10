@@ -29,20 +29,26 @@ Caller obligations, because none of them happen here:
   opening its own outer savepoint (see that function's docstring for why).
   ``id = -1`` can never match a row an autoincrement primary key minted,
   so this can never touch a real row's data, and it is skipped entirely
-  on PostgreSQL, which does not need it. A degraded handoff still leaves
-  whatever the caller was about to persist for its own reasons (a stale
-  attempt continuing to write its own task row, for instance) untouched --
-  that is a fact the three eventual finalizer call sites must each account
-  for, not something this module can prevent. Those three finalizers are
-  the complete writer set this module assumes: a fourth, legacy release
-  path (``AgentServiceManager.execute_task`` in ``web/api/chat.py``) also
-  formally writes ``TaskStatus.WAITING_FOR_USER`` on a task row when
-  ``manage_task_lease`` is true, but every production call site
-  (``websocket.py``, and the Feishu/Slack/Telegram bot channels) passes
-  ``manage_task_lease=False`` -- that write path is confirmed unreachable
-  today, not merely unlikely. A caller added later that reaches it with
-  ``manage_task_lease=True`` would make it a fourth writer this module's
-  finalizer accounting does not yet account for.
+  on PostgreSQL, which does not need it. A degraded handoff's own rollback
+  reaches only as far as the savepoint this function opens at
+  ``with``-entry: a write the caller flushed *before* entering the block
+  is already durable in the caller's outer transaction and survives a
+  degrade untouched. A write the caller issues *inside* the block instead
+  shares this function's own savepoint with the interaction row itself, so
+  a degrade's ``ROLLBACK TO SAVEPOINT`` discards both together,
+  indistinguishably -- which is why the caller contract restricts the
+  ``with`` body to handoff operations alone, nothing else. Getting that
+  boundary right is a fact the three eventual finalizer call sites must
+  each account for, not something this module can prevent. Those three
+  finalizers are the complete writer set this module assumes: a fourth,
+  legacy release path (``AgentServiceManager.execute_task`` in
+  ``web/api/chat.py``) also formally writes ``TaskStatus.WAITING_FOR_USER``
+  on a task row when ``manage_task_lease`` is true, but every production
+  call site (``websocket.py``, and the Feishu/Slack/Telegram bot channels)
+  passes ``manage_task_lease=False`` -- that write path is confirmed
+  unreachable today, not merely unlikely. A caller added later that
+  reaches it with ``manage_task_lease=True`` would make it a fourth writer
+  this module's finalizer accounting does not yet account for.
 * If ``stage_interaction_request`` raises ``InteractionOwnerStateError``,
   the session is left mid-transaction with no savepoint of its own to roll
   back to (the failure happened before this function opened one) -- the
@@ -994,6 +1000,13 @@ class _InteractionHandoff:
         self.anchor = anchor
         self.now = now
         self._staged = False
+        # Whether a call to stage() actually returned a staged row, as
+        # opposed to _staged, which only counts that stage() was called at
+        # all (the one-call-per-handoff reentry rule) regardless of whether
+        # that call raised before ever staging anything. See stage()'s own
+        # assignment of this flag, and the misuse handler below that reads
+        # it, for why the two must not be conflated.
+        self._staged_row = False
 
     def _assert_current_attempt(self) -> None:
         """``lease.attempt_id is None`` is a fail-open sentinel (a
@@ -1100,7 +1113,7 @@ class _InteractionHandoff:
                 f"task {self.task.id}'s source {origin!r} is outside the "
                 f"origin vocabulary {sorted(_ORIGIN_VOCABULARY)}"
             )
-        return stage_interaction_request(
+        result = stage_interaction_request(
             self.db,
             task_id=int(self.task.id),
             run_id=self.lease.run_id,
@@ -1113,6 +1126,12 @@ class _InteractionHandoff:
             expires_at=expires_at,
             now=self.now,
         )
+        # Only set once stage_interaction_request has actually returned a
+        # row -- an exception from any of it (the misclassification funnel,
+        # a DataError, ...) leaves this False, which is what the misuse
+        # handler below relies on to keep its message accurate.
+        self._staged_row = True
+        return result
 
 
 def _safe(obj: Any, name: str) -> Any:
@@ -1448,16 +1467,23 @@ def interaction_handoff(
         raise
     else:
         if not savepoint.is_active:
-            # handoff._staged tells the two ways this misuse can happen
+            # handoff._staged_row tells the two ways this misuse can happen
             # apart: a caller can violate the no-I/O-in-between obligation
             # either after a successful stage() (there is a real staged row
             # whose containment just vanished) or without ever calling
-            # stage() at all (zero calls is otherwise legal -- see
-            # _InteractionHandoff's own docstring -- so nothing was staged,
-            # but the caller's own commit/rollback still deactivated this
-            # savepoint the same way). Same exception type either way; only
+            # stage() at all, or calling it but never reaching a staged row
+            # (zero calls is otherwise legal -- see _InteractionHandoff's
+            # own docstring -- and a stage() call that raised before
+            # returning also leaves nothing staged), so the caller's own
+            # commit/rollback still deactivated this savepoint the same way
+            # with no row behind it. Same exception type either way; only
             # the message should claim a staged row exists when one does.
-            if handoff._staged:
+            # _staged (call count, for the one-call-per-handoff reentry
+            # rule) is deliberately not used here: it is True the instant
+            # stage() is entered, before it is known whether a row was ever
+            # staged, which would make this message claim a row exists even
+            # when stage() raised before staging anything.
+            if handoff._staged_row:
                 raise InteractionHandoffMisuse(
                     "the caller committed or rolled back inside the "
                     "interaction_handoff block; the savepoint that contains "

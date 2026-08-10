@@ -962,17 +962,22 @@ def test_p8b_inner_savepoint_cleans_up_on_non_integrity_error_during_insert(
     db.close()
 
 
+@pytest.mark.parametrize("raiser", ["logger_error", "register_degradation"])
 def test_cm10_logger_error_raising_still_rolls_savepoint_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raiser: str
 ) -> None:
-    """If ``logger.error`` itself raises inside ``interaction_handoff``'s
-    swallowed-exception handler (a misconfigured logging handler, for
-    instance), the savepoint rollback must still happen -- it now lives in
-    that handler's own ``finally``, not as a bare statement after
-    ``logger.error`` that only runs if logging itself succeeds. Before this
-    commit, a raise from ``logger.error`` skipped the rollback entirely,
-    leaking the outer savepoint open on top of replacing the swallowed
-    exception with whatever the logging call raised."""
+    """If ``logger.error`` or ``register_degradation`` itself raises inside
+    ``interaction_handoff``'s swallowed-exception handler (a misconfigured
+    logging handler, or a bug in the signal registry, for instance), the
+    savepoint rollback must still happen -- it lives in that handler's own
+    ``finally``, not as a bare statement after either call that only runs if
+    both of them succeed. Before the fix this pins, a raise from
+    ``logger.error`` skipped the rollback entirely, leaking the outer
+    savepoint open on top of replacing the swallowed exception with
+    whatever the logging call raised. Both calls are wrapped in the same
+    ``try``: a handler failure -- from either one -- escapes uncaught by
+    design (it is not one of the six swallowed types), but must never leak
+    the savepoint it was about to roll back."""
 
     from xagent.web.services import task_interaction_staging as staging_module
 
@@ -985,11 +990,15 @@ def test_cm10_logger_error_raising_still_rolls_savepoint_back(
     task = db.get(Task, task_id)
 
     def _boom(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("logging backend unavailable")
+        raise RuntimeError("handoff signal handler failure")
 
-    monkeypatch.setattr(staging_module.logger, "error", _boom)
+    if raiser == "logger_error":
+        monkeypatch.setattr(staging_module.logger, "error", _boom)
+    else:
+        assert raiser == "register_degradation"
+        monkeypatch.setattr(staging_module, "register_degradation", _boom)
 
-    with pytest.raises(RuntimeError, match="logging backend unavailable"):
+    with pytest.raises(RuntimeError, match="handoff signal handler failure"):
         with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
             h.stage(
                 kind="clarification",
@@ -1445,16 +1454,19 @@ _T_CM_1_CASES = [
     "anchor-corrupt",
     "attempt-mismatch",
     "run-partition-mismatch",
+    "origin-unknown",
     "replay-after-conflict",
 ]
 
 
 @pytest.mark.parametrize("case", _T_CM_1_CASES)
-def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
-    """T-CM-1, widened to six cells: the four dedicated exception types,
-    plus InteractionRunPartitionMismatch (swallowed under this module's
-    F-3 override, see the CM's docstring), plus REPLAY-after-conflict as
-    the successful-return control. Every cell: (a) the with-block exits
+def test_cm1_seven_cell_exit_matrix(tmp_path: Path, case: str) -> None:
+    """T-CM-1, widened to seven cells: the six swallowed types
+    (InteractionSlotTaken, InteractionRequestClosed, InteractionAnchorCorrupt,
+    InteractionAttemptMismatch, InteractionRunPartitionMismatch -- swallowed
+    under this module's F-3 override, see the CM's docstring -- and
+    InteractionOriginUnknown), plus REPLAY-after-conflict as the
+    successful-return control. Every cell: (a) the with-block exits
     without the exception escaping; (b) exactly the swallowed exceptions
     register a degradation and log; (c) the caller's own pre-with pending
     write survives and commits alongside the caller.
@@ -1517,6 +1529,10 @@ def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
     elif case == "run-partition-mismatch":
         anchor = _anchor(anchor_id, run_partition="some-other-run")
         expect_signal = ops_signals.INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED
+    elif case == "origin-unknown":
+        db.execute(sa.update(Task).where(Task.id == task_id).values(source="web"))
+        db.commit()
+        expect_signal = ops_signals.INTERACTION_HANDOFF_DEGRADED
     else:
         assert case == "replay-after-conflict"
         expect_signal = None
@@ -1590,7 +1606,13 @@ def test_cm1_six_cell_exit_matrix(tmp_path: Path, case: str) -> None:
     db.commit()
     assert _caller_write_survived(db, task_id, f"caller-write-{case}")
     signals = ops_signals.active_degradations()
-    assert expect_signal in signals
+    # An exact-set comparison, not `expect_signal in signals`, but scoped to
+    # this module's own signal names: the module-global registry
+    # (ops_signals._signals) can carry residue from other tests that share
+    # the same process, and a global equality check would be flaky against
+    # that residue, not against this test's own behavior.
+    interaction_signals = {name for name in signals if name.startswith("interaction_")}
+    assert interaction_signals == {expect_signal}
     db.close()
 
 
@@ -1696,6 +1718,45 @@ def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
     db.commit()
     assert result.created is True
     assert ops_signals.active_degradations() == {}
+    db.close()
+
+
+def test_cm5_in_block_write_is_discarded_with_the_degraded_row(
+    tmp_path: Path,
+) -> None:
+    """Pins the module docstring's containment boundary: a write the caller
+    issues *inside* the ``with`` block shares this function's own savepoint
+    with the interaction row itself, so a degrade's ``ROLLBACK TO
+    SAVEPOINT`` discards both together -- unlike a write flushed *before*
+    the block opens (see the other ``test_cm*`` cases, which all mark their
+    caller write ahead of ``with`` and assert it survives). This is exactly
+    why the caller contract restricts the ``with`` body to handoff
+    operations alone: a write placed inside it is not merely at risk of
+    being rolled back on a degrade, it *will* be, indistinguishably from
+    the interaction row it was staged alongside."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _force_attempt_mismatch(db, task_id)
+    db.commit()
+    task = db.get(Task, task_id)
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        _mark_caller_write(db, task_id, "in-block-write")
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
+    assert not _caller_write_survived(db, task_id, "in-block-write")
     db.close()
 
 
@@ -1936,9 +1997,10 @@ def test_cm8c_normal_exit_after_deactivation_without_a_stage_call_names_no_row(
     the ``with`` block deactivates this context manager's own outer
     savepoint the same way T-CM-8b's does -- the misuse detection does not
     require a prior ``stage()`` call to fire. The two variants must not
-    share a message that claims a staged row exists when ``handoff._staged``
-    is still ``False``: this pins the "no interaction row was staged"
-    wording for that case, while T-CM-8b pins the other."""
+    share a message that claims a staged row exists when
+    ``handoff._staged_row`` is still ``False``: this pins the "no
+    interaction row was staged" wording for that case, while T-CM-8b pins
+    the other."""
 
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
@@ -1954,6 +2016,53 @@ def test_cm8c_normal_exit_after_deactivation_without_a_stage_call_names_no_row(
                 db.rollback()
             else:
                 db.commit()
+
+    assert ops_signals.active_degradations() == {}
+    db.close()
+
+
+def test_cm8d_stage_call_that_raises_before_staging_names_no_row(
+    tmp_path: Path,
+) -> None:
+    """The case the ``_staged`` / ``_staged_row`` split exists for:
+    ``h.stage()`` is called (so ``_staged`` -- the one-call-per-handoff
+    reentry counter -- is ``True`` from the first line of ``stage()``,
+    before any of its own checks run), but this call's ``lease`` has no
+    ``run_id``, so ``stage()`` raises ``ValueError`` before it ever calls
+    ``stage_interaction_request`` -- no row was staged, so ``_staged_row``
+    stays ``False``. The caller here catches that ``ValueError`` itself,
+    inside the ``with`` block, and then commits from inside it -- the same
+    no-I/O-in-between violation T-CM-8b/T-CM-8c construct, deactivating
+    this handoff's own savepoint. The misuse message that follows must
+    describe this the same way T-CM-8c's zero-call case does ("no
+    interaction row was staged"), not T-CM-8b's ("the staged interaction
+    row no longer exists") -- ``_staged`` alone cannot tell these two cases
+    apart, because it is already ``True`` in both by the time the ``with``
+    block exits."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id=None
+    )
+    task = db.get(Task, task_id)
+
+    with pytest.raises(InteractionHandoffMisuse, match="no interaction row was staged"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            try:
+                h.stage(
+                    kind="clarification",
+                    protocol_version=1,
+                    request_payload={"prompt": "p"},
+                    request_idempotency_key=_next_key(),
+                    expires_at=_now() + timedelta(minutes=15),
+                )
+            except ValueError:
+                pass
+            db.commit()
 
     assert ops_signals.active_degradations() == {}
     db.close()
@@ -2397,6 +2506,53 @@ def test_cm11_swallow_handler_survives_a_non_object_anchor(tmp_path: Path) -> No
     db.close()
 
 
+def test_cm12_lease_without_run_id_is_rejected_in_stage(tmp_path: Path) -> None:
+    """A ``TaskLease`` with no ``run_id`` at all (the pre-attempt-column
+    rolling-restart window and the ``_task_lease_snapshot`` ambient sentinel
+    can both produce one, and here it is built directly with both
+    ``run_id`` and ``attempt_id`` set to ``None``) cannot stage anything:
+    ``stage()``'s own ``ValueError`` for this ("lease has no run_id; cannot
+    stage an interaction request without one") is a programming-error
+    signal, not one of the six swallowed types, so it propagates out of the
+    with-block uncaught instead of degrading -- there is no
+    ``anchor.resume_run_partition`` for a ``None`` ``run_id`` to even be
+    compared against."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id=None
+    )
+    task = db.get(Task, task_id)
+
+    with pytest.raises(ValueError, match="lease has no run_id"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+
+    assert ops_signals.active_degradations() == {}
+    assert db.in_transaction()
+    db.rollback()
+
+    verify = session_factory()
+    row_count = verify.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    verify.close()
+    assert row_count == 0
+    db.close()
+
+
 def test_handoff_never_writes_any_task_column(tmp_path: Path) -> None:
     """The module docstring's own invariant: neither entry point writes any
     *data* column of ``tasks``. The SQLite-only savepoint guard
@@ -2406,12 +2562,22 @@ def test_handoff_never_writes_any_task_column(tmp_path: Path) -> None:
     ``sa.update(Task)`` with no ``.values()`` at all would instead compile a
     SET clause naming every column SQLAlchemy maps on ``Task`` (lease-fencing
     columns included), and even ``.values(id=-1)`` alone still picks up
-    ``updated_at`` from its ``onupdate=func.now()``. This pins that a
-    successful handoff+stage leaves the task row's every column
-    byte-identical -- not just that ``lease_attempt_id``/``updated_at``
-    happen to survive -- by snapshotting the whole row before and after."""
+    ``updated_at`` from its ``onupdate=func.now()``.
+
+    A before/after column snapshot alone cannot catch every way this
+    invariant could break: an UPDATE whose SET clause names every column on
+    ``tasks`` but whose WHERE clause matches zero rows (``WHERE id = -1``,
+    for instance) would leave the snapshot byte-identical even though the
+    statement itself was wrong. The statements this handoff actually issues
+    are the real subject, so a ``before_cursor_execute`` listener
+    (``_count_cursor_executions``) captures every one of them, and this
+    asserts the only UPDATE that ever targets ``tasks`` is the guard's own
+    single-column self-assignment -- not merely that its (zero) rowcount
+    happened to leave no trace. The column snapshot is kept as a secondary,
+    redundant check."""
 
     engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
     session_factory = _session_factory(engine)
     task_id, anchor_id = _seed(session_factory)
     db = session_factory()
@@ -2422,6 +2588,7 @@ def test_handoff_never_writes_any_task_column(tmp_path: Path) -> None:
     before = {
         column.name: getattr(task, column.name) for column in Task.__table__.columns
     }
+    before_statement_count = len(statements)
 
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
         staged = h.stage(
@@ -2433,6 +2600,26 @@ def test_handoff_never_writes_any_task_column(tmp_path: Path) -> None:
         )
     db.commit()
     assert staged.created is True
+
+    issued = statements[before_statement_count:]
+    task_updates = [
+        statement
+        for statement in issued
+        if statement.split(None, 2)[:2] == ["UPDATE", Task.__tablename__]
+    ]
+    guard_sql = f"UPDATE {Task.__tablename__} SET id = id WHERE id = -1"
+    assert task_updates == [guard_sql], task_updates
+    for statement in task_updates:
+        set_clause = statement.upper().split(" SET ", 1)[1].split(" WHERE ")[0]
+        for column in (
+            "runner_id",
+            "lease_attempt_id",
+            "run_id",
+            "status",
+            "lease_expires_at",
+        ):
+            assert column.upper() not in set_clause, (column, statement)
+
     db.close()
 
     fresh = session_factory()

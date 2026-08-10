@@ -915,6 +915,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # delete would leave a steady state with nothing to prune unable
             # to clear the signal at all.
             clear_degradation(CHECKPOINT_PRUNE_FAILED)
+            if not stale_rows:
+                # Nothing ranks outside the window, so no protection set is
+                # needed to decide there is nothing to delete: skip the
+                # schema gate and the interaction-anchor query below.
+                # stale_ids is a filtered subset of stale_rows, so an empty
+                # stale_rows always reaches the same early return further
+                # down. Placed after the clear above so the healthy-attempt
+                # signal still fires on every write.
+                return
             # Protection set, second source: a trace row anchored by an
             # ACTIVE interaction row must survive retention, or answering
             # that interaction later would find no checkpoint to resume
@@ -992,7 +1001,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
             # and cannot raise this -- that changes when the interaction
             # table's migration lands, whose rows enforce their CHECK on
             # upgraded SQLite too; a freshly created SQLite database
-            # (create_all, e.g. tests) has the FK and can. Under stricter isolation levels the same race can instead
+            # (create_all, e.g. tests) has the FK and can. Under stricter
+            # isolation levels the same race can instead
             # surface as psycopg2's SerializationFailure or DeadlockDetected,
             # both of which SQLAlchemy wraps in OperationalError, not
             # IntegrityError -- catch both so this retention path degrades

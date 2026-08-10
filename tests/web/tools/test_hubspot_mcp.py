@@ -59,6 +59,27 @@ def test_request_returns_empty_dict_on_no_content(monkeypatch):
     assert hubspot._request("DELETE", "/crm/v3/objects/contacts/1") == {}
 
 
+def test_request_defaults_to_the_short_timeout(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot._request("GET", "/crm/v3/objects/contacts/1")
+
+    assert mock_request.call_args.kwargs["timeout"] == hubspot.DEFAULT_TIMEOUT_SECONDS
+
+
+def test_association_listing_uses_the_longer_timeout(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot._list_association_ids("/crm/v3/objects/contacts/c1/associations/deals", 10)
+
+    assert (
+        mock_request.call_args.kwargs["timeout"]
+        == hubspot.ASSOCIATION_LISTING_TIMEOUT_SECONDS
+    )
+
+
 def test_create_note_assembles_associations(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": "note-1"}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)

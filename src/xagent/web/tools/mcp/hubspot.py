@@ -17,10 +17,12 @@ setup_proxy_env()
 mcp = FastMCP("hubspot-mcp")
 
 HUBSPOT_BASE_URL = "https://api.hubapi.com"
+DEFAULT_TIMEOUT_SECONDS = 30
 # Association listing (e.g. contact-to-deal) can be slow to respond on
 # portals with tens of thousands of contacts; 30s was observed timing out
-# on those pulls.
-DEFAULT_TIMEOUT_SECONDS = 90
+# on those pulls. Scoped to that call path so a slow/degraded HubSpot API
+# doesn't also make every other tool call hang for the same longer window.
+ASSOCIATION_LISTING_TIMEOUT_SECONDS = 90
 
 DEFAULT_CONTACT_PROPERTIES = [
     "email",
@@ -81,6 +83,7 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
     response = requests.request(
         method=method,
@@ -88,7 +91,7 @@ def _request(
         headers=_headers(),
         params=params,
         json=body,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     try:
         response.raise_for_status()
@@ -119,7 +122,9 @@ def _list_association_ids(path: str, max_results: int) -> tuple[list[Any], bool]
         }
         if after:
             params["after"] = after
-        page = _request("GET", path, params=params)
+        page = _request(
+            "GET", path, params=params, timeout=ASSOCIATION_LISTING_TIMEOUT_SECONDS
+        )
         results = page.get("results", [])
         ids.extend(item.get("id") for item in results)
         after = ((page.get("paging") or {}).get("next") or {}).get("after")

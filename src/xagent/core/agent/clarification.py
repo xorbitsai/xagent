@@ -49,9 +49,12 @@ class ClarificationRequestItem:
 class ClarificationDraft:
     """A typed view over a waiting turn, common to all clarification sources.
 
-    ``requests`` is always non-empty: the single-source waiting points
-    (``send_message`` / ``ask_user_question``) contribute exactly one item,
-    and the multi-tool waiting point contributes one item per waiting tool.
+    ``requests`` carries one item per pending question: the single-source
+    waiting points (``send_message`` / ``ask_user_question``) contribute
+    exactly one item, and the multi-tool waiting point contributes one item
+    per waiting tool. A malformed or legacy waiting payload can yield an
+    empty tuple; construction still succeeds and the marker stays
+    deterministic.
 
     ``turn_marker`` is a stable string built from ``turn_message_count``,
     ``origin_step_id``, and the ordered ``(tool_call_id, interaction_id)``

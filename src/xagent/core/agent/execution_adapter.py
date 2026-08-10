@@ -398,7 +398,7 @@ class AgentExecutionAdapter:
                         else [],
                     },
                     # Surfaced as its own top-level key rather than left for
-                    # callers to dig out of ``agent_result`` below:
+                    # callers to dig out of ``agent_result`` above:
                     # ``agent_result`` is a diagnostic snapshot already read
                     # by ``agent_tool.py`` and ``websocket.py`` for that
                     # purpose, and a new typed contract should not be mixed

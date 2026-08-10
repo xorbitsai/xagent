@@ -454,32 +454,24 @@ def _validate_anchor_fields(anchor: InteractionAnchor) -> None:
     reaches SQL.
     """
 
-    if not anchor.resume_event_id:
-        raise InteractionAnchorCorrupt("anchor.resume_event_id must not be empty")
-    if len(anchor.resume_event_id) > _MAX_LENGTHS["resume_event_id"]:
+    if not isinstance(anchor, InteractionAnchor):
         raise InteractionAnchorCorrupt(
-            "resume_event_id exceeds the column limit "
-            f"{_MAX_LENGTHS['resume_event_id']} (got {len(anchor.resume_event_id)}): "
-            "a locator this long cannot have come from a valid trace row"
+            f"anchor must be an InteractionAnchor, got {type(anchor).__name__}"
         )
-    if not anchor.resume_execution_id:
-        raise InteractionAnchorCorrupt("anchor.resume_execution_id must not be empty")
-    if len(anchor.resume_execution_id) > _MAX_LENGTHS["resume_execution_id"]:
-        raise InteractionAnchorCorrupt(
-            "resume_execution_id exceeds the column limit "
-            f"{_MAX_LENGTHS['resume_execution_id']} (got "
-            f"{len(anchor.resume_execution_id)}): a locator this long cannot "
-            "have come from a valid trace row"
-        )
-    if not anchor.resume_run_partition:
-        raise InteractionAnchorCorrupt("anchor.resume_run_partition must not be empty")
-    if len(anchor.resume_run_partition) > _MAX_LENGTHS["resume_run_partition"]:
-        raise InteractionAnchorCorrupt(
-            "resume_run_partition exceeds the column limit "
-            f"{_MAX_LENGTHS['resume_run_partition']} (got "
-            f"{len(anchor.resume_run_partition)}): a locator this long cannot "
-            "have come from a valid trace row"
-        )
+    for field_name in (
+        "resume_event_id",
+        "resume_execution_id",
+        "resume_run_partition",
+    ):
+        value = getattr(anchor, field_name)
+        if not value:
+            raise InteractionAnchorCorrupt(f"anchor.{field_name} must not be empty")
+        if len(value) > _MAX_LENGTHS[field_name]:
+            raise InteractionAnchorCorrupt(
+                f"{field_name} exceeds the column limit "
+                f"{_MAX_LENGTHS[field_name]} (got {len(value)}): a locator "
+                "this long cannot have come from a valid trace row"
+            )
     if anchor.resume_locator_format != _RESUME_LOCATOR_FORMAT:
         raise InteractionAnchorCorrupt(
             f"anchor.resume_locator_format must be {_RESUME_LOCATOR_FORMAT!r}, "
@@ -542,7 +534,11 @@ def _validate_request_fields(
         raise ValueError(
             f"kind must be one of {sorted(_KIND_VOCABULARY)}, got {kind!r}"
         )
-    if isinstance(protocol_version, bool) or protocol_version != _PROTOCOL_VERSION:
+    if (
+        not isinstance(protocol_version, int)
+        or isinstance(protocol_version, bool)
+        or protocol_version != _PROTOCOL_VERSION
+    ):
         raise ValueError(
             f"protocol_version must be {_PROTOCOL_VERSION}, got {protocol_version!r}"
         )
@@ -603,11 +599,17 @@ def _validate_request_fields(
         json.dumps(request_payload, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"request_payload is not JSON-serializable: {exc}") from exc
+    if not isinstance(expires_at, datetime):
+        raise ValueError(
+            f"expires_at must be a datetime, got {type(expires_at).__name__}"
+        )
     utc_offset = expires_at.utcoffset()
     if expires_at.tzinfo is None or utc_offset is None:
         raise ValueError("expires_at must be an aware UTC datetime")
     if utc_offset.total_seconds() != 0:
         raise ValueError("expires_at must be UTC (utcoffset must be zero)")
+    if not isinstance(now, datetime):
+        raise ValueError(f"now must be a datetime, got {type(now).__name__}")
     now_utc_offset = now.utcoffset()
     if now.tzinfo is None or now_utc_offset is None:
         raise ValueError("now must be an aware UTC datetime")
@@ -1049,6 +1051,11 @@ class _InteractionHandoff:
                 "attempted a second"
             )
         self._staged = True
+        if self.lease.task_id != int(self.task.id):
+            raise ValueError(
+                f"lease names task {self.lease.task_id} but this handoff was "
+                f"given task {int(self.task.id)}"
+            )
         self._assert_current_attempt()
         self._assert_anchor_consistent()
         if self.lease.run_id is None:

@@ -234,6 +234,16 @@ _T_P_1_CASES = [
     pytest.param({"kind": "approval"}, ValueError, id="illegal-kind"),
     pytest.param({"kind": 123}, ValueError, id="kind-not-str"),
     pytest.param({"protocol_version": 2}, ValueError, id="protocol-not-1"),
+    # 1.0 == 1 numerically, so the old `protocol_version != _PROTOCOL_VERSION`
+    # check alone let a float silently through; the isinstance(int) guard
+    # added ahead of it is what this case pins.
+    pytest.param({"protocol_version": 1.0}, ValueError, id="protocol-version-float"),
+    pytest.param(
+        {"expires_at": "not-a-datetime"}, ValueError, id="expires-at-not-datetime"
+    ),
+    pytest.param({"expires_at": None}, ValueError, id="expires-at-none"),
+    pytest.param({"now": "not-a-datetime"}, ValueError, id="now-not-datetime"),
+    pytest.param({"now": None}, ValueError, id="now-none"),
     pytest.param({"origin": "email"}, ValueError, id="illegal-origin"),
     pytest.param({"origin": 123}, ValueError, id="origin-not-str"),
     pytest.param(
@@ -376,6 +386,27 @@ def test_step_one_rejects_missing_anchor_trace_event_id_without_sql(
     anchor = _anchor(anchor_id)
     object.__setattr__(anchor, "trace_event_id", None)
     kwargs = _stage_kwargs(anchor)
+    before = len(statements)
+    with pytest.raises(InteractionAnchorCorrupt):
+        stage_interaction_request(db, task_id=task_id, **kwargs)
+    assert statements[before:] == []
+    db.close()
+
+
+def test_step_one_rejects_wrong_type_anchor_without_sql(tmp_path: Path) -> None:
+    """An ``anchor`` that is not an ``InteractionAnchor`` at all (a caller
+    passing a plain dict, say) must raise ``InteractionAnchorCorrupt`` from
+    the isinstance guard at the top of ``_validate_anchor_fields``, not an
+    ``AttributeError`` from the first ``anchor.<field>`` access that guard
+    exists to preempt."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    kwargs = _stage_kwargs(_anchor(anchor_id))
+    kwargs["anchor"] = {"trace_event_id": anchor_id}
     before = len(statements)
     with pytest.raises(InteractionAnchorCorrupt):
         stage_interaction_request(db, task_id=task_id, **kwargs)
@@ -1758,6 +1789,45 @@ def test_cm7_second_stage_in_one_handoff_is_rejected(tmp_path: Path) -> None:
         .where(TaskInteractionRequest.task_id == task_id)
     ).scalar_one()
     assert row_count == 0, "the outer savepoint rollback must discard the first row too"
+    db.close()
+
+
+def test_cm7b_lease_task_mismatch_raises_before_any_staging_statement(
+    tmp_path: Path,
+) -> None:
+    """``stage()`` must reject a lease that names a different task than the
+    one this handoff was constructed with -- a caller bug distinct from
+    ``InteractionAttemptMismatch`` (same task, stale attempt): here the
+    lease and the task disagree about which row is even in play. Raised as
+    a plain ``ValueError``, not swallowed, before the attempt or anchor
+    assertions or any staging SQL against ``task_interaction_requests``."""
+
+    engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id + 1)
+    task = db.get(Task, task_id)
+
+    before = len(statements)
+    with pytest.raises(ValueError, match="lease names task"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+    issued = statements[before:]
+    assert not any(
+        s.strip().upper().startswith("INSERT INTO task_interaction_requests".upper())
+        for s in issued
+    ), issued
+    assert ops_signals.active_degradations() == {}
+    db.rollback()
     db.close()
 
 

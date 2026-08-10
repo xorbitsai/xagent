@@ -187,12 +187,19 @@ async def _inline_preview_response(
     filename: str,
     media_type: str,
     file_id: Optional[str] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> FileResponse:
     """Build the final inline preview FileResponse, rasterizing SVG to PNG.
 
     Raw SVG bytes are never served inline — an embedded ``<script>`` would
     execute on direct top-level navigation to this response. Every other
     media type is served as-is.
+
+    ``extra_headers`` lets a caller layer route-specific headers (e.g. the
+    public/tokened route's ``Cache-Control``) without changing behavior for
+    other callers — this helper is shared by both the authenticated and
+    public preview endpoints, and the authenticated in-app path relies on
+    normal browser caching for repeatedly-rendered chat images.
     """
 
     if media_type == "image/svg+xml":
@@ -215,6 +222,7 @@ async def _inline_preview_response(
             headers={
                 "Content-Disposition": "inline",
                 "X-Content-Type-Options": "nosniff",
+                **(extra_headers or {}),
             },
         )
     return FileResponse(
@@ -224,8 +232,19 @@ async def _inline_preview_response(
         headers={
             "Content-Disposition": "inline",
             "X-Content-Type-Options": "nosniff",
+            **(extra_headers or {}),
         },
     )
+
+
+# The public/tokened preview route (unlike the authenticated in-app one) is
+# now loaded directly as <img>/<audio>/<video> src on public share surfaces
+# (#1196), which fetches automatically on render with no user action. A
+# response with no Cache-Control lets the browser write the tokened URL and
+# its bytes to disk cache, where they can outlive the guest session. This
+# header must NOT be applied to the authenticated preview route: chat images
+# there rely on ordinary browser caching across repeated renders.
+_PUBLIC_PREVIEW_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
 
 
 def _durable_redirect_response(
@@ -1724,6 +1743,7 @@ async def public_preview_file(
                 filename=str(file_record.filename),
                 media_type=guess_media_type(str(file_record.filename)),
                 file_id=file_id if is_valid_uuid(file_id) else None,
+                extra_headers=_PUBLIC_PREVIEW_CACHE_HEADERS,
             )
     else:
         # Try to resolve as legacy path across all user directories
@@ -1771,6 +1791,7 @@ async def public_preview_file(
         filename=target_path.name,
         media_type=guess_media_type(target_path.name),
         file_id=file_id if is_valid_uuid(file_id) else None,
+        extra_headers=_PUBLIC_PREVIEW_CACHE_HEADERS,
     )
 
 

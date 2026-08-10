@@ -485,3 +485,73 @@ class TestAdminFileAccess:
         )
 
         assert response.status_code == 403
+
+    def test_public_preview_sets_no_store_cache_control(
+        self, test_db, temp_uploads_dir
+    ):
+        # The public route is loaded directly as <img>/<audio>/<video> src on
+        # share surfaces, which fetches automatically on render. Without this
+        # header the tokened URL and its bytes could land in browser disk
+        # cache and outlive the guest session.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=85,
+            user_id=regular_user_id,
+            title="Cache header test",
+            description="public preview cache header test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.txt",
+            "media bytes",
+        )
+
+        client = TestClient(test_app)
+        response = client.get(f"/api/files/public/preview/{uploaded_file.file_id}")
+
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "private, no-store"
+
+    def test_authenticated_preview_keeps_default_caching(
+        self, test_db, temp_uploads_dir
+    ):
+        # The authenticated in-app preview route must not get the public
+        # route's no-store override: chat images there rely on ordinary
+        # browser caching across repeated renders of the same message.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=86,
+            user_id=regular_user_id,
+            title="Authenticated cache header test",
+            description="authenticated preview cache header test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.txt",
+            "media bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}", headers=user_headers
+        )
+
+        assert response.status_code == 200
+        assert response.headers.get("cache-control") != "private, no-store"

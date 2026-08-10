@@ -18,10 +18,14 @@ mcp = FastMCP("hubspot-mcp")
 
 HUBSPOT_BASE_URL = "https://api.hubapi.com"
 DEFAULT_TIMEOUT_SECONDS = 30
-# Association listing (e.g. contact-to-deal) can be slow to respond on
-# portals with tens of thousands of contacts; 30s was observed timing out
-# on those pulls. Scoped to that call path so a slow/degraded HubSpot API
-# doesn't also make every other tool call hang for the same longer window.
+# A single association-listing call is scoped to one contact and capped at
+# max_results, so it isn't inherently slow on its own. Timeouts at the 30s
+# default were reported, though, during a bulk pull looping this call across
+# a large portal (~53k contacts); no latency beyond "exceeded 30s" was
+# measured, so 90s is a deliberate margin rather than a tuned value. Scoped
+# to this call path (rather than raising the shared default) so a slow or
+# degraded HubSpot API doesn't also make every other tool call hang for the
+# same longer window.
 ASSOCIATION_LISTING_TIMEOUT_SECONDS = 90
 
 DEFAULT_CONTACT_PROPERTIES = [
@@ -83,7 +87,7 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
-    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    timeout: float | tuple[float, float] | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
     response = requests.request(
         method=method,

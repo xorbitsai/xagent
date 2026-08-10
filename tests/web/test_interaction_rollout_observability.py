@@ -23,6 +23,11 @@ from sqlalchemy.orm import sessionmaker
 import xagent.web.models.database as database_module
 import xagent.web.services.interaction_rollout as ir
 from tests.web.services.task_interaction_schema_shared import (
+    assert_accepted,
+    make_row,
+    make_task,
+    make_trace_event,
+    make_user,
     tables_excluding_interaction_requests,
 )
 from xagent.web.api.admin_interaction_rollout import (
@@ -210,13 +215,18 @@ async def test_to4c_latch_negative_rechecks_every_probe(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # Admin diagnostics endpoint
 #
-# SQLite only, deliberately: the active-row stats query
+# SQLite only, deliberately: the query itself
 # (SELECT count(*), min(created_at) FROM task_interaction_requests WHERE
 # status = 'active' AND active_slot IS NOT NULL) uses no PostgreSQL-specific
 # syntax -- no JSON operators, no ::casts, no RETURNING, nothing beyond
-# ANSI count()/min()/WHERE -- so its behavior does not vary by backend and
-# a PostgreSQL run would exercise nothing this SQLite run does not already
-# cover.
+# ANSI count()/min()/WHERE -- so the SQL dialect itself does not vary by
+# backend. What *does* vary is how each driver marshals the min(created_at)
+# result back into Python: PostgreSQL hands back a tz-aware datetime,
+# SQLite hands back a plain str. That difference is exactly why this suite
+# includes a non-empty-table cell (test_to6b below) in addition to the
+# empty-table cell (test_to6) -- an empty table never puts a value through
+# min(created_at) at all, so it cannot catch a mismatch between what the
+# query returns and what the age computation expects.
 # ---------------------------------------------------------------------------
 
 
@@ -253,6 +263,16 @@ def _regular_user() -> User:
 async def test_to5_non_admin_gets_403_with_exact_detail(
     monkeypatch, sqlite_session_with_table
 ):
+    # No 401 (missing/invalid/expired credentials) cell here: this suite
+    # calls the route function directly with a hand-built User, bypassing
+    # the get_current_user dependency entirely (see the module docstring),
+    # so there is no request to reject with 401 in the first place. That
+    # dependency is shared by every admin-authenticated endpoint in this
+    # codebase and its own 401 paths (missing, malformed, expired, and
+    # invalid tokens) are already covered by tests/web/test_auth_dependencies.py --
+    # this endpoint adds nothing to that behavior, so re-deriving it through
+    # a second TestClient + JWT harness here would test the shared
+    # dependency a second time, not this endpoint.
     _set_policy(monkeypatch, mode="legacy")
     with pytest.raises(HTTPException) as exc:
         await get_interaction_rollout_diagnostics(
@@ -280,6 +300,32 @@ async def test_to6_empty_table_returns_zero_active_count_and_no_oldest_age(
     assert response["active_count"] == 0
     assert response["oldest_age_seconds"] is None
     assert "schema_absent" not in response
+
+
+async def test_to6b_active_row_present_yields_positive_count_and_age(
+    monkeypatch, sqlite_session_with_table
+):
+    """Regression cell for the SQLite str-vs-datetime marshaling gap: SQLite
+    returns min(created_at) as a plain str, not a datetime, so the age
+    computation must accept both shapes (see the comment above this
+    section). An empty table never exercises this path.
+    """
+    _set_policy(monkeypatch, mode="legacy")
+    user_id = make_user(sqlite_session_with_table)
+    task_id = make_task(sqlite_session_with_table, user_id=user_id)
+    anchor_id = make_trace_event(sqlite_session_with_table, task_id=task_id)
+    assert_accepted(
+        sqlite_session_with_table,
+        make_row(task_id=task_id, resume_trace_event_id=anchor_id),
+    )
+
+    response = await get_interaction_rollout_diagnostics(
+        current_user=_admin_user(), db=sqlite_session_with_table
+    )
+
+    assert response["active_count"] == 1
+    assert isinstance(response["oldest_age_seconds"], float)
+    assert response["oldest_age_seconds"] > 0
 
 
 async def test_to7_table_absent_returns_schema_absent_without_count_fields(

@@ -74,21 +74,29 @@ async def get_interaction_rollout_diagnostics(
                 "WHERE status = 'active' AND active_slot IS NOT NULL"
             )
         ).one()
+
+        # Result-type marshaling for the raw column value differs by
+        # backend: PostgreSQL hands back a tz-aware datetime, SQLite hands
+        # back a plain str (its DATETIME type has no native temporal type).
+        # Both shapes -- and any further marshaling surprise -- are handled
+        # in this same try so they land in the deliberate 503 branch below,
+        # never as an unhandled 500.
+        oldest_created_at = row.oldest_created_at
+        oldest_age_seconds: float | None = None
+        if oldest_created_at is not None:
+            if isinstance(oldest_created_at, str):
+                oldest_created_at = datetime.fromisoformat(oldest_created_at)
+            if oldest_created_at.tzinfo is None:
+                oldest_created_at = oldest_created_at.replace(tzinfo=timezone.utc)
+            oldest_age_seconds = (
+                datetime.now(timezone.utc) - oldest_created_at
+            ).total_seconds()
     except Exception as exc:
         logger.exception("Interaction rollout diagnostics stats query failed")
         raise HTTPException(
             status_code=503,
             detail="Interaction rollout diagnostics stats query failed",
         ) from exc
-
-    oldest_created_at = row.oldest_created_at
-    oldest_age_seconds: float | None = None
-    if oldest_created_at is not None:
-        if oldest_created_at.tzinfo is None:
-            oldest_created_at = oldest_created_at.replace(tzinfo=timezone.utc)
-        oldest_age_seconds = (
-            datetime.now(timezone.utc) - oldest_created_at
-        ).total_seconds()
 
     response["active_count"] = row.active_count
     response["oldest_age_seconds"] = oldest_age_seconds

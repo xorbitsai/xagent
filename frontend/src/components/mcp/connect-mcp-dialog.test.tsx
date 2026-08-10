@@ -7,8 +7,9 @@ import { ConnectMcpDialog } from "./connect-mcp-dialog"
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const toastSuccessMock = vi.hoisted(() => vi.fn())
+const toastWarningMock = vi.hoisted(() => vi.fn())
 const useAuthMock = vi.hoisted(() => vi.fn(() => ({ token: "token", inTeam: false })))
-const translateMock = vi.hoisted(() => (key: string) => key)
+const translateMock = vi.hoisted(() => vi.fn((key: string) => key))
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 
@@ -30,7 +31,7 @@ vi.mock("@/contexts/mcp-apps-context", () => ({
 }))
 
 vi.mock("@/components/ui/sonner", () => ({
-  toast: { error: toastErrorMock, success: toastSuccessMock },
+  toast: { error: toastErrorMock, success: toastSuccessMock, warning: toastWarningMock },
 }))
 
 vi.mock("@/components/ui/dialog", () => ({
@@ -360,6 +361,12 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
     toastSuccessMock.mockReset()
+    toastWarningMock.mockReset()
+    // Clear call history only (mockClear, not mockReset): the identity
+    // implementation must survive, and without clearing, an interpolation
+    // assertion like toHaveBeenCalledWith(key, { name }) could be satisfied
+    // by a matching call from an earlier test in this file.
+    translateMock.mockClear()
     useAuthMock.mockReturnValue({ token: "token", inTeam: false })
   })
 
@@ -505,6 +512,40 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     }
   })
 
+  it("fires exactly one POST when a keyless connect is double-clicked in the same tick", async () => {
+    // Round-9: keylessConnectsRef's guard had zero test coverage — removing
+    // its .has()/.add() calls would leave every other test green. Without
+    // it, disabled={isConnecting} alone doesn't help here: it's React state,
+    // so it lags one commit cycle behind two synchronous clicks fired back
+    // to back before any render flushes, producing duplicate POSTs, success
+    // toasts, and loadApps() refreshes. The ref is synchronous and closes
+    // that window outright.
+    let connectCalls = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url === "http://api.local/api/mcp/apps/chrome/connect") {
+        connectCalls += 1
+        return Promise.resolve({ ok: true, json: async () => ({ id: 1 }) })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    const connectButton = screen.getByRole("button", { name: "connect-chrome" })
+    // Not wrapped in separate act() calls / awaits — the point is to land
+    // both clicks before React (or a prior await) gets a chance to update
+    // the disabled state in between.
+    fireEvent.click(connectButton)
+    fireEvent.click(connectButton)
+
+    await waitFor(() => {
+      expect(toastSuccessMock).toHaveBeenCalledTimes(1)
+    })
+    expect(connectCalls).toBe(1)
+  })
+
   it("connects a keyless catalog app directly through the connect endpoint", async () => {
     let connectBody: string | undefined
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
@@ -537,6 +578,11 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     // receives only that one string argument here — the { name } param
     // itself is exercised for real by the i18n locale files, not this mock.
     expect(toastSuccessMock).toHaveBeenCalledWith("tools.mcp.dialog.connectSuccess")
+    // Round-9: the assertion above only pinned the key, leaving the new
+    // {name} interpolation itself unexercised (translateMock drops the
+    // params argument entirely). Assert the component actually passed it to
+    // t(), independent of what the mock does with it.
+    expect(translateMock).toHaveBeenCalledWith("tools.mcp.dialog.connectSuccess", { name: "Chrome" })
   })
 
   it("surfaces the backend error when a keyless connect fails", async () => {
@@ -827,8 +873,19 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
     const cancelButtons = screen.getAllByRole("button", { name: "tools.mcp.buttons.cancel" })
     expect(cancelButtons.length).toBeGreaterThan(0)
+    // Round-8 N2: the buttons are disabled while in flight, so a real click
+    // doesn't even reach requestClose — but that leaves Escape/outside-click
+    // as the only paths that still call it while blocked. Verify both:
+    for (const button of cancelButtons) {
+      expect(button).toBeDisabled()
+    }
     fireEvent.click(cancelButtons[0])
     expect(onOpenChange).not.toHaveBeenCalledWith(false)
+    // Round-9 N2: a blocked close attempt (Escape/outside-click/header X all
+    // route through the same requestClose) previously no-op'd with zero
+    // feedback. It now surfaces a toast instead of appearing frozen.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    expect(toastWarningMock).toHaveBeenCalledWith("tools.mcp.alerts.closeBlockedWhileConnecting")
 
     resolveChrome?.()
     await waitFor(() => {

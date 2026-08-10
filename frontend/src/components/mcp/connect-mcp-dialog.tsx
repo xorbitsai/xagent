@@ -420,7 +420,15 @@ export function ConnectMcpDialog({
     // flight, or its success/error toast fires after the user already
     // believes they dismissed it. Scoped to the POST itself (not
     // loadingApps, which also spans OAuth popup waits).
-    if (catalogConnectsInFlight > 0) return
+    if (catalogConnectsInFlight > 0) {
+      // Round-9: Escape, outside-click, and the header X all route through
+      // this same function (see the Dialog's onOpenChange below), so a
+      // blocked attempt previously no-op'd with zero feedback for up to the
+      // full connect timeout — the only in-flight signal is a small per-card
+      // spinner that's easy to miss. Surface it explicitly instead.
+      toast.warning(t('tools.mcp.alerts.closeBlockedWhileConnecting'))
+      return
+    }
     connectorEditRequestRef.current += 1
     setCustomApiEditBaseline(null)
     setMcpEditBaseline(null)
@@ -1323,8 +1331,16 @@ export function ConnectMcpDialog({
                 </Button>
                 <Button
                   onClick={handleSaveCustomMcp}
+                  // Round-9: Save was missed when the Cancel/footer-Connect
+                  // buttons got this treatment in round 8 -- reachable by
+                  // starting a keyless connect on the Library tab, switching
+                  // to this tab (no tab-switch guard exists), and saving:
+                  // the save succeeds and toasts, but requestClose() no-ops
+                  // while catalogConnectsInFlight > 0, leaving the dialog
+                  // silently stuck open with no explanation.
                   disabled={
                     isSavingCustom ||
+                    catalogConnectsInFlight > 0 ||
                     !mcpFormData.name?.trim() ||
                     !mcpFormData.url?.trim() ||
                     (customApiEnv.length > 0 && customApiEnv.some(env => env.key.trim() && !env.value.trim()))
@@ -1362,7 +1378,8 @@ export function ConnectMcpDialog({
                   <Button variant="outline" onClick={requestClose} disabled={catalogConnectsInFlight > 0}>
                     {t('tools.mcp.buttons.cancel')}
                   </Button>
-                  <Button onClick={handleSaveCustomMcp} disabled={isSavingCustom}>
+                  {/* Round-9: same rationale as the Custom API tab's Save. */}
+                  <Button onClick={handleSaveCustomMcp} disabled={isSavingCustom || catalogConnectsInFlight > 0}>
                     {isSavingCustom && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                     {t('tools.mcp.buttons.save')}
                   </Button>

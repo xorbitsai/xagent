@@ -1277,6 +1277,7 @@ const zh = {
         saveFailed: "保存失败",
         connectTimedOut: "连接超时，请重试",
         shareTimedOut: "已连接，但分享给团队超时——可稍后在其设置中重新分享",
+        closeBlockedWhileConnecting: "正在连接中，请稍候再关闭",
         deleteFailed: "删除失败",
         toggleFailed: "切换状态失败",
         atLeastOneSecret: "至少需要一个有效的密钥",

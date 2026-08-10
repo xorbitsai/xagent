@@ -128,6 +128,28 @@ def downgrade() -> None:
     # connect/disconnect routes 404 once this row is gone (get_app_by_id
     # returns None), so leftover rows are removed via the server-level route
     # (DELETE /api/mcp/servers/{id}), not the catalog one.
+    #
+    # An unconditional DELETE-by-app_id is NOT safe here: upgrade()'s
+    # collision branch adopts a pre-existing hand-created row (e.g. an
+    # operator who created one before this migration deployed, per #1143)
+    # by flipping only is_visible_in_connector -- name/description/transport
+    # are left exactly as the operator set them. Deleting unconditionally on
+    # downgrade would destroy that operator's own row, not "remove the entry
+    # this migration owns." Matching on name/description/transport (specific
+    # enough that a hand-made row coincidentally matching all three isn't a
+    # realistic concern) distinguishes a genuinely migration-created row from
+    # an adopted one without needing a new tracking column -- a row that
+    # doesn't match is left in place, restored rather than destroyed.
+    # Known edge, in the safe direction: description (unlike name/transport)
+    # is admin-editable even on builtin rows, so a migration-created row
+    # whose description an admin later changed is skipped too -- downgrade
+    # then leaves a hidden orphan row behind rather than risking deleting
+    # operator-owned data. Same tradeoff the zoom seed migration makes for
+    # its provider-row guard.
     bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        sa.delete(PUBLIC_MCP_APPS_TABLE)
+        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
     )

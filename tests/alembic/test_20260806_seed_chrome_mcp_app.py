@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -161,6 +162,42 @@ def test_downgrade_removes_chrome(tmp_path):
         assert "chrome-devtools" not in _app_ids(connection)
 
 
+def test_downgrade_preserves_an_adopted_preexisting_row(tmp_path):
+    """Round-9: the collision branch in upgrade() adopts a hand-created row
+    (e.g. an operator who created one before this migration deployed, per
+    #1143) by flipping only is_visible_in_connector -- it does not overwrite
+    name/description/transport. An unconditional DELETE-by-app_id on
+    downgrade would then destroy the operator's own row, not "remove the
+    entry this migration owns." Pin that upgrade (adopt) -> downgrade
+    (restore, not destroy) sequence."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('chrome-devtools', 'Operator Chrome', 'hand-made', "
+                "'stdio', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        row = connection.execute(
+            text(
+                "SELECT name, is_visible_in_connector FROM public_mcp_apps "
+                "WHERE app_id='chrome-devtools'"
+            )
+        ).first()
+        # Adopted and forced hidden by upgrade(), then left in place by
+        # downgrade() -- destroyed would mean row is None.
+        assert row is not None
+        assert row[0] == "Operator Chrome"
+        assert row[1] == 0
+
+
 def test_downgrade_then_upgrade_round_trip(tmp_path):
     """Round-6 MINOR-4: downgrade().upgrade() had no coverage. A downgrade
     only deletes the catalog row (leftover MCPServer/UserMCPServer rows are
@@ -284,3 +321,22 @@ def test_dockerfile_npx_cache_pin_matches_registry():
         f"Dockerfile cache-warm line no longer matches the runtime npx "
         f"resolution prefix {runtime_prefix!r}"
     )
+
+
+def test_seed_builtin_apps_raises_when_visibility_column_missing(tmp_path):
+    """Round-9: seed_builtin_oauth_and_public_mcp_apps (the fresh-database
+    path invoked from database.py, as opposed to this file's migration
+    upgrade()) carries the identical missing-visibility-column guard for the
+    identical reason -- but the only test touching its caller
+    (tests/migration/test_migration.py) monkeypatches the whole function
+    out, leaving this copy of the RuntimeError unexercised. Drive it
+    directly instead of through that caller."""
+    from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text("CREATE TABLE public_mcp_apps (app_id VARCHAR(100) NOT NULL UNIQUE)")
+        )
+        with pytest.raises(RuntimeError, match="is_visible_in_connector"):
+            seed_builtin_oauth_and_public_mcp_apps(connection)

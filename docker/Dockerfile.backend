@@ -162,16 +162,23 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
     && rm -rf /var/lib/apt/lists/*
 
 # Browser for the built-in "chrome" MCP connector (chrome-devtools-mcp).
-# Gated behind INSTALL_CHROME (default on, so the published image is
-# unchanged) rather than tying this to is_visible_in_connector: that flag is
-# a mutable DB boolean an admin can flip at runtime with no image rebuild, so
-# it cannot gate what ships in the image. A build ARG is the actual release
-# gate for the image; deployments that never intend to enable this connector
-# can pass --build-arg INSTALL_CHROME=false to drop both the image size and
-# the added attack surface (a root, --no-sandbox-capable browser) entirely.
-# Also note the container has no USER directive anywhere (root throughout,
-# pre-existing and out of scope here) -- see the follow-up issue tracking
-# both that and the security review this connector needs before unhiding.
+# Gated behind INSTALL_CHROME (default true: the default build invocation is
+# unchanged, but the resulting image gains a Chrome install and a warmed npx
+# cache it did not have before) rather than tying this to
+# is_visible_in_connector: that flag is a mutable DB boolean an admin can
+# flip at runtime with no image rebuild, so it cannot gate what ships in the
+# image. A build ARG is the actual release gate for the image; deployments
+# that never intend to enable this connector can pass
+# --build-arg INSTALL_CHROME=false to drop the image size and the
+# /opt/google/chrome/chrome binary + npx cache. That flag does NOT remove
+# all root/--no-sandbox browser exposure from the image: Playwright Chromium
+# is installed unconditionally in a separate stage below and is already
+# launched with --no-sandbox as root by the pre-existing browser_use tool,
+# independent of this connector and this flag. Also note the container has
+# no USER directive anywhere (root throughout, pre-existing and out of scope
+# here) -- see the follow-up issue tracking both that (scoped to cover the
+# generic custom-MCP-server path too, not just this connector's visibility
+# toggle) and the security review needed before unhiding.
 ARG INSTALL_CHROME=true
 # Distinct from the Playwright Chromium below, which chrome-devtools-mcp does
 # not detect. Its default "stable" channel resolution checks exactly

@@ -246,6 +246,7 @@ _T_P_1_CASES = [
     ),
     pytest.param({"request_payload": None}, ValueError, id="payload-none"),
     pytest.param({"run_id": ""}, ValueError, id="run-id-empty"),
+    pytest.param({"run_id": "x" * 65}, ValueError, id="run-id-too-long"),
     pytest.param({"now": datetime.now()}, ValueError, id="now-naive"),
     pytest.param(
         {"now": _now().replace(tzinfo=timezone(timedelta(hours=8)))},
@@ -278,6 +279,24 @@ _T_P_1_ANCHOR_CASES = [
         {},
         InteractionAnchorCorrupt,
         id="anchor-checkpoint-type-wrong",
+    ),
+    pytest.param(
+        {"resume_event_id": "x" * 256},
+        {},
+        InteractionAnchorCorrupt,
+        id="anchor-event-id-too-long",
+    ),
+    pytest.param(
+        {"resume_execution_id": "x" * 256},
+        {},
+        InteractionAnchorCorrupt,
+        id="anchor-execution-id-too-long",
+    ),
+    pytest.param(
+        {"resume_run_partition": "x" * 65},
+        {"run_id": "run-a"},
+        InteractionAnchorCorrupt,
+        id="anchor-run-partition-too-long",
     ),
 ]
 

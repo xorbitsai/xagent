@@ -76,6 +76,15 @@ ever issued. Adding a column CHECK to ``TaskInteractionRequest`` without
 adding the matching Python check here reopens that misclassification
 funnel by one more case.
 
+Two mechanisms, not one: a CHECK violation surfaces as an ``IntegrityError``
+and lands in the misclassification funnel above; a column-length violation
+surfaces as a ``DataError`` on PostgreSQL -- not an ``IntegrityError``, so
+the conflict classifier never sees it, and not in ``_SWALLOWED``, so it
+would escape the handoff entirely -- and is silently accepted on SQLite,
+which does not enforce ``VARCHAR`` length. That asymmetry is why the length
+caps are derived from the model's own column types rather than written as
+literals.
+
 Two cells this validation block cannot close, by construction: the parent
 ``tasks`` row (``fk_task_interaction_requests_task_id``) or the anchor's
 ``trace_events`` row (``fk_task_interaction_requests_resume_trace_event_id``)
@@ -134,6 +143,21 @@ _ORIGIN_VOCABULARY = frozenset(
 _RESUME_LOCATOR_FORMAT = "trace_event_pk_v1"
 _RESUME_CHECKPOINT_TYPE = "agent_execution_checkpoint"
 _PROTOCOL_VERSION = 1
+
+_MAX_LENGTHS: dict[str, int] = {
+    # Derived from the model so they cannot drift from the schema. These
+    # are column types, not CHECK constraints: an over-length value is
+    # silently stored on SQLite and raises DataError -- not IntegrityError
+    # -- on PostgreSQL, so it never enters the conflict classifier and
+    # never reaches the swallowed set.
+    name: TaskInteractionRequest.__table__.c[name].type.length
+    for name in (
+        "run_id",
+        "resume_event_id",
+        "resume_execution_id",
+        "resume_run_partition",
+    )
+}
 
 
 # ---------------------------------------------------------------------------
@@ -390,10 +414,30 @@ def _validate_anchor_fields(anchor: InteractionAnchor) -> None:
 
     if not anchor.resume_event_id:
         raise InteractionAnchorCorrupt("anchor.resume_event_id must not be empty")
+    if len(anchor.resume_event_id) > _MAX_LENGTHS["resume_event_id"]:
+        raise InteractionAnchorCorrupt(
+            "resume_event_id exceeds the column limit "
+            f"{_MAX_LENGTHS['resume_event_id']} (got {len(anchor.resume_event_id)}): "
+            "a locator this long cannot have come from a valid trace row"
+        )
     if not anchor.resume_execution_id:
         raise InteractionAnchorCorrupt("anchor.resume_execution_id must not be empty")
+    if len(anchor.resume_execution_id) > _MAX_LENGTHS["resume_execution_id"]:
+        raise InteractionAnchorCorrupt(
+            "resume_execution_id exceeds the column limit "
+            f"{_MAX_LENGTHS['resume_execution_id']} (got "
+            f"{len(anchor.resume_execution_id)}): a locator this long cannot "
+            "have come from a valid trace row"
+        )
     if not anchor.resume_run_partition:
         raise InteractionAnchorCorrupt("anchor.resume_run_partition must not be empty")
+    if len(anchor.resume_run_partition) > _MAX_LENGTHS["resume_run_partition"]:
+        raise InteractionAnchorCorrupt(
+            "resume_run_partition exceeds the column limit "
+            f"{_MAX_LENGTHS['resume_run_partition']} (got "
+            f"{len(anchor.resume_run_partition)}): a locator this long cannot "
+            "have come from a valid trace row"
+        )
     if anchor.resume_locator_format != _RESUME_LOCATOR_FORMAT:
         raise InteractionAnchorCorrupt(
             f"anchor.resume_locator_format must be {_RESUME_LOCATOR_FORMAT!r}, "
@@ -481,6 +525,11 @@ def _validate_request_fields(
         raise ValueError("expires_at must be after now")
     if not run_id:
         raise ValueError("run_id must not be empty")
+    if len(run_id) > _MAX_LENGTHS["run_id"]:
+        raise ValueError(
+            f"run_id must be at most {_MAX_LENGTHS['run_id']} characters, "
+            f"got {len(run_id)}"
+        )
 
     _validate_anchor_fields(anchor)
 

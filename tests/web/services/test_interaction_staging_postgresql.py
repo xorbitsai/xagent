@@ -209,6 +209,52 @@ def _force_next_identity_select_to_miss(
     return state
 
 
+def test_p_over_length_run_id_rejected_before_sql_via_handoff(
+    engine, db_session, fixtures
+) -> None:
+    """A run_id longer than its column (VARCHAR(64)) must never reach SQL:
+    on PostgreSQL an over-length value would raise DataError, not
+    IntegrityError, so the conflict classifier in
+    stage_interaction_request's own except IntegrityError block would never
+    see it, and DataError is not in _SWALLOWED either, so it would escape
+    interaction_handoff entirely. The Python-side length check in
+    _validate_request_fields must preempt that by rejecting with ValueError
+    before any statement (besides the CM's own SAVEPOINT) is issued.
+
+    The anchor's own resume_run_partition is left short and valid on
+    purpose: only the lease's run_id is over-length here, so the failure
+    exercised is _validate_request_fields's own run_id-length check, not
+    _assert_anchor_consistent's anchor-field check (which runs first, inside
+    handoff.stage(), and would otherwise mask this one if both were long)."""
+
+    task_id, anchor_id = fixtures
+    long_run_id = "x" * 65
+    anchor = _anchor(anchor_id)
+    lease = TaskLease(
+        task_id=task_id, runner_id="runner-1", run_id=long_run_id, attempt_id=None
+    )
+    db = db_session
+    task = db.get(Task, task_id)
+
+    statements = _count_cursor_executions(engine)
+    before = len(statements)
+    with pytest.raises(ValueError) as excinfo:
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+    assert "64" in str(excinfo.value)
+    issued = statements[before:]
+    assert not any(
+        s.strip().upper().startswith(("INSERT", "UPDATE")) for s in issued
+    ), issued
+    db.rollback()
+
+
 def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:
     task_id, anchor_id = fixtures
     anchor = _anchor(anchor_id)

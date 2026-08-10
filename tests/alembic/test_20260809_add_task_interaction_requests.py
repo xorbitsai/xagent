@@ -498,3 +498,68 @@ def test_postgresql_downgrade_leaves_no_residue(postgresql_engine_factory) -> No
     with engine.connect() as connection:
         index_names_after = _pg_index_names(connection)
     assert index_names_after == index_names_before
+
+
+def test_postgresql_upgrade_targets_the_search_path_schema_past_a_stale_shadow(
+    postgresql_engine_factory,
+) -> None:
+    """Regression for the guard-1 shadowing failure this migration's guards
+    used to have: a stale same-named table sitting earlier on search_path
+    (public) than the live application schema (app) used to make
+    ``TABLE in inspector.get_table_names()`` true against the *wrong*
+    relation, so guard 1 treated the table as already built and returned
+    without ever creating it in the schema the application actually reads
+    from -- a silent no-op that still let the revision stamp as applied.
+
+    Reflection and DDL must resolve the same schema this migration's guards
+    inspect for the fix to hold: this test builds live parents only inside
+    ``app``, leaves a decoy ``task_interaction_requests`` sitting in
+    ``public`` (unrelated columns, so a schema mix-up is easy to tell apart
+    from success), sets ``search_path`` to ``app, public`` -- naming the
+    live schema first but not exclusively, matching how a real application
+    role's search_path is configured -- and asserts upgrade() builds the
+    real table inside ``app`` with its foreign keys bound to ``app``'s
+    parents, while the ``public`` decoy is left untouched.
+    """
+    migration = _load_migration_module()
+    engine = postgresql_engine_factory("shadow")
+
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE SCHEMA app")
+        for table in PARENT_TABLES:
+            connection.exec_driver_sql(
+                f"CREATE TABLE app.{table} (id INTEGER PRIMARY KEY)"
+            )
+        # The decoy: same name as the migration's target, wrong schema, and
+        # a shape the real table never has -- so an assertion that reads
+        # this table by mistake fails loudly instead of coincidentally
+        # matching.
+        connection.exec_driver_sql(
+            f"CREATE TABLE public.{TABLE} (decoy_marker INTEGER PRIMARY KEY)"
+        )
+        connection.exec_driver_sql("SET search_path TO app, public")
+
+        operations = _operations(connection)
+        with Operations.context(operations.get_context()):
+            migration.upgrade()
+
+        inspector = sa.inspect(connection)
+        assert TABLE in inspector.get_table_names(schema="app")
+
+        fks = {
+            fk["name"]: fk["referred_schema"]
+            for fk in inspector.get_foreign_keys(TABLE, schema="app")
+        }
+        assert fks == {name: "app" for name in FK_NAMES}
+
+        checks = {
+            c["name"] for c in inspector.get_check_constraints(TABLE, schema="app")
+        }
+        assert checks == CHECK_NAMES
+
+        # The public decoy must be untouched: still its original one-column
+        # shape, never overwritten or extended by the migration.
+        decoy_columns = {
+            c["name"] for c in inspector.get_columns(TABLE, schema="public")
+        }
+        assert decoy_columns == {"decoy_marker"}

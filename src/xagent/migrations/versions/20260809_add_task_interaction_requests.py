@@ -34,6 +34,11 @@ __table_args__ (see TaskInteractionRequest's docstring) is instead
 enforced by the create_all/migration parity tests, not by the downgrade
 path.
 
+downgrade() is state-based, not provenance-based: it drops whatever table
+is there, including one a create_all built rather than this revision --
+same as the sibling column migrations (e.g.
+20260804_add_task_checkpoint_trace_event_anchor.py).
+
 The offline SQLite script below carries no transaction wrapper of its
 own, so a mid-script failure would still let a trailing
 `alembic_version` update land and the stamp would need manual repair.
@@ -155,7 +160,40 @@ CHECKS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _create_table() -> None:
+# The schema of the *visible* parent relations (tasks/trace_events/users).
+# version_table_schema names only the Alembic version table, and
+# current_schema() is merely the first entry on search_path, so neither
+# identifies the schema an unqualified reference actually resolves to. Ask
+# PostgreSQL which one it resolves -- same lookup as
+# 20260808_add_task_lease_attempt_id.py's _target_schema.
+POSTGRES_VISIBLE_TABLE_SCHEMA_SQL = sa.text(
+    """
+    SELECT ns.nspname
+    FROM pg_catalog.pg_class AS cls
+    JOIN pg_catalog.pg_namespace AS ns ON ns.oid = cls.relnamespace
+    WHERE cls.oid = pg_catalog.to_regclass(:table_name)
+    """
+)
+
+
+def _target_schema() -> str | None:
+    """The schema holding the parent relations this table hangs off.
+
+    Resolved from a parent, not from TABLE: TABLE does not exist yet on the
+    run that creates it, so to_regclass() on it would always be NULL.
+    """
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        resolved = bind.execute(
+            POSTGRES_VISIBLE_TABLE_SCHEMA_SQL, {"table_name": PARENT_TABLES[0]}
+        ).scalar()
+        if resolved:
+            return str(resolved)
+    schema = op.get_context().version_table_schema
+    return str(schema) if schema else None
+
+
+def _create_table(schema: str | None) -> None:
     op.create_table(
         TABLE,
         sa.Column("id", sa.Integer(), nullable=False),
@@ -225,9 +263,10 @@ def _create_table() -> None:
             name="fk_task_interaction_requests_responder_user_id",
             ondelete="SET NULL",
         ),
+        schema=schema,
     )
     for index_name, columns in INDEXES:
-        op.create_index(index_name, TABLE, list(columns), unique=False)
+        op.create_index(index_name, TABLE, list(columns), unique=False, schema=schema)
 
 
 def upgrade() -> None:
@@ -238,11 +277,17 @@ def upgrade() -> None:
     # the 20260726 shape, not the inspector-only shape #1137 used -- the
     # latter raises under --sql on both dialects.
     if context.as_sql:
-        _create_table()
+        _create_table(None)
         return
 
+    # Resolve the schema the parent tables actually live in before doing any
+    # reflection: both guards below must inspect the same schema the table
+    # gets created in, or a stale same-named table (or same-named parents) on
+    # an earlier search_path entry can shadow the real target -- see the
+    # module docstring.
+    schema = _target_schema()
     inspector = sa.inspect(op.get_bind())
-    tables = set(inspector.get_table_names())
+    tables = set(inspector.get_table_names(schema=schema))
 
     # Guard 1: a create_all-first startup already has this table: makes
     # `alembic upgrade head` idempotent against it.
@@ -256,11 +301,18 @@ def upgrade() -> None:
     if not set(PARENT_TABLES) <= tables:
         return
 
-    _create_table()
+    _create_table(schema)
 
 
 def downgrade() -> None:
-    if not op.get_context().as_sql:
-        if TABLE not in sa.inspect(op.get_bind()).get_table_names():
-            return
-    op.drop_table(TABLE)
+    context = op.get_context()
+
+    if context.as_sql:
+        op.drop_table(TABLE)
+        return
+
+    schema = _target_schema()
+    if TABLE not in sa.inspect(op.get_bind()).get_table_names(schema=schema):
+        return
+
+    op.drop_table(TABLE, schema=schema)

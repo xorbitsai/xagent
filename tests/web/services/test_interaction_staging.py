@@ -288,6 +288,11 @@ _T_P_1_CASES = [
     # instead of failing loudly on the real problem -- a caller passing the
     # wrong type.
     pytest.param({"run_id": ["not", "a", "string"]}, ValueError, id="run-id-not-str"),
+    # None is caught by the same isinstance(run_id, str) guard as the list
+    # case above, not the `if not run_id` emptiness check right after it --
+    # pinned separately since both branches raise ValueError here, and only
+    # running this case proves which one actually fired.
+    pytest.param({"run_id": None}, ValueError, id="run-id-none"),
     pytest.param({"now": datetime.now()}, ValueError, id="now-naive"),
     pytest.param(
         {"now": _now().replace(tzinfo=timezone(timedelta(hours=8)))},
@@ -2012,7 +2017,7 @@ def test_v_n4_degrade_still_lets_caller_commit_run(tmp_path: Path, case: str) ->
     db.close()
 
 
-def test_cm4_no_notification_and_no_outer_commit() -> None:
+def test_cm4_no_notification() -> None:
     import ast
 
     from xagent.web.services import task_interaction_staging

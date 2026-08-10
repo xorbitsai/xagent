@@ -556,7 +556,12 @@ def test_sp5_integrity_error_poisons_transaction_until_savepoint_rollback(
             task_id=task_id,
             **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
         )
-    db.rollback()
+    # No db.rollback() here, deliberately: the whole point of this second
+    # read is to prove the session is usable again on its own, right after
+    # InteractionSlotTaken, without the caller having to roll back first.
+    # An intervening rollback would make the read succeed regardless of
+    # whether the primitive's own inner savepoint actually contained the
+    # poisoning -- this assertion is only load-bearing without it.
     still_usable = db.execute(
         _identity_lookup_stmt(
             task_id=task_id, run_id="run-a", request_idempotency_key=key

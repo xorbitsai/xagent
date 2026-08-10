@@ -38,6 +38,7 @@ from xagent.web.services import ops_signals
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
     InteractionAnchorCorrupt,
+    InteractionHandoffMisuse,
     InteractionOwnerStateError,
     InteractionRequestClosed,
     InteractionRunPartitionMismatch,
@@ -1489,6 +1490,55 @@ def test_cm6_assertions_precede_any_staging_statement(tmp_path: Path) -> None:
         .where(TaskInteractionRequest.task_id == task_id)
     ).scalar_one()
     assert row_count == 0
+    db.close()
+
+
+def test_cm7_second_stage_in_one_handoff_is_rejected(tmp_path: Path) -> None:
+    """T-CM-7: ``stage()`` may be called at most once per handoff. A second
+    call inside the same ``with`` block raises ``InteractionHandoffMisuse``,
+    which is not one of the five swallowed types -- it propagates through
+    the CM's ``except BaseException`` branch, which rolls back the *outer*
+    savepoint before re-raising. That rollback discards the first call's
+    already-inner-committed row along with it: the whole handoff is loud
+    (the exception is visible to the caller) and leaves nothing behind,
+    never a silent ``created=True`` receipt for the first call while the
+    second is dropped on the floor."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with pytest.raises(InteractionHandoffMisuse):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "first"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "second"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+
+    # Not swallowed: no degradation signal, same as InteractionOwnerStateError.
+    assert ops_signals.active_degradations() == {}
+    assert db.in_transaction()
+    db.commit()
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0, "the outer savepoint rollback must discard the first row too"
     db.close()
 
 

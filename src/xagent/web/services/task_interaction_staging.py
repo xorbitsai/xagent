@@ -258,6 +258,18 @@ class InteractionOwnerStateError(InteractionHandoffError):
     """
 
 
+class InteractionHandoffMisuse(InteractionHandoffError):
+    """``stage()`` was called more than once inside one handoff.
+
+    Deliberately absent from ``_SWALLOWED``: the schema allows exactly one
+    active interaction row per task, so a second ``stage()`` in the same
+    handoff can only fail -- and the handler that would swallow it rolls
+    back the outer savepoint, discarding the first call's row while
+    reporting success. This is a caller bug, classified the same way
+    ``InteractionOwnerStateError`` is: propagate, do not degrade.
+    """
+
+
 # Explicit tuple, not `isinstance(exc, InteractionHandoffError)`: dispatching
 # off the common base class would make any *future* subclass of it
 # automatically swallowed the moment it is defined -- a fail-open default.
@@ -755,7 +767,8 @@ def stage_interaction_request(
 
 class _InteractionHandoff:
     """The object ``interaction_handoff`` yields. Constructed once per
-    ``with`` block; ``stage`` may be called zero or more times inside it.
+    ``with`` block; ``stage`` may be called exactly once (zero calls is
+    legal: a caller may decide not to ask).
     """
 
     def __init__(
@@ -772,6 +785,7 @@ class _InteractionHandoff:
         self.task = task
         self.anchor = anchor
         self.now = now
+        self._staged = False
 
     def _assert_current_attempt(self) -> None:
         """``lease.attempt_id is None`` is a fail-open sentinel (a
@@ -846,6 +860,13 @@ class _InteractionHandoff:
         docstring for why they live here rather than in ``__enter__``.
         """
 
+        if self._staged:
+            raise InteractionHandoffMisuse(
+                "interaction_handoff supports exactly one stage() call per "
+                f"handoff; task {self.task.id} run {self.lease.run_id} "
+                "attempted a second"
+            )
+        self._staged = True
         self._assert_current_attempt()
         self._assert_anchor_consistent()
         if self.lease.run_id is None:
@@ -916,11 +937,11 @@ def interaction_handoff(
 
         savepoint = db.begin_nested()        # this function's own
         yield handoff                        # caller calls handoff.stage()
-                                              # zero or more times; each
-                                              # call asserts attempt and
-                                              # anchor validity first, then
-                                              # opens and closes its *own*
-                                              # inner savepoint (see
+                                              # exactly once; that call
+                                              # asserts attempt and anchor
+                                              # validity first, then opens
+                                              # and closes its *own* inner
+                                              # savepoint (see
                                               # stage_interaction_request)
         normal exit         -> savepoint.commit()
         one of five expected failures

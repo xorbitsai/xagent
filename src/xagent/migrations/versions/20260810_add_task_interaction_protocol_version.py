@@ -116,6 +116,12 @@ def upgrade() -> None:
 def downgrade() -> None:
     context = op.get_context()
 
+    # Constraint dropped before column, both here and in the online branch
+    # below. PostgreSQL does not require this order -- DROP COLUMN auto-drops
+    # a single-column CHECK that depends on the dropped column, no CASCADE
+    # needed. The explicit drop_constraint keeps the downgrade symmetric with
+    # upgrade's add-column-then-add-constraint sequence and independent of
+    # that auto-drop behaviour.
     if context.as_sql:
         if context.dialect.name == "postgresql":
             op.drop_constraint(CONSTRAINT_NAME, TABLE, type_="check")

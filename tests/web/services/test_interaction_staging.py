@@ -872,6 +872,102 @@ def test_p8_owner_state_error_is_not_integrity_error(tmp_path: Path) -> None:
     db.close()
 
 
+def test_p8b_inner_savepoint_cleans_up_on_non_integrity_error_during_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inner savepoint opened around the INSERT (``inner =
+    db.begin_nested()``) must roll itself back on any exception the flush
+    raises, not only ``IntegrityError`` -- the one type the ``except``
+    clause right after it names. Before this commit, an exception of any
+    other type propagated straight out of ``stage_interaction_request``
+    with that savepoint still open (neither the ``except`` branch's
+    ``inner.rollback()`` nor the ``else`` branch's ``inner.commit()`` runs
+    on the path that isn't either of theirs), leaking it into whatever the
+    caller does next. The ``finally`` this commit adds closes it on every
+    exit, not just the two paths this function names explicitly.
+
+    Simulated here by making the third ``db.flush()`` call on this session
+    raise ``TypeError`` -- standing in for a bind-time serialization failure
+    the pre-INSERT JSON-serializability probe (added in an earlier commit)
+    did not catch. The first two calls must run for real or this never
+    reaches the savepoint this test targets: call 1 is
+    ``stage_interaction_request``'s own step-2 caller-write flush, and call
+    2 is ``db.begin_nested()``'s own implicit flush (``Session.begin_nested()``
+    always flushes first, to establish the SAVEPOINT after whatever is
+    already pending) -- failing that one instead would mean ``inner =
+    db.begin_nested()`` itself never returns, so no savepoint would exist
+    for this test to find still open. Only call 3, the explicit
+    ``db.flush()`` right after ``db.add(new_row)`` inside the already-open
+    savepoint, exercises the ``finally`` this commit adds."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+
+    original_flush = Session.flush
+    state = {"calls": 0}
+
+    def _patched_flush(self: Session, *args: Any, **kwargs: Any) -> Any:
+        if self is db:
+            state["calls"] += 1
+            if state["calls"] == 3:
+                raise TypeError("simulated bind-time serialization failure")
+        return original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "flush", _patched_flush)
+
+    with pytest.raises(TypeError, match="simulated bind-time serialization failure"):
+        stage_interaction_request(db, task_id=task_id, **_stage_kwargs(anchor))
+
+    assert db.in_nested_transaction() is False
+    db.rollback()
+    db.close()
+
+
+def test_cm10_logger_error_raising_still_rolls_savepoint_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If ``logger.error`` itself raises inside ``interaction_handoff``'s
+    swallowed-exception handler (a misconfigured logging handler, for
+    instance), the savepoint rollback must still happen -- it now lives in
+    that handler's own ``finally``, not as a bare statement after
+    ``logger.error`` that only runs if logging itself succeeds. Before this
+    commit, a raise from ``logger.error`` skipped the rollback entirely,
+    leaking the outer savepoint open on top of replacing the swallowed
+    exception with whatever the logging call raised."""
+
+    from xagent.web.services import task_interaction_staging as staging_module
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id, resume_event_id="")  # triggers InteractionAnchorCorrupt
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("logging backend unavailable")
+
+    monkeypatch.setattr(staging_module.logger, "error", _boom)
+
+    with pytest.raises(RuntimeError, match="logging backend unavailable"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+
+    assert db.in_nested_transaction() is False
+    db.rollback()
+    db.close()
+
+
 def test_p9_replay_after_conflict(tmp_path: Path) -> None:
     """Two sessions race on the same (task_id, run_id, key). ``a``'s own
     manual pre-read (below, before ``b`` commits) misses, as intended -- but

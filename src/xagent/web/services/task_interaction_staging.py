@@ -918,6 +918,20 @@ def stage_interaction_request(
             status="active",
             active_slot=1,
         )
+    finally:
+        # A no-op on both handled paths above (the except branch's own
+        # inner.rollback() and the else branch's inner.commit() have already
+        # deactivated the savepoint by the time this runs). What it actually
+        # guards is any exception this try block does not otherwise catch --
+        # IntegrityError is the only one classified above, so anything else
+        # db.flush() or the constructor could raise (a StatementError from a
+        # bind-time serialization failure, for instance) would previously
+        # propagate straight out with this savepoint still open, leaking it
+        # into whatever the caller does next. Closing it here regardless of
+        # which path was taken keeps this function's own savepoint scoped to
+        # this function on every exit, not just the two it names explicitly.
+        if inner.is_active:
+            inner.rollback()
 
 
 # ---------------------------------------------------------------------------
@@ -1308,29 +1322,35 @@ def interaction_handoff(
             (sig for cls, sig in _DEGRADATION_SIGNALS.items() if isinstance(exc, cls)),
             INTERACTION_HANDOFF_DEGRADED,
         )
-        register_degradation(
-            signal,
-            f"task {task.id} run {lease.run_id}: {type(exc).__name__}: {exc}",
-        )
-        logger.error(
-            "interaction handoff degraded",
-            extra={
-                "task_id": task.id,
-                "lease_run_id": lease.run_id,
-                "lease_attempt_id": lease.attempt_id,
-                "anchor_run_partition": anchor.resume_run_partition,
-                "exception_type": type(exc).__name__,
-                "degradation_signal": signal,
-            },
-        )
-        # Registration and logging run first, and the rollback is
-        # guarded: a caller that violated the never-commit-or-rollback-
-        # inside-this-block contract has already deactivated this
-        # savepoint, and an unguarded rollback would raise
-        # ResourceClosedError -- replacing the swallowed exception and
-        # skipping the degradation signal entirely.
-        if savepoint.is_active:
-            savepoint.rollback()
+        try:
+            register_degradation(
+                signal,
+                f"task {task.id} run {lease.run_id}: {type(exc).__name__}: {exc}",
+            )
+            logger.error(
+                "interaction handoff degraded",
+                extra={
+                    "task_id": task.id,
+                    "lease_run_id": lease.run_id,
+                    "lease_attempt_id": lease.attempt_id,
+                    "anchor_run_partition": anchor.resume_run_partition,
+                    "exception_type": type(exc).__name__,
+                    "degradation_signal": signal,
+                },
+            )
+        finally:
+            # Registration and logging run first, in the try; the rollback
+            # lives in finally so it still runs even if logger.error itself
+            # raises (a misconfigured handler, for instance) -- otherwise
+            # that would leak this savepoint open on top of replacing the
+            # swallowed exception. The rollback stays guarded: a caller that
+            # violated the never-commit-or-rollback-inside-this-block
+            # contract has already deactivated this savepoint, and an
+            # unguarded rollback would raise ResourceClosedError, replacing
+            # whatever exception is already in flight and skipping the
+            # degradation signal entirely.
+            if savepoint.is_active:
+                savepoint.rollback()
         return
     except BaseException:
         if savepoint.is_active:

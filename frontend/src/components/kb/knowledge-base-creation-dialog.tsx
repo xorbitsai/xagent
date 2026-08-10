@@ -180,7 +180,7 @@ function SelectableCardGroup<T extends string>({
     event.preventDefault()
     const next = step === 0 ? jump : (index + step + options.length) % options.length
     onSelect(options[next].value)
-    cards[next].focus()
+    cards[next]?.focus()
   }
 
   return (
@@ -967,7 +967,6 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             <div className="mt-6">
               <Stepper
                 currentStep={currentStep}
-                contentClassName="pt-6"
                 steps={[
                   { label: t("kb.dialog.steps.nameIt"), content: <div /> },
                   { label: t("kb.dialog.steps.addContent"), content: <div /> },
@@ -977,7 +976,10 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-6 pb-6">
+          {/* This dialog renders its step bodies here, outside the Stepper, so
+              the gap the stepper's dropped `mb-6` used to provide lives on the
+              real content container — not on the Stepper's empty tabpanel. */}
+          <div className="flex-1 overflow-y-auto px-6 pt-6 pb-6">
             {currentStep === 1 && (
               <div className="space-y-6">
                 <div>

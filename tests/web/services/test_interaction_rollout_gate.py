@@ -136,6 +136,26 @@ def test_tg6_native_mode_allowed_source_table_present_is_allowed_no_origin_field
     assert not hasattr(decision, "origin")
 
 
+def test_tg6b_unknown_source_degradation_survives_a_later_allowed_decision(
+    monkeypatch, sqlite_session_with_table
+):
+    """Pins the deliberate no-auto-clear deviation: SCHEMA_ABSENT is cleared
+    on every ALLOWED decision (test_tg6 exercises that path directly), but
+    UNKNOWN_TASK_SOURCE is never touched by any decision other than the one
+    that raised it -- an unrelated task later clearing to ALLOWED must not
+    erase a still-unexplained unrecognized source on a different task.
+    """
+    _set_policy(monkeypatch, mode="native", native_sources={"sdk"})
+    ir.evaluate_native_publication(sqlite_session_with_table, _FakeTask("bogus", id=1))
+    assert INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE in active_degradations()
+
+    decision = ir.evaluate_native_publication(
+        sqlite_session_with_table, _FakeTask("sdk", id=2)
+    )
+    assert decision is ir.NativePublicationDecision.ALLOWED
+    assert INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE in active_degradations()
+
+
 def test_tg7_none_source_with_no_channel_allowed_as_internal(
     monkeypatch, sqlite_session_with_table
 ):

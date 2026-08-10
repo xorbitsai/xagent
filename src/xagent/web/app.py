@@ -740,6 +740,14 @@ async def readiness_check() -> JSONResponse:
 
     policy = get_interaction_rollout_policy()
     if policy.mode == "native" and not is_native_schema_ready():
+        # If the database itself is unreachable here (connection refused,
+        # timeout), that exception propagates out of this route unhandled
+        # and FastAPI turns it into a 500 -- asymmetric with the deliberate
+        # 503 below for "database reachable, schema not yet migrated".
+        # Accepted: a 500 still fails the readiness probe the same way a
+        # 503 would, and folding "database unreachable" into that same
+        # typed 503 would misreport a connectivity outage as a pending
+        # migration.
         SessionLocal = get_session_local()
         db = SessionLocal()
         try:

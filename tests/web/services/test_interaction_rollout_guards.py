@@ -107,6 +107,13 @@ _BANNED_NAMES = frozenset(
         # violation.
         "validate_interaction_rollout_at_startup",
         "InteractionRolloutPolicy",
+        # The module-private accessor and its backing singleton: a
+        # read-side consumer reaching for either one bypasses the public
+        # accessor (and its own fail-fast check) entirely, so both must be
+        # banned directly rather than relying on the public name alone to
+        # catch it.
+        "_require_policy",
+        "_policy",
     }
 )
 
@@ -305,6 +312,10 @@ def _enclosing_function_name(tree: ast.Module, lineno: int) -> str | None:
 
 
 def test_tw2c_get_interaction_rollout_policy_has_at_most_two_whitelisted_sites():
+    # The bound is <=2, not ==2, on purpose: a count of 1 (e.g. if the admin
+    # diagnostics endpoint moved into its own later change) must stay valid
+    # too -- only a site outside the whitelist, or more than 2 sites total,
+    # may fail this guard.
     hits = _count_calls("get_interaction_rollout_policy")
     seen = set()
     for path, lineno in hits:
@@ -315,17 +326,6 @@ def test_tw2c_get_interaction_rollout_policy_has_at_most_two_whitelisted_sites()
     assert len(hits) <= 2, f"more than 2 call sites: {hits}"
     for site in seen:
         assert site in _GET_POLICY_SITE_WHITELIST, f"unlisted call site: {site}"
-
-
-def test_tw2c_ii_fewer_than_two_sites_is_allowed_and_only_informational():
-    """A count of 1 (e.g. if the admin diagnostics endpoint were split into
-    its own PR) must not fail this guard -- only a site outside the
-    whitelist, or more than 2 sites total, may fail it."""
-    hits = _count_calls("get_interaction_rollout_policy")
-    # This branch ships both whitelisted sites, so today's count is 2 --
-    # this assertion documents that a future count of 1 remains valid too,
-    # for whenever one of the two call sites moves to a later change.
-    assert len(hits) in (1, 2)
 
 
 def test_tw2d_validate_interaction_rollout_at_startup_has_exactly_one_caller():

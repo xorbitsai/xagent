@@ -178,6 +178,12 @@ function StateProbe() {
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
       <div data-testid="task-title">{state.currentTask?.title || ""}</div>
       <div data-testid="task-id">{state.taskId ?? ""}</div>
+      <div data-testid="task-runtime-extensions">
+        {JSON.stringify(state.taskRuntimeExtensions)}
+      </div>
+      <div data-testid="task-runtime-extension-bindings">
+        {JSON.stringify(state.currentTask?.runtimeExtensionBindings || [])}
+      </div>
       <div data-testid="steps-count">{state.steps.length}</div>
       <div data-testid="steps">{JSON.stringify(state.steps.map((step) => ({
         id: step.id,
@@ -202,6 +208,29 @@ function MessageContentProbe() {
         <React.Fragment key={message.id}>{message.content}</React.Fragment>
       ))}
     </div>
+  )
+}
+
+function TaskRuntimeMetadataProbe() {
+  const { dispatch, setTaskId } = useApp()
+  return (
+    <button type="button" onClick={() => {
+      dispatch({
+        type: "SET_CURRENT_TASK",
+        payload: {
+          id: "823",
+          title: "Local browser task",
+          status: "completed",
+          description: "Inspect the selected window",
+          createdAt: "2026-08-07T07:00:00Z",
+          updatedAt: "2026-08-07T07:01:00Z",
+          runtimeExtensionBindings: ["local_browser"],
+        },
+      })
+      setTaskId(823, { navigate: false })
+    }}>
+      select task
+    </button>
   )
 }
 
@@ -965,6 +994,97 @@ describe("AppProvider websocket message routing", () => {
     ])
   })
 
+  it("sends selected task runtime extensions in the create request", async () => {
+    let createBody: Record<string, unknown> | undefined
+    apiRequestMock.mockImplementation(
+      async (url: string, options?: RequestInit) => {
+        if (url.endsWith("/api/chat/task/create")) {
+          createBody = JSON.parse(String(options?.body || "{}"))
+          return {
+            ok: true,
+            json: async () => ({
+              task_id: 8,
+              title: "inspect browser",
+              description: "inspect browser",
+              status: "pending",
+            }),
+          }
+        }
+        return { ok: true, json: async () => ({}) }
+      },
+    )
+
+    let send: (() => Promise<void>) | undefined
+    function RuntimeExtensionProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("inspect browser", {
+        clientMessageId: "turn-local-browser",
+        runtimeExtensions: { local_browser: {} },
+      })
+      return null
+    }
+
+    wsHarness.isConnected = false
+    render(
+      <AppProvider token="token">
+        <RuntimeExtensionProbe />
+      </AppProvider>
+    )
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = send?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(createBody).toEqual(
+      expect.objectContaining({
+        runtime_extensions: { local_browser: {} },
+      })
+    )
+
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => {
+      await delivery
+    })
+  })
+
+  it("loads task runtime metadata for history replay", async () => {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/api/chat/task/823/runtime-extensions")) {
+        return {
+          ok: true,
+          json: async () => ({
+            task_id: 823,
+            runtime_extensions: {
+              local_browser: { kind: "local_browser" },
+            },
+          }),
+        }
+      }
+      return { ok: true, json: async () => ({}) }
+    })
+
+    render(
+      <AppProvider token="token">
+        <TaskRuntimeMetadataProbe />
+        <StateProbe />
+      </AppProvider>,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "select task" }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-runtime-extensions")).toHaveTextContent(
+        JSON.stringify({ local_browser: { kind: "local_browser" } }),
+      )
+    })
+  })
+
   it("does not crash on a trace event without data", () => {
     render(
       <AppProvider token="token">
@@ -1334,6 +1454,41 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("failed")
       expect(screen.getByTestId("processing").textContent).toBe("false")
+    })
+  })
+
+  it("retains persisted runtime-extension bindings from task info", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        data: {
+          event_id: "task-info-runtime-1",
+          event_type: "task_info",
+          data: {
+            id: 1,
+            title: "Test task",
+            description: "Test task",
+            status: "COMPLETED",
+            created_at: "2026-05-27T05:00:00Z",
+            updated_at: "2026-05-27T05:00:02Z",
+            runtime_extension_bindings: ["local_browser"],
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("task-runtime-extension-bindings"),
+      ).toHaveTextContent(JSON.stringify(["local_browser"]))
     })
   })
 

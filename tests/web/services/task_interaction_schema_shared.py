@@ -1,5 +1,10 @@
 """Shared fixtures for the TaskInteractionRequest constraint-behavior suite.
 
+Also serves test_task_interaction_schema_gate.py and
+test_task_deletion_checkpoint_pointer.py, which import
+tables_excluding_interaction_requests() below to build the same
+filtered-schema shape those suites need.
+
 Split across test_task_interaction_schema.py (SQLite, always runs) and
 test_task_interaction_schema_postgresql.py (PostgreSQL, skips without
 XAGENT_TEST_POSTGRES_URL), following the split used for
@@ -44,6 +49,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
@@ -63,6 +69,22 @@ _UNIQUE_CONSTRAINT_COLUMNS: dict[str, tuple[str, ...]] = {
         "request_idempotency_key",
     ),
 }
+
+
+def tables_excluding_interaction_requests() -> list:
+    """Every table this repo's models declare, except the interaction table.
+
+    Building a database from this filtered set reproduces the shape of a
+    deployment upgraded through every migration except the (unmerged) one
+    that creates task_interaction_requests -- the table has no inbound
+    foreign keys, so excluding it cannot break create order (verified in the
+    audit: 52 of 53 tables created, zero inbound FKs to the target).
+    """
+    return [
+        table
+        for table in Base.metadata.sorted_tables
+        if table.name != TaskInteractionRequest.__tablename__
+    ]
 
 
 def make_user(db: Session) -> int:

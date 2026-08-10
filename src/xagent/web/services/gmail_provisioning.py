@@ -1218,17 +1218,47 @@ def best_effort_provision_gmail_watches_for_user(
 
     Used after OAuth (re)connects a Gmail account: any enabled Gmail trigger
     already bound to that mailbox gets its delivery resources re-ensured.
-    Failures are recorded on the watch state, never raised.
+    Failures are recorded on the watch state, never raised; a failure before
+    any account resolves has no watch state to land on and is only logged.
+
+    Rolls back ``db`` on failure, so callers must not hold uncommitted work on
+    that session across this call.
     """
-    accounts = (
-        db.query(UserOAuth)
-        .filter(UserOAuth.user_id == int(user_id), UserOAuth.provider == "gmail")
-        .all()
-    )
-    referenced_account_ids = _referenced_gmail_oauth_account_ids(
-        db,
-        [(int(account.id), str(account.email or "")) for account in accounts],
-    )
+    # The account lookup and the binding resolution are inside the guard, not
+    # just the per-account loop: the caller runs this after committing the
+    # OAuth token, so a raise here would turn an already-successful connect
+    # into an error page.
+    #
+    # A mailbox missed here has no automatic retry under the default
+    # configuration. ``XAGENT_GMAIL_WATCH_ENABLED`` defaults to false and gates
+    # both ``scan_due_gmail_watch_renewals`` and ``sweep_gmail_provisioning``;
+    # only with it set does the former recover this case, by selecting Gmail
+    # accounts that back an enabled Gmail trigger and have no watch state row.
+    # (``sweep_gmail_provisioning`` never covers it either way: it only retries
+    # mailboxes that already have such a row.) Otherwise the mailbox stays
+    # unprovisioned until its trigger is next saved, which re-enters
+    # provisioning through ``GmailTriggerProvider.register``.
+    try:
+        accounts = (
+            db.query(UserOAuth)
+            .filter(UserOAuth.user_id == int(user_id), UserOAuth.provider == "gmail")
+            .all()
+        )
+        referenced_account_ids = _referenced_gmail_oauth_account_ids(
+            db,
+            [(int(account.id), str(account.email or "")) for account in accounts],
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to resolve Gmail accounts for user %s %s: %s",
+            user_id,
+            context,
+            exc,
+            exc_info=True,
+        )
+        return
+
     for account in accounts:
         email = str(account.email or "").strip().lower()
         if not email:

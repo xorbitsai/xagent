@@ -132,15 +132,19 @@ class MCPServerUpdate(BaseModel):
 
 
 class MCPAppConnectRequest(BaseModel):
-    """Connect a key-based (non-oauth) catalog app with the caller's own secrets.
+    """Connect a key-based or keyless (non-oauth) catalog app.
 
-    OAuth apps use the OAuth popup flow; this path is for apps like Google Maps
-    that authenticate with a static API key. The key is stored as a per-user env
-    override on a shared server row (see PR #750), so each user brings their own.
+    OAuth apps use the OAuth popup flow; this path is for apps that
+    authenticate with a static API key (e.g. Google Maps — the key is stored
+    as a per-user env override on a shared server row, see PR #750, so each
+    user brings their own) and for keyless apps with no secrets at all
+    (e.g. Chrome — the body carries only is_active).
     """
 
     env: Optional[dict] = Field(
-        None, description="Per-user env overrides (e.g. the API key)"
+        None,
+        description="Per-user env overrides (e.g. the API key). Ignored for "
+        "keyless apps, whose empty required_env allowlist drops every key.",
     )
     env_source: Optional[Literal["own", "shared", "platform"]] = Field(
         None,
@@ -150,7 +154,9 @@ class MCPAppConnectRequest(BaseModel):
     is_active: Optional[bool] = Field(
         None,
         description="Whether the connection is active (defaults to True on first "
-        "connect; left unchanged on reconnect when omitted)",
+        "connect; left unchanged on reconnect when omitted). The keyless connect "
+        "flow sends True explicitly so reconnecting a dormant association "
+        "reactivates it.",
     )
 
 
@@ -2311,9 +2317,45 @@ def _add_catalog_server_with_race_recovery(
     return server
 
 
+def _reject_hidden_catalog_app(app_info: dict) -> None:
+    """404 a connect attempt against a hidden catalog app.
+
+    is_visible_in_connector governs the catalog listing, but hiding an app is
+    also used as a release gate (e.g. the chrome connector ships hidden until
+    persistent stdio sessions land) — so the connect paths must enforce it
+    server-side too, or any caller who knows the app_id could still provision
+    the connector with a direct POST. 404 (not 403) so a hidden app is
+    indistinguishable from a nonexistent one.
+
+    Scope: wired into the api_key/keyless path (_ensure_catalog_app_server)
+    and the remote-MCP OAuth path (_ensure_catalog_mcp_oauth_server) only.
+    The builtin_oauth provider-redirect flow (auth.py generic_oauth_callback
+    -> _ensure_user_mcp_server) does NOT run this check. This is a config
+    action away from mattering, not just a future refactor: is_visible_in_
+    connector is freely admin-mutable via PATCH on any catalog app, so the
+    moment an operator hides an existing builtin_oauth row using this same
+    release-gate idiom, new connections reopen through this third path with
+    no code change. Tracked in #1203 — do not apply the hidden-as-release-
+    gate pattern to an oauth-transport row until that closes.
+
+    Blast radius: this fires on every connect call, before the caller's
+    existing association is looked up — so on a hidden app it also blocks
+    reconnect/key-rotation for already-connected users, not just fresh
+    connects (disconnect and the server/tool routes are unaffected — they
+    are server-scoped and never call this). Deliberate for now: it matches
+    the listing's "strong hide" semantics, and the only hidden app today
+    ships hidden from day one, so no such association can exist.
+    """
+    if not app_info.get("is_visible_in_connector", True):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
+        )
+
+
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
-    """Idempotently ensure the shared server row for a key-based catalog app
-    exists, without creating any per-user association. Returns (server, app_info).
+    """Idempotently ensure the shared server row for a key-based or keyless
+    catalog app exists, without creating any per-user association. Returns
+    (server, app_info).
 
     Used by connect before attaching the caller's env. Raises 400/404/409.
     """
@@ -2324,15 +2366,18 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
         )
+    _reject_hidden_catalog_app(app_info)
     if app_info.get("auth_type") == "builtin_oauth":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="OAuth apps must be connected via the OAuth flow",
         )
-    if app_info.get("auth_type") != "api_key":
+    # "keyless" shares this path: same shared stdio server row, just no
+    # required_env to attach (the env merge below reduces to a no-op).
+    if app_info.get("auth_type") not in ("api_key", "keyless"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This app cannot be connected with an API key",
+            detail="This app cannot be connected via the connect endpoint",
         )
     launch = app_info.get("launch_config") or {}
     command = launch.get("command")
@@ -2391,6 +2436,7 @@ def _ensure_catalog_mcp_oauth_server(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
         )
+    _reject_hidden_catalog_app(app_info)
     if app_info.get("auth_type") != "mcp_oauth":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2464,10 +2510,11 @@ def connect_mcp_app(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> MCPServerResponse:
-    """Connect a key-based (non-oauth) catalog app for the current user.
+    """Connect a key-based or keyless (non-oauth) catalog app for the current user.
 
     One shared server row backs the app for all users; each user gets their own
-    per-user env (their key). Connecting again updates the caller's key.
+    per-user env (their key). Connecting again updates the caller's key. For
+    keyless apps the association is created with no env at all.
     """
     from xagent.core.utils.encryption import decrypt_env_dict, encrypt_env_dict
 

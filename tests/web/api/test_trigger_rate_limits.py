@@ -298,6 +298,86 @@ class TestRemoteIpDerivation:
         request = self._request("10.0.0.1", None)
         assert remote_ip_from_request(request) == "10.0.0.1"
 
+    def test_port_suffixed_entries_resolve_to_the_bare_ip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1185: some proxies append the client's source port. Rejecting
+        those would collapse every client behind such a proxy onto the peer
+        address — one shared rate-limit bucket. The port is dropped so the
+        bucket stays keyed per client, not per ephemeral connection."""
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "1")
+        cases = {
+            "203.0.113.7:8080": "203.0.113.7",
+            "203.0.113.7:0": "203.0.113.7",
+            "203.0.113.7:65535": "203.0.113.7",
+            "[2001:db8::1]:8080": "2001:db8::1",
+            # Brackets with no port are still a valid IPv6 reference.
+            "[2001:db8::1]": "2001:db8::1",
+            # Brackets are stripped without checking the host is IPv6. No real
+            # proxy emits this (RFC 3986 reserves brackets for IPv6), but it
+            # yields the same string the bare form would, so it cannot reach a
+            # different bucket than its canonical spelling.
+            "[1.2.3.4]:80": "1.2.3.4",
+        }
+        for forwarded, expected in cases.items():
+            request = self._request("10.0.0.1", forwarded)
+            assert remote_ip_from_request(request) == expected, forwarded
+
+    def test_bare_ipv6_is_never_split_on_its_last_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1185 regression guard: an unbracketed IPv6 literal can end in a
+        group that looks like a port. Stripping it would silently rewrite the
+        entry into a *different*, still-valid address — worse than the
+        peer-address fallback, since nothing would flag it."""
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "1")
+        for forwarded in ("2001:db8::1:8080", "2001:db8::1", "::1"):
+            request = self._request("10.0.0.1", forwarded)
+            assert remote_ip_from_request(request) == forwarded, forwarded
+
+    def test_malformed_port_and_bracket_forms_fall_back_to_peer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Port stripping must not widen what counts as IP-shaped: the value
+        is persisted and used as rate-limit key material (#1108)."""
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "1")
+        forged = (
+            "203.0.113.7:evil",
+            "203.0.113.7:99999",
+            "203.0.113.7:8080x",
+            # Longer than sys.get_int_max_str_digits() (4300): int() raises on
+            # these, so the length bound must reject them before conversion or
+            # a client-controlled header becomes an unhandled 500.
+            "203.0.113.7:" + "9" * 5000,
+            # str.isdigit() accepts non-ASCII digits that int() then rejects.
+            "203.0.113.7:٨٠",
+            "203.0.113.7:²",
+            "203.0.113.7:",
+            ":8080",
+            "[2001:db8::1",
+            "[2001:db8::1]8080",
+            "[2001:db8::1]:",
+            "[2001:db8::1]:evil",
+            "[]",
+            "[]:80",
+            "[not-an-ip]:80",
+            "evil:8080",
+            # Multi-colon non-IP: pins the no-bracket, no-port fallthrough in
+            # _split_host_port, which is otherwise only reached by entries that
+            # do parse as IPv6.
+            "a:b:c",
+            # ipaddress.ip_address() accepts an unbounded IPv6 zone-id, which
+            # would otherwise be returned verbatim and persisted as the client
+            # IP — the exact unbounded-string injection this validation exists
+            # to prevent.
+            "::1%eth0",
+            "::1%" + "A" * 4000,
+            "[fe80::1%eth0]:80",
+        )
+        for entry in forged:
+            request = self._request("10.0.0.1", entry)
+            assert remote_ip_from_request(request) == "10.0.0.1", entry
+
 
 class TestLimiterConfiguration:
     def test_memory_storage_without_redis(

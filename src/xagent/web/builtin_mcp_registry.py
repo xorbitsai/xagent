@@ -559,6 +559,83 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 ],
             },
         },
+        {
+            # "chrome-devtools", not the generic "chrome", matching the
+            # upstream package name and the vendor-scoped ids every other
+            # seeded app uses. Known, accepted caveat: api/mcp.py couples
+            # catalog apps to user-server names by normalized id AND display
+            # name (_is_reserved_catalog_name rejects creating/renaming a
+            # server to either; library_names hides user servers whose name
+            # matches a catalog app name) -- and the display name below is
+            # deliberately kept as the friendlier "Chrome", so a user-created
+            # server literally named "chrome"/"Chrome" is still rejected on
+            # create/rename and suppressed from the local listing. Product
+            # chose the display name over freeing that (plausible but niche)
+            # name; scoping the id at least keeps the shared server row and
+            # connect-flow naming collision-free.
+            "app_id": "chrome-devtools",
+            "name": "Chrome",
+            "description": "Automate a Chrome browser: open pages, read content, fill forms, take screenshots, and inspect network requests.",
+            "icon": "https://www.google.com/s2/favicons?domain=chrome.google.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            # Hidden until the runtime supports execution-scoped (persistent)
+            # stdio MCP sessions: today every tool call spawns a fresh
+            # chrome-devtools-mcp process (mcp_adapter._execute_mcp_call ->
+            # create_session), so browser/page state does not survive across
+            # calls and any multi-step flow (navigate -> click/fill) breaks.
+            # Once persistent sessions land, admins can re-enable via
+            # PATCH /api/admin/mcp/apps — is_visible_in_connector is not a
+            # builtin-protected field, so no redeploy is needed.
+            "is_visible_in_connector": False,
+            # Keyless (non-oauth): no secrets to collect — connecting only
+            # creates the per-user association via POST /api/mcp/apps/{id}/connect.
+            # --headless/--isolated keep server deployments displayless and give
+            # each session a throwaway profile instead of a shared one.
+            # Version-pinned: npx resolves this on every launch, so an
+            # unpinned tag would silently pick up new upstream releases; the
+            # backend image (Dockerfile.backend) pre-installs this exact
+            # version globally so npx resolves it locally instead of hitting
+            # the npm registry on every server launch.
+            # No --executablePath/--channel: the default "stable" channel
+            # resolution finds Chrome per-platform (/Applications/... on
+            # macOS dev hosts, /opt/google/chrome/chrome in the backend
+            # image, which Dockerfile.backend guarantees exists) — a
+            # hardcoded path here would break every other platform.
+            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
+            # backend container runs Chrome as root, needing the same root/
+            # no-sandbox exposure the existing browser_use tool
+            # (core/tools/core/browser_use.py) already carries in this image
+            # -- not identical flags (browser_use passes only --no-sandbox,
+            # plus --disable-web-security and file-access flags this
+            # connector does not set), just a comparable, already-accepted
+            # trade-off, not a new class of risk.
+            # --no-usage-statistics/--no-performance-crux: chrome-devtools-mcp
+            # sends usage telemetry to Google and POSTs page URLs to the CrUX
+            # API by default; opt out until this connector's data flow is
+            # disclosed to users.
+            "launch_config": {
+                "command": "npx",
+                "args": [
+                    "-y",
+                    # npm-exec flag, must precede the package spec: with the
+                    # exact-version cache warmed at image build time
+                    # (Dockerfile.backend), resolution never hits the npm
+                    # registry at launch; on a cache miss (e.g. first run on
+                    # a dev machine) it still fetches normally.
+                    "--prefer-offline",
+                    "chrome-devtools-mcp@1.6.0",
+                    "--headless",
+                    "--isolated",
+                    "--chrome-arg=--no-sandbox",
+                    "--chrome-arg=--disable-setuid-sandbox",
+                    "--no-usage-statistics",
+                    "--no-performance-crux",
+                ],
+            },
+        },
     ]
 
 
@@ -682,6 +759,20 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         app_columns = {
             column["name"] for column in inspector.get_columns("public_mcp_apps")
         }
+        # Same guard as the chrome seed migration's upgrade(), and for the
+        # same reason: is_visible_in_connector is load-bearing for the
+        # hidden-rollout gate several rows ship behind (chrome today), so
+        # _filter_row silently dropping it and falling back to the table's
+        # visible-by-default would seed those rows visible. This caller only
+        # runs against a table just created from the current model (see
+        # should_seed_builtin_mcp_registry in database.py), so the column
+        # should always be present here -- this is belt-and-suspenders, not
+        # a path expected to actually fire.
+        if "is_visible_in_connector" not in app_columns:
+            raise RuntimeError(
+                "public_mcp_apps.is_visible_in_connector is missing; "
+                "builtin apps that ship hidden must not seed visible"
+            )
         existing_app_ids = set(
             bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars()
         )

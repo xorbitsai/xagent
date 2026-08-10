@@ -15,6 +15,10 @@ vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({ openFilePreview: vi.fn() }),
 }))
 
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ user: { id: "guest", is_admin: false } }),
+}))
+
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: (key: string) => key }),
 }))

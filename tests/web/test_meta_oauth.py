@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
@@ -18,6 +19,7 @@ from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services import gmail_provisioning
 from xagent.web.tools import config as tool_config
 
 
@@ -160,6 +162,154 @@ def test_gmail_callback_best_effort_registers_watch_after_oauth_commit(
     )
     assert oauth_account.email == "alice@gmail.com"
     assert calls == [int(user.id)]
+
+
+def test_gmail_callback_succeeds_when_best_effort_watch_provisioning_raises(
+    db_session, monkeypatch, caplog
+):
+    """A post-commit provisioning failure must not fail the connect itself."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "gmail-token",
+                    "refresh_token": "gmail-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.modify",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+
+    def raising_best_effort_provision(_db, *, user_id: int, context: str):
+        raise RuntimeError("account lookup lost its connection")
+
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_provisioning."
+        "best_effort_provision_gmail_watches_for_user",
+        raising_best_effort_provision,
+    )
+
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    assert "Authentication Failed" not in response.body.decode()
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "gmail")
+        .one()
+    )
+    assert oauth_account.email == "alice@gmail.com"
+    assert "Best-effort Gmail watch provisioning failed" in caplog.text
+
+
+def test_gmail_callback_survives_a_raising_account_lookup_during_provisioning(
+    db_session, monkeypatch, caplog
+):
+    """Exercise the callback guard and the service guard as composed.
+
+    The test above stubs provisioning out entirely, so it only proves the
+    callback guard works. Here the real service runs and its own account
+    lookup raises, which is the failure #1150 reproduced on staging.
+    """
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "gmail-token",
+                    "refresh_token": "gmail-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.modify",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+
+    real_provision = gmail_provisioning.best_effort_provision_gmail_watches_for_user
+
+    def failing_query(*_args, **_kwargs):
+        raise OperationalError("SELECT user_oauth", {}, Exception("connection lost"))
+
+    def provision_with_failing_account_lookup(provision_db, **kwargs):
+        # Fail only the lookups the service itself issues; the callback's own
+        # queries, which run before the OAuth commit, must succeed. The revert
+        # has to happen here rather than at teardown, because this test queries
+        # the session again below to assert the OAuth row was committed. `pop`
+        # rather than `del` so a refactor that skips the assignment surfaces as
+        # its own failure instead of an AttributeError from this line.
+        provision_db.query = failing_query
+        try:
+            return real_provision(provision_db, **kwargs)
+        finally:
+            provision_db.__dict__.pop("query", None)
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "best_effort_provision_gmail_watches_for_user",
+        provision_with_failing_account_lookup,
+    )
+
+    caplog.set_level(logging.WARNING, logger=gmail_provisioning.__name__)
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    assert "Authentication Failed" not in response.body.decode()
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "gmail")
+        .one()
+    )
+    assert oauth_account.email == "alice@gmail.com"
+    assert "Failed to resolve Gmail accounts for user" in caplog.text
 
 
 def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(

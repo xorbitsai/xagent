@@ -20,6 +20,8 @@ from ..context_ref import ContextReference
 
 COMPUTER_FRAME_ID_METADATA_KEY = "computer_frame_id"
 COMPUTER_SESSION_ID_METADATA_KEY = "computer_session_id"
+COMPUTER_PERCEPTION_METADATA_KEY = "computer_perception"
+COMPUTER_CONTROL_METADATA_KEY = "computer_control"
 
 # Observation metadata flags set by adapters when their structural view is
 # incomplete. Missing structure is diagnostic context, not proof of risk.
@@ -111,6 +113,12 @@ class ComputerPerceptionMode(str, Enum):
     AUTO = "auto"
     VISION = "vision"
     SEMANTIC = "semantic"
+
+
+class ComputerControlTransport(str, Enum):
+    """Transport used to deliver actions to a selected computer target."""
+
+    NATIVE_ACCESSIBILITY = "native_accessibility"
 
 
 class ComputerActionType(str, Enum):

@@ -47,6 +47,7 @@ from .api.auth import auth_router
 from .api.channel import router as channel_router
 from .api.chat import chat_router
 from .api.cloud_storage import cloud_router
+from .api.computer import computer_router
 from .api.conversation_logs import router as conversation_logs_router
 from .api.custom_api import custom_api_router
 from .api.deployment_config import router as deployment_config_router
@@ -76,6 +77,10 @@ from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.local_browser_runtime import (
+    register_local_browser_runtime,
+    unregister_local_browser_runtime,
+)
 from .services.orphan_upload_gc import run_orphan_upload_gc_loop
 from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
@@ -90,7 +95,6 @@ from .services.uploaded_file_recovery import (
 setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
 
 logger = logging.getLogger(__name__)
-
 
 __all__ = ["app"]
 
@@ -973,6 +977,7 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
+app.include_router(computer_router)
 app.include_router(conversation_logs_router)
 app.include_router(file_router)
 app.include_router(jobs_router)
@@ -1015,6 +1020,11 @@ async def startup_event() -> None:
     logger.info("Initializing database...")
     init_db()
     logger.info("Database initialized successfully")
+
+    # Keep built-in task-runtime providers scoped to the application lifespan.
+    # Register even when disabled so task creation receives a precise 403
+    # instead of an ambiguous "unknown extension" error.
+    register_local_browser_runtime()
 
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
@@ -1615,6 +1625,7 @@ async def shutdown_event() -> None:
     from .services.task_runtime import shutdown_task_runtime_hook_executor
 
     shutdown_task_runtime_hook_executor()
+    unregister_local_browser_runtime()
 
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager

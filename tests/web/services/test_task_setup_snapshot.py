@@ -474,6 +474,102 @@ def test_inline_published_preview_agent_is_excluded_in_snapshot(db_session) -> N
     assert snapshot.excluded_agent_id == int(preview_agent.id)
 
 
+def test_inline_preview_agent_with_noncanonical_id_is_not_excluded_in_snapshot(
+    db_session,
+) -> None:
+    user = _create_user(db_session)
+    preview_agent = _create_agent(db_session, user_id=int(user.id))
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        agent_config={
+            "instructions": "preview instructions",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": [],
+            "preview_agent_id": f"0{int(preview_agent.id)}",
+        },
+    )
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.excluded_agent_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_excluded"),
+    [
+        (AgentStatus.PUBLISHED, True),
+        (AgentStatus.DRAFT, False),
+    ],
+)
+async def test_build_tools_inline_preview_uses_persisted_task_owner(
+    db_session,
+    monkeypatch,
+    status,
+    expected_excluded,
+) -> None:
+    """The live DB reader authorizes preview IDs as the persisted task owner."""
+    from xagent.web.api import chat as chat_module
+    from xagent.web.api.chat import AgentServiceManager
+
+    owner = _create_user(db_session)
+    actor = User(username="preview-actor", password_hash="hash", is_admin=False)
+    db_session.add(actor)
+    db_session.commit()
+    db_session.refresh(actor)
+    preview_agent = _create_agent(db_session, int(owner.id), status=status)
+    task = _create_task(
+        db_session,
+        user_id=int(owner.id),
+        agent_config={
+            "instructions": "preview instructions",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": [],
+            "preview_agent_id": str(int(preview_agent.id)),
+        },
+    )
+
+    resolved_owner_ids: list[int] = []
+    real_resolver = chat_module.resolve_authorized_agent
+
+    def observe_resolver(session, owner_user_id, candidate_id):
+        resolved_owner_ids.append(owner_user_id)
+        return real_resolver(session, owner_user_id, candidate_id)
+
+    observed_excluded_ids: list[int | None] = []
+
+    async def capture_tools(*_args, **kwargs):
+        observed_excluded_ids.append(kwargs["excluded_agent_id"])
+        return [], object()
+
+    monkeypatch.setattr(chat_module, "resolve_authorized_agent", observe_resolver)
+    monkeypatch.setattr(chat_module, "create_default_tools", capture_tools)
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
+
+    manager = AgentServiceManager()
+    await manager._build_tools_for_task(
+        task_id=int(task.id),
+        task=task,
+        db=db_session,
+        user=actor,
+        agent_config=task.agent_config,
+        task_llm=None,
+        task_vision_llm=None,
+    )
+
+    assert resolved_owner_ids == [int(owner.id)]
+    assert int(actor.id) != int(owner.id)
+    assert observed_excluded_ids == [
+        int(preview_agent.id) if expected_excluded else None
+    ]
+
+
 def test_agent_builder_published_sets_excluded_agent_id(db_session) -> None:
     """Task pointing at a PUBLISHED agent: excluded_agent_id matches
     agent.id, agent_config is populated, agent.status flows through."""

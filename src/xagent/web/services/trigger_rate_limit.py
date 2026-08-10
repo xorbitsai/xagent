@@ -183,7 +183,9 @@ def remote_ip_from_request(request: object) -> str | None:
 
     With ``XAGENT_TRUSTED_PROXY_HOPS=N`` (N>0), the client address is taken
     from ``X-Forwarded-For`` counting N trusted entries from the right;
-    otherwise the raw socket peer address is used.
+    otherwise the raw socket peer address is used. The returned value is
+    always a bare IP: a port appended by the proxy is stripped, and anything
+    not IP-shaped falls back to the peer address.
     """
     client = getattr(request, "client", None)
     peer_host = getattr(client, "host", None)
@@ -212,12 +214,84 @@ def remote_ip_from_request(request: object) -> str | None:
     # callers use this as rate-limit key material and persist it (#1108's
     # `widget_client_ip`), so an unvalidated header could inject an unbounded
     # arbitrary string. Fall back to the peer address rather than trusting it.
-    try:
-        ipaddress.ip_address(candidate)
-    except ValueError:
+    client_ip = _client_ip_from_forwarded_entry(candidate)
+    if client_ip is None:
         logger.warning(
             "Ignoring non-IP X-Forwarded-For entry %r; using peer address",
             candidate[:64],
         )
         return peer_ip
-    return candidate
+    return client_ip
+
+
+def _client_ip_from_forwarded_entry(candidate: str) -> str | None:
+    """Return the bare IP an X-Forwarded-For entry denotes, else None.
+
+    The entry is returned as written, not canonicalized: equivalent spellings
+    of one IPv6 address still key separate rate-limit buckets, exactly as they
+    did before ports were handled.
+
+    Bare IPs are the convention (nginx, ALB, most CDNs), but some proxies
+    (Azure App Service / Application Gateway among them) append the client's
+    source port as ``ip:port`` or ``[ipv6]:port``. Rejecting those outright
+    would silently collapse every client behind such a proxy onto the peer
+    address — one shared rate-limit bucket and, for widgets, one shared run
+    quota (#1185). The port is dropped rather than kept so buckets stay keyed
+    per client rather than per ephemeral connection.
+    """
+    # ipaddress.ip_address() accepts an IPv6 zone-id suffix, and the zone-id
+    # itself is unbounded and unvalidated: `::1%` + 4000 characters parses and
+    # round-trips. A zone-id names a local interface, so it is meaningless for
+    # a remote client address and no proxy emits one — but leaving it accepted
+    # would defeat the bound this validation exists to enforce, since the
+    # result is persisted and used as Redis key material.
+    if "%" in candidate:
+        return None
+    host, port = _split_host_port(candidate)
+    if host is None:
+        return None
+    if port is not None and not _is_valid_port(port):
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return host
+
+
+def _split_host_port(candidate: str) -> tuple[str | None, str | None]:
+    """Split an entry into (host, port), with port None when absent.
+
+    Returns ``(None, None)`` for structurally malformed bracket forms. A bare
+    IPv6 literal is never split: ``2001:db8::1:8080`` is a valid address whose
+    last group only looks like a port, so splitting on the final colon would
+    silently rewrite it into a *different* address. Only the unambiguous forms
+    carry a port: a bracketed host, and a host with exactly one colon (IPv4).
+    Brackets are not checked for IPv6 specifically — RFC 3986 reserves them for
+    it, and a bracketed IPv4 still yields the same string its bare form would,
+    so it lands in the same bucket.
+    """
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing < 0:
+            return None, None
+        host = candidate[1:closing]
+        rest = candidate[closing + 1 :]
+        if not rest:
+            return host, None
+        if not rest.startswith(":"):
+            return None, None
+        return host, rest[1:]
+    if candidate.count(":") == 1:
+        host, _, port = candidate.partition(":")
+        return host, port
+    return candidate, None
+
+
+def _is_valid_port(port: str) -> bool:
+    # The length bound has to come first: int() raises on digit strings longer
+    # than sys.get_int_max_str_digits() (4300 by default), so a header of the
+    # form `1.2.3.4:99…9` would otherwise escape as an unhandled ValueError.
+    # isascii() matters too: str.isdigit() also accepts non-ASCII digit
+    # characters (superscripts among them) that int() then rejects.
+    return len(port) <= 5 and port.isascii() and port.isdigit() and int(port) <= 65535

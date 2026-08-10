@@ -48,6 +48,25 @@ UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
 UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
 UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
+NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
+NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
+BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
+BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
+BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
+BROWSER_CUA_DRIVER_MAX_ELEMENTS = "XAGENT_BROWSER_CUA_DRIVER_MAX_ELEMENTS"
+SUPPORTED_NATIVE_BROWSER_APP_NAMES = frozenset(
+    {
+        "Brave Browser",
+        "Google Chrome",
+        "Google Chrome Canary",
+        "Chromium",
+        "Microsoft Edge",
+        "Vivaldi",
+    }
+)
+_NATIVE_BROWSER_APP_NAMES_BY_CASEFOLD = {
+    name.casefold(): name for name in SUPPORTED_NATIVE_BROWSER_APP_NAMES
+}
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
 FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
@@ -601,6 +620,64 @@ def get_task_runtime_hook_queue_timeout_seconds() -> int:
     """Seconds a provider hook may wait for a runtime worker before starting."""
 
     return _get_positive_int_env(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, 30)
+
+
+def get_native_browser_enabled() -> bool:
+    """Whether tasks may control a browser on the interactive Xagent host."""
+
+    return _get_bool_env(NATIVE_BROWSER_ENABLED, False)
+
+
+def get_native_browser_app_name() -> str:
+    """Browser application exposed by the Local browser runtime."""
+
+    configured = (
+        os.getenv(NATIVE_BROWSER_APP_NAME, "Google Chrome").strip() or "Google Chrome"
+    )
+    canonical = _NATIVE_BROWSER_APP_NAMES_BY_CASEFOLD.get(configured.casefold())
+    if canonical is None:
+        supported = ", ".join(sorted(SUPPORTED_NATIVE_BROWSER_APP_NAMES))
+        raise ValueError(
+            f"{NATIVE_BROWSER_APP_NAME} must name a supported browser: {supported}"
+        )
+    return canonical
+
+
+def get_browser_cua_driver_command() -> str:
+    """Executable used to start the Local browser cua-driver MCP server."""
+
+    return os.getenv(BROWSER_CUA_DRIVER_COMMAND, "cua-driver").strip() or "cua-driver"
+
+
+def get_browser_cua_driver_socket() -> str | None:
+    """Optional cua-driver daemon socket endpoint for Local browser."""
+
+    value = os.getenv(BROWSER_CUA_DRIVER_SOCKET, "").strip()
+    return value or None
+
+
+def get_browser_cua_driver_timeout_seconds() -> float:
+    """Per-call timeout for the Local browser driver."""
+
+    raw_value = os.getenv(BROWSER_CUA_DRIVER_TIMEOUT_SECONDS, "30").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = 30.0
+    if value > 0:
+        return value
+    logger.warning(
+        "Invalid %s=%r; falling back to 30 seconds",
+        BROWSER_CUA_DRIVER_TIMEOUT_SECONDS,
+        raw_value,
+    )
+    return 30.0
+
+
+def get_browser_cua_driver_max_elements() -> int:
+    """Maximum AX elements requested for one Local browser observation."""
+
+    return _get_positive_int_env(BROWSER_CUA_DRIVER_MAX_ELEMENTS, 2_000)
 
 
 def get_checkpoint_encoding_v2_enabled() -> bool:

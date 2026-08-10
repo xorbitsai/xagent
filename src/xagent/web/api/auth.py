@@ -34,6 +34,7 @@ from ..models.database import get_db
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 
 logger = logging.getLogger(__name__)
@@ -46,15 +47,31 @@ EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
-    from ..services.gmail_provisioning import (
-        best_effort_provision_gmail_watches_for_user,
-    )
+    """Provision Gmail watches without letting the outcome reach the caller.
 
-    best_effort_provision_gmail_watches_for_user(
-        db,
-        user_id=user_id,
-        context="after OAuth callback",
-    )
+    This runs after the OAuth token is committed, so the connect has already
+    succeeded. Anything raised here would be rendered by the callback's outer
+    handler as an ``Authentication Failed`` 500, telling the user a connector
+    failed while it is in fact connected. A best-effort side effect must not
+    be able to change what the callback returns.
+    """
+    # The module is imported at module level so that a genuine module
+    # resolution failure surfaces at startup instead of being logged here as a
+    # routine provisioning warning. The call stays inside the guard, and going
+    # through the module keeps the attribute lookup late so tests can patch it.
+    try:
+        gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+            db,
+            user_id=user_id,
+            context="after OAuth callback",
+        )
+    except Exception:
+        logger.warning(
+            "Best-effort Gmail watch provisioning failed for user %s "
+            "after OAuth callback",
+            user_id,
+            exc_info=True,
+        )
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:

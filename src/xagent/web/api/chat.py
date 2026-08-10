@@ -68,7 +68,11 @@ from ..sandbox_keys import (
 )
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.agent_access import list_accessible_published_agents
-from ..services.agent_team_scope import get_agent_team_scope, owned_agent_clause
+from ..services.agent_team_scope import (
+    get_agent_team_scope,
+    owned_agent_clause,
+    resolve_authorized_agent,
+)
 from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
@@ -1919,16 +1923,10 @@ class AgentServiceManager:
                 )
             elif agent_config and agent_config.get("preview_agent_id"):
                 preview_user_id = int(task.user_id)
-                current_agent = (
-                    db.query(Agent)
-                    .filter(
-                        Agent.id == agent_config["preview_agent_id"],
-                        owned_agent_clause(
-                            preview_user_id,
-                            get_agent_team_scope(db, preview_user_id),
-                        ),
-                    )
-                    .first()
+                current_agent = resolve_authorized_agent(
+                    db,
+                    preview_user_id,
+                    agent_config.get("preview_agent_id"),
                 )
                 if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                     excluded_agent_id = int(current_agent.id)
@@ -2545,45 +2543,6 @@ class AgentServiceManager:
                         f"{snapshot.agent.id} ({snapshot.agent.name}), "
                         "will exclude from agent tools"
                     )
-
-                # Inline preview_agent_id case (#459 build-preview): the
-                # snapshot path doesn't cover this because it resolves
-                # excluded_agent_id only through ``task.agent_id``; the
-                # preview agent is referenced inside the inline
-                # ``agent_config`` dict on tasks with ``agent_id=None``.
-                # Run this in addition to (not instead of) the snapshot
-                # value above -- they're mutually exclusive by design
-                # (either task has an agent_id OR has inline preview).
-                if (
-                    excluded_agent_id is None
-                    and snapshot is None
-                    and agent_config
-                    and agent_config.get("preview_agent_id")
-                ):
-                    from ..models.agent import AgentStatus
-
-                    if task is None:
-                        raise ValueError(
-                            f"Task {task_id} missing while resolving preview agent"
-                        )
-                    preview_user_id = int(task.user_id)
-                    assert db is not None
-                    current_agent = (
-                        db.query(Agent)
-                        .filter(
-                            Agent.id == agent_config["preview_agent_id"],
-                            owned_agent_clause(
-                                preview_user_id,
-                                get_agent_team_scope(db, preview_user_id),
-                            ),
-                        )
-                        .first()
-                    )
-                    if current_agent and current_agent.status == AgentStatus.PUBLISHED:
-                        excluded_agent_id = int(current_agent.id)
-                        logger.info(
-                            f"Preview task {task_id} is for published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
-                        )
 
                 workforce_runtime = (
                     snapshot.workforce_runtime

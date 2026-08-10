@@ -201,7 +201,10 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         environment_label: str = "browser",
         perception_mode: ComputerPerceptionMode | str = ComputerPerceptionMode.AUTO,
         headless: bool = True,
+        environment_scope: Literal["step", "task"] = "step",
     ) -> None:
+        if environment_scope not in {"step", "task"}:
+            raise ValueError("environment_scope must be 'step' or 'task'")
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
         self._workspace = workspace
@@ -218,6 +221,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             )
         )
         self._headless = headless
+        self._environment_scope = environment_scope
         self._environments: dict[str, ComputerEnvironment] = {}
 
     @property
@@ -305,7 +309,9 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         # The session is an execution-scoped resource. Never let model output
         # select another task's browser, even if it invents a session_id field.
         raw_args.pop("session_id", None)
-        session_id = self._default_session_id(step_id)
+        session_id = self._default_session_id(
+            step_id if self._environment_scope == "step" else None
+        )
         if not session_id:
             return self._error_result(
                 session_id="",
@@ -328,20 +334,19 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 error=f"Invalid computer action: {exc}",
             )
 
-        environment = self._environments.get(session_id)
-        if environment is None:
-            environment = self._environment_factory(
-                session_id=session_id,
-                workspace=self._workspace,
-                headless=self._headless,
-            )
-            self._environments[session_id] = environment
-
         observation_only = action.type in {
             ComputerActionType.OBSERVE,
             ComputerActionType.SCREENSHOT,
         }
+        environment = self._environments.get(session_id)
         try:
+            if environment is None:
+                environment = self._environment_factory(
+                    session_id=session_id,
+                    workspace=self._workspace,
+                    headless=self._headless,
+                )
+                self._environments[session_id] = environment
             current = environment.current_observation
             if current is None:
                 if not observation_only:
@@ -399,14 +404,14 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
             RuntimeError,
             ValueError,
         ) as exc:
-            current = environment.current_observation
+            current = environment.current_observation if environment else None
             return self._error_result(
                 session_id=session_id,
                 frame_id=current.frame_id if current else None,
                 error=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - provider failures become tool results.
-            current = environment.current_observation
+            current = environment.current_observation if environment else None
             return self._error_result(
                 session_id=session_id,
                 frame_id=current.frame_id if current else None,

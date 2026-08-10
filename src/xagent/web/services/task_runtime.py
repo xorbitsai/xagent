@@ -107,10 +107,11 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # the re-layer never fires here. So reserving ``is_preview`` or
 # ``preview_agent_id`` would still silently strip them from this config with
 # nothing to restore them, breaking agent-builder preview. That it cannot be
-# reserved is not a statement that it is safe: three of its readers resolve it
-# through an ownership-scoped query, but the SSH tools' ``_agent_id_from_task``
-# reads it with no such check and uses it to pick which targets a task may
-# reach, so the answer for that key has to be reader-side (issue #1136).
+# reserved is not a statement that it is safe: every authorization-sensitive
+# reader must treat it as an untrusted persisted candidate and route it through
+# ``agent_team_scope.resolve_authorized_agent`` using the task owner. The SSH
+# reader also rejects archived agents before it constructs an execution
+# identity, so malformed or out-of-scope values cannot select SSH targets.
 #
 # Before adding a key here: (1) confirm no server writer reaches this column
 # *through* the sanitizer (the preview path above is the only known case);
@@ -262,17 +263,10 @@ def _get_task_runtime_hook_executor() -> ThreadPoolExecutor:
         return _task_runtime_hook_executor
 
 
-def register_task_extension(
+def _validate_task_extension_provider(
     name: str,
     provider: TaskRuntimeExtensionProvider,
-) -> None:
-    """Register one process-wide task runtime provider.
-
-    Registration is deliberately not idempotent: re-registering a name raises
-    so a second provider cannot silently shadow the first. Replacing a live
-    provider is an ``unregister_task_extension`` followed by a fresh register.
-    """
-
+) -> str:
     normalized = _normalize_extension_name(name)
     missing = [
         method
@@ -284,8 +278,41 @@ def register_task_extension(
             "Task runtime extension provider is missing callable method(s): "
             + ", ".join(missing)
         )
+    return normalized
+
+
+def register_task_extension(
+    name: str,
+    provider: TaskRuntimeExtensionProvider,
+) -> None:
+    """Register one process-wide task runtime provider.
+
+    Registration is deliberately not idempotent: re-registering a name raises
+    so a second provider cannot silently shadow the first. Replacing a live
+    provider is an ``unregister_task_extension`` followed by a fresh register.
+    """
+
+    normalized = _validate_task_extension_provider(name, provider)
     with _task_runtime_extensions_lock:
         if normalized in _task_runtime_extensions:
+            raise ValueError(
+                f"Task runtime extension '{normalized}' is already registered"
+            )
+        _task_runtime_extensions[normalized] = provider
+
+
+def _register_task_extension_idempotently(
+    name: str,
+    provider: TaskRuntimeExtensionProvider,
+) -> None:
+    """Register ``provider`` once while rejecting a different owner."""
+
+    normalized = _validate_task_extension_provider(name, provider)
+    with _task_runtime_extensions_lock:
+        existing = _task_runtime_extensions.get(normalized)
+        if existing is provider:
+            return
+        if existing is not None:
             raise ValueError(
                 f"Task runtime extension '{normalized}' is already registered"
             )

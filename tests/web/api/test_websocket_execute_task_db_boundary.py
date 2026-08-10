@@ -44,6 +44,7 @@ async def test_legacy_execute_uses_worker_snapshot_and_primitive_scheduler_bound
             process_description="Follow the saved process",
             examples=[{"input": "a", "output": "b"}],
             source="internal",
+            agent_config={"runtime_extension_bindings": ["local_browser"]},
         )
         db.add(task)
         db.commit()
@@ -147,6 +148,34 @@ async def test_legacy_execute_uses_worker_snapshot_and_primitive_scheduler_bound
     assert task_info["event_type"] == "task_info"
     assert task_info["data"]["id"] == task_id
     assert task_info["data"]["status"] == TaskStatus.PENDING.value
+    assert task_info["data"]["runtime_extension_bindings"] == ["local_browser"]
+
+
+def test_websocket_task_info_exposes_persisted_runtime_extension_bindings(
+    _test_db: None,
+) -> None:
+    db = _direct_db_session()
+    try:
+        user = User(username="runtime-binding-owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+        task = Task(
+            user_id=int(user.id),
+            title="Runtime-bound task",
+            description="Use the selected computer",
+            status=TaskStatus.COMPLETED,
+            source="internal",
+            agent_config={"runtime_extension_bindings": ["local_browser"]},
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+        routing, _ = websocket_api._load_websocket_task_routing_snapshot(db, task)
+
+        assert routing.task_info["runtime_extension_bindings"] == ["local_browser"]
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

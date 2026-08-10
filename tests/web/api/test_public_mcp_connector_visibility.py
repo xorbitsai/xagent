@@ -466,6 +466,61 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
             pass
 
 
+def test_real_shipped_chrome_row_is_excluded_from_the_connector_list() -> None:
+    """Round-7/8 open nit: the synthetic hidden-app test above pins the
+    listing filter's mechanics, and the connect-endpoint 404 is pinned
+    elsewhere against the real app id — but nothing asserted the listing
+    filter on the row this PR actually ships. init_db seeds the real
+    registry rows (chrome-devtools included, hidden), so this drives the
+    exact shipped state end to end: the row exists in the DB (asserted, so
+    the listing check can't pass vacuously) yet never reaches the catalog
+    listing. A registry visibility flip cannot ship silently with the suite
+    green."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        # Guard against a vacuous pass: the row really is in the DB (seeded
+        # by init_db from the registry), and really is hidden.
+        db = next(get_db())
+        try:
+            seeded = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "chrome-devtools")
+                .one()
+            )
+            assert seeded.is_visible_in_connector is False, (
+                "chrome-devtools must ship hidden -- if this flips to True, "
+                "update this test's premise together with the unhide checklist"
+            )
+        finally:
+            db.close()
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+        app_ids = {app["id"] for app in response.json()}
+        assert "chrome-devtools" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_custom_stdio_mcp_with_same_name_does_not_mark_builtin_oauth_app_connected() -> (
     None
 ):
@@ -1181,29 +1236,31 @@ def test_mixed_case_oauth_transport_app_is_marked_connected(
             pass
 
 
-def test_admin_create_app_rejects_keyless_command_entry() -> None:
-    """Write-time constraint (#764): a non-oauth entry with a launch command but
-    no required_env would classify as "unconnectable", so the admin API rejects
-    it instead of silently persisting an unconnectable row."""
+def test_admin_create_app_accepts_keyless_and_rejects_partial_key_shapes() -> None:
+    """Write-time constraint (#764), updated for the keyless class: a stdio
+    entry with a launch command and no required_env classifies as "keyless"
+    (e.g. Chrome) and is accepted; the genuinely partial shapes — required_env
+    without a command, or a command on a remote transport — still classify as
+    "unconnectable" and are rejected."""
     temp_dir = _setup_test_db()
     try:
         _setup_admin()
         admin_headers = _login("admin", "admin123")
 
-        # Shape 1: command without required_env.
+        # A stdio command without required_env is a valid keyless app.
         resp = client.post(
             "/api/admin/mcp/apps",
             headers=admin_headers,
             json={
-                "app_id": "bad-keyless",
-                "name": "BadKeyless",
+                "app_id": "ok-keyless",
+                "name": "OkKeyless",
                 "transport": "stdio",
                 "launch_config": {"command": "npx", "args": ["-y", "x"]},
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 200
 
-        # Shape 2 (the reverse asymmetric shape): required_env without command.
+        # required_env without command stays rejected.
         resp = client.post(
             "/api/admin/mcp/apps",
             headers=admin_headers,
@@ -1212,6 +1269,19 @@ def test_admin_create_app_rejects_keyless_command_entry() -> None:
                 "name": "BadNoCommand",
                 "transport": "stdio",
                 "launch_config": {"required_env": ["KEY"]},
+            },
+        )
+        assert resp.status_code == 422
+
+        # A command on a remote transport is not keyless — still rejected.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-remote-command",
+                "name": "BadRemoteCommand",
+                "transport": "streamable_http",
+                "launch_config": {"command": "npx", "args": ["-y", "x"]},
             },
         )
         assert resp.status_code == 422
@@ -1322,6 +1392,9 @@ def test_admin_update_app_enforces_auth_classification() -> None:
         assert created.status_code == 200
         app_pk = created.json()["id"]
 
+        # Dropping the command (keeping required_env) is a genuinely partial
+        # shape and must be rejected. (Dropping required_env instead would be a
+        # legitimate api_key -> keyless transition, not a violation.)
         updated = client.put(
             f"/api/admin/mcp/apps/{app_pk}",
             headers=admin_headers,
@@ -1329,10 +1402,79 @@ def test_admin_update_app_enforces_auth_classification() -> None:
                 "app_id": "good-keyed",
                 "name": "GoodKeyed",
                 "transport": "stdio",
-                "launch_config": {"command": "npx"},
+                "launch_config": {"required_env": ["KEY"]},
             },
         )
         assert updated.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_put_removing_required_env_transitions_api_key_row_to_connectable_keyless() -> (
+    None
+):
+    """Round-4 MINOR-7b / round-5 m4: this loosening is real and previously
+    untested via PUT (only the CREATE/POST acceptance of a fresh keyless
+    shape was covered). An admin-created stdio row with required_env
+    classifies api_key; removing required_env via PUT is a legitimate
+    transition to keyless (not the genuinely partial shape rejected in
+    test_admin_update_app_enforces_auth_classification above, which drops
+    command instead) -- the write-time validator must accept it (200, not
+    422), and the resulting row must actually be connectable through the
+    real user-facing endpoint afterward, not just pass admin validation.
+    """
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "required_env": ["KEY"]},
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        from xagent.web.mcp_apps import classify_app_auth
+
+        assert (
+            classify_app_auth("stdio", {"command": "npx", "required_env": ["KEY"]})
+            == "api_key"
+        )
+
+        updated = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx"},
+            },
+        )
+        assert updated.status_code == 200
+        assert classify_app_auth("stdio", {"command": "npx"}) == "keyless"
+
+        # Connectable through the real endpoint post-transition, with no env
+        # at all -- the keyless shape's defining behavior.
+        connected = client.post(
+            "/api/mcp/apps/transitioning-app/connect",
+            headers=admin_headers,
+            json={"is_active": True},
+        )
+        assert connected.status_code == 200
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -1423,7 +1565,9 @@ def test_admin_list_apps_does_not_500_on_partial_launch_config_row() -> None:
                     app_id="legacy-bad",
                     name="LegacyBad",
                     transport="stdio",
-                    launch_config={"command": "npx"},
+                    # required_env without a command: still a genuinely partial
+                    # shape (command-only now classifies "keyless", not partial).
+                    launch_config={"required_env": ["KEY"]},
                 )
             )
             db.commit()
@@ -1791,10 +1935,13 @@ def test_admin_custom_patch_validates_merged_state_and_keeps_app_id_immutable() 
         assert updated.json()["launch_config"]["command"] == "new-command"
         assert updated.json()["is_builtin"] is False
 
+        # required_env without a command is still a partial shape on the merged
+        # state. (command without required_env would now merge into a valid
+        # keyless app instead.)
         invalid = client.patch(
             f"/api/admin/mcp/apps/{app_pk}",
             headers=admin_headers,
-            json={"launch_config": {"command": "incomplete-command"}},
+            json={"launch_config": {"required_env": ["CUSTOM_TOKEN"]}},
         )
         assert invalid.status_code == 422
 

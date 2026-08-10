@@ -2,7 +2,7 @@ import React from "react"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { getApiUrl } from "@/lib/utils"
-import { Settings, Unlink, Plus, Users, UserMinus } from "lucide-react"
+import { Settings, Unlink, Plus, Users, UserMinus, Loader2 } from "lucide-react"
 import { apiRequest } from "@/lib/api-wrapper"
 import { toast } from "@/components/ui/sonner"
 import { useAuth } from "@/contexts/auth-context"
@@ -22,6 +22,12 @@ interface OfficialMcpSettingsDialogProps {
   onConnectStart?: (app: AppIntegration) => void
   onConfigure?: (app: AppIntegration) => void
   onManageKey?: (app: AppIntegration) => void
+  // True while the parent-owned connect request for this app is in flight
+  // (e.g. a keyless connect fired via onConnectStart). Disables the Connect
+  // trigger so rapid double-clicks can't fire overlapping POSTs, and gives
+  // the flow its only visible progress state — the catalog card spinner is
+  // occluded by this dialog.
+  isConnecting?: boolean
 }
 
 export function OfficialMcpSettingsDialog({
@@ -33,7 +39,8 @@ export function OfficialMcpSettingsDialog({
   isGloballyConnected = false,
   onConnectStart,
   onConfigure,
-  onManageKey
+  onManageKey,
+  isConnecting = false
 }: OfficialMcpSettingsDialogProps) {
   const { token, inTeam } = useAuth()
   const { t } = useI18n()
@@ -208,8 +215,13 @@ export function OfficialMcpSettingsDialog({
               <Button
                 className="w-full max-w-[200px] rounded-full h-11 font-medium bg-blue-600 text-white hover:bg-blue-700"
                 onClick={() => handleConnectApp(app)}
+                disabled={isConnecting}
               >
-                <Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.connect')}
+                {isConnecting ? (
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> {t('tools.mcp.dialog.connecting')}</>
+                ) : (
+                  <><Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.connect')}</>
+                )}
               </Button>
             )}
 
@@ -217,12 +229,15 @@ export function OfficialMcpSettingsDialog({
               <>
                 {(() => {
                   const isKeyBased = app.auth_type === "api_key"
+                  // Keyless apps have no key and no editable config — once
+                  // connected, disconnect is the only sensible action.
+                  const isKeyless = app.auth_type === "keyless"
                   // Team tool the viewer doesn't own: they can use it, but the backend
                   // rejects edit/delete/unshare (403), so don't render those buttons.
                   const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
                   return (
                     <>
-                      {!isNonOwnedTeamTool && (
+                      {!isNonOwnedTeamTool && !isKeyless && (
                         <Button
                           className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
                           onClick={() => {

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { Bot, ChevronDown, ChevronUp, Copy, Check } from "lucide-react";
+import { Bot, ChevronDown, ChevronUp, Copy, Check, Laptop } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
@@ -83,6 +83,11 @@ export interface ChatMessageProps {
   onOpenExecutionPlan?: () => void;
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
   onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
+  contextBadges?: Array<{
+    kind: "computer_use";
+    label: string;
+    detail: string;
+  }>;
 }
 
 function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
@@ -303,6 +308,7 @@ export function ChatMessage({
   onOpenExecutionPlan,
   onAgentExecutionClick,
   onSendInteraction,
+  contextBadges,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
@@ -503,6 +509,23 @@ export function ChatMessage({
                 !isUser && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
                   <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} />
                 )
+              )}
+              {isUser && contextBadges && contextBadges.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {contextBadges.map((badge) => (
+                    <div
+                      key={`${badge.kind}:${badge.label}:${badge.detail}`}
+                      role="note"
+                      className="inline-flex h-7 min-w-0 items-center gap-1.5 rounded-lg border border-border/80 bg-background/55 px-2 text-xs text-muted-foreground"
+                      aria-label={`${badge.label} · ${badge.detail}`}
+                    >
+                      <Laptop className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">{badge.label}</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="truncate">{badge.detail}</span>
+                    </div>
+                  ))}
+                </div>
               )}
               {!isUser && interactions && interactions.length > 0 && (
                 <div className="mt-4 border-t pt-4">

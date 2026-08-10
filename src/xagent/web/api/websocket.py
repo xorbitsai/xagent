@@ -163,7 +163,10 @@ from ..services.task_lease_service import (
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
 )
-from ..services.task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
+from ..services.task_runtime import (
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+    task_extension_bindings_from_agent_config,
+)
 from ..services.uploaded_file_store import (
     StagedUploadedFile,
     SupersededObjectCleanupClaim,
@@ -5238,6 +5241,9 @@ def _load_websocket_task_routing_snapshot(
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,
+                "runtime_extension_bindings": list(
+                    task_extension_bindings_from_agent_config(task.agent_config)
+                ),
                 "is_dag": (
                     agent_execution_mode == "think"
                     if agent_execution_mode is not None
@@ -6467,6 +6473,9 @@ def _load_legacy_execute_task_request_sync(
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,
+                "runtime_extension_bindings": list(
+                    task_extension_bindings_from_agent_config(task.agent_config)
+                ),
                 "created_at": safe_timestamp_to_unix(task.created_at)
                 if task.created_at
                 else None,

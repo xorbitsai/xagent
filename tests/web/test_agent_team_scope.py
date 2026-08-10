@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import operators
 from sqlalchemy.sql.elements import BinaryExpression, BooleanClauseList
@@ -70,6 +71,125 @@ def test_scope_uses_hook_when_installed():
         assert ats.get_agent_team_scope(None, None) is None  # None user -> no scope
     finally:
         ats.set_agent_team_scope_hook(None)
+
+
+class _QueryRecorder:
+    def __init__(self) -> None:
+        self.filters: tuple[object, ...] = ()
+
+    def filter(self, *_clauses):
+        self.filters = _clauses
+        return self
+
+    def first(self):
+        return None
+
+
+class _RecordingSession:
+    def __init__(self) -> None:
+        self.query_calls: list[object] = []
+        self.query_recorder = _QueryRecorder()
+
+    def query(self, model):
+        self.query_calls.append(model)
+        return self.query_recorder
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        None,
+        False,
+        True,
+        1.0,
+        0,
+        -1,
+        "",
+        "0",
+        "01",
+        "+1",
+        " 1",
+        "1 ",
+        "1.0",
+        "1x",
+        "\N{ARABIC-INDIC DIGIT ONE}",
+        2**31,
+        str(2**31),
+    ],
+)
+def test_resolve_authorized_agent_rejects_noncanonical_or_out_of_range_ids_before_query(
+    candidate,
+):
+    session = _RecordingSession()
+
+    assert (
+        ats.resolve_authorized_agent(session, owner_user_id=7, candidate_id=candidate)
+        is None
+    )
+    assert session.query_calls == []
+
+
+def test_resolve_authorized_agent_rejects_overlong_string_before_regex_or_query(
+    monkeypatch,
+):
+    class _RegexSentinel:
+        def fullmatch(self, _candidate):
+            raise AssertionError("regex must not scan overlong candidate ids")
+
+    session = _RecordingSession()
+    monkeypatch.setattr(ats, "_CANONICAL_AGENT_ID", _RegexSentinel())
+
+    assert (
+        ats.resolve_authorized_agent(session, owner_user_id=7, candidate_id="1" * 5000)
+        is None
+    )
+    assert session.query_calls == []
+
+
+@pytest.mark.parametrize("candidate", [1, "1", 2**31 - 1, str(2**31 - 1)])
+def test_resolve_authorized_agent_queries_canonical_postgres_integer_ids(candidate):
+    session = _RecordingSession()
+
+    assert (
+        ats.resolve_authorized_agent(session, owner_user_id=7, candidate_id=candidate)
+        is None
+    )
+    assert session.query_calls == [Agent]
+
+
+def test_resolve_authorized_agent_binds_postgres_integer_maximum_as_an_integer():
+    session = _RecordingSession()
+
+    assert (
+        ats.resolve_authorized_agent(
+            session, owner_user_id=7, candidate_id=str(2**31 - 1)
+        )
+        is None
+    )
+    compiled = session.query_recorder.filters[0].compile(dialect=postgresql.dialect())
+    assert 2**31 - 1 in compiled.params.values()
+
+
+def test_resolve_authorized_agent_applies_existing_owner_team_scope(db):
+    owner = _make_user(db, "owner@scope.test")
+    outsider = _make_user(db, "outsider@scope.test")
+    owned = Agent(user_id=int(owner.id), name="owned")
+    foreign = Agent(user_id=int(outsider.id), name="foreign")
+    db.add_all([owned, foreign])
+    db.commit()
+
+    assert (
+        ats.resolve_authorized_agent(
+            db, owner_user_id=int(owner.id), candidate_id=owned.id
+        )
+        == owned
+    )
+    assert (
+        ats.resolve_authorized_agent(
+            db, owner_user_id=int(owner.id), candidate_id=foreign.id
+        )
+        is None
+    )
 
 
 def test_owned_clause_shape():

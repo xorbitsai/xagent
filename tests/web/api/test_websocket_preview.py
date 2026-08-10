@@ -87,6 +87,7 @@ async def test_handle_build_preview_execution_uses_normal_task_flow():
     mock_user.is_admin = False
 
     message_data = {
+        "agent_id": 41,
         "instructions": "test instructions",
         "execution_mode": "graph",
         "models": {
@@ -127,6 +128,7 @@ async def test_handle_build_preview_execution_uses_normal_task_flow():
     assert create_request.is_visible is False
     assert create_request.agent_id is None
     assert create_request.agent_config["instructions"] == "test instructions"
+    assert create_request.agent_config["preview_agent_id"] == 41
     assert create_request.llm_ids == ["1", None, None, None]
     assert create_request.files is None
     mock_register_connection.assert_called_once_with(mock_websocket, 123)

@@ -499,14 +499,12 @@ def test_connect_rejects_oauth_app(test_db):
     assert exc.value.status_code == 400
 
 
-def test_connect_rejects_unconnectable_app(test_db):
-    """An entry that classifies as "unconnectable" (a launch command but no
-    required_env, so nothing to key on) is rejected by the key-based gate. Such
-    a row can only reach the DB directly / pre-validator; the connect gate is the
-    backstop. Guards the auth_type != "api_key" branch of _ensure_catalog_app_server.
+def test_connect_keyless_app_creates_association_without_env(test_db):
+    """A keyless entry (a stdio command with no required_env, e.g. Chrome)
+    connects through the same endpoint: shared server row + non-owner
+    association, but with no per-user env at all. Any env a caller does send is
+    dropped — required_env is empty, so nothing is allowed through.
     """
-    from fastapi import HTTPException
-
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
 
     test_db.add(
@@ -519,9 +517,304 @@ def test_connect_rejects_unconnectable_app(test_db):
     )
     test_db.commit()
 
+    connect_mcp_app(
+        "keyless",
+        MCPAppConnectRequest(env={"INJECTED": "nope"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    server = test_db.query(MCPServer).filter(MCPServer.name == "keyless").first()
+    assert server is not None
+    assert server.transport == "stdio"
+    assert server.command == "npx"
+    assert server.args == ["-y", "some-mcp"]
+
+    assoc = (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.user_id == 1, UserMCPServer.mcpserver_id == server.id)
+        .first()
+    )
+    assert assoc is not None
+    assert assoc.is_owner is False
+    assert assoc.is_active is True
+    # No declared keys -> nothing stored, not even the injected env.
+    assert assoc.env is None
+
+
+def test_connect_rejects_hidden_app(test_db):
+    """is_visible_in_connector is a release gate, not just a display toggle:
+    a hidden app must not be connectable by anyone who knows the app_id (the
+    chrome connector ships hidden until persistent stdio sessions land). The
+    gate returns 404 so a hidden app is indistinguishable from a nonexistent
+    one, and it must fire before any shared server row is created.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="hidden-keyless",
+            name="hidden-keyless",
+            transport="stdio",
+            is_visible_in_connector=False,
+            launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+        )
+    )
+    test_db.commit()
+
     with pytest.raises(HTTPException) as exc:
         connect_mcp_app(
-            "keyless",
+            "hidden-keyless",
+            MCPAppConnectRequest(is_active=True),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 404
+
+    # The gate fired before provisioning: no shared server row was created.
+    assert (
+        test_db.query(MCPServer).filter(MCPServer.name == "hidden-keyless").first()
+        is None
+    )
+
+
+def test_connect_rejects_the_real_shipped_chrome_app(test_db):
+    """End-to-end on the actual app_id="chrome-devtools", not a synthetic stand-in:
+    shipping hidden is this PR's entire safety story, so it must be pinned
+    against the real registry row, not just a hand-built fixture that happens
+    to share the shape. The DB row only needs app_id/is_visible_in_connector
+    to match the seed migration -- transport/launch_config are overlaid from
+    builtin_mcp_registry.py by get_app_by_id regardless of what's stored.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    registry_row = get_builtin_public_mcp_app("chrome-devtools")
+    assert registry_row is not None
+    assert registry_row["is_visible_in_connector"] is False, (
+        "chrome must ship hidden -- if this ever flips to True, this test's "
+        "premise (and the PR's rollout safety story) no longer holds"
+    )
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="chrome-devtools",
+            name="Chrome",
+            transport=registry_row["transport"],
+            is_visible_in_connector=registry_row["is_visible_in_connector"],
+            launch_config=registry_row["launch_config"],
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "chrome-devtools",
+            MCPAppConnectRequest(is_active=True),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 404
+    assert (
+        test_db.query(MCPServer).filter(MCPServer.name == "chrome-devtools").first()
+        is None
+    )
+
+
+def test_connect_reactivates_dormant_association_when_requested(test_db):
+    """The keyless connect flow sends is_active=True explicitly; the backend
+    must flip a dormant (is_active=False) association back on. Guards the
+    reactivation semantics the frontend now depends on
+    (connect-mcp-dialog.tsx submitKeylessConnect).
+    """
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="keyless-dormant",
+            name="keyless-dormant",
+            transport="stdio",
+            launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+        )
+    )
+    test_db.commit()
+
+    # First connect creates the association, then the user turns it off.
+    connect_mcp_app(
+        "keyless-dormant",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    server = test_db.query(MCPServer).filter(MCPServer.name == "keyless-dormant").one()
+    assoc = (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.user_id == 1, UserMCPServer.mcpserver_id == server.id)
+        .one()
+    )
+    assoc.is_active = False
+    test_db.commit()
+
+    # Reconnect with is_active=True reactivates; omitting it must NOT
+    # (a key-update reconnect may not silently re-enable a disabled row).
+    connect_mcp_app(
+        "keyless-dormant",
+        MCPAppConnectRequest(),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    test_db.refresh(assoc)
+    assert assoc.is_active is False
+
+    connect_mcp_app(
+        "keyless-dormant",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    test_db.refresh(assoc)
+    assert assoc.is_active is True
+
+
+def test_hiding_an_app_blocks_reconnect_for_an_already_connected_user(test_db):
+    """Round-6 MINOR-5, first direction: _reject_hidden_catalog_app's
+    docstring claims hiding an app also blocks reconnect/key-rotation for
+    users who connected while it was visible, not just fresh connects. That
+    claim was previously prose-only -- pin it. The existing association must
+    survive untouched: the block is on the connect *attempt*, not the data.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    app = PublicMCPApp(
+        app_id="visible-then-hidden",
+        name="visible-then-hidden",
+        transport="stdio",
+        is_visible_in_connector=True,
+        launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+    )
+    test_db.add(app)
+    test_db.commit()
+
+    # Connect while visible.
+    connect_mcp_app(
+        "visible-then-hidden",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    server = (
+        test_db.query(MCPServer).filter(MCPServer.name == "visible-then-hidden").one()
+    )
+    assoc_before = (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.user_id == 1, UserMCPServer.mcpserver_id == server.id)
+        .one()
+    )
+    assert assoc_before.is_active is True
+
+    # An admin hides it (e.g. incident response, or reusing this PR's
+    # hidden-rollout idiom for another app).
+    app.is_visible_in_connector = False
+    test_db.commit()
+
+    # The existing user's reconnect/key-rotation attempt now 404s.
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "visible-then-hidden",
+            MCPAppConnectRequest(is_active=True),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 404
+
+    # The pre-existing association is untouched by the blocked attempt.
+    test_db.refresh(assoc_before)
+    assert assoc_before.is_active is True
+
+
+async def test_hiding_an_app_does_not_block_disconnect(test_db):
+    """Round-6 MINOR-5, second direction: the same docstring claims
+    disconnect (and the server/tool routes) are unaffected by hiding, since
+    they're server-scoped and never call _reject_hidden_catalog_app. Pin
+    that a user can still disconnect from an app that was hidden after they
+    connected.
+    """
+    from xagent.web.api.mcp import (
+        MCPAppConnectRequest,
+        connect_mcp_app,
+        delete_mcp_server,
+    )
+
+    app = PublicMCPApp(
+        app_id="visible-then-hidden-disconnect",
+        name="visible-then-hidden-disconnect",
+        transport="stdio",
+        is_visible_in_connector=True,
+        launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+    )
+    test_db.add(app)
+    test_db.commit()
+
+    connect_mcp_app(
+        "visible-then-hidden-disconnect",
+        MCPAppConnectRequest(is_active=True),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    # Captured as a plain int: the sole user disconnecting deletes the
+    # shared MCPServer row too (no other user left), which would expire the
+    # ORM object itself if held onto and re-queried afterward.
+    server_id = (
+        test_db.query(MCPServer)
+        .filter(MCPServer.name == "visible-then-hidden-disconnect")
+        .one()
+        .id
+    )
+
+    app.is_visible_in_connector = False
+    test_db.commit()
+
+    # Disconnect is server-scoped (by numeric id, no catalog lookup) and must
+    # succeed even though the app is now hidden.
+    await delete_mcp_server(server_id, current_user=_user(test_db, 1), db=test_db)
+    assert (
+        test_db.query(UserMCPServer)
+        .filter(UserMCPServer.mcpserver_id == server_id, UserMCPServer.user_id == 1)
+        .first()
+        is None
+    )
+
+
+def test_connect_rejects_unconnectable_app(test_db):
+    """An entry that classifies as "unconnectable" (required_env but no launch
+    command, so nothing to run) is rejected by the connect gate. Such a row can
+    only reach the DB directly / pre-validator; the connect gate is the backstop.
+    Guards the auth_type not in ("api_key", "keyless") branch of
+    _ensure_catalog_app_server.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="broken",
+            name="broken",
+            transport="stdio",
+            launch_config={"required_env": ["KEY"]},
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "broken",
             MCPAppConnectRequest(env={"X": "y"}),
             current_user=_user(test_db, 1),
             db=test_db,

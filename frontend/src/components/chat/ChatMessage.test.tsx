@@ -128,6 +128,24 @@ describe("ChatMessage Session file capability", () => {
     )
   })
 
+  it("renders Computer use context on a user message", () => {
+    render(
+      <ChatMessage
+        role="user"
+        content="Open the selected page"
+        contextBadges={[{
+          kind: "computer_use",
+          label: "Computer use",
+          detail: "Local browser",
+        }]}
+      />,
+    )
+
+    expect(
+      screen.getByRole("note", { name: "Computer use · Local browser" }),
+    ).toBeInTheDocument()
+  })
+
   it("uses the same safe projection for normal assistant DOM and copied content", () => {
     appContextMock.filesDisabled = true
     const { container } = render(

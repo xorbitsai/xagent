@@ -1,26 +1,38 @@
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from xagent.core.ssh import (
     ActorRef,
     BoundTargetInfo,
     PrincipalRef,
     ResolvedSshTarget,
+    SensitiveSshCredential,
     SshError,
     SshErrorCode,
     SshExecutionContext,
     SshSecretHandle,
 )
 from xagent.core.ssh.executor import SshExecuteOutcome
+from xagent.core.ssh.runner import SshRunResult
 from xagent.core.tools.adapters.vibe.ssh_tools import (
     SshDownloadTool,
     SshExecuteTool,
     SshListTargetsTool,
     SshUploadTool,
-    _agent_id_from_task,
+    _agent_id_for_task,
     _egress_from_env,
     _numeric_task_id,
+)
+from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.user import User
+from xagent.web.services.agent_team_scope import (
+    AgentTeamScope,
+    set_agent_team_scope_hook,
 )
 
 
@@ -232,23 +244,502 @@ def test_numeric_task_id_parses_workspace_prefixed_id() -> None:
     assert _numeric_task_id(None) is None
 
 
-def test_agent_id_from_task_normal() -> None:
-    task = SimpleNamespace(agent_id=5, agent_config=None)
-    assert _agent_id_from_task(task) == 5
+@pytest.fixture
+def task_db(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'ssh-tools.db'}")
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(autoflush=False, bind=engine, expire_on_commit=False)
+    try:
+        yield session_factory
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
 
 
-def test_agent_id_from_task_preview_fallback() -> None:
-    # Preview tasks (#459) carry agent_id=None; the edited agent id lives in
-    # agent_config["preview_agent_id"].
-    task = SimpleNamespace(agent_id=None, agent_config={"preview_agent_id": 7})
-    assert _agent_id_from_task(task) == 7
+def _new_user(db, name: str) -> User:
+    user = User(username=name, email=f"{name}@example.test", password_hash="x")
+    db.add(user)
+    db.flush()
+    return user
 
 
-def test_agent_id_from_task_none_when_unresolvable() -> None:
-    assert _agent_id_from_task(None) is None
-    assert (
-        _agent_id_from_task(SimpleNamespace(agent_id=None, agent_config=None)) is None
+def _new_agent(db, user_id: int, **overrides) -> Agent:
+    agent = Agent(
+        user_id=user_id,
+        name=overrides.pop("name", "ssh-agent"),
+        status=overrides.pop("status", AgentStatus.DRAFT),
+        **overrides,
     )
+    db.add(agent)
+    db.flush()
+    return agent
+
+
+def _new_task(db, user_id: int, **overrides) -> Task:
+    task = Task(
+        user_id=user_id,
+        title="SSH task",
+        description="SSH task",
+        status=TaskStatus.PENDING,
+        **overrides,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@pytest.mark.parametrize("status", [AgentStatus.DRAFT, AgentStatus.PUBLISHED])
+def test_agent_id_for_task_authorizes_owned_direct_agent(task_db, status) -> None:
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        agent = _new_agent(db, int(owner.id), status=status)
+        task = _new_task(db, int(owner.id), agent_id=int(agent.id))
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id)) == int(agent.id)
+
+
+@pytest.mark.parametrize("status", [AgentStatus.DRAFT, AgentStatus.PUBLISHED])
+def test_agent_id_for_task_authorizes_owned_preview_agent(task_db, status) -> None:
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        agent = _new_agent(db, int(owner.id), status=status)
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_config={"preview_agent_id": int(agent.id)},
+        )
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id)) == int(agent.id)
+
+
+def test_agent_id_for_task_rejects_cross_owner_published_direct_agent(task_db) -> None:
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        other = _new_user(db, "other")
+        published = _new_agent(db, int(other.id), status=AgentStatus.PUBLISHED)
+        task = _new_task(db, int(owner.id), agent_id=int(published.id))
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id)) is None
+
+
+@pytest.mark.parametrize("candidate", ["01", "abc", True, 2**31, str(2**31)])
+def test_agent_id_for_task_rejects_malformed_preview_candidate(
+    task_db, candidate
+) -> None:
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_config={"preview_agent_id": candidate},
+        )
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id)) is None
+
+
+def test_agent_id_for_task_rejects_cross_scope_preview_agent(task_db) -> None:
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        other = _new_user(db, "other")
+        foreign = _new_agent(db, int(other.id))
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_config={"preview_agent_id": int(foreign.id)},
+        )
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id)) is None
+
+
+def test_agent_id_for_task_rejects_archived_agent(task_db) -> None:
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        archived = _new_agent(db, int(owner.id), status=AgentStatus.ARCHIVED)
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_config={"preview_agent_id": int(archived.id)},
+        )
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id)) is None
+
+
+def test_agent_id_for_task_does_not_fallback_after_denied_primary_agent(
+    task_db,
+) -> None:
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        other = _new_user(db, "other")
+        denied_primary = _new_agent(db, int(other.id), name="foreign")
+        owned_preview = _new_agent(db, int(owner.id), name="owned")
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_id=int(denied_primary.id),
+            agent_config={"preview_agent_id": int(owned_preview.id)},
+        )
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id)) is None
+
+
+def test_agent_id_for_task_allows_team_admin_private_and_member_team_visible(
+    task_db,
+) -> None:
+    db = task_db()
+    try:
+        admin = _new_user(db, "admin")
+        member = _new_user(db, "member")
+        private = _new_agent(
+            db, int(member.id), team_id=77, visibility="admins", name="private"
+        )
+        shared = _new_agent(
+            db, int(admin.id), team_id=77, visibility="team", name="shared"
+        )
+        legacy = _new_agent(db, int(member.id), team_id=None, name="legacy")
+        admin_task = _new_task(
+            db, int(admin.id), agent_config={"preview_agent_id": int(private.id)}
+        )
+        member_task = _new_task(
+            db, int(member.id), agent_config={"preview_agent_id": int(shared.id)}
+        )
+        legacy_task = _new_task(
+            db, int(member.id), agent_config={"preview_agent_id": int(legacy.id)}
+        )
+    finally:
+        db.close()
+
+    set_agent_team_scope_hook(
+        lambda _db, user_id: AgentTeamScope(
+            team_id=77, is_team_admin=user_id == int(admin.id)
+        )
+    )
+    try:
+        assert _agent_id_for_task(task_db, int(admin_task.id)) == int(private.id)
+        assert _agent_id_for_task(task_db, int(member_task.id)) == int(shared.id)
+        assert _agent_id_for_task(task_db, int(legacy_task.id)) == int(legacy.id)
+    finally:
+        set_agent_team_scope_hook(None)
+
+
+class _RecordingTargetProvider(_Provider):
+    def __init__(
+        self,
+        *,
+        resolved=None,
+        targets=None,
+        credential=None,
+        events=None,
+    ) -> None:
+        super().__init__(resolved=resolved, targets=targets)
+        self._credential = credential
+        self._events = events
+        self.list_calls = 0
+        self.resolve_calls = 0
+        self.list_contexts = []
+        self.resolve_contexts = []
+
+    async def resolve(self, context, target_alias):
+        self.resolve_calls += 1
+        self.resolve_contexts.append(context)
+        if self._events is not None:
+            self._events.append(("resolve", context, target_alias))
+        return await super().resolve(context, target_alias)
+
+    async def list_bound_targets(self, context):
+        self.list_calls += 1
+        self.list_contexts.append(context)
+        if self._events is not None:
+            self._events.append(("list", context))
+        return await super().list_bound_targets(context)
+
+    async def read_version(self, secret_handle):
+        if self._events is not None:
+            self._events.append(("read_version", secret_handle))
+        if self._credential is None:
+            raise NotImplementedError
+        return self._credential
+
+
+class _RecordingRunner:
+    def __init__(self, events) -> None:
+        self._events = events
+
+    async def execute(self, **kwargs) -> SshRunResult:
+        self._events.append(("run", kwargs["command"]))
+        return SshRunResult(exit_code=0, stdout="ok", stderr="", truncated=False)
+
+
+@pytest.mark.parametrize("status", [AgentStatus.DRAFT, AgentStatus.PUBLISHED])
+async def test_create_ssh_tools_propagates_authorized_preview_context_to_execute(
+    task_db,
+    monkeypatch,
+    status,
+) -> None:
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        _new_agent(db, int(owner.id), name="id-separator")
+        preview = _new_agent(db, int(owner.id), name="preview", status=status)
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_config={"preview_agent_id": int(preview.id)},
+        )
+        owner_id = int(owner.id)
+        preview_id = int(preview.id)
+        task_id = int(task.id)
+    finally:
+        db.close()
+    assert preview_id != owner_id
+
+    events: list[tuple] = []
+    provider = _RecordingTargetProvider(
+        resolved=_resolved(),
+        targets=[
+            BoundTargetInfo(
+                alias="prod",
+                display_name="Production",
+                capabilities=frozenset({"execute"}),
+            )
+        ],
+        credential=SensitiveSshCredential(b"KEY", "", "ssh-ed25519"),
+        events=events,
+    )
+
+    def _factory(session_factory):
+        events.append(("factory", session_factory))
+        return provider
+
+    runner = _RecordingRunner(events)
+    set_ssh_target_provider_hook(_factory)
+    monkeypatch.setattr(ssh_tools, "_make_ssh_sandbox_lease", lambda *_args: None)
+    monkeypatch.setattr(ssh_tools, "AsyncsshRunner", lambda: runner)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: owner_id,
+        get_task_id=lambda: f"web_task_{task_id}",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        tools = await ssh_tools.create_ssh_tools(config)
+        assert [tool.name for tool in tools] == [
+            "ssh_list_targets",
+            "ssh_execute",
+            "ssh_upload",
+            "ssh_download",
+        ]
+
+        expected_context = SshExecutionContext(
+            actor=ActorRef(actor_type="user", actor_id=str(owner_id)),
+            execution_principal=PrincipalRef(
+                principal_type="user", principal_id=str(owner_id)
+            ),
+            agent_id=preview_id,
+            task_id=task_id,
+            turn_id=None,
+            request_id=f"web_task_{task_id}",
+        )
+        assert provider.list_contexts == [expected_context]
+        assert events == [("factory", task_db), ("list", expected_context)]
+
+        execute_tool = next(tool for tool in tools if tool.name == "ssh_execute")
+        assert isinstance(execute_tool, SshExecuteTool)
+
+        async def _resolve_public(_hostname, _port):
+            return ["8.8.8.8"]
+
+        execute_tool._executor._resolver = _resolve_public
+        outcome = await execute_tool.run_json_async(
+            {"target": "prod", "command": "uptime"}
+        )
+
+        assert outcome["ok"] is True
+        assert outcome["stdout"] == "ok"
+        assert provider.resolve_contexts == [expected_context]
+        assert provider.resolve_contexts[0] is provider.list_contexts[0]
+        assert events == [
+            ("factory", task_db),
+            ("list", expected_context),
+            ("resolve", expected_context, "prod"),
+            ("read_version", _resolved().secret_handle),
+            ("run", "uptime"),
+        ]
+    finally:
+        set_ssh_target_provider_hook(None)
+
+
+async def test_create_ssh_tools_denies_cross_scope_preview_before_provider_targets(
+    task_db,
+) -> None:
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        other = _new_user(db, "other")
+        foreign = _new_agent(db, int(other.id))
+        task = _new_task(
+            db,
+            int(owner.id),
+            agent_config={"preview_agent_id": int(foreign.id)},
+        )
+    finally:
+        db.close()
+
+    provider = _RecordingTargetProvider()
+    factory_calls: list[object] = []
+
+    def _factory(session_factory):
+        factory_calls.append(session_factory)
+        return provider
+
+    set_ssh_target_provider_hook(_factory)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: int(owner.id),
+        get_task_id=lambda: f"web_task_{int(task.id)}",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        assert await ssh_tools.create_ssh_tools(config) == []
+        assert factory_calls == [task_db]
+        assert provider.list_calls == 0
+        assert provider.resolve_calls == 0
+    finally:
+        set_ssh_target_provider_hook(None)
+
+
+@pytest.mark.parametrize(
+    ("case", "preview_candidate"),
+    [
+        ("cross-owner-direct", None),
+        ("malformed-preview", "abc"),
+        ("oversized-preview", "1" * 5000),
+        ("nonexistent-preview", "2147483647"),
+        ("archived-direct", None),
+        ("denied-primary-no-preview-fallback", None),
+    ],
+)
+async def test_create_ssh_tools_denies_unresolved_task_agent_before_provider_targets(
+    task_db,
+    case,
+    preview_candidate,
+) -> None:
+    """Persisted task identity must be authorized before provider target access."""
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        if case == "cross-owner-direct":
+            other = _new_user(db, "other")
+            foreign = _new_agent(db, int(other.id), status=AgentStatus.PUBLISHED)
+            task = _new_task(db, int(owner.id), agent_id=int(foreign.id))
+        elif case in {"malformed-preview", "oversized-preview", "nonexistent-preview"}:
+            task = _new_task(
+                db,
+                int(owner.id),
+                agent_config={"preview_agent_id": preview_candidate},
+            )
+        elif case == "archived-direct":
+            archived = _new_agent(db, int(owner.id), status=AgentStatus.ARCHIVED)
+            task = _new_task(db, int(owner.id), agent_id=int(archived.id))
+        else:
+            other = _new_user(db, "other")
+            denied_primary = _new_agent(db, int(other.id), name="foreign")
+            owned_preview = _new_agent(db, int(owner.id), name="owned")
+            task = _new_task(
+                db,
+                int(owner.id),
+                agent_id=int(denied_primary.id),
+                agent_config={"preview_agent_id": int(owned_preview.id)},
+            )
+    finally:
+        db.close()
+
+    provider = _RecordingTargetProvider()
+    factory_calls: list[object] = []
+
+    def _factory(session_factory):
+        factory_calls.append(session_factory)
+        return provider
+
+    set_ssh_target_provider_hook(_factory)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: int(owner.id),
+        get_task_id=lambda: f"web_task_{int(task.id)}",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        assert await ssh_tools.create_ssh_tools(config) == []
+        assert factory_calls == [task_db]
+        assert provider.list_calls == 0
+        assert provider.resolve_calls == 0
+    finally:
+        set_ssh_target_provider_hook(None)
+
+
+async def test_create_ssh_tools_propagates_task_owner_scope_failure(task_db) -> None:
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        agent = _new_agent(db, int(owner.id))
+        task = _new_task(db, int(owner.id), agent_id=int(agent.id))
+    finally:
+        db.close()
+
+    provider = _RecordingTargetProvider()
+    set_ssh_target_provider_hook(lambda _session_factory: provider)
+
+    def _raise_scope_failure(*_args):
+        raise RuntimeError("team scope unavailable")
+
+    set_agent_team_scope_hook(_raise_scope_failure)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: int(owner.id),
+        get_task_id=lambda: f"web_task_{int(task.id)}",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="team scope unavailable"):
+            await ssh_tools.create_ssh_tools(config)
+        assert provider.list_calls == 0
+        assert provider.resolve_calls == 0
+    finally:
+        set_agent_team_scope_hook(None)
+        set_ssh_target_provider_hook(None)
 
 
 class _FakeLease:

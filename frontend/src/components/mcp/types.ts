@@ -17,7 +17,7 @@ export interface AppIntegration {
   // Canonical connect classification derived on the catalog entry by the
   // backend (mcp_apps.classify_app_auth). Read this instead of re-deriving
   // from provider/required_env so the dialogs can't drift from the backend.
-  auth_type?: "builtin_oauth" | "api_key" | "mcp_oauth" | "unconnectable"
+  auth_type?: "builtin_oauth" | "api_key" | "keyless" | "mcp_oauth" | "unconnectable"
   launch_config?: {
     command?: string
     args?: string[]

@@ -71,6 +71,43 @@ def _register(name: str, provider: _Provider, registered: list[str]) -> _Provide
     return provider
 
 
+@pytest.mark.asyncio
+async def test_task_create_persists_inline_preview_agent_without_top_level_agent_id() -> (
+    None
+):
+    _admin_headers()
+    _register_second_user("preview-owner", "previewpass1")
+    db = _direct_db_session()
+    try:
+        owner = db.query(User).filter(User.username == "preview-owner").one()
+        created = await create_task(
+            TaskCreateRequest(
+                title="inline preview",
+                description="inline preview",
+                agent_id=None,
+                agent_config={
+                    "instructions": "preview",
+                    "knowledge_bases": [],
+                    "skills": [],
+                    "tool_categories": ["ssh"],
+                    "is_preview": True,
+                    "preview_agent_id": 41,
+                },
+                is_visible=False,
+            ),
+            db=db,
+            user=owner,
+        )
+
+        db.expire_all()
+        task = db.query(Task).filter(Task.id == int(created.task_id)).one()
+        assert task.agent_id is None
+        assert task.agent_config["preview_agent_id"] == 41
+        assert task.agent_config["tool_categories"] == ["ssh"]
+    finally:
+        db.close()
+
+
 # ===== reserved agent_config keys are server-owned, never client-supplied =====
 
 

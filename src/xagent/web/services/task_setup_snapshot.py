@@ -215,20 +215,14 @@ def _resolve_inline_preview_excluded_agent_id(
     if not agent_config or not agent_config.get("preview_agent_id"):
         return None
 
-    from ..models.agent import Agent, AgentStatus
-    from .agent_team_scope import get_agent_team_scope, owned_agent_clause
+    from ..models.agent import AgentStatus
+    from .agent_team_scope import resolve_authorized_agent
 
     owner_user_id = int(task_row.user_id)
-    preview_agent = (
-        session.query(Agent)
-        .filter(
-            Agent.id == agent_config["preview_agent_id"],
-            owned_agent_clause(
-                owner_user_id,
-                get_agent_team_scope(session, owner_user_id),
-            ),
-        )
-        .first()
+    preview_agent = resolve_authorized_agent(
+        session,
+        owner_user_id,
+        agent_config.get("preview_agent_id"),
     )
     if preview_agent is None or preview_agent.status != AgentStatus.PUBLISHED:
         return None

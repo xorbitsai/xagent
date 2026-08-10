@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +226,25 @@ async def test_computer_tool_executes_normalized_bare_element_id_target() -> Non
     target = factory.environments[0].executed[0].actions[0].target
     assert target is not None
     assert target.element_id == "button-1"
+
+
+@pytest.mark.asyncio
+async def test_computer_tool_returns_environment_factory_failure() -> None:
+    def failing_factory(**_kwargs: Any) -> ComputerEnvironment:
+        raise RuntimeError("local browser authorization was revoked")
+
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=failing_factory,
+    )
+
+    result = await tool.run_json_async({})
+
+    assert result["success"] is False
+    assert result["session_id"] == "task-1"
+    assert "authorization was revoked" in result["error"]
+    assert tool._environments == {}
 
 
 @pytest.mark.parametrize(
@@ -457,6 +477,53 @@ async def test_computer_tool_derives_session_from_task_and_step() -> None:
 
     assert result["session_id"] == "task-1:inspect_page"
     assert factory.calls[0]["session_id"] == "task-1:inspect_page"
+
+
+@pytest.mark.asyncio
+async def test_task_scoped_computer_tool_shares_one_environment_across_steps() -> None:
+    factory = EnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+        environment_scope="task",
+    )
+
+    first = await tool.run_json_async({"_xagent_step_id": "inspect"})
+    second = await tool.run_json_async({"_xagent_step_id": "act"})
+
+    assert first["session_id"] == "task-1"
+    assert second["session_id"] == "task-1"
+    assert len(factory.environments) == 1
+    assert factory.environments[0].observe_count == 2
+
+
+@pytest.mark.asyncio
+async def test_task_scoped_computer_tool_serializes_competing_step_actions() -> None:
+    factory = EnvironmentFactory()
+    tool = ComputerTool(
+        task_id="task-1",
+        workspace=object(),  # type: ignore[arg-type]
+        environment_factory=factory,
+        environment_scope="task",
+    )
+    initial = await tool.run_json_async({"_xagent_step_id": "inspect"})
+    action = {
+        "expected_frame_id": initial["frame_id"],
+        "action": "click",
+        "target": {"point": {"x": 0.5, "y": 0.5}},
+    }
+
+    first, second = await asyncio.gather(
+        tool.run_json_async({**action, "_xagent_step_id": "first"}),
+        tool.run_json_async({**action, "_xagent_step_id": "second"}),
+    )
+
+    assert sorted((first["success"], second["success"])) == [False, True]
+    assert len(factory.environments) == 1
+    assert len(factory.environments[0].executed) == 1
+    failure = first if first["success"] is False else second
+    assert "current frame" in failure["error"]
 
 
 @pytest.mark.asyncio

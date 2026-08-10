@@ -15,6 +15,10 @@ from xagent.config import (
     BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
     BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
     BOXLITE_HOME_DIR,
+    BROWSER_CUA_DRIVER_COMMAND,
+    BROWSER_CUA_DRIVER_MAX_ELEMENTS,
+    BROWSER_CUA_DRIVER_SOCKET,
+    BROWSER_CUA_DRIVER_TIMEOUT_SECONDS,
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
@@ -49,6 +53,8 @@ from xagent.config import (
     MCP_OAUTH_ALLOW_PRIVATE_HOSTS,
     MCP_OAUTH_PROXY_URL,
     MCP_TOOL_INIT_TIMEOUT_SECONDS,
+    NATIVE_BROWSER_APP_NAME,
+    NATIVE_BROWSER_ENABLED,
     OPENROUTER_OFFICIAL_PROVIDERS_ONLY,
     PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
@@ -105,6 +111,10 @@ from xagent.config import (
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
     get_boxlite_home_dir,
+    get_browser_cua_driver_command,
+    get_browser_cua_driver_max_elements,
+    get_browser_cua_driver_socket,
+    get_browser_cua_driver_timeout_seconds,
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
@@ -141,6 +151,8 @@ from xagent.config import (
     get_mcp_oauth_allow_private_hosts,
     get_mcp_oauth_proxy_url,
     get_mcp_tool_init_timeout_seconds,
+    get_native_browser_app_name,
+    get_native_browser_enabled,
     get_openrouter_official_providers_only,
     get_password_reset_expire_minutes,
     get_preview_tmp_dir,
@@ -214,6 +226,19 @@ class TestEnvironmentVariableConstants:
 
     def test_storage_root_constant(self):
         assert STORAGE_ROOT == "XAGENT_STORAGE_ROOT"
+
+    def test_local_browser_constants(self):
+        assert NATIVE_BROWSER_ENABLED == "XAGENT_NATIVE_BROWSER_ENABLED"
+        assert NATIVE_BROWSER_APP_NAME == "XAGENT_NATIVE_BROWSER_APP_NAME"
+        assert BROWSER_CUA_DRIVER_COMMAND == "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
+        assert BROWSER_CUA_DRIVER_SOCKET == "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
+        assert (
+            BROWSER_CUA_DRIVER_TIMEOUT_SECONDS
+            == "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
+        )
+        assert (
+            BROWSER_CUA_DRIVER_MAX_ELEMENTS == "XAGENT_BROWSER_CUA_DRIVER_MAX_ELEMENTS"
+        )
 
     def test_sandbox_image_constant(self):
         assert SANDBOX_IMAGE == "SANDBOX_IMAGE"
@@ -1674,6 +1699,54 @@ class TestTaskRuntimeHookConfig:
 
         assert get_task_runtime_hook_max_workers() == 8
         assert get_task_runtime_hook_queue_timeout_seconds() == 30
+
+
+class TestLocalBrowserConfig:
+    def test_defaults(self, monkeypatch):
+        for name in (
+            NATIVE_BROWSER_ENABLED,
+            NATIVE_BROWSER_APP_NAME,
+            BROWSER_CUA_DRIVER_COMMAND,
+            BROWSER_CUA_DRIVER_SOCKET,
+            BROWSER_CUA_DRIVER_TIMEOUT_SECONDS,
+            BROWSER_CUA_DRIVER_MAX_ELEMENTS,
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        assert get_native_browser_enabled() is False
+        assert get_native_browser_app_name() == "Google Chrome"
+        assert get_browser_cua_driver_command() == "cua-driver"
+        assert get_browser_cua_driver_socket() is None
+        assert get_browser_cua_driver_timeout_seconds() == 30
+        assert get_browser_cua_driver_max_elements() == 2_000
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(NATIVE_BROWSER_ENABLED, "true")
+        monkeypatch.setenv(NATIVE_BROWSER_APP_NAME, "Chromium")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_COMMAND, "/opt/bin/cua-driver")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_SOCKET, "/tmp/cua.sock")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_TIMEOUT_SECONDS, "12.5")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_MAX_ELEMENTS, "250")
+
+        assert get_native_browser_enabled() is True
+        assert get_native_browser_app_name() == "Chromium"
+        assert get_browser_cua_driver_command() == "/opt/bin/cua-driver"
+        assert get_browser_cua_driver_socket() == "/tmp/cua.sock"
+        assert get_browser_cua_driver_timeout_seconds() == 12.5
+        assert get_browser_cua_driver_max_elements() == 250
+
+    def test_invalid_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_TIMEOUT_SECONDS, "0")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_MAX_ELEMENTS, "invalid")
+
+        assert get_browser_cua_driver_timeout_seconds() == 30
+        assert get_browser_cua_driver_max_elements() == 2_000
+
+    def test_rejects_non_browser_native_application(self, monkeypatch):
+        monkeypatch.setenv(NATIVE_BROWSER_APP_NAME, "Terminal")
+
+        with pytest.raises(ValueError, match="must name a supported browser"):
+            get_native_browser_app_name()
 
 
 class TestCheckpointStorageConfig:

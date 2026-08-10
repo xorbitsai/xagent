@@ -58,6 +58,12 @@ import {
 // Matches the backend mask; a masked value submitted unchanged keeps the stored secret.
 const MASKED_SECRET_VALUE = "********"
 
+// Upper bound on a catalog connect POST (connectCatalogApp below). Without
+// this, a hung request left catalogConnectsInFlight stuck above zero forever
+// — silently blocking every future dialog close with no explanation
+// (round-6 MAJOR-1).
+const CATALOG_CONNECT_TIMEOUT_MS = 30_000
+
 // A connector's (type, numeric id) for the /api/connectors sharing endpoints.
 // Only connected connectors carry a numeric server_id; catalog entries without
 // one can't be shared/statused, so return null.
@@ -107,7 +113,25 @@ export function ConnectMcpDialog({
   const { apps: officialApps } = useMcpApps()
   const [searchQuery, setSearchQuery] = useState("")
   const [debouncedSearch, setDebouncedSearch] = useState("")
-  const [loadingApp, setLoadingApp] = useState<string | null>(null)
+  // Per-app-id in-flight set, not a single shared slot: every connect
+  // mechanism (keyless, key-based, mcp_oauth, builtin_oauth) reads/clears
+  // this by app id, and a single `string | null` slot let one app's cleanup
+  // clobber another app's in-flight state whenever two connects overlapped
+  // across different mechanisms — reported three times (round 3 MINOR-6,
+  // round 4, round 5 M1) because per-call-site match-guards on a shared slot
+  // don't compose; this retires all of them at once.
+  const [loadingApps, setLoadingApps] = useState<Set<string>>(new Set())
+  const markAppLoading = (appId: string) => {
+    setLoadingApps(prev => (prev.has(appId) ? prev : new Set(prev).add(appId)))
+  }
+  const clearAppLoading = (appId: string) => {
+    setLoadingApps(prev => {
+      if (!prev.has(appId)) return prev
+      const next = new Set(prev)
+      next.delete(appId)
+      return next
+    })
+  }
   const [isLoadingApps, setIsLoadingApps] = useState(false)
   const [activeCategory, setActiveCategory] = useState("All")
   const [activeLocation, setActiveLocation] = useState("remote")
@@ -119,6 +143,14 @@ export function ConnectMcpDialog({
   const [keyEnvValues, setKeyEnvValues] = useState<Record<string, string>>({})
   const [keyEnvSource, setKeyEnvSource] = useState<"own" | "shared" | "platform">("own")
   const [isConnectingKey, setIsConnectingKey] = useState(false)
+  // Number of catalog connect POSTs (key-based or keyless) currently in
+  // flight — deliberately narrower than loadingApps, which also stays set for
+  // the whole builtin-OAuth popup wait (up to 5 minutes): the main dialog's
+  // close guard reads this, and must not lock the dialog for that long.
+  // A counter, not a boolean: with overlapping requests a boolean is cleared
+  // by the first finally while the second is still pending, silently
+  // reopening the guard window.
+  const [catalogConnectsInFlight, setCatalogConnectsInFlight] = useState(0)
   // Ownership choice at connect/create; "team" triggers a share call after success.
   const [shareChoice, setShareChoice] = useState<"private" | "team">("private")
   const [localSelectedServers, setLocalSelectedServers] = useState<string[]>([])
@@ -221,8 +253,14 @@ export function ConnectMcpDialog({
   // silently — the connector simply stays private.
   const shareConnector = async (ref: { type: string; id: number }): Promise<boolean> => {
     try {
+      // Round-7: callers await this from inside connectCatalogApp's success
+      // branch, ahead of the finally that clears catalogConnectsInFlight — an
+      // unbounded hang here would wedge the dialog's close guard open forever,
+      // one layer below the timeout that already bounds the connect POST
+      // itself. Same bound, so a hang here fails exactly as visibly.
       const response = await apiRequest(`${getApiUrl()}/api/connectors/${ref.type}/${ref.id}/share`, {
         method: "POST",
+        signal: AbortSignal.timeout(CATALOG_CONNECT_TIMEOUT_MS),
       })
       if (response.ok) return true
       toast.error(
@@ -233,7 +271,12 @@ export function ConnectMcpDialog({
       return false
     } catch (error) {
       console.error("Failed to share connector:", error)
-      toast.error(t("tools.mcp.alerts.saveFailed"))
+      // Round-8 N4: a share timeout must not claim the *connection* timed
+      // out — by the time this runs, the connect POST already succeeded and
+      // its success toast already fired. Telling the user to "try again"
+      // would prompt them to retry an already-established connection.
+      const timedOut = error instanceof DOMException && error.name === "TimeoutError"
+      toast.error(timedOut ? t('tools.mcp.alerts.shareTimedOut') : t("tools.mcp.alerts.saveFailed"))
       return false
     }
   }
@@ -251,7 +294,10 @@ export function ConnectMcpDialog({
       window.removeEventListener('message', listener)
     )
     mcpOauthMessageListenersRef.current.clear()
-    setLoadingApp(null)
+    // This teardown abandons every timer/listener tracked above regardless
+    // of which app(s) they belonged to, so it clears every in-flight app,
+    // not just one.
+    setLoadingApps(new Set())
   }
 
   useEffect(() => {
@@ -359,6 +405,35 @@ export function ConnectMcpDialog({
       toast.error(t('tools.mcp.dialog.mcpDetailFetchError'))
       return false
     }
+  }
+
+  // Shared close path for every "close this dialog" action — the Dialog's
+  // own Escape/outside-click dismissal AND every Cancel/footer button, which
+  // previously called the raw onOpenChange(false) prop directly and so
+  // bypassed the in-flight guard entirely (round-6 MAJOR-1): starting a
+  // catalog connect on the Library tab, then switching to the Custom API/MCP
+  // tab and hitting Cancel (or successfully saving), closed the dialog out
+  // from under a still-pending POST. Anything that wants to close this
+  // dialog must call this, not the raw onOpenChange prop.
+  const requestClose = () => {
+    // Don't let a close action go through while a catalog connect POST is in
+    // flight, or its success/error toast fires after the user already
+    // believes they dismissed it. Scoped to the POST itself (not
+    // loadingApps, which also spans OAuth popup waits).
+    if (catalogConnectsInFlight > 0) {
+      // Round-9: Escape, outside-click, and the header X all route through
+      // this same function (see the Dialog's onOpenChange below), so a
+      // blocked attempt previously no-op'd with zero feedback for up to the
+      // full connect timeout — the only in-flight signal is a small per-card
+      // spinner that's easy to miss. Surface it explicitly instead.
+      toast.warning(t('tools.mcp.alerts.closeBlockedWhileConnecting'))
+      return
+    }
+    connectorEditRequestRef.current += 1
+    setCustomApiEditBaseline(null)
+    setMcpEditBaseline(null)
+    onOpenChange(false)
+    setRuntimeValidationError(null)
   }
 
   const handleSaveCustomMcp = async () => {
@@ -481,7 +556,7 @@ export function ConnectMcpDialog({
         setActiveTab("library");
       } else {
         // If in standalone tools page, just close the dialog
-        onOpenChange(false);
+        requestClose();
       }
 
       setEditingCustomServerId(null)
@@ -525,22 +600,77 @@ export function ConnectMcpDialog({
     setConnectingKeyApp(app)
   }
 
+  // Shared POST to /apps/{id}/connect for both catalog-connect paths (key-based
+  // and keyless): same request shape, same success/error/loading handling.
+  // Callers own their own loading-state setter and any path-specific
+  // post-success work (closing their own dialog state, sharing with team) via
+  // the onSuccess callback, which receives the raw response so it can still
+  // read the connected server's id when needed.
+  const connectCatalogApp = async (
+    app: AppIntegration,
+    body: Record<string, unknown>,
+    options: {
+      autoSelect: boolean
+      setLoading: (loading: boolean) => void
+      onSuccess?: (response: Response) => Promise<void> | void
+    }
+  ) => {
+    options.setLoading(true)
+    setCatalogConnectsInFlight(count => count + 1)
+    try {
+      // Bounded so a hung request can't wedge the dialog's close guard
+      // (round-6 MAJOR-1) indefinitely — apiRequest forwards this signal
+      // straight through to fetch, no shared-wrapper change needed.
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(CATALOG_CONNECT_TIMEOUT_MS),
+      })
+      if (response.ok) {
+        toast.success(t('tools.mcp.dialog.connectSuccess', { name: app.name }))
+        // Path-specific follow-up runs before the loadApps() refresh below so
+        // its effects (e.g. the key path's team share) are already reflected
+        // in the reloaded list.
+        if (options.onSuccess) await options.onSuccess(response)
+        if (options.autoSelect && onConnectSelected) {
+          setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name])
+        }
+        if (onSuccess) onSuccess()
+        loadApps()
+        // Same clobber risk as loadingApps above: selectedApp is shared
+        // across the whole catalog too. If the user closed this app's
+        // settings and opened a different app while this request was still
+        // in flight, selectedApp now points at that other app — clearing it
+        // unconditionally would close whatever the user is currently
+        // looking at instead of just this (already-closed) dialog.
+        setSelectedApp(current => current?.id === app.id ? null : current)
+      } else {
+        const error = await response.json()
+        toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
+      }
+    } catch (error) {
+      console.error("Failed to connect app:", error)
+      const timedOut = error instanceof DOMException && error.name === "TimeoutError"
+      toast.error(timedOut ? t('tools.mcp.alerts.connectTimedOut') : t('tools.mcp.alerts.saveFailed'))
+    } finally {
+      options.setLoading(false)
+      setCatalogConnectsInFlight(count => count - 1)
+    }
+  }
+
   const submitKeyConnect = async (autoSelect: boolean) => {
     if (!connectingKeyApp) return
+    const app = connectingKeyApp
     // Only the "own" source sends a per-user key. For shared/platform we omit
     // env entirely (undefined drops from the JSON) so the backend leaves the
     // stored own key untouched — an empty {} would clear it, forcing re-entry
     // when switching back to "own".
     const env = keyEnvSource === "own" ? keyEnvValues : undefined
-    setIsConnectingKey(true)
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${connectingKeyApp.id}/connect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ env, env_source: keyEnvSource })
-      })
-      if (response.ok) {
-        toast.success(t('tools.mcp.buttons.save'))
+    await connectCatalogApp(app, { env, env_source: keyEnvSource }, {
+      autoSelect,
+      setLoading: setIsConnectingKey,
+      onSuccess: async (response) => {
         // "Share with team" chosen: catalog connect users are usually not the
         // owner, so shareConnector toasts a clear 403 message and stays private.
         if (shareChoice === "team") {
@@ -551,22 +681,32 @@ export function ConnectMcpDialog({
             console.error("Failed to read connected app for sharing:", error)
           }
         }
-        if (autoSelect && onConnectSelected) {
-          setLocalSelectedServers(prev => prev.includes(connectingKeyApp.name) ? prev : [...prev, connectingKeyApp.name])
-        }
-        if (onSuccess) onSuccess()
-        loadApps()
         setConnectingKeyApp(null)
-        setSelectedApp(null)
-      } else {
-        const error = await response.json()
-        toast.error(error.detail || t('tools.mcp.alerts.saveFailed'))
-      }
-    } catch (error) {
-      console.error("Failed to connect app:", error)
-      toast.error(t('tools.mcp.alerts.saveFailed'))
+      },
+    })
+  }
+
+  // Keyless catalog app (e.g. Chrome): no secrets to collect, so skip the key
+  // dialog entirely and POST straight to the connect endpoint. is_active is
+  // sent explicitly (not omitted) so re-connecting after a dormant
+  // association (is_active=false) reactivates it instead of silently staying
+  // disconnected — the backend only flips is_active when told to.
+  // The ref guard (round-8 N6) covers the one window the disabled buttons
+  // can't: loadingApps is React state, so disabled={} lags a commit cycle,
+  // and a double-click landing in the same tick would fire two POSTs. The
+  // backend recovers idempotently, so this only saves a wasted duplicate
+  // request — a ref is synchronous, closing the window outright.
+  const keylessConnectsRef = React.useRef<Set<string>>(new Set())
+  const submitKeylessConnect = async (app: AppIntegration, autoSelect: boolean) => {
+    if (keylessConnectsRef.current.has(app.id)) return
+    keylessConnectsRef.current.add(app.id)
+    try {
+      await connectCatalogApp(app, { is_active: true }, {
+        autoSelect,
+        setLoading: (loading) => (loading ? markAppLoading(app.id) : clearAppLoading(app.id)),
+      })
     } finally {
-      setIsConnectingKey(false)
+      keylessConnectsRef.current.delete(app.id)
     }
   }
 
@@ -576,7 +716,7 @@ export function ConnectMcpDialog({
   // authorization URL. Mirrors custom-mcp-form's handleConnectMcpOAuth,
   // but keyed by catalog app_id instead of a server id.
   const handleConnectMcpOAuthApp = async (app: AppIntegration, autoSelect: boolean) => {
-    setLoadingApp(app.id)
+    markAppLoading(app.id)
     // Open the popup synchronously on the click, before any await — popup
     // blockers reject windows opened outside direct user-gesture handling.
     // The window-features string matters: without it, browsers open a full
@@ -592,7 +732,7 @@ export function ConnectMcpDialog({
     )
     if (!popup) {
       toast.error("Popup blocked. Please allow popups for this site to connect.")
-      setLoadingApp(null)
+      clearAppLoading(app.id)
       return
     }
     popup.opener = null
@@ -610,14 +750,14 @@ export function ConnectMcpDialog({
         popup.close()
         const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthConnectFailed'))
         toast.error(message)
-        setLoadingApp(null)
+        clearAppLoading(app.id)
         return
       }
       const data = await response.json() as McpOAuthConnectResponse
       if (!data.authorization_url) {
         popup.close()
         toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
-        setLoadingApp(null)
+        clearAppLoading(app.id)
         return
       }
       popup.location.href = data.authorization_url
@@ -625,7 +765,7 @@ export function ConnectMcpDialog({
       console.error("Failed to start MCP OAuth connect:", error)
       popup.close()
       toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
-      setLoadingApp(null)
+      clearAppLoading(app.id)
       return
     }
     // F5: if the dialog closed (or this component unmounted) while the
@@ -650,7 +790,7 @@ export function ConnectMcpDialog({
       if (!popup.closed && !expired) return
       window.clearInterval(checkPopup)
       mcpOauthPollTimersRef.current.delete(checkPopup)
-      setLoadingApp(null)
+      clearAppLoading(app.id)
       if (!popup.closed) {
         // Timed out with the popup still open: stop the spinner. If the user
         // eventually finishes, the next apps refresh shows the connection.
@@ -675,7 +815,9 @@ export function ConnectMcpDialog({
         if (autoSelect && onConnectSelected) {
           setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name])
         }
-        setSelectedApp(null)
+        // Same clobber class as connectCatalogApp above: only close this
+        // app's settings dialog if the user hasn't since opened another one.
+        setSelectedApp(current => current?.id === app.id ? null : current)
       })()
     }, 500)
     mcpOauthPollTimersRef.current.add(checkPopup)
@@ -683,10 +825,13 @@ export function ConnectMcpDialog({
 
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
     if (app.auth_type !== "builtin_oauth") {
-      // Key-based catalog app: collect the key; remote-MCP OAuth app: start
-      // the per-user OAuth (DCR) flow. Anything else is a mis-authored entry.
+      // Key-based catalog app: collect the key; keyless app: connect directly;
+      // remote-MCP OAuth app: start the per-user OAuth (DCR) flow. Anything
+      // else is a mis-authored entry.
       if (app.auth_type === "api_key") {
         openKeyConnect(app);
+      } else if (app.auth_type === "keyless") {
+        void submitKeylessConnect(app, autoSelect);
       } else if (app.auth_type === "mcp_oauth") {
         handleConnectMcpOAuthApp(app, autoSelect);
       } else {
@@ -703,7 +848,7 @@ export function ConnectMcpDialog({
       return;
     }
 
-    setLoadingApp(app.id)
+    markAppLoading(app.id)
     // Open OAuth in a popup window to handle the callback smoothly
     const width = 600;
     const height = 700;
@@ -719,14 +864,14 @@ export function ConnectMcpDialog({
 
     if (!popup) {
       toast.error("Popup blocked. Please allow popups for this site to connect.");
-      setLoadingApp(null);
+      clearAppLoading(app.id);
       return;
     }
 
     // Listen for the postMessage from the popup
     const handleMessage = (event: MessageEvent) => {
       if (event.data?.type === 'oauth-success') {
-        setLoadingApp(null)
+        clearAppLoading(app.id)
         window.removeEventListener('message', handleMessage)
         mcpOauthMessageListenersRef.current.delete(handleMessage)
         window.clearInterval(checkPopup)
@@ -740,7 +885,9 @@ export function ConnectMcpDialog({
           setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name]);
         }
 
-        setSelectedApp(null);
+        // Same clobber class as connectCatalogApp above: only close this
+        // app's settings dialog if the user hasn't since opened another one.
+        setSelectedApp(current => current?.id === app.id ? null : current);
       }
     };
 
@@ -760,7 +907,7 @@ export function ConnectMcpDialog({
       mcpOauthPollTimersRef.current.delete(checkPopup)
       window.removeEventListener('message', handleMessage);
       mcpOauthMessageListenersRef.current.delete(handleMessage)
-      setLoadingApp(null);
+      clearAppLoading(app.id);
     }, 500);
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
@@ -809,13 +956,14 @@ export function ConnectMcpDialog({
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
+        // Radix's own Escape/outside-click dismissal — route it through the
+        // same requestClose() every explicit close action uses, so this is
+        // the only place the guard logic lives.
         if (!nextOpen) {
-          connectorEditRequestRef.current += 1
-          setCustomApiEditBaseline(null)
-          setMcpEditBaseline(null)
+          requestClose()
+          return
         }
         onOpenChange(nextOpen)
-        if (!nextOpen) setRuntimeValidationError(null)
       }}
     >
       <DialogContent className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50">
@@ -1072,7 +1220,7 @@ export function ConnectMcpDialog({
                     {apps.map(app => {
                       const isGloballyConnected = isAppConnected(app)
                       const isSelected = localSelectedServers.includes(app.id) || localSelectedServers.includes(app.name)
-                      const isLoading = loadingApp === app.id
+                      const isLoading = loadingApps.has(app.id)
                       return (
                         <Card key={app.id} className={`p-[0] cursor-pointer transition-colors shadow-sm relative ${isSelectMode && isSelected ? 'border-blue-500 bg-blue-50/30 ring-1 ring-blue-500' : 'hover:border-slate-300 border-slate-200'}`} onClick={() => handleCardClick(app, isGloballyConnected)}>
                           {isGloballyConnected && (
@@ -1175,13 +1323,24 @@ export function ConnectMcpDialog({
               </div>
 
               <div className="flex justify-end gap-3 mt-8 pt-4 border-t">
-                <Button variant="outline" onClick={() => onOpenChange(false)}>
+                {/* Round-8 N2: requestClose silently refuses while a catalog
+                    connect is in flight — disable the trigger so the blocked
+                    state is visible instead of the button appearing dead. */}
+                <Button variant="outline" onClick={requestClose} disabled={catalogConnectsInFlight > 0}>
                   {t('tools.mcp.buttons.cancel')}
                 </Button>
                 <Button
                   onClick={handleSaveCustomMcp}
+                  // Round-9: Save was missed when the Cancel/footer-Connect
+                  // buttons got this treatment in round 8 -- reachable by
+                  // starting a keyless connect on the Library tab, switching
+                  // to this tab (no tab-switch guard exists), and saving:
+                  // the save succeeds and toasts, but requestClose() no-ops
+                  // while catalogConnectsInFlight > 0, leaving the dialog
+                  // silently stuck open with no explanation.
                   disabled={
                     isSavingCustom ||
+                    catalogConnectsInFlight > 0 ||
                     !mcpFormData.name?.trim() ||
                     !mcpFormData.url?.trim() ||
                     (customApiEnv.length > 0 && customApiEnv.some(env => env.key.trim() && !env.value.trim()))
@@ -1214,10 +1373,13 @@ export function ConnectMcpDialog({
                   {ownershipRadio}
                 </div>
                 <div className="flex justify-end gap-3 mt-8">
-                  <Button variant="outline" onClick={() => onOpenChange(false)}>
+                  {/* Round-8 N2: same rationale as the Custom API tab's
+                      Cancel above. */}
+                  <Button variant="outline" onClick={requestClose} disabled={catalogConnectsInFlight > 0}>
                     {t('tools.mcp.buttons.cancel')}
                   </Button>
-                  <Button onClick={handleSaveCustomMcp} disabled={isSavingCustom}>
+                  {/* Round-9: same rationale as the Custom API tab's Save. */}
+                  <Button onClick={handleSaveCustomMcp} disabled={isSavingCustom || catalogConnectsInFlight > 0}>
                     {isSavingCustom && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                     {t('tools.mcp.buttons.save')}
                   </Button>
@@ -1239,11 +1401,20 @@ export function ConnectMcpDialog({
             </div>
             <Button
               className="font-medium bg-blue-600 hover:bg-blue-700 text-white shadow-sm px-6"
+              // Round-7: onConnectSelected commits localSelectedServers to the
+              // parent as a one-shot snapshot, with no later reconciliation.
+              // If a catalog connect is still in flight, that snapshot can be
+              // stale (missing the app the in-flight connect will add via
+              // autoSelect once it succeeds) — and requestClose()'s own guard
+              // wouldn't even close the dialog after committing it. Disable
+              // the trigger instead of letting it commit early; same signal
+              // requestClose already gates on.
+              disabled={catalogConnectsInFlight > 0}
               onClick={() => {
                 if (onConnectSelected) {
                   onConnectSelected(localSelectedServers);
                 }
-                onOpenChange(false);
+                requestClose();
               }}
             >
               <Zap className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.connect')}
@@ -1256,6 +1427,13 @@ export function ConnectMcpDialog({
       <OfficialMcpSettingsDialog
         open={!!selectedApp}
         onOpenChange={(nextOpen) => {
+          // Deliberately NOT gated on catalogConnectsInFlight, unlike the
+          // parent dialog's requestClose (round-8 N5): closing this per-app
+          // sub-dialog mid-connect is tolerated by design — in-flight state
+          // is tracked per app id, completion clears selectedApp only if it
+          // still points at the same app, and the cross-app regression
+          // tests pin exactly this sequence. Blocking it would trap the
+          // user inside the sub-dialog for the full request bound instead.
           if (!nextOpen) {
             connectorEditRequestRef.current += 1
             setSelectedApp(null)
@@ -1263,6 +1441,7 @@ export function ConnectMcpDialog({
         }}
         app={selectedApp}
         isGloballyConnected={selectedApp ? isAppConnected(selectedApp) : false}
+        isConnecting={!!selectedApp && loadingApps.has(selectedApp.id)}
         onSuccess={() => {
           if (onSuccess) onSuccess();
           loadApps();

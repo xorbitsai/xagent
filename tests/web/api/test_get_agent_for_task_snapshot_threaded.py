@@ -43,6 +43,7 @@ from xagent.web.api import chat as chat_module
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models import Base, Task
 from xagent.web.models import database as database_module
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -570,6 +571,110 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
     # before reaching this point.
     assert constructed.get("pattern") == "single_call"
     assert constructed.get("task_id") == "42"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_excluded"),
+    [
+        (AgentStatus.PUBLISHED, True),
+        (AgentStatus.DRAFT, False),
+    ],
+)
+async def test_get_agent_for_task_snapshot_reader_uses_persisted_task_owner(
+    tmp_path,
+    monkeypatch,
+    status,
+    expected_excluded,
+) -> None:
+    """The reachable get-agent path delegates preview exclusion to its snapshot."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'preview-owner.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
+
+    with session_factory() as setup_db:
+        owner = User(username="preview-owner", password_hash="hash", is_admin=False)
+        actor = User(username="preview-actor", password_hash="hash", is_admin=False)
+        setup_db.add_all([owner, actor])
+        setup_db.flush()
+        preview_agent = Agent(
+            user_id=int(owner.id),
+            name="preview-agent",
+            status=status,
+            instructions="preview instructions",
+            execution_mode="flash",
+            models={},
+            knowledge_bases=[],
+            skills=[],
+            tool_categories=[],
+        )
+        setup_db.add(preview_agent)
+        setup_db.flush()
+        task = Task(
+            user_id=int(owner.id),
+            title="preview task",
+            description="preview",
+            status=TaskStatus.PENDING,
+            execution_mode="flash",
+            agent_config={
+                "instructions": "preview instructions",
+                "skills": [],
+                "knowledge_bases": [],
+                "tool_categories": [],
+                "preview_agent_id": str(int(preview_agent.id)),
+            },
+        )
+        setup_db.add(task)
+        setup_db.commit()
+        owner_id = int(owner.id)
+        actor_id = int(actor.id)
+        preview_agent_id = int(preview_agent.id)
+        task_id = int(task.id)
+
+    resolved_owner_ids: list[int] = []
+    from xagent.web.services import agent_team_scope
+
+    real_resolver = agent_team_scope.resolve_authorized_agent
+
+    def observe_resolver(session, owner_user_id, candidate_id):
+        resolved_owner_ids.append(owner_user_id)
+        return real_resolver(session, owner_user_id, candidate_id)
+
+    observed_excluded_ids: list[int | None] = []
+
+    async def capture_tools(*_args: Any, **kwargs: Any):
+        observed_excluded_ids.append(kwargs["excluded_agent_id"])
+        return [], MagicMock()
+
+    manager = AgentServiceManager()
+    agent_service = MagicMock()
+    agent_service.workspace = None
+    request_db = session_factory()
+    actor_user = request_db.get(User, actor_id)
+    assert actor_user is not None
+    monkeypatch.setattr(agent_team_scope, "resolve_authorized_agent", observe_resolver)
+    try:
+        with (
+            patch.object(manager, "_load_persisted_conversation_history"),
+            patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+            patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+            patch("xagent.web.api.chat.create_default_tools", new=capture_tools),
+            patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+            patch("xagent.web.api.chat.AgentService", return_value=agent_service),
+        ):
+            await manager.get_agent_for_task(task_id, request_db, user=actor_user)
+    finally:
+        request_db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+    assert actor_id != owner_id
+    assert resolved_owner_ids == [owner_id]
+    assert observed_excluded_ids == [preview_agent_id if expected_excluded else None]
 
 
 @pytest.mark.asyncio

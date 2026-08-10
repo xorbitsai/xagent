@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy import text as sql_text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import QueuePool
 
@@ -521,6 +523,81 @@ def test_best_effort_provision_matches_duplicate_mailboxes_by_account_id(
     )
 
     assert provisioned == [int(first.id)]
+
+
+def test_best_effort_provision_swallows_account_lookup_failure(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing account lookup must not escape the best-effort contract."""
+    # No trigger fixture here: the patched query raises on the service's first
+    # statement, so the binding data would never be read.
+    user = _create_user(db_session)
+    provisioned: list[int] = []
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "ensure_gmail_mailbox_provisioned",
+        lambda _db, account: provisioned.append(int(account.id)),
+    )
+
+    def raising_query(*_args: Any, **_kwargs: Any) -> NoReturn:
+        raise OperationalError("SELECT user_oauth", {}, Exception("connection lost"))
+
+    monkeypatch.setattr(db_session, "query", raising_query)
+    caplog.set_level(logging.WARNING, logger=gmail_provisioning.__name__)
+
+    gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+        db_session,
+        user_id=int(user.id),
+        context="test",
+    )
+
+    assert provisioned == []
+    assert "Failed to resolve Gmail accounts for user" in caplog.text
+    assert "connection lost" in caplog.text
+
+
+def test_best_effort_provision_swallows_binding_resolution_failure(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing trigger-binding lookup must not escape either."""
+    # The account lookup runs for real here, so the mailbox fixture matters;
+    # the binding resolution it feeds is patched out.
+    user = _create_user(db_session)
+    _create_oauth(db_session, user)
+    provisioned: list[int] = []
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "ensure_gmail_mailbox_provisioned",
+        lambda _db, account: provisioned.append(int(account.id)),
+    )
+
+    def raising_resolution(*_args: Any, **_kwargs: Any) -> NoReturn:
+        raise OperationalError(
+            "SELECT agent_triggers", {}, Exception("statement timeout")
+        )
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "_referenced_gmail_oauth_account_ids",
+        raising_resolution,
+    )
+    caplog.set_level(logging.WARNING, logger=gmail_provisioning.__name__)
+
+    gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+        db_session,
+        user_id=int(user.id),
+        context="test",
+    )
+
+    assert provisioned == []
+    assert "Failed to resolve Gmail accounts for user" in caplog.text
+    assert "statement timeout" in caplog.text
 
 
 def test_unregister_releases_mailbox_only_after_last_enabled_trigger_is_deleted(

@@ -35,13 +35,26 @@ from tests.web.services.checkpoint_anchor_shared import (
     build_upgraded_sqlite_engine,
     reset_checkpoint_anchor_fk_create_rule,
 )
+from tests.web.services.task_interaction_schema_shared import (
+    make_row as make_interaction_row,
+)
+from tests.web.services.task_interaction_schema_shared import (
+    make_task,
+    make_trace_event,
+    make_user,
+    tables_excluding_interaction_requests,
+)
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.api.admin_users import _purge_user_task_rows
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.services.task_deletion import purge_task_rows
+from xagent.web.services.task_interaction_schema import (
+    interaction_requests_table_exists,
+)
 
 
 def _seed_task_with_anchored_checkpoint(session: Session, *, username: str) -> int:
@@ -69,6 +82,30 @@ def _seed_task_with_anchored_checkpoint(session: Session, *, username: str) -> i
     task.last_checkpoint_trace_event_id = event_row.id
     session.commit()
     return int(task.id)
+
+
+def _seed_task_with_interaction_row(
+    session: Session, *, username: str, status: str = "active"
+) -> tuple[int, int]:
+    """A task with one interaction row anchored to a real trace_events row.
+
+    Independent of _seed_task_with_anchored_checkpoint above: these tests
+    are about task_interaction_requests.resume_trace_event_id, not
+    tasks.last_checkpoint_trace_event_id, so the task's own pointer is left
+    unset.
+    """
+    user_id = make_user(session)
+    task_id = make_task(session, user_id=user_id)
+    anchor_id = make_trace_event(session, task_id=task_id)
+    row = TaskInteractionRequest(
+        **make_interaction_row(
+            task_id=task_id, resume_trace_event_id=anchor_id, status=status
+        )
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return task_id, int(row.id)
 
 
 @contextmanager
@@ -143,6 +180,31 @@ def sqlite_fk_on_session(tmp_path):
 
 
 @pytest.fixture
+def sqlite_fk_on_session_without_interaction_table(tmp_path):
+    """Same shape as sqlite_fk_on_session, minus task_interaction_requests
+    -- reproduces a deployment upgraded to a revision before that table
+    exists (see test_task_interaction_schema_gate.py for the same filter
+    used against the presence predicate directly)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'fk_on_no_interaction.db'}")
+
+    @event.listens_for(engine, "connect")
+    def _set_fk(dbapi_connection, _record):  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    reset_checkpoint_anchor_fk_create_rule()
+    Base.metadata.create_all(
+        bind=engine, tables=tables_excluding_interaction_requests()
+    )
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = session_factory()
+    yield session
+    session.close()
+    engine.dispose()
+
+
+@pytest.fixture
 def sqlite_upgraded_session(tmp_path):
     """A SQLite database shaped like the migration's ADD COLUMN path for a
     table that already existed -- the D1 asymmetry: no DB-level FK for the
@@ -181,6 +243,30 @@ def postgres_session():
         conn.execute(text("CREATE SCHEMA public"))
     reset_checkpoint_anchor_fk_create_rule()
     Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = session_factory()
+    yield session
+    session.close()
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    engine.dispose()
+
+
+@pytest.fixture
+def postgres_session_without_interaction_table():
+    """Same shape as postgres_session, minus task_interaction_requests."""
+    url = _postgres_url()
+    if not url:
+        pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+    reset_checkpoint_anchor_fk_create_rule()
+    Base.metadata.create_all(
+        bind=engine, tables=tables_excluding_interaction_requests()
+    )
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = session_factory()
     yield session
@@ -283,6 +369,158 @@ def test_purge_task_rows_nulls_pointer_before_the_task_delete_flushes(
 
 
 # ---------------------------------------------------------------------------
+# purge_task_rows: task_interaction_requests deletion (PR-C2b).
+# ---------------------------------------------------------------------------
+
+
+def _interaction_row_count(session: Session, task_id: int) -> int:
+    return (
+        session.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.task_id == task_id)
+        .count()
+    )
+
+
+def test_purge_task_rows_deletes_an_active_interaction_row_sqlite(
+    sqlite_fk_on_session,
+) -> None:
+    session = sqlite_fk_on_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-active-single", status="active"
+    )
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+@pytest.mark.postgresql
+def test_purge_task_rows_deletes_an_active_interaction_row_postgres(
+    postgres_session,
+) -> None:
+    session = postgres_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-active-single", status="active"
+    )
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+def test_purge_task_rows_deletes_a_terminal_interaction_row_sqlite(
+    sqlite_fk_on_session,
+) -> None:
+    """Regression control: the row count is asserted directly so the test
+    is about the interaction row being gone, not about purge returning
+    True. It is deliberately not a discriminator for removing the delete
+    statement -- a terminal row's anchor is never SET NULL by the
+    trace_events delete, and the ``tasks.id`` ON DELETE CASCADE removes
+    the row at the task delete regardless, so this stays green either
+    way. The active-row tests are the discriminators."""
+    session = sqlite_fk_on_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-terminal-single", status="terminated"
+    )
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+@pytest.mark.postgresql
+def test_purge_task_rows_deletes_a_terminal_interaction_row_postgres(
+    postgres_session,
+) -> None:
+    session = postgres_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-terminal-single", status="terminated"
+    )
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+def _assert_interaction_delete_between_pointer_update_and_trace_events_delete(
+    seen,
+) -> None:  # type: ignore[no-untyped-def]
+    pointer_update = _index_of(
+        seen,
+        lambda s: s.startswith("UPDATE tasks")
+        and "last_checkpoint_trace_event_id" in s,
+        "pointer NULL update",
+    )
+    interaction_delete = _index_of(
+        seen,
+        lambda s: s.startswith("DELETE FROM task_interaction_requests"),
+        "task_interaction_requests delete",
+    )
+    trace_delete = _index_of(
+        seen,
+        lambda s: s.startswith("DELETE FROM trace_events"),
+        "trace_events delete",
+    )
+    assert pointer_update < interaction_delete < trace_delete, seen
+
+
+def test_purge_task_rows_deletes_interaction_rows_before_trace_events_fk_on(
+    sqlite_fk_on_session,
+) -> None:
+    session = sqlite_fk_on_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-order-single-fk-on", status="active"
+    )
+
+    with _recorded_statements(session.get_bind()) as seen:
+        assert purge_task_rows(session, task_id=task_id) is True
+    _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
+    session.commit()
+
+
+def test_purge_task_rows_deletes_interaction_rows_before_trace_events_upgraded(
+    sqlite_upgraded_session,
+) -> None:
+    """The alembic-upgraded form is where this matters most: it has no
+    DB-level FK for the checkpoint pointer column and (SQLite FK
+    enforcement defaulting off for this engine) no enforced ON DELETE SET
+    NULL for the interaction anchor either, so a reversed ordering would
+    not fail loudly here. Statement order is the only direct evidence."""
+    session = sqlite_upgraded_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-order-single-upgraded", status="active"
+    )
+
+    with _recorded_statements(session.get_bind()) as seen:
+        assert purge_task_rows(session, task_id=task_id) is True
+    _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
+    session.commit()
+
+
+@pytest.mark.postgresql
+def test_purge_task_rows_deletes_interaction_rows_before_trace_events_postgres(
+    postgres_session,
+) -> None:
+    session = postgres_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-order-single-postgres", status="active"
+    )
+
+    with _recorded_statements(session.get_bind()) as seen:
+        assert purge_task_rows(session, task_id=task_id) is True
+    _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
+    session.commit()
+
+
+# ---------------------------------------------------------------------------
 # _purge_user_task_rows (bulk, admin path).
 # ---------------------------------------------------------------------------
 
@@ -365,3 +603,187 @@ def test_purge_user_task_rows_nulls_pointer_before_trace_events_are_gone(
     ).scalar_one()
     assert remaining_events == 0
     session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# _purge_user_task_rows: task_interaction_requests deletion (PR-C2b).
+# ---------------------------------------------------------------------------
+
+
+def test_purge_user_task_rows_deletes_an_active_interaction_row_sqlite(
+    sqlite_fk_on_session,
+) -> None:
+    session = sqlite_fk_on_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-active-bulk", status="active"
+    )
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+@pytest.mark.postgresql
+def test_purge_user_task_rows_deletes_an_active_interaction_row_postgres(
+    postgres_session,
+) -> None:
+    session = postgres_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-active-bulk", status="active"
+    )
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+def test_purge_user_task_rows_deletes_a_terminal_interaction_row_sqlite(
+    sqlite_fk_on_session,
+) -> None:
+    """M4 regression control, bulk path: see the single-task terminal test
+    above for why the count must be asserted directly."""
+    session = sqlite_fk_on_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-terminal-bulk", status="terminated"
+    )
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+@pytest.mark.postgresql
+def test_purge_user_task_rows_deletes_a_terminal_interaction_row_postgres(
+    postgres_session,
+) -> None:
+    session = postgres_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-terminal-bulk", status="terminated"
+    )
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+    assert _interaction_row_count(session, task_id) == 0
+
+
+def test_purge_user_task_rows_deletes_interaction_rows_before_trace_events_fk_on(
+    sqlite_fk_on_session,
+) -> None:
+    session = sqlite_fk_on_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-order-bulk-fk-on", status="active"
+    )
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    with _recorded_statements(session.get_bind()) as seen:
+        _purge_user_task_rows(session, user_id=user_id)
+    _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
+    session.commit()
+
+
+def test_purge_user_task_rows_deletes_interaction_rows_before_trace_events_upgraded(
+    sqlite_upgraded_session,
+) -> None:
+    """Same rationale as the single-task upgraded-form test above: no
+    DB-level enforcement makes a reversed ordering fail loudly here, so
+    statement order is the only direct evidence."""
+    session = sqlite_upgraded_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-order-bulk-upgraded", status="active"
+    )
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    with _recorded_statements(session.get_bind()) as seen:
+        _purge_user_task_rows(session, user_id=user_id)
+    _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
+    session.commit()
+
+
+@pytest.mark.postgresql
+def test_purge_user_task_rows_deletes_interaction_rows_before_trace_events_postgres(
+    postgres_session,
+) -> None:
+    session = postgres_session
+    task_id, _row_id = _seed_task_with_interaction_row(
+        session, username="u-order-bulk-postgres", status="active"
+    )
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    with _recorded_statements(session.get_bind()) as seen:
+        _purge_user_task_rows(session, user_id=user_id)
+    _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
+    session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Absent-table branch: both purge functions on a deployment upgraded to a
+# revision before task_interaction_requests exists (PR-C2b, P4).
+# ---------------------------------------------------------------------------
+
+
+def test_purge_task_rows_succeeds_without_the_interaction_table_sqlite(
+    sqlite_fk_on_session_without_interaction_table,
+) -> None:
+    session = sqlite_fk_on_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-single")
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+
+
+@pytest.mark.postgresql
+def test_purge_task_rows_succeeds_without_the_interaction_table_postgres(
+    postgres_session_without_interaction_table,
+) -> None:
+    session = postgres_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-single")
+
+    assert purge_task_rows(session, task_id=task_id) is True
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+
+
+def test_purge_user_task_rows_succeeds_without_the_interaction_table_sqlite(
+    sqlite_fk_on_session_without_interaction_table,
+) -> None:
+    session = sqlite_fk_on_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-bulk")
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0
+
+
+@pytest.mark.postgresql
+def test_purge_user_task_rows_succeeds_without_the_interaction_table_postgres(
+    postgres_session_without_interaction_table,
+) -> None:
+    session = postgres_session_without_interaction_table
+    assert interaction_requests_table_exists(session) is False
+    task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-bulk")
+    user_id = session.query(Task).filter(Task.id == task_id).one().user_id
+
+    _purge_user_task_rows(session, user_id=user_id)
+    session.commit()
+
+    assert session.query(Task).filter(Task.id == task_id).count() == 0

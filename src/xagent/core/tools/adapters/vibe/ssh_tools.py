@@ -264,19 +264,6 @@ class SshDownloadTool(_SshTransferTool):
         return SshOpResult(ok=True, message="downloaded").model_dump()
 
 
-def _agent_id_from_task(task: Any) -> int | None:
-    """Resolve the agent id a task runs as. Normal tasks carry ``agent_id``;
-    build-preview tasks (#459) leave it NULL and carry the edited agent id in
-    ``agent_config["preview_agent_id"]``."""
-    if task is None:
-        return None
-    if task.agent_id is not None:
-        return int(task.agent_id)
-    cfg = task.agent_config or {}
-    pid = cfg.get("preview_agent_id") if isinstance(cfg, dict) else None
-    return int(pid) if pid is not None else None
-
-
 def _numeric_task_id(task_id: Any) -> int | None:
     """Extract the DB task id. The tool config hands us a workspace-scoped
     string like ``"web_task_30"`` (or a non-task id like ``"tools_list"``),
@@ -294,12 +281,25 @@ def _numeric_task_id(task_id: Any) -> int | None:
 def _agent_id_for_task(session_factory: Any, numeric_task_id: int | None) -> int | None:
     if numeric_task_id is None:
         return None
+    from .....web.models.agent import AgentStatus
     from .....web.models.task import Task
+    from .....web.services.agent_team_scope import resolve_authorized_agent
     from .db_session import tool_session_scope
 
     with tool_session_scope(session_factory) as db:
         task = db.query(Task).filter(Task.id == numeric_task_id).first()
-        return _agent_id_from_task(task)
+        if task is None:
+            return None
+        candidate_id = task.agent_id
+        if candidate_id is None:
+            config = task.agent_config
+            candidate_id = (
+                config.get("preview_agent_id") if isinstance(config, dict) else None
+            )
+        agent = resolve_authorized_agent(db, int(task.user_id), candidate_id)
+        if agent is None or agent.status == AgentStatus.ARCHIVED:
+            return None
+        return int(agent.id)
 
 
 def _make_ssh_sandbox_lease(

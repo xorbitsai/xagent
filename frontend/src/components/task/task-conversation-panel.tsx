@@ -221,6 +221,30 @@ export function TaskConversationPanel({
   const [isDragging, setIsDragging] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const userMessageContextBadges = useMemo(() => {
+    const hasBoundLocalBrowser = (
+      (
+        state.currentTask?.id === String(state.taskId)
+        && state.currentTask.runtimeExtensionBindings?.includes("local_browser")
+      )
+      || Object.values(state.taskRuntimeExtensions || {}).some(
+        (metadata) => metadata.kind === "local_browser",
+      )
+    )
+    return hasBoundLocalBrowser
+      ? [{
+          kind: "computer_use" as const,
+          label: t("chatPage.input.localBrowser.chipLabel"),
+          detail: t("chatPage.input.localBrowser.label"),
+        }]
+      : []
+  }, [
+    state.currentTask?.id,
+    state.currentTask?.runtimeExtensionBindings,
+    state.taskId,
+    state.taskRuntimeExtensions,
+    t,
+  ])
   const isFilePreviewOpen = !filesDisabled && state.filePreview.isOpen
   const anyPreviewOpen = mode === "page" && (isFilePreviewOpen || dagPreviewOpen)
   const hideDelegatedChildTraces = Boolean(onAgentExecutionClick)
@@ -746,6 +770,7 @@ export function TaskConversationPanel({
                         interactions={item.interactions}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
+                        contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
                         onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                         onAgentExecutionClick={onAgentExecutionClick}
                       />

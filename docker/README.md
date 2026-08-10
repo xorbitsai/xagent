@@ -333,6 +333,12 @@ Backend image dependencies are resolved from the committed `pyproject.toml` and
 `uv.lock` during the Docker build. Keep `uv.lock` up to date before publishing;
 the backend image build runs `uv sync --locked` for reproducible installs.
 
+**Build args:**
+
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64) plus a warmed `npx` cache for the built-in Chrome MCP connector (`chrome-devtools-mcp`). Pass `--build-arg INSTALL_CHROME=false` to skip both, dropping the image size and the `/opt/google/chrome/chrome` binary + npx cache for deployments that never enable the connector — it ships hidden from the connector catalog until #1200 lands regardless of this flag. **This flag does not remove all root/`--no-sandbox` browser exposure in the image**: Playwright Chromium is installed unconditionally in a separate build stage and is already launched with `--no-sandbox` as root by the pre-existing `browser_use` tool, independent of this connector and this flag. Operator note: the connector launches via `npx` with an exact version pin; on a deployment whose npx cache is cold (a non-Docker install, or an `INSTALL_CHROME=false` image later flipped visible), the first tool call fetches that pinned package from the npm registry, as the backend user, before the server starts. |
+
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \

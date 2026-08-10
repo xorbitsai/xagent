@@ -136,7 +136,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models.task import Task
-from ..models.task_interaction import TaskInteractionRequest
+from ..models.task_interaction import ORIGIN_VOCABULARY, TaskInteractionRequest
 from .ops_signals import (
     INTERACTION_HANDOFF_DEGRADED,
     INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED,
@@ -148,9 +148,10 @@ from .task_lease_service import TaskLease
 logger = logging.getLogger(__name__)
 
 _KIND_VOCABULARY = frozenset({"clarification"})
-_ORIGIN_VOCABULARY = frozenset(
-    {"internal", "sdk", "a2a", "trigger", "widget", "shared_link"}
-)
+# Derived from the model's own ORIGIN_VOCABULARY, not a second hand-written
+# frozenset -- see that module's comment for why the two must share one
+# source instead of two copies that could drift apart.
+_ORIGIN_VOCABULARY = ORIGIN_VOCABULARY
 _RESUME_LOCATOR_FORMAT = "trace_event_pk_v1"
 _RESUME_CHECKPOINT_TYPE = "agent_execution_checkpoint"
 _PROTOCOL_VERSION = 1

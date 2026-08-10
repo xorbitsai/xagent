@@ -85,6 +85,24 @@ def normalize_interaction_origin(source: str | None) -> str | None:
     return None
 
 
+# The single source of truth for the origin vocabulary: both the CHECK
+# constraint's IN-list below and the staging primitive's own Python-side
+# validation (``_ORIGIN_VOCABULARY`` in task_interaction_staging.py) derive
+# from this tuple, so the two can never drift apart the way two
+# independently hand-written copies could. Order is preserved in
+# ORIGIN_VALUES for the CHECK's rendered SQL; ORIGIN_VOCABULARY is the
+# frozenset membership tests actually want.
+ORIGIN_VALUES: tuple[str, ...] = (
+    "internal",
+    "sdk",
+    "a2a",
+    "trigger",
+    "widget",
+    "shared_link",
+)
+ORIGIN_VOCABULARY = frozenset(ORIGIN_VALUES)
+
+
 class TaskInteractionRequest(Base):  # type: ignore
     """One blocking interaction request raised by a task and its lifecycle to answer or expiry.
 
@@ -256,7 +274,7 @@ class TaskInteractionRequest(Base):  # type: ignore
             name="ck_task_interaction_requests_kind",
         ),
         CheckConstraint(
-            "origin IN ('internal','sdk','a2a','trigger','widget','shared_link')",
+            "origin IN (" + ",".join(f"'{v}'" for v in ORIGIN_VALUES) + ")",
             name="ck_task_interaction_requests_origin",
         ),
         CheckConstraint(

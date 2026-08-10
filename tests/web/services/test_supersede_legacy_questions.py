@@ -304,18 +304,28 @@ def test_supersede_never_commits_and_the_caller_can_still_roll_back(monkeypatch)
 
         commit_calls = 0
         original_commit = db.commit
+        rollback_calls = 0
+        original_rollback = db.rollback
 
         def spy_commit():
             nonlocal commit_calls
             commit_calls += 1
             return original_commit()
 
+        def spy_rollback():
+            nonlocal rollback_calls
+            rollback_calls += 1
+            return original_rollback()
+
         monkeypatch.setattr(db, "commit", spy_commit)
+        monkeypatch.setattr(db, "rollback", spy_rollback)
 
         updated = supersede_legacy_question_rows(db, task_id=int(task.id))
 
         assert updated == 1
         assert commit_calls == 0
+        assert rollback_calls == 0
+        monkeypatch.setattr(db, "rollback", original_rollback)
 
         sentinel = TaskChatMessage(
             task_id=int(task.id),

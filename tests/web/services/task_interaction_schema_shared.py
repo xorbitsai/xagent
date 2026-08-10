@@ -484,6 +484,15 @@ def reflect_full_inventory(engine: sa.engine.Engine) -> dict[str, Any]:
     column names; that sort is intentional, not an oversight, and must stay
     paired with the comment on ``EXPECTED_UNIQUE_CONSTRAINTS`` above making
     the same claim for the hand-written literal.
+
+    Column *position* is pinned too: ``columns`` below maps each name to
+    ``(position, type, nullable, default)``, not just the last three, with
+    position taken from enumerate() over get_columns()'s already-ordered
+    return. That order is the table's physical column order -- PostgreSQL's
+    ``attnum``, SQLite's ``cid`` -- so two schemas that declare the same
+    columns with the same types in a different order compare unequal here,
+    where a name-keyed dict without a position field would consider them
+    identical.
     """
     inspector = sa.inspect(engine)
 
@@ -532,13 +541,14 @@ def reflect_full_inventory(engine: sa.engine.Engine) -> dict[str, Any]:
     for idx in inspector.get_indexes(TABLE_NAME):
         bucket = "unique" if idx["unique"] else "nonunique"
         indexes[bucket][idx["name"]] = tuple(idx["column_names"])
-    columns: dict[str, tuple[str, bool, str | None]] = {
+    columns: dict[str, tuple[int, str, bool, str | None]] = {
         c["name"]: (
+            position,
             str(c["type"]),
             bool(c["nullable"]),
             _normalize_default(c.get("default")),
         )
-        for c in inspector.get_columns(TABLE_NAME)
+        for position, c in enumerate(inspector.get_columns(TABLE_NAME))
     }
 
     return {

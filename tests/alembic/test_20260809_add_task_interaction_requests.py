@@ -1,18 +1,29 @@
 """Tests for the task_interaction_requests table migration."""
 
-import importlib.util
-import os
-import uuid
 from io import StringIO
 from pathlib import Path
 
-import psycopg2
 import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
+
+from tests.shared.postgres_disposable import (
+    disposable_database_factory,
+    load_migration_module,
+)
+from tests.web.services.checkpoint_anchor_shared import (
+    reset_checkpoint_anchor_fk_create_rule,
+)
+from tests.web.services.task_interaction_schema_shared import (
+    EXPECTED_CHECK_CONSTRAINT_NAMES,
+)
+from xagent.web.models.database import Base
+
+# Imported for its side effect: registering task_interaction_requests on
+# Base.metadata, so Base.metadata.create_all() below builds it too.
+from xagent.web.models.task_interaction import TaskInteractionRequest  # noqa: F401
 
 MIGRATION_PATH = (
     Path(__file__).parent.parent.parent
@@ -23,31 +34,10 @@ DOWN_REVISION = "20260808_add_task_lease_attempt_id"
 TABLE = "task_interaction_requests"
 PARENT_TABLES = ("tasks", "trace_events", "users")
 
-CHECK_NAMES = {
-    "ck_task_interaction_requests_status",
-    "ck_task_interaction_requests_kind",
-    "ck_task_interaction_requests_origin",
-    "ck_task_interaction_requests_resume_checkpoint_type",
-    "ck_task_interaction_requests_resume_locator_format",
-    "ck_task_interaction_requests_terminal_reason",
-    "ck_task_interaction_requests_protocol_version_floor",
-    "ck_task_interaction_requests_active_slot_value",
-    "ck_task_interaction_requests_active_slot_pairs_status",
-    "ck_task_interaction_requests_active_anchor",
-    "ck_task_interaction_requests_active_protocol",
-    "ck_task_interaction_requests_terminal_pairs_status",
-    "ck_task_interaction_requests_terminated_at_pairs_status",
-    "ck_task_interaction_requests_response_pairs_status",
-    "ck_task_interaction_requests_responded_at_pairs_status",
-    "ck_task_interaction_requests_responder_pairs_responded_at",
-    "ck_task_interaction_requests_expiry_after_creation",
-    "ck_task_interaction_requests_run_id_nonempty",
-    "ck_task_interaction_requests_resume_event_id_nonempty",
-    "ck_task_interaction_requests_resume_execution_id_nonempty",
-    "ck_task_interaction_requests_resume_run_partition_nonempty",
-    "ck_task_interaction_requests_request_idempotency_key_nonempty",
-    "ck_task_interaction_requests_responder_identity_nonempty",
-}
+# Local alias: used throughout this file, kept short rather than spelling out
+# EXPECTED_CHECK_CONSTRAINT_NAMES (task_interaction_schema_shared.py's own
+# name, shared with the model/create_all parity suite) at every call site.
+CHECK_NAMES = EXPECTED_CHECK_CONSTRAINT_NAMES
 FK_NAMES = {
     "fk_task_interaction_requests_task_id",
     "fk_task_interaction_requests_resume_trace_event_id",
@@ -60,17 +50,9 @@ INDEX_NAMES = {
 
 
 def _load_migration_module():
-    spec = importlib.util.spec_from_file_location(
-        "add_task_interaction_requests_migration", MIGRATION_PATH
+    return load_migration_module(
+        MIGRATION_PATH, "add_task_interaction_requests_migration"
     )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def _operations(connection) -> Operations:
-    return Operations(MigrationContext.configure(connection))
 
 
 def _offline_sql(migration, dialect_name: str, operation: str) -> str:
@@ -97,106 +79,10 @@ def _create_parent_tables(connection, tables: tuple[str, ...] = PARENT_TABLES) -
         connection.exec_driver_sql(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
 
 
-def _psycopg2_kwargs(base_url: str, dbname: str | None = None) -> dict[str, object]:
-    parsed = make_url(base_url)
-    return {
-        "host": parsed.host,
-        "port": parsed.port,
-        "user": parsed.username,
-        "password": parsed.password,
-        "dbname": dbname if dbname is not None else parsed.database,
-    }
-
-
 @pytest.fixture
 def postgresql_engine_factory():
-    """Yields a callable that mints a brand-new, disposable PostgreSQL
-    database per call (via CREATE DATABASE against the server
-    XAGENT_TEST_POSTGRES_URL names) and drops every database it created on
-    teardown. Skips the whole test if the env var is unset.
-
-    Copied from test_task_interaction_requests_schema_parity.py's fixture
-    of the same name (own module-local copy, not a shared import, following
-    this repo's precedent of duplicating the PostgreSQL disposable-database
-    pattern per test file rather than centralizing it -- see
-    test_task_interaction_schema_postgresql.py's docstring, which cites the
-    same pattern copied from test_task_status_storage_postgresql.py /
-    test_runtime_key_transition_postgres.py). See that fixture's docstring
-    for why the DBAPI connection is opened with an explicit ``creator=``
-    callable instead of letting SQLAlchemy's psycopg2 dialect connect
-    itself: measured against this fixture's target server, SQLAlchemy's own
-    connect path intermittently fails to authenticate against a database
-    created moments earlier, while a bare ``psycopg2.connect()`` with
-    identical parameters always succeeds.
-    """
-    base_url = os.getenv("XAGENT_TEST_POSTGRES_URL")
-    if not base_url:
-        pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
-
-    def _admin_connection():
-        conn = psycopg2.connect(**_psycopg2_kwargs(base_url))
-        conn.autocommit = True
-        return conn
-
-    minted: list[tuple[str, sa.engine.Engine]] = []
-
-    def _make(tag: str) -> sa.engine.Engine:
-        dbname = f"xagent_b2_alembic_{tag}_{uuid.uuid4().hex[:10]}"
-        admin_conn = _admin_connection()
-        try:
-            admin_conn.cursor().execute(f'CREATE DATABASE "{dbname}"')
-        finally:
-            admin_conn.close()
-
-        connect_kwargs = _psycopg2_kwargs(base_url, dbname)
-
-        def _connect(_kwargs: dict[str, object] = connect_kwargs):
-            return psycopg2.connect(**_kwargs)
-
-        engine = sa.create_engine("postgresql://", creator=_connect)
-        minted.append((dbname, engine))
-        return engine
-
-    try:
-        yield _make
-    finally:
-        for dbname, engine in minted:
-            try:
-                engine.dispose()
-            except Exception as exc:  # noqa: BLE001
-                # Never stop here: an engine that will not dispose must not
-                # block the drops below, or every database after it leaks.
-                print(f"could not dispose the engine for {dbname}: {exc!r}")
-
-        undropped: list[str] = []
-        if minted:
-            try:
-                admin_conn = _admin_connection()
-            except Exception as exc:
-                raise RuntimeError(
-                    "cannot reach the PostgreSQL server to drop the "
-                    "disposable databases this fixture created; drop them "
-                    "by hand: " + ", ".join(name for name, _ in minted)
-                ) from exc
-            try:
-                # One autocommit connection serves every drop: a failed
-                # DROP DATABASE leaves it usable, so a database still in
-                # use costs its own name, not the rest of the list.
-                for dbname, _engine in minted:
-                    try:
-                        admin_conn.cursor().execute(
-                            f'DROP DATABASE IF EXISTS "{dbname}"'
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        undropped.append(f"{dbname} ({exc!r})")
-            finally:
-                admin_conn.close()
-
-        if undropped:
-            raise RuntimeError(
-                "disposable databases left behind on the server; drop them "
-                "by hand: " + "; ".join(undropped)
-            )
+    with disposable_database_factory("xagent_b2_alembic") as make:
+        yield make
 
 
 def _pg_index_names(connection) -> set[str]:
@@ -253,9 +139,9 @@ def test_online_upgrade_builds_the_table_and_downgrade_removes_it() -> None:
 
     with engine.begin() as connection:
         _create_parent_tables(connection)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
 
         inspector = sa.inspect(connection)
@@ -267,7 +153,7 @@ def test_online_upgrade_builds_the_table_and_downgrade_removes_it() -> None:
         indexes = {ix["name"] for ix in inspector.get_indexes(TABLE)}
         assert indexes == INDEX_NAMES
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.downgrade()
 
         assert TABLE not in sa.inspect(connection).get_table_names()
@@ -279,9 +165,9 @@ def test_online_upgrade_is_idempotent() -> None:
 
     with engine.begin() as connection:
         _create_parent_tables(connection)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
             migration.upgrade()
 
@@ -297,9 +183,9 @@ def test_online_downgrade_is_idempotent() -> None:
 
     with engine.begin() as connection:
         _create_parent_tables(connection)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
             migration.downgrade()
             migration.downgrade()
@@ -316,9 +202,9 @@ def test_upgrade_skips_when_a_parent_table_is_missing(missing_table: str) -> Non
 
     with engine.begin() as connection:
         _create_parent_tables(connection, present)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
 
         assert TABLE not in sa.inspect(connection).get_table_names()
@@ -333,36 +219,44 @@ def test_upgrade_builds_the_table_when_every_parent_table_is_present() -> None:
 
     with engine.begin() as connection:
         _create_parent_tables(connection)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
 
         assert TABLE in sa.inspect(connection).get_table_names()
 
 
-def test_upgrade_skips_when_the_table_already_exists() -> None:
-    """Positive control for guard 1: create the table by another route
-    first (mirroring a create_all-first startup), then confirm upgrade()
-    is a no-op rather than erroring on a duplicate table."""
+def test_upgrade_is_a_no_op_against_a_create_all_built_table() -> None:
+    """Positive control for guard 1, built from the real create_all-first
+    shape rather than from a second upgrade() call (test_online_upgrade_is_
+    idempotent already covers repeated upgrade() calls): build the table via
+    Base.metadata.create_all(), the actual path production startups use
+    before any migration ever runs, then confirm upgrade() leaves it
+    untouched instead of erroring on a duplicate table or drifting its
+    constraint inventory."""
+    reset_checkpoint_anchor_fk_create_rule()
     migration = _load_migration_module()
     engine = sa.create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
 
     with engine.begin() as connection:
-        _create_parent_tables(connection)
-        operations = _operations(connection)
-
-        with Operations.context(operations.get_context()):
-            migration.upgrade()
-            checks_before = {
-                c["name"] for c in sa.inspect(connection).get_check_constraints(TABLE)
-            }
-            migration.upgrade()
-
-        checks_after = {
-            c["name"] for c in sa.inspect(connection).get_check_constraints(TABLE)
+        inspector_before = sa.inspect(connection)
+        checks_before = {
+            c["name"] for c in inspector_before.get_check_constraints(TABLE)
         }
-        assert checks_after == checks_before == CHECK_NAMES
+        columns_before = {c["name"] for c in inspector_before.get_columns(TABLE)}
+
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
+            migration.upgrade()
+
+        inspector_after = sa.inspect(connection)
+        checks_after = {c["name"] for c in inspector_after.get_check_constraints(TABLE)}
+        columns_after = {c["name"] for c in inspector_after.get_columns(TABLE)}
+
+    assert checks_before == checks_after == CHECK_NAMES
+    assert columns_before == columns_after
 
 
 # ---------------------------------------------------------------------------
@@ -383,9 +277,9 @@ def test_postgresql_online_upgrade_builds_the_table_and_downgrade_removes_it(
 
     with engine.begin() as connection:
         _create_parent_tables(connection)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
 
         inspector = sa.inspect(connection)
@@ -404,7 +298,7 @@ def test_postgresql_online_upgrade_builds_the_table_and_downgrade_removes_it(
         }
         assert indexes == INDEX_NAMES
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.downgrade()
 
         assert TABLE not in sa.inspect(connection).get_table_names()
@@ -416,9 +310,9 @@ def test_postgresql_online_upgrade_is_idempotent(postgresql_engine_factory) -> N
 
     with engine.begin() as connection:
         _create_parent_tables(connection)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
             migration.upgrade()
 
@@ -434,9 +328,9 @@ def test_postgresql_online_downgrade_is_idempotent(postgresql_engine_factory) ->
 
     with engine.begin() as connection:
         _create_parent_tables(connection)
-        operations = _operations(connection)
+        context = MigrationContext.configure(connection)
 
-        with Operations.context(operations.get_context()):
+        with Operations.context(context):
             migration.upgrade()
             migration.downgrade()
             migration.downgrade()
@@ -475,8 +369,8 @@ def test_postgresql_downgrade_leaves_no_residue(postgresql_engine_factory) -> No
     assert TABLE not in tables_before
 
     with engine.begin() as connection:
-        operations = _operations(connection)
-        with Operations.context(operations.get_context()):
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
             migration.upgrade()
 
     inspector = sa.inspect(engine)
@@ -486,8 +380,8 @@ def test_postgresql_downgrade_leaves_no_residue(postgresql_engine_factory) -> No
     assert sequences_with == sequences_before | {f"{TABLE}_id_seq"}
 
     with engine.begin() as connection:
-        operations = _operations(connection)
-        with Operations.context(operations.get_context()):
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
             migration.downgrade()
 
     inspector = sa.inspect(engine)
@@ -539,8 +433,8 @@ def test_postgresql_upgrade_targets_the_search_path_schema_past_a_stale_shadow(
         )
         connection.exec_driver_sql("SET search_path TO app, public")
 
-        operations = _operations(connection)
-        with Operations.context(operations.get_context()):
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
             migration.upgrade()
 
         inspector = sa.inspect(connection)

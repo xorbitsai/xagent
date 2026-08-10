@@ -347,6 +347,26 @@ class InteractionOriginUnknown(InteractionHandoffError):
 # called for propagating it unchanged, the same as InteractionOwnerStateError
 # below it). See interaction_handoff's docstring for the reasoning and the
 # re-adjudication obligation this override carries forward.
+#
+# A second trigger for auditing this tuple, beyond a new exception type
+# being defined here: any new way a statement inside the with-block can
+# fail at all, whether or not it introduces a new named exception. The
+# JSON-serialization probe in _validate_request_fields is one instance of
+# this already in this module -- before it existed, a non-serializable
+# request_payload failed at bind time as StatementError, a genuinely new
+# failure mode this tuple had never been asked to classify, escaping
+# _SWALLOWED silently rather than being named here on purpose. Probing for
+# it earlier and converting it to ValueError was a deliberate choice to
+# keep it out of this tuple, propagating like every other programming-error
+# ValueError in this module -- not a decision this tuple's own contents
+# would ever surface on inspection, since the exception type it now raises
+# already existed. Every future change that makes some new class of
+# failure reachable from inside the with-block -- a new column CHECK, a new
+# I/O call, a new library the underlying INSERT might route through --
+# carries the same obligation this tuple's own definition asks of a new
+# exception type: decide, on purpose, whether it belongs on this list or
+# off it, and leave that decision visible in the diff a reviewer actually
+# reads.
 _SWALLOWED: tuple[type[BaseException], ...] = (
     InteractionSlotTaken,
     InteractionRequestClosed,
@@ -806,6 +826,13 @@ def stage_interaction_request(
     live run's own next staging attempt then surfaces as
     ``InteractionSlotTaken`` or ``InteractionRequestClosed``, not as the
     precondition violation that actually caused it.
+
+    ``now`` is a trusted service-internal clock, taken as a parameter so
+    reclaim and expiry are testable without sleeping. It is validated for
+    timezone-awareness but deliberately not bounded against wall-clock
+    time: an absurd value retires live, unexpired rows as
+    ``deadline_elapsed`` indistinguishably from a real expiry, and nothing
+    in this function can tell the two apart afterwards.
     """
 
     if isinstance(task_id, bool) or not isinstance(task_id, int):
@@ -1196,12 +1223,32 @@ def interaction_handoff(
     AST gate -- must re-adjudicate this policy once a real reachability
     picture exists**, not carry it forward unexamined.
 
-    Every degradation signal this module registers is sticky: nothing
-    clears it once set (``ops_signals.py`` has no automatic-clear path, by
-    design -- see that module's docstring). ``/health`` reports a
-    degradation from an hour-old, already-recovered handoff exactly the
-    same as one from a second ago. This module inherits that behavior; it
-    does not introduce it.
+    Every degradation signal this module registers is sticky in a way none
+    of ``ops_signals.py``'s other six signals are.
+    ``CHECKPOINT_LOAD_UNAVAILABLE``, ``CHECKPOINT_DECODE_FALLBACK``,
+    ``CHECKPOINT_PK_ANCHOR_DANGLING``, ``CHECKPOINT_PRUNE_FAILED``,
+    ``CHECKPOINT_LEGACY_POINTER_AMBIGUOUS``, and
+    ``GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED`` each have a producer-side
+    ``clear_degradation()`` call somewhere in this codebase
+    (``trace_handlers.py``, ``task_lease_recovery.py``,
+    ``trigger_providers/gmail.py``) that runs once the condition that set
+    them resolves. ``INTERACTION_HANDOFF_DEGRADED`` and
+    ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` are the only two
+    entries in the registry with no ``clear_degradation()`` call anywhere
+    -- not because ``ops_signals.py`` forbids clearing (it does not;
+    ``clear_degradation`` exists and every other signal uses it), but
+    because nothing in this module, or any future caller of it, has been
+    written to call it. ``/health`` therefore reports a degradation from an
+    hour-old, already-recovered handoff exactly the same as one from a
+    second ago -- at the same security-relevant-misconfiguration severity
+    ``ops_signals.py``'s own docstring describes for every entry, with
+    nothing to distinguish stale from fresh. This is a property this
+    module introduces, not one it inherits from ``ops_signals.py``'s
+    design: the change that wires the first production caller must decide
+    who owns clearing these two signals, alongside the run-partition
+    override's own re-adjudication obligation above -- both are open
+    questions the zero-production-caller state of this module has left
+    unexamined, not settled defaults to carry forward unchanged.
 
     A SQLite-only correctness gap, found and fixed while building this
     module: a session whose first write-adjacent statement is a bare
@@ -1318,6 +1365,11 @@ def interaction_handoff(
             "caller's pending writes failed to flush while opening the "
             "interaction handoff's savepoint"
         ) from exc
+    # Must not raise: this sits outside the try that owns `savepoint`, so a
+    # raise here would leak it un-rolled-back and, because this whole
+    # function is a @contextmanager generator, would fire from __enter__ --
+    # before `with` ever runs its body, and before this savepoint could be
+    # unwound the way every other exit path below unwinds it.
     handoff = _InteractionHandoff(db, lease, task=task, anchor=anchor, now=now)
     try:
         yield handoff

@@ -313,8 +313,12 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     ``(task_id, role, turn_id)``. This update never touches any of those
     three columns, so on the normal path it has no constraint-failure
     surface to hit — the ``except DBAPIError`` clause below exists for
-    database-layer failures (a dropped connection, a statement timeout),
-    not for a unique-index collision this statement cannot cause.
+    statement-level failures the database reports back (a constraint
+    violation elsewhere in the schema, a statement timeout), not for a
+    unique-index collision this statement cannot cause. A dropped
+    connection is a different failure mode and not what motivates this
+    clause: it kills the whole enclosing transaction outright, and no
+    savepoint changes that.
 
     The WHERE predicate is exactly the three-condition filter
     ``get_latest_waiting_question`` runs before its own ``ORDER BY``:
@@ -330,6 +334,17 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     superseding at all. Collapsing the whole set removes that failure mode
     structurally.
 
+    Because nothing else in this codebase ever transitions
+    ``message_type`` away from ``"question"``, this same whole-set sweep
+    also flips any already-answered question row left over from an
+    earlier turn on the task, not only the row still genuinely waiting —
+    that is deliberate, not a side effect to fix; it is the same
+    whole-set shape that keeps a stale row from ever outranking the live
+    question. One consequence: for a historical row, the admin
+    transcript export cannot tell "answered, then superseded" apart from
+    "abandoned, then superseded" — both end up as
+    ``"question_superseded"`` with nothing recording which happened.
+
     A rowcount of zero is a normal outcome, not a failure — it happens
     whenever the mid-turn write path already swallowed its own error,
     whenever a reentrant call already zeroed the set on an earlier pass, or
@@ -343,9 +358,11 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     caller's next flush or commit. The savepoint is what lets a failed
     supersede degrade instead of taking the caller's transaction down with
     it. The catch clause is narrowed to ``sqlalchemy.exc.DBAPIError`` —
-    the database telling us the statement failed — and nothing broader;
-    programming errors such as ``InvalidRequestError`` or a bad argument
-    are left to propagate.
+    the database reporting that the statement itself failed, which
+    includes ``ProgrammingError`` (e.g. a malformed or rejected SQL
+    statement) — and nothing broader. Session and argument misuse on the
+    Python side — ``InvalidRequestError``, ``PendingRollbackError``,
+    ``ArgumentError`` — is not a ``DBAPIError`` and is left to propagate.
 
     Serializing this function against a concurrent call to ``respond()``
     on the same task is not this function's job — it relies on whatever

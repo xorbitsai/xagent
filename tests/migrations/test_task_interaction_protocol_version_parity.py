@@ -167,7 +167,16 @@ def _build_migration_shaped_sqlite_engine():
         legacy_columns = [name for name in _column_names(connection) if name != COLUMN]
         column_list = ", ".join(legacy_columns)
 
+        # Without legacy_alter_table, SQLite's RENAME rewrites every sibling
+        # table's stored FK DDL to point at the renamed name (tasks_old),
+        # and the DROP TABLE below then leaves the whole schema with
+        # dangling references -- any later operation that reflects the
+        # dependency graph (op.batch_alter_table does) fails with
+        # NoSuchTableError. legacy_alter_table=ON makes RENAME touch only
+        # the tasks table itself, matching a real ALTER TABLE RENAME.
+        connection.execute(sa.text("PRAGMA legacy_alter_table=ON"))
         connection.execute(sa.text(f"ALTER TABLE {TABLE} RENAME TO {TABLE}_old"))
+        connection.execute(sa.text("PRAGMA legacy_alter_table=OFF"))
         connection.execute(sa.text(stripped_sql))
         connection.execute(
             sa.text(
@@ -319,28 +328,34 @@ def test_diff_narrow_inventory_reports_no_differences_for_identical_inventories(
 # ---- T-M-5: create_all SQLite cannot be downgraded; migration-chain can ----
 
 
-def test_create_all_sqlite_downgrade_fails_but_migration_shaped_sqlite_succeeds() -> (
-    None
-):
-    """SQLite refuses to DROP a column that a CHECK constraint references,
-    so calling downgrade() on a create_all-built SQLite database raises
-    OperationalError("no such column: interaction_protocol_version"). This
-    is a direct consequence of the CHECK asymmetry above, not a bug: it only
-    happens on a shape that never goes through a real downgrade. A database
-    maintained through the revision chain never received the CHECK on
-    SQLite in the first place (T-M-1b/T-M-1d), so its downgrade() has no
-    CHECK-referenced column to trip over. Both halves are asserted here so a
-    reader who only sees the first half does not read it as a defect to fix
-    -- "fixing" it by making downgrade() smarter would not change the fact
-    that no real database ever hits this path.
+def test_sqlite_downgrade_succeeds_on_both_install_shapes() -> None:
+    """The reviewer's round-2 Finding 1 established that a fresh install
+    stamps head and then builds its schema via create_all (see
+    src/xagent/db/migration.py's empty-DB stamp path and database.py's
+    create_all call), so the create_all-built SQLite shape is a real
+    downgrade-reachable production shape, not a synthetic one -- and SQLite
+    3.35+ refuses to DROP a column a CHECK constraint references, so the old
+    unconditional drop_column() broke downgrade() on that shape. downgrade()
+    now rebuilds the table via batch_alter_table on SQLite (see the
+    migration's downgrade() online branch), which drops the CHECK and the
+    column together regardless of which shape the database has. Both shapes
+    are asserted here: the migration-shaped database never had the CHECK to
+    begin with (T-M-1b/T-M-1d), while the create_all-built one does and must
+    have both the column and the CHECK clause removed from the table DDL.
     """
     migration = load_migration_module(MIGRATION_PATH)
 
     create_all_engine = _build_create_all_sqlite_engine()
     with create_all_engine.begin() as connection:
         with patch.object(migration, "op", _operations(connection)):
-            with pytest.raises(sa.exc.OperationalError, match="no such column"):
-                migration.downgrade()
+            migration.downgrade()
+            assert COLUMN not in _column_names(connection)
+
+        ddl = connection.execute(
+            sa.text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:name"),
+            {"name": TABLE},
+        ).scalar()
+        assert CONSTRAINT_NAME not in ddl
 
     migration_engine = _build_migration_shaped_sqlite_engine()
     with migration_engine.begin() as connection:

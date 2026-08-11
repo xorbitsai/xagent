@@ -116,12 +116,15 @@ def upgrade() -> None:
 def downgrade() -> None:
     context = op.get_context()
 
-    # Constraint dropped before column, both here and in the online branch
-    # below. PostgreSQL does not require this order -- DROP COLUMN auto-drops
-    # a single-column CHECK that depends on the dropped column, no CASCADE
-    # needed. The explicit drop_constraint keeps the downgrade symmetric with
-    # upgrade's add-column-then-add-constraint sequence and independent of
-    # that auto-drop behaviour.
+    # Constraint dropped before column, both here and in the online
+    # PostgreSQL branch below. PostgreSQL does not require this order --
+    # DROP COLUMN auto-drops a single-column CHECK that depends on the
+    # dropped column, no CASCADE needed. The explicit drop_constraint keeps
+    # the downgrade symmetric with upgrade's add-column-then-add-constraint
+    # sequence and independent of that auto-drop behaviour. This offline
+    # branch is PostgreSQL-oriented and stays untouched by the SQLite fix
+    # below: batch mode (needed for SQLite) cannot run in --sql mode on
+    # either dialect.
     if context.as_sql:
         if context.dialect.name == "postgresql":
             op.drop_constraint(CONSTRAINT_NAME, TABLE, type_="check")
@@ -137,5 +140,23 @@ def downgrade() -> None:
         if CONSTRAINT_NAME in _online_check_constraints(schema):
             op.drop_constraint(CONSTRAINT_NAME, TABLE, type_="check", schema=schema)
 
+        if COLUMN in _online_columns(schema):
+            op.drop_column(TABLE, COLUMN, schema=schema)
+        return
+
+    # Non-PostgreSQL (SQLite): a fresh install stamps head and then builds
+    # the schema via create_all (see src/xagent/db/migration.py's empty-DB
+    # stamp path and database.py's create_all call), so the fresh-install
+    # shape DOES carry ck_tasks_interaction_protocol_version on SQLite even
+    # though the migration's own upgrade() never adds it there (see the
+    # upgrade() branch above and test_sqlite_check_asymmetry_is_expected).
+    # SQLite 3.35+ refuses to DROP a column a CHECK constraint references, so
+    # a plain drop_column() breaks on that shape. batch_alter_table rebuilds
+    # the table (copy/rename/drop) instead, which drops the constraint and
+    # the column together regardless of which shape this database has.
     if COLUMN in _online_columns(schema):
-        op.drop_column(TABLE, COLUMN, schema=schema)
+        constraint_present = CONSTRAINT_NAME in _online_check_constraints(schema)
+        with op.batch_alter_table(TABLE, schema=schema) as batch_op:
+            if constraint_present:
+                batch_op.drop_constraint(CONSTRAINT_NAME, type_="check")
+            batch_op.drop_column(COLUMN)

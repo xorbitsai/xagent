@@ -1894,6 +1894,37 @@ async def test_dag_pattern_single_waiting_regression_unchanged() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_has_no_live_step_tasks_at_waiting_return() -> None:
+    """T-X-5 (DAG half): has_live_step_tasks() reads False once run() has
+    handed back a waiting result -- the executable form of "no step task
+    outlives the batch that produced the delivered answer"."""
+
+    pattern, result, _ = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert pattern.has_live_step_tasks() is False
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_live_step_tasks_excluded_from_get_state() -> None:
+    """T-X-5b: the live-task-tracking attribute never reaches get_state()
+    -- asyncio.Task objects are not JSON-serializable, so leaking one in
+    would silently break checkpoint persistence."""
+
+    pattern, _, _ = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+
+    state = pattern.get_state()
+
+    assert "_live_step_tasks" not in state
+    assert not any("live_step_tasks" in key for key in state)
+    json.dumps(state)
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_invalidated_step_is_rescheduled_after_winner_settles() -> (
     None
 ):

@@ -1860,6 +1860,19 @@ class DAGPattern(AgentPattern):
                 None,
             )
 
+    def has_live_step_tasks(self) -> bool:
+        """Return whether a concurrent step batch is still running right now.
+
+        Only the multi-step branch of ``_execute_ready_steps`` ever
+        populates ``_live_step_tasks``; the single-step fast path never
+        creates an ``asyncio.Task`` and this is always ``False`` on that
+        path. ``_execute_ready_steps`` clears the set in a ``finally``
+        before it returns, whatever the outcome, so a caller inspecting
+        this once ``run()`` has returned always sees an accurate answer.
+        """
+
+        return bool(self._live_step_tasks)
+
     def _waiting_step_id(self) -> str | None:
         for step_id in self.active_step_ids:
             state = self.active_step_pattern_states.get(step_id)

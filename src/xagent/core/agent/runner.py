@@ -255,6 +255,30 @@ class AgentRunner:
                         normalized.get("status") or "failed"
                     ).strip()
                     teardown_status = normalized_status or "failed"
+                    if (
+                        normalized_status == "waiting_for_user"
+                        and normalized.get("clarification_draft") is not None
+                    ):
+                        # A pattern that hands back a question to answer must
+                        # not still have other step tasks running -- those
+                        # would keep mutating shared state (self.status,
+                        # active step bookkeeping) after this run() call has
+                        # already told the caller it is safe to resume from
+                        # a single waiting step. Only DAGPattern implements
+                        # this today; any other pattern is read as having no
+                        # live tasks (auto.py's top-level case included --
+                        # its run() cannot return while a nested DAG child
+                        # still has tasks in flight, so that path is a known,
+                        # accepted gap rather than a real miss).
+                        has_live_step_tasks = getattr(
+                            pattern, "has_live_step_tasks", None
+                        )
+                        if callable(has_live_step_tasks) and has_live_step_tasks():
+                            raise AssertionError(
+                                f"{pattern.__class__.__name__} for execution "
+                                f"{execution_id} returned a waiting_for_user "
+                                "result while it still has live step tasks."
+                            )
                     if normalized_status in {"interrupted", "waiting_for_user"}:
                         await self._dispatch_callback(
                             "on_run_end",

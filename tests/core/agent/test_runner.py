@@ -522,6 +522,57 @@ async def test_runner_passes_waiting_status_to_tool_teardown(tmp_path: Path) -> 
     assert tool.teardown_calls == [("interaction-task", "waiting_for_user")]
 
 
+class LiveStepTasksPattern:
+    """A pattern that reports a waiting_for_user exit while its
+    has_live_step_tasks() predicate is under test control, to pin the
+    runner-side guard independently of any real pattern implementation."""
+
+    def __init__(self, *, live_step_tasks: bool) -> None:
+        self._live_step_tasks = live_step_tasks
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": "Pick one.",
+            "clarification_draft": {"source": "test"},
+        }
+
+    def has_live_step_tasks(self) -> bool:
+        return self._live_step_tasks
+
+
+@pytest.mark.asyncio
+async def test_runner_raises_when_waiting_exit_still_has_live_step_tasks(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="interactive",
+        patterns=[LiveStepTasksPattern(live_step_tasks=True)],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    with pytest.raises(AssertionError, match="live step tasks"):
+        await runner.run(task="Run an interactive tool", execution_id="live-tasks-task")
+
+
+@pytest.mark.asyncio
+async def test_runner_allows_waiting_exit_once_step_tasks_are_clear(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="interactive",
+        patterns=[LiveStepTasksPattern(live_step_tasks=False)],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(
+        task="Run an interactive tool", execution_id="no-live-tasks-task"
+    )
+
+    assert result["status"] == "waiting_for_user"
+
+
 @pytest.mark.asyncio
 async def test_runner_passes_failed_status_when_tool_setup_raises(
     tmp_path: Path,

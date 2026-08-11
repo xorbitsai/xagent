@@ -1753,7 +1753,7 @@ async def run_double_waiting_dag(
 
 @pytest.mark.asyncio
 async def test_dag_pattern_concurrent_double_waiting_invalidates_loser() -> None:
-    """T-X-1: when two steps both reach waiting_for_user in the same
+    """When two steps both reach waiting_for_user in the same
     wakeup, exactly one draft is delivered; the other is invalidated
     (status, active-step bookkeeping cleared) and its id is surfaced under
     clarification_superseded_step_ids on the winner's result. No signal is
@@ -1778,7 +1778,7 @@ async def test_dag_pattern_concurrent_double_waiting_invalidates_loser() -> None
 
 @pytest.mark.asyncio
 async def test_dag_pattern_concurrent_double_waiting_winner_is_deterministic() -> None:
-    """T-X-2: the winner is the lexicographically first step id, regardless
+    """The winner is the lexicographically first step id, regardless
     of which step's task happened to be constructed (and therefore
     scheduled) first -- not whichever task a ``set`` iterates first."""
 
@@ -1795,7 +1795,7 @@ async def test_dag_pattern_concurrent_double_waiting_winner_is_deterministic() -
 
 @pytest.mark.asyncio
 async def test_dag_pattern_concurrent_double_waiting_delivers_to_winner() -> None:
-    """T-X-3: the reply-delivery lookup resolves to the winning step, not
+    """The reply-delivery lookup resolves to the winning step, not
     an arbitrary one."""
 
     pattern, result, _ = await run_double_waiting_dag(
@@ -1878,7 +1878,7 @@ async def run_single_waiting_with_cancelled_sibling_dag() -> tuple[
 
 @pytest.mark.asyncio
 async def test_dag_pattern_single_waiting_regression_unchanged() -> None:
-    """T-X-4: a single step reaching waiting_for_user, with an independent
+    """A single step reaching waiting_for_user, with an independent
     sibling still running, is unaffected by the exactly-one machinery --
     same result keys, same sibling cancellation, no superseded-step key."""
 
@@ -1928,7 +1928,7 @@ async def test_dag_pattern_live_step_tasks_cleared_after_cancelling_a_sibling() 
 
 @pytest.mark.asyncio
 async def test_dag_pattern_has_no_live_step_tasks_at_waiting_return() -> None:
-    """T-X-5 (DAG half): has_live_step_tasks() reads False once run() has
+    """has_live_step_tasks() reads False once run() has
     handed back a waiting result -- the executable form of "no step task
     outlives the batch that produced the delivered answer"."""
 
@@ -1942,7 +1942,7 @@ async def test_dag_pattern_has_no_live_step_tasks_at_waiting_return() -> None:
 
 @pytest.mark.asyncio
 async def test_dag_pattern_live_step_tasks_excluded_from_get_state() -> None:
-    """T-X-5b: the live-task-tracking attribute never reaches get_state()
+    """The live-task-tracking attribute never reaches get_state()
     -- asyncio.Task objects are not JSON-serializable, so leaking one in
     would silently break checkpoint persistence."""
 
@@ -1961,7 +1961,7 @@ async def test_dag_pattern_live_step_tasks_excluded_from_get_state() -> None:
 async def test_dag_pattern_invalidated_step_is_rescheduled_after_winner_settles() -> (
     None
 ):
-    """T-X-6: invalidation is non-terminal. Once active_step_ids drains,
+    """Invalidation is non-terminal. Once active_step_ids drains,
     _ready_steps() offers the invalidated step again, and the next attempt
     flips its status back to "running".
 
@@ -2135,7 +2135,7 @@ async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
 
 @pytest.mark.asyncio
 async def test_dag_waiting_draft_attribution_differs_only_by_step() -> None:
-    """T-R-17: two independently-run steps reaching an identical waiting
+    """Two independently-run steps reaching an identical waiting
     turn (same message count, same tool_call_id/interaction_id) get
     distinct turn markers purely because DAG attributes each draft to its
     own step; levelling that attribution to a shared step id makes the two
@@ -2203,7 +2203,7 @@ async def test_dag_waiting_draft_attribution_differs_only_by_step() -> None:
 
 @pytest.mark.asyncio
 async def test_dag_waiting_draft_reentry_without_new_message_is_stable() -> None:
-    """T-R-18: resuming the same waiting step with no new user message
+    """Resuming the same waiting step with no new user message
     reproduces the identical origin_step_id and turn_marker -- a pure
     re-entry, not a new turn."""
 

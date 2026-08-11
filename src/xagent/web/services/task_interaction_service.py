@@ -603,7 +603,7 @@ class CreateNotWired:
     """A well-formed, authorized create() call has nothing to report but
     that fact: this seam validates and returns, it does not stage a row.
 
-    Retired by the wiring batch's ignition PR, which fills this seam's call
+    Retired by the change that fills this seam's call
     body. Until then a well-formed, authorized request has nothing to
     report but that fact: this seam validates and returns, it does not
     stage. That later change deletes this variant and its reason constant
@@ -628,8 +628,8 @@ CreateOutcome = (
 # it is the same closed vocabulary either way -- only which pairs are
 # *producible* changes (see CREATE_OUTCOME_PRODUCIBLE_REASONS below). 13
 # reasons total (the "Created" / None pair is not a reason string and is
-# counted separately). Do not recount this at implementation time -- it is
-# taken directly from the frozen design's own line-by-line count.
+# counted separately). Do not update this number by recounting the set
+# literal below -- it is pinned as part of the vocabulary's contract.
 CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
     {
         "unknown_kind",
@@ -651,7 +651,7 @@ CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
 # The (outcome type, reason) pairs this delivery's create() can actually
 # produce today: validation and authorization run, but the seam never
 # stages a row, so nothing past those two categories -- plus NotWired
-# itself -- is reachable. 7 pairs. Once the wiring batch fills create()'s
+# itself -- is reachable. 7 pairs. Once a later change fills create()'s
 # call body, this dict is replaced by one covering all 13 reasons (minus
 # seam_not_wired, which is deleted along with CreateNotWired) -- not
 # extended in place, so the guard's expected count changes atomically with
@@ -676,8 +676,8 @@ CREATE_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str]] = {
 # ``AskUserQuestionArgs`` (``core/tools/adapters/vibe/ask_user_tool.py``),
 # imported by name rather than redeclared, so the two cannot drift the way
 # a hand-written mirror would. ``create()`` below uses the parse half to
-# validate an incoming envelope's ``values``; the wiring batch's write side
-# is the intended future importer of the construct half, so that the
+# validate an incoming envelope's ``values``; the future write path is the
+# intended importer of the construct half, so that the
 # payload the write path stages and the payload the read path
 # (``materialize_compatibility_view``) decodes come from the same function
 # pair, not two independently maintained copies.
@@ -728,15 +728,14 @@ def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
 
 
 # TTL policy interval for a create() envelope's optional ttl_seconds
-# override. The frozen design requires this bound to be enforced in the
-# facade (clamping silently would be fail-open and is explicitly rejected
-# in favor of an outright validation failure), but does not pin concrete
-# numbers -- it describes the requirement as "a [min, max] policy interval"
-# without giving one. No existing config or constant anywhere in this
-# codebase defines an interaction TTL policy today. The two bounds below
-# are this delivery's own placeholder, not a fact recovered from source,
-# logs, or the database -- flagged here, and in this delivery's own report,
-# as a value that needs an explicit policy decision, not a discovered one.
+# override. Enforcing the bound here in the facade is deliberate: clamping
+# silently would be fail-open, and is explicitly rejected in favor of an
+# outright validation failure. The concrete numbers are not pinned by
+# anything: no existing config or constant anywhere in this codebase
+# defines an interaction TTL policy today. The two bounds below are this
+# delivery's own placeholder, not a fact recovered from source, logs, or
+# the database -- flagged here as a value that needs an explicit policy
+# decision, not a discovered one.
 _MIN_INTERACTION_TTL_SECONDS = 60
 _MAX_INTERACTION_TTL_SECONDS = 7 * 24 * 3600
 
@@ -805,10 +804,10 @@ def create(
     even runs, because there is no row to check ownership against.
 
     ``origin`` is deliberately not part of this envelope or this
-    validation step in this delivery: the frozen design's own reason
-    vocabulary has no origin-related entry, and ``stage_interaction_request``
+    validation step in this delivery: the reason vocabulary deliberately
+    has no origin-related entry, and ``stage_interaction_request``
     (which this seam does not call) already validates it against the
-    model's public vocabulary when the wiring batch does call it. Adding an
+    model's public vocabulary once a production write path calls it. Adding an
     origin check here now would validate a field this seam never uses for
     anything.
 
@@ -1023,8 +1022,8 @@ def _resolve_read_direction_anchor(
       because both are answering the same question, "is this a legitimate
       checkpoint row", from different directions. (A shared, stateless
       predicate the two resolvers could both import is a real
-      simplification, registered as a follow-up, not done here -- see the
-      module-level attribution note.)
+      simplification, left as a follow-up, not done here -- see the
+      module docstring's delivered-here accounting.)
     - ``CHECKPOINT_LOAD_UNAVAILABLE`` is registered exactly the way
       trace_handlers registers it: a read failure is a read failure on
       either side.
@@ -1140,7 +1139,7 @@ class CompatibilityQuestionView:
     produces. Not the legacy ``(question, interactions)`` tuple
     ``chat_history_service.get_latest_waiting_question`` returns -- that
     lossy projection, and the four call sites that consume it, belong to
-    the wiring batch's adapter (see the module attribution note), which
+    a later adapter change (see the module docstring), which
     imports this type and projects it down. ``reason`` carries the reason
     code #1079's endpoint needs and the legacy tuple has no slot for; it is
     only set on the ``"unanswerable"`` tier.
@@ -1200,7 +1199,7 @@ def materialize_compatibility_view(
     loosened, this tier's projection needs re-deciding alongside it, not
     independently.
 
-    Consumers, and how much of this result they get: the wiring batch's
+    Consumers, and how much of this result they get: a later
     adapter (not written here) projects this down to the legacy
     ``(question, interactions)`` tuple for the four existing call sites,
     dropping ``reason`` -- lossy by design, not an oversight. #1079's own

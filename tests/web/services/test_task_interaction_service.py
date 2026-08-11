@@ -9,7 +9,7 @@ production-caller gate (its own file,
 ``test_task_interaction_service_production_gate.py``).
 
 RespondOutcome's failure matrix, and what this delivery does and does not
-do with it: the frozen design enumerates 25 triggering cells across
+do with it: the matrix enumerates 25 triggering cells across
 ``respond()``'s not-yet-implemented logic, producing 21 distinct (outcome
 type, reason) pairs -- fewer than 25 because several cells share a pair
 (five different "principal does not own this task" cells all produce
@@ -42,8 +42,8 @@ docstring in ``task_interaction_service.py``), so there is no behavior yet
 for those tests to pin. What this delivery does write is the vocabulary
 guard below (``test_respond_outcome_vocabulary_has_exactly_21_pairs``),
 which is a different assertion from either the cell-by-cell tests or a
-mapping meta-test, per the frozen design's own three-way division of
-labor:
+mapping meta-test, per the three-way division of labor between the
+assertion layers:
 
 | Assertion | Checks | Catches | Misses |
 |---|---|---|---|
@@ -74,8 +74,7 @@ from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 # ---------------------------------------------------------------------------
-# Vocabulary guards (three numbers, pinned by the frozen design's own
-# line-by-line count -- do not recompute them here):
+# Vocabulary guards (three pinned numbers -- do not recompute them here):
 #
 #   - RespondOutcome: 21 (outcome type, reason) pairs.
 #   - CreateOutcome reason word list: 13 words total, across both delivery
@@ -134,7 +133,7 @@ def test_create_outcome_this_period_covers_exactly_the_six_producible_variants()
     None
 ):
     """CreateCreated, CreateConflict, and CreateStale are not producible
-    until the wiring batch's ignition PR fills create()'s call body --
+    until a later change fills create()'s call body --
     create() never stages a row in this delivery, so nothing that requires
     a staged row can be returned yet."""
 
@@ -147,8 +146,8 @@ def test_create_outcome_this_period_covers_exactly_the_six_producible_variants()
 
 
 def test_locator_mismatch_reason_constant_does_not_exist_in_source() -> None:
-    """A design revision voided the reason 'locator_mismatch' before this
-    delivery began. Asserting its absence guards against it surviving as a
+    """The reason 'locator_mismatch' is deliberately not part of this
+    vocabulary. Asserting its absence guards against it surviving as a
     dead string constant that would mislead a future reader into thinking
     that path is still live."""
 
@@ -159,9 +158,9 @@ def test_locator_mismatch_reason_constant_does_not_exist_in_source() -> None:
 
 
 # ---------------------------------------------------------------------------
-# build_v1_request_payload(): closes the §R1-2 obligation -- its output must
-# always pass the identical JSON-serializability probe
-# stage_interaction_request runs before its own INSERT.
+# build_v1_request_payload(): its output must always pass the identical
+# JSON-serializability probe stage_interaction_request runs before its
+# own INSERT.
 # ---------------------------------------------------------------------------
 
 
@@ -242,7 +241,7 @@ def _seeded_task(_session_factory) -> int:
     try:
         user_id = make_user(db)
         task_id = make_task(db, user_id=user_id)
-        # run_id="run-a" matches every C-11 fixture row below by default --
+        # run_id="run-a" matches every fixture row below by default --
         # the active-row predicate requires TaskInteractionRequest.run_id
         # == Task.run_id, so a task with no run_id would make every active
         # row invisible regardless of the scenario under test.
@@ -868,7 +867,7 @@ def test_t3_prime_anchor_dangling_when_the_row_fails_validation(
 
 
 def test_t3_does_not_fall_back_to_legacy(_db: Session, _seeded_task: int) -> None:
-    """Pins §V2-7.5's prohibition directly: a T3 result must never present
+    """A T3 result must never present
     as "no active row" -- it must always be the unanswerable tier, never
     the legacy tier, even though get_latest_waiting_question would also
     return (None, None) for this same task if it were consulted."""

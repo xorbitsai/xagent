@@ -15,8 +15,9 @@ holds an active native interaction row, so from that change on the only way
 such a task can be answered is a caller that goes through ``respond()``. The
 first HTTP caller arrives separately, with the endpoint issue, and does not
 retire anything here. ``create()`` is not covered by this gate's retirement
-at all: its production call body arrives with the wiring batch that also
-fills in ``stage_interaction_request``'s caller obligations -- the change
+at all: its production call body arrives with the change that wires
+interaction creation end-to-end and fills in
+``stage_interaction_request``'s caller obligations -- the change
 that deletes this gate file must add a replacement guard that locks
 ``create()`` alone, or the seam stops being provably a seam the moment this
 file goes away.

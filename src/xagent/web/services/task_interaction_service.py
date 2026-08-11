@@ -1,0 +1,252 @@
+"""Typed lifecycle service for blocking task interaction requests: the
+answer-side counterpart to ``task_interaction_staging.py``'s ask-side
+primitive.
+
+Not merged into ``task_interaction_staging.py``. That module's own
+docstring pins its merge reason to a fact this module does not share: its
+two entry points exist in one file because they share every exception type
+and one nesting invariant that must never be split across a file boundary,
+both live on the ask side, and both require the caller to already hold the
+transaction they run inside. This module's answering seam is the opposite
+shape on every one of those points -- it owns its own session and its own
+commit, and it does not nest inside anyone else's savepoint. Putting it in
+the same file would make that staging module's merge-reason docstring false
+the day this file lands. What this module reuses instead of duplicating is
+narrow: the staging module's exception base class and its anchor
+self-consistency check, imported by name, not copied.
+
+Concurrency precondition, stated once here because every rowcount-based
+branch this service will grow depends on it: every rowcount-based branch
+below assumes READ COMMITTED (PostgreSQL's default, and what this
+deployment uses): a blocked UPDATE re-evaluates its WHERE clause after the
+lock is released. Under REPEATABLE READ or stricter the same conflict
+surfaces as a serialization failure instead, and the classification this
+service documents does not hold.
+
+Audit identity: a row's ``responder_user_id`` foreign key is cleared by the
+database itself (``ON DELETE SET NULL``) if the responding user is later
+deleted; ``responder_identity`` is not touched by that FK and is the only
+field this table's audit trail can rely on staying populated. Anything that
+records who answered a request must treat ``responder_identity`` as
+authoritative and ``responder_user_id`` as a convenience join that can go
+missing under normal account deletion, not a corruption signal.
+
+Delivered here: the ``InteractionPrincipal`` value object and the shared
+public-chat ownership predicate extracted from ``public_chat_access.py``;
+the ``RespondOutcome`` and ``CreateOutcome`` discriminated unions and their
+reason vocabularies; the ``create()`` typed seam (validates and returns,
+does not stage a row); ``get()``/``list()``; and the three-tier compatibility
+materialization view. Not delivered here: ``respond()``'s call body, the
+answer fence, the compatibility seam into the existing resume coordinator,
+and any new counter. Those land with later changes; this module's own
+zero-production-caller gate
+(``tests/web/services/test_task_interaction_service_production_gate.py``)
+is what keeps that boundary enforced rather than aspirational.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..models.task import Task
+
+# ---------------------------------------------------------------------------
+# Principal and the shared public-chat ownership predicate
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InteractionPrincipal:
+    """A resolved caller identity: either an authenticated web user or an
+    anonymous widget/share guest, carrying every field the public-chat
+    ownership predicate below and the future answer-side authorization
+    predicate need.
+
+    This is not a transport-authentication object -- it does not verify a
+    JWT, a widget key, or an embed ticket. Callers resolve those themselves
+    (``public_chat_access.py`` already does, for the widget and share
+    channels) and construct this value object from the result. Splitting it
+    this way keeps authentication where the transport already lives and
+    puts only the authorization predicate here, which is the reading this
+    module's callers need: the four public-chat entry points already decode
+    their own credentials before ever calling the ownership predicate.
+
+    ``kind`` is ``"user"`` for an authenticated web session or ``"guest"``
+    for a widget/share visitor. ``user_id`` is populated for both kinds --
+    an authenticated user is also the task owner or an admin acting on it,
+    and a guest's owning user is the entity (agent/workforce) owner the
+    guest is chatting through, not the guest itself. ``is_admin`` records
+    whether this is an admin acting on someone else's task (the turn still
+    runs as the task owner; ``is_admin`` is audit-only). ``channel_id``,
+    ``auth_mode``, the four ``*_id`` entity-binding fields, and ``guest_id``
+    mirror the fields ``public_chat_access.py``'s access-context dataclasses
+    already carry (see that module's ``PublicChatAccessContext`` and
+    ``ShareChatAccessContext``); exactly one of ``widget_agent_id`` /
+    ``widget_workforce_id`` / ``share_agent_id`` / ``share_workforce_id`` is
+    populated for a guest principal, none for a ``"user"`` principal.
+
+    ``identity_string`` produces the same ``"user:{id}"`` / ``"guest:{gid}"``
+    namespacing the ``responder_identity`` column comment documents
+    (``models/task_interaction.py``): the prefix is a namespace, not
+    decoration, because a bare user id and a bare guest id share no type and
+    must never compare equal by accident.
+    """
+
+    kind: str  # "user" | "guest"
+    user_id: int | None
+    is_admin: bool
+    channel_id: int | None
+    auth_mode: str | None  # "widget" | "share" | None
+    widget_agent_id: int | None = None
+    widget_workforce_id: int | None = None
+    share_agent_id: int | None = None
+    share_workforce_id: int | None = None
+    guest_id: str | None = None
+
+    def identity_string(self) -> str:
+        if self.kind == "guest":
+            return f"guest:{self.guest_id}"
+        return f"user:{self.user_id}"
+
+
+def task_is_owned_by_public_principal(
+    task: "Task", principal: InteractionPrincipal
+) -> bool:
+    """The shared conjunction extracted from ``public_chat_access.py``'s
+    four widget/share ownership checks (``_get_task_for_workforce_widget_context``,
+    ``get_task_for_public_context``, ``_get_task_for_workforce_share_context``,
+    ``get_task_for_share_context``), plus two deliberate tightenings over
+    that pre-existing code.
+
+    Direction is inferred from which single entity-binding field is
+    populated on ``principal``: exactly one of ``widget_agent_id`` /
+    ``widget_workforce_id`` / ``share_agent_id`` / ``share_workforce_id``
+    must be set, matching how each of the four existing entry points already
+    commits to one direction structurally. Zero or more than one populated
+    field is a caller error (an ambiguous principal must never be treated as
+    "try every direction until one matches") and raises ``ValueError`` --
+    fail closed on a malformed caller, not fail open on a guess.
+
+    The conjunction, in order:
+
+    1. ``task.user_id == principal.user_id``. All four pre-existing entry
+       points already enforce this as a filter on the SQL query that loads
+       ``task`` in the first place, before this predicate ever runs, so in
+       the three wired production callers this conjunct is redundant with
+       that filter -- and checked here anyway, the same way the share-agent
+       direction's row-level entity binding (item 4 below) is checked here
+       even though it, too, duplicates a filter already applied upstream in
+       ``get_task_for_share_context``. A caller that reaches this predicate
+       with an unfiltered ``task`` (any future consumer that looks a task up
+       by id alone) gets ownership enforced here rather than silently
+       relying on an upstream filter it may not have applied.
+    2. ``task.channel_id is None``. All three production callers wired to
+       this predicate require it (a widget/share task is never bound to a
+       bot channel); the fourth direction (plain widget-agent, matched by
+       ``get_task_for_public_context``) keeps its own channel-id-or-None
+       filter and is deliberately *not* routed through this predicate (see
+       ``get_task_for_public_context``'s own comment) -- this predicate's
+       simpler "must be None" is exercised only by tests that address the
+       widget-agent direction directly.
+    3. ``task.agent_config`` is a ``dict``.
+    4. ``task.agent_config["auth_mode"] == principal.auth_mode``. This is
+       one of the two tightenings: the pre-existing widget-agent branch of
+       ``get_task_for_public_context`` never checks ``auth_mode`` at all,
+       while the other three entry points do. A widget guest whose
+       self-chosen ``guest_id`` happens to equal a share guest's
+       server-minted one is rejected here even though the same inputs fed
+       to the untouched ``get_task_for_public_context`` return the task --
+       that divergence is intentional (see that function's own comment for
+       the candidate-issue this predicate does not fix).
+    5. Entity binding for whichever single direction ``principal``
+       addresses, requiring the task-side value to be genuinely present --
+       not folded from ``None``/missing into a comparable default. This is
+       the second tightening: the pre-existing code's ``int(x or 0) !=
+       expected`` shape treats a missing task-side value the same as a
+       task-side value of exactly zero, which would accept a
+       zero-or-``None`` principal field against a task whose
+       ``agent_config`` simply never set the corresponding key. Requiring
+       presence first closes that gap in both directions the pre-existing
+       code took it: a missing config key never satisfies any principal
+       value, and a missing/``None`` principal field never satisfies any
+       config value.
+       - widget-agent: ``task.agent_id == principal.widget_agent_id``
+         (row-level only; the pre-existing code has no JSON-level widget
+         entity binding to mirror -- see the candidate issue below).
+       - widget-workforce: ``task.agent_config["widget_workforce_id"] ==
+         principal.widget_workforce_id`` (JSON-level only).
+       - share-agent: **both** ``task.agent_id ==
+         principal.share_agent_id`` (row-level) **and**
+         ``task.agent_config["share_agent_id"] == principal.share_agent_id``
+         (JSON-level) -- the pre-existing ``get_task_for_share_context`` is
+         the one entry point that checks both.
+       - share-workforce: ``task.agent_config["share_workforce_id"] ==
+         principal.share_workforce_id`` (JSON-level only).
+    6. ``task.agent_config["guest_id"] == principal.guest_id``, with
+       ``principal.guest_id`` required non-empty first -- an empty or
+       ``None`` guest id must never match a task whose own ``guest_id`` is
+       also empty or missing.
+
+    Candidate issue, logged and not fixed here: the widget-agent direction
+    (``get_task_for_public_context``, not routed through this predicate)
+    has no JSON-level entity binding to mirror asymmetrically with the
+    other three directions, and (separately) has no ``auth_mode`` check in
+    the pre-existing code this predicate does not touch. Fixing either is a
+    behavior change to a production authorization path and is out of scope
+    for this change, which only extracts and adds a new, additively-called
+    predicate.
+    """
+
+    populated = [
+        name
+        for name, value in (
+            ("widget_agent", principal.widget_agent_id),
+            ("widget_workforce", principal.widget_workforce_id),
+            ("share_agent", principal.share_agent_id),
+            ("share_workforce", principal.share_workforce_id),
+        )
+        if value is not None
+    ]
+    if len(populated) != 1:
+        raise ValueError(
+            "InteractionPrincipal must populate exactly one of widget_agent_id / "
+            "widget_workforce_id / share_agent_id / share_workforce_id to address "
+            f"task_is_owned_by_public_principal; got {populated!r}"
+        )
+    direction = populated[0]
+
+    if principal.user_id is None or task.user_id != principal.user_id:
+        return False
+    if task.channel_id is not None:
+        return False
+    if not isinstance(task.agent_config, dict):
+        return False
+    if task.agent_config.get("auth_mode") != principal.auth_mode:
+        return False
+
+    if direction == "widget_agent":
+        if task.agent_id is None or task.agent_id != principal.widget_agent_id:
+            return False
+    elif direction == "widget_workforce":
+        config_value = task.agent_config.get("widget_workforce_id")
+        if config_value is None or int(config_value) != principal.widget_workforce_id:
+            return False
+    elif direction == "share_agent":
+        if task.agent_id is None or task.agent_id != principal.share_agent_id:
+            return False
+        config_value = task.agent_config.get("share_agent_id")
+        if config_value is None or int(config_value) != principal.share_agent_id:
+            return False
+    else:  # share_workforce
+        config_value = task.agent_config.get("share_workforce_id")
+        if config_value is None or int(config_value) != principal.share_workforce_id:
+            return False
+
+    if not principal.guest_id:
+        return False
+    if task.agent_config.get("guest_id") != principal.guest_id:
+        return False
+
+    return True

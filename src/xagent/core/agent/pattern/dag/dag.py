@@ -760,6 +760,14 @@ class DAGPattern(AgentPattern):
                     winner_task, winner_result = completed_results[0]
                     winner_step_id = tasks[winner_task]
 
+                    # This loop invalidates losers drawn from `done`; the
+                    # cancellation below acts on `pending`. `asyncio.wait`
+                    # partitions the tasks it was given into exactly these
+                    # two sets, so a task can never be in both -- the two
+                    # cleanup passes touch disjoint task sets, and running
+                    # this one before or after the cancellation below
+                    # cannot change which steps end up invalidated versus
+                    # cancelled.
                     superseded_step_ids: list[str] = []
                     for loser_task, loser_result in completed_results[1:]:
                         if loser_result.get("status") != "waiting_for_user":
@@ -816,6 +824,7 @@ class DAGPattern(AgentPattern):
                                     for task, step_id in tasks.items()
                                     if task in pending
                                 ],
+                                "superseded_step_ids": superseded_step_ids,
                             },
                         )
                     return winner_result

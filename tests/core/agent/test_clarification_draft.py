@@ -313,8 +313,10 @@ def test_with_origin_step_recomputes_marker_for_different_steps() -> None:
     assert draft_b.origin_step_id == "step-b"
     assert draft_a.turn_marker != draft_b.turn_marker
 
-    # Flattening origin_step_id back out leaves the two markers equal --
-    # the only encoded difference between them is that one field.
-    flattened_a = draft_a.turn_marker.replace("6:step-a", "0:")
-    flattened_b = draft_b.turn_marker.replace("6:step-b", "0:")
-    assert flattened_a == flattened_b
+    # Flattening origin_step_id back out through the same with_origin_step()
+    # method (rather than string surgery on the encoded marker) leaves the
+    # two markers equal to each other and to the original unattributed
+    # draft -- origin_step_id was the only field that varied between them.
+    flattened_a = draft_a.with_origin_step("").turn_marker
+    flattened_b = draft_b.with_origin_step("").turn_marker
+    assert flattened_a == flattened_b == base.turn_marker

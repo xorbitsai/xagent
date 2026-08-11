@@ -397,12 +397,13 @@ class AgentExecutionAdapter:
                         if isinstance(interactions, list)
                         else [],
                     },
-                    # Surfaced as its own top-level key rather than left for
-                    # callers to dig out of ``agent_result`` above:
-                    # ``agent_result`` is a diagnostic snapshot already read
-                    # by ``agent_tool.py`` and ``websocket.py`` for that
-                    # purpose, and a new typed contract should not be mixed
-                    # into a field with different consumers and semantics.
+                    # This top-level key is the supported contract for
+                    # readers of the clarification draft. ``agent_result``
+                    # above is a diagnostic snapshot of the raw pattern
+                    # result, already read by ``agent_tool.py`` and
+                    # ``websocket.py`` for other purposes -- it happens to
+                    # carry the same draft too, but callers should not dig
+                    # it out from there.
                     "clarification_draft": result.get("clarification_draft"),
                 }
             )

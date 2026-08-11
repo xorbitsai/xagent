@@ -7,7 +7,13 @@ import pytest
 from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
-from xagent.core.agent.clarification import draft_from_waiting_request
+from xagent.core.agent.clarification import (
+    ClarificationDraft,
+    draft_from_waiting_request,
+)
+from xagent.core.agent.trace import TraceAction
+from xagent.web.api.trace_handlers import DatabaseTraceHandler
+from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
 
 
 class CalculatorArgs(BaseModel):
@@ -174,6 +180,47 @@ async def test_waiting_return_via_tool_carries_tool_waiting_draft() -> None:
     )
     assert result["clarification_draft"] == expected
     assert result["clarification_draft"].source == "tool_waiting"
+
+
+@pytest.mark.asyncio
+async def test_empty_message_send_message_reaches_waiting_with_no_draft() -> None:
+    """A ``send_message`` call with an empty ``message`` and
+    ``expect_response=True`` is schema-valid (the tool only requires the
+    ``message`` key to be present, not non-empty) and reaches
+    ``waiting_for_user`` with no derivable draft.
+
+    This is the reachable production case documented on
+    ``draft_from_waiting_request``: the waiting request carries no message,
+    no ``"interactions"`` key, and no ``"requests"`` list, so
+    ``clarification_draft`` is ``None`` rather than a typed draft.
+    """
+
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-send-empty",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"","message_type":"question",'
+                                '"expect_response":true}'
+                            ),
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(execution_id="exec-empty-message")
+    context.add_user_message("Ask")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["status"] == "waiting_for_user"
+    assert result["clarification_draft"] is None
 
 
 @pytest.mark.asyncio
@@ -373,3 +420,148 @@ def test_marker_distinguishes_requests_with_ambiguous_raw_concatenation() -> Non
     # Naive "|"-joining without a length prefix would collapse both raw
     # concatenations to "a|b|c\nd" -- the markers must still differ.
     assert draft_a.turn_marker != draft_b.turn_marker
+
+
+class RecordingTracer:
+    """Fake tracer that records every ``trace_event`` call verbatim.
+
+    Unlike ``RecordingTraceBackend`` in ``test_clarification_draft.py``
+    (which sits behind ``TraceCheckpointStore`` and only ever sees
+    checkpoint-shaped payloads), this attaches directly to
+    ``PatternRuntime`` so it also captures the pattern-start/pattern-end
+    trace events that ``ReActPattern.run`` emits on its own -- including
+    the ``on_pattern_end`` event, whose ``data["result"]`` is the same
+    result dict ``pattern.run`` returns, with the live
+    ``ClarificationDraft`` still attached.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        require_persisted: bool = False,
+    ) -> str:
+        del require_persisted
+        self.events.append(
+            {
+                "event_type": event_type,
+                "task_id": task_id,
+                "step_id": step_id,
+                "data": dict(data or {}),
+            }
+        )
+        return f"event-{len(self.events)}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_factory", "serialize_method"),
+    [
+        (lambda: DatabaseTraceHandler(1), "_serialize_data_for_json"),
+        (lambda: WebSocketTraceHandler(1), "_serialize_data"),
+    ],
+    ids=["database_trace_handler", "websocket_trace_handler"],
+)
+async def test_pattern_end_trace_payload_with_draft_survives_real_serializer(
+    handler_factory: Any, serialize_method: str
+) -> None:
+    """The actual trace-event payload built by ``PatternRuntime.on_pattern_end``
+    (``{"pattern": ..., "result": result, "status": ...}``, see
+    ``runtime.py``'s ``on_pattern_end`` / ``_emit_pattern_trace``) round-trips
+    through the real database and WebSocket trace-handler serializers without
+    falling back to the ``_serialization_error`` stub, and ``result``/
+    ``status`` survive the round trip with their content intact.
+
+    The companion cell
+    ``test_pattern_end_trace_payload_without_to_dict_collapses_to_stub``
+    guards the failure direction: it removes ``ClarificationDraft.to_dict``
+    and asserts the payload collapses to the ``_serialization_error`` stub.
+    """
+
+    tracer = RecordingTracer()
+    runtime = PatternRuntime(execution_id="exec-trace-payload", tracer=tracer)
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(execution_id="exec-trace-payload")
+    context.add_user_message("Ask")
+
+    result = await pattern.run(
+        context=context, tools=[], llm=_send_message_llm(), runtime=runtime
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert result["clarification_draft"] is not None
+
+    end_events = [
+        event
+        for event in tracer.events
+        if event["event_type"].action == TraceAction.END and "result" in event["data"]
+    ]
+    assert len(end_events) == 1
+    payload = end_events[0]["data"]
+    assert payload["result"] is result
+
+    handler = handler_factory()
+    serialized = getattr(handler, serialize_method)(payload)
+
+    assert "_serialization_error" not in serialized
+    assert serialized["status"] == "waiting_for_user"
+    assert serialized["result"]["status"] == "waiting_for_user"
+    assert serialized["result"]["clarification_draft"]["source"] == "send_message"
+    assert serialized["result"]["clarification_draft"]["message"] == "Choose A or B"
+    requests = serialized["result"]["clarification_draft"]["requests"]
+    assert isinstance(requests, list)
+    assert requests and all(isinstance(item, dict) for item in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_factory", "serialize_method"),
+    [
+        (lambda: DatabaseTraceHandler(1), "_serialize_data_for_json"),
+        (lambda: WebSocketTraceHandler(1), "_serialize_data"),
+    ],
+    ids=["database_trace_handler", "websocket_trace_handler"],
+)
+async def test_pattern_end_trace_payload_without_to_dict_collapses_to_stub(
+    handler_factory: Any, serialize_method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing ``ClarificationDraft.to_dict`` collapses the whole trace
+    payload to the ``_serialization_error`` stub.
+
+    This is the failure-direction guard for the survival cell above: the
+    serializers have no branch for a bare dataclass, so without ``to_dict``
+    the draft reaches ``json.dumps`` unconverted, the dump raises, and the
+    handler replaces the ENTIRE event payload with the three-key stub.
+    """
+
+    tracer = RecordingTracer()
+    runtime = PatternRuntime(execution_id="exec-trace-stub", tracer=tracer)
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(execution_id="exec-trace-stub")
+    context.add_user_message("Ask")
+
+    result = await pattern.run(
+        context=context, tools=[], llm=_send_message_llm(), runtime=runtime
+    )
+    assert result["status"] == "waiting_for_user"
+
+    end_events = [
+        event
+        for event in tracer.events
+        if event["event_type"].action == TraceAction.END and "result" in event["data"]
+    ]
+    payload = end_events[0]["data"]
+
+    monkeypatch.delattr(ClarificationDraft, "to_dict", raising=True)
+
+    handler = handler_factory()
+    serialized = getattr(handler, serialize_method)(payload)
+
+    assert "_serialization_error" in serialized
+    assert "result" not in serialized

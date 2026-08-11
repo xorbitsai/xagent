@@ -44,6 +44,15 @@ class ClarificationRequestItem:
     tool_call_id: str
     interaction_id: str
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain dict view, for ``ClarificationDraft.to_dict``."""
+
+        return {
+            "tool_name": self.tool_name,
+            "tool_call_id": self.tool_call_id,
+            "interaction_id": self.interaction_id,
+        }
+
 
 @dataclass(frozen=True)
 class ClarificationDraft:
@@ -97,6 +106,41 @@ class ClarificationDraft:
             requests=self.requests,
         )
         return replace(self, origin_step_id=step_id, turn_marker=turn_marker)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a stable, fully plain-data view of this draft.
+
+        This exists because the execution-result dict that carries a
+        ``ClarificationDraft`` (under ``result["clarification_draft"]``) is
+        serialized into trace events by handlers that use the ``to_dict``
+        protocol -- ``DatabaseTraceHandler._serialize_data_for_json`` and its
+        WebSocket twin call ``value.to_dict()`` whenever it is callable, and
+        then recursively re-serialize whatever that call returns. So this
+        method cannot hand back nested dataclasses: ``interactions`` becomes
+        a plain list (its entries are already plain dicts), and ``requests``
+        becomes a list of plain dicts via ``ClarificationRequestItem.to_dict``.
+        The serializers do descend into tuples on their own; the contract is
+        stricter than the mechanism requires -- only plain data may appear in
+        the returned structure -- so that a future field holding a dataclass
+        without ``to_dict`` cannot slip through unnoticed.
+
+        This method exists for those serializers, not as a general "this
+        object is always JSON-safe" promise: a consumer that calls
+        ``json.dumps`` directly on the result dict never invokes ``to_dict``
+        and still fails on the bare dataclass.
+        """
+
+        return {
+            "source": self.source,
+            "message": self.message,
+            "message_type": self.message_type,
+            "interactions": list(self.interactions),
+            "requests": [item.to_dict() for item in self.requests],
+            "origin_step_id": self.origin_step_id,
+            "origin_execution_id": self.origin_execution_id,
+            "turn_message_count": self.turn_message_count,
+            "turn_marker": self.turn_marker,
+        }
 
 
 def _marker_clean(value: str) -> str:
@@ -167,14 +211,28 @@ def draft_from_waiting_request(
       empty-form ``ask_user_question`` still has the key) -> ``"ask_user_question"``.
     - otherwise -> ``"send_message"``.
 
-    Returns ``None`` in exactly one case: ``request`` carries neither a
-    non-empty message nor an ``"interactions"`` key nor a non-empty
-    ``"requests"`` list. That case has no reachable production caller today;
-    it exists so that resuming a checkpoint written by an older schema
-    degrades to "no draft" instead of raising and blocking resume.
+    Returns ``None`` in two cases, both meaning "no typed draft could be
+    derived" rather than a raised error:
+
+    - ``request`` is not a dict (``None``, a stray ``str``, a ``list``,
+      ...) -- a type mismatch from the caller.
+    - ``request`` is a dict but carries neither a non-empty message nor an
+      ``"interactions"`` key nor a non-empty ``"requests"`` list. This is
+      reachable in production today: a ``send_message`` call with an empty
+      ``message`` and ``expect_response=True`` reaches ``waiting_for_user``
+      with no message, no ``"interactions"`` key, and no ``"requests"``
+      list (see the ``send_message`` branch of
+      ``ReActPattern._handle_control_tool`` in ``react.py``). It also
+      covers resuming a checkpoint written by an older schema, which
+      degrades to "no draft" instead of raising and blocking resume.
     """
 
     if not isinstance(request, dict):
+        logger.warning(
+            "draft_from_waiting_request: waiting request is not a dict "
+            "(got %s); skipping clarification draft",
+            type(request).__name__,
+        )
         return None
 
     message = str(request.get("message") or "")

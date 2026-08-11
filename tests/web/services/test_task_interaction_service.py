@@ -11,6 +11,18 @@ production-caller gate (its own file,
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from tests.web.services.task_interaction_schema_shared import make_task, make_user
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_service as svc
 
 # ---------------------------------------------------------------------------
@@ -96,3 +108,189 @@ def test_locator_mismatch_reason_constant_does_not_exist_in_source() -> None:
 
     source = inspect.getsource(svc)
     assert "locator_mismatch" not in source
+
+
+# ---------------------------------------------------------------------------
+# create(): the six (outcome, reason) pairs producible in this delivery.
+# CC1 (slot_taken / idempotency_key_reused), CS1 (anchor_dangling /
+# run_ended), and CU2 (checkpoint_unavailable / anchor_run_mismatch) are not
+# producible -- create() never stages a row, so nothing that requires one
+# can happen. Those three pairs become producible only once the wiring
+# batch fills create()'s call body.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _engine(tmp_path: Path):
+    db_path = tmp_path / "task_interaction_service.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    apply_sqlite_concurrency_pragmas(engine)
+    Base.metadata.create_all(bind=engine)
+    return engine
+
+
+@pytest.fixture
+def _session_factory(_engine):
+    return sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+
+
+@pytest.fixture
+def _seeded_task(_session_factory) -> int:
+    db = _session_factory()
+    try:
+        user_id = make_user(db)
+        return make_task(db, user_id=user_id)
+    finally:
+        db.close()
+
+
+@pytest.fixture
+def _db(_session_factory) -> Session:
+    db = _session_factory()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _valid_values() -> dict[str, Any]:
+    return {
+        "message": "Which environment?",
+        "interactions": [
+            {"type": "text_input", "field": "env", "label": "Environment"}
+        ],
+    }
+
+
+def _valid_envelope(**overrides: Any) -> svc.CreateInteractionEnvelope:
+    defaults: dict[str, Any] = {
+        "kind": "clarification",
+        "protocol_version": 1,
+        "request_idempotency_key": "create-key-1",
+        "values": _valid_values(),
+        "ttl_seconds": None,
+    }
+    defaults.update(overrides)
+    return svc.CreateInteractionEnvelope(**defaults)
+
+
+def _owning_principal(task_user_id: int) -> svc.InteractionPrincipal:
+    return svc.InteractionPrincipal(
+        kind="user",
+        user_id=task_user_id,
+        is_admin=False,
+        channel_id=None,
+        auth_mode=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"kind": "not_a_real_kind"}, id="unknown_kind"),
+        pytest.param({"protocol_version": 2}, id="unknown_protocol_version"),
+    ],
+)
+def test_cv1_unknown_kind_or_protocol_version_is_rejected(
+    _db: Session, _seeded_task: int, overrides: dict[str, Any]
+) -> None:
+    envelope = _valid_envelope(**overrides)
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(1),
+        envelope=envelope,
+    )
+    assert isinstance(outcome, svc.CreateValidationRejected)
+    expected = "unknown_kind" if "kind" in overrides else "unknown_protocol_version"
+    assert outcome.reason == expected
+
+
+def test_cv2_malformed_idempotency_key_is_rejected(
+    _db: Session, _seeded_task: int
+) -> None:
+    envelope = _valid_envelope(request_idempotency_key="has a space")
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="malformed_idempotency_key")
+
+
+def test_cv3_values_not_shaped_like_v1_payload_is_rejected(
+    _db: Session, _seeded_task: int
+) -> None:
+    envelope = _valid_envelope(values={"not": "a valid payload"})
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+
+
+def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
+    _db: Session, _seeded_task: int
+) -> None:
+    envelope = _valid_envelope(ttl_seconds=1)
+    assert envelope.ttl_seconds < svc._MIN_INTERACTION_TTL_SECONDS
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+
+
+def test_ca1_principal_not_owning_the_task_is_unauthorized(
+    _db: Session, _seeded_task: int
+) -> None:
+    envelope = _valid_envelope()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(999999),
+        envelope=envelope,
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_cu1_missing_task_is_unavailable(_db: Session) -> None:
+    envelope = _valid_envelope()
+    outcome = svc.create(
+        _db, task_id=999999999, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateUnavailable(reason="task_missing")
+
+
+def test_cw1_fully_valid_call_returns_not_wired(
+    _db: Session, _seeded_task: int
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    envelope = _valid_envelope()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=envelope,
+    )
+    assert outcome == svc.CreateNotWired(reason="seam_not_wired")
+
+
+def test_create_never_touches_staging_or_stages_a_row(
+    _db: Session, _seeded_task: int
+) -> None:
+    """create() must not call stage_interaction_request -- confirmed here
+    by asserting the table it would write to stays empty across a
+    successful (CreateNotWired) call."""
+
+    envelope = _valid_envelope()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=svc.InteractionPrincipal(
+            kind="user",
+            user_id=None,
+            is_admin=True,
+            channel_id=None,
+            auth_mode=None,
+        ),
+        envelope=envelope,
+    )
+    assert isinstance(outcome, svc.CreateNotWired)
+    assert _db.query(TaskInteractionRequest).count() == 0

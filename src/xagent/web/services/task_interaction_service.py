@@ -47,12 +47,20 @@ is what keeps that boundary enforced rather than aspirational.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from pydantic import ValidationError as _PydanticValidationError
+
+from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionArgs
+from ..models.task import Task
+from ..models.task_interaction import INTERACTION_PROTOCOL_VERSION
+from .task_command_transport import _normalize_command_id
+from .task_interaction_staging import _KIND_VOCABULARY
 
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from ..models.task import Task
+    from sqlalchemy.orm import Session
 
 # ---------------------------------------------------------------------------
 # Principal and the shared public-chat ownership predicate
@@ -564,3 +572,163 @@ CREATE_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str]] = {
     "CreateUnavailable": frozenset({"task_missing"}),
     "CreateNotWired": frozenset({"seam_not_wired"}),
 }
+
+
+# ---------------------------------------------------------------------------
+# v1 request_payload construct/parse function pair. The shape is
+# ``AskUserQuestionArgs`` (``core/tools/adapters/vibe/ask_user_tool.py``),
+# imported by name rather than redeclared, so the two cannot drift the way
+# a hand-written mirror would. ``create()`` below uses the parse half to
+# validate an incoming envelope's ``values``; the wiring batch's write side
+# is the intended future importer of the construct half, so that the
+# payload the write path stages and the payload the read path
+# (``materialize_compatibility_view``) decodes come from the same function
+# pair, not two independently maintained copies.
+# ---------------------------------------------------------------------------
+
+
+def parse_v1_request_payload(values: Any) -> AskUserQuestionArgs:
+    """Validate ``values`` against the v1 request_payload contract.
+
+    Raises ``pydantic.ValidationError`` on any shape mismatch -- the type,
+    not a boolean or an outcome, because both of this function's callers
+    need the distinction between "validation failed" and "validation
+    infrastructure failed" that only an exception type preserves, and each
+    translates it into its own outcome shape at its own call site.
+    """
+
+    if isinstance(values, AskUserQuestionArgs):
+        return values
+    return AskUserQuestionArgs.model_validate(values)
+
+
+def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
+    """Render a validated ``AskUserQuestionArgs`` instance into the exact
+    JSON-shaped dict ``stage_interaction_request``'s ``request_payload``
+    parameter expects."""
+
+    return parsed.model_dump(mode="json")
+
+
+# TTL policy interval for a create() envelope's optional ttl_seconds
+# override. The frozen design requires this bound to be enforced in the
+# facade (clamping silently would be fail-open and is explicitly rejected
+# in favor of an outright validation failure), but does not pin concrete
+# numbers -- it describes the requirement as "a [min, max] policy interval"
+# without giving one. No existing config or constant anywhere in this
+# codebase defines an interaction TTL policy today. The two bounds below
+# are this delivery's own placeholder, not a fact recovered from source,
+# logs, or the database -- flagged here, and in this delivery's own report,
+# as a value that needs an explicit policy decision, not a discovered one.
+_MIN_INTERACTION_TTL_SECONDS = 60
+_MAX_INTERACTION_TTL_SECONDS = 7 * 24 * 3600
+
+
+@dataclass(frozen=True)
+class CreateInteractionEnvelope:
+    """The caller-supplied intent for ``create()``: what interaction to
+    publish, not yet validated. Every field is checked by ``create()``'s
+    validation step before anything else runs; none of them are trusted
+    as-is."""
+
+    kind: str
+    protocol_version: int
+    request_idempotency_key: str
+    values: Any
+    ttl_seconds: float | int | None = None
+
+
+def create(
+    db: "Session",
+    *,
+    task_id: int,
+    principal: InteractionPrincipal,
+    envelope: CreateInteractionEnvelope,
+) -> CreateOutcome:
+    """Typed seam for publishing a native clarification interaction.
+
+    The body validates the envelope and returns a typed outcome. It does
+    NOT call ``stage_interaction_request``: that call is what retires the
+    zero-production-caller gate in
+    ``tests/web/services/test_interaction_staging_production_gate.py``, and
+    that gate retires only for the change that wires all three finalizers,
+    adds the Task-side protocol marker, and switches the read surface
+    together -- i.e. the wiring batch's ignition PR (W5), not this one.
+
+    Validation order, each step short-circuiting on the first failure:
+    ``kind`` and ``protocol_version`` against the v1 vocabulary and
+    version, ``request_idempotency_key`` against
+    ``COMMAND_ID_PATTERN`` (via ``task_command_transport``'s own
+    normalizer, not a copy of its regex), ``values`` against the v1
+    ``request_payload`` contract, and an optional ``ttl_seconds`` against
+    this facade's policy interval -- out of range is a rejection, never a
+    silent clamp. Authorization runs only after every one of those passes,
+    and only against a task this call itself loads by id: a ``"user"``
+    principal must own the task or be an admin; a ``"guest"`` principal is
+    checked with the same shared ownership predicate ``respond()`` will
+    reuse (``task_is_owned_by_public_principal``), not a re-derived
+    conjunction. A task that does not exist at all is ``Unavailable``, not
+    ``Unauthorized`` -- that branch is reached before the ownership check
+    even runs, because there is no row to check ownership against.
+
+    ``origin`` is deliberately not part of this envelope or this
+    validation step in this delivery: the frozen design's own reason
+    vocabulary has no origin-related entry, and ``stage_interaction_request``
+    (which this seam does not call) already validates it against the
+    model's public vocabulary when the wiring batch does call it. Adding an
+    origin check here now would validate a field this seam never uses for
+    anything.
+
+    Of the staging module's nine exception classes, three
+    (``InteractionAttemptMismatch``, ``InteractionHandoffMisuse``,
+    ``InteractionOriginUnknown``) are raised only from inside
+    ``_InteractionHandoff``'s own call path and are therefore unreachable
+    from this function, which never enters that context manager -- this
+    function has no call to any of the staging module's exception-raising
+    code at all in this delivery, since it never calls
+    ``stage_interaction_request``.
+    """
+
+    if envelope.kind not in _KIND_VOCABULARY:
+        return CreateValidationRejected(reason="unknown_kind")
+    if envelope.protocol_version != INTERACTION_PROTOCOL_VERSION:
+        return CreateValidationRejected(reason="unknown_protocol_version")
+    try:
+        _normalize_command_id(envelope.request_idempotency_key)
+    except ValueError:
+        return CreateValidationRejected(reason="malformed_idempotency_key")
+    try:
+        parse_v1_request_payload(envelope.values)
+    except _PydanticValidationError:
+        return CreateValidationRejected(reason="invalid_values")
+    if envelope.ttl_seconds is not None:
+        if isinstance(envelope.ttl_seconds, bool) or not isinstance(
+            envelope.ttl_seconds, (int, float)
+        ):
+            return CreateValidationRejected(reason="invalid_values")
+        if not (
+            _MIN_INTERACTION_TTL_SECONDS
+            <= envelope.ttl_seconds
+            <= _MAX_INTERACTION_TTL_SECONDS
+        ):
+            return CreateValidationRejected(reason="invalid_values")
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        return CreateUnavailable(reason="task_missing")
+
+    if principal.kind == "user":
+        authorized = principal.is_admin or (
+            principal.user_id is not None and task.user_id == principal.user_id
+        )
+    elif principal.kind == "guest":
+        try:
+            authorized = task_is_owned_by_public_principal(task, principal)
+        except ValueError:
+            authorized = False
+    else:
+        authorized = False
+    if not authorized:
+        return CreateUnauthorized(reason="not_task_principal")
+
+    return CreateNotWired(reason="seam_not_wired")

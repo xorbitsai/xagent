@@ -259,12 +259,28 @@ def delete_workforce_permanently(
         # (Gmail watches etc.). Capture what teardown needs while the rows
         # are still readable; the actual unregister runs after commit, same
         # ordering as _delete_trigger.
-        trigger_teardowns = [
-            (trigger, str(trigger.type), dict(trigger.config or {}))
-            for trigger in db.query(AgentTrigger)
+        trigger_teardowns: list[tuple[AgentTrigger, str, dict[str, Any]]] = []
+        for trigger in (
+            db.query(AgentTrigger)
             .filter(AgentTrigger.workforce_id == workforce_id)
             .all()
-        ]
+        ):
+            trigger_type = str(trigger.type)
+            config = dict(trigger.config or {})
+            # Expunge now, before this session's cascade-delete and commit
+            # expire every instance it still tracks: an expunged object
+            # keeps its already-loaded column values in memory and is never
+            # touched by this session again, so it stays safely readable
+            # from the background thread that runs the actual provider
+            # teardown post-commit -- accessing an attribute on a still-
+            # tracked, expired, deleted-row instance there would raise
+            # DetachedInstanceError/ObjectDeletedError instead. Cascade
+            # delete is unaffected: Workforce.triggers hasn't been loaded
+            # yet (the fence's expire_all() above cleared any earlier
+            # load), so flush resolves it with its own fresh query,
+            # independent of this separately-queried, now-detached copy.
+            db.expunge(trigger)
+            trigger_teardowns.append((trigger, trigger_type, config))
 
         # Neither table is reachable through the ORM cascades on Workforce,
         # and SQLite runs without foreign-key enforcement, so the DB-level

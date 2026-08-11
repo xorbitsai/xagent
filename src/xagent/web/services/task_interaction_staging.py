@@ -679,7 +679,7 @@ def _validate_request_fields(
     # own json.loads but is not valid JSON text. The two backends then
     # diverge on what a real INSERT does with it -- SQLite has no native
     # JSON type and stores the column as TEXT, so it stores that invalid
-    # JSON verbatim with no complaint at all; PostgreSQL's jsonb parser
+    # JSON verbatim with no complaint at all; PostgreSQL's JSON parser
     # rejects it, raising DataError, not StatementError. Passing
     # allow_nan=False makes this probe raise ValueError for NaN/Infinity
     # before either of those divergent, backend-specific outcomes is ever

@@ -384,7 +384,7 @@ def public_chat_identity_matches(task: "Task", principal: InteractionPrincipal) 
     against the full input space per entry point (every combination of
     the five boolean criteria this conjunction and this identity check
     together decide): a majority of the combined-failure cells -- on the
-    order of 31-35 of the 55 input cells that are denied at all, per entry
+    order of 31-35 of the 55 enumerated input cells (54 of which deny), per entry
     point -- now return the not-found text where the pre-existing,
     per-function order would have returned the unavailable text for that
     same input. The allow/deny decision itself is unchanged for every

@@ -25,7 +25,7 @@ from sqlalchemy.orm import sessionmaker
 from tests.web.services.task_interaction_schema_shared import make_task, make_user
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.web.models.database import Base
-from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
@@ -246,3 +246,37 @@ def test_active_row_predicate_three_way_tiering(db_session) -> None:
 
     view3 = svc.materialize_compatibility_view(db, task3)
     assert view3.tier == "legacy"
+
+
+# ---------------------------------------------------------------------------
+# TaskStatusPredicate compile-time assertion. Necessarily green today, not
+# aspirationally green: the active-row query this delivery ships never
+# references Task.status at all (see _active_native_row_criteria's own
+# docstring for why -- "is the task WAITING_FOR_USER" is a concern the
+# future answer fence adds, not part of "which row is the live one"), so
+# there is no TaskStatus literal for this assertion to ever have caught in
+# this delivery. It stays here anyway, not deleted, as the tripwire for the
+# change that does add a Task.status conjunct to a query built from this
+# same predicate (the answer fence, or the write-side reclaim statement):
+# when either lands, this assertion must go on compiling their query too,
+# and it must keep passing only because that new conjunct goes through
+# TaskStatusPredicate rather than a bare TaskStatus member-name string. A
+# future author who adds a literal instead of using TaskStatusPredicate
+# should see this assertion turn red, not stay silently green because
+# nobody pointed it at the new query.
+# ---------------------------------------------------------------------------
+
+
+def test_active_row_query_compiles_with_zero_taskstatus_literals(engine) -> None:
+    stmt = (
+        sa.select(TaskInteractionRequest)
+        .join(Task, Task.id == TaskInteractionRequest.task_id)
+        .where(
+            TaskInteractionRequest.task_id == 1,
+            *svc._active_native_row_criteria(),
+        )
+    )
+    compiled = str(stmt.compile(bind=engine, compile_kwargs={"literal_binds": True}))
+    for member in TaskStatus:
+        assert member.name not in compiled
+        assert member.name.lower() not in compiled

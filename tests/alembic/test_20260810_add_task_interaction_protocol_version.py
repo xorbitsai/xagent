@@ -387,6 +387,62 @@ def test_check_constraint_semantics_on_a_create_all_built_sqlite_database() -> N
     )
 
 
+# ---- SQLite downgrade/upgrade round trip permanently drops the CHECK ----
+
+
+def test_sqlite_create_all_downgrade_upgrade_round_trip_loses_the_check() -> None:
+    """downgrade() rebuilds the tasks table via batch_alter_table on SQLite,
+    which drops the CHECK constraint along with the column it references;
+    upgrade() then adds the column back but, on SQLite, deliberately does
+    not re-add the CHECK (unqualified CHECK-add has no offline rendering
+    and no online implementation here -- see the migration's upgrade()
+    branch and test_sqlite_check_asymmetry_is_expected in
+    tests/migrations/test_task_interaction_protocol_version_parity.py). So
+    one downgrade()/upgrade() cycle permanently converts a SQLite database
+    with the fresh-install shape (create_all, which does carry the CHECK)
+    into the migration shape (which never has it on SQLite), and nothing
+    restores it afterwards. The convergence that would restore the CHECK
+    belongs to the change that lands this column's first production writer,
+    not to this migration.
+    """
+    migration = load_migration_module(MIGRATION_PATH)
+    reset_checkpoint_anchor_fk_create_rule()
+    engine = sa.create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        assert CONSTRAINT_NAME in _check_constraint_names(connection)
+
+    tasks_before = sa.Table(TABLE, sa.MetaData(), autoload_with=engine)
+    with pytest.raises(sa.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sa.insert(tasks_before).values(
+                    interaction_protocol_version=99, user_id=1, title="probe"
+                )
+            )
+
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+            migration.upgrade()
+
+        assert COLUMN in _column_names(connection)
+        ddl = connection.execute(
+            sa.text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:name"),
+            {"name": TABLE},
+        ).scalar()
+        assert CONSTRAINT_NAME not in ddl
+
+    tasks_after = sa.Table(TABLE, sa.MetaData(), autoload_with=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(tasks_after).values(
+                interaction_protocol_version=99, user_id=1, title="probe"
+            )
+        )
+
+
 # ---- _target_schema(): catalog hit / empty-catalog fallback (mocked) ----
 
 

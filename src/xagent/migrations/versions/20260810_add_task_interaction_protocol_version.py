@@ -114,6 +114,14 @@ def upgrade() -> None:
     if context.dialect.name != "postgresql":
         return
 
+    # On PostgreSQL create_check_constraint takes an ACCESS EXCLUSIVE lock on
+    # tasks and validates every existing row before returning (see
+    # 20260804_add_task_checkpoint_trace_event_anchor.py for the same note
+    # against create_foreign_key). Here the column was added moments earlier
+    # in this same migration, so every row is still NULL and validation
+    # cannot fail -- but on a large deployment, a NOT VALID constraint
+    # followed by a separate VALIDATE CONSTRAINT would move validation out
+    # of the lock window if that ever becomes a concern.
     if CONSTRAINT_NAME not in _online_check_constraints(schema):
         op.create_check_constraint(
             CONSTRAINT_NAME, TABLE, CONSTRAINT_CONDITION, schema=schema

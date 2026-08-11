@@ -1125,8 +1125,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }
 
       const finalToolCategories = [...selectedToolCategories]
+      // Same resolution as handleCreate below: selectedMcpServers holds
+      // whatever string the connect flow stored (often the app's display
+      // name), but the backend matches mcp:<selector> against the actual
+      // MCP server row name, which is the catalog app_id for a
+      // shared-server catalog app -- not its display name. Pushing the raw
+      // value broke Chrome (app_id "chrome-devtools" vs. display name
+      // "Chrome"), the first app where the two deliberately differ.
       selectedMcpServers.forEach(server => {
-        finalToolCategories.push(`mcp:${server}`)
+        const connectedServer = findMatchingMcpServer(mcpServers, server)
+        const connectedApp = findMatchingMcpApp(officialApps, server)
+        finalToolCategories.push(`mcp:${connectedServer?.name || connectedApp?.id || server}`)
       })
       if (hasSshBindings && !finalToolCategories.includes("ssh")) {
         finalToolCategories.push("ssh")
@@ -1451,7 +1460,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     selectedMcpServers.forEach(server => {
       const connectedServer = findMatchingMcpServer(mcpServers, server)
       const connectedApp = findMatchingMcpApp(officialApps, server)
-      finalToolCategories.push(`mcp:${connectedServer?.name || connectedApp?.name || server}`)
+      // connectedApp?.id (the catalog app_id), not connectedApp?.name (its
+      // display name): for a shared-server catalog app, the backend names
+      // the actual MCP server row after the app_id
+      // (_ensure_catalog_app_server / _ensure_catalog_mcp_oauth_server), not
+      // the display name. Every pre-existing app's id and name normalize to
+      // the same backend key, so this was previously masked -- Chrome is
+      // the first app where they deliberately differ (app_id
+      // "chrome-devtools" vs. display name "Chrome"), and pushing the name
+      // here sent the backend an mcp:Chrome selector matching no loaded
+      // server, silently loading zero tools (backend log:
+      // reason="no_tools_returned").
+      finalToolCategories.push(`mcp:${connectedServer?.name || connectedApp?.id || server}`)
     })
 
     setIsCreating(true)

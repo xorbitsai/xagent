@@ -134,7 +134,13 @@ def _production_modules() -> list[Path]:
 def test_no_production_module_imports_or_calls_the_gated_names() -> None:
     offenders: dict[str, set[str]] = {}
     for path in _production_modules():
-        uses = _production_uses(path.read_text())
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"{path}: not valid UTF-8, cannot be AST-scanned by this gate"
+            ) from exc
+        uses = _production_uses(source)
         if uses:
             offenders[str(path)] = uses
     assert offenders == {}, offenders
@@ -245,5 +251,5 @@ def test_primitive_module_itself_is_not_flagged() -> None:
     # from within its own module (only entered via a caller's `with`), so
     # it does not appear here the same way -- that asymmetry is expected,
     # not a gap in the scanner.
-    own_source = Path(module.__file__).read_text()
+    own_source = Path(module.__file__).read_text(encoding="utf-8")
     assert "stage_interaction_request" in _production_uses(own_source)

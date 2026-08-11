@@ -289,9 +289,9 @@ def test_sp2_replay_after_conflict_commits_cleanly(session_factory, fixtures) ->
     its own step-3 pre-read, ``b`` has already committed, and READ
     COMMITTED gives that pre-read a fresh snapshot that sees ``b``'s row
     directly -- so this test pins the step-3 pre-read replay path, the same
-    one T-P-9 pins on SQLite, not step 7's post-conflict re-check. See
+    one T-P-9 pins on SQLite, not step 6's post-conflict re-check. See
     ``test_sp6_replay_after_conflict_via_insert_collision`` below for the
-    construction that reaches step 7 for real on this backend."""
+    construction that reaches step 6 for real on this backend."""
 
     task_id, anchor_id = fixtures
     anchor = _anchor(anchor_id)
@@ -342,7 +342,7 @@ def test_sp6_replay_after_conflict_via_insert_collision(
     """PostgreSQL counterpart of
     test_interaction_staging.py::test_p9b_replay_after_conflict_via_insert_collision
     -- see that test's docstring for the full mechanism. Confirmed by the
-    same poison-probe check: replacing step 7's REPLAY return with an
+    same poison-probe check: replacing step 6's REPLAY return with an
     unconditional raise leaves T-SP-2 above green but fails this test."""
 
     task_id, anchor_id = fixtures
@@ -499,7 +499,7 @@ def test_sp5_integrity_error_poisons_transaction_until_savepoint_rollback(
     """PostgreSQL-only: an uncaught IntegrityError poisons the rest of the
     transaction (InFailedSqlTransaction) until something rolls back to the
     savepoint open when it fired. Confirms the primitive's own inner
-    savepoint is what makes the post-conflict re-check (step 7) possible at
+    savepoint is what makes the post-conflict re-check (step 6) possible at
     all on this backend -- without it, the very next statement issued would
     surface as InFailedSqlTransaction (sqlalchemy.exc.InternalError) instead of running."""
 

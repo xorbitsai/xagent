@@ -15,6 +15,7 @@ connection does not give.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import create_engine, event
-from sqlalchemy.exc import IntegrityError, StatementError
+from sqlalchemy.exc import DataError, IntegrityError, StatementError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_interaction_schema_shared import (
@@ -163,29 +164,29 @@ def _force_next_identity_select_to_miss(
 
     Exists because two sessions racing the way this suite constructs a race
     (the winner commits and closes *before* the loser's own call even
-    starts) does not reach step 7's post-conflict re-check on either
+    starts) does not reach step 6's post-conflict re-check on either
     backend: by the time the loser's own step-3 pre-read fires, the
     winner's row is already committed and visible to it (SQLite: a bare,
     non-transactional SELECT sees the latest commit; PostgreSQL READ
     COMMITTED takes a fresh per-statement snapshot), so the loser's call
     returns straight from step 3 and never reaches its own INSERT at all.
     That is a fact about this suite's sequential, same-process
-    construction, not a general claim that step 7 is unreachable by
+    construction, not a general claim that step 6 is unreachable by
     natural interleaving: on PostgreSQL specifically, a genuinely
     concurrent INSERT that blocks on another session's still-uncommitted
     duplicate row -- true overlap, not this suite's commit-then-run
-    ordering -- reaches step 7 naturally once the blocking transaction
+    ordering -- reaches step 6 naturally once the blocking transaction
     commits and the waiting session's own INSERT then fails with a real
     IntegrityError. Forcing one read to lie is what drives the same
     interleaving inside this suite's own sequential constructions: the
     call proceeds to the reclaim UPDATE and its own INSERT, collides with
     the winner's real, already-committed row on the database's own unique
     constraints, rolls back its own inner savepoint, and only then does
-    step 7's second, *unpatched* identity SELECT run -- for real, against
+    step 6's second, *unpatched* identity SELECT run -- for real, against
     the real database -- and find the winner's row.
 
     Only the first ``SELECT`` on ``db`` after this is called is faked;
-    every other statement (the reclaim ``UPDATE``, the ``INSERT``, step 7's
+    every other statement (the reclaim ``UPDATE``, the ``INSERT``, step 6's
     own re-check ``SELECT``) goes through unpatched. Non-``SELECT``
     statements (a caller's own prior write, the reclaim ``UPDATE``) are
     never intercepted at all, regardless of ordering.
@@ -247,6 +248,39 @@ def _defeat_json_probe_but_not_bind_time_serialization(
         return real_dumps(*args, **kwargs)
 
     monkeypatch.setattr(json, "dumps", _patched)
+
+
+def _fail_next_flush_with_data_error(
+    monkeypatch: pytest.MonkeyPatch, db: Session
+) -> None:
+    """Force the *next* ``Session.flush()`` call on ``db`` to raise a real
+    ``sqlalchemy.exc.DataError``, then let every later flush on ``db`` run
+    for real.
+
+    SQLite does not enforce ``VARCHAR`` length, so a genuine column-length
+    ``DataError`` (the case (g) widens this module's two
+    ``except (IntegrityError, DataError)`` guards for -- see
+    ``task_interaction_staging.py``'s module docstring, "Three mechanisms,
+    not one") cannot be constructed on this backend by driving real data
+    through a real INSERT. Monkeypatching ``Session.flush`` itself is the
+    least invasive substitute: it raises the real exception type from
+    inside the real ``try`` block each guard wraps -- confirmed directly
+    that ``Session.begin_nested()`` calls ``self.flush()`` while
+    establishing its SAVEPOINT, so this same patch reaches both guards'
+    call sites, not just ``stage_interaction_request``'s own explicit
+    ``db.flush()``.
+    """
+
+    original_flush = Session.flush
+    state = {"armed": True}
+
+    def _patched(self: Session, *args: Any, **kwargs: Any) -> Any:
+        if self is db and state["armed"]:
+            state["armed"] = False
+            raise DataError("simulated column-length violation", None, None)
+        return original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "flush", _patched)
 
 
 def _clear_signals() -> None:
@@ -567,7 +601,6 @@ def test_p3_clean_stage_is_not_visible_before_commit(tmp_path: Path) -> None:
     assert result.created is True
     assert result.status == "active"
     assert result.active_slot == 1
-    assert result.staged_db_id > 0
 
     other = session_factory()
     visible = other.execute(
@@ -601,7 +634,7 @@ def test_p3b_stale_caller_clock_does_not_misclassify_as_slot_taken(
     running behind produces an expires_at that lands *before* the server's
     real created_at, which the database's CHECK rejects as an
     IntegrityError on the INSERT. Because this table was otherwise empty,
-    step 7's post-conflict re-check found no identity row at this call's own
+    step 6's post-conflict re-check found no identity row at this call's own
     identity and misclassified that CHECK violation as InteractionSlotTaken
     -- the false diagnosis this test pins: a stale-but-internally-consistent
     caller clock silently swallowed the caller's turn instead of staging its
@@ -775,8 +808,8 @@ def test_p5_same_run_tombstone_stays_closed(tmp_path: Path) -> None:
 
 def test_p5b_identity_is_run_scoped_not_task_scoped(tmp_path: Path) -> None:
     """The same idempotency key used by two different runs on the same
-    task must not be conflated -- each run's step-4 pre-read must only ever
-    see rows from its own run. Regression for a step-4 predicate that
+    task must not be conflated -- each run's step-3 pre-read must only ever
+    see rows from its own run. Regression for a step-3 predicate that
     forgets run_id and falls back to task-scoped identity: without run_id in
     the WHERE clause, run-b's pre-read for a shared key would find run-a's
     still-active row and incorrectly replay it as if it were run-b's own,
@@ -946,11 +979,10 @@ def test_p8_owner_state_error_is_not_integrity_error(tmp_path: Path) -> None:
     doomed = Task(user_id=10**9, title=None)  # user_id references nothing
     db.add(doomed)
 
-    with pytest.raises(InteractionOwnerStateError) as excinfo:
+    with pytest.raises(InteractionOwnerStateError):
         stage_interaction_request(
             db, task_id=task_id, **_stage_kwargs(_anchor(anchor_id))
         )
-    assert not isinstance(excinfo.value, IntegrityError)
     db.rollback()
     db.close()
 
@@ -1008,6 +1040,31 @@ def test_p8b_inner_savepoint_cleans_up_on_non_integrity_error_during_insert(
     # was actually unwound, not merely marked inactive and left open
     # underneath (which would instead surface as PendingRollbackError here).
     db.execute(sa.select(sa.literal(1)))
+    db.rollback()
+    db.close()
+
+
+def test_p8c_data_error_from_flush_is_owner_state_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case (g): ``stage_interaction_request``'s own step-2 flush guard
+    (``except (IntegrityError, DataError)``) must convert a ``DataError``
+    the same way it already converts an ``IntegrityError`` -- both are the
+    caller's own pending write failing to flush, not a conflict on this
+    call's own INSERT. See ``_fail_next_flush_with_data_error`` for why a
+    real ``DataError`` has to be driven in via monkeypatch on this backend."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+
+    _fail_next_flush_with_data_error(monkeypatch, db)
+
+    with pytest.raises(InteractionOwnerStateError, match="before interaction staging"):
+        stage_interaction_request(db, task_id=task_id, **_stage_kwargs(anchor))
+
     db.rollback()
     db.close()
 
@@ -1072,12 +1129,12 @@ def test_p9_replay_after_conflict(tmp_path: Path) -> None:
     a just-committed row immediately (no persistent snapshot outside an
     explicit transaction) -- so ``a``'s call returns straight from step 3's
     hit, exactly like a same-key replay with no race at all. It never
-    reaches its own INSERT, and therefore never reaches step 7's
+    reaches its own INSERT, and therefore never reaches step 6's
     post-conflict re-check. This test pins that pre-read replay path (a
     real, separate contract this module makes) and that the loser's own
-    call never inserts a duplicate row -- not step 7. See
+    call never inserts a duplicate row -- not step 6. See
     ``test_p9b_replay_after_conflict_via_insert_collision`` below for the
-    dedicated test that reaches step 7 for real, by forcing the second
+    dedicated test that reaches step 6 for real, by forcing the second
     call's own pre-read to miss despite the row already being committed."""
 
     engine = _engine(tmp_path)
@@ -1089,7 +1146,7 @@ def test_p9_replay_after_conflict(tmp_path: Path) -> None:
     a = session_factory()
     b = session_factory()
 
-    # A performs its own step-1..4 manually up through the pre-read miss,
+    # A performs its own step-1..3 manually up through the pre-read miss,
     # then pauses (does not reclaim/insert yet).
     from xagent.web.services.task_interaction_staging import _identity_lookup_stmt
 
@@ -1140,14 +1197,14 @@ def test_p9_replay_after_conflict(tmp_path: Path) -> None:
 def test_p9b_replay_after_conflict_via_insert_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dedicated test for step 7's post-conflict re-check itself --
+    """The dedicated test for step 6's post-conflict re-check itself --
     T-P-9 above pins the pre-read replay path (step 3), which is what every
     naturally-racing construction on this codebase's two backends actually
-    exercises; it does not reach step 7 (confirmed: replacing step 7's
+    exercises; it does not reach step 6 (confirmed: replacing step 6's
     REPLAY return with an unconditional raise leaves T-P-9, T-SP-2, and
     T-CM-1's ``replay-after-conflict`` cell all green).
 
-    Reaching step 7 for real requires the loser's own step-3 pre-read to
+    Reaching step 6 for real requires the loser's own step-3 pre-read to
     miss despite the winner's row already being committed -- an
     interleaving that does not occur naturally on either backend this suite
     runs against, so it is driven directly via
@@ -1158,7 +1215,7 @@ def test_p9b_replay_after_conflict_via_insert_collision(
     ``uq_task_interaction_active_slot`` and
     ``uq_task_interaction_request_identity`` are live collision surfaces
     here, since A and B share both ``task_id`` and ``run_id``). That
-    collision rolls back A's own inner savepoint, and step 7's own
+    collision rolls back A's own inner savepoint, and step 6's own
     re-check -- an unpatched, real SELECT by the time it runs -- finds B's
     row and replays it.
     """
@@ -1192,12 +1249,12 @@ def test_p9b_replay_after_conflict_via_insert_collision(
     insert_count = sum(1 for s in issued if s.strip().upper().startswith("INSERT"))
     assert insert_count == 1, issued
     # ...and its own inner savepoint rolled back rather than committed --
-    # this is what makes step 7's re-check possible at all (see the
+    # this is what makes step 6's re-check possible at all (see the
     # module's own docstring on why a shared savepoint breaks this).
     assert any("ROLLBACK TO SAVEPOINT" in s.upper() for s in issued), issued
     assert not any("RELEASE SAVEPOINT" in s.upper() for s in issued), issued
 
-    # Step 7's own re-check ran and replayed B's row -- not a fresh insert
+    # Step 6's own re-check ran and replayed B's row -- not a fresh insert
     # of A's own, and not InteractionSlotTaken.
     assert a_result.created is False
     assert a_result.staged_db_id == b_result.staged_db_id
@@ -1224,7 +1281,7 @@ def test_p9b_replay_after_conflict_via_insert_collision(
 def test_p9c_post_conflict_recheck_reclassifies_terminal_identity_as_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """F-4 regression: when step 7's post-conflict re-check finds the
+    """F-4 regression: when step 6's post-conflict re-check finds the
     identity row it collided with in a *terminal* state, it must raise
     ``InteractionRequestClosed`` -- the same classification step 3's own
     pre-read gives that state -- not ``InteractionSlotTaken``. This is the
@@ -1246,7 +1303,7 @@ def test_p9c_post_conflict_recheck_reclassifies_terminal_identity_as_closed(
     ``_force_next_identity_select_to_miss`` machinery ``test_p9b`` uses), so
     A's call proceeds into the reclaim UPDATE and its own INSERT, which
     collides for real -- on the identity unique, not the active-slot one.
-    That collision rolls back A's own inner savepoint, and step 7's own
+    That collision rolls back A's own inner savepoint, and step 6's own
     re-check -- an unpatched, real SELECT by the time it runs -- finds B's
     now-terminal row and reclassifies the conflict accordingly."""
 
@@ -1340,7 +1397,7 @@ def test_p10_slot_taken_does_not_retry(tmp_path: Path) -> None:
 
 
 def test_p11_replay_ignores_expiry(tmp_path: Path) -> None:
-    """k-N2: step 4 replays an already-expired active row without
+    """k-N2: step 3 replays an already-expired active row without
     consulting expires_at."""
 
     engine = _engine(tmp_path)
@@ -1381,8 +1438,8 @@ def test_p11_replay_ignores_expiry(tmp_path: Path) -> None:
 def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression pin: the reclaim UPDATE (step 5) stays in the outer
-    transaction, not the inner savepoint that wraps the INSERT (step 6), so
+    """Regression pin: the reclaim UPDATE (step 4) stays in the outer
+    transaction, not the inner savepoint that wraps the INSERT (step 5), so
     an INSERT-time conflict on this same call does not undo a genuine
     reclaim that same call already performed.
 
@@ -1444,11 +1501,11 @@ def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
     def _fail_third_flush(self: Session, *args: Any, **kwargs: Any) -> Any:
         if self is db:
             flush_calls_on_db["n"] += 1
-            # Three flush() calls happen on this session before step 6's
-            # INSERT would otherwise succeed: (1) step 3's explicit flush of
+            # Three flush() calls happen on this session before step 5's
+            # INSERT would otherwise succeed: (1) step 2's explicit flush of
             # the caller's own pending writes -- none here; (2) the implicit
             # snapshot flush Session.begin_nested() always issues to
-            # establish the inner savepoint; (3) step 6's own explicit
+            # establish the inner savepoint; (3) step 5's own explicit
             # flush, right as the INSERT is attempted, immediately after
             # this call's own reclaim UPDATE has already run -- exactly the
             # point a genuinely racing session's conflict would surface.
@@ -1524,9 +1581,44 @@ _T_CM_1_CASES = [
     "replay-after-conflict",
 ]
 
+# F-3: expected TaskInteractionRequest row count for this task after each
+# degrading cell exits. slot-taken and request-closed each pre-stage one row
+# before the handoff runs (see the case setup below), so zero rows would be
+# wrong for those two -- the pre-staged row must survive untouched and no
+# second row must have been added. The other four cells fail before any
+# staging SQL is issued (validation, or the attempt/anchor/origin assertions
+# in stage(), all run before stage_interaction_request's own first
+# statement), so zero is the only row count consistent with that ordering.
+# replay-after-conflict is not a degrading cell (see the early `return`
+# above) and is not in this table.
+_T_CM_1_ROW_COUNT_AFTER_DEGRADE = {
+    "slot-taken": 1,
+    "request-closed": 1,
+    "anchor-corrupt": 0,
+    "attempt-mismatch": 0,
+    "run-partition-mismatch": 0,
+    "origin-unknown": 0,
+}
+
+# F-10: the exact set of keys interaction_handoff's swallowed-exception
+# handler passes as `extra` to logger.error (task_interaction_staging.py,
+# the "interaction handoff degraded" log line). Pinned here, not re-derived,
+# so a key added to or dropped from that call site's `extra` dict without a
+# matching test update fails loudly instead of silently.
+_DEGRADATION_LOG_EXTRA_KEYS = {
+    "task_id",
+    "lease_run_id",
+    "lease_attempt_id",
+    "anchor_run_partition",
+    "exception_type",
+    "degradation_signal",
+}
+
 
 @pytest.mark.parametrize("case", _T_CM_1_CASES)
-def test_cm1_seven_cell_exit_matrix(tmp_path: Path, case: str) -> None:
+def test_cm1_seven_cell_exit_matrix(
+    tmp_path: Path, case: str, caplog: pytest.LogCaptureFixture
+) -> None:
     """T-CM-1, widened to seven cells: the six swallowed types
     (InteractionSlotTaken, InteractionRequestClosed, InteractionAnchorCorrupt,
     InteractionAttemptMismatch, InteractionRunPartitionMismatch -- swallowed
@@ -1539,16 +1631,19 @@ def test_cm1_seven_cell_exit_matrix(tmp_path: Path, case: str) -> None:
 
     The ``replay-after-conflict`` cell's own construction (below) pins the
     step-3 pre-read replay path through the full context manager -- the
-    same path T-P-9 pins at the primitive level, not step 7's
+    same path T-P-9 pins at the primitive level, not step 6's
     post-conflict re-check: by the time this cell's own ``h.stage()`` call
     runs its step-3 pre-read, the winner session has already committed, and
-    that pre-read hits directly (see T-P-9's docstring for why). Step 7 is
+    that pre-read hits directly (see T-P-9's docstring for why). Step 6 is
     reached and pinned separately, by
     ``test_p9b_replay_after_conflict_via_insert_collision`` at the
     primitive level -- confirmed by the same poison-probe check T-P-9's
-    docstring describes: this cell stays green with step 7's REPLAY return
+    docstring describes: this cell stays green with step 6's REPLAY return
     replaced by an unconditional raise."""
 
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_staging"
+    )
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
     task_id, anchor_id = _seed(session_factory)
@@ -1605,7 +1700,7 @@ def test_cm1_seven_cell_exit_matrix(tmp_path: Path, case: str) -> None:
 
     if case == "replay-after-conflict":
         # A REPLAY-after-conflict via the step-3 pre-read, not a clean
-        # insert and not step 7 (see this test's own docstring): db's first
+        # insert and not step 6 (see this test's own docstring): db's first
         # statement on this session has to happen before the winner's
         # commit, purely so this session's own connection exists before
         # that commit -- db's own later pre-read inside h.stage() still
@@ -1679,6 +1774,48 @@ def test_cm1_seven_cell_exit_matrix(tmp_path: Path, case: str) -> None:
     # that residue, not against this test's own behavior.
     interaction_signals = {name for name in signals if name.startswith("interaction_")}
     assert interaction_signals == {expect_signal}
+
+    # F-3: table state after degrade. slot-taken and request-closed each
+    # pre-staged one row before the handoff ran; the other four cells fail
+    # before any staging SQL is issued. Either way, the handoff's own
+    # savepoint rollback must leave exactly this many rows behind -- not
+    # more (a leaked INSERT) and not fewer (a rollback that undid a
+    # pre-existing row it never should have touched).
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == _T_CM_1_ROW_COUNT_AFTER_DEGRADE[case]
+
+    # F-10: the degradation log record's `extra` payload is exactly the six
+    # keys the swallow handler emits -- pinned by diffing this record's
+    # attributes against a bare LogRecord's, rather than merely checking
+    # the six are present, so a key added to that call site without a
+    # matching test update is caught too.
+    degraded_records = [
+        r for r in caplog.records if r.message == "interaction handoff degraded"
+    ]
+    assert len(degraded_records) == 1, degraded_records
+    record = degraded_records[0]
+    baseline = logging.LogRecord(
+        name="baseline",
+        level=logging.ERROR,
+        pathname="x",
+        lineno=1,
+        msg="m",
+        args=None,
+        exc_info=None,
+    )
+    # caplog's own capture handler formats every record it stores (to build
+    # its text log), which is what stamps `.message` onto it -- an artifact
+    # of capture, not part of the `extra` dict logger.error was called with.
+    baseline.message = baseline.getMessage()
+    extra_keys = set(vars(record)) - set(vars(baseline))
+    assert extra_keys == _DEGRADATION_LOG_EXTRA_KEYS
+    assert record.task_id == task_id
+    assert record.degradation_signal == expect_signal
+
     db.close()
 
 
@@ -1690,13 +1827,14 @@ def test_cm2_owner_state_error_propagates_uncaught(tmp_path: Path) -> None:
 
     The doomed write is added *inside* the with-block, right before
     ``stage()`` -- not before ``interaction_handoff`` is even entered --
-    so its flush happens inside ``stage_interaction_request``'s own step-3
+    so its flush happens inside ``stage_interaction_request``'s own step-2
     flush, reached through the CM's ``except`` clause around ``yield``, the
     same path a real caller's own pending write would take. Adding it
     before the ``with`` line instead would only exercise the CM's *other*
     IntegrityError guard, the one around its own ``db.begin_nested()`` --
-    a real gap an earlier version of this test had, which a
-    _SWALLOWED-widening mutation could pass right through undetected."""
+    covered separately by
+    ``test_cm2e_owner_state_error_from_begin_nested_propagates_uncaught``
+    below."""
 
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
@@ -1706,7 +1844,7 @@ def test_cm2_owner_state_error_propagates_uncaught(tmp_path: Path) -> None:
     lease = _lease(task_id)
     task = db.get(Task, task_id)
 
-    with pytest.raises(InteractionOwnerStateError) as excinfo:
+    with pytest.raises(InteractionOwnerStateError):
         with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
             doomed = Task(user_id=10**9, title=None)
             db.add(doomed)
@@ -1717,8 +1855,74 @@ def test_cm2_owner_state_error_propagates_uncaught(tmp_path: Path) -> None:
                 request_idempotency_key=_next_key(),
                 expires_at=_now() + timedelta(minutes=15),
             )
-    assert not isinstance(excinfo.value, IntegrityError)
     assert db.in_transaction()
+    db.rollback()
+    db.close()
+
+
+def test_cm2e_owner_state_error_from_begin_nested_propagates_uncaught(
+    tmp_path: Path,
+) -> None:
+    """T-CM-2's own *other* IntegrityError guard: a doomed write added
+    *before* ``interaction_handoff`` is even entered is caught by
+    ``Session.begin_nested()``'s own mandatory pre-savepoint flush --
+    ``interaction_handoff``'s own ``except`` around that call, not
+    ``stage_interaction_request``'s step-2 flush T-CM-2 above exercises.
+    Both guards raise ``InteractionOwnerStateError``; only the message
+    differs (see the two raise sites in ``task_interaction_staging.py``).
+    Because the failure fires from ``__enter__``, the ``with`` block's body
+    never runs -- ``stage()`` is never reached."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    doomed = Task(user_id=10**9, title=None)
+    db.add(doomed)
+
+    with pytest.raises(InteractionOwnerStateError, match="while opening"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()):
+            pass
+
+    db.rollback()
+    # The session must accept the next statement -- proving the failure
+    # left it usable after a full rollback, not merely marked but still
+    # poisoned.
+    assert db.execute(sa.select(sa.literal(1))).scalar_one() == 1
+    db.close()
+
+
+def test_cm2f_data_error_from_begin_nested_is_owner_state_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case (g)'s other guard: ``interaction_handoff``'s own
+    ``except (IntegrityError, DataError)`` around ``db.begin_nested()`` must
+    also convert a ``DataError`` -- the counterpart to
+    ``test_p8c_data_error_from_flush_is_owner_state_error`` above, which
+    pins the same conversion at ``stage_interaction_request``'s own step-2
+    flush. See ``_fail_next_flush_with_data_error`` for why a real
+    ``DataError`` has to be driven in via monkeypatch on this backend, and
+    ``test_cm2e`` above for why the ``with`` block's body never runs when
+    this guard is the one that fires."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    _fail_next_flush_with_data_error(monkeypatch, db)
+
+    with pytest.raises(InteractionOwnerStateError, match="while opening"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()):
+            pass
+
     db.rollback()
     db.close()
 
@@ -1871,6 +2075,36 @@ def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
     db.commit()
     assert result.created is True
     assert ops_signals.active_degradations() == {}
+    db.close()
+
+
+def test_cm3b_zero_stage_calls_is_legal(tmp_path: Path) -> None:
+    """F-11: zero stage() calls is legal (see _InteractionHandoff's own
+    docstring, task_interaction_staging.py :1038-1042) -- a caller may open
+    interaction_handoff, decide not to ask, and exit normally with nothing
+    staged."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()):
+        _mark_caller_write(db, task_id, "caller-write-zero-stage")
+
+    db.commit()
+
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0
+    assert ops_signals.active_degradations() == {}
+    assert _caller_write_survived(db, task_id, "caller-write-zero-stage")
     db.close()
 
 

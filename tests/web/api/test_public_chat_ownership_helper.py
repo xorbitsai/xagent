@@ -5,9 +5,15 @@ conjunction and the two deliberate tightenings over the pre-existing code).
 
 Pure-Python unit tests against unpersisted ``Task`` instances -- the
 predicate never issues SQL, so no database fixture is needed here. Phase 2
-of this delivery is what proves the three wired entry points still behave
-identically after routing through this predicate (via the existing,
-unmodified ``public_chat_access`` test suites).
+of this delivery is what proves the three wired entry points still make
+the same allow/deny decision after routing through this predicate (via the
+existing, unmodified ``public_chat_access`` test suites, which pass with
+the same count before and after). That is narrower than "behave
+identically": for a combined-failure input (identity wrong and something
+else also wrong), which of the two denial messages comes back can differ
+from the pre-existing per-function order -- see
+``public_chat_identity_matches``'s own docstring for the precedence rule
+and why the change only narrows what a denied response reveals.
 """
 
 from __future__ import annotations
@@ -209,6 +215,30 @@ def test_widget_agent_binding_rejects_when_task_has_no_agent() -> None:
 
 def test_widget_workforce_binding_rejects_when_config_key_is_missing() -> None:
     task = _task(agent_id=None, agent_config={"auth_mode": "widget", "guest_id": "g-1"})
+    assert (
+        task_is_owned_by_public_principal(task, _widget_workforce_principal()) is False
+    )
+
+
+def test_widget_workforce_binding_rejects_non_int_convertible_value_without_raising() -> (
+    None
+):
+    """Direct call, not routed through create()'s own except-ValueError
+    wrapper: a truthy, non-numeric config value (a non-empty string that
+    is not a number) must make the predicate return False cleanly. The
+    old int(x or 0) shape this replaces would raise ValueError here --
+    "not-a-number" is truthy, so `or 0` never substitutes -- and that
+    exception must not happen even before any caller-side try/except gets
+    a chance to catch it."""
+
+    task = _task(
+        agent_id=None,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "g-1",
+            "widget_workforce_id": "not-a-number",
+        },
+    )
     assert (
         task_is_owned_by_public_principal(task, _widget_workforce_principal()) is False
     )

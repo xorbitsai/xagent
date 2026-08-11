@@ -15,7 +15,7 @@ from xagent.core.task_runtime import (
     merge_task_runtime_contributions,
 )
 from xagent.core.tools.adapters.vibe.browser_tools import (
-    _has_local_browser_runtime,
+    _has_computer_runtime,
     create_browser_tools,
 )
 from xagent.web.models.task import Task
@@ -41,11 +41,11 @@ class FakeSession:
         self.closed = False
         self.committed = False
 
-    def query(self, model: Any) -> "FakeSession":
+    def query(self, model: Any) -> FakeSession:
         self.model = model
         return self
 
-    def filter(self, *_args: Any) -> "FakeSession":
+    def filter(self, *_args: Any) -> FakeSession:
         return self
 
     def first(self) -> Any:
@@ -339,7 +339,37 @@ def test_unbound_local_browser_provider_does_not_suppress_playwright() -> None:
         {LOCAL_BROWSER_TASK_EXTENSION: None}
     )
 
-    assert _has_local_browser_runtime(contribution) is False
+    assert _has_computer_runtime(contribution) is False
+
+
+def test_whitespace_padded_computer_name_suppresses_playwright() -> None:
+    contribution = merge_task_runtime_contributions(
+        {
+            "out_of_tree_browser": TaskRuntimeContribution(
+                tools=(SimpleNamespace(name=" computer "),)
+            )
+        }
+    )
+
+    assert _has_computer_runtime(contribution) is True
+
+
+@pytest.mark.asyncio
+async def test_out_of_tree_computer_runtime_suppresses_playwright_family() -> None:
+    contribution = merge_task_runtime_contributions(
+        {
+            "out_of_tree_browser": TaskRuntimeContribution(
+                tools=(SimpleNamespace(name="computer"),)
+            )
+        }
+    )
+    config = SimpleNamespace(
+        get_browser_tools_enabled=lambda: True,
+        get_task_runtime_contribution=lambda: contribution,
+    )
+
+    assert _has_computer_runtime(contribution) is True
+    assert await create_browser_tools(config) == []
 
 
 def test_local_browser_public_metadata_is_bound_task_only(

@@ -253,3 +253,61 @@ def test_primitive_module_itself_is_not_flagged() -> None:
     # not a gap in the scanner.
     own_source = Path(module.__file__).read_text(encoding="utf-8")
     assert "stage_interaction_request" in _production_uses(own_source)
+
+
+def test_staging_module_defines_no_second_vocabulary_copy() -> None:
+    """The staging module must consume the model's column-domain constants,
+    never redeclare them. The merge-order rule for the origin vocabulary is
+    that the model owns the one literal list (INTERACTION_ORIGIN_VOCABULARY,
+    INTERACTION_PROTOCOL_VERSION); every other surface derives from it. This
+    guard fails if task_interaction_staging.py grows its own literal set,
+    tuple, or list re-enumerating vocabulary members, its own integer
+    protocol-version constant, or an inline origin-normalization function --
+    each of which would be a drift-capable second copy.
+    """
+    import xagent.web.services.task_interaction_staging as staging_module
+
+    source = Path(staging_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    from xagent.web.models.task_interaction import INTERACTION_ORIGIN_VOCABULARY
+
+    for node in ast.walk(tree):
+        # No literal collection may re-enumerate origin vocabulary members.
+        if isinstance(node, (ast.Set, ast.Tuple, ast.List)):
+            literals = {
+                el.value
+                for el in node.elts
+                if isinstance(el, ast.Constant) and isinstance(el.value, str)
+            }
+            overlap = literals & INTERACTION_ORIGIN_VOCABULARY
+            assert not overlap, (
+                f"literal collection re-enumerates origin vocabulary members "
+                f"{sorted(overlap)}; derive from the model's "
+                f"INTERACTION_ORIGIN_VOCABULARY instead"
+            )
+        # No inline origin-normalization logic.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name.lower()
+            assert not ("normalize" in name and "origin" in name), (
+                f"{node.name} looks like inline origin normalization; the "
+                "model module owns normalize_interaction_origin"
+            )
+    # _PROTOCOL_VERSION and _ORIGIN_VOCABULARY must be Name-aliases of the
+    # model's constants, not fresh literals.
+    aliases = {
+        target.id: node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+        and target.id in {"_PROTOCOL_VERSION", "_ORIGIN_VOCABULARY"}
+    }
+    assert set(aliases) == {"_PROTOCOL_VERSION", "_ORIGIN_VOCABULARY"}
+    for name, value in aliases.items():
+        assert isinstance(value, ast.Name), (
+            f"{name} must alias the model's constant by name, got "
+            f"{ast.dump(value)[:80]}"
+        )
+    assert aliases["_ORIGIN_VOCABULARY"].id == "INTERACTION_ORIGIN_VOCABULARY"
+    assert aliases["_PROTOCOL_VERSION"].id == "INTERACTION_PROTOCOL_VERSION"

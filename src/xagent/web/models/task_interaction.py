@@ -44,12 +44,17 @@ from .database import Base
 # lowercased there. Do not unify the two -- each rule is pinned by its own
 # tests and guards a different kind of input.
 # ---------------------------------------------------------------------------
-# The one literal list. Ordered: the ``ck_task_interaction_requests_origin``
-# CHECK below renders its IN-list from this tuple, and offline SQL must be
-# byte-deterministic, so order is part of the contract. Every other surface
-# -- the two frozenset views below and the staging primitive's Python-side
-# validation -- derives from this tuple, so no second hand-written copy can
-# drift.
+INTERACTION_ORIGIN_VOCABULARY = frozenset(
+    {"internal", "sdk", "a2a", "trigger", "widget", "shared_link"}
+)
+INTERACTION_PROTOCOL_VERSION = 1
+
+# Ordering overlay for the ``ck_task_interaction_requests_origin`` CHECK
+# below: offline SQL must be byte-deterministic and the already-frozen
+# migration rendered the IN-list in exactly this order, so the order cannot
+# be derived by sorting. Membership is owned by
+# ``INTERACTION_ORIGIN_VOCABULARY`` above -- this tuple only fixes the
+# rendering order, and the assert keeps the pair from ever diverging.
 ORIGIN_VALUES: tuple[str, ...] = (
     "internal",
     "sdk",
@@ -58,8 +63,10 @@ ORIGIN_VALUES: tuple[str, ...] = (
     "widget",
     "shared_link",
 )
-INTERACTION_ORIGIN_VOCABULARY = frozenset(ORIGIN_VALUES)
-INTERACTION_PROTOCOL_VERSION = 1
+assert frozenset(ORIGIN_VALUES) == INTERACTION_ORIGIN_VOCABULARY, (
+    "ORIGIN_VALUES is an ordering overlay over INTERACTION_ORIGIN_VOCABULARY; "
+    "change membership there, then mirror it here"
+)
 
 # ``Task.source`` literals actually written by producers today -- a proper
 # subset of INTERACTION_ORIGIN_VOCABULARY, never an alias for it. The
@@ -95,12 +102,6 @@ def normalize_interaction_origin(source: str | None) -> str | None:
     if source in INTERACTION_ORIGIN_VOCABULARY:
         return source
     return None
-
-
-# Alias imported by the staging primitive's Python-side validation
-# (``_ORIGIN_VOCABULARY`` in task_interaction_staging.py). A view over
-# ``ORIGIN_VALUES`` above, same object as INTERACTION_ORIGIN_VOCABULARY.
-ORIGIN_VOCABULARY = INTERACTION_ORIGIN_VOCABULARY
 
 
 class TaskInteractionRequest(Base):  # type: ignore

@@ -2492,6 +2492,76 @@ def test_cm9_out_of_vocabulary_task_source_degrades(tmp_path: Path) -> None:
     db.close()
 
 
+def test_cm9b_vocabulary_binding_is_the_origin_set_not_the_gating_set() -> None:
+    """The staging validation must bind to the model's six-member origin
+    vocabulary (INTERACTION_ORIGIN_VOCABULARY), not the rollout gate's
+    seven-member gating vocabulary (INTERACTION_GATING_SOURCES), whose extra
+    synthetic "channel" key exists only as an operator gating token. Binding
+    to the wrong set would let "channel" pass Python-side validation, hit
+    the database CHECK, and come back misclassified as a slot conflict.
+    Identity, not equality: an equal-but-distinct copy would already be a
+    second source."""
+
+    from xagent.web.models.task_interaction import INTERACTION_ORIGIN_VOCABULARY
+    from xagent.web.services import task_interaction_staging
+    from xagent.web.services.interaction_rollout import INTERACTION_GATING_SOURCES
+
+    assert task_interaction_staging._ORIGIN_VOCABULARY is INTERACTION_ORIGIN_VOCABULARY
+    assert task_interaction_staging._ORIGIN_VOCABULARY != INTERACTION_GATING_SOURCES
+    assert "channel" in INTERACTION_GATING_SOURCES
+    assert "channel" not in task_interaction_staging._ORIGIN_VOCABULARY
+
+
+def test_cm9c_gating_only_channel_source_degrades(tmp_path: Path) -> None:
+    """The gating-only "channel" token, read back as a ``task.source``, must
+    take the unknown-origin degrade path exactly like any other
+    out-of-vocabulary source: no row, no escaping exception, the shared
+    handoff signal registered. This is the behavioral half of the binding
+    pin above -- if validation ever bound to INTERACTION_GATING_SOURCES,
+    "channel" would pass Python-side validation and reach the database
+    CHECK instead."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+
+    db.execute(sa.update(Task).where(Task.id == task_id).values(source="channel"))
+    db.commit()
+    task = db.get(Task, task_id)
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+
+    degradations = ops_signals.active_degradations()
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in degradations
+    # The degrade must be the unknown-origin classification made BEFORE any
+    # SQL. If validation were bound to the gating set instead, "channel"
+    # would reach the database CHECK and come back reclassified as a slot
+    # conflict -- same signal, same zero rows, different exception type --
+    # which is exactly the failure this assertion distinguishes.
+    assert (
+        "InteractionOriginUnknown"
+        in degradations[ops_signals.INTERACTION_HANDOFF_DEGRADED]
+    )
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0
+    db.close()
+
+
 @pytest.mark.parametrize("case", ["attempt-mismatch", "anchor-corrupt"])
 def test_v_n4_degrade_still_lets_caller_commit_run(tmp_path: Path, case: str) -> None:
     """v-n4, made executable: after a degrade, code placed *after* the

@@ -145,7 +145,11 @@ from sqlalchemy.exc import DataError, IntegrityError, ResourceClosedError
 from sqlalchemy.orm import Session
 
 from ..models.task import Task
-from ..models.task_interaction import ORIGIN_VOCABULARY, TaskInteractionRequest
+from ..models.task_interaction import (
+    INTERACTION_ORIGIN_VOCABULARY,
+    INTERACTION_PROTOCOL_VERSION,
+    TaskInteractionRequest,
+)
 from .ops_signals import (
     INTERACTION_HANDOFF_DEGRADED,
     INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED,
@@ -157,13 +161,17 @@ from .task_lease_service import TaskLease
 logger = logging.getLogger(__name__)
 
 _KIND_VOCABULARY = frozenset({"clarification"})
-# Derived from the model's own ORIGIN_VOCABULARY, not a second hand-written
-# frozenset -- see that module's comment for why the two must share one
-# source instead of two copies that could drift apart.
-_ORIGIN_VOCABULARY = ORIGIN_VOCABULARY
+# Derived from the model's own INTERACTION_ORIGIN_VOCABULARY (the merged
+# rollout-controls change owns the vocabulary now), not a second
+# hand-written frozenset -- see that module's comment for why every surface
+# must share one source instead of copies that could drift apart. NOT the
+# rollout gate's INTERACTION_GATING_SOURCES, which is a strict superset
+# carrying the synthetic gating-only "channel" key that must never pass
+# this module's validation.
+_ORIGIN_VOCABULARY = INTERACTION_ORIGIN_VOCABULARY
 _RESUME_LOCATOR_FORMAT = "trace_event_pk_v1"
 _RESUME_CHECKPOINT_TYPE = "agent_execution_checkpoint"
-_PROTOCOL_VERSION = 1
+_PROTOCOL_VERSION = INTERACTION_PROTOCOL_VERSION
 
 _MAX_LENGTHS: dict[str, int] = {
     # Derived from the model so they cannot drift from the schema. These

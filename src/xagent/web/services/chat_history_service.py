@@ -350,6 +350,11 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     not a failure. The return value exists only for logging; callers
     must not branch on it.
 
+    ``TaskChatMessage``'s only unique constraint is on
+    ``(task_id, role, turn_id)``; this UPDATE never touches any of those
+    three columns, so a unique-index collision is not what the catch
+    clause below is for.
+
     The UPDATE runs inside its own ``db.begin_nested()`` SAVEPOINT and
     catches only ``DBAPIError`` — a statement-level database failure,
     including ``ProgrammingError`` — logging and degrading via

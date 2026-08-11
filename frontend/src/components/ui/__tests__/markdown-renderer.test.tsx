@@ -887,6 +887,39 @@ describe('MarkdownRenderer', () => {
     expect(video.tagName.toLowerCase()).toBe('video')
   })
 
+  it('shows the model alt text, not the backend-injected title, when files are disabled', () => {
+    // Regression coverage for a files-disabled-only bug: the presentation
+    // branch used to resolve title-first, showing the backend-injected
+    // filename instead of the model's own alt text. The existing
+    // "sanitizes Markdown labels and titles" test uses an https:// image
+    // whose alt/title sanitize to the same basename, which masks this
+    // ordering bug entirely -- this uses non-path prose alt text so the
+    // two are guaranteed to differ.
+    render(
+      <MarkdownRenderer
+        filesDisabled
+        content='![预览视频](file:550e8400-e29b-41d4-a716-446655440000 "generated_video.mp4")'
+      />,
+    )
+
+    expect(screen.getByText('预览视频')).toBeInTheDocument()
+    expect(screen.queryByText('generated_video.mp4')).not.toBeInTheDocument()
+  })
+
+  it('displays the model label, not the title, for a non-media titled file link', () => {
+    // The title is only ever a media-type detection hint; a non-media
+    // reference's title must never leak into what the user sees as content
+    // (it's fine as an invisible <a title> tooltip), and must not make the
+    // reference misclassify as some previewable kind it isn't.
+    const content =
+      '[下载报告](file:550e8400-e29b-41d4-a716-446655440000 "annual_report_2024.pdf")'
+    render(<MarkdownRenderer content={content} />)
+
+    expect(screen.getByText('下载报告')).toBeInTheDocument()
+    expect(screen.queryByText('annual_report_2024.pdf')).not.toBeInTheDocument()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
   it('renders file links as image previews when the path has an image extension', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,

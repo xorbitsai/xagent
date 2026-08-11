@@ -362,11 +362,11 @@ def test_reconcile_keeps_mismatched_label_that_already_has_media_extension():
         db.close()
 
 
-def test_reconcile_uses_title_for_filename_with_bracket_characters():
-    # A "]" or "[" has no special meaning inside a quoted title (unlike a
-    # label, which the "]" would terminate early), so a bracket-bearing
-    # filename now takes the title path instead of degrading to a plain
-    # download link the way it did before titles existed.
+def test_reconcile_uses_title_for_filename_with_closing_bracket():
+    # "]" has no special meaning inside a quoted title (unlike a label,
+    # which it would terminate early), so a filename with a closing bracket
+    # but no opening one takes the title path instead of degrading to a
+    # plain download link the way it did before titles existed.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -385,6 +385,35 @@ def test_reconcile_uses_title_for_filename_with_bracket_characters():
         )
 
         assert content == '[下载视频（MP4）](file:real-id "clip ].mp4")'
+    finally:
+        db.close()
+
+
+def test_reconcile_skips_rewrite_for_filename_with_opening_bracket():
+    # Unlike "]", an opening "[" IS unsafe for a title: the title-parsing
+    # regex excludes it so a malformed title can never swallow a
+    # subsequent, well-formed [label](file:...) reference whole. A
+    # filename with "[" is therefore unsafe for both title and label (the
+    # label guard already excluded "[") and the reference is left
+    # untouched rather than getting a half-safe rewrite.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="clip [draft.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（MP4）](file:real-id)",
+        )
+
+        assert content == "[下载视频（MP4）](file:real-id)"
     finally:
         db.close()
 
@@ -574,6 +603,335 @@ def test_reconcile_round_trips_single_quote_title_for_non_media_reference():
         )
 
         assert content == '[report](file:real-id "annual_report_2024.pdf")'
+    finally:
+        db.close()
+
+
+def test_reconcile_repairs_invented_id_from_title_when_label_is_prose():
+    # The repair heuristic must consult the title, not just the label: once
+    # a reference has already been through one title-injection pass, a
+    # later pass over content whose original id has since gone invalid can
+    # only find the real filename in the title -- the label is untouched
+    # model prose that reveals nothing about it.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="c6553861-5bdd-4628-9b15-1310e34fe499",
+            filename="generated_video_253a6da9.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content=(
+                '[下载视频（MP4）](file:invented-id "generated_video_253a6da9.mp4")'
+            ),
+        )
+
+        assert content == (
+            "[下载视频（MP4）](file:c6553861-5bdd-4628-9b15-1310e34fe499 "
+            '"generated_video_253a6da9.mp4")'
+        )
+    finally:
+        db.close()
+
+
+def test_reconcile_repairs_from_title_after_original_record_is_removed():
+    # Reproduces the repair-heuristic gap end to end: reconcile once (a
+    # title gets injected), delete the underlying record, register a
+    # replacement under a new id with the same filename, then reconcile the
+    # already-titled content again. Before the title was consulted for
+    # repair, this second pass would have dropped the reference to plain
+    # text -- the label is untouched prose, so filename-based repair had
+    # nothing to match on even though the correct filename was sitting
+    # right there in the title.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="original-id",
+            filename="generated_video.mp4",
+        )
+
+        once = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[下载视频（MP4）](file:original-id)",
+        )
+        assert once == '[下载视频（MP4）](file:original-id "generated_video.mp4")'
+
+        stale_record = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == "original-id").one()
+        )
+        db.delete(stale_record)
+        db.flush()
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="replacement-id",
+            filename="generated_video.mp4",
+        )
+
+        twice = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content=once,
+        )
+
+        assert twice == ('[下载视频（MP4）](file:replacement-id "generated_video.mp4")')
+    finally:
+        db.close()
+
+
+def test_reconcile_unlinks_titled_reference_with_ambiguous_filename():
+    # The title-aware repair heuristic is still subject to the same
+    # ambiguity guard as label-based repair: a filename match that isn't
+    # unique can't be trusted to pick the right record.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="first-id", filename="report.mp4")
+        _add_file(db, user, task, file_id="second-id", filename="report.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[下载报告](file:invented-id "report.mp4")',
+        )
+
+        assert content == "下载报告"
+        assert "file:" not in content
+    finally:
+        db.close()
+
+
+def test_reconcile_unlinks_titled_reference_when_stored_file_id_is_invalid():
+    # Title-based repair can still land on a record whose OWN stored id is
+    # malformed; that must still be caught and unlinked (dropping the
+    # title along with the brackets), same as the label-based case.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="invalid/id",
+            filename="generated_video.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[下载视频](file:invented-id "generated_video.mp4")',
+        )
+
+        assert content == "下载视频"
+    finally:
+        db.close()
+
+
+def test_reconcile_keeps_pre_existing_title_when_label_already_reveals_type():
+    # When the label alone is already classifiable, the backend must not
+    # touch a pre-existing title -- there's no signal that an
+    # author-supplied title is wrong just because it differs from the
+    # record's current filename (mirrors
+    # test_reconcile_keeps_mismatched_label_that_already_has_media_extension
+    # for the title case).
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="generated_video_a1b2c3.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[my_clip.mp4](file:real-id "custom title.mp4")',
+        )
+
+        assert content == '[my_clip.mp4](file:real-id "custom title.mp4")'
+    finally:
+        db.close()
+
+
+def test_reconcile_handles_multiple_valid_links_in_one_message():
+    # The substitution is a single global regex pass over the whole
+    # message; each match must be reconciled independently rather than
+    # leaking state (e.g. a stale title) from one match into the next.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="video-id", filename="generated_video.mp4")
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="audio-id",
+            filename="generated_podcast.mp3",
+            mime_type="audio/mpeg",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content=(
+                "[下载视频（MP4）](file:video-id) and [下载音频（MP3）](file:audio-id)"
+            ),
+        )
+
+        assert content == (
+            '[下载视频（MP4）](file:video-id "generated_video.mp4") and '
+            '[下载音频（MP3）](file:audio-id "generated_podcast.mp3")'
+        )
+    finally:
+        db.close()
+
+
+def test_reconcile_drops_unsafe_pass_through_title_without_touching_label():
+    # A non-media reference's title is pure pass-through (no injection
+    # logic runs for it). Single-quote syntax lets an input title
+    # legitimately contain a literal double quote, but this function
+    # always re-emits titles with the double-quote delimiter, so that
+    # title can't be reproduced safely -- drop it rather than rewrite the
+    # label, which has nothing to do with title safety for non-media types.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="report.pdf",
+            mime_type="application/pdf",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[report](file:real-id 'annual \"2024\" report.pdf')",
+        )
+
+        assert content == "[report](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_unlinks_reference_with_escaped_quote_in_invented_titles_id():
+    # A backslash-escaped quote inside the title must not make the whole
+    # [label](file:id "...") construct fail to match -- that would let an
+    # invented id skip validation entirely (the pre-title-support regex
+    # bypassed this kind of link completely; this asserts the id is
+    # actually evaluated and correctly unlinked, not silently ignored).
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="real-id", filename="clip.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[x](file:invented-id "we\\"ird.mp4")',
+        )
+
+        assert content == "x"
+    finally:
+        db.close()
+
+
+def test_reconcile_validates_id_despite_unsafe_escaped_title():
+    # Complements the unlink case above: here the id is directly valid, so
+    # escape-aware title parsing must let the reference survive
+    # reconciliation. The raw escaped title itself is still unsafe to
+    # re-emit verbatim (see _UNSAFE_TITLE_RE) and is dropped rather than
+    # corrupting the output.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="report.pdf",
+            mime_type="application/pdf",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[report](file:real-id "we\\"ird.pdf")',
+        )
+
+        assert content == "[report](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_validates_id_for_paren_delimited_title():
+    # CommonMark also allows a (title) delimiter form. It must be
+    # recognized so id validation runs instead of silently skipping the
+    # whole reference the way the pre-escape-aware regex did.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="report.pdf",
+            mime_type="application/pdf",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[report](file:real-id (annual report))",
+        )
+
+        assert content == '[report](file:real-id "annual report")'
+    finally:
+        db.close()
+
+
+def test_reconcile_does_not_merge_adjacent_links_across_a_malformed_title():
+    # A malformed title in one reference must not swallow a second,
+    # well-formed reference whole. Before excluding "[" from the
+    # title/junk character classes, this exact input collapsed into one
+    # match spanning both links and silently dropped id2's reference from
+    # the output entirely.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="id2", filename="clip.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[a](file:id1 "x [b](file:id2 ")',
+        )
+
+        # id2's reference is recovered as its own independent, validated
+        # match; the malformed leading fragment is left as inert literal
+        # text rather than being silently merged away.
+        assert '[b](file:id2 "clip.mp4")' in content
+        assert content == '[a](file:id1 "x [b](file:id2 "clip.mp4")'
     finally:
         db.close()
 

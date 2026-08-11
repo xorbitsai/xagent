@@ -261,12 +261,19 @@ function containsPreviewFileLinkNode(node: any): boolean {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
     const title = typeof node.properties?.title === 'string' ? node.properties.title : ''
-    const detectionName = title || hastText(node)
+    const label = hastText(node)
+    const detectionName = title || label
     if (
       resolvePreviewableFileLink({
         fileNameFromPath,
         detectionName,
-        displayName: detectionName,
+        // Only the boolean result is used at this call site (whether the
+        // node is a previewable file link at all) -- displayFilename is
+        // discarded. Still pass the correctly-ordered value (label-first)
+        // rather than detectionName, so this call site can't silently hand
+        // a future caller the wrong filename if displayFilename ever
+        // starts being consumed here.
+        displayName: label || title || fileNameFromPath,
       })
     ) {
       return true
@@ -479,7 +486,12 @@ function MarkdownImage({
     })
     const previewKind = preview?.previewKind ?? 'image'
     if (filesDisabled) {
-      return <span>{presentationTitle || presentationAlt || sanitizeFilesDisabledPresentationText(displayName)}</span>
+      // displayName is already alt-first (falling back to title, then the
+      // path) -- the same rule this component applies everywhere else, so
+      // reuse it directly rather than re-deriving the fallback order here.
+      // The previous title-first order showed the backend-injected
+      // filename instead of the model's own alt text on this one branch.
+      return <span>{sanitizeFilesDisabledPresentationText(displayName)}</span>
     }
 
     return (

@@ -10,10 +10,10 @@ file boundary:
   stale or superseded active row, and the active-row INSERT under a
   savepoint this function owns.
 * ``interaction_handoff`` -- a context manager that opens the outer
-  savepoint the whole handoff lives in, asserts the caller's lease still
-  owns the task row and that the anchor it was given is self-consistent,
-  and degrades on a closed set of expected failures instead of losing the
-  caller's turn.
+  savepoint the whole handoff lives in, and -- when ``stage()`` is called --
+  asserts the caller's lease still owns the task row and that the anchor it
+  was given is self-consistent, degrading on a closed set of expected
+  failures instead of losing the caller's turn.
 
 Caller obligations, because none of them happen here:
 
@@ -55,7 +55,10 @@ Caller obligations, because none of them happen here:
   caller must roll back the whole transaction before issuing another
   statement on it. Every other exception this module raises during a call
   wrapped by ``interaction_handoff`` is contained by that context manager's
-  own savepoint; called outside it, the same rollback obligation applies.
+  own savepoint; called outside it, the same rollback obligation applies --
+  including for ``InteractionSlotTaken`` and ``InteractionRequestClosed``,
+  the two a direct caller can still see after the reclaim UPDATE has
+  already committed in this transaction.
 
 Zero production callers as of this module's introduction: a static test
 (``tests/web/services/test_interaction_staging_production_gate.py``) asserts
@@ -138,7 +141,7 @@ from datetime import datetime
 from typing import Any, Iterator
 
 import sqlalchemy as sa
-from sqlalchemy.exc import IntegrityError, ResourceClosedError
+from sqlalchemy.exc import DataError, IntegrityError, ResourceClosedError
 from sqlalchemy.orm import Session
 
 from ..models.task import Task
@@ -171,10 +174,10 @@ _MAX_LENGTHS: dict[str, int] = {
     #
     # This derivation assumes every one of these columns is a String(N).
     # A Text column has no length cap at all -- .type.length reports None
-    # for one -- which would make the length check built from this dict a
-    # silent no-op for that field instead of raising at construction time.
-    # Re-derive this dict's shape if any of these locator columns ever
-    # widens from String(N) to Text.
+    # for one -- and the import-time assert immediately below this dict
+    # fails at module import when that happens, so schema drift here is
+    # loud, not silent. Re-derive this dict's shape if any of these locator
+    # columns ever widens from String(N) to Text.
     name: TaskInteractionRequest.__table__.c[name].type.length
     for name in (
         "run_id",
@@ -477,7 +480,11 @@ class StagedInteractionRequest:
     ``status`` and ``active_slot`` describe that row as it stood at the
     moment this call read it, which on the step-3 path may already be
     expired (see ``stage_interaction_request``'s docstring on why step 3
-    does not consult ``expires_at``).
+    does not consult ``expires_at``). Both replay paths match on the
+    identity key alone -- they never compare payload, anchor, or
+    ``expires_at`` against the row they return -- and the key's own
+    derivation contract belongs to the first production writer (see
+    ``request_idempotency_key``'s column comment, ``models/task_interaction.py``).
     """
 
     staged_db_id: int
@@ -628,7 +635,7 @@ def _validate_request_fields(
     # escape interaction_handoff entirely instead of degrading like every
     # other expected failure this module knows how to name. Probing here,
     # before the INSERT is ever issued, turns that crash into the same
-    # ValueError every other row-13-and-earlier violation raises.
+    # ValueError every other pure-Python precondition violation raises.
     #
     # allow_nan=False is load-bearing, not a strictness knob: the default
     # json.dumps happily renders float('nan') / float('inf') as the bare
@@ -703,7 +710,7 @@ def _validate_request_fields(
     # once. run_id comes from the service's own lease, not from persisted
     # data; an over-length run_id is a programming error in this module's
     # own caller, so it raises ValueError here and propagates uncaught, the
-    # same as every other row-13-and-earlier violation in this function.
+    # same as every other pure-Python precondition violation in this function.
     # anchor.resume_run_partition, by contrast, comes from a database read
     # of whatever a trace_events row happens to hold; an over-length value
     # there is data corruption this module is built to degrade on, not a
@@ -802,6 +809,38 @@ def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.
     )
 
 
+def _replay_or_raise_closed(
+    row: Any,
+    *,
+    task_id: int,
+    run_id: str,
+    key: str,
+) -> StagedInteractionRequest | None:
+    """The dispatch both the idempotency pre-read (step 3) and the
+    post-conflict re-check (step 6) apply to a hit on
+    ``_identity_lookup_stmt``: replay an ``active`` row as-is, or raise
+    ``InteractionRequestClosed`` for a terminal one. Returns ``None`` when
+    ``row`` is ``None`` -- what "no hit" means differs at each call site (step
+    3 proceeds to reclaim and INSERT; step 6 raises ``InteractionSlotTaken``),
+    so that decision stays with the caller. Extracted so the two sites cannot
+    classify the same row state differently; behavior-preserving, including
+    the exact exception message text.
+    """
+
+    if row is None:
+        return None
+    if row.status == "active":
+        return StagedInteractionRequest(
+            staged_db_id=int(row.id),
+            created=False,
+            status=row.status,
+            active_slot=row.active_slot,
+        )
+    raise InteractionRequestClosed(
+        f"request {key!r} on task {task_id} run {run_id!r} is already {row.status}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The staging primitive
 # ---------------------------------------------------------------------------
@@ -887,6 +926,16 @@ def stage_interaction_request(
     ``isolation_level`` on its engine; the change that wires the first
     production caller should assert that rather than continue to assume it.
 
+    ``SELECT ... FOR UPDATE`` on the task row was considered, as an
+    alternative to the savepoint-plus-re-check design above, and rejected:
+    it would close only the slot-race cell, not the two FK-race cells
+    (concurrent task deletion, concurrent trace-event pruning) documented
+    above, which belong to a different serialization boundary than this
+    function's own; SQLAlchemy silently drops ``with_for_update()`` on
+    SQLite, so the savepoint fallback would still be required for that
+    backend regardless; and it would hold a row lock across the whole
+    validation-plus-insert span, increasing contention with lease renewal.
+
     This function's reclaim UPDATE assumes the caller has already proven it
     holds the task's current attempt; bypassing that precondition to call it
     directly lets a dead run silently displace a live run's question -- the
@@ -921,7 +970,7 @@ def stage_interaction_request(
 
     try:
         db.flush()
-    except IntegrityError as exc:
+    except (IntegrityError, DataError) as exc:
         raise InteractionOwnerStateError(
             "caller's pending writes failed to flush before interaction staging"
         ) from exc
@@ -933,18 +982,11 @@ def stage_interaction_request(
             request_idempotency_key=normalized_key,
         )
     ).first()
-    if existing is not None:
-        if existing.status == "active":
-            return StagedInteractionRequest(
-                staged_db_id=int(existing.id),
-                created=False,
-                status=existing.status,
-                active_slot=existing.active_slot,
-            )
-        raise InteractionRequestClosed(
-            f"request {normalized_key!r} on task {resolved_task_id} run "
-            f"{run_id!r} is already {existing.status}"
-        )
+    replay = _replay_or_raise_closed(
+        existing, task_id=resolved_task_id, run_id=run_id, key=normalized_key
+    )
+    if replay is not None:
+        return replay
 
     db.execute(
         _reclaim_stale_slot_stmt(task_id=resolved_task_id, run_id=run_id, now=now),
@@ -991,18 +1033,11 @@ def stage_interaction_request(
                 request_idempotency_key=normalized_key,
             )
         ).first()
-        if again is not None:
-            if again.status == "active":
-                return StagedInteractionRequest(
-                    staged_db_id=int(again.id),
-                    created=False,
-                    status=again.status,
-                    active_slot=again.active_slot,
-                )
-            raise InteractionRequestClosed(
-                f"request {normalized_key!r} on task {resolved_task_id} run "
-                f"{run_id!r} is already {again.status}"
-            )
+        replay = _replay_or_raise_closed(
+            again, task_id=resolved_task_id, run_id=run_id, key=normalized_key
+        )
+        if replay is not None:
+            return replay
         raise InteractionSlotTaken(
             f"task {resolved_task_id} already has an active interaction "
             "request in a different slot"
@@ -1163,6 +1198,10 @@ class _InteractionHandoff:
             raise ValueError(
                 "lease has no run_id; cannot stage an interaction request without one"
             )
+        # An out-of-vocabulary task.source is currently unreachable because
+        # every production write site hardcodes a literal from
+        # ORIGIN_VALUES (or takes the "internal" default) -- the safety is
+        # a property of the callers, not of any normalization function here.
         origin = str(self.task.source) if self.task.source else "internal"
         if origin not in _ORIGIN_VOCABULARY:
             raise InteractionOriginUnknown(
@@ -1464,7 +1503,7 @@ def interaction_handoff(
     # statement earlier than the primitive's own docstring describes.
     try:
         savepoint = db.begin_nested()
-    except IntegrityError as exc:
+    except (IntegrityError, DataError) as exc:
         raise InteractionOwnerStateError(
             "caller's pending writes failed to flush while opening the "
             "interaction handoff's savepoint"

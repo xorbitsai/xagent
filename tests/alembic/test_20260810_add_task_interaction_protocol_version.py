@@ -201,6 +201,7 @@ def test_online_sqlite_upgrade_adds_column_without_check_and_downgrade_removes_i
 # ---- T-M-1h: online PostgreSQL upgrade/downgrade (disposable database) ----
 
 
+@pytest.mark.postgresql
 def test_online_postgresql_upgrade_adds_column_and_check_and_downgrade_removes_both() -> (
     None
 ):
@@ -255,6 +256,7 @@ def test_online_upgrade_is_idempotent_sqlite() -> None:
     _assert_idempotent_upgrade(migration, sa.create_engine("sqlite:///:memory:"))
 
 
+@pytest.mark.postgresql
 def test_online_upgrade_is_idempotent_postgresql() -> None:
     migration = _migration_module()
     with disposable_database_factory("xagent_w1_migration") as make_database:
@@ -281,6 +283,7 @@ def test_online_downgrade_is_idempotent_when_column_is_absent_sqlite() -> None:
     )
 
 
+@pytest.mark.postgresql
 def test_online_downgrade_is_idempotent_when_column_is_absent_postgresql() -> None:
     migration = _migration_module()
     with disposable_database_factory("xagent_w1_migration") as make_database:
@@ -328,6 +331,7 @@ def test_create_all_then_upgrade_is_noop_sqlite() -> None:
     )
 
 
+@pytest.mark.postgresql
 def test_create_all_then_upgrade_is_noop_postgresql() -> None:
     migration = _migration_module()
     with disposable_database_factory("xagent_w1_migration") as make_database:
@@ -360,6 +364,7 @@ def _assert_check_constraint_semantics(engine, extra_columns: dict) -> None:
                 )
 
 
+@pytest.mark.postgresql
 def test_check_constraint_semantics_on_an_online_migrated_postgresql_database() -> None:
     migration = _migration_module()
     with disposable_database_factory("xagent_w1_migration") as make_database:

@@ -228,6 +228,7 @@ def test_sqlite_check_asymmetry_is_expected() -> None:
 # ---- T-M-2c: PostgreSQL -- column and CHECK match exactly ----
 
 
+@pytest.mark.postgresql
 def test_postgresql_column_and_check_match_between_migration_and_create_all() -> None:
     with disposable_database_factory("xagent_w1_parity") as make_database:
         migration_engine = _build_migration_shaped_postgresql_engine(

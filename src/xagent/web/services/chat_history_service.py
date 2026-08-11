@@ -28,7 +28,27 @@ DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
 
-_SUPERSEDED_MESSAGE_TYPE = "question_superseded"
+QUESTION_MESSAGE_TYPE = "question"
+SUPERSEDED_MESSAGE_TYPE = "question_superseded"
+
+
+def _waiting_question_filters(task_id: int) -> tuple[Any, ...]:
+    """The three-leg WHERE predicate for a task's pending assistant
+    question rows: ``task_id``, ``role == "assistant"``,
+    ``message_type == QUESTION_MESSAGE_TYPE``. Shared by the reader
+    (``get_latest_waiting_question``) and the writer
+    (``supersede_legacy_question_rows``) so the two conditions cannot
+    drift apart by hand-editing one copy and not the other.
+
+    Scoped to this pending-question predicate only. A second,
+    ``allow_superseded`` pass over already-superseded rows may be added
+    to the reader later; that pass is not this helper's concern.
+    """
+    return (
+        TaskChatMessage.task_id == task_id,
+        TaskChatMessage.role == "assistant",
+        TaskChatMessage.message_type == QUESTION_MESSAGE_TYPE,
+    )
 
 
 @dataclass(frozen=True)
@@ -297,135 +317,103 @@ def mark_user_message_delivery_sync(
 
 
 def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
-    """Mark every still-pending assistant question row on a task as superseded.
+    """Mark every assistant question row on a task as superseded, whether
+    still pending or already answered.
 
-    Rewrites ``message_type`` from ``"question"`` to
-    ``"question_superseded"`` for every row on ``task_id`` where
-    ``role == "assistant"``. It only rewrites that one column: it never
-    deletes rows, never touches ``content`` or ``interactions``, and never
-    writes the reverse direction. Like ``mark_user_message_delivery``, it
-    does not commit or roll back ``db`` — the caller owns the transaction.
-    This function expects to run inside a finishing transaction that
-    already holds a lock on the task's ``tasks`` row (see the paragraph on
-    concurrency below).
+    Rewrites ``message_type`` from ``QUESTION_MESSAGE_TYPE`` to
+    ``SUPERSEDED_MESSAGE_TYPE`` for every row on ``task_id`` where
+    ``role == "assistant"``, using the predicate shared with the reader
+    via ``_waiting_question_filters``. It only rewrites that one column:
+    no deletes, no ``content``/``interactions`` changes, no reverse
+    direction. Runs with ``synchronize_session=False``, so a
+    ``TaskChatMessage`` object already loaded in the caller's session
+    keeps its stale ``message_type`` until the caller refreshes it. Like
+    ``mark_user_message_delivery``, it does not commit or roll back
+    ``db`` — the caller owns the transaction, and is expected to already
+    hold a lock on the task's ``tasks`` row (see the concurrency
+    paragraph below).
 
-    ``TaskChatMessage``'s only unique constraint is on
-    ``(task_id, role, turn_id)``. This update never touches any of those
-    three columns, so on the normal path it has no constraint-failure
-    surface to hit — the ``except DBAPIError`` clause below exists for
-    statement-level failures the database reports back (a constraint
-    violation elsewhere in the schema, a statement timeout), not for a
-    unique-index collision this statement cannot cause. A dropped
-    connection is a different failure mode and not what motivates this
-    clause: it kills the whole enclosing transaction outright, and no
-    savepoint changes that.
+    The update is deliberately whole-set and unordered rather than
+    ``ORDER BY id DESC LIMIT 1``: under two simultaneously waiting
+    questions, an ordered pick would relabel only the winner and leave
+    the loser stuck as ``"question"`` forever. Collapsing the whole set
+    removes that failure mode structurally — and, as a consequence, also
+    flips any already-answered question row left over from an earlier
+    turn, not only the row still genuinely waiting. That is deliberate,
+    not a side effect to fix. One user-visible cost: for a historical
+    row, the admin transcript export can no longer tell "answered, then
+    superseded" apart from "abandoned, then superseded" — both end up as
+    ``SUPERSEDED_MESSAGE_TYPE`` with nothing recording which happened.
 
-    The WHERE predicate is exactly the three-condition filter
-    ``get_latest_waiting_question`` runs before its own ``ORDER BY``:
-    ``task_id``, ``role == "assistant"``, ``message_type == "question"``.
-    A static guard pins the two predicate sets equal; changing one side
-    without the other makes that guard fail.
+    A rowcount of zero is a normal outcome — an already-empty set, a
+    reentrant call, a mid-turn write that already failed on its own —
+    not a failure. The return value exists only for logging; callers
+    must not branch on it.
 
-    The update is deliberately unordered and untargeted — it rewrites the
-    whole matching set instead of picking one row with
-    ``ORDER BY id DESC LIMIT 1``. Under two simultaneously waiting
-    questions, an ordered pick would only relabel the winner and leave the
-    loser row stuck as ``"question"`` forever, which is worse than not
-    superseding at all. Collapsing the whole set removes that failure mode
-    structurally.
+    The UPDATE runs inside its own ``db.begin_nested()`` SAVEPOINT and
+    catches only ``DBAPIError`` — a statement-level database failure,
+    including ``ProgrammingError`` — logging and degrading via
+    ``CLARIFICATION_LEGACY_SUPERSEDE_FAILED`` instead of taking the
+    caller's transaction down with it; the savepoint is what makes that
+    degrade possible on PostgreSQL, where a failed statement otherwise
+    aborts the whole enclosing transaction. Python-side misuse —
+    ``InvalidRequestError``, ``PendingRollbackError``, ``ArgumentError``
+    — is not a ``DBAPIError`` and is left to propagate. This is the
+    opposite failure policy from ``mark_user_message_delivery``, which
+    lets a ``DBAPIError`` propagate: that helper guards a mandatory state
+    transition, while this one is a best-effort cleanup sweep that can
+    safely no-op and retry on a later call.
 
-    Because nothing else in this codebase ever transitions
-    ``message_type`` away from ``"question"``, this same whole-set sweep
-    also flips any already-answered question row left over from an
-    earlier turn on the task, not only the row still genuinely waiting —
-    that is deliberate, not a side effect to fix; it is the same
-    whole-set shape that keeps a stale row from ever outranking the live
-    question. One consequence: for a historical row, the admin
-    transcript export cannot tell "answered, then superseded" apart from
-    "abandoned, then superseded" — both end up as
-    ``"question_superseded"`` with nothing recording which happened.
+    Serializing this against a concurrent ``respond()`` call on the same
+    task is not this function's job — it relies on the caller's
+    transaction already holding the task locked (a real row lock on
+    PostgreSQL, the single-writer model on SQLite); a green SQLite test
+    does not exercise that lock.
 
-    A rowcount of zero is a normal outcome, not a failure — it happens
-    whenever the mid-turn write path already swallowed its own error,
-    whenever a reentrant call already zeroed the set on an earlier pass, or
-    whenever an empty projection meant no assistant question row was ever
-    persisted. None of those cases should raise or alert.
-
-    The update runs inside its own SAVEPOINT (``db.begin_nested()``). That
-    is not defensive programming: on PostgreSQL, one failed statement
-    marks the whole enclosing transaction aborted, so without a savepoint,
-    swallowing a database error here would only relocate the crash to the
-    caller's next flush or commit. The savepoint is what lets a failed
-    supersede degrade instead of taking the caller's transaction down with
-    it. The catch clause is narrowed to ``sqlalchemy.exc.DBAPIError`` —
-    the database reporting that the statement itself failed, which
-    includes ``ProgrammingError`` (e.g. a malformed or rejected SQL
-    statement) — and nothing broader. Session and argument misuse on the
-    Python side — ``InvalidRequestError``, ``PendingRollbackError``,
-    ``ArgumentError`` — is not a ``DBAPIError`` and is left to propagate.
-
-    Serializing this function against a concurrent call to ``respond()``
-    on the same task is not this function's job — it relies on whatever
-    already holds the task locked for the caller's finishing transaction:
-    a real row lock on PostgreSQL, and the single-writer model on SQLite.
-    A green unit test against SQLite does not exercise the PostgreSQL row
-    lock.
-
-    ``interaction_handoff`` (``task_interaction_staging.py``) is a
-    context manager whose own with-block must be the transaction's last
-    word before the caller commits — no other write may run inside it. A
-    call site sitting inside that with-block must sit outside it instead,
-    or stay inside it without issuing its own commit. On the path that
-    follows ``persist_assistant_message_no_commit``, callers must issue an
-    explicit ``db.flush()`` afterward rather than relying on autoflush to
-    make the pending row visible to this update.
-
-    That ordering is deliberate, and it means this update supersedes the
-    very row the flush just made visible. That is the intended outcome,
-    not a side effect of the unbounded predicate: on that path the caller
-    has already staged a structured interaction row for the same turn,
-    and the structured row — not the transcript row — is the question the
-    reader is meant to serve, because the reader consults the task's
-    protocol-version marker before it ever reaches this table. The
-    transcript row keeps its ``content`` and ``interactions`` untouched
-    and stays in the history; what it loses is only its standing as the
-    *pending* question. A caller that stages a transcript question row
-    meant to remain answerable must not call this function in the same
-    transaction — no predicate here will spare that row.
-
-    This UPDATE runs with ``synchronize_session=False``: a
-    ``TaskChatMessage`` object already loaded into the caller's session
-    keeps its stale ``message_type`` in memory until the caller calls
-    ``refresh()`` or ``expire()`` on it, even if the caller runs a fresh
-    query afterward in the same session that returns that same
-    identity-mapped object — SQLAlchemy's identity map hands back the
-    in-memory object as-is rather than re-reading the row, so the fresh
-    query does not pick up the UPDATE either.
-
-    Returns the number of rows updated. The return value exists only for
-    logging; callers must not branch on it.
+    This function has no caller in ``src/`` yet. The intended call site
+    sits inside ``interaction_handoff`` (``task_interaction_staging.py``),
+    after ``persist_assistant_message_no_commit`` and an explicit
+    ``db.flush()``, and would supersede the very transcript row that
+    flush just made visible — on purpose, because the structured
+    interaction row staged in the same turn is meant to become the
+    question a future protocol-version-gated reader serves instead. That
+    reader gate does not exist yet: ``get_latest_waiting_question`` gates
+    on ``task_id``/``role``/``message_type`` only, nothing about protocol
+    version. This paragraph is therefore a contract on the follow-up that
+    introduces both the caller and that reader gate, not a description of
+    current behavior — the wiring change's acceptance criteria carry the
+    full call-site obligations (ordering, the explicit flush, never
+    calling this on a transcript question meant to remain answerable).
     """
 
+    updated = 0
+    statement_succeeded = False
     try:
         with db.begin_nested():
             updated = (
                 db.query(TaskChatMessage)
-                .filter(
-                    TaskChatMessage.task_id == task_id,
-                    TaskChatMessage.role == "assistant",
-                    TaskChatMessage.message_type == "question",
-                )
+                .filter(*_waiting_question_filters(task_id))
                 .update(
-                    {TaskChatMessage.message_type: _SUPERSEDED_MESSAGE_TYPE},
+                    {TaskChatMessage.message_type: SUPERSEDED_MESSAGE_TYPE},
                     synchronize_session=False,
                 )
             )
+            statement_succeeded = True
     except DBAPIError as exc:
-        logger.error(
-            "Failed to supersede legacy question rows for task %s",
-            task_id,
-            exc_info=True,
-        )
+        if statement_succeeded:
+            logger.error(
+                "Savepoint exit failed after superseding %s legacy question "
+                "row(s) for task %s; degrading instead of trusting that count",
+                updated,
+                task_id,
+                exc_info=True,
+            )
+        else:
+            logger.error(
+                "Failed to supersede legacy question rows for task %s",
+                task_id,
+                exc_info=True,
+            )
         register_degradation(
             CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
             f"task {task_id}: legacy question supersede failed ({type(exc).__name__})",
@@ -621,11 +609,7 @@ def get_latest_waiting_question(
 
     latest_question = (
         db.query(TaskChatMessage)
-        .filter(
-            TaskChatMessage.task_id == task_id,
-            TaskChatMessage.role == "assistant",
-            TaskChatMessage.message_type == "question",
-        )
+        .filter(*_waiting_question_filters(task_id))
         .order_by(TaskChatMessage.id.desc())
         .first()
     )

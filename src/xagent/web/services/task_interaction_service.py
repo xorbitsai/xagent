@@ -7,11 +7,15 @@ docstring pins its merge reason to a fact this module does not share: its
 two entry points exist in one file because they share every exception type
 and one nesting invariant that must never be split across a file boundary,
 both live on the ask side, and both require the caller to already hold the
-transaction they run inside. This module's answering seam is the opposite
-shape on every one of those points -- it owns its own session and its own
-commit, and it does not nest inside anyone else's savepoint. Putting it in
-the same file would make that staging module's merge-reason docstring false
-the day this file lands. What this delivery reuses from the staging module
+transaction they run inside. This module's future ``respond()`` -- not
+implemented in this delivery, see below for what is -- is designed to be
+the opposite shape on every one of those points: it will own its own
+session and its own commit, and will not nest inside anyone else's
+savepoint. Nothing in this delivery opens a session or commits anything;
+``create()`` takes a caller-owned session and only reads through it. Putting
+the future seam in the same file as the staging primitive would make that
+staging module's merge-reason docstring false the day it lands. What this
+delivery reuses from the staging module
 instead of duplicating is narrow and one-directional: the private kind
 vocabulary (``_KIND_VOCABULARY``), imported by name. ``create()`` never
 calls ``stage_interaction_request`` in this delivery and therefore never
@@ -55,6 +59,7 @@ is what keeps that boundary enforced rather than aspirational.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -146,6 +151,40 @@ class InteractionPrincipal:
         return f"user:{self.user_id}"
 
 
+def _json_entity_binding_matches(config_value: Any, expected: int) -> bool:
+    """True when a JSON-sourced entity-binding value equals ``expected``.
+
+    ``config_value`` comes from ``Task.agent_config``, a JSON column
+    another writer controls -- it is untrusted data, not a value this
+    predicate can assume is even convertible to ``int``. A non-empty
+    string that is not a number, a list, or a dict would make a bare
+    ``int(config_value)`` raise ``TypeError``/``ValueError``; this treats
+    every such value as "does not match" instead of letting the exception
+    escape, the same fail-closed default every other conjunct in this
+    predicate uses for a missing or wrong value.
+
+    This is not a behavior change from the pre-existing code's
+    ``int(x or 0) != expected`` shape for the inputs that shape actually
+    handled: ``or 0`` only ever substitutes ``0`` for a *falsy*
+    ``config_value`` (``None``, ``""``, ``0``, an empty list or dict), and
+    ``int(0)`` never raises, so the pre-existing shape never crashed on
+    falsy input either -- it just couldn't be reached with a genuinely
+    unconvertible value, because the only inputs it was ever fed were
+    already int-convertible ids or an absent key. A *truthy*
+    non-int-convertible value (a non-numeric string, a non-empty list, a
+    non-empty dict) is new ground neither shape ever needed to cover
+    safely until this predicate started being called with untrusted JSON
+    it does not otherwise validate the shape of.
+    """
+
+    if config_value is None:
+        return False
+    try:
+        return int(config_value) == expected
+    except (TypeError, ValueError):
+        return False
+
+
 def task_is_owned_by_public_principal(
     task: "Task", principal: InteractionPrincipal
 ) -> bool:
@@ -209,7 +248,12 @@ def task_is_owned_by_public_principal(
        presence first closes that gap in both directions the pre-existing
        code took it: a missing config key never satisfies any principal
        value, and a missing/``None`` principal field never satisfies any
-       config value.
+       config value. The three JSON-level comparisons below go through
+       ``_json_entity_binding_matches``, which also treats a *present but
+       non-int-convertible* config value (a non-numeric string, a list, a
+       dict) as not matching rather than letting ``int(...)`` raise -- see
+       that function's own docstring for why this is not a behavior change
+       from the pre-existing shape for the inputs that shape actually saw.
        - widget-agent: ``task.agent_id == principal.widget_agent_id``
          (row-level only; the pre-existing code has no JSON-level widget
          entity binding to mirror -- see the candidate issue below).
@@ -266,18 +310,23 @@ def task_is_owned_by_public_principal(
         if task.agent_id is None or task.agent_id != principal.widget_agent_id:
             return False
     elif direction == "widget_workforce":
-        config_value = task.agent_config.get("widget_workforce_id")
-        if config_value is None or int(config_value) != principal.widget_workforce_id:
+        if not _json_entity_binding_matches(
+            task.agent_config.get("widget_workforce_id"),
+            principal.widget_workforce_id,
+        ):
             return False
     elif direction == "share_agent":
         if task.agent_id is None or task.agent_id != principal.share_agent_id:
             return False
-        config_value = task.agent_config.get("share_agent_id")
-        if config_value is None or int(config_value) != principal.share_agent_id:
+        if not _json_entity_binding_matches(
+            task.agent_config.get("share_agent_id"), principal.share_agent_id
+        ):
             return False
     else:  # share_workforce
-        config_value = task.agent_config.get("share_workforce_id")
-        if config_value is None or int(config_value) != principal.share_workforce_id:
+        if not _json_entity_binding_matches(
+            task.agent_config.get("share_workforce_id"),
+            principal.share_workforce_id,
+        ):
             return False
 
     if not principal.guest_id:
@@ -312,19 +361,42 @@ def public_chat_identity_matches(task: "Task", principal: InteractionPrincipal) 
     user stays a caller-side SQL filter, never a post-load attribute read,
     across every function this predicate is wired into.
 
-    Message-selection priority under a hypothetical *simultaneous* identity
-    **and** entity-binding failure is not preserved identically across all
-    three pre-existing functions by this split: the pre-existing
-    widget-workforce code checked guest_id before entity binding (identity
-    wins), while both pre-existing share-side functions checked entity
-    binding before guest_id (entity wins). This helper always gives
-    identity priority, matching the widget-workforce order and diverging
-    from the share-side order only when both dimensions are wrong at once
-    -- a combination no caller here can construct today (auth_mode alone
-    already separates the widget and share channels) and no existing test
-    exercises. The security property that matters -- a guest_id mismatch
-    alone is indistinguishable from not-found -- holds under either
-    priority.
+    **Identity mismatch takes precedence over every other criterion, not
+    just entity binding.** This function is checked first at each of the
+    three wired call sites; when it returns ``False`` the caller raises the
+    not-found-shaped message immediately, without ever asking whether
+    channel binding, config shape, auth_mode, or entity binding also
+    failed. Concretely: for *any* input where ``guest_id`` does not match,
+    the caller now gets the not-found message, regardless of what else
+    about that input is also wrong.
+
+    This is a deliberate narrowing of the pre-existing behavior, not a
+    byte-identical extraction of it. Each of the three pre-existing
+    functions checked identity at a different point in its own chain of
+    early returns -- widget-workforce checked it before entity binding,
+    both share-side functions checked entity binding (and, for
+    share-agent, two separate binding checks) before it -- so for a
+    combined-failure input (identity wrong *and* one or more of the other
+    criteria also wrong), the pre-existing code could return either
+    message depending on which check happened to run first for that
+    specific function. Routing every combined failure through identity
+    first collapses that per-function variance into one rule. Verified
+    against the full input space per entry point (every combination of
+    the five boolean criteria this conjunction and this identity check
+    together decide): a majority of the combined-failure cells -- on the
+    order of 31-35 of the 55 input cells that are denied at all, per entry
+    point -- now return the not-found text where the pre-existing,
+    per-function order would have returned the unavailable text for that
+    same input. The allow/deny decision itself is unchanged for every
+    cell; only which of the two denial messages a combined failure gets
+    can differ, and only in the direction of revealing less: the
+    not-found message is the one that tells a probing visitor nothing
+    about which criterion failed, so this shift narrows the information a
+    denied response leaks, it never widens it. A single-criterion failure
+    (identity wrong and nothing else, or something else wrong and identity
+    fine) is unaffected -- both messages are already pinned by the
+    single-cause tests, and this change only touches cells where more than
+    one criterion fails at once.
     """
 
     if not principal.guest_id:
@@ -630,9 +702,29 @@ def parse_v1_request_payload(values: Any) -> AskUserQuestionArgs:
 def build_v1_request_payload(parsed: AskUserQuestionArgs) -> dict[str, Any]:
     """Render a validated ``AskUserQuestionArgs`` instance into the exact
     JSON-shaped dict ``stage_interaction_request``'s ``request_payload``
-    parameter expects."""
+    parameter expects.
 
-    return parsed.model_dump(mode="json")
+    Raises ``ValueError`` if the rendered dict is not JSON-serializable
+    with ``allow_nan=False`` -- the identical probe
+    ``stage_interaction_request`` (``task_interaction_staging.py``) runs on
+    ``request_payload`` before its own INSERT, for the identical reason:
+    pydantic's ``float`` field accepts ``float('nan')`` /
+    ``float('inf')`` by default (``InteractionArg.default_value`` is one
+    such field), and the default ``json.dumps`` would render either as the
+    bare, non-standard JSON tokens ``NaN`` / ``Infinity`` instead of
+    raising. Closing this probe here means a payload this function
+    produces can never be the thing that trips staging's own probe later
+    -- the two are meant to agree because they are validating the same
+    contract from opposite ends of the same pipe, not because one copies
+    the other.
+    """
+
+    payload = parsed.model_dump(mode="json")
+    try:
+        json.dumps(payload, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"request_payload is not JSON-serializable: {exc}") from exc
+    return payload
 
 
 # TTL policy interval for a create() envelope's optional ttl_seconds
@@ -678,21 +770,37 @@ def create(
     ``tests/web/services/test_interaction_staging_production_gate.py``, and
     that gate retires only for the change that wires all three finalizers,
     adds the Task-side protocol marker, and switches the read surface
-    together -- i.e. the wiring batch's ignition PR (W5), not this one.
+    together -- i.e. the wiring change that supplies this seam's call body,
+    not this one.
 
     Validation order, each step short-circuiting on the first failure:
     ``kind`` and ``protocol_version`` against the v1 vocabulary and
-    version, ``request_idempotency_key`` against
-    ``COMMAND_ID_PATTERN`` (via ``task_command_transport``'s own
+    version, ``request_idempotency_key`` against ``str`` first (a non-string
+    value -- ``None``, an ``int``, ``bytes`` -- is rejected before the
+    normalizer is ever called, not caught as a side effect of whatever
+    ``TypeError``/``AttributeError`` a non-string would raise inside it)
+    and then ``COMMAND_ID_PATTERN`` (via ``task_command_transport``'s own
     normalizer, not a copy of its regex), ``values`` against the v1
-    ``request_payload`` contract, and an optional ``ttl_seconds`` against
-    this facade's policy interval -- out of range is a rejection, never a
-    silent clamp. Authorization runs only after every one of those passes,
+    ``request_payload`` contract (shape, via ``parse_v1_request_payload``,
+    then JSON-serializability with ``allow_nan=False``, via
+    ``build_v1_request_payload`` -- a shape-valid payload carrying a
+    NaN/Infinity ``default_value`` fails the second check and is rejected
+    the same way a shape failure is), and an optional ``ttl_seconds``
+    against this facade's policy interval -- out of range is a rejection,
+    never a silent clamp. Authorization runs only after every one of those
+    passes,
     and only against a task this call itself loads by id: a ``"user"``
     principal must own the task or be an admin; a ``"guest"`` principal is
     checked with the same shared ownership predicate ``respond()`` will
     reuse (``task_is_owned_by_public_principal``), not a re-derived
-    conjunction. A task that does not exist at all is ``Unavailable``, not
+    conjunction; a principal whose ``kind`` is neither ``"user"`` nor
+    ``"guest"`` is always unauthorized -- there is no third branch that
+    defaults to allow. A malformed principal that populates zero or more
+    than one of the guest entity-binding fields makes the ownership
+    predicate raise ``ValueError``; this function catches only that one
+    exception type from that one call and treats it as unauthorized, the
+    same fail-closed-on-a-malformed-caller behavior the predicate itself
+    documents. A task that does not exist at all is ``Unavailable``, not
     ``Unauthorized`` -- that branch is reached before the ownership check
     even runs, because there is no row to check ownership against.
 
@@ -703,6 +811,13 @@ def create(
     model's public vocabulary when the wiring batch does call it. Adding an
     origin check here now would validate a field this seam never uses for
     anything.
+
+    This seam does not consult the native-publication gate
+    (``interaction_rollout.evaluate_native_publication``): that gate's own
+    docstring scopes it to "a finalizer is about to transition a task into
+    WAITING_FOR_USER", and this seam is not a finalizer -- gating belongs to
+    the finalizer layer that will supply this seam's call body, not to the
+    validation-and-authorization facade in front of it.
 
     Of the staging module's nine exception classes, three
     (``InteractionAttemptMismatch``, ``InteractionHandoffMisuse``,
@@ -718,13 +833,22 @@ def create(
         return CreateValidationRejected(reason="unknown_kind")
     if envelope.protocol_version != INTERACTION_PROTOCOL_VERSION:
         return CreateValidationRejected(reason="unknown_protocol_version")
+    if not isinstance(envelope.request_idempotency_key, str):
+        return CreateValidationRejected(reason="malformed_idempotency_key")
     try:
         _normalize_command_id(envelope.request_idempotency_key)
     except ValueError:
         return CreateValidationRejected(reason="malformed_idempotency_key")
     try:
-        parse_v1_request_payload(envelope.values)
+        parsed_values = parse_v1_request_payload(envelope.values)
     except _PydanticValidationError:
+        return CreateValidationRejected(reason="invalid_values")
+    try:
+        build_v1_request_payload(parsed_values)
+    except ValueError:
+        # e.g. a NaN/Infinity default_value: shape-valid per
+        # AskUserQuestionArgs, but not JSON-serializable with
+        # allow_nan=False -- see build_v1_request_payload's own docstring.
         return CreateValidationRejected(reason="invalid_values")
     if envelope.ttl_seconds is not None:
         if isinstance(envelope.ttl_seconds, bool) or not isinstance(
@@ -760,10 +884,11 @@ def create(
 
 
 # ---------------------------------------------------------------------------
-# The shared active-row predicate (C-9's run scoping and C-11's T2/T3 read
-# share the same four fields the design pins together; the future answer
-# fence and write-side reclaim predicate are meant to import this too, once
-# they land -- see the docstring below for why all four must move as one).
+# The shared active-row predicate (list_active()'s run scoping and the
+# compatibility view's T2/T3 read share the same four fields the design
+# pins together; the future answer fence and write-side reclaim predicate
+# are meant to import this too, once they land -- see the docstring below
+# for why all of them must move as one).
 # ---------------------------------------------------------------------------
 
 
@@ -785,10 +910,13 @@ def _active_native_row_criteria() -> tuple[Any, ...]:
     This predicate is meant to be imported by every future caller that
     needs the same notion of "the live row" -- the answer fence and the
     write-side reclaim statement both land later, and the design commits
-    all four callers (this one, ``get()``/``list_active()``, the fence, and
-    reclaim) to changing together if the predicate ever does, specifically
-    so it cannot drift into two different definitions of "active" across
-    the read and write sides.
+    all of this predicate's callers (today: ``list_active()`` and this
+    module's own ``_active_native_row()``; later: the fence and reclaim) to
+    changing together if the predicate ever does, specifically so it cannot
+    drift into two different definitions of "active" across the read and
+    write sides. ``get()`` is deliberately **not** one of those callers --
+    it fetches one row by id, scoped only by ``task_id``, with no
+    active-row filtering at all; see its own docstring.
     """
 
     return (
@@ -865,9 +993,23 @@ def _resolve_read_direction_anchor(
     db: "Session", row: TaskInteractionRequest
 ) -> _AnchorUnresolved | None:
     """Resolve an active interaction row's resume anchor for the read
-    direction: does ``row.resume_trace_event_id`` still point at a usable
-    checkpoint row? Returns ``None`` on success, or an ``_AnchorUnresolved``
-    naming which of the two outcomes applies otherwise.
+    direction: does ``row.resume_trace_event_id`` still point at a
+    structurally valid checkpoint row -- the right task, event type,
+    checkpoint type, run partition, and (when present) execution identity?
+    Returns ``None`` on success, or an ``_AnchorUnresolved`` naming which of
+    the two outcomes applies otherwise.
+
+    This validates the row's *identity*, not its *payload*: unlike
+    ``trace_handlers``, which also calls ``decode_trace_event_data`` and
+    can fail there too (registering ``CHECKPOINT_DECODE_FALLBACK``), this
+    resolver never attempts to decode ``trace_row.data`` beyond reading the
+    handful of fields the validity judgment itself needs. A row that
+    passes this resolver is confirmed to be the legitimate checkpoint the
+    interaction row's anchor names; whether its full payload would also
+    decode cleanly is a question this function does not ask, because
+    nothing downstream of it in this delivery needs that answer -- the
+    native projection this resolver feeds reads ``request_payload`` on the
+    interaction row itself, never the checkpoint row's own ``data``.
 
     Deliberate divergences from trace_handlers' anchor path
     (``api/trace_handlers.py``'s own by-primary-key resolver), listed
@@ -918,6 +1060,27 @@ def _resolve_read_direction_anchor(
       retried against a different candidate set. See
       ``materialize_compatibility_view``'s own docstring for why folding
       this into "no active row" and retrying legacy is prohibited outright.
+
+    A further divergence, this one against the write-direction ("finalizer
+    side") anchor resolver a later change supplies rather than against
+    trace_handlers: that resolver treats a legacy checkpoint type as "no
+    anchor available" and never stages an active row anchored to one at
+    all. This resolver, by contrast, accepts every member of
+    ``READABLE_CHECKPOINT_TYPES`` -- the current type and the legacy ones
+    -- exactly as trace_handlers does. The two disagreeing is not a bug to
+    reconcile: because the write side never produces an active row
+    anchored to a legacy-type checkpoint, this resolver's broader
+    acceptance of legacy types is unreachable in production regardless --
+    there is no row for it to ever apply to. It stays broader than
+    strictly necessary only because narrowing it here would make this
+    resolver's row-validity judgment diverge from trace_handlers' for no
+    reachable gain, which is the exact kind of drift the shared-judgment
+    bullet above exists to prevent. Separately, if the write-direction
+    resolver ever classifies its own dangling-pointer case, it is expected
+    to register its own signal at its own call site, not
+    ``CHECKPOINT_PK_ANCHOR_DANGLING`` -- that constant's registration in
+    this module describes only the read direction; the two sides do not
+    share a signal budget any more than they share a resolver.
     """
 
     if row.resume_trace_event_id is None:
@@ -1014,9 +1177,11 @@ def materialize_compatibility_view(
     and this reader has to survive being called inside it.
 
     T2 (tier ``"native"``) -- an active native row exists and its resume
-    anchor resolves to a usable checkpoint: the native projection,
-    ``question`` and ``interactions`` decoded from ``request_payload``
-    itself, not the legacy transcript.
+    anchor resolves (see ``_resolve_read_direction_anchor`` for exactly
+    what "resolves" checks -- the checkpoint row's identity, not its
+    decoded payload): the native projection, ``question`` and
+    ``interactions`` decoded from ``request_payload`` itself, not the
+    legacy transcript.
 
     T3 (tier ``"unanswerable"``) -- an active native row exists but its
     anchor does not resolve (see ``_resolve_read_direction_anchor``):

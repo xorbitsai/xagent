@@ -49,7 +49,9 @@ async def create_browser_tools(config: "BaseToolConfig") -> list[Any]:
     try:
         from .browser_use import create_browser_tools
 
-        return create_browser_tools(task_id=task_id, workspace=workspace)
+        return create_browser_tools(
+            task_id=task_id, workspace=workspace, locale=config.get_browser_locale()
+        )
     except Exception as e:
         logger.warning(f"Failed to create browser tools: {e}")
         return []

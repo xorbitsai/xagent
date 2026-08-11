@@ -284,6 +284,17 @@ class BaseToolConfig(ABC):
         configs without a DB session.
         """
 
+    def get_browser_locale(self) -> Optional[str]:
+        """Locale for browser automation sessions this config's tasks create.
+
+        ``None`` means "no request-derived locale available" -- the browser
+        tool then falls back to its own deployment default (see
+        ``get_browser_tool_default_locale`` in config.py) rather than a
+        single language being hardcoded for every task regardless of who
+        asked.
+        """
+        return None
+
     @abstractmethod
     def get_file_tools_enabled(self) -> bool:
         """Whether to include file tools."""

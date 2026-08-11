@@ -1122,6 +1122,11 @@ def _load_tool_runtime_policy_snapshot(
     )
 
 
+# Maps the frontend's `app_locale` cookie (see i18n-context.tsx, which only
+# ever sets "en" or "zh") to a Playwright-compatible locale tag.
+_APP_LOCALE_TO_BROWSER_LOCALE = {"en": "en-US", "zh": "zh-CN"}
+
+
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
@@ -1761,6 +1766,27 @@ class WebToolConfig(BaseToolConfig):
     def get_browser_tools_enabled(self) -> bool:
         """Whether to include browser automation tools."""
         return self._browser_tools_enabled
+
+    def get_browser_locale(self) -> Optional[str]:
+        """Derive a browser-automation locale from the account's own
+        ``app_locale`` setting (the language picked via xagent's UI
+        language switcher; see frontend/src/contexts/i18n-context.tsx),
+        so a task's Playwright sessions request pages in the language the
+        account actually chose to work in, rather than a single locale
+        hardcoded for every deployment or the browser's own
+        Accept-Language header (which reflects OS/browser settings, not a
+        deliberate account choice, and does not necessarily match what
+        language the account works in).
+
+        ``None`` (no request, no cookie, or a value the frontend doesn't
+        emit) lets the browser tool fall back to its own deployment
+        default.
+        """
+        cookies = getattr(self.request, "cookies", None)
+        app_locale = getattr(cookies, "get", lambda _key: None)("app_locale")
+        if not isinstance(app_locale, str):
+            return None
+        return _APP_LOCALE_TO_BROWSER_LOCALE.get(app_locale)
 
     def set_task_runtime_contribution(self, contribution: Any) -> None:
         """Attach the detached contribution built for this task."""

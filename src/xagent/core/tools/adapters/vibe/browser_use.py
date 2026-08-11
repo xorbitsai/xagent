@@ -38,6 +38,11 @@ class BrowserTaskSessionMixin:
     """Keeps browser tool default sessions aligned during task setup."""
 
     _task_id: Optional[str] = None
+    # Playwright context locale for sessions this task creates. Set once by
+    # ``create_browser_tools`` on every browser tool (not just navigate):
+    # a session springs into existence on the FIRST tool call that touches
+    # it, whichever tool that is, and the locale is frozen at that moment.
+    _locale: Optional[str] = None
 
     async def setup(self, task_id: Optional[str] = None) -> None:
         if task_id:
@@ -51,6 +56,8 @@ class BrowserTaskSessionMixin:
         step_id = updated.pop(_STEP_SESSION_ARG, None)
         if not updated.get("session_id") and self._task_id:
             updated["session_id"] = self._default_session_id(step_id)
+        if self._locale and "locale" not in updated:
+            updated["locale"] = self._locale
         return updated
 
     def _default_session_id(self, step_id: Any = None) -> str:
@@ -1122,6 +1129,7 @@ def create_browser_tools(
     workspace: Optional["TaskWorkspace"] = None,
     *,
     include_debug_tools: bool = False,
+    locale: Optional[str] = None,
 ) -> list:
     """
     Create all browser automation tools for a task.
@@ -1131,6 +1139,9 @@ def create_browser_tools(
         workspace: Optional workspace for saving screenshots
         include_debug_tools: Include browser session diagnostics. Disabled for
             normal agent runs so debug schemas do not consume model context.
+        locale: Playwright context locale for sessions this task creates
+            (e.g. derived from the requesting account's app_locale setting).
+            Falls back to the deployment default when not supplied.
 
     Returns:
         List of browser tool instances
@@ -1152,4 +1163,10 @@ def create_browser_tools(
     ]
     if include_debug_tools:
         tools.append(BrowserListSessionsTool())
+    # A browser session is created by the FIRST tool call that touches it
+    # (navigate is typical, but nothing guarantees it), so every tool must
+    # carry the locale for _with_default_session to inject.
+    for tool in tools:
+        if isinstance(tool, BrowserTaskSessionMixin):
+            tool._locale = locale
     return tools

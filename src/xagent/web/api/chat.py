@@ -3651,6 +3651,9 @@ def _build_unique_workspace_target(base_dir: Path, filename: str) -> Path:
 @chat_router.post("/task/create", response_model=TaskCreateResponse)
 async def create_task(
     request: TaskCreateRequest,
+    # FastAPI always injects the real Request for HTTP calls regardless of the
+    # default; the None default keeps direct (test) callers working.
+    http_request: Request = None,  # type: ignore[assignment]
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> TaskCreateResponse:
@@ -3987,7 +3990,13 @@ async def create_task(
         logger.info(
             f"Setting LLM configuration for task {task.id} with llm_ids: {task_llm_ids_to_set}"
         )
-        get_agent_manager(request).set_task_llms(int(task.id), task_llm_ids_to_set, db)
+        # ``http_request`` (the real Starlette Request, with cookies/headers)
+        # -- not ``request`` (the parsed TaskCreateRequest body, which has
+        # neither) -- so WebToolConfig.get_browser_locale() can resolve the
+        # account's app_locale cookie once this task's tools get built.
+        get_agent_manager(http_request).set_task_llms(
+            int(task.id), task_llm_ids_to_set, db
+        )
 
         if selected_file_ids:
             from ..models.uploaded_file import UploadedFile
@@ -4046,7 +4055,7 @@ async def create_task(
                     "creation failure",
                     task_id,
                 )
-            get_agent_manager(request).remove_agent(task_id, int(user.id))
+            get_agent_manager(http_request).remove_agent(task_id, int(user.id))
             if isinstance(exc.cause, TaskRuntimeClientError):
                 status_code = exc.cause.status_code
                 detail = exc.cause.detail

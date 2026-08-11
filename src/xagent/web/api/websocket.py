@@ -5816,7 +5816,7 @@ async def _handle_chat_message_unserialized(
                 )
                 if task_setup_snapshot is None:
                     raise ValueError(f"Task {task_id} is no longer available")
-                agent_service = await get_agent_manager().get_agent_for_task(
+                agent_service = await get_agent_manager(websocket).get_agent_for_task(
                     task_id,
                     None,
                     user=task_setup_snapshot.runtime_user,
@@ -7427,7 +7427,7 @@ async def _handle_pause_task_unserialized(
 
         # Get agent service (as the task owner)
         logger.info(f"Getting agent service for task {task_id}")
-        agent_service = await get_agent_manager().get_agent_for_task(
+        agent_service = await get_agent_manager(websocket).get_agent_for_task(
             task_id,
             None,
             user=task_setup_snapshot.runtime_user,
@@ -7651,7 +7651,7 @@ async def _handle_resume_task_unserialized(
             status=task_status,
         ).as_dict()
 
-        agent_service = await get_agent_manager().get_agent_for_task(
+        agent_service = await get_agent_manager(websocket).get_agent_for_task(
             task_id,
             None,
             user=task_setup_snapshot.runtime_user,

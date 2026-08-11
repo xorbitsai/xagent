@@ -1749,6 +1749,31 @@ class TestLocalBrowserConfig:
             get_native_browser_app_name()
 
 
+class TestBrowserToolDefaultLocaleConfig:
+    """Fallback locale/timezone for browser_use (Playwright) sessions."""
+
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv(config.BROWSER_TOOL_DEFAULT_LOCALE, raising=False)
+        monkeypatch.delenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, raising=False)
+
+        assert config.get_browser_tool_default_locale() == "en-US"
+        assert config.get_browser_tool_default_timezone() is None
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_LOCALE, "ja-JP")
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, "Asia/Tokyo")
+
+        assert config.get_browser_tool_default_locale() == "ja-JP"
+        assert config.get_browser_tool_default_timezone() == "Asia/Tokyo"
+
+    def test_blank_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_LOCALE, "   ")
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, "")
+
+        assert config.get_browser_tool_default_locale() == "en-US"
+        assert config.get_browser_tool_default_timezone() is None
+
+
 class TestCheckpointStorageConfig:
     """Config for checkpoint trace-event storage encoding and retention."""
 

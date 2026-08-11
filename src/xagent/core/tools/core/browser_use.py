@@ -286,6 +286,12 @@ class BrowserSessionManager:
                         f"{existing.locale!r}; requested locale {locale!r} ignored "
                         "(a session's locale is frozen at creation)"
                     )
+                if timezone_id and existing.timezone_id != timezone_id:
+                    logger.warning(
+                        f"Browser session {session_id!r} already exists with timezone "
+                        f"{existing.timezone_id!r}; requested timezone {timezone_id!r} "
+                        "ignored (a session's timezone is frozen at creation)"
+                    )
                 existing._last_used = datetime.now()
                 return existing
 

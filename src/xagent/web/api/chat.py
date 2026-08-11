@@ -3652,7 +3652,13 @@ def _build_unique_workspace_target(base_dir: Path, filename: str) -> Path:
 async def create_task(
     request: TaskCreateRequest,
     # FastAPI always injects the real Request for HTTP calls regardless of the
-    # default; the None default keeps direct (test) callers working.
+    # default; the None default keeps direct (test) callers working. Must stay
+    # a bare `Request` annotation, not `Optional[Request]` -- FastAPI only
+    # recognizes the special-cased injected-Request parameter with the exact
+    # bare type; wrapping it in Optional makes FastAPI try to build a Pydantic
+    # field from it instead, which fails at route-registration time since
+    # Request isn't a valid Pydantic field type (verified: this reproduces a
+    # collection-time FastAPIError in every test that imports this module).
     http_request: Request = None,  # type: ignore[assignment]
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),

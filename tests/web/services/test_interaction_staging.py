@@ -1788,29 +1788,25 @@ def test_cm1_seven_cell_exit_matrix(
     ).scalar_one()
     assert row_count == _T_CM_1_ROW_COUNT_AFTER_DEGRADE[case]
 
-    # F-10: the degradation log record's `extra` payload is exactly the six
-    # keys the swallow handler emits -- pinned by diffing this record's
-    # attributes against a bare LogRecord's, rather than merely checking
+    # The degradation log record's `extra` payload is exactly the six keys
+    # the swallow handler emits -- pinned by diffing this record's
+    # attributes against a control record's, rather than merely checking
     # the six are present, so a key added to that call site without a
-    # matching test update is caught too.
+    # matching test update is caught too. The control record is emitted
+    # through the same logger and captured by the same caplog handler, so
+    # every environment-dependent built-in attribute (which varies across
+    # Python versions and capture setups) appears on both sides and cancels
+    # out of the diff; a hand-constructed bare LogRecord does not have that
+    # property.
     degraded_records = [
         r for r in caplog.records if r.message == "interaction handoff degraded"
     ]
     assert len(degraded_records) == 1, degraded_records
     record = degraded_records[0]
-    baseline = logging.LogRecord(
-        name="baseline",
-        level=logging.ERROR,
-        pathname="x",
-        lineno=1,
-        msg="m",
-        args=None,
-        exc_info=None,
+    logging.getLogger("xagent.web.services.task_interaction_staging").error(
+        "caplog baseline probe"
     )
-    # caplog's own capture handler formats every record it stores (to build
-    # its text log), which is what stamps `.message` onto it -- an artifact
-    # of capture, not part of the `extra` dict logger.error was called with.
-    baseline.message = baseline.getMessage()
+    baseline = next(r for r in caplog.records if r.message == "caplog baseline probe")
     extra_keys = set(vars(record)) - set(vars(baseline))
     assert extra_keys == _DEGRADATION_LOG_EXTRA_KEYS
     assert record.task_id == task_id

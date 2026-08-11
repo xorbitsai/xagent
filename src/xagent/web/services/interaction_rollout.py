@@ -113,6 +113,15 @@ def gating_key(task: "Task") -> str | None:
     widget task's synthetic key would collapse to ``"channel"`` even though
     its actual origin is ``"widget"``, silently pulling widget traffic into
     whatever rollout batch was meant only for IM channels.
+
+    The ``"channel"`` key is persisted but not stable over a task's
+    lifetime: ``Task.channel_id`` has ``ondelete=SET NULL``, so deleting
+    the channel a task belongs to nulls that column on the task row that
+    survives the deletion. A task gated as ``"channel"`` today can be
+    re-read later, after its channel is deleted, and gate as
+    ``"internal"`` instead -- the same task, two different answers,
+    neither of them wrong for the state of the data at the time each was
+    computed.
     """
     # Task.source is a legacy Column-typed attribute (not Mapped[str | None]),
     # so mypy sees it as opaque; cast rather than loosen
@@ -135,7 +144,10 @@ def gating_key(task: "Task") -> str | None:
 # reuse this one registry instead of standing up a second counter parser.
 # This mirrors ops_signals's own "one owner, many producers" shape. Only the
 # rollout.decision.* family is incremented in this PR; every other constant
-# below is a placeholder naming its future owner.
+# below is a placeholder naming its future owner. The nine placeholder
+# constants below are intentionally dead code until the producer named in
+# each one's comment lands and starts incrementing it -- not an oversight
+# to flag.
 # ---------------------------------------------------------------------------
 COUNTER_ROLLOUT_DECISION_ALLOWED = "rollout.decision.allowed"
 COUNTER_ROLLOUT_DECISION_BLOCKED_MODE = "rollout.decision.blocked_mode"
@@ -250,15 +262,23 @@ def validate_interaction_rollout_at_startup() -> InteractionRolloutPolicy:
 
         raw_sources_env = os.getenv(INTERACTION_NATIVE_SOURCES)
         tokens = get_interaction_native_sources()
+        # Same split and blank-filter as get_interaction_native_sources(),
+        # but without its case/whitespace normalization, so the duplicate
+        # check below can quote what the operator actually typed. Without
+        # this, "SDK,sdk" would report the collision as "'sdk' is listed
+        # more than once" with no indication that the two entries were
+        # spelled differently in the first place.
+        raw_tokens = [t for t in (raw_sources_env or "").split(",") if t.strip()]
 
-        seen: set[str] = set()
-        for token in tokens:
+        seen: dict[str, str] = {}
+        for token, raw_token in zip(tokens, raw_tokens):
             if token in seen:
                 raise InteractionRolloutConfigError(
-                    f"Invalid {INTERACTION_NATIVE_SOURCES}: entry {token!r} "
-                    "is listed more than once."
+                    f"Invalid {INTERACTION_NATIVE_SOURCES}: entry {raw_token!r} "
+                    f"is listed more than once (already present as "
+                    f"{seen[token]!r}; both normalize to {token!r})."
                 )
-            seen.add(token)
+            seen[token] = raw_token
             if token not in INTERACTION_GATING_SOURCES:
                 raise InteractionRolloutConfigError(
                     f"Invalid {INTERACTION_NATIVE_SOURCES} entry {token!r}: "

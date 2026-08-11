@@ -282,7 +282,7 @@ async def test_to5_non_admin_gets_403_with_exact_detail(
     assert exc.value.detail == "Admin access required"
 
 
-async def test_to5_admin_gets_200(monkeypatch, sqlite_session_with_table):
+async def test_to5b_admin_gets_200(monkeypatch, sqlite_session_with_table):
     _set_policy(monkeypatch, mode="legacy")
     response = await get_interaction_rollout_diagnostics(
         current_user=_admin_user(), db=sqlite_session_with_table
@@ -357,6 +357,31 @@ async def test_to8_stats_query_exception_returns_503_not_a_fake_zero(
     assert exc.value.status_code == 503
 
 
+async def test_to8b_connection_error_before_table_check_returns_503_not_500(
+    monkeypatch, sqlite_session_with_table
+):
+    """interaction_requests_table_exists() calls db.connection() before the
+    stats query runs. A transient failure there (connection refused,
+    dropped mid-request) must land in the same deliberate 503 branch as a
+    failure in the stats query itself, not escape the try block and reach
+    the caller as an unhandled 500.
+    """
+    _set_policy(monkeypatch, mode="legacy")
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("simulated connection failure")
+
+    monkeypatch.setattr(sqlite_session_with_table, "connection", _raise)
+
+    with pytest.raises(HTTPException) as exc:
+        await get_interaction_rollout_diagnostics(
+            current_user=_admin_user(), db=sqlite_session_with_table
+        )
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "Interaction rollout diagnostics stats query failed"
+    assert "task_interaction_requests" not in exc.value.detail
+
+
 # ---------------------------------------------------------------------------
 # Counter registry snapshot isolation
 # ---------------------------------------------------------------------------
@@ -373,7 +398,7 @@ def test_to9_counters_snapshot_is_a_copy_not_a_live_reference():
     assert "bogus" not in fresh
 
 
-def test_to9_counters_snapshot_concurrent_increments_total_correctly():
+def test_to9b_counters_snapshot_concurrent_increments_total_correctly():
     import threading
 
     def _bump():

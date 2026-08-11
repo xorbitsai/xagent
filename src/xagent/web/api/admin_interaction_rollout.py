@@ -61,11 +61,11 @@ async def get_interaction_rollout_diagnostics(
         "degradations": active_degradations(),
     }
 
-    if not interaction_requests_table_exists(db):
-        response["schema_absent"] = True
-        return response
-
     try:
+        if not interaction_requests_table_exists(db):
+            response["schema_absent"] = True
+            return response
+
         row = db.execute(
             text(
                 "SELECT count(*) AS active_count, "

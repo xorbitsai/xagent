@@ -157,34 +157,64 @@ def _paged_list(
     return response
 
 
-def _success_with_capped_dict(field_name: str, data: Any, **rest: Any) -> str:
-    """Build a success payload, halving a dict's top-level keys until the
-    response fits the platform's output limit.
+def _success_with_capped_dict(field_name: str, data: Any) -> str:
+    """Build a success payload, trimming a dict until the response fits the
+    platform's output limit.
 
     HubSpot's analytics/statistics/metrics responses are dicts keyed by
     date, dimension, or id depending on the endpoint and parameters (e.g.
     one key per day for a "daily" analytics breakdown over a wide date
-    range) rather than a single flat list, so this halves top-level keys
-    instead of list items - same adaptive-halving reasoning as
-    _paged_list, applied to the shape these tools actually return. When
-    ``data`` isn't a dict, there is nothing generically safe to trim
-    without guessing at a shape this function doesn't know, so it is
-    returned as-is (``truncated`` stays False - it reports content this
-    function removed, and here nothing was).
+    range), where most of the payload's size typically lives in one or two
+    large nested list/dict values while the rest are small scalars (an
+    "offset" or "total" field alongside a big "breakdowns" list). Dropping
+    whole top-level keys to shrink such a dict can discard the entire
+    useful payload on the very first step while leaving small, mostly
+    empty scalar fields behind - and there's no cursor to retry with, so
+    that data is gone for this call. Phase 1 instead repeatedly finds the
+    largest list/dict-valued key and halves *its* contents (recursing one
+    level, not further), so small scalar keys survive untouched as long as
+    there is a bigger key left to shrink first. Phase 2 is a fallback for
+    the residual case - a dict with no list/dict-valued keys at all (e.g.
+    a handful of scalar keys with huge string values) - and drops whole
+    keys, exactly as phase 1 replaces; it's guaranteed to terminate at {}.
     """
     max_output_length = get_tool_max_output_length()
-    truncated = False
-    payload = {field_name: data, "truncated": truncated, **rest}
-    response = _success(**payload)
-    if not isinstance(data, dict):
+    response = _success(**{field_name: data, "truncated": False})
+    if not isinstance(data, dict) or len(response) <= max_output_length:
         return response
-    keys = list(data.keys())
+
+    working = dict(data)
+    truncated = False
+    while len(response) > max_output_length:
+        collection_keys = [
+            key
+            for key, value in working.items()
+            if isinstance(value, (list, dict)) and len(value) > 0
+        ]
+        if not collection_keys:
+            break
+        target_key = max(
+            collection_keys,
+            key=lambda key: len(json.dumps(working[key], ensure_ascii=False)),
+        )
+        target_value = working[target_key]
+        if isinstance(target_value, list):
+            working[target_key] = target_value[: len(target_value) // 2]
+        else:
+            sub_keys = list(target_value.keys())
+            working[target_key] = {
+                sub_key: target_value[sub_key]
+                for sub_key in sub_keys[: len(sub_keys) // 2]
+            }
+        truncated = True
+        response = _success(**{field_name: working, "truncated": truncated})
+
+    keys = list(working.keys())
     while len(response) > max_output_length and keys:
         keys = keys[: len(keys) // 2]
-        data = {key: data[key] for key in keys}
+        working = {key: working[key] for key in keys}
         truncated = True
-        payload = {field_name: data, "truncated": truncated, **rest}
-        response = _success(**payload)
+        response = _success(**{field_name: working, "truncated": truncated})
     return response
 
 
@@ -778,9 +808,19 @@ def hubspot_get_marketing_email_statistics(
             "emailIds": ids
         }
         if start_date:
-            params["startTimestamp"] = start_date
+            params["startTimestamp"] = _require_date_format(
+                start_date,
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+                "start_date",
+                "YYYY-MM-DDTHH:MM:SSZ",
+            )
         if end_date:
-            params["endTimestamp"] = end_date
+            params["endTimestamp"] = _require_date_format(
+                end_date,
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+                "end_date",
+                "YYYY-MM-DDTHH:MM:SSZ",
+            )
         result = _request("GET", "/marketing/v3/emails/statistics/list", params=params)
         return _success_with_capped_dict("statistics", result)
     except Exception as e:
@@ -799,6 +839,11 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
     output size limit - retry with a smaller `limit` to see the trimmed
     entries. Use hubspot_get_campaign_metrics for performance metrics on
     a specific campaign.
+
+    The connector requests marketing.campaigns.read as optional (the
+    Campaigns API requires Marketing Hub Professional or higher), so this
+    call fails with a permissions error on portals below that tier - the
+    connection itself still works for every other tool.
     """
     try:
         params: dict[str, Any] = {
@@ -834,6 +879,11 @@ def hubspot_get_campaign_metrics(
     `end_date` are optional "YYYY-MM-DD" strings (a different format
     from hubspot_get_analytics_report's "YYYYMMDD" - this is a separate,
     newer HubSpot API) that limit the reporting window.
+
+    The connector requests marketing.campaigns.read as optional (the
+    Campaigns API requires Marketing Hub Professional or higher), so this
+    call fails with a permissions error on portals below that tier - the
+    connection itself still works for every other tool.
     """
     try:
         campaign_id = _url_path_id(campaign_id, "campaign_id")

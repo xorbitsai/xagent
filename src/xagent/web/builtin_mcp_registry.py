@@ -328,23 +328,29 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
                 "forms",
-                "marketing.campaigns.read",
             ],
-            # Both scopes are tier-gated (business-intelligence: Marketing
-            # Hub Basic+; marketing-email: Enterprise or the transactional
-            # email add-on); requesting them as required scopes would block
-            # the whole OAuth authorization (and therefore every CRM tool
-            # too) for portals below those tiers. Sent
-            # via the authorize request's optional_scope parameter instead
-            # (see api/auth.py) so those portals still connect successfully
-            # and only hubspot_get_analytics_report /
-            # hubspot_list_marketing_emails / hubspot_get_marketing_email_statistics
-            # fail at call time if the tier doesn't grant them. This pairing
-            # must also be reflected in this app's scope configuration in the
+            # All three are tier-gated (business-intelligence: Marketing Hub
+            # Basic+; marketing-email: Enterprise or the transactional email
+            # add-on; marketing.campaigns.read: the Campaigns API itself
+            # requires Marketing Hub Professional+, confirmed against
+            # HubSpot's Campaigns API docs); requesting any of them as
+            # required scopes would block the whole OAuth authorization (and
+            # therefore every CRM tool too) for portals below those tiers.
+            # Sent via the authorize request's optional_scope parameter
+            # instead (see api/auth.py) so those portals still connect
+            # successfully and only hubspot_get_analytics_report /
+            # hubspot_list_marketing_emails / hubspot_get_marketing_email_statistics /
+            # hubspot_list_campaigns / hubspot_get_campaign_metrics fail at
+            # call time if the tier doesn't grant them. This pairing must
+            # also be reflected in this app's scope configuration in the
             # HubSpot Developer Dashboard - HubSpot blocks installation if a
             # scope's required/optional designation there disagrees with
             # which parameter it arrives in.
-            "optional_oauth_scopes": ["business-intelligence", "marketing-email"],
+            "optional_oauth_scopes": [
+                "business-intelligence",
+                "marketing-email",
+                "marketing.campaigns.read",
+            ],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -699,6 +705,27 @@ def get_builtin_optional_oauth_scopes(app_id: str) -> list[str]:
     if row is None:
         return []
     return list(row.get("optional_oauth_scopes", []))
+
+
+def get_builtin_execution_fields_and_optional_scopes(
+    app_id: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Single-scan equivalent of calling get_builtin_execution_fields and
+    get_builtin_optional_oauth_scopes separately.
+
+    Each of those does its own linear scan of the registry plus a deepcopy
+    of the full matched row; a caller needing both (as _app_to_dict does
+    for every app on a listing path) would otherwise pay for that scan
+    twice per app. This does it once and derives both results from the
+    same row.
+    """
+    row = get_builtin_public_mcp_app(app_id)
+    if row is None:
+        return None, []
+    execution_fields = {
+        field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES
+    }
+    return execution_fields, list(row.get("optional_oauth_scopes", []))
 
 
 def _safe_configuration_hash(values: dict[str, Any]) -> str:

@@ -429,11 +429,14 @@ def test_get_form_submissions_reports_has_more(monkeypatch):
     )
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
 
-    result = json.loads(hubspot.hubspot_get_form_submissions("form-1", limit=10))
+    result = json.loads(
+        hubspot.hubspot_get_form_submissions("form-1", limit=10, after="cursor-0")
+    )
 
     assert result["status"] == "success"
     assert result["has_more"] is True
     assert result["after"] == "cursor-1"
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-0"
     assert mock_request.call_args.kwargs["url"].endswith(
         "/form-integrations/v1/submissions/forms/form-1"
     )
@@ -621,11 +624,32 @@ def test_get_analytics_report_rejects_wrong_date_format(monkeypatch):
     mock_request.assert_not_called()
 
 
-def test_get_analytics_report_caps_output_size(monkeypatch):
-    """A "daily" breakdown over a wide date range is keyed by date at the
-    top level - many buckets, each with a nested per-dimension breakdown -
-    so the cap must halve top-level keys, not assume a flat object."""
-    report = {f"202601{day:02d}": {"sources": "x" * 200} for day in range(1, 29)}
+def test_get_analytics_report_rejects_bad_end_date_with_valid_start_date(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "20260101", "2026-01-31")
+    )
+
+    assert result["status"] == "error"
+    assert "end_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_analytics_report_caps_output_preserving_scalar_keys(monkeypatch):
+    """The cap must shrink the CONTENTS of the largest nested list/dict
+    value, not drop whole top-level keys - dropping keys could discard a
+    small summary field (offset, total) on the very first step while the
+    oversized field it summarizes survives untouched, and there's no
+    cursor to retry with to recover it."""
+    report = {
+        "offset": 0,
+        "total": 42,
+        "breakdowns": [
+            {"date": f"202601{day:02d}", "value": "x" * 200} for day in range(1, 40)
+        ],
+    }
     mock_request = Mock(return_value=MockResponse(json_data=report))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
     monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 2000)
@@ -638,8 +662,30 @@ def test_get_analytics_report_caps_output_size(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is True
-    assert 0 < len(result["report"]) < len(report)
-    assert len(json.dumps(result)) <= 2000 + 200  # last halving step can overshoot
+    assert result["report"]["offset"] == 0
+    assert result["report"]["total"] == 42
+    assert 0 < len(result["report"]["breakdowns"]) < len(report["breakdowns"])
+    assert len(json.dumps(result)) <= 2000 + 400  # last halving step can overshoot
+
+
+def test_get_analytics_report_falls_back_to_dropping_keys_with_no_collections(
+    monkeypatch,
+):
+    """When a dict has no list/dict-valued keys to shrink into - e.g. a
+    handful of scalar fields with huge string values - the fallback must
+    still guarantee termination by dropping whole keys, down to {}."""
+    report = {"totals": "x" * 5000}
+    mock_request = Mock(return_value=MockResponse(json_data=report))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 200)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "20260101", "20260131")
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["report"] == {}
 
 
 def test_get_analytics_report_does_not_truncate_a_small_response(monkeypatch):
@@ -757,6 +803,40 @@ def test_get_marketing_email_statistics_passes_email_ids(monkeypatch):
     }
     assert mock_request.call_args.kwargs["params"] == {"emailIds": ["e1", "e2"]}
     assert mock_request.call_args.kwargs["method"] == "GET"
+
+
+def test_get_marketing_email_statistics_passes_through_a_non_dict_body(monkeypatch):
+    """A non-dict response body has nothing generically safe to trim
+    without guessing at a shape the capping helper doesn't know, so it
+    must pass through unmodified with truncated=False rather than crash
+    or silently corrupt the value."""
+    mock_request = Mock(return_value=MockResponse(json_data=[{"id": "e1"}]))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1"))
+
+    assert result == {
+        "status": "success",
+        "statistics": [{"id": "e1"}],
+        "truncated": False,
+    }
+
+
+def test_get_marketing_email_statistics_rejects_bad_end_date_with_valid_start_date(
+    monkeypatch,
+):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_marketing_email_statistics(
+            "e1", start_date="2026-01-01T00:00:00Z", end_date="not-a-timestamp"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "end_date" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_get_marketing_email_statistics_passes_time_window(monkeypatch):
@@ -950,6 +1030,21 @@ def test_get_campaign_metrics_rejects_wrong_date_format(monkeypatch):
 
     assert result["status"] == "error"
     assert "YYYY-MM-DD" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_campaign_metrics_rejects_bad_end_date_with_valid_start_date(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_campaign_metrics(
+            "campaign-1", start_date="2026-01-01", end_date="20260131"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "end_date" in result["message"]
     mock_request.assert_not_called()
 
 

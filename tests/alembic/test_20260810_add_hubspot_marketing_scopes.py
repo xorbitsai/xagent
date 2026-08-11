@@ -252,9 +252,11 @@ def test_upgrade_without_table_is_a_noop(tmp_path):
 
 
 def test_upgrade_invalidates_existing_hubspot_grant_only(tmp_path):
-    """Both tokens must be cleared: refresh_oauth_token_if_needed re-mints an
-    access token off refresh_token alone, so a surviving refresh_token would
-    silently resurrect the old-scoped grant on the next tool call.
+    """Both tokens must be cleared. The current token resolver already
+    short-circuits on a falsy access_token before reaching
+    refresh_oauth_token_if_needed, so clearing refresh_token too is
+    defense-in-depth against a future resolver shape, not a fix for a
+    live path today.
     """
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

@@ -43,15 +43,16 @@ PREVIOUS_SCOPES = [
 CURRENT_SCOPES = [
     *PREVIOUS_SCOPES,
     "forms",
-    "marketing.campaigns.read",
 ]
-# business-intelligence and marketing-email are requested separately via the
-# authorize request's optional_scope parameter (see api/auth.py and
-# get_builtin_optional_oauth_scopes) - not part of oauth_scopes at all, so
-# not persisted here. Both are tier-gated (business-intelligence: Marketing
-# Hub Basic+; marketing-email: Enterprise or the transactional email
-# add-on); requesting them as required scopes would block reconnection
-# entirely for portals below those tiers.
+# business-intelligence, marketing-email, and marketing.campaigns.read are
+# requested separately via the authorize request's optional_scope parameter
+# (see api/auth.py and get_builtin_optional_oauth_scopes) - not part of
+# oauth_scopes at all, so not persisted here. All three are tier-gated
+# (business-intelligence: Marketing Hub Basic+; marketing-email: Enterprise
+# or the transactional email add-on; marketing.campaigns.read: the
+# Campaigns API itself requires Marketing Hub Professional+); requesting
+# any of them as required scopes would block reconnection entirely for
+# portals below those tiers.
 
 PREVIOUS_DESCRIPTION = (
     "Connect to HubSpot CRM to search, create, and update contacts and "
@@ -141,13 +142,17 @@ def _invalidate_existing_hubspot_grants(bind: sa.engine.Connection) -> None:
     existing connection keeps showing "Connected" and fails only at call time
     with a raw HubSpot missing-scopes error.
 
-    Unlike the Facebook migration, refresh_token must be cleared too:
-    refresh_oauth_token_if_needed (web/tools/config.py) refreshes purely off
-    expires_at + refresh_token without ever looking at access_token, and
-    HubSpot access tokens expire in ~30 minutes — so a cleared access_token
-    with a surviving refresh_token would be silently re-minted (with the old
-    scope set) on the next tool call. Meta has no such path; its refresh
-    exchanges the access token itself, which clearing already breaks.
+    Unlike the Facebook migration, refresh_token is cleared too, as
+    defense-in-depth: the current token resolver (web/tools/config.py)
+    already short-circuits on a falsy access_token before ever reaching
+    refresh_oauth_token_if_needed, so a surviving refresh_token cannot
+    resurrect the old-scoped grant through that specific path today. It's
+    cleared anyway so this migration doesn't rely on that resolver's
+    current shape staying exactly as it is - a future resolver that checks
+    refresh_token independently of access_token would otherwise silently
+    re-mint the old-scoped access_token on its next refresh. Meta has no
+    such path to defend against; its refresh exchanges the access token
+    itself, which clearing already breaks.
     """
     if not _columns_present(bind, "user_oauth", {"provider", "access_token"}):
         return

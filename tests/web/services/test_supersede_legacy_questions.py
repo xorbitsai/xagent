@@ -176,11 +176,15 @@ def test_supersede_degrades_on_dbapi_error_and_lets_the_caller_commit(monkeypatc
         assert signal_name in ops_signals.active_degradations()
         detail = ops_signals.active_degradations()[signal_name]
         # Exact match, not a substring check: the detail is a composed
-        # "task_id=<id> exception_type=<class name>" string with nothing
-        # else in it -- no exception free-text, which could leak DB
-        # connection info into a process-wide, unauthenticated-adjacent
-        # registry (see ops_signals.py's own docstring on that boundary).
-        assert detail == f"task_id={task.id} exception_type=OperationalError"
+        # "task <id>: legacy question supersede failed (<class name>)"
+        # string with nothing else in it -- no exception free-text, which
+        # could leak DB connection info into a process-wide,
+        # unauthenticated-adjacent registry (see ops_signals.py's own
+        # docstring on that boundary).
+        assert (
+            detail
+            == f"task {task.id}: legacy question supersede failed (OperationalError)"
+        )
 
         # The point of the savepoint: the caller's transaction is still
         # usable and can commit after the swallow.

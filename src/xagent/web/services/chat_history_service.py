@@ -382,7 +382,7 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
         logger.error("Failed to supersede legacy question rows for task %s", task_id)
         register_degradation(
             CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
-            f"task_id={task_id} exception_type={type(exc).__name__}",
+            f"task {task_id}: legacy question supersede failed ({type(exc).__name__})",
         )
         return 0
 

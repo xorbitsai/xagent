@@ -1186,7 +1186,7 @@ def test_permanent_delete_unregisters_cascade_deleted_trigger_bindings(
     captured: list[Any] = []
     monkeypatch.setattr(
         "xagent.web.api.workforces.unregister_deleted_trigger_bindings",
-        lambda _db, teardowns: captured.append(list(teardowns)),
+        lambda teardowns: captured.append(list(teardowns)),
     )
 
     response = client.delete(

@@ -831,13 +831,12 @@ async def archive_or_delete_workforce(
         await pause_workforce_tasks_after_archive(pause_targets)
         if trigger_teardowns:
             # Provider unregister (e.g. releasing a Gmail watch) can do real
-            # network I/O; this route is `async def` so FastAPI runs it
-            # directly on the event loop thread -- offload to a worker
-            # thread instead of blocking every other concurrent request on
-            # it, same as delete_workforce_trigger_route already does for a
-            # single trigger delete.
+            # network I/O; offload to a worker thread instead of blocking
+            # every other concurrent request on the event loop. Does NOT
+            # pass this request's `db` through -- a Session is not safe to
+            # hand to a background thread, so the callee opens its own.
             await asyncio.to_thread(
-                unregister_deleted_trigger_bindings, db, trigger_teardowns
+                unregister_deleted_trigger_bindings, trigger_teardowns
             )
         return {"id": workforce_id, "status": "deleted"}
 

@@ -86,33 +86,24 @@ export default function WorkforcesPage() {
     void load(page, search)
   }, [load, page, search])
 
-  const handlePublish = async (item: WorkforceListItem) => {
+  const createPublishHandler = (publish: boolean) => async (item: WorkforceListItem) => {
+    const apiCall = publish ? publishWorkforce : unpublishWorkforce
     try {
       setPublishingId(item.id)
-      await publishWorkforce(item.id)
-      toast.success(t("workforces.messages.published"))
+      await apiCall(item.id)
+      toast.success(t(publish ? "workforces.messages.published" : "workforces.messages.unpublished"))
       void load(page, search)
     } catch (err) {
-      const nextError = err instanceof Error ? err.message : t("workforces.errors.publish")
+      const nextError = err instanceof Error
+        ? err.message
+        : t(publish ? "workforces.errors.publish" : "workforces.errors.unpublish")
       toast.error(nextError)
     } finally {
       setPublishingId(null)
     }
   }
-
-  const handleUnpublish = async (item: WorkforceListItem) => {
-    try {
-      setPublishingId(item.id)
-      await unpublishWorkforce(item.id)
-      toast.success(t("workforces.messages.unpublished"))
-      void load(page, search)
-    } catch (err) {
-      const nextError = err instanceof Error ? err.message : t("workforces.errors.unpublish")
-      toast.error(nextError)
-    } finally {
-      setPublishingId(null)
-    }
-  }
+  const handlePublish = createPublishHandler(true)
+  const handleUnpublish = createPublishHandler(false)
 
   const handleArchive = async (item: WorkforceListItem) => {
     try {

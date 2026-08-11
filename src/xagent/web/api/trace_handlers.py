@@ -43,7 +43,10 @@ from ...web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
     current_task_lease,
 )
-from ...web.services.trace_event_staging import stage_trace_event_row
+from ...web.services.trace_event_staging import (
+    checkpoint_run_partition_filter,
+    stage_trace_event_row,
+)
 from ...web.services.trace_message_storage import (
     SQL_IN_CLAUSE_CHUNK_SIZE,
     CheckpointMessageDecodeError,
@@ -470,8 +473,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
     @staticmethod
     def _checkpoint_run_partition_filter(run_id: str | None) -> Any:
-        run_field = DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD].as_string()
-        return run_field == run_id if run_id is not None else run_field.is_(None)
+        return checkpoint_run_partition_filter(run_id)
 
     def _load_pk_anchored_checkpoint(
         self,

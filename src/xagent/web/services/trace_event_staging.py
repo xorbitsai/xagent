@@ -156,5 +156,33 @@ def stage_trace_event_row(
                 trace_event_id=row_id,
             ),
         )
-
     return StagedTraceRow(row_id=None, stored_data=data, anchor=None)
+
+
+def checkpoint_run_partition_filter(run_id: str | None) -> Any:
+    """The run-partition predicate the legacy checkpoint scan uses to filter
+    ``trace_events`` rows by run partition
+    (``DatabaseTraceHandler._checkpoint_run_partition_filter``,
+    ``web/api/trace_handlers.py``).
+
+    Moved here, unchanged, from that ``trace_handlers.py`` staticmethod: this
+    module already imports every name the predicate needs
+    (``DatabaseTraceEvent``, ``TASK_RUN_ID_TRACE_FIELD``), and services must
+    not import from api, so the move means a future services-layer consumer
+    of this predicate never has to reverse-import the api layer to get it.
+
+    The interaction anchor resolver (``resolve_interaction_anchor``,
+    ``services/task_interaction_anchor.py``) is not such a consumer -- it
+    never calls this function. It does its own plain-Python equality check
+    against a single already-fetched row instead of building a SQL predicate
+    for a query's ``WHERE`` clause, and is mentioned here only as this
+    function's semantic sibling: the two answer the same run-partition-match
+    question, but disagree on what ``run_id IS NULL`` means. ``run_id is
+    None`` is a legitimate partition here -- the root-checkpoint read path
+    this predicate was written for can genuinely have no run id yet --
+    which is why it compiles to ``IS NULL`` rather than being rejected. The
+    resolver instead treats ``task.run_id IS NULL`` as absence outright,
+    before any row is even read (see that module's own docstring for why).
+    """
+    run_field = DatabaseTraceEvent.data[TASK_RUN_ID_TRACE_FIELD].as_string()
+    return run_field == run_id if run_id is not None else run_field.is_(None)

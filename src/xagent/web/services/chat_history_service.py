@@ -390,7 +390,11 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
                 )
             )
     except DBAPIError as exc:
-        logger.error("Failed to supersede legacy question rows for task %s", task_id)
+        logger.error(
+            "Failed to supersede legacy question rows for task %s",
+            task_id,
+            exc_info=True,
+        )
         register_degradation(
             CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
             f"task {task_id}: legacy question supersede failed ({type(exc).__name__})",

@@ -1,13 +1,16 @@
 """Behavior tests for ``supersede_legacy_question_rows``.
 
-Covers the SQLite-reachable half of the eight pinned cells: whole-set
+Covers everything about the helper that is provable on SQLite: whole-set
 rewrite semantics with negative controls (role and cross-task isolation),
 idempotency, the degrade/propagate split on the catch clause, signal
-pairing, and transcript-field invariance. The PostgreSQL-only cell
-(savepoint necessity under an aborted transaction) lives in
-``test_supersede_savepoint_postgresql.py`` -- SQLite does not poison an
-open transaction after a failed statement, so that mutation cannot be
-proven red here (see that file's module docstring).
+pairing, and transcript-field invariance. One property is not provable
+here -- that the savepoint is actually necessary, i.e. that a failed
+statement without it would poison the caller's transaction. SQLite does
+not abort an open transaction after a failed statement the way
+PostgreSQL does, so that specific mutation cannot be made to fail on
+this backend; it is covered instead in
+``test_supersede_savepoint_postgresql.py`` (see that file's module
+docstring).
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import ops_signals
 from xagent.web.services.chat_history_service import (
+    SUPERSEDED_MESSAGE_TYPE,
     get_latest_waiting_question,
     persist_assistant_message,
     supersede_legacy_question_rows,
@@ -63,10 +67,11 @@ def _clean_signal():
 
 def test_supersede_zeroes_the_whole_waiting_set_with_negative_controls():
     """Two simultaneously waiting questions on the same task both flip;
-    a same-task row with ``role='user'`` and a same-shaped row on a
-    different task are untouched -- the negative controls prove the
-    ``role`` and ``task_id`` predicate legs actually gate the update,
-    not just the ``message_type`` leg."""
+    a same-task row with ``role='user'``, a same-task assistant row with
+    a different ``message_type``, and a same-shaped row on a different
+    task are all untouched -- the negative controls prove all three
+    predicate legs (``role``, ``message_type``, ``task_id``) actually
+    gate the update, not just one of them."""
     db = _create_db_session()
     try:
         task = _create_task(db)
@@ -100,6 +105,17 @@ def test_supersede_zeroes_the_whole_waiting_set_with_negative_controls():
         db.commit()
         db.refresh(user_row)
 
+        # Adversarial negative control: role='assistant' and same task,
+        # but message_type is not "question" -- if the helper's predicate
+        # ever dropped the message_type leg, this row would wrongly flip
+        # too.
+        non_question_row = persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "Just a status update, not a question",
+        )
+
         other_question = persist_assistant_message(
             db,
             int(other_task.id),
@@ -114,11 +130,31 @@ def test_supersede_zeroes_the_whole_waiting_set_with_negative_controls():
         db.refresh(first)
         db.refresh(second)
         db.refresh(user_row)
+        db.refresh(non_question_row)
         db.refresh(other_question)
-        assert first.message_type == "question_superseded"
-        assert second.message_type == "question_superseded"
+        assert first.message_type == SUPERSEDED_MESSAGE_TYPE
+        assert second.message_type == SUPERSEDED_MESSAGE_TYPE
         assert user_row.message_type == "question"
+        assert non_question_row.message_type == "assistant_message"
         assert other_question.message_type == "question"
+    finally:
+        db.close()
+
+
+def test_supersede_is_a_benign_no_op_for_a_task_with_no_rows():
+    """A nonexistent ``task_id`` is a benign 0-row no-op, not an error --
+    the same outcome as an empty projection where no assistant question
+    row was ever persisted for a real task. Pins the ``task_id`` leg's
+    behavior at its boundary, distinct from
+    ``test_supersede_is_idempotent_on_a_second_call``, which pins
+    behavior on a task that *did* have a row superseded already."""
+    db = _create_db_session()
+    try:
+        updated = supersede_legacy_question_rows(db, task_id=999999)
+
+        assert updated == 0
+        signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
+        assert signal_name not in ops_signals.active_degradations()
     finally:
         db.close()
 
@@ -141,7 +177,7 @@ def test_supersede_is_idempotent_on_a_second_call():
         assert first_pass == 1
         assert second_pass == 0
         db.refresh(row)
-        assert row.message_type == "question_superseded"
+        assert row.message_type == SUPERSEDED_MESSAGE_TYPE
     finally:
         db.close()
 
@@ -287,21 +323,22 @@ def test_supersede_never_commits_and_the_caller_can_still_roll_back(monkeypatch)
     wedged connection) that would have taken that ability away from the
     caller.
 
-    That second write is a fresh row, not the supersede's own row. On
-    real ACID PostgreSQL a caller-issued ``db.rollback()`` after this
-    point would undo the supersede's own UPDATE too, since a released
-    SAVEPOINT only discards the ability to roll back *to* that point --
-    it does not commit anything. On this SQLite test engine it does not:
-    the stock pysqlite driver has a long-documented quirk where SQL text
-    it does not itself parse as starting a transaction (``SAVEPOINT``,
-    ``RELEASE``) can leave its own implicit transaction bookkeeping out
-    of sync with the server, so a RELEASEd savepoint's write has been
-    observed to survive a later top-level ``ROLLBACK`` here -- a fact
-    about this driver, not about ``supersede_legacy_question_rows``.
-    Asserting on the supersede's own row here would be asserting a false
-    thing on this backend; the second-write check proves the same
-    "helper stays out of the caller's transaction control" property
-    without depending on that driver quirk.
+    That second write is a fresh row, not the supersede's own row, and
+    that is deliberate. On real ACID PostgreSQL a caller-issued
+    ``db.rollback()`` after this point would, in principle, undo the
+    supersede's own UPDATE too, since a released SAVEPOINT only discards
+    the ability to roll back *to* that point -- it does not commit
+    anything. That narrower claim -- that the supersede's own row reverts
+    under a later top-level rollback -- is not asserted anywhere in this
+    suite, not on SQLite and not on PostgreSQL:
+    ``test_supersede_savepoint_postgresql.py`` proves a different
+    property (a CHECK-constraint failure inside the savepoint not
+    poisoning the outer transaction), not rollback survival. What this
+    test proves is narrower and does not depend on that unasserted claim:
+    the helper never commits or rolls back on its own, shown by the
+    commit spy recording zero calls and by the fresh sentinel row above
+    still being cleanly removable by the caller's own explicit rollback
+    -- proof the session was left as a normal, abortable transaction.
     """
     db = _create_db_session()
     try:
@@ -388,7 +425,7 @@ def test_supersede_touches_only_the_message_type_column():
         supersede_legacy_question_rows(db, task_id=int(task.id))
 
         db.refresh(row)
-        assert row.message_type == "question_superseded"
+        assert row.message_type == SUPERSEDED_MESSAGE_TYPE
         assert row.id == before["id"]
         assert row.content == before["content"]
         assert row.interactions == before["interactions"]
@@ -440,8 +477,8 @@ def test_supersede_opens_a_savepoint(monkeypatch):
 def test_supersede_end_to_end_with_the_reader():
     """Persist a waiting question, confirm the reader sees it, supersede
     it, then confirm the reader sees nothing -- proving the two functions
-    agree end-to-end, not just on the statically extracted predicate sets
-    ``test_supersede_predicate_pairing.py`` checks."""
+    agree end-to-end at runtime, on top of sharing
+    ``_waiting_question_filters`` at the source level."""
     db = _create_db_session()
     try:
         task = _create_task(db)

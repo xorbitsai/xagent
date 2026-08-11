@@ -21,6 +21,7 @@ from xagent.core.agent import (
     PlanStep,
     PlanValidationError,
 )
+from xagent.core.agent.clarification import draft_from_waiting_request
 from xagent.core.agent.pattern.base import RequiredToolCallError
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.agent.pattern.dag.plan_generator import (
@@ -1668,6 +1669,401 @@ async def test_dag_pattern_concurrent_failure_clears_cancelled_sibling() -> None
         "fail": "failed",
         "slow": "pending",
     }
+
+
+class ConcurrentWaitingLLM:
+    """Two DAG steps that each reach waiting_for_user via
+    send_message(expect_response=True), synchronized on a shared release
+    event so both complete inside the same asyncio.wait() wakeup."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.started_by_task: dict[str, asyncio.Event] = {}
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
+        messages = list(kwargs.get("messages", []))
+        task = current_step_task(messages)
+        self.started_by_task.setdefault(task, asyncio.Event()).set()
+        await self.release.wait()
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"ask-{task}",
+                    "function": {
+                        "name": "send_message",
+                        "arguments": json.dumps(
+                            {
+                                "message": f"Question for {task}",
+                                "message_type": "question",
+                                "expect_response": True,
+                            }
+                        ),
+                    },
+                }
+            ],
+            "done": False,
+        }
+
+    async def wait_started(self, task: str) -> None:
+        await asyncio.wait_for(
+            self.started_by_task.setdefault(task, asyncio.Event()).wait(),
+            timeout=1,
+        )
+
+
+async def run_double_waiting_dag(
+    *, first_step_id: str, second_step_id: str
+) -> tuple[DAGPattern, dict[str, Any], TracerCheckpointStore]:
+    """Run a two-step DAG where both steps reach waiting_for_user in the
+    same wakeup; return the pattern, the DAG's returned result dict, and
+    the checkpoint tracer, for the caller to assert against."""
+
+    tracer = TracerCheckpointStore()
+    llm = ConcurrentWaitingLLM()
+    execution_id = f"dag-double-waiting-{first_step_id}-{second_step_id}"
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id=first_step_id, task=f"Ask {first_step_id}"),
+            PlanStep(id=second_step_id, task=f"Ask {second_step_id}"),
+        ),
+        max_concurrency=2,
+    )
+    runtime = PatternRuntime(tracer=tracer, execution_id=execution_id)
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id=execution_id),
+            tools=[],
+            llm=llm,
+            runtime=runtime,
+        )
+    )
+    await llm.wait_started(f"Ask {first_step_id}")
+    await llm.wait_started(f"Ask {second_step_id}")
+    llm.release.set()
+    result = await asyncio.wait_for(run_task, timeout=1)
+    return pattern, result, tracer
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_concurrent_double_waiting_invalidates_loser() -> None:
+    """T-X-1: when two steps both reach waiting_for_user in the same
+    wakeup, exactly one draft is delivered; the other is invalidated
+    (status, active-step bookkeeping cleared) and its id is surfaced under
+    clarification_superseded_step_ids on the winner's result. No signal is
+    asserted here -- registering one is not this layer's job."""
+
+    pattern, result, _ = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert result["active_step_id"] == "ask_a"
+    assert result["clarification_superseded_step_ids"] == ["ask_b"]
+
+    steps_by_id = {step.id: step for step in pattern.plan.steps}
+    assert steps_by_id["ask_b"].status == "clarification_invalidated"
+    assert steps_by_id["ask_a"].status == "running"
+
+    assert pattern.active_step_ids == ["ask_a"]
+    assert "ask_b" not in pattern.active_step_pattern_states
+    assert "ask_b" not in pattern.active_step_contexts
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_concurrent_double_waiting_winner_is_deterministic() -> None:
+    """T-X-2: the winner is the lexicographically first step id, regardless
+    of which step's task happened to be constructed (and therefore
+    scheduled) first -- not whichever task a ``set`` iterates first."""
+
+    _, result_first_then_second, _ = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+    _, result_second_then_first, _ = await run_double_waiting_dag(
+        first_step_id="ask_b", second_step_id="ask_a"
+    )
+
+    assert result_first_then_second["active_step_id"] == "ask_a"
+    assert result_second_then_first["active_step_id"] == "ask_a"
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_concurrent_double_waiting_delivers_to_winner() -> None:
+    """T-X-3: the reply-delivery lookup resolves to the winning step, not
+    an arbitrary one."""
+
+    pattern, result, _ = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+
+    assert pattern._waiting_step_id() == "ask_a" == result["active_step_id"]
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_single_waiting_regression_unchanged() -> None:
+    """T-X-4: a single step reaching waiting_for_user, with an independent
+    sibling still running, is unaffected by the exactly-one machinery --
+    same result keys, same sibling cancellation, no superseded-step key."""
+
+    class WaitingAndSlowLLM:
+        def __init__(self) -> None:
+            self.slow_started = asyncio.Event()
+            self.slow_cancelled = asyncio.Event()
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+                return default_completion_assessment_response(kwargs)
+            messages = list(kwargs.get("messages", []))
+            task = current_step_task(messages)
+            if task == "Slow task":
+                self.slow_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.slow_cancelled.set()
+                    raise
+            if task == "Ask task":
+                await self.slow_started.wait()
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "ask-only",
+                            "function": {
+                                "name": "send_message",
+                                "arguments": json.dumps(
+                                    {
+                                        "message": "Pick an option",
+                                        "message_type": "question",
+                                        "expect_response": True,
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            return {"content": "done", "done": True}
+
+    llm = WaitingAndSlowLLM()
+    tracer = TracerCheckpointStore()
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="ask", task="Ask task"),
+            PlanStep(id="slow", task="Slow task"),
+        ),
+        react_max_iterations=1,
+    )
+
+    result = await asyncio.wait_for(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-single-waiting"),
+            tools=[],
+            llm=llm,
+            runtime=PatternRuntime(tracer=tracer, execution_id="dag-single-waiting"),
+        ),
+        timeout=1,
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert result["active_step_id"] == "ask"
+    assert "clarification_superseded_step_ids" not in result
+    assert set(result.keys()) == {
+        "success",
+        "status",
+        "message",
+        "message_type",
+        "context",
+        "clarification_draft",
+        "execution_id",
+        "active_step_id",
+    }
+    assert llm.slow_cancelled.is_set()
+    assert pattern.active_step_ids == ["ask"]
+    assert {step.id: step.status for step in pattern.plan.steps} == {
+        "ask": "running",
+        "slow": "pending",
+    }
+    assert tracer.checkpoints[-1]["label"] == "dag_after_cancelled_siblings"
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_invalidated_step_is_rescheduled_after_winner_settles() -> (
+    None
+):
+    """T-X-6: invalidation is non-terminal. Once active_step_ids drains,
+    _ready_steps() offers the invalidated step again, and the next attempt
+    flips its status back to "running".
+
+    That next attempt is a brand-new try from the top of the step, not a
+    resume: whatever tool calls the step already made and whatever message
+    it already sent to the user before invalidation are not replayed or
+    compensated -- the step's prior context is dropped, not reused.
+    """
+
+    pattern, _, _ = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+    loser = next(step for step in pattern.plan.steps if step.id == "ask_b")
+    assert loser.status == "clarification_invalidated"
+
+    # The winner's turn has settled and the DAG is free to schedule again.
+    pattern.active_step_ids = []
+    ready_ids = {step.id for step in pattern._ready_steps()}
+    assert "ask_b" in ready_ids
+
+    # A fresh attempt does not resume the invalidated step's prior context.
+    assert pattern.active_step_contexts.get("ask_b") is None
+
+    class CapturingStatusLLM:
+        def __init__(self, *, step: PlanStep) -> None:
+            self.step = step
+            self.status_at_call: str | None = None
+
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            self.status_at_call = self.step.status
+            return {"content": "retried", "done": True}
+
+    rerun_llm = CapturingStatusLLM(step=loser)
+    await pattern._execute_step(
+        step=loser,
+        root_context=ExecutionContext(execution_id="dag-double-waiting-rerun"),
+        tools=[],
+        llm=rerun_llm,
+        runtime=PatternRuntime(execution_id="dag-double-waiting-rerun"),
+    )
+
+    assert rerun_llm.status_at_call == "running"
+    assert loser.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_double_waiting_invalidation_persists_across_restore() -> (
+    None
+):
+    """The §H-2 checkpoint extension: a batch that invalidates a loser
+    while ``pending`` is empty (no sibling left to cancel) still writes a
+    checkpoint, so the invalidation survives a resume instead of only
+    living in memory until the process restores from an earlier snapshot.
+    """
+
+    pattern, result, tracer = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+    assert result["clarification_superseded_step_ids"] == ["ask_b"]
+
+    checkpoint = tracer.checkpoints[-1]
+    assert checkpoint["label"] == "dag_after_cancelled_siblings"
+
+    restored = DAGPattern(lambda **_: None)
+    restored.load_state(checkpoint["pattern_state"])
+
+    restored_steps_by_id = {step.id: step for step in restored.plan.steps}
+    assert restored_steps_by_id["ask_b"].status == "clarification_invalidated"
+    assert restored.active_step_ids == ["ask_a"]
+    assert "ask_b" not in restored.active_step_pattern_states
+    assert "ask_b" not in restored.active_step_contexts
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
+    """§H-3: in a batch where one step is interrupted and another is
+    waiting in the same wakeup, the interrupted result wins -- an
+    interrupt is a control instruction, not a workflow question the user
+    can be asked to sit through -- and the losing waiting step is
+    invalidated exactly like a losing waiting step in an all-waiting
+    batch. Step ids are chosen so the waiting step would win under plain
+    lexicographic order, to prove the win comes from the interrupted/
+    waiting classification and not from id ordering.
+
+    Driving both a real interrupt and a real waiting_for_user through the
+    LLM/ReAct layers in the same wakeup is impractical to synchronize
+    reliably, so this stubs DAGPattern._execute_step -- the boundary
+    _execute_ready_steps actually schedules as asyncio.Task objects -- and
+    exercises the real scheduling, sorting, and invalidation logic under
+    test through genuine concurrent tasks.
+    """
+
+    release = asyncio.Event()
+    started: dict[str, asyncio.Event] = {}
+
+    async def fake_execute_step(
+        self: DAGPattern, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        started.setdefault(step.id, asyncio.Event()).set()
+        await release.wait()
+        root_context = kwargs["root_context"]
+        if step.id == "z_interrupt_step":
+            self.status = "interrupted"
+            step.status = "interrupted"
+            return {
+                "success": False,
+                "status": "interrupted",
+                "execution_id": root_context.execution_id,
+                "context": root_context,
+                "active_step_id": step.id,
+            }
+        self.status = "waiting_for_user"
+        draft = draft_from_waiting_request(
+            {
+                "message": "Pick one",
+                "message_type": "question",
+                "interactions": [],
+                "tool_call_id": "ask-wait",
+                "tool_name": "ask_user_question",
+                "message_count": 2,
+            },
+            execution_id=root_context.execution_id,
+            step_id=None,
+        )
+        attributed_draft = draft.with_origin_step(step.id) if draft else None
+        return {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": "Pick one",
+            "message_type": "question",
+            "clarification_draft": attributed_draft,
+            "execution_id": root_context.execution_id,
+            "context": root_context,
+            "active_step_id": step.id,
+        }
+
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="a_wait_step", task="Wait me"),
+            PlanStep(id="z_interrupt_step", task="Interrupt me"),
+        ),
+        max_concurrency=2,
+    )
+    pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-mixed-batch"),
+            tools=[],
+            llm=object(),
+            runtime=PatternRuntime(execution_id="dag-mixed-batch"),
+        )
+    )
+    await asyncio.wait_for(
+        started.setdefault("a_wait_step", asyncio.Event()).wait(), timeout=1
+    )
+    await asyncio.wait_for(
+        started.setdefault("z_interrupt_step", asyncio.Event()).wait(), timeout=1
+    )
+    release.set()
+    result = await asyncio.wait_for(run_task, timeout=1)
+
+    assert result["status"] == "interrupted"
+    assert result["active_step_id"] == "z_interrupt_step"
+    assert result["clarification_superseded_step_ids"] == ["a_wait_step"]
+
+    steps_by_id = {step.id: step for step in pattern.plan.steps}
+    assert steps_by_id["a_wait_step"].status == "clarification_invalidated"
+    assert "a_wait_step" not in pattern.active_step_ids
 
 
 @pytest.mark.asyncio

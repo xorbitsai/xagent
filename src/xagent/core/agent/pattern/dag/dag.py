@@ -321,7 +321,14 @@ class _RuntimeLLMProxy:
 
 
 class DAGPattern(AgentPattern):
-    """Minimal DAG execution pattern that reuses ReActPattern for each step."""
+    """Minimal DAG execution pattern that reuses ReActPattern for each step.
+
+    A task is only ever allowed one active question outstanding at a time
+    against the user; the DAG side of that rule is exactly-one: when
+    concurrent steps in the same batch all end up waiting for a user reply
+    in the same wakeup, exactly one of them gets to keep its question, and
+    the rest are invalidated rather than left to race the user's answer.
+    """
 
     def __init__(
         self,
@@ -354,6 +361,11 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = 0
         self.completion_feedback: str | None = None
         self.completion_replan_count = 0
+        # Live concurrent step tasks for the in-progress batch, maintained by
+        # _execute_ready_steps() and always empty once it returns (whatever
+        # the outcome). asyncio.Task objects are not JSON-serializable, so
+        # this must never be added to get_state().
+        self._live_step_tasks: set[asyncio.Task[Any]] = set()
 
     async def run(
         self,
@@ -679,6 +691,7 @@ class DAGPattern(AgentPattern):
         steps_by_id = {step.id: step for step in steps}
         pending = set(tasks)
         scheduled_step_ids = set(steps_by_id)
+        self._live_step_tasks = set(pending)
 
         def schedule_ready_steps() -> None:
             if self.plan is None:
@@ -709,6 +722,7 @@ class DAGPattern(AgentPattern):
                 tasks[task] = ready_step.id
                 steps_by_id[ready_step.id] = ready_step
                 pending.add(task)
+                self._live_step_tasks.add(task)
                 scheduled_step_ids.add(ready_step.id)
                 available_slots -= 1
                 if available_slots <= 0:
@@ -720,68 +734,124 @@ class DAGPattern(AgentPattern):
                     pending,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                self._live_step_tasks = set(pending)
+
+                # A single wakeup can complete more than one step; collect
+                # every non-None result instead of acting on whichever task
+                # a ``set`` happens to iterate first.
+                completed_results: list[tuple[asyncio.Task[Any], dict[str, Any]]] = []
                 for task in done:
                     result = task.result()
                     if result is not None:
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
+                        completed_results.append((task, result))
+
+                if completed_results:
+                    # Deterministic winner selection: an interrupted result
+                    # always outranks a waiting one (an interrupt is a
+                    # control instruction, not a workflow question the user
+                    # can be asked to sit through), and within the same kind
+                    # the lexicographically first step id wins.
+                    completed_results.sort(
+                        key=lambda item: (
+                            0 if item[1].get("status") != "waiting_for_user" else 1,
+                            tasks[item[0]],
                         )
-                        if pending:
-                            await runtime.checkpoint(
-                                "dag_after_cancelled_siblings",
-                                context=root_context,
-                                pattern=self,
-                                status=self.status,
-                                metadata={
-                                    "active_step_ids": list(self.active_step_ids),
-                                    "cancelled_step_ids": [
-                                        step_id
-                                        for task, step_id in tasks.items()
-                                        if task in pending
-                                    ],
-                                },
-                            )
-                        return result
-                    failed_step = next(
-                        (
-                            step
-                            for step in steps_by_id.values()
-                            if step.status == "failed"
-                        ),
-                        None,
                     )
-                    if failed_step is not None:
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
+                    winner_task, winner_result = completed_results[0]
+                    winner_step_id = tasks[winner_task]
+
+                    superseded_step_ids: list[str] = []
+                    for loser_task, loser_result in completed_results[1:]:
+                        if loser_result.get("status") != "waiting_for_user":
+                            continue
+                        loser_step_id = tasks[loser_task]
+                        self._clear_active_step(loser_step_id)
+                        loser_step = steps_by_id.get(loser_step_id)
+                        if loser_step is not None:
+                            # Non-terminal, and not picked up by the same-
+                            # wakeup backfill in schedule_ready_steps():
+                            # _ready_steps() offers this step again once
+                            # active_step_ids drains, but
+                            # _pending_ready_steps() only collects steps
+                            # already at "pending", so it waits for the next
+                            # wakeup's readiness check before it reruns.
+                            loser_step.status = "clarification_invalidated"
+                        superseded_step_ids.append(loser_step_id)
+
+                    if superseded_step_ids:
+                        logger.error(
+                            "Multiple concurrent DAG steps completed with a "
+                            "pending user question in the same batch; only "
+                            "%s's question is delivered, the rest are "
+                            "invalidated.",
+                            winner_step_id,
+                            extra={
+                                "execution_id": getattr(
+                                    root_context, "execution_id", None
+                                ),
+                                "superseded_step_ids": superseded_step_ids,
+                                "winner_step_id": winner_step_id,
+                            },
                         )
-                        return await self._fail(
+                        winner_result = {
+                            **winner_result,
+                            "clarification_superseded_step_ids": superseded_step_ids,
+                        }
+
+                    await self._cancel_pending_steps(
+                        pending,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                    )
+                    if pending or superseded_step_ids:
+                        await runtime.checkpoint(
+                            "dag_after_cancelled_siblings",
                             context=root_context,
-                            runtime=runtime,
-                            error=(
-                                failed_step.error or f"Step {failed_step.id} failed."
-                            ),
-                            failure_reason="step_failed",
-                            checkpoint_label="dag_failed",
-                            failed_step_id=failed_step.id,
+                            pattern=self,
+                            status=self.status,
+                            metadata={
+                                "active_step_ids": list(self.active_step_ids),
+                                "cancelled_step_ids": [
+                                    step_id
+                                    for task, step_id in tasks.items()
+                                    if task in pending
+                                ],
+                            },
                         )
-                    if self._needs_replan(root_context):
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
-                        )
-                        return None
-                    if self.status in {"interrupted", "waiting_for_user"}:
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
-                        )
-                        return None
+                    return winner_result
+
+                failed_step = next(
+                    (step for step in steps_by_id.values() if step.status == "failed"),
+                    None,
+                )
+                if failed_step is not None:
+                    await self._cancel_pending_steps(
+                        pending,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                    )
+                    return await self._fail(
+                        context=root_context,
+                        runtime=runtime,
+                        error=(failed_step.error or f"Step {failed_step.id} failed."),
+                        failure_reason="step_failed",
+                        checkpoint_label="dag_failed",
+                        failed_step_id=failed_step.id,
+                    )
+                if self._needs_replan(root_context):
+                    await self._cancel_pending_steps(
+                        pending,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                    )
+                    return None
+                if self.status in {"interrupted", "waiting_for_user"}:
+                    await self._cancel_pending_steps(
+                        pending,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                    )
+                    return None
                 schedule_ready_steps()
         except Exception:
             try:
@@ -793,6 +863,8 @@ class DAGPattern(AgentPattern):
             except Exception:
                 logger.exception("Failed to clean up cancelled DAG sibling steps.")
             raise
+        finally:
+            self._live_step_tasks.clear()
         return None
 
     async def _execute_step(

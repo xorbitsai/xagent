@@ -6,16 +6,22 @@ dataclass over already-in-memory data.
 
 A :class:`ClarificationDraft` is a derived value, not stored state. Its only
 source of truth is ``ReActPattern.waiting_for_user_request``, which already
-travels through ``get_state()`` / ``load_state()`` on its own. The draft
-itself does not join that round trip -- it is cheap to recompute from the
-restored request every time a waiting turn is produced, so there is nothing
-to persist or reconcile a second time.
+travels through ``get_state()`` / ``load_state()`` on its own -- the draft
+itself never enters that particular round trip (pinned by tests). It does
+still surface, restored as a plain dict rather than this dataclass, inside a
+different snapshot: the auto coordinator pattern copies its child's whole
+result dict verbatim into ``AutoPattern.last_result`` (see
+``pattern/auto/auto.py``), and a waiting ReAct child's result carries the
+draft under ``result["clarification_draft"]``.
 
 ``turn_marker`` is the only idempotency-relevant value this module produces,
 and it carries no persistence-format promise of its own: it is a stable,
-opaque string. Deriving a storage key (length limits, character-set
-validation, or any other on-disk contract) is a web-layer concern that reads
-this string; this module does not know what that contract looks like.
+opaque string. Its idempotency scope is a single ``(task_id, run_id)``
+partition -- two different tasks or runs may legitimately produce equal
+markers, since neither identifier is a marker component. Deriving a storage
+key (length limits, character-set validation, or any other on-disk
+contract) is a web-layer concern that reads this string; this module does
+not know what that contract looks like.
 """
 
 from __future__ import annotations
@@ -114,8 +120,11 @@ class ClarificationDraft:
         ``ClarificationDraft`` (under ``result["clarification_draft"]``) is
         serialized into trace events by handlers that use the ``to_dict``
         protocol -- ``DatabaseTraceHandler._serialize_data_for_json`` and its
-        WebSocket twin call ``value.to_dict()`` whenever it is callable, and
-        then recursively re-serialize whatever that call returns. So this
+        WebSocket twins, ``WebSocketTraceHandler._serialize_data`` in
+        ``ws_trace_handlers.py`` and ``SharedWebSocketTracer._serialize_data``
+        in ``websocket.py``, call ``value.to_dict()`` whenever it is
+        callable, and then recursively re-serialize whatever that call
+        returns. So this
         method cannot hand back nested dataclasses: ``interactions`` becomes
         a plain list (its entries are already plain dicts), and ``requests``
         becomes a list of plain dicts via ``ClarificationRequestItem.to_dict``.
@@ -146,18 +155,28 @@ class ClarificationDraft:
 def _marker_clean(value: str) -> str:
     """Filter ``value`` to the character domain a marker may contain.
 
-    This function must stay in the same domain as ``clean_string`` in
-    ``src/xagent/web/api/trace_handlers.py:_serialize_data_for_json`` --
-    that function is a closure the core layer cannot import, so this is a
-    forced duplicate rather than a convenience one. If someone changes the
-    domain of ``clean_string``, this function must change with it. The test
-    that watches for drift is
+    Four independent copies of this control-character filter exist in the
+    codebase, and all four must stay in the same domain: this function,
+    plus three web-layer closures that the core layer cannot import and so
+    cannot share code with -- ``src/xagent/web/api/trace_handlers.py``'s
+    ``DatabaseTraceHandler._serialize_data_for_json`` (``clean_string``),
+    ``src/xagent/web/api/ws_trace_handlers.py``'s
+    ``WebSocketTraceHandler._serialize_data`` (``clean_string``), and
+    ``src/xagent/web/api/websocket.py``'s
+    ``SharedWebSocketTracer._serialize_data`` (``clean_string``). If
+    someone changes the domain of any one of the four, the other three must
+    change with it. The test that watches for drift between this copy and
+    the database-handler copy is
     ``test_marker_survives_trace_serialization_of_a_dirty_interaction_id`` in
     ``tests/core/agent/test_react_clarification_draft.py``, which calls the
     real ``DatabaseTraceHandler._serialize_data_for_json`` rather than a copy
     of it.
     """
 
+    # Both replaces below target the same code point, NUL (U+0000); the
+    # second is a no-op after the first and is kept only to mirror
+    # clean_string's two-line form character-for-character, per the
+    # cross-layer contract above.
     cleaned = value.replace("\x00", "")  # Remove NULL character
     cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
     return "".join(char for char in cleaned if ord(char) >= 32 or char in _MARKER_KEEP)

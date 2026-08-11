@@ -13,6 +13,7 @@ from xagent.core.agent.clarification import (
 )
 from xagent.core.agent.trace import TraceAction
 from xagent.web.api.trace_handlers import DatabaseTraceHandler
+from xagent.web.api.websocket import SharedWebSocketTracer
 from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
 
 
@@ -284,11 +285,25 @@ async def test_marker_survives_trace_serialization_of_a_dirty_interaction_id() -
     the marker recomputed after the injected request round-trips through the
     real trace serializer and a JSON encode/decode cycle -- ``_marker_clean``
     and ``clean_string`` share a domain, so persistence cannot desync them.
+
+    The injected id carries both a byte the domain rejects (``\\x01``) and
+    one it keeps (``\\t``), so the before/after comparison actually depends
+    on the two filters agreeing on ``\\t``. That comparison alone only
+    catches a *web*-side narrowing, though: both markers finish with a call
+    to this module's own ``_marker_clean``, so a *core*-side narrowing of
+    ``_MARKER_KEEP`` would apply identically on both sides of the comparison
+    and never show up as a mismatch. The direct equality assertion below
+    closes that gap by pinning ``_MARKER_KEEP`` against the literal
+    keep-set read out of ``clean_string``'s real source.
     """
 
+    import ast
+    import inspect
     import json
+    import re
 
     from xagent.core.agent.checkpoint import TraceCheckpointStore
+    from xagent.core.agent.clarification import _MARKER_KEEP
     from xagent.web.api.trace_handlers import DatabaseTraceHandler
 
     class RecordingTraceBackend:
@@ -331,7 +346,9 @@ async def test_marker_survives_trace_serialization_of_a_dirty_interaction_id() -
     assert result["status"] == "waiting_for_user"
 
     assert pattern.waiting_for_user_request is not None
-    pattern.waiting_for_user_request["requests"][0]["interaction_id"] += "\x01"
+    pattern.waiting_for_user_request["requests"][0]["interaction_id"] = (
+        "wait\tcall\x01x"
+    )
 
     marker_before = draft_from_waiting_request(
         pattern.waiting_for_user_request,
@@ -367,6 +384,18 @@ async def test_marker_survives_trace_serialization_of_a_dirty_interaction_id() -
     ).turn_marker
 
     assert marker_after == marker_before
+
+    # Direct pin, independent of the before/after comparison above: read
+    # ``clean_string``'s keep-set literal out of the real
+    # ``DatabaseTraceHandler._serialize_data_for_json`` source and assert it
+    # matches ``_MARKER_KEEP`` character-for-character. A core-side edit
+    # that narrows or widens ``_MARKER_KEEP`` shows up here even though it
+    # cannot show up in the before/after comparison.
+    web_source = inspect.getsource(DatabaseTraceHandler._serialize_data_for_json)
+    keep_set_match = re.search(r'char in ("(?:[^"\\]|\\.)*")', web_source)
+    assert keep_set_match is not None, "clean_string keep-set literal not found"
+    web_keep_set = ast.literal_eval(keep_set_match.group(1))
+    assert _MARKER_KEEP == web_keep_set
 
 
 def test_marker_distinguishes_requests_with_ambiguous_raw_concatenation() -> None:
@@ -465,8 +494,13 @@ class RecordingTracer:
     [
         (lambda: DatabaseTraceHandler(1), "_serialize_data_for_json"),
         (lambda: WebSocketTraceHandler(1), "_serialize_data"),
+        (lambda: SharedWebSocketTracer(ws=None, task_id=1), "_serialize_data"),
     ],
-    ids=["database_trace_handler", "websocket_trace_handler"],
+    ids=[
+        "database_trace_handler",
+        "websocket_trace_handler",
+        "shared_websocket_tracer",
+    ],
 )
 async def test_pattern_end_trace_payload_with_draft_survives_real_serializer(
     handler_factory: Any, serialize_method: str
@@ -525,8 +559,13 @@ async def test_pattern_end_trace_payload_with_draft_survives_real_serializer(
     [
         (lambda: DatabaseTraceHandler(1), "_serialize_data_for_json"),
         (lambda: WebSocketTraceHandler(1), "_serialize_data"),
+        (lambda: SharedWebSocketTracer(ws=None, task_id=1), "_serialize_data"),
     ],
-    ids=["database_trace_handler", "websocket_trace_handler"],
+    ids=[
+        "database_trace_handler",
+        "websocket_trace_handler",
+        "shared_websocket_tracer",
+    ],
 )
 async def test_pattern_end_trace_payload_without_to_dict_collapses_to_stub(
     handler_factory: Any, serialize_method: str, monkeypatch: pytest.MonkeyPatch

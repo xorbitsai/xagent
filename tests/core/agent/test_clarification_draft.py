@@ -123,10 +123,19 @@ def test_send_message_draft_classifies_and_shapes_requests() -> None:
 
     assert draft is not None
     assert draft.source == "send_message"
-    assert draft.source in CLARIFICATION_SOURCES
+    # Pins the constant's actual value rather than restating the equality
+    # assert above: ``draft.source in CLARIFICATION_SOURCES`` would pass
+    # for any of the three literals and catches nothing on its own.
+    assert CLARIFICATION_SOURCES == {
+        "send_message",
+        "ask_user_question",
+        "tool_waiting",
+    }
     assert len(draft.requests) == 1
     assert draft.requests[0].tool_call_id == "call-send"
     assert draft.requests[0].interaction_id == "call-send"
+    assert draft.requests[0].tool_name == "send_message"
+    assert draft.origin_execution_id == "exec-1"
     assert draft.interactions == ()
     assert draft.message == "Choose A or B"
 
@@ -152,6 +161,8 @@ def test_ask_user_question_draft_classifies_and_matches_normalized_interactions(
     assert len(draft.requests) == 1
     assert draft.requests[0].tool_call_id == "call-ask"
     assert draft.requests[0].interaction_id == "call-ask"
+    assert draft.requests[0].tool_name == "ask_user_question"
+    assert draft.origin_execution_id == "exec-1"
     assert draft.interactions == tuple(normalized)
 
 
@@ -167,6 +178,8 @@ def test_tool_waiting_draft_classifies_and_shapes_requests() -> None:
     assert len(draft.requests) == 1
     assert draft.requests[0].tool_call_id == "wait-a"
     assert draft.requests[0].interaction_id == "interaction-a"
+    assert draft.requests[0].tool_name == "approval_gate"
+    assert draft.origin_execution_id == "exec-1"
 
 
 def test_empty_form_ask_user_question_still_classifies_as_ask_user_question() -> None:
@@ -320,3 +333,26 @@ def test_with_origin_step_recomputes_marker_for_different_steps() -> None:
     flattened_a = draft_a.with_origin_step("").turn_marker
     flattened_b = draft_b.with_origin_step("").turn_marker
     assert flattened_a == flattened_b == base.turn_marker
+
+
+def test_distinct_nonempty_tool_call_ids_produce_distinct_markers() -> None:
+    """Two waiting requests that differ only in ``tool_call_id`` produce
+    different markers, as long as both ids are non-empty -- the guarantee
+    ``ReActPattern._normalize_tool_calls`` enforces in production by
+    falling back to ``f"tool_call_{index}"`` for any missing or empty id.
+
+    An empty-``tool_call_id`` collision is reachable only from a corrupted
+    checkpoint: ``load_state`` restores ``waiting_for_user_request``
+    verbatim from whatever dict it is given, with no re-normalization, so a
+    hand-edited or pre-normalization legacy checkpoint could still carry an
+    empty id.
+    """
+
+    request_a = _send_message_request(tool_call_id="call-a")
+    request_b = _send_message_request(tool_call_id="call-b")
+
+    draft_a = draft_from_waiting_request(request_a, execution_id="exec-1", step_id=None)
+    draft_b = draft_from_waiting_request(request_b, execution_id="exec-1", step_id=None)
+
+    assert draft_a is not None and draft_b is not None
+    assert draft_a.turn_marker != draft_b.turn_marker

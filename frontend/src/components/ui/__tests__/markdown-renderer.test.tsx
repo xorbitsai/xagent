@@ -874,6 +874,27 @@ describe('MarkdownRenderer', () => {
     expect(screen.getByText('下载视频（MP4）')).toBeInTheDocument()
   })
 
+  it('falls back to the label for detection when a pre-existing title does not reveal the type', async () => {
+    // The backend only injects/overwrites a title when the label doesn't
+    // already reveal the media type (label_reveals_type in
+    // file_reference_output_service.py) -- so it leaves this exact
+    // combination (a label that already says .mp4, alongside an
+    // unrelated, non-descriptive pre-existing title) untouched. Detection
+    // must mirror that: falling back to the label when the title alone
+    // doesn't classify, instead of trusting a title that was never meant
+    // to be a detection hint in the first place.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+    })
+    const content =
+      '[report.mp4](file:550e8400-e29b-41d4-a716-446655440000 "See the notes")'
+    render(<MarkdownRenderer content={content} />)
+
+    const video = await screen.findByLabelText('report.mp4')
+    expect(video.tagName.toLowerCase()).toBe('video')
+  })
+
   it('detects video via the image title while displaying the model alt text', async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,
@@ -888,13 +909,20 @@ describe('MarkdownRenderer', () => {
   })
 
   it('shows the model alt text, not the backend-injected title, when files are disabled', () => {
-    // Regression coverage for a files-disabled-only bug: the presentation
-    // branch used to resolve title-first, showing the backend-injected
-    // filename instead of the model's own alt text. The existing
-    // "sanitizes Markdown labels and titles" test uses an https:// image
-    // whose alt/title sanitize to the same basename, which masks this
-    // ordering bug entirely -- this uses non-path prose alt text so the
-    // two are guaranteed to differ.
+    // This exercises MarkdownRenderer's tree-level pre-sanitizer
+    // (sanitizeFilesDisabledPresentationText), NOT MarkdownImage's own
+    // internal `if (filesDisabled) return <span>...</span>` branch for a
+    // `file:` src: the pre-sanitizer converts a `![alt](file:... "title")`
+    // node to plain text before ReactMarkdown ever builds an <img> node, so
+    // that branch is unreachable through this entry point and this test
+    // cannot exercise it (confirmed: reverting that branch's fix does not
+    // change this test's outcome). It's still real, useful coverage of a
+    // real code path -- the pre-sanitizer must itself prefer alt over
+    // title when converting the node to a label -- just not what its
+    // original name/comment claimed to guard. The component-level branch
+    // is kept as defense-in-depth (see its own comment in
+    // markdown-renderer.tsx) since falling through to InlineFilePreview
+    // would render an interactive preview despite files being disabled.
     render(
       <MarkdownRenderer
         filesDisabled

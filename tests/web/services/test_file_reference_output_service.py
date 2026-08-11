@@ -963,6 +963,113 @@ def test_audio_extension_detection_matches_frontend_set():
     assert frontend_audio_extensions == _AUDIO_EXTENSIONS
 
 
+def test_reconcile_does_not_strand_content_across_a_malformed_parenthetical():
+    # Regression for a real data-corruption bug: the "junk" fallback for a
+    # malformed title used to allow "(" through, so it could match only
+    # through an inner, unrelated ")" and strand everything after it (up to
+    # the link's own closing paren) as literal text outside the link. With
+    # "(" excluded, this exact input fails to match at all -- identical to
+    # this regex's behavior before title support existed at all, i.e. the
+    # correct, non-destructive "leave it untouched" outcome.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="real-id", filename="report.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[x](file:real-id (c) 2024) tail",
+        )
+
+        assert content == "[x](file:real-id (c) 2024) tail"
+    finally:
+        db.close()
+
+
+def test_reconcile_normalizes_unparsable_trailing_junk():
+    # Pins the deliberate side effect of the junk fallback: an input like
+    # this is inert literal text to CommonMark (invalid destination/title
+    # syntax), but the model clearly meant a file link, so reconciliation
+    # normalizes it into a live, validated reference and drops the junk.
+    # Contrast with the parenthetical case above, which cannot be safely
+    # bounded and is left completely untouched instead.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="real-id", filename="report.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[report.mp4](file:real-id not a title)",
+        )
+
+        assert content == "[report.mp4](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_validates_id_for_title_with_trailing_whitespace():
+    # A title clause is allowed trailing whitespace before the link's
+    # closing paren. Without this, the title-form match would fail and fall
+    # through to the junk alternative, which has no notion of title syntax
+    # and would silently discard the title text -- with no re-injection for
+    # a non-media file like this one.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="report.pdf",
+            mime_type="application/pdf",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[report](file:real-id  "annual report"  )',
+        )
+
+        assert content == '[report](file:real-id "annual report")'
+    finally:
+        db.close()
+
+
+def test_reconcile_repairs_invented_id_from_label_when_title_names_a_different_file():
+    # Mirror-image case of test_reconcile_repairs_invented_id_from_title_...:
+    # the title takes priority, but only when it actually resolves to
+    # exactly one record. Here the title is unresolvable prose while the
+    # label alone is the exact, resolvable filename -- an unconditional
+    # title-over-label pick would incorrectly unlink this instead of
+    # repairing it. The pre-existing title survives untouched afterwards:
+    # the label already reveals the media type ("report.mp4" ends in
+    # .mp4), so the title-injection step below has no reason to intervene.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="report.mp4",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[report.mp4](file:invented-id "My yearly report")',
+        )
+
+        assert content == '[report.mp4](file:real-id "My yearly report")'
+    finally:
+        db.close()
+
+
 def test_reconcile_reuses_prefetched_records_without_querying():
     db, user, task = _create_context()
     try:

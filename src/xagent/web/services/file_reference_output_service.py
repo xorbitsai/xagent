@@ -38,9 +38,30 @@ logger = logging.getLogger(__name__)
 #   ``_UNSAFE_LABEL_RE``/``_UNSAFE_TITLE_RE`` below.
 #
 # A title clause that doesn't parse as any of the three forms (duplicated,
-# unterminated, mismatched delimiters) falls through to the bare
-# alternative, which discards it as unstructured trailing content up to
-# the next ``)`` -- the reference is still validated, just without a title.
+# unterminated, mismatched delimiters) falls through to the "junk"
+# alternative, which discards it as unstructured trailing content up to the
+# next ``)`` -- the reference is still validated, just without a title. A
+# deliberate side effect: an input like ``[x](file:id not a title)``, which
+# CommonMark renders as inert literal text (invalid destination/title
+# syntax), is normalized into a live ``[x](file:id)`` link when the id
+# resolves. That's this function's purpose applied to a slightly mangled
+# reference -- the model clearly meant a file link -- rather than an
+# accident; see test_reconcile_normalizes_unparsable_trailing_junk. That
+# junk alternative excludes ``(`` (as well as ``)``/``[``/control chars): if
+# it didn't, junk could cross an inner ``)`` that isn't this link's own
+# closing paren and strand the remainder of the message outside the link
+# entirely (verified: ``[x](file:id (c) 2024) tail`` would otherwise match
+# only through the first ``)``, leaving `` 2024) tail`` as stray text in the
+# persisted transcript). Excluding ``(`` means this and similar malformed
+# inputs simply fail to match at all -- identical to this regex's pre-title
+# behavior of leaving an unparsable reference completely untouched, which
+# is the correct, non-destructive fallback.
+#
+# Each title form also tolerates trailing whitespace before the closing
+# ``)`` (``\s*`` after the delimiter closes) -- otherwise
+# ``[a](file:id "t.mp4"  )`` would fail title-form and fall through to junk,
+# which has no notion of title syntax and would silently discard the title
+# text with no re-injection for non-media files.
 #
 # This is the canonical parser for this ``[label](file:id ["title"])``
 # format -- ``reconcile_assistant_file_references`` is what actually
@@ -55,10 +76,12 @@ _MARKDOWN_FILE_REFERENCE_RE = re.compile(
     r"(?P<image>!)?\[(?P<label>[^\]]*)\]\("
     r"(?P<target>file:[^)\s]+)"
     r"(?:"
-    r'(?:\s+(?:"(?P<dtitle>(?:[^"\\)[\x00-\x1f\x7f]|\\.)*)"'
+    r"(?:\s+"
+    r'(?:"(?P<dtitle>(?:[^"\\)[\x00-\x1f\x7f]|\\.)*)"'
     r"|'(?P<stitle>(?:[^'\\)[\x00-\x1f\x7f]|\\.)*)'"
-    r"|\((?P<ptitle>(?:[^()\\[\x00-\x1f\x7f]|\\.)*)\)))?"
-    r"|[^)[\x00-\x1f\x7f]*"
+    r"|\((?P<ptitle>(?:[^()\\[\x00-\x1f\x7f]|\\.)*)\))"
+    r"\s*)?"
+    r"|[^()[\x00-\x1f\x7f]*"
     r")"
     r"\)"
 )
@@ -173,11 +196,14 @@ def reconcile_assistant_file_references(
     """Canonicalize valid links, repair unique filename matches, and unlink fakes.
 
     Models occasionally copy a filename correctly while inventing the UUID in
-    ``file:<id>``. A broken UUID must never become a clickable preview. When the
-    markdown label uniquely identifies a file in the current task/user scope,
-    replace it with that record's canonical id; otherwise keep only plain text.
-    Filename repair is necessarily heuristic if an older same-named file is no
-    longer present, so every repair is logged as a warning for auditability.
+    ``file:<id>``. A broken UUID must never become a clickable preview. Repair
+    tries the markdown *title* before the label -- once a reference has
+    already been through one reconcile pass, the real filename lives there,
+    not in the label -- falling through to the label if the title doesn't
+    uniquely identify a file in the current task/user scope. If neither does,
+    keep only plain text. Filename repair is necessarily heuristic if an
+    older same-named file is no longer present, so every repair is logged as
+    a warning for auditability.
     """
     if not isinstance(content, str) or "file:" not in content:
         return content
@@ -206,27 +232,36 @@ def reconcile_assistant_file_references(
         record = records_by_id.get(referenced_id or "")
 
         if record is None:
-            # The title is this function's own injection slot for the real
-            # filename (see below) and takes priority over the label as the
-            # repair source: once a reference has already been reconciled
-            # once, a later pass over the same content (e.g. persist-time
-            # then read-time) finds the filename in the title, not the
-            # label, and must not lose repair capability just because of
-            # that.
-            filename = Path((parsed_title or label).strip()).name
-            filename_key = filename.casefold()
-            candidates = task_records_by_filename.get(filename_key, [])
-            if not candidates:
-                candidates = records_by_filename.get(filename_key, [])
-            if len(candidates) == 1:
-                record = candidates[0]
-                logger.warning(
-                    "Repaired invalid assistant FileRef %s using heuristic unique "
-                    "filename %s for task %s",
-                    referenced_id or target,
-                    filename,
-                    task_id,
-                )
+            # Try the title before the label, but fall through to the label
+            # if the title doesn't resolve to exactly one record -- not just
+            # if it's absent. The title is this function's own injection
+            # slot for the real filename (see below), so once a reference
+            # has already been reconciled once, a later pass over the same
+            # content (e.g. persist-time then read-time) finds the filename
+            # there rather than in the label, and must not lose repair
+            # capability just because of that. But an unconditional
+            # title-over-label pick would create the mirror-image gap: a
+            # model-authored title that happens to name a different (or no)
+            # file must not shadow a label that's otherwise a perfect,
+            # resolvable match.
+            for filename_source in (parsed_title, label):
+                if not filename_source:
+                    continue
+                filename = Path(filename_source.strip()).name
+                filename_key = filename.casefold()
+                candidates = task_records_by_filename.get(filename_key, [])
+                if not candidates:
+                    candidates = records_by_filename.get(filename_key, [])
+                if len(candidates) == 1:
+                    record = candidates[0]
+                    logger.warning(
+                        "Repaired invalid assistant FileRef %s using heuristic "
+                        "unique filename %s for task %s",
+                        referenced_id or target,
+                        filename,
+                        task_id,
+                    )
+                    break
 
         if record is None:
             logger.warning(
@@ -260,12 +295,14 @@ def reconcile_assistant_file_references(
         if _is_inline_preview_media(filename):
             suffix = Path(filename).suffix.casefold()
             # Only intervene when the label alone can't already be
-            # classified by the frontend -- mirrors the pre-title behavior
-            # exactly, just preferring a title over overwriting the label
-            # when intervention is needed. A label that already reveals the
-            # type is left alone even if it names a different file than the
-            # record (see test_reconcile_keeps_mismatched_label_...): there
-            # is no signal that a coincidental extension match is wrong.
+            # classified by the frontend -- the same gate the pre-title
+            # label-rewrite used (the mechanism differs: inject/overwrite a
+            # title first, only falling back to overwriting the label when
+            # the filename can't safely become a title). A label that
+            # already reveals the type is left alone even if it names a
+            # different file than the record (see
+            # test_reconcile_keeps_mismatched_label_...): there is no
+            # signal that a coincidental extension match is wrong.
             label_reveals_type = bool(suffix) and label.strip().casefold().endswith(
                 suffix
             )
@@ -296,6 +333,12 @@ def reconcile_assistant_file_references(
         # allows an embedded double quote) could be unsafe to re-emit with
         # the double-quote delimiter this function always writes. Drop it
         # rather than escape it -- same reasoning as `_UNSAFE_LABEL_RE`.
+        #
+        # This delimiter choice also means a model-authored '...' or (...)
+        # title is normalized to "..." syntax even when nothing else about
+        # the reference changed -- intentional (one consistent output form
+        # is simpler to reason about than round-tripping the original
+        # delimiter), not an oversight.
         if display_title and not _UNSAFE_TITLE_RE.search(display_title):
             return f'{prefix}[{display_label}]({canonical_ref} "{display_title}")'
         return f"{prefix}[{display_label}]({canonical_ref})"

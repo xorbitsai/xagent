@@ -84,7 +84,7 @@ def test_model_and_migration_constraint_texts_are_identical() -> None:
     model_conditions = {
         item.name: str(item.sqltext)
         for item in Task.__table_args__
-        if type(item).__name__ == "CheckConstraint"
+        if isinstance(item, sa.CheckConstraint)
     }
 
     migration = load_migration_module(MIGRATION_PATH)
@@ -235,13 +235,18 @@ def test_sqlite_check_asymmetry_is_expected() -> None:
     """Two SQLite deployments of the same xagent version can enforce
     different invariants on this column depending on install history: a
     fresh install (stamp head, then create_all) HAS the CHECK, while a
-    database that walked the revision chain does NOT -- upgrade() cannot
-    add a CHECK to an existing table on SQLite (NotImplementedError, both
-    online and offline; the batch_alter_table workaround cannot run in
-    --sql mode on either dialect, which the offline-SQL requirement rules
-    out -- see the migration and the model's __table_args__ comment).
-    Concretely: inserting interaction_protocol_version=2 succeeds on the
-    chain-walked shape and raises IntegrityError on the fresh-install shape.
+    database that walked the revision chain does NOT. Offline, upgrade()
+    cannot add a CHECK to an existing table on SQLite: a plain CHECK-add
+    raises NotImplementedError there, and the batch_alter_table rebuild
+    that could add it cannot render under --sql mode on either dialect,
+    which offline SQL support (a hard requirement) rules out. Online,
+    batch_alter_table could add the CHECK to an existing SQLite table the
+    same way downgrade() already removes it -- upgrade() does not do that
+    today; that convergence is deliberately deferred to the first
+    production writer of this column (see the migration and the model's
+    __table_args__ comment). Concretely: inserting
+    interaction_protocol_version=2 succeeds on the chain-walked shape and
+    raises IntegrityError on the fresh-install shape.
     This asymmetry is expected today because the column has zero writers --
     nothing has ever inserted a non-NULL value, so nothing observes the
     divergence. The change that adds the first writer to this column must
@@ -317,12 +322,13 @@ def test_diff_narrow_inventory_flags_a_changed_check_expression() -> None:
 
 def test_sqlite_downgrade_succeeds_on_both_install_shapes() -> None:
     """A fresh install stamps head and then builds its schema via create_all
-    (see src/xagent/db/migration.py's empty-DB stamp path and database.py's
-    create_all call), so the create_all-built SQLite shape is a real
-    downgrade-reachable production shape, not a synthetic one -- and SQLite
-    3.35+ refuses to DROP a column a CHECK constraint references, so the old
-    unconditional drop_column() broke downgrade() on that shape. downgrade()
-    now rebuilds the table via batch_alter_table on SQLite (see the
+    (see src/xagent/db/migration.py's empty-DB stamp path and
+    src/xagent/web/models/database.py's create_all call, at its
+    _initialize_database_schema site), so the create_all-built SQLite shape
+    is a real downgrade-reachable production shape, not a synthetic one --
+    and SQLite 3.35+ refuses to DROP a column a CHECK constraint references,
+    so the old unconditional drop_column() broke downgrade() on that shape.
+    downgrade() now rebuilds the table via batch_alter_table on SQLite (see the
     migration's downgrade() online branch), which drops the CHECK and the
     column together regardless of which shape the database has. Both shapes
     are asserted here: the migration-shaped database never had the CHECK to

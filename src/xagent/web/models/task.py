@@ -86,11 +86,16 @@ class Task(Base):  # type: ignore
         # transcript path; 1 means a protocol v1 interaction row exists.
         #
         # Only create_all-built databases and PostgreSQL carry this CHECK
-        # through the migration's upgrade(): the SQLite migration branch
-        # cannot add a CHECK to an existing table -- that raises
-        # NotImplementedError on that dialect both online and offline, and
-        # the batch_alter_table workaround cannot run in --sql mode on
-        # either dialect, which the offline-SQL requirement rules out.
+        # through the migration's upgrade(). SQLite is excluded there for
+        # two separate reasons. Offline (--sql generation), a plain
+        # CHECK-add raises NotImplementedError on SQLite, and the
+        # batch_alter_table rebuild that could add it instead cannot
+        # render under --sql mode on either dialect -- offline SQL support
+        # is a hard requirement, so upgrade() has no path to the CHECK on
+        # SQLite there. Online, batch_alter_table could add the CHECK to
+        # an existing SQLite table the same way downgrade() already
+        # removes it; that convergence is deliberately deferred to the
+        # first production writer of this column rather than done now.
         # SQLite is the default self-hosted backend (get_database_url()
         # falls back to it when DATABASE_URL is unset); PostgreSQL is the
         # recommended backend at production scale. A fresh SQLite install

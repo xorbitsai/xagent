@@ -76,10 +76,17 @@ def upgrade() -> None:
     context = op.get_context()
 
     # Offline (--sql) generation has a MockConnection, so reflection is
-    # unavailable. Emit the unconditional DDL instead of inspecting. Adding a
-    # CHECK to an existing table has no --sql-mode-safe path on SQLite (see
-    # the migration docstring in the model's __table_args__ comment), so only
-    # PostgreSQL gets the constraint here.
+    # unavailable. Emit the unconditional DDL instead of inspecting. Adding
+    # a CHECK to an existing table has no --sql-mode-safe path on SQLite --
+    # the batch_alter_table rebuild that could add it cannot render under
+    # --sql mode on either dialect, and offline SQL support is a hard
+    # requirement -- so only PostgreSQL gets the constraint here. Online,
+    # batch_alter_table could add the CHECK to an existing SQLite table the
+    # same way downgrade() already removes it; that convergence is
+    # deliberately deferred to the first production writer of this column
+    # (see the model's __table_args__ comment and
+    # test_sqlite_check_asymmetry_is_expected in
+    # tests/migrations/test_task_interaction_protocol_version_parity.py).
     if context.as_sql:
         op.add_column(TABLE, sa.Column(COLUMN, sa.Integer(), nullable=True))
         if context.dialect.name == "postgresql":
@@ -121,10 +128,28 @@ def downgrade() -> None:
     # DROP COLUMN auto-drops a single-column CHECK that depends on the
     # dropped column, no CASCADE needed. The explicit drop_constraint keeps
     # the downgrade symmetric with upgrade's add-column-then-add-constraint
-    # sequence and independent of that auto-drop behaviour. This offline
-    # branch is PostgreSQL-oriented and stays untouched by the SQLite fix
-    # below: batch mode (needed for SQLite) cannot run in --sql mode on
-    # either dialect.
+    # sequence and independent of that auto-drop behaviour.
+    #
+    # The SQLite side of this offline branch stays a plain drop_column,
+    # unlike the batch_alter_table rebuild the online branch below uses.
+    # Offline (--sql) generation cannot run batch mode, so that rebuild has
+    # no offline rendering here -- see
+    # 20260804_add_task_checkpoint_trace_event_anchor.py, which takes the
+    # same shape on this same table and documents accepting the loud
+    # first-statement failure this produces against a create_all-built
+    # SQLite database. Fixing this revision alone would not make the
+    # offline downgrade chain traversable for that shape either: two
+    # revisions further down, 20260804 fails the same way, so the failure
+    # is a property of the repository's offline-downgrade support, not of
+    # this revision. The alternative -- an offline batch_alter_table
+    # rebuild via copy_from=<a frozen Table object> -- needs a full table
+    # definition frozen inside the migration; if that frozen copy ever
+    # drifts from the real table, the rendered rebuild silently drops the
+    # missing columns' data instead of failing, which is strictly worse
+    # than today's loud first-statement error. Downgrading a
+    # create_all-built SQLite database over a live connection takes the
+    # rebuilding branch below instead, which reflects the real table and
+    # needs no frozen copy.
     if context.as_sql:
         if context.dialect.name == "postgresql":
             op.drop_constraint(CONSTRAINT_NAME, TABLE, type_="check")
@@ -146,8 +171,9 @@ def downgrade() -> None:
 
     # Non-PostgreSQL (SQLite): a fresh install stamps head and then builds
     # the schema via create_all (see src/xagent/db/migration.py's empty-DB
-    # stamp path and database.py's create_all call), so the fresh-install
-    # shape DOES carry ck_tasks_interaction_protocol_version on SQLite even
+    # stamp path and src/xagent/web/models/database.py's create_all call,
+    # at its _initialize_database_schema site), so the fresh-install shape
+    # DOES carry ck_tasks_interaction_protocol_version on SQLite even
     # though the migration's own upgrade() never adds it there (see the
     # upgrade() branch above and test_sqlite_check_asymmetry_is_expected).
     # SQLite 3.35+ refuses to DROP a column a CHECK constraint references, so

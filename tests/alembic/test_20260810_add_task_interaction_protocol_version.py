@@ -69,6 +69,10 @@ def _check_constraint_names(connection) -> set[str]:
 
 
 def test_offline_upgrade_postgresql_emits_add_column_and_check() -> None:
+    """A rendering check: it proves the offline SQL emits the expected ADD
+    COLUMN and CHECK statements, not that they execute against a live
+    database -- the execution half is covered by the online migration
+    tests."""
     migration = load_migration_module(MIGRATION_PATH)
 
     with patch.object(
@@ -121,6 +125,10 @@ def test_offline_downgrade_postgresql_drops_constraint_before_column() -> None:
 
 
 def test_offline_downgrade_sqlite_only_drops_column() -> None:
+    """Pins the plain DROP COLUMN as the offline SQLite downgrade's
+    rendering. That rendering is not executable against a create_all-built
+    SQLite database -- see the migration's downgrade() comment for why that
+    is accepted rather than fixed."""
     migration = load_migration_module(MIGRATION_PATH)
 
     with patch.object(

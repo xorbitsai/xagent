@@ -1215,6 +1215,13 @@ _SCAN_ROOT = _REPO_ROOT / "src" / "xagent"
 _UNRELATED_SOURCE_LITERALS = {
     ("skills/personal_db.py", "personal"),  # SkillRecord.source
     ("services/tool_credentials.py", "db"),  # local var: credential origin
+    # ClarificationDraft.source: which waiting mechanism produced the draft
+    # (send_message / ask_user_question / tool_waiting), not a Task ingress
+    # channel -- these values never reach the tasks.source column or the
+    # origin CHECK.
+    ("core/agent/clarification.py", "send_message"),
+    ("core/agent/clarification.py", "ask_user_question"),
+    ("core/agent/clarification.py", "tool_waiting"),
 }
 
 

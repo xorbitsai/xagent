@@ -14,6 +14,7 @@ connection does not give.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import create_engine, event
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_interaction_schema_shared import (
@@ -205,6 +206,47 @@ def _force_next_identity_select_to_miss(
 
     monkeypatch.setattr(Session, "execute", _patched)
     return state
+
+
+def _defeat_json_probe_but_not_bind_time_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patch ``json.dumps`` so this module's own pre-INSERT probe
+    (``json.dumps(request_payload, allow_nan=False)`` in
+    ``_validate_request_fields``) unconditionally reports success, while
+    SQLAlchemy's own bind-time JSON serialization -- inside the INSERT's own
+    flush, past that probe -- keeps failing for real on whatever
+    non-serializable value the caller passed.
+
+    An unconditional ``json.dumps = lambda *a, **k: "{}"`` does not achieve
+    this: ``json`` is one process-wide module object, and both this
+    module's probe (``import json`` in ``task_interaction_staging.py``) and
+    SQLAlchemy's own JSON column type (``import json`` in
+    ``sqlalchemy/sql/sqltypes.py``) hold the *same* object, confirmed
+    directly -- patching ``dumps`` on it patches both callers identically,
+    which fakes out the real bind-time serialization too and makes the
+    INSERT succeed instead of failing, defeating the point of this
+    construction entirely.
+
+    The two call sites are distinguishable by their call signature, not by
+    identity: this module's probe always passes ``allow_nan=False``: see
+    ``_validate_request_fields``. SQLAlchemy's ``JSON._make_bind_processor``
+    calls its serializer as ``json_serializer(value)`` -- one positional
+    argument, no keywords at all (confirmed by reading
+    ``sqlalchemy/sql/sqltypes.py`` directly). This patch keys off exactly
+    that: a call carrying ``allow_nan`` in its keyword arguments is the
+    probe and gets faked out; every other call is real serialization and
+    runs the real ``json.dumps``.
+    """
+
+    real_dumps = json.dumps
+
+    def _patched(*args: Any, **kwargs: Any) -> Any:
+        if "allow_nan" in kwargs:
+            return "{}"
+        return real_dumps(*args, **kwargs)
+
+    monkeypatch.setattr(json, "dumps", _patched)
 
 
 def _clear_signals() -> None:
@@ -912,29 +954,35 @@ def test_p8b_inner_savepoint_cleans_up_on_non_integrity_error_during_insert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The inner savepoint opened around the INSERT (``inner =
-    db.begin_nested()``) must roll itself back on any exception the flush
-    raises, not only ``IntegrityError`` -- the one type the ``except``
-    clause right after it names. Before this commit, an exception of any
-    other type propagated straight out of ``stage_interaction_request``
-    with that savepoint still open (neither the ``except`` branch's
-    ``inner.rollback()`` nor the ``else`` branch's ``inner.commit()`` runs
-    on the path that isn't either of theirs), leaking it into whatever the
-    caller does next. The ``finally`` this commit adds closes it on every
-    exit, not just the two paths this function names explicitly.
+    db.begin_nested()``) must unwind on a bind-time failure inside flush,
+    not only on ``IntegrityError`` -- the one type the ``except`` clause
+    right after it names.
 
-    Simulated here by making the third ``db.flush()`` call on this session
-    raise ``TypeError`` -- standing in for a bind-time serialization failure
-    the pre-INSERT JSON-serializability probe (added in an earlier commit)
-    did not catch. The first two calls must run for real or this never
-    reaches the savepoint this test targets: call 1 is
-    ``stage_interaction_request``'s own step-2 caller-write flush, and call
-    2 is ``db.begin_nested()``'s own implicit flush (``Session.begin_nested()``
-    always flushes first, to establish the SAVEPOINT after whatever is
-    already pending) -- failing that one instead would mean ``inner =
-    db.begin_nested()`` itself never returns, so no savepoint would exist
-    for this test to find still open. Only call 3, the explicit
-    ``db.flush()`` right after ``db.add(new_row)`` inside the already-open
-    savepoint, exercises the ``finally`` this commit adds."""
+    An earlier version of this test simulated the failure with a mocked
+    ``Session.flush`` raising a plain ``TypeError``. That mock left
+    ``inner.is_active`` True the whole time, so it passed for the wrong
+    reason -- it never exercised what a real bind-time failure actually
+    does to the savepoint. The real failure is worse: SQLAlchemy's JSON
+    column type serializes ``request_payload`` at bind time, inside the
+    INSERT's own flush -- past this module's pre-INSERT
+    ``json.dumps(..., allow_nan=False)`` probe -- and when that
+    serialization fails, SQLAlchemy marks the open SAVEPOINT inactive
+    *before* the ``StatementError`` it raises ever surfaces here (measured
+    directly). By the time control reaches the ``finally``,
+    ``inner.is_active`` is already False even though the SAVEPOINT itself is
+    still open in the database, waiting to be unwound -- an ``if
+    inner.is_active: inner.rollback()`` guard reads that False and skips the
+    call entirely, leaking the savepoint open. Only an unconditional
+    ``rollback()`` (guarded solely against an already-*closed* transaction,
+    via ``ResourceClosedError``) actually pops it.
+
+    To reach that path without this module's own pre-INSERT probe catching
+    the payload first, the probe is defeated here (see
+    ``_defeat_json_probe_but_not_bind_time_serialization`` for why an
+    unconditional ``json.dumps`` patch would silently defang the real
+    serialization too, and how this one avoids that) so real serialization
+    is left free to fail for real on the non-serializable ``datetime`` in
+    the payload below."""
 
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
@@ -942,22 +990,19 @@ def test_p8b_inner_savepoint_cleans_up_on_non_integrity_error_during_insert(
     db = session_factory()
     anchor = _anchor(anchor_id)
 
-    original_flush = Session.flush
-    state = {"calls": 0}
+    _defeat_json_probe_but_not_bind_time_serialization(monkeypatch)
 
-    def _patched_flush(self: Session, *args: Any, **kwargs: Any) -> Any:
-        if self is db:
-            state["calls"] += 1
-            if state["calls"] == 3:
-                raise TypeError("simulated bind-time serialization failure")
-        return original_flush(self, *args, **kwargs)
+    kwargs = _stage_kwargs(anchor, request_payload={"bad": datetime.now(timezone.utc)})
 
-    monkeypatch.setattr(Session, "flush", _patched_flush)
-
-    with pytest.raises(TypeError, match="simulated bind-time serialization failure"):
-        stage_interaction_request(db, task_id=task_id, **_stage_kwargs(anchor))
+    with pytest.raises(StatementError):
+        stage_interaction_request(db, task_id=task_id, **kwargs)
 
     assert db.in_nested_transaction() is False
+
+    # The session must accept the next statement -- proving the savepoint
+    # was actually unwound, not merely marked inactive and left open
+    # underneath (which would instead surface as PendingRollbackError here).
+    db.execute(sa.select(sa.literal(1)))
     db.rollback()
     db.close()
 
@@ -1688,6 +1733,93 @@ def test_cm2b_non_serializable_payload_propagates_through_handoff(
 
     assert ops_signals.active_degradations() == {}
     assert db.in_transaction()
+    db.rollback()
+    db.close()
+
+
+def test_cm2c_statement_error_at_bind_time_propagates_uncaught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlike ``test_cm2b`` above (a ``ValueError`` this module's own
+    pre-INSERT probe catches in plain Python), a bind-time
+    ``StatementError`` -- the probe defeated the same way
+    ``test_p8b_inner_savepoint_cleans_up_on_non_integrity_error_during_insert``
+    defeats it -- is not one of the six swallowed types either, so it must
+    propagate out of the with-block the same way, through the CM's
+    ``except BaseException`` branch, with the outer savepoint actually
+    unwound behind it (not merely marked inactive) and no degradation
+    signal registered."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    _defeat_json_probe_but_not_bind_time_serialization(monkeypatch)
+
+    with pytest.raises(StatementError):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"bad": datetime.now(timezone.utc)},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+
+    assert db.in_nested_transaction() is False
+    assert ops_signals.active_degradations() == {}
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0
+    db.rollback()
+    db.close()
+
+
+def test_cm2d_bare_runtime_error_from_with_body_propagates_and_unwinds(
+    tmp_path: Path,
+) -> None:
+    """A caller bug inside the with-block that is none of the six swallowed
+    types, ``InteractionOwnerStateError``, or ``InteractionHandoffMisuse``
+    must still propagate uncaught, through the CM's ``except BaseException``
+    branch -- and that branch's own savepoint rollback must actually unwind
+    it, discarding the row ``stage()`` already staged, rather than leaking
+    it open the way an ``is_active``-guarded rollback would on a
+    flush-deactivated savepoint."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _lease(task_id)
+    task = db.get(Task, task_id)
+
+    with pytest.raises(RuntimeError, match="caller bug inside the with block"):
+        with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+            h.stage(
+                kind="clarification",
+                protocol_version=1,
+                request_payload={"prompt": "p"},
+                request_idempotency_key=_next_key(),
+                expires_at=_now() + timedelta(minutes=15),
+            )
+            raise RuntimeError("caller bug inside the with block")
+
+    assert db.in_nested_transaction() is False
+    assert ops_signals.active_degradations() == {}
+    row_count = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert row_count == 0
     db.rollback()
     db.close()
 

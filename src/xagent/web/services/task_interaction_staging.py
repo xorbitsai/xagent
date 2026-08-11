@@ -138,7 +138,7 @@ from datetime import datetime
 from typing import Any, Iterator
 
 import sqlalchemy as sa
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, ResourceClosedError
 from sqlalchemy.orm import Session
 
 from ..models.task import Task
@@ -972,19 +972,18 @@ def stage_interaction_request(
             active_slot=1,
         )
     finally:
-        # A no-op on both handled paths above (the except branch's own
-        # inner.rollback() and the else branch's inner.commit() have already
-        # deactivated the savepoint by the time this runs). What it actually
-        # guards is any exception this try block does not otherwise catch --
-        # IntegrityError is the only one classified above, so anything else
-        # db.flush() or the constructor could raise (a StatementError from a
-        # bind-time serialization failure, for instance) would previously
-        # propagate straight out with this savepoint still open, leaking it
-        # into whatever the caller does next. Closing it here regardless of
-        # which path was taken keeps this function's own savepoint scoped to
-        # this function on every exit, not just the two it names explicitly.
-        if inner.is_active:
+        # Three states are possible here. Active: roll back normally.
+        # Flush-deactivated -- a bind-time failure inside flush marks
+        # the savepoint inactive BEFORE the exception surfaces
+        # (measured) -- is_active is already False, but rollback() is
+        # exactly what unwinds it; an is_active guard would skip it and
+        # leak the savepoint. Closed -- the caller committed or rolled
+        # back the whole transaction -- rollback() raises
+        # ResourceClosedError, absorbed: nothing is left to unwind.
+        try:
             inner.rollback()
+        except ResourceClosedError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1465,18 +1464,32 @@ def interaction_handoff(
             # lives in finally so it still runs even if logger.error itself
             # raises (a misconfigured handler, for instance) -- otherwise
             # that would leak this savepoint open on top of replacing the
-            # swallowed exception. The rollback stays guarded: a caller that
+            # swallowed exception. Three states are possible here. Active:
+            # roll back normally. Flush-deactivated -- a bind-time failure
+            # inside some statement issued during the with-block already
+            # marked the savepoint inactive before the swallowed exception
+            # ever surfaced (measured) -- is_active is already False, but
+            # rollback() is exactly what unwinds it; an is_active guard
+            # would skip it and leak the savepoint. Closed -- a caller that
             # violated the never-commit-or-rollback-inside-this-block
-            # contract has already deactivated this savepoint, and an
-            # unguarded rollback would raise ResourceClosedError, replacing
-            # whatever exception is already in flight and skipping the
-            # degradation signal entirely.
-            if savepoint.is_active:
+            # contract has already deactivated this savepoint by committing
+            # or rolling back the whole transaction -- rollback() raises
+            # ResourceClosedError, absorbed: nothing is left to unwind.
+            try:
                 savepoint.rollback()
+            except ResourceClosedError:
+                pass
         return
     except BaseException:
-        if savepoint.is_active:
+        # Same three-state reasoning as the swallowed-exception handler's
+        # own finally above: active or flush-deactivated, rollback()
+        # unwinds it; closed (absorbed ResourceClosedError) because a
+        # caller-misuse commit/rollback inside the block already ended the
+        # transaction and left nothing to unwind.
+        try:
             savepoint.rollback()
+        except ResourceClosedError:
+            pass
         raise
     else:
         if not savepoint.is_active:

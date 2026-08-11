@@ -1031,8 +1031,18 @@ class DAGPattern(AgentPattern):
                 pattern=self,
                 metadata={"active_step_id": step.id},
             )
+            # ReAct itself never knows which DAG step it is running as (its
+            # draft always carries step_id=None); attribute the draft to
+            # this step here, where that identity is known. The draft is a
+            # frozen dataclass, so this is a copy, not an in-place edit.
+            draft = result.get("clarification_draft")
+            attributed_result = dict(result)
+            if draft is not None:
+                attributed_result["clarification_draft"] = draft.with_origin_step(
+                    step.id
+                )
             return {
-                **result,
+                **attributed_result,
                 "execution_id": root_context.execution_id,
                 "context": root_context,
                 "active_step_id": step.id,

@@ -21,7 +21,10 @@ from xagent.core.agent import (
     PlanStep,
     PlanValidationError,
 )
-from xagent.core.agent.clarification import draft_from_waiting_request
+from xagent.core.agent.clarification import (
+    ClarificationDraft,
+    draft_from_waiting_request,
+)
 from xagent.core.agent.pattern.base import RequiredToolCallError
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.agent.pattern.dag.plan_generator import (
@@ -2064,6 +2067,138 @@ async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
     steps_by_id = {step.id: step for step in pattern.plan.steps}
     assert steps_by_id["a_wait_step"].status == "clarification_invalidated"
     assert "a_wait_step" not in pattern.active_step_ids
+
+
+@pytest.mark.asyncio
+async def test_dag_waiting_draft_attribution_differs_only_by_step() -> None:
+    """T-R-17: two independently-run steps reaching an identical waiting
+    turn (same message count, same tool_call_id/interaction_id) get
+    distinct turn markers purely because DAG attributes each draft to its
+    own step; levelling that attribution to a shared step id makes the two
+    drafts fully equal, proving the inequality comes only from step
+    identity."""
+
+    class FixedAskLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "ask-fixed",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Pick an option",
+                                    "message_type": "question",
+                                    "expect_response": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            }
+
+    async def run_single_step(step_id: str) -> ClarificationDraft:
+        pattern = DAGPattern(lambda **_: None)
+        root_context = ExecutionContext(execution_id=f"dag-attr-{step_id}")
+        root_context.add_user_message("Help me decide")
+        result = await pattern._execute_step(
+            step=PlanStep(id=step_id, task="Ask"),
+            root_context=root_context,
+            tools=[],
+            llm=FixedAskLLM(),
+            runtime=PatternRuntime(execution_id=f"dag-attr-{step_id}"),
+        )
+        assert result is not None
+        assert result["status"] == "waiting_for_user"
+        draft = result["clarification_draft"]
+        assert draft is not None
+        return draft
+
+    draft_a = await run_single_step("step_a")
+    draft_b = await run_single_step("step_b")
+
+    # Same turn content in every field that feeds the marker.
+    assert draft_a.turn_message_count == draft_b.turn_message_count
+    assert draft_a.requests == draft_b.requests
+    assert draft_a.origin_step_id == "step_a"
+    assert draft_b.origin_step_id == "step_b"
+    assert draft_a.turn_marker != draft_b.turn_marker
+
+    # Levelling only the step attribution (origin_execution_id is not a
+    # marker input and legitimately differs here -- each call built its own
+    # root context) makes the two markers equal, proving the earlier
+    # inequality traced to step identity alone.
+    assert (
+        draft_a.with_origin_step("shared").turn_marker
+        == draft_b.with_origin_step("shared").turn_marker
+    )
+
+
+@pytest.mark.asyncio
+async def test_dag_waiting_draft_reentry_without_new_message_is_stable() -> None:
+    """T-R-18: resuming the same waiting step with no new user message
+    reproduces the identical origin_step_id and turn_marker -- a pure
+    re-entry, not a new turn."""
+
+    class FixedAskLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "ask-fixed",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Pick an option",
+                                    "message_type": "question",
+                                    "expect_response": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            }
+
+    class UnusedLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("a pure re-entry must not call the LLM again")
+
+    pattern = DAGPattern(lambda **_: None)
+    step = PlanStep(id="confirm", task="Ask")
+    root_context = ExecutionContext(execution_id="dag-reentry")
+    root_context.add_user_message("Help me decide")
+
+    first = await pattern._execute_step(
+        step=step,
+        root_context=root_context,
+        tools=[],
+        llm=FixedAskLLM(),
+        runtime=PatternRuntime(execution_id="dag-reentry"),
+    )
+    assert first is not None
+    first_draft = first["clarification_draft"]
+    assert first_draft is not None
+
+    second = await pattern._execute_step(
+        step=step,
+        root_context=root_context,
+        tools=[],
+        llm=UnusedLLM(),
+        runtime=PatternRuntime(execution_id="dag-reentry"),
+    )
+    assert second is not None
+    second_draft = second["clarification_draft"]
+    assert second_draft is not None
+
+    assert second_draft.origin_step_id == first_draft.origin_step_id == "confirm"
+    assert second_draft.turn_marker == first_draft.turn_marker
+    assert second_draft == first_draft
 
 
 @pytest.mark.asyncio

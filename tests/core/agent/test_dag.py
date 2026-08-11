@@ -1978,10 +1978,10 @@ async def test_dag_pattern_invalidated_step_is_rescheduled_after_winner_settles(
 async def test_dag_pattern_double_waiting_invalidation_persists_across_restore() -> (
     None
 ):
-    """The §H-2 checkpoint extension: a batch that invalidates a loser
-    while ``pending`` is empty (no sibling left to cancel) still writes a
-    checkpoint, so the invalidation survives a resume instead of only
-    living in memory until the process restores from an earlier snapshot.
+    """A batch that invalidates a loser while ``pending`` is empty (no
+    sibling left to cancel) still writes a checkpoint, so the invalidation
+    survives a resume instead of only living in memory until the process
+    restores from an earlier snapshot.
     """
 
     pattern, result, tracer = await run_double_waiting_dag(
@@ -2004,7 +2004,7 @@ async def test_dag_pattern_double_waiting_invalidation_persists_across_restore()
 
 @pytest.mark.asyncio
 async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
-    """§H-3: in a batch where one step is interrupted and another is
+    """In a batch where one step is interrupted and another is
     waiting in the same wakeup, the interrupted result wins -- an
     interrupt is a control instruction, not a workflow question the user
     can be asked to sit through -- and the losing waiting step is

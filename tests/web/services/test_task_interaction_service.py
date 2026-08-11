@@ -7,6 +7,49 @@ by ``tests/web/api/test_public_chat_ownership_helper.py``, since it is
 extracted from and tested alongside ``public_chat_access.py``) and the
 production-caller gate (its own file,
 ``test_task_interaction_service_production_gate.py``).
+
+RespondOutcome's failure matrix, and what this delivery does and does not
+do with it: the frozen design enumerates 25 triggering cells across
+``respond()``'s not-yet-implemented logic, producing 21 distinct (outcome
+type, reason) pairs -- fewer than 25 because several cells share a pair
+(five different "principal does not own this task" cells all produce
+``(RespondUnauthorized, not_task_principal)``; two "same idempotency key,
+different actor" cells both produce ``(RespondConflict,
+idempotency_key_reused)``; one cell, kind/version validation, is
+parametrized over two reasons on its own). The full cell-to-pair mapping:
+
+    OK        -> (Accepted, None)                                    1
+    V1        -> (ValidationRejected, unknown_kind)                  }  2
+                 (ValidationRejected, unknown_protocol_version)      }
+    V2        -> (ValidationRejected, malformed_idempotency_key)     1
+    V3        -> (ValidationRejected, invalid_values)                1
+    V5        -> (ValidationRejected, kind_version_mismatch)         1
+    A1..A5    -> (Unauthorized, not_task_principal)      1 (5 cells share it)
+    U1        -> (Unavailable, task_missing)                         1
+    U2        -> (Unavailable, interaction_missing)                  1
+    U3        -> (Unavailable, checkpoint_unavailable)                1
+    R1        -> (Replayed, None)                                    1
+    C1        -> (Conflict, already_answered)                        1
+    C2,C3     -> (Conflict, idempotency_key_reused)      1 (2 cells share it)
+    S1..S7    -> seven distinct (Stale, *) pairs                     7
+    X1        -> (OutcomeUnknown, None)                              1
+    -----------------------------------------------------------------
+    25 cells; 21 distinct pairs (19 single-reason cells + V1's own 2)
+
+This delivery does **not** write the 25 cell-by-cell tests this matrix
+implies -- ``respond()`` itself is not implemented here (see the module
+docstring in ``task_interaction_service.py``), so there is no behavior yet
+for those tests to pin. What this delivery does write is the vocabulary
+guard below (``test_respond_outcome_vocabulary_has_exactly_21_pairs``),
+which is a different assertion from either the cell-by-cell tests or a
+mapping meta-test, per the frozen design's own three-way division of
+labor:
+
+| Assertion | Checks | Catches | Misses |
+|---|---|---|---|
+| Vocabulary closure (this file, written) | The set of (outcome, reason) pairs RespondOutcome can produce == the 21-pair vocabulary | A new reason constant or outcome variant added without updating the vocabulary | Cell-level coverage |
+| Cell-by-cell tests (not written here; land with respond()) | One test per of the 25 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
+| Mapping meta-test (not written here; lands with respond()) | Each of the 21 pairs is produced by >= 1 cell's test (19 singles + V1's 2) | A new cell that produces a new pair with no test written for it; V1's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a sixth not_task_principal scenario) -- caught by review, not this meta-test |
 """
 
 from __future__ import annotations
@@ -520,6 +563,12 @@ def _force_dangling_pointer(db: Session, *, interaction_id: int) -> None:
 def test_t3_anchor_dangling_when_the_pointer_names_no_row(
     _db: Session, _seeded_task: int
 ) -> None:
+    """One of this delivery's two mutation-test guards: folding the T3
+    branch back into the T1 legacy fallback must turn this test red, while
+    the T1 tests above stay green -- proving the suite actually
+    distinguishes "there is an active row but it cannot be answered right
+    now" from "there is no active row at all"."""
+
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     row = _make_active_interaction_row(
         _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id

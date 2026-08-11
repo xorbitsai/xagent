@@ -182,7 +182,12 @@ def test_widget_principal_against_a_share_task_with_matching_guest_id_is_rejecte
     equal, but auth_mode disagrees. The same inputs fed to the untouched
     get_task_for_public_context on the current tree return the task instead
     of rejecting it -- this test asserts the helper's tightening over that
-    existing behavior, not existing behavior itself."""
+    existing behavior, not existing behavior itself.
+
+    This is the mutation-test guard for the auth_mode conjunct: deleting
+    that conjunct from task_is_owned_by_public_principal must turn this
+    test red. A guard that stays green under that deletion would mean the
+    tightening is documentation only, not enforced behavior."""
 
     share_task = _task(
         agent_id=5,

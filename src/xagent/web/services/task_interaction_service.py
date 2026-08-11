@@ -50,6 +50,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from ..models.task import Task
 
 # ---------------------------------------------------------------------------
@@ -297,3 +299,268 @@ def public_chat_identity_matches(task: "Task", principal: InteractionPrincipal) 
     if not isinstance(task.agent_config, dict):
         return False
     return task.agent_config.get("guest_id") == principal.guest_id
+
+
+# ---------------------------------------------------------------------------
+# RespondOutcome: the answer-side discriminated union. Types only in this
+# delivery -- respond() itself, and every branch that could actually
+# produce most of these variants, lands with a later change (see the module
+# docstring). Defining the full union now, rather than growing it
+# incrementally alongside respond()'s call body, is what lets the reason
+# vocabulary be pinned once and the counting below be a real guard instead
+# of a moving target.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InteractionResponseReceipt:
+    """Everything a caller needs to know about a successful answer, taken
+    before commit from an explicit ``RETURNING``/``SELECT`` -- never from a
+    lazy ORM relationship read after commit, which could re-issue SQL
+    against a session whose transaction has already ended. Appears only on
+    ``RespondAccepted`` and ``RespondReplayed``; every other outcome carries
+    no receipt because no answer became durable.
+
+    Field-for-field, this mirrors ``StagedInteractionRequest``'s and
+    ``StagedTaskCommand``'s own after-flush value objects: a name that
+    marks "already durable", not merely "staged in this call's session".
+    """
+
+    interaction_id: int
+    task_id: int
+    run_id: str
+    status: str  # "answered"
+    responded_at: "datetime"
+    responder_identity: str
+    idempotency_key: str
+    command_db_id: int
+    task_state_version: int
+    task_control_state: str
+
+
+@dataclass(frozen=True)
+class RespondAccepted:
+    receipt: InteractionResponseReceipt
+
+
+@dataclass(frozen=True)
+class RespondValidationRejected:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RespondUnauthorized:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RespondUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RespondReplayed:
+    receipt: InteractionResponseReceipt
+
+
+@dataclass(frozen=True)
+class RespondConflict:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RespondStale:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RespondOutcomeUnknown:
+    """A commit whose acknowledgment was ambiguous, reconciled against the
+    durable graph, and still unresolved after every reconciliation attempt.
+    Not an exception this service lets escape -- a stable, typed result a
+    caller can act on (e.g. surface "we could not confirm this went
+    through" rather than crash)."""
+
+
+RespondOutcome = (
+    RespondAccepted
+    | RespondValidationRejected
+    | RespondUnauthorized
+    | RespondUnavailable
+    | RespondReplayed
+    | RespondConflict
+    | RespondStale
+    | RespondOutcomeUnknown
+)
+
+# The (outcome type, reason) pairs RespondOutcome can produce once
+# respond() is implemented, keyed by outcome class name. ``None`` in the
+# reason set stands for the reason-less variants (Accepted / Replayed /
+# OutcomeUnknown carry no reason code). This is the vocabulary guard: it
+# proves the reason word list stays closed at exactly the pairs enumerated
+# here, nothing more -- it does NOT prove every pair has a test written
+# against it (several reasons are reachable from more than one triggering
+# condition, e.g. every "A" row of the design's failure matrix collapses to
+# the single (Unauthorized, not_task_principal) pair here; a guard over
+# this dict cannot and does not distinguish which condition produced a
+# given pair). Do not read "count matches" as "coverage complete".
+RESPOND_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str | None]] = {
+    "RespondAccepted": frozenset({None}),
+    "RespondValidationRejected": frozenset(
+        {
+            "unknown_kind",
+            "unknown_protocol_version",
+            "malformed_idempotency_key",
+            "invalid_values",
+            "kind_version_mismatch",
+        }
+    ),
+    "RespondUnauthorized": frozenset({"not_task_principal"}),
+    "RespondUnavailable": frozenset(
+        {"task_missing", "interaction_missing", "checkpoint_unavailable"}
+    ),
+    "RespondReplayed": frozenset({None}),
+    "RespondConflict": frozenset({"already_answered", "idempotency_key_reused"}),
+    "RespondStale": frozenset(
+        {
+            "expired",
+            "run_superseded",
+            "answered_via_chat",
+            "run_ended",
+            "foreign_run",
+            "state_version_advanced",
+            "anchor_dangling",
+        }
+    ),
+    "RespondOutcomeUnknown": frozenset({None}),
+}
+
+
+# ---------------------------------------------------------------------------
+# CreateOutcome: the create() seam's own discriminated union. Same family,
+# same style as RespondOutcome, but a separate set of classes -- the two
+# unions are not reused between each other even where a reason string
+# happens to be spelled the same way (e.g. "not_task_principal" appears in
+# both vocabularies below because both seams reuse the shared ownership
+# predicate's verdict, not because the two outcome types share a base
+# class).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CreatedInteractionReceipt:
+    """Same family as ``InteractionResponseReceipt``: taken before commit,
+    never from a lazy relationship read after it. Produced only once
+    ``CreateCreated`` becomes producible -- not in this delivery (see
+    ``create()``'s own docstring)."""
+
+    interaction_id: int
+    task_id: int
+    run_id: str
+    active_slot: int | None
+    protocol_version: int
+    request_idempotency_key: str
+    expires_at: "datetime"
+
+
+@dataclass(frozen=True)
+class CreateCreated:
+    receipt: CreatedInteractionReceipt
+
+
+@dataclass(frozen=True)
+class CreateValidationRejected:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CreateUnauthorized:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CreateUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CreateConflict:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CreateStale:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CreateNotWired:
+    """A well-formed, authorized create() call has nothing to report but
+    that fact: this seam validates and returns, it does not stage a row.
+
+    Retired by the wiring batch's ignition PR, which fills this seam's call
+    body. Until then a well-formed, authorized request has nothing to
+    report but that fact: this seam validates and returns, it does not
+    stage. That later change deletes this variant and its reason constant
+    together; the vocabulary guard then asserts one fewer pair, which is
+    what makes the deletion impossible to forget.
+    """
+
+    reason: str  # always "seam_not_wired" in this delivery
+
+
+CreateOutcome = (
+    CreateCreated
+    | CreateValidationRejected
+    | CreateUnauthorized
+    | CreateUnavailable
+    | CreateConflict
+    | CreateStale
+    | CreateNotWired
+)
+
+# The reason word list is defined once, for both delivery periods, because
+# it is the same closed vocabulary either way -- only which pairs are
+# *producible* changes (see CREATE_OUTCOME_PRODUCIBLE_REASONS below). 13
+# reasons total (the "Created" / None pair is not a reason string and is
+# counted separately). Do not recount this at implementation time -- it is
+# taken directly from the frozen design's own line-by-line count.
+CREATE_OUTCOME_REASON_WORDS: frozenset[str] = frozenset(
+    {
+        "unknown_kind",
+        "unknown_protocol_version",
+        "malformed_idempotency_key",
+        "invalid_values",
+        "not_task_principal",
+        "task_missing",
+        "checkpoint_unavailable",
+        "anchor_run_mismatch",
+        "slot_taken",
+        "idempotency_key_reused",
+        "anchor_dangling",
+        "run_ended",
+        "seam_not_wired",
+    }
+)
+
+# The (outcome type, reason) pairs this delivery's create() can actually
+# produce today: validation and authorization run, but the seam never
+# stages a row, so nothing past those two categories -- plus NotWired
+# itself -- is reachable. 7 pairs. Once the wiring batch fills create()'s
+# call body, this dict is replaced by one covering all 13 reasons (minus
+# seam_not_wired, which is deleted along with CreateNotWired) -- not
+# extended in place, so the guard's expected count changes atomically with
+# the variant it is pinned to.
+CREATE_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str]] = {
+    "CreateValidationRejected": frozenset(
+        {
+            "unknown_kind",
+            "unknown_protocol_version",
+            "malformed_idempotency_key",
+            "invalid_values",
+        }
+    ),
+    "CreateUnauthorized": frozenset({"not_task_principal"}),
+    "CreateUnavailable": frozenset({"task_missing"}),
+    "CreateNotWired": frozenset({"seam_not_wired"}),
+}

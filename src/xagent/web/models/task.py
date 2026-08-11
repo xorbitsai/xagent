@@ -85,15 +85,26 @@ class Task(Base):  # type: ignore
         # staged for the current wait" and readers fall back to the legacy
         # transcript path; 1 means a protocol v1 interaction row exists.
         #
-        # Only create_all-built databases and PostgreSQL carry this CHECK.
-        # The SQLite migration branch cannot emit it: adding a constraint to
-        # an existing table raises NotImplementedError on that dialect both
-        # online and offline, and the batch_alter_table workaround cannot run
-        # in --sql mode on either dialect, which the offline-SQL requirement
-        # rules out. SQLite is development and test only; production is
-        # PostgreSQL, and create_all-built SQLite test databases do carry the
-        # CHECK, so the constraint's behaviour stays covered by tests. The
-        # asymmetry is asserted as expected, not merely left uncovered -- see
+        # Only create_all-built databases and PostgreSQL carry this CHECK
+        # through the migration's upgrade(): the SQLite migration branch
+        # cannot add a CHECK to an existing table -- that raises
+        # NotImplementedError on that dialect both online and offline, and
+        # the batch_alter_table workaround cannot run in --sql mode on
+        # either dialect, which the offline-SQL requirement rules out.
+        # SQLite is the default self-hosted backend (get_database_url()
+        # falls back to it when DATABASE_URL is unset); PostgreSQL is the
+        # recommended backend at production scale. A fresh SQLite install
+        # stamps head and builds its schema via create_all rather than
+        # walking the revision chain, so it carries this CHECK even though
+        # upgrade() never adds it there -- the migration's downgrade()
+        # accounts for that by rebuilding the table on SQLite (dropping the
+        # CHECK when present, alongside the column) instead of a plain
+        # drop_column, so both the fresh-install and migration-chain SQLite
+        # shapes downgrade cleanly. create_all-built SQLite test databases
+        # also carry the CHECK, so the constraint's behaviour stays covered
+        # by tests. The asymmetry between upgrade() (never adds the CHECK on
+        # SQLite) and a fresh install (has it anyway) is asserted as
+        # expected, not merely left uncovered -- see
         # tests/migrations/test_task_interaction_protocol_version_parity.py.
         #
         # Unlike task_interaction_requests' floor-plus-active-pin split

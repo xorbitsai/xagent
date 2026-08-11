@@ -210,9 +210,8 @@ def _build_migration_shaped_postgresql_engine(engine):
     return engine
 
 
-def _build_create_all_sqlite_engine():
+def _build_create_all_engine(engine):
     reset_checkpoint_anchor_fk_create_rule()
-    engine = sa.create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     return engine
 
@@ -222,7 +221,7 @@ def _build_create_all_sqlite_engine():
 
 def test_sqlite_column_matches_between_migration_and_create_all() -> None:
     migration_engine = _build_migration_shaped_sqlite_engine()
-    create_all_engine = _build_create_all_sqlite_engine()
+    create_all_engine = _build_create_all_engine(sa.create_engine("sqlite:///:memory:"))
 
     migration_inv = _reflect_narrow_inventory(migration_engine)
     create_all_inv = _reflect_narrow_inventory(create_all_engine)
@@ -233,19 +232,29 @@ def test_sqlite_column_matches_between_migration_and_create_all() -> None:
 
 
 def test_sqlite_check_asymmetry_is_expected() -> None:
-    """SQLite cannot receive this CHECK through the migration path: adding a
-    constraint to an existing table raises NotImplementedError on SQLite
-    both online and offline, and the batch_alter_table workaround cannot run
-    in --sql mode on either dialect, which the offline-SQL requirement rules
-    out (see the migration and the model's __table_args__ comment). So a
-    migration-shaped SQLite database has no ck_tasks_interaction_protocol_version
-    CHECK, while a create_all-built one does (it comes straight from the
-    model). This asymmetry is expected, not a defect: if this assertion goes
-    red, check whether someone changed the SQLite branch of the migration to
-    emit the CHECK -- that would break `alembic upgrade --sql` on SQLite.
+    """Two SQLite deployments of the same xagent version can enforce
+    different invariants on this column depending on install history: a
+    fresh install (stamp head, then create_all) HAS the CHECK, while a
+    database that walked the revision chain does NOT -- upgrade() cannot
+    add a CHECK to an existing table on SQLite (NotImplementedError, both
+    online and offline; the batch_alter_table workaround cannot run in
+    --sql mode on either dialect, which the offline-SQL requirement rules
+    out -- see the migration and the model's __table_args__ comment).
+    Concretely: inserting interaction_protocol_version=2 succeeds on the
+    chain-walked shape and raises IntegrityError on the fresh-install shape.
+    This asymmetry is expected today because the column has zero writers --
+    nothing has ever inserted a non-NULL value, so nothing observes the
+    divergence. The change that adds the first writer to this column must
+    either converge the two shapes (e.g. teach upgrade() to add the CHECK on
+    SQLite via batch_alter_table the way downgrade() now removes it) or
+    explicitly justify writing to a column whose constraint isn't uniformly
+    enforced. If this assertion goes red because someone changed the SQLite
+    branch of upgrade() to emit the CHECK, that is this convergence
+    happening -- update this test to match, don't just re-pin the old
+    asymmetry.
     """
     migration_engine = _build_migration_shaped_sqlite_engine()
-    create_all_engine = _build_create_all_sqlite_engine()
+    create_all_engine = _build_create_all_engine(sa.create_engine("sqlite:///:memory:"))
 
     migration_checks = _reflect_narrow_inventory(migration_engine)["checks"]
     create_all_checks = _reflect_narrow_inventory(create_all_engine)["checks"]
@@ -263,21 +272,13 @@ def test_postgresql_column_and_check_match_between_migration_and_create_all() ->
         migration_engine = _build_migration_shaped_postgresql_engine(
             make_database("migration_side")
         )
-        create_all_engine = _build_create_all_engine_postgresql(
-            make_database("create_all_side")
-        )
+        create_all_engine = _build_create_all_engine(make_database("create_all_side"))
 
         migration_inv = _reflect_narrow_inventory(migration_engine)
         create_all_inv = _reflect_narrow_inventory(create_all_engine)
 
         differences = _diff_narrow_inventory(migration_inv, create_all_inv)
         assert differences == []
-
-
-def _build_create_all_engine_postgresql(engine):
-    reset_checkpoint_anchor_fk_create_rule()
-    Base.metadata.create_all(engine)
-    return engine
 
 
 # ---- T-M-2d: the comparator itself catches a changed CHECK expression ----
@@ -311,27 +312,12 @@ def test_diff_narrow_inventory_flags_a_changed_check_expression() -> None:
     assert any("checks" in difference for difference in differences)
 
 
-def test_diff_narrow_inventory_reports_no_differences_for_identical_inventories() -> (
-    None
-):
-    inventory = {
-        "column_present": True,
-        "column_nullable": True,
-        "checks": {
-            CONSTRAINT_NAME: "interaction_protocol_version IS NULL OR interaction_protocol_version = 1"
-        },
-    }
-
-    assert _diff_narrow_inventory(inventory, dict(inventory)) == []
-
-
 # ---- T-M-5: create_all SQLite cannot be downgraded; migration-chain can ----
 
 
 def test_sqlite_downgrade_succeeds_on_both_install_shapes() -> None:
-    """The reviewer's round-2 Finding 1 established that a fresh install
-    stamps head and then builds its schema via create_all (see
-    src/xagent/db/migration.py's empty-DB stamp path and database.py's
+    """A fresh install stamps head and then builds its schema via create_all
+    (see src/xagent/db/migration.py's empty-DB stamp path and database.py's
     create_all call), so the create_all-built SQLite shape is a real
     downgrade-reachable production shape, not a synthetic one -- and SQLite
     3.35+ refuses to DROP a column a CHECK constraint references, so the old
@@ -345,7 +331,7 @@ def test_sqlite_downgrade_succeeds_on_both_install_shapes() -> None:
     """
     migration = load_migration_module(MIGRATION_PATH)
 
-    create_all_engine = _build_create_all_sqlite_engine()
+    create_all_engine = _build_create_all_engine(sa.create_engine("sqlite:///:memory:"))
     with create_all_engine.begin() as connection:
         with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()

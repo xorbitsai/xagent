@@ -66,6 +66,8 @@ from xagent.web.services.task_lease_service import TaskLease
 
 _key_counter = count()
 
+pytestmark = pytest.mark.postgresql
+
 
 @pytest.fixture()
 def engine():

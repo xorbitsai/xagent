@@ -1805,51 +1805,54 @@ async def test_dag_pattern_concurrent_double_waiting_delivers_to_winner() -> Non
     assert pattern._waiting_step_id() == "ask_a" == result["active_step_id"]
 
 
-@pytest.mark.asyncio
-async def test_dag_pattern_single_waiting_regression_unchanged() -> None:
-    """T-X-4: a single step reaching waiting_for_user, with an independent
-    sibling still running, is unaffected by the exactly-one machinery --
-    same result keys, same sibling cancellation, no superseded-step key."""
+class WaitingAndSlowLLM:
+    def __init__(self) -> None:
+        self.slow_started = asyncio.Event()
+        self.slow_cancelled = asyncio.Event()
 
-    class WaitingAndSlowLLM:
-        def __init__(self) -> None:
-            self.slow_started = asyncio.Event()
-            self.slow_cancelled = asyncio.Event()
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
+        messages = list(kwargs.get("messages", []))
+        task = current_step_task(messages)
+        if task == "Slow task":
+            self.slow_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.slow_cancelled.set()
+                raise
+        if task == "Ask task":
+            await self.slow_started.wait()
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "ask-only",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Pick an option",
+                                    "message_type": "question",
+                                    "expect_response": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            }
+        return {"content": "done", "done": True}
 
-        async def chat(self, **kwargs: Any) -> dict[str, Any]:
-            if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
-                return default_completion_assessment_response(kwargs)
-            messages = list(kwargs.get("messages", []))
-            task = current_step_task(messages)
-            if task == "Slow task":
-                self.slow_started.set()
-                try:
-                    await asyncio.Future()
-                except asyncio.CancelledError:
-                    self.slow_cancelled.set()
-                    raise
-            if task == "Ask task":
-                await self.slow_started.wait()
-                return {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "ask-only",
-                            "function": {
-                                "name": "send_message",
-                                "arguments": json.dumps(
-                                    {
-                                        "message": "Pick an option",
-                                        "message_type": "question",
-                                        "expect_response": True,
-                                    }
-                                ),
-                            },
-                        }
-                    ],
-                    "done": False,
-                }
-            return {"content": "done", "done": True}
+
+async def run_single_waiting_with_cancelled_sibling_dag() -> tuple[
+    DAGPattern, dict[str, Any], TracerCheckpointStore, WaitingAndSlowLLM
+]:
+    """Run a two-step DAG where one step reaches waiting_for_user while an
+    independent sibling is still in flight and gets cancelled as a result;
+    return the pattern, the result, the checkpoint tracer, and the fake
+    LLM, for the caller to assert against."""
 
     llm = WaitingAndSlowLLM()
     tracer = TracerCheckpointStore()
@@ -1870,6 +1873,16 @@ async def test_dag_pattern_single_waiting_regression_unchanged() -> None:
         ),
         timeout=1,
     )
+    return pattern, result, tracer, llm
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_single_waiting_regression_unchanged() -> None:
+    """T-X-4: a single step reaching waiting_for_user, with an independent
+    sibling still running, is unaffected by the exactly-one machinery --
+    same result keys, same sibling cancellation, no superseded-step key."""
+
+    pattern, result, tracer, llm = await run_single_waiting_with_cancelled_sibling_dag()
 
     assert result["status"] == "waiting_for_user"
     assert result["active_step_id"] == "ask"
@@ -1891,6 +1904,26 @@ async def test_dag_pattern_single_waiting_regression_unchanged() -> None:
         "slow": "pending",
     }
     assert tracer.checkpoints[-1]["label"] == "dag_after_cancelled_siblings"
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_live_step_tasks_cleared_after_cancelling_a_sibling() -> None:
+    """has_live_step_tasks() reads False once run() has returned even when
+    the winning batch left a genuinely non-empty pending set behind (here,
+    a still-running sibling that gets cancelled). The all-waiting scenario
+    cannot pin this: both of its steps complete in the same wakeup, so its
+    pending set is already empty before the batch is even processed, and
+    the finally clause that clears the live-task set has nothing left to
+    do by the time it runs. Only a scenario where pending is genuinely
+    non-empty at the point the winner is chosen -- a step cancelled
+    instead of completed -- can tell a present finally-clause clear apart
+    from a missing one.
+    """
+
+    pattern, result, _, _ = await run_single_waiting_with_cancelled_sibling_dag()
+
+    assert result["status"] == "waiting_for_user"
+    assert pattern.has_live_step_tasks() is False
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,8 @@ production-caller gate (its own file,
 
 from __future__ import annotations
 
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +21,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_interaction_schema_shared import make_task, make_user
+from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
-from xagent.web.models.task import Task
+from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_service as svc
+from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 # ---------------------------------------------------------------------------
 # Vocabulary guards (three numbers, pinned by the frozen design's own
@@ -139,7 +143,15 @@ def _seeded_task(_session_factory) -> int:
     db = _session_factory()
     try:
         user_id = make_user(db)
-        return make_task(db, user_id=user_id)
+        task_id = make_task(db, user_id=user_id)
+        # run_id="run-a" matches every C-11 fixture row below by default --
+        # the active-row predicate requires TaskInteractionRequest.run_id
+        # == Task.run_id, so a task with no run_id would make every active
+        # row invisible regardless of the scenario under test.
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.run_id = "run-a"
+        db.commit()
+        return task_id
     finally:
         db.close()
 
@@ -294,3 +306,331 @@ def test_create_never_touches_staging_or_stages_a_row(
     )
     assert isinstance(outcome, svc.CreateNotWired)
     assert _db.query(TaskInteractionRequest).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# materialize_compatibility_view(): the three-tier compatibility read.
+# ---------------------------------------------------------------------------
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _make_trace_event(
+    db: Session,
+    *,
+    task_id: int,
+    run_partition: str = "run-a",
+    execution_id: str = "exec-1",
+    event_type: str = str(CHECKPOINT_EVENT_TYPE),
+    checkpoint_type: str = "agent_execution_checkpoint",
+    build_id: str | None = None,
+) -> int:
+    event = TraceEvent(
+        task_id=task_id,
+        event_id=f"trace-event-{task_id}",
+        event_type=event_type,
+        timestamp=_now(),
+        build_id=build_id,
+        data={
+            TASK_RUN_ID_TRACE_FIELD: run_partition,
+            "checkpoint_type": checkpoint_type,
+            "execution_id": execution_id,
+        },
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return int(event.id)
+
+
+def _make_active_interaction_row(
+    db: Session,
+    *,
+    task_id: int,
+    run_id: str = "run-a",
+    resume_trace_event_id: int | None,
+    resume_run_partition: str = "run-a",
+    resume_execution_id: str = "exec-1",
+    protocol_version: int = 1,
+) -> TaskInteractionRequest:
+    now = _now()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id=run_id,
+        kind="clarification",
+        protocol_version=protocol_version,
+        status="active",
+        active_slot=1,
+        origin="internal",
+        request_payload={
+            "message": "Which environment?",
+            "interactions": [
+                {"type": "text_input", "field": "env", "label": "Environment"}
+            ],
+        },
+        request_idempotency_key=f"key-{task_id}",
+        resume_trace_event_id=resume_trace_event_id,
+        resume_event_id="resume-event-1",
+        resume_execution_id=resume_execution_id,
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition=resume_run_partition,
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def _make_answered_interaction_row(db: Session, *, task_id: int, run_id: str) -> None:
+    now = _now()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id=run_id,
+        kind="clarification",
+        protocol_version=1,
+        status="answered",
+        active_slot=None,
+        origin="internal",
+        request_payload={"message": "old question", "interactions": []},
+        response_payload={"env": "prod"},
+        request_idempotency_key=f"answered-key-{task_id}",
+        resume_trace_event_id=None,
+        resume_event_id="resume-event-2",
+        resume_execution_id="exec-2",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition=run_id,
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+        responder_identity="user:1",
+        responded_at=now,
+    )
+    db.add(row)
+    db.commit()
+
+
+def test_t1_falls_back_to_legacy_when_the_table_does_not_exist(
+    _db: Session, _seeded_task: int
+) -> None:
+    TaskInteractionRequest.__table__.drop(bind=_db.get_bind())
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "legacy"
+    assert view.reason is None
+
+
+def test_t1_falls_back_to_legacy_when_there_is_no_active_row(
+    _db: Session, _seeded_task: int
+) -> None:
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "legacy"
+    assert view.question is None
+    assert view.interactions is None
+
+
+def test_t1_falls_back_to_legacy_when_protocol_version_is_unrecognized(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ck_task_interaction_requests_active_protocol`` pins every active
+    row's protocol_version to 1 today, so this branch cannot be reached
+    through any real write against this schema -- it defends against a
+    future protocol version whose active-row CHECK has not been written
+    yet. Monkeypatching the row lookup is how this delivery tests a branch
+    the schema itself does not yet allow to be constructed."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    row = _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    row.protocol_version = 2
+
+    def _fake_active_row(db: Session, task_id: int) -> TaskInteractionRequest:
+        return row
+
+    monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "legacy"
+
+
+def test_t2_native_projection_when_the_anchor_resolves(
+    _db: Session, _seeded_task: int
+) -> None:
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "native"
+    assert view.question == "Which environment?"
+    assert view.interactions == [
+        {
+            "type": "text_input",
+            "field": "env",
+            "label": "Environment",
+            "options": None,
+            "placeholder": None,
+            "multiline": False,
+            "min": None,
+            "max": None,
+            "default_value": None,
+            "accept": None,
+            "multiple": False,
+        }
+    ]
+    assert view.reason is None
+
+
+def _force_dangling_pointer(db: Session, *, interaction_id: int) -> None:
+    """Point an already-committed active row's anchor at a trace_events id
+    that does not exist. This state cannot arise through any write this
+    schema's own CHECK + FK constraints allow -- an INSERT with a bad
+    pointer is rejected by the FK, and deleting the pointed-to row while
+    the interaction row is still active is rejected by
+    ck_task_interaction_requests_active_anchor -- so simulating it for a
+    defensive-path test means bypassing FK enforcement for one raw write,
+    the same way a real corruption (an out-of-band DB intervention, a
+    migration bug) would bypass the ORM layer that normally enforces it.
+
+    Uses an independent sqlite3 connection to the same file rather than the
+    session's own connection: SQLite ignores a ``PRAGMA foreign_keys``
+    change issued while a transaction is already open on that connection,
+    and disturbing the session's own transaction state here would leak
+    into the assertions that follow.
+    """
+
+    db_path = str(db.get_bind().url.database)
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute(
+            "UPDATE task_interaction_requests SET resume_trace_event_id = ? "
+            "WHERE id = ?",
+            (999999999, interaction_id),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+    db.expire_all()
+
+
+def test_t3_anchor_dangling_when_the_pointer_names_no_row(
+    _db: Session, _seeded_task: int
+) -> None:
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    row = _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    _force_dangling_pointer(_db, interaction_id=row.id)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "anchor_dangling"
+    assert view.question == "Which environment?"
+    assert view.interactions is None
+
+
+def test_t3_prime_anchor_dangling_when_the_row_fails_validation(
+    _db: Session, _seeded_task: int
+) -> None:
+    """T3': same reason code as a missing row -- a pointer that resolves to
+    an invalid row and a pointer that resolves to nothing are the same fact
+    from this reader's side (see _resolve_read_direction_anchor's
+    docstring for why the registration surface is deliberately wider than
+    trace_handlers')."""
+
+    trace_event_id = _make_trace_event(
+        _db, task_id=_seeded_task, run_partition="a-different-run"
+    )
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "anchor_dangling"
+
+
+def test_t3_does_not_fall_back_to_legacy(_db: Session, _seeded_task: int) -> None:
+    """Pins §V2-7.5's prohibition directly: a T3 result must never present
+    as "no active row" -- it must always be the unanswerable tier, never
+    the legacy tier, even though get_latest_waiting_question would also
+    return (None, None) for this same task if it were consulted."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    row = _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    _force_dangling_pointer(_db, interaction_id=row.id)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier != "legacy"
+
+
+def test_stale_run_active_row_is_invisible(_db: Session, _session_factory) -> None:
+    """A5-P2, task 2: the active row was staged under a run the task has
+    since moved past. Falls back to legacy, exactly like "no active row"."""
+
+    db = _session_factory()
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-current"
+    db.commit()
+    trace_event_id = _make_trace_event(db, task_id=task_id, run_partition="run-old")
+    _make_active_interaction_row(
+        db,
+        task_id=task_id,
+        run_id="run-old",
+        resume_trace_event_id=trace_event_id,
+        resume_run_partition="run-old",
+    )
+    view = svc.materialize_compatibility_view(db, task_id)
+    assert view.tier == "legacy"
+    db.close()
+
+
+def test_answered_row_is_invisible(_db: Session, _seeded_task: int) -> None:
+    """A5-P2, task 3: an answered row is not an active row and must not be
+    projected as one."""
+
+    _make_answered_interaction_row(_db, task_id=_seeded_task, run_id="run-a")
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "legacy"
+
+
+def test_list_returns_only_the_active_row_not_the_answered_one(
+    _db: Session, _session_factory
+) -> None:
+    db = _session_factory()
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    db.commit()
+    trace_event_id = _make_trace_event(db, task_id=task_id)
+    active = _make_active_interaction_row(
+        db, task_id=task_id, resume_trace_event_id=trace_event_id
+    )
+    _make_answered_interaction_row(db, task_id=task_id, run_id="run-a")
+
+    rows = svc.list_active(db, task_id=task_id)
+    assert [row.id for row in rows] == [active.id]
+    db.close()
+
+
+def test_get_scopes_by_task_id_not_by_interaction_id_alone(
+    _db: Session, _session_factory
+) -> None:
+    db = _session_factory()
+    user_id = make_user(db)
+    task_a = make_task(db, user_id=user_id)
+    task_b = make_task(db, user_id=user_id)
+    trace_event_id = _make_trace_event(db, task_id=task_a)
+    row = _make_active_interaction_row(
+        db, task_id=task_a, resume_trace_event_id=trace_event_id
+    )
+
+    assert svc.get(db, task_id=task_a, interaction_id=row.id) is not None
+    assert svc.get(db, task_id=task_b, interaction_id=row.id) is None
+    db.close()

@@ -35,7 +35,7 @@ Delivered here: the ``InteractionPrincipal`` value object and the shared
 public-chat ownership predicate extracted from ``public_chat_access.py``;
 the ``RespondOutcome`` and ``CreateOutcome`` discriminated unions and their
 reason vocabularies; the ``create()`` typed seam (validates and returns,
-does not stage a row); ``get()``/``list()``; and the three-tier compatibility
+does not stage a row); ``get()``/``list_active()``; and the three-tier compatibility
 materialization view. Not delivered here: ``respond()``'s call body, the
 answer fence, the compatibility seam into the existing resume coordinator,
 and any new counter. Those land with later changes; this module's own
@@ -51,11 +51,27 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError as _PydanticValidationError
 
+from ...core.agent.checkpoint import (
+    CHECKPOINT_EVENT_TYPE,
+    READABLE_CHECKPOINT_TYPES,
+    checkpoint_execution_id,
+)
 from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionArgs
-from ..models.task import Task
-from ..models.task_interaction import INTERACTION_PROTOCOL_VERSION
+from ..models.task import Task, TraceEvent
+from ..models.task_interaction import (
+    INTERACTION_PROTOCOL_VERSION,
+    TaskInteractionRequest,
+)
+from .chat_history_service import get_latest_waiting_question
+from .ops_signals import (
+    CHECKPOINT_LOAD_UNAVAILABLE,
+    CHECKPOINT_PK_ANCHOR_DANGLING,
+    register_degradation,
+)
 from .task_command_transport import _normalize_command_id
+from .task_interaction_schema import interaction_requests_table_exists
 from .task_interaction_staging import _KIND_VOCABULARY
+from .task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -732,3 +748,319 @@ def create(
         return CreateUnauthorized(reason="not_task_principal")
 
     return CreateNotWired(reason="seam_not_wired")
+
+
+# ---------------------------------------------------------------------------
+# The shared active-row predicate (C-9's run scoping and C-11's T2/T3 read
+# share the same four fields the design pins together; the future answer
+# fence and write-side reclaim predicate are meant to import this too, once
+# they land -- see the docstring below for why all four must move as one).
+# ---------------------------------------------------------------------------
+
+
+def _active_native_row_criteria() -> tuple[Any, ...]:
+    """The four-field predicate for "this task's one live interaction row",
+    excluding the ``task_id`` equality itself (every caller already scopes
+    by task_id its own way -- a join column here, a plain filter there).
+
+    ``status == "active"`` and ``active_slot IS NOT NULL`` are the row's own
+    lifecycle state; ``TaskInteractionRequest.run_id == Task.run_id`` is
+    what makes a *stale* active row (one staged in a run the task has since
+    moved on from) invisible to every reader -- a query using this
+    predicate must join against ``Task`` on ``task_id`` for that comparison
+    to resolve. Deliberately does **not** include ``Task.status`` -- "is the
+    task currently WAITING_FOR_USER" is a separate concern the future
+    answer fence adds on top of this predicate, not a part of "which row is
+    this task's live one".
+
+    This predicate is meant to be imported by every future caller that
+    needs the same notion of "the live row" -- the answer fence and the
+    write-side reclaim statement both land later, and the design commits
+    all four callers (this one, ``get()``/``list_active()``, the fence, and
+    reclaim) to changing together if the predicate ever does, specifically
+    so it cannot drift into two different definitions of "active" across
+    the read and write sides.
+    """
+
+    return (
+        TaskInteractionRequest.status == "active",
+        TaskInteractionRequest.active_slot.isnot(None),
+        TaskInteractionRequest.run_id == Task.run_id,
+    )
+
+
+def get(
+    db: "Session", *, task_id: int, interaction_id: int
+) -> TaskInteractionRequest | None:
+    """Fetch one interaction request row by id, scoped to the given task --
+    fetching a resource by id always carries an ownership predicate in the
+    same query, never a bare id lookup a caller trusts on its own."""
+
+    return (
+        db.query(TaskInteractionRequest)
+        .filter(
+            TaskInteractionRequest.id == interaction_id,
+            TaskInteractionRequest.task_id == task_id,
+        )
+        .first()
+    )
+
+
+def list_active(db: "Session", *, task_id: int) -> list[TaskInteractionRequest]:
+    """The ``list()`` deliverable's get-list seam. Named ``list_active``,
+    not the bare ``list``, because this module annotates other functions'
+    return types with the builtin ``list[...]`` generic throughout, and a
+    module-level ``list`` name shadows that builtin for every annotation
+    resolved after its definition, not just call sites.
+
+    Every row for this task whose (status, active_slot, run_id) conjunction
+    matches the shared active-row predicate. At most one row today
+    (``uq_task_interaction_active_slot`` caps a task at one active slot),
+    but this accessor's contract is "the live rows for this task", not "the
+    one active row" -- answered/terminated history is out of scope here."""
+
+    return (
+        db.query(TaskInteractionRequest)
+        .join(Task, Task.id == TaskInteractionRequest.task_id)
+        .filter(
+            TaskInteractionRequest.task_id == task_id,
+            *_active_native_row_criteria(),
+        )
+        .all()
+    )
+
+
+def _active_native_row(db: "Session", task_id: int) -> TaskInteractionRequest | None:
+    return (
+        db.query(TaskInteractionRequest)
+        .join(Task, Task.id == TaskInteractionRequest.task_id)
+        .filter(
+            TaskInteractionRequest.task_id == task_id,
+            *_active_native_row_criteria(),
+        )
+        .first()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Read-direction anchor resolution + the three-tier compatibility view.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _AnchorUnresolved:
+    reason: str  # "anchor_dangling" | "checkpoint_unavailable"
+
+
+def _resolve_read_direction_anchor(
+    db: "Session", row: TaskInteractionRequest
+) -> _AnchorUnresolved | None:
+    """Resolve an active interaction row's resume anchor for the read
+    direction: does ``row.resume_trace_event_id`` still point at a usable
+    checkpoint row? Returns ``None`` on success, or an ``_AnchorUnresolved``
+    naming which of the two outcomes applies otherwise.
+
+    Deliberate divergences from trace_handlers' anchor path
+    (``api/trace_handlers.py``'s own by-primary-key resolver), listed
+    because the two are close enough in shape that "align them" is the
+    obvious next edit for a reader who has not seen this list:
+
+    - The row-validity judgment (``task_id``, ``event_type``, ``build_id``,
+      ``checkpoint_type in READABLE_CHECKPOINT_TYPES``, run partition, and
+      -- when the checkpoint row carries one -- execution identity) is
+      copied deliberately: this set must agree with trace_handlers' own,
+      because both are answering the same question, "is this a legitimate
+      checkpoint row", from different directions. (A shared, stateless
+      predicate the two resolvers could both import is a real
+      simplification, registered as a follow-up, not done here -- see the
+      module-level attribution note.)
+    - ``CHECKPOINT_LOAD_UNAVAILABLE`` is registered exactly the way
+      trace_handlers registers it: a read failure is a read failure on
+      either side.
+    - ``CHECKPOINT_PK_ANCHOR_DANGLING``'s registration surface is
+      deliberately *wider* here than in trace_handlers: trace_handlers only
+      registers it when the pointer names a row that does not exist, and
+      raises (unregistered) when a row exists but fails validation.
+      trace_handlers has a second candidate set to fall back to (the legacy
+      scan) and treats "this specific row is bad" as different from "there
+      is truly nothing to find"; this resolver has no second candidate set
+      -- a pointer that resolves to an invalid row and a pointer that
+      resolves to no row at all are the same fact from here (this answer
+      cannot be recovered), so both register the one signal.
+    - **This resolver never calls ``clear_degradation``.** Clearing
+      ``CHECKPOINT_PK_ANCHOR_DANGLING`` is process-wide and coarse by
+      design (trace_handlers' own comment: "one healthy task's read clears
+      another task's dangling signal"); trace_handlers clears it before
+      every read because it runs at high frequency across many tasks and
+      that coarseness pays for itself. This resolver runs far less often,
+      scoped to one task's one active row -- clearing here would erase a
+      signal trace_handlers (or an earlier call here, for a different
+      task) just registered, with no comparable frequency to earn back the
+      false-clear rate. The clear right belongs to the read surface that
+      runs at that frequency, not to every caller that happens to touch the
+      same registry. This is a fact about ``CHECKPOINT_PK_ANCHOR_DANGLING``
+      and ``CHECKPOINT_LOAD_UNAVAILABLE`` specifically, not a claim that
+      every degradation signal in the registry has one exclusive clearer --
+      ``INTERACTION_HANDOFF_DEGRADED`` and
+      ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` are a separate pair
+      with no clearer at all yet, and this module does not touch them.
+    - This resolver never falls back to a legacy scan on its own -- a
+      resolution failure is reported as "unanswerable", not silently
+      retried against a different candidate set. See
+      ``materialize_compatibility_view``'s own docstring for why folding
+      this into "no active row" and retrying legacy is prohibited outright.
+    """
+
+    if row.resume_trace_event_id is None:
+        register_degradation(
+            CHECKPOINT_PK_ANCHOR_DANGLING,
+            f"task {row.task_id}: active interaction {row.id} has no resume anchor",
+        )
+        return _AnchorUnresolved(reason="anchor_dangling")
+
+    try:
+        trace_row = db.get(TraceEvent, row.resume_trace_event_id)
+    except Exception:
+        register_degradation(
+            CHECKPOINT_LOAD_UNAVAILABLE,
+            f"task {row.task_id}: interaction {row.id} anchor row fetch failed",
+        )
+        return _AnchorUnresolved(reason="checkpoint_unavailable")
+
+    if trace_row is None:
+        register_degradation(
+            CHECKPOINT_PK_ANCHOR_DANGLING,
+            f"task {row.task_id}: interaction {row.id} anchor "
+            f"{row.resume_trace_event_id} has no matching trace_events row",
+        )
+        return _AnchorUnresolved(reason="anchor_dangling")
+
+    row_data: dict[str, Any] = (
+        trace_row.data if isinstance(trace_row.data, dict) else {}
+    )
+    run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)
+    partition_matches = run_field == row.resume_run_partition
+    row_execution_id = checkpoint_execution_id(row_data)
+    execution_matches = (
+        not row_execution_id or row_execution_id == row.resume_execution_id
+    )
+    if (
+        trace_row.task_id != row.task_id
+        or trace_row.event_type != str(CHECKPOINT_EVENT_TYPE)
+        or trace_row.build_id is not None
+        or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
+        or not partition_matches
+        or not execution_matches
+    ):
+        register_degradation(
+            CHECKPOINT_PK_ANCHOR_DANGLING,
+            f"task {row.task_id}: interaction {row.id} anchor "
+            f"{row.resume_trace_event_id} does not match the row it points at",
+        )
+        return _AnchorUnresolved(reason="anchor_dangling")
+
+    return None
+
+
+@dataclass(frozen=True)
+class CompatibilityQuestionView:
+    """The rich three-tier result ``materialize_compatibility_view``
+    produces. Not the legacy ``(question, interactions)`` tuple
+    ``chat_history_service.get_latest_waiting_question`` returns -- that
+    lossy projection, and the four call sites that consume it, belong to
+    the wiring batch's adapter (see the module attribution note), which
+    imports this type and projects it down. ``reason`` carries the reason
+    code #1079's endpoint needs and the legacy tuple has no slot for; it is
+    only set on the ``"unanswerable"`` tier.
+    """
+
+    tier: str  # "legacy" | "native" | "unanswerable"
+    question: str | None
+    interactions: list[dict[str, Any]] | None
+    reason: str | None = None
+
+
+def _legacy_view(db: "Session", task_id: int) -> CompatibilityQuestionView:
+    question, interactions = get_latest_waiting_question(db, task_id)
+    return CompatibilityQuestionView(
+        tier="legacy", question=question, interactions=interactions
+    )
+
+
+def materialize_compatibility_view(
+    db: "Session", task_id: int
+) -> CompatibilityQuestionView:
+    """The single rich implementation of "what is this waiting task's
+    question", three-tiered:
+
+    T1 (tier ``"legacy"``) -- the ``task_interaction_requests`` table does
+    not exist yet, there is no active native row for this task, the active
+    row's ``protocol_version`` is not one this reader recognizes, or its
+    ``request_payload`` does not parse against the v1 shape: falls back,
+    internally, to ``get_latest_waiting_question`` and returns exactly what
+    that function would have, unconditionally. This tier's table-existence
+    gate is not defensive decoration for a table that might never exist --
+    ``interaction_rollout.py``'s own ``/ready`` gate treats "the service
+    deploys before its own migration has run" as a real, accepted window,
+    and this reader has to survive being called inside it.
+
+    T2 (tier ``"native"``) -- an active native row exists and its resume
+    anchor resolves to a usable checkpoint: the native projection,
+    ``question`` and ``interactions`` decoded from ``request_payload``
+    itself, not the legacy transcript.
+
+    T3 (tier ``"unanswerable"``) -- an active native row exists but its
+    anchor does not resolve (see ``_resolve_read_direction_anchor``):
+    ``question`` is still the row's own question text (there genuinely is
+    one, waiting), ``interactions`` is ``None`` (it cannot currently be
+    answered), and ``reason`` names why. **This tier must never fold into
+    "no active row" and retry the T1 fallback** -- doing so would show the
+    caller a legacy transcript question whose answer would land in a slot
+    a native row has already claimed, producing a self-contradictory
+    result. The one thing that makes this projection honest rather than a
+    lie by omission: the compatibility seam that accepts continuation
+    commands (landing with a later change) refuses a legacy-shaped answer
+    on exactly this same condition -- an active native row with an
+    unresolved anchor -- so "no controls shown" and "a free-text answer
+    would be refused anyway" agree. If that seam's refusal is ever
+    loosened, this tier's projection needs re-deciding alongside it, not
+    independently.
+
+    Consumers, and how much of this result they get: the wiring batch's
+    adapter (not written here) projects this down to the legacy
+    ``(question, interactions)`` tuple for the four existing call sites,
+    dropping ``reason`` -- lossy by design, not an oversight. #1079's own
+    endpoint (not written here) is meant to consume this rich result
+    directly, keeping ``reason`` for its own outcome classification.
+    """
+
+    if not interaction_requests_table_exists(db):
+        return _legacy_view(db, task_id)
+
+    row = _active_native_row(db, task_id)
+    if row is None:
+        return _legacy_view(db, task_id)
+    if row.protocol_version != INTERACTION_PROTOCOL_VERSION:
+        return _legacy_view(db, task_id)
+
+    try:
+        parsed = parse_v1_request_payload(row.request_payload)
+    except _PydanticValidationError:
+        return _legacy_view(db, task_id)
+
+    unresolved = _resolve_read_direction_anchor(db, row)
+    if unresolved is not None:
+        return CompatibilityQuestionView(
+            tier="unanswerable",
+            question=parsed.message,
+            interactions=None,
+            reason=unresolved.reason,
+        )
+
+    return CompatibilityQuestionView(
+        tier="native",
+        question=parsed.message,
+        interactions=[
+            interaction.model_dump(mode="json") for interaction in parsed.interactions
+        ],
+    )

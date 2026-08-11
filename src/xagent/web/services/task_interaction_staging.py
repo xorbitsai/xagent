@@ -160,6 +160,29 @@ from .task_lease_service import TaskLease
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    # Entry points.
+    "interaction_handoff",
+    "stage_interaction_request",
+    # The object interaction_handoff yields.
+    "InteractionHandoff",
+    # Data carriers.
+    "InteractionAnchor",
+    "StagedInteractionRequest",
+    # Exceptions -- InteractionHandoffError is the common base every other
+    # one subclasses; see _SWALLOWED below for which six of these eight
+    # subclasses interaction_handoff degrades instead of propagating.
+    "InteractionHandoffError",
+    "InteractionAnchorCorrupt",
+    "InteractionAttemptMismatch",
+    "InteractionHandoffMisuse",
+    "InteractionOriginUnknown",
+    "InteractionOwnerStateError",
+    "InteractionRequestClosed",
+    "InteractionRunPartitionMismatch",
+    "InteractionSlotTaken",
+]
+
 _KIND_VOCABULARY = frozenset({"clarification"})
 # Derived from the model's own INTERACTION_ORIGIN_VOCABULARY (the merged
 # rollout-controls change owns the vocabulary now), not a second
@@ -273,7 +296,7 @@ class InteractionAnchorCorrupt(InteractionHandoffError):
 class InteractionAttemptMismatch(InteractionHandoffError):
     """The caller's lease no longer names the task's current attempt.
 
-    Raised by ``_InteractionHandoff.stage()``, at the start of the call,
+    Raised by ``InteractionHandoff.stage()``, at the start of the call,
     before any staging SQL is issued -- not by ``interaction_handoff``'s
     ``__enter__`` (see ``stage()``'s own docstring for why this
     precondition has to live there). Raised when
@@ -343,7 +366,7 @@ class InteractionHandoffMisuse(InteractionHandoffError):
       ``with`` block -- violating ``interaction_handoff``'s "no I/O in
       between" obligation -- whether or not ``stage()`` had already
       succeeded (zero calls is otherwise legal on its own -- see
-      ``_InteractionHandoff``'s own docstring). Both operations end the
+      ``InteractionHandoff``'s own docstring). Both operations end the
       whole transaction, deactivating this context manager's own outer
       savepoint along with it; by the time the block exits normally, that
       savepoint no longer exists to commit. Raising here instead of
@@ -449,10 +472,15 @@ class InteractionAnchor:
 
     Represents only half of anchor resolution. The other half -- a database
     read against ``trace_events`` by primary key, layered into
-    absence/unavailable/corrupt outcomes with a legacy-column fallback -- is
-    a caller obligation that belongs to the change that wires a production
-    reader, because it is a DB read that must happen outside any savepoint
-    this module opens. What this dataclass carries is the *result* of that
+    absence/unavailable/corrupt outcomes -- is a caller obligation that
+    belongs to the change that wires a production reader, because it is a DB
+    read that must happen outside any savepoint this module opens. That
+    resolution (``resolve_interaction_anchor``,
+    ``task_interaction_anchor.py``) reports an unavailable pointer as
+    absence uniformly, with no fallback scan of the legacy
+    ``last_checkpoint_event_id`` column -- see that function's own docstring
+    for why the two are not folded together. What this dataclass carries is
+    the *result* of that
     read once the caller already has one in hand: the fields both
     ``stage_interaction_request`` and ``interaction_handoff`` validate for
     self-consistency (non-empty strings, the two closed vocabularies, and a
@@ -509,7 +537,7 @@ class StagedInteractionRequest:
 def _validate_anchor_fields(anchor: InteractionAnchor) -> None:
     """The plain-Python half of anchor validation, shared by
     ``stage_interaction_request``'s own pre-INSERT check and
-    ``_InteractionHandoff.stage()``'s own precondition check -- both now run
+    ``InteractionHandoff.stage()``'s own precondition check -- both now run
     at the start of their respective calls, not in ``__enter__`` -- so the
     two never drift into checking different things for the same dataclass.
 
@@ -1078,10 +1106,16 @@ def stage_interaction_request(
 # ---------------------------------------------------------------------------
 
 
-class _InteractionHandoff:
+class InteractionHandoff:
     """The object ``interaction_handoff`` yields. Constructed once per
     ``with`` block; ``stage`` may be called exactly once (zero calls is
     legal: a caller may decide not to ask).
+
+    This class is constructed only by ``interaction_handoff``. Constructing
+    it directly bypasses the savepoint that function owns, so a row a direct
+    construction stages has none of the handoff's containment guarantees --
+    nothing rolls it back on a swallowed failure, because nothing opened the
+    savepoint that rollback would target.
     """
 
     def __init__(
@@ -1098,14 +1132,22 @@ class _InteractionHandoff:
         self.task = task
         self.anchor = anchor
         self.now = now
+        # Call count, for the one-call-per-handoff reentry rule -- True the
+        # instant stage() is entered, before it is known whether a call
+        # actually produced a row. Distinct from self.staged, set below,
+        # which records the row: a stage() call that raises before
+        # stage_interaction_request returns leaves _staged True (it was
+        # called) but self.staged None (nothing was produced). The misuse
+        # handler in interaction_handoff reads self.staged, not this flag,
+        # to tell the two apart.
         self._staged = False
-        # Whether a call to stage() actually returned a staged row, as
-        # opposed to _staged, which only counts that stage() was called at
-        # all (the one-call-per-handoff reentry rule) regardless of whether
-        # that call raised before ever staging anything. See stage()'s own
-        # assignment of this flag, and the misuse handler below that reads
-        # it, for why the two must not be conflated.
-        self._staged_row = False
+        # The row stage() actually produced, or None if stage() was never
+        # called, or was called but raised before stage_interaction_request
+        # returned. This is the object's public degradation surface: a
+        # caller can check `handoff.staged is None` after the `with` block
+        # to know whether this round staged an interaction row, without
+        # consulting the ops_signals registry.
+        self.staged: StagedInteractionRequest | None = None
 
     def _assert_current_attempt(self) -> None:
         """``lease.attempt_id is None`` is a fail-open sentinel (a
@@ -1229,11 +1271,12 @@ class _InteractionHandoff:
             expires_at=expires_at,
             now=self.now,
         )
-        # Only set once stage_interaction_request has actually returned a
-        # row -- an exception from any of it (the misclassification funnel,
-        # a DataError, ...) leaves this False, which is what the misuse
-        # handler below relies on to keep its message accurate.
-        self._staged_row = True
+        # Only assigned once stage_interaction_request has actually returned
+        # a row -- an exception from any of it (the misclassification
+        # funnel, a DataError, ...) leaves self.staged at its __init__
+        # default of None, which is what the misuse handler below relies on
+        # to keep its message accurate.
+        self.staged = result
         return result
 
 
@@ -1265,7 +1308,7 @@ def interaction_handoff(
     task: Task,
     anchor: InteractionAnchor,
     now: datetime,
-) -> Iterator[_InteractionHandoff]:
+) -> Iterator[InteractionHandoff]:
     """Open the savepoint one interaction handoff lives in and degrade --
     instead of losing the caller's turn -- on a closed set of expected
     failures, including the caller's lease no longer owning the task's
@@ -1521,7 +1564,7 @@ def interaction_handoff(
     # function is a @contextmanager generator, would fire from __enter__ --
     # before `with` ever runs its body, and before this savepoint could be
     # unwound the way every other exit path below unwinds it.
-    handoff = _InteractionHandoff(db, lease, task=task, anchor=anchor, now=now)
+    handoff = InteractionHandoff(db, lease, task=task, anchor=anchor, now=now)
     try:
         yield handoff
     except _SWALLOWED as exc:
@@ -1584,14 +1627,14 @@ def interaction_handoff(
         raise
     else:
         if not savepoint.is_active:
-            # handoff._staged_row tells the two ways this misuse can happen
+            # handoff.staged tells the two ways this misuse can happen
             # apart: a caller can violate the no-I/O-in-between obligation
             # either after a successful stage() (there is a real staged row
             # whose containment just vanished) or without ever calling
             # stage() at all, or calling it but never reaching a staged row
-            # (zero calls is otherwise legal -- see _InteractionHandoff's
-            # own docstring -- and a stage() call that raised before
-            # returning also leaves nothing staged), so the caller's own
+            # (zero calls is otherwise legal -- see InteractionHandoff's own
+            # docstring -- and a stage() call that raised before returning
+            # also leaves nothing staged), so the caller's own
             # commit/rollback still deactivated this savepoint the same way
             # with no row behind it. Same exception type either way; only
             # the message should claim a staged row exists when one does.
@@ -1600,7 +1643,7 @@ def interaction_handoff(
             # stage() is entered, before it is known whether a row was ever
             # staged, which would make this message claim a row exists even
             # when stage() raised before staging anything.
-            if handoff._staged_row:
+            if handoff.staged is not None:
                 raise InteractionHandoffMisuse(
                     "the caller committed or rolled back inside the "
                     "interaction_handoff block; the savepoint that contains "

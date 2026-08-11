@@ -2075,8 +2075,8 @@ def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
 
 
 def test_cm3b_zero_stage_calls_is_legal(tmp_path: Path) -> None:
-    """F-11: zero stage() calls is legal (see _InteractionHandoff's own
-    docstring, task_interaction_staging.py :1038-1042) -- a caller may open
+    """F-11: zero stage() calls is legal (see InteractionHandoff's own
+    docstring, task_interaction_staging.py) -- a caller may open
     interaction_handoff, decide not to ask, and exit normally with nothing
     staged."""
 
@@ -2381,9 +2381,8 @@ def test_cm8c_normal_exit_after_deactivation_without_a_stage_call_names_no_row(
     savepoint the same way T-CM-8b's does -- the misuse detection does not
     require a prior ``stage()`` call to fire. The two variants must not
     share a message that claims a staged row exists when
-    ``handoff._staged_row`` is still ``False``: this pins the "no
-    interaction row was staged" wording for that case, while T-CM-8b pins
-    the other."""
+    ``handoff.staged`` is still ``None``: this pins the "no interaction row
+    was staged" wording for that case, while T-CM-8b pins the other."""
 
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
@@ -2407,13 +2406,13 @@ def test_cm8c_normal_exit_after_deactivation_without_a_stage_call_names_no_row(
 def test_cm8d_stage_call_that_raises_before_staging_names_no_row(
     tmp_path: Path,
 ) -> None:
-    """The case the ``_staged`` / ``_staged_row`` split exists for:
+    """The case the ``_staged`` / ``staged`` split exists for:
     ``h.stage()`` is called (so ``_staged`` -- the one-call-per-handoff
     reentry counter -- is ``True`` from the first line of ``stage()``,
     before any of its own checks run), but this call's ``lease`` has no
     ``run_id``, so ``stage()`` raises ``ValueError`` before it ever calls
-    ``stage_interaction_request`` -- no row was staged, so ``_staged_row``
-    stays ``False``. The caller here catches that ``ValueError`` itself,
+    ``stage_interaction_request`` -- no row was staged, so ``staged``
+    stays ``None``. The caller here catches that ``ValueError`` itself,
     inside the ``with`` block, and then commits from inside it -- the same
     no-I/O-in-between violation T-CM-8b/T-CM-8c construct, deactivating
     this handoff's own savepoint. The misuse message that follows must

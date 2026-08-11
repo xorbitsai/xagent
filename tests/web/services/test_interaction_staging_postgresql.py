@@ -396,7 +396,9 @@ def test_sp6_replay_after_conflict_via_insert_collision(
         a.close()
 
 
-def test_sp3_clean_stage_commits_with_caller(db_session, fixtures) -> None:
+def test_sp3_clean_stage_commits_with_caller(
+    db_session, session_factory, fixtures
+) -> None:
     task_id, anchor_id = fixtures
     anchor = _anchor(anchor_id)
     lease = _lease(task_id)
@@ -414,8 +416,15 @@ def test_sp3_clean_stage_commits_with_caller(db_session, fixtures) -> None:
         )
     db.commit()
     assert _caller_write_survived(db, task_id, "pg-sp3-write")
-    row = db.get(TaskInteractionRequest, result.staged_db_id)
+    # A fresh session, not db.get() on the same session that staged the row:
+    # the identity map would hand back the same in-memory object regardless
+    # of whether the row is actually durable on disk, so a same-session read
+    # here would be vacuous -- it could pass even if the commit above never
+    # made the row visible to anyone else.
+    other = session_factory()
+    row = other.get(TaskInteractionRequest, result.staged_db_id)
     assert row is not None
+    other.close()
 
 
 def test_sp4_all_three_cells_preserve_callers_pending_write(

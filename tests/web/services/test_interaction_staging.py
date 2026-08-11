@@ -538,16 +538,21 @@ def test_p2_run_partition_mismatch_is_not_a_slot_taken_subclass(
     """T-P-2: run_id != resume_run_partition raises
     InteractionRunPartitionMismatch, and that type is not a subclass of
     InteractionSlotTaken -- the two must stay distinguishable so a
-    corruption is never observably confused with an ordinary slot race."""
+    corruption is never observably confused with an ordinary slot race.
+    Also, like every other step-1 rejection, this must be raised in plain
+    Python before any SQL is issued."""
 
     engine = _engine(tmp_path)
+    statements = _count_cursor_executions(engine)
     session_factory = _session_factory(engine)
     task_id, anchor_id = _seed(session_factory)
     db = session_factory()
     anchor = _anchor(anchor_id, run_partition="run-b")
     kwargs = _stage_kwargs(anchor, run_id="run-a")
+    before = len(statements)
     with pytest.raises(InteractionRunPartitionMismatch) as excinfo:
         stage_interaction_request(db, task_id=task_id, **kwargs)
+    assert statements[before:] == []
     assert not isinstance(excinfo.value, InteractionSlotTaken)
     db.close()
 
@@ -1406,6 +1411,16 @@ def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
     without a second connection: what matters for this mutation is only
     where the reclaim statement sits relative to the inner savepoint
     boundary, not why the INSERT failed.
+
+    The dirty-view read right after the raise (below) only proves this
+    session's own uncommitted state -- it cannot tell a real, durable
+    reclaim apart from one this session merely staged in memory and would
+    lose on rollback; a mutation that dropped the reclaim from the outer
+    transaction entirely, but happened to leave this session's own
+    in-memory identity map looking reclaimed, could still pass that read.
+    Committing and re-reading from a fresh session afterward is what
+    actually proves the reclaim survived: durable on disk, not just visible
+    to the session that wrote it.
     """
 
     engine = _engine(tmp_path)
@@ -1456,7 +1471,13 @@ def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
     row = _row_state(db, victim.staged_db_id)
     assert row.status == "terminated"
     assert row.terminal_reason == "run_superseded"
-    db.rollback()
+
+    db.commit()
+    other = session_factory()
+    durable_row = _row_state(other, victim.staged_db_id)
+    assert durable_row.status == "terminated"
+    assert durable_row.terminal_reason == "run_superseded"
+    other.close()
     db.close()
 
 
@@ -2264,7 +2285,6 @@ def test_v_n4_degrade_still_lets_caller_commit_run(tmp_path: Path, case: str) ->
         anchor = _anchor(anchor_id, resume_event_id="")
         lease = _lease(task_id)
 
-    ran_after_with = False
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
         h.stage(
             kind="clarification",
@@ -2273,15 +2293,15 @@ def test_v_n4_degrade_still_lets_caller_commit_run(tmp_path: Path, case: str) ->
             request_idempotency_key=_next_key(),
             expires_at=_now() + timedelta(minutes=15),
         )
-    # This line standing in for "the caller's own commit" -- reaching it at
-    # all is the assertion.
-    ran_after_with = True
+    # Code placed here, standing in for "the caller's own commit" -- the
+    # real assertion is that it runs at all and its write is durable,
+    # checked below via a fresh session, not via a boolean flag that would
+    # only prove this line was reached, not that its effect persisted.
     db.execute(
         sa.update(Task).where(Task.id == task_id).values(title="post-with-write")
     )
     db.commit()
 
-    assert ran_after_with is True
     db2 = session_factory()
     assert (
         db2.execute(sa.select(Task.title).where(Task.id == task_id)).scalar_one()
@@ -2416,6 +2436,14 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
         )
     db.commit()
     assert _caller_write_survived(db, task_id, "sp1-write")
+    # Exact-set, not `in`, scoped to this module's own signal names -- same
+    # idiom as T-CM-1 (test_cm1_seven_cell_exit_matrix): the module-global
+    # registry can carry residue from other tests sharing the same process,
+    # and a bare `in` check would not catch a second, unexpected signal
+    # firing alongside the expected one.
+    signals = ops_signals.active_degradations()
+    interaction_signals = {name for name in signals if name.startswith("interaction_")}
+    assert interaction_signals == {ops_signals.INTERACTION_HANDOFF_DEGRADED}
     db.close()
 
 
@@ -2550,6 +2578,7 @@ def test_cm_swallows_subclasses_of_swallowed_types(
     db = session_factory()
     task = db.get(Task, task_id)
     lease = _lease(task_id)
+    _mark_caller_write(db, task_id, "cm-subclass-write")
 
     class _SubSlotTaken(InteractionSlotTaken):
         pass
@@ -2569,8 +2598,13 @@ def test_cm_swallows_subclasses_of_swallowed_types(
             request_idempotency_key=_next_key(),
             expires_at=_now() + timedelta(minutes=15),
         )
-    caller_ran_after_with = True
-    assert caller_ran_after_with
+    db.commit()
+    # A real durability assertion, not a boolean flag: the with-block must
+    # actually exit and let the caller's own commit run, and that commit's
+    # effect (the caller write marked above) must survive it -- the same
+    # caller-write-survival pattern every other T-CM cell in this suite
+    # uses to prove the same thing.
+    assert _caller_write_survived(db, task_id, "cm-subclass-write")
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
     db.close()
 
@@ -2624,8 +2658,6 @@ def test_cm11_swallow_handler_survives_a_non_object_anchor(tmp_path: Path) -> No
             request_idempotency_key=_next_key(),
             expires_at=_now() + timedelta(minutes=15),
         )
-    caller_ran_after_with = True
-    assert caller_ran_after_with
     db.commit()
 
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
@@ -2635,6 +2667,35 @@ def test_cm11_swallow_handler_survives_a_non_object_anchor(tmp_path: Path) -> No
         .where(TaskInteractionRequest.task_id == task_id)
     ).scalar_one()
     assert row_count == 0
+    db.close()
+
+
+def test_safe_returns_none_for_detached_expired_instance(tmp_path: Path) -> None:
+    """``_safe()``'s own docstring names ``DetachedInstanceError``
+    specifically, not just ``AttributeError``, as a case it must swallow --
+    ``test_cm11_swallow_handler_survives_a_non_object_anchor`` above only
+    exercises the ``AttributeError`` path (a dict has no such attribute at
+    all). This pins the other named path directly: an ORM instance that is
+    both expired (its column values must be reloaded from the database
+    before a read can return) and detached (there is no session left to do
+    that reload with) raises ``DetachedInstanceError`` -- a
+    ``SQLAlchemyError`` subclass, not ``AttributeError`` -- from the
+    attribute access itself, so a bare ``getattr(obj, name, None)`` would
+    not catch it and would crash the logging ``_safe()`` exists to
+    protect."""
+
+    from xagent.web.services.task_interaction_staging import _safe
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, _anchor_id = _seed(session_factory)
+    db = session_factory()
+    task = db.get(Task, task_id)
+    db.commit()
+    db.expire_all()
+    db.expunge(task)
+
+    assert _safe(task, "title") is None
     db.close()
 
 

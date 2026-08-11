@@ -183,6 +183,9 @@ _MAX_LENGTHS: dict[str, int] = {
         "resume_run_partition",
     )
 }
+assert all(v is not None for v in _MAX_LENGTHS.values()), (
+    "a locator column widened to Text reports length None; re-derive these caps"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +234,15 @@ class InteractionRequestClosed(InteractionHandoffError):
     reclaimed to ``terminated`` earlier in the *same* run still raises this
     on reuse (there is no cross-run leakage to guard against, because a
     different run never shares this row at all).
+
+    This exception deliberately covers both terminal outcomes alike --
+    ``answered`` and ``terminated`` both raise it, with no separate type or
+    argument telling the two apart. For staging purposes they are the same
+    fact: the identity row is closed and cannot be staged over, regardless
+    of which of the two ways it got there. The caller-visible distinction
+    between "a human answered this" and "this was reclaimed/expired" belongs
+    to whatever reads the row back afterward, not to this staging-time
+    check.
     """
 
 
@@ -596,6 +608,17 @@ def _validate_request_fields(
         raise ValueError("request_idempotency_key must be 1-64 URL-safe characters")
     if request_payload is None:
         raise ValueError("request_payload must not be None")
+    # request_payload's *shape* -- what keys it has, what its values look
+    # like -- is deliberately never inspected anywhere in this function,
+    # beyond the two checks below (not None, and JSON-serializable). It is
+    # an opaque caller-supplied blob as far as this primitive is concerned:
+    # the protocol layer that eventually renders it to a human or another
+    # system is what owns and enforces its shape, not the staging layer
+    # that merely persists it. Widening this function to also validate
+    # shape would duplicate a contract that belongs one layer up and would
+    # make this primitive reject payloads its own protocol layer might
+    # still consider valid.
+    #
     # A value that cannot be JSON-serialized at all never reaches this
     # block's other checks -- it would sail through every one of them (it is
     # not None, and nothing else here inspects its shape) and fail instead
@@ -671,6 +694,27 @@ def _validate_request_fields(
             f"got {len(run_id)}"
         )
 
+    # This length check on run_id, and _validate_anchor_fields's own length
+    # check on anchor.resume_run_partition right below, guard the same
+    # _MAX_LENGTHS["run_id"] cap on what is structurally the same value --
+    # both are compared against each other a few lines down -- but they
+    # raise different exception types on purpose, and this function's
+    # ordering is what decides which one fires when both are over-length at
+    # once. run_id comes from the service's own lease, not from persisted
+    # data; an over-length run_id is a programming error in this module's
+    # own caller, so it raises ValueError here and propagates uncaught, the
+    # same as every other row-13-and-earlier violation in this function.
+    # anchor.resume_run_partition, by contrast, comes from a database read
+    # of whatever a trace_events row happens to hold; an over-length value
+    # there is data corruption this module is built to degrade on, not a
+    # caller bug, so _validate_anchor_fields raises InteractionAnchorCorrupt
+    # for it instead -- swallowed by interaction_handoff. Because this
+    # run_id check runs first, before _validate_anchor_fields is ever
+    # called, a caller that supplies both an over-length run_id and an
+    # over-length anchor.resume_run_partition at once always sees the
+    # run_id's ValueError, never the anchor's InteractionAnchorCorrupt: the
+    # programming-error classification wins over the data-corruption one,
+    # deliberately.
     _validate_anchor_fields(anchor)
 
     if run_id != anchor.resume_run_partition:

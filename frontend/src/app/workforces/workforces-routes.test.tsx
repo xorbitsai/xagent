@@ -12,8 +12,10 @@ const listWorkforceRunsMock = vi.hoisted(() => vi.fn())
 const runWorkforceMock = vi.hoisted(() => vi.fn())
 const addWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const archiveWorkforceMock = vi.hoisted(() => vi.fn())
+const deleteWorkforcePermanentlyMock = vi.hoisted(() => vi.fn())
 const publishWorkforceMock = vi.hoisted(() => vi.fn())
 const removeWorkforceAgentMock = vi.hoisted(() => vi.fn())
+const unarchiveWorkforceMock = vi.hoisted(() => vi.fn())
 const unpublishWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceAgentMock = vi.hoisted(() => vi.fn())
@@ -142,6 +144,7 @@ vi.mock("@/lib/api-wrapper", () => ({
 vi.mock("@/lib/workforces-api", () => ({
   addWorkforceAgent: addWorkforceAgentMock,
   archiveWorkforce: archiveWorkforceMock,
+  deleteWorkforcePermanently: deleteWorkforcePermanentlyMock,
   getWorkforce: getWorkforceMock,
   getWorkforceAgentExecution: getWorkforceAgentExecutionMock,
   getWorkforceRun: getWorkforceRunMock,
@@ -151,6 +154,7 @@ vi.mock("@/lib/workforces-api", () => ({
   publishWorkforce: publishWorkforceMock,
   removeWorkforceAgent: removeWorkforceAgentMock,
   runWorkforce: runWorkforceMock,
+  unarchiveWorkforce: unarchiveWorkforceMock,
   unpublishWorkforce: unpublishWorkforceMock,
   updateWorkforce: updateWorkforceMock,
   updateWorkforceAgent: updateWorkforceAgentMock,
@@ -297,8 +301,10 @@ describe("workforce route entry points", () => {
     runWorkforceMock.mockReset()
     addWorkforceAgentMock.mockReset()
     archiveWorkforceMock.mockReset()
+    deleteWorkforcePermanentlyMock.mockReset()
     publishWorkforceMock.mockReset()
     removeWorkforceAgentMock.mockReset()
+    unarchiveWorkforceMock.mockReset()
     unpublishWorkforceMock.mockReset()
     updateWorkforceMock.mockReset()
     updateWorkforceAgentMock.mockReset()

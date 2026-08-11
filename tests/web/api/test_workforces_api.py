@@ -8,8 +8,11 @@ from sqlalchemy import event
 
 from xagent.web.api import workforces as workforces_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.database import get_engine
+from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.trigger import AgentTrigger
 from xagent.web.models.user import User
 from xagent.web.models.workforce import (
     Workforce,
@@ -931,6 +934,395 @@ def test_archived_workforce_rejects_all_edit_boundaries() -> None:
         headers=headers,
     )
     assert remove_worker_response.status_code == 409
+
+
+def test_unarchive_restores_archived_workforce_to_draft() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Unarchive Workforce")
+    workforce_id = int(workforce["id"])
+
+    archive_response = client.delete(f"/api/workforces/{workforce_id}", headers=headers)
+    assert archive_response.status_code == 200, archive_response.text
+    assert archive_response.json()["status"] == "archived"
+
+    unarchive_response = client.post(
+        f"/api/workforces/{workforce_id}/unarchive", headers=headers
+    )
+    assert unarchive_response.status_code == 200, unarchive_response.text
+    assert unarchive_response.json()["status"] == "draft"
+
+    db = _direct_db_session()
+    try:
+        workforce_row = db.get(Workforce, workforce_id)
+        assert workforce_row is not None
+        assert workforce_row.status == "draft"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("status", ["draft", "active"])
+def test_unarchive_rejects_non_archived_workforce(status: str) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name=f"Unarchive {status.title()} Workforce")
+    workforce_id = int(workforce["id"])
+
+    if status == "active":
+        publish_response = client.post(
+            f"/api/workforces/{workforce_id}/publish", headers=headers
+        )
+        assert publish_response.status_code == 200, publish_response.text
+
+    response = client.post(f"/api/workforces/{workforce_id}/unarchive", headers=headers)
+
+    assert response.status_code == 409, response.text
+    db = _direct_db_session()
+    try:
+        workforce_row = db.get(Workforce, workforce_id)
+        assert workforce_row is not None
+        assert workforce_row.status == status
+    finally:
+        db.close()
+
+
+def test_unarchive_requires_edit_access() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Private Unarchive Workforce")
+    workforce_id = int(workforce["id"])
+    other_headers = _register_second_user()
+
+    archive_response = client.delete(f"/api/workforces/{workforce_id}", headers=headers)
+    assert archive_response.status_code == 200, archive_response.text
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/unarchive", headers=other_headers
+    )
+
+    assert response.status_code == 403, response.text
+    db = _direct_db_session()
+    try:
+        workforce_row = db.get(Workforce, workforce_id)
+        assert workforce_row is not None
+        assert workforce_row.status == "archived"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("status", ["draft", "active", "archived"])
+def test_permanent_delete_removes_workforce_regardless_of_status(
+    status: str,
+) -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name=f"Delete {status.title()} Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+    worker_agent_ids = [int(worker["agent"]["id"]) for worker in workforce["workers"]]
+
+    if status == "active":
+        publish_response = client.post(
+            f"/api/workforces/{workforce_id}/publish", headers=headers
+        )
+        assert publish_response.status_code == 200, publish_response.text
+    elif status == "archived":
+        archive_response = client.delete(
+            f"/api/workforces/{workforce_id}", headers=headers
+        )
+        assert archive_response.status_code == 200, archive_response.text
+
+    # A run in history is exactly what blocks the soft discard path -- the
+    # permanent delete must succeed anyway, cascading it away too.
+    run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.add(
+            WorkforceBuilderMessage(
+                workforce_id=workforce_id,
+                user_id=owner_id,
+                role="assistant",
+                content="Draft plan",
+                status="message",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": workforce_id, "status": "deleted"}
+
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(WorkforceRun, run_id) is None
+        assert (
+            db.query(WorkforceAgent).filter_by(workforce_id=workforce_id).count() == 0
+        )
+        assert (
+            db.query(WorkforceBuilderMessage)
+            .filter_by(workforce_id=workforce_id)
+            .count()
+            == 0
+        )
+        # Generated + exclusive manager is deleted alongside, same as discard.
+        assert db.get(Agent, manager_id) is None
+        assert all(
+            db.get(Agent, worker_id) is not None for worker_id in worker_agent_ids
+        )
+    finally:
+        db.close()
+
+
+def test_permanent_delete_preserves_reusable_manager() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Delete Reusable Manager Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        # Not a workforce-generated manager, so it is never staged for deletion.
+        assert db.get(Agent, manager_id) is not None
+    finally:
+        db.close()
+
+
+def test_permanent_delete_removes_api_keys_and_deployment_row() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Delete Deployment Workforce")
+    workforce_id = int(workforce["id"])
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            AgentApiKey(
+                workforce_id=workforce_id,
+                key_prefix="wfdel1",
+                key_hash="hashed",
+            )
+        )
+        db.add(
+            Deployment(
+                owner_type=DeploymentOwnerType.WORKFORCE.value,
+                owner_id=workforce_id,
+                share_enabled=True,
+                share_token="wf-delete-token",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.query(AgentApiKey).filter_by(workforce_id=workforce_id).count() == 0
+        assert (
+            db.query(Deployment)
+            .filter_by(
+                owner_type=DeploymentOwnerType.WORKFORCE.value,
+                owner_id=workforce_id,
+            )
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
+def test_permanent_delete_unregisters_cascade_deleted_trigger_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ORM cascade that removes a workforce's triggers on hard delete
+    bypasses the trigger CRUD path's provider teardown (releasing a Gmail
+    watch, etc.) -- delete_workforce_permanently must capture that data
+    itself and the route must still dispatch the actual unregister call."""
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Delete Trigger Workforce")
+    workforce_id = int(workforce["id"])
+
+    db = _direct_db_session()
+    try:
+        trigger = AgentTrigger(
+            user_id=owner_id,
+            workforce_id=workforce_id,
+            type="webhook",
+            name="webhook trigger",
+            enabled=True,
+            config={"marker": "should-be-passed-to-teardown"},
+            webhook_token="wf-delete-trigger-token",
+            secret_hash="$2b$hidden",
+        )
+        db.add(trigger)
+        db.commit()
+        trigger_id = int(trigger.id)
+    finally:
+        db.close()
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        "xagent.web.api.workforces.unregister_deleted_trigger_bindings",
+        lambda _db, teardowns: captured.append(list(teardowns)),
+    )
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(captured) == 1
+    [(captured_trigger, captured_type, captured_config)] = captured[0]
+    assert int(captured_trigger.id) == trigger_id
+    assert captured_type == "webhook"
+    assert captured_config == {"marker": "should-be-passed-to-teardown"}
+
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(AgentTrigger, trigger_id) is None
+    finally:
+        db.close()
+
+
+def test_permanent_delete_keeps_unsafe_shared_generated_manager() -> None:
+    """Unlike discard (undo of a run-free draft), permanent delete must not
+    block on a generated manager that is unsafe to also remove -- the intent
+    here is "remove this workforce", and the other workforce still using the
+    shared manager is unaffected either way."""
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Delete Shared Manager Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        other = Workforce(
+            owner_user_id=owner_id,
+            scope_type="user",
+            scope_id=str(owner_id),
+            name="Other Manager Reference For Delete",
+            manager_agent_id=manager_id,
+            status="draft",
+        )
+        db.add(other)
+        db.commit()
+        other_id = int(other.id)
+    finally:
+        db.close()
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": workforce_id, "status": "deleted"}
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(Workforce, other_id) is not None
+        assert db.get(Agent, manager_id) is not None
+    finally:
+        db.close()
+
+
+def test_permanent_delete_requires_edit_access_without_mutation() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Private Delete Workforce")
+    workforce_id = int(workforce["id"])
+    other_headers = _register_second_user()
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=other_headers
+    )
+
+    assert response.status_code == 403, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+    finally:
+        db.close()
+
+
+def test_permanent_delete_rolls_back_when_generated_manager_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Rollback Delete Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    def fail_cleanup(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        "xagent.web.services.agent_store.AgentStore.stage_delete_agent",
+        fail_cleanup,
+        raising=False,
+    )
+    caplog.set_level(logging.ERROR, logger="xagent.web.api.workforces")
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=headers
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_delete_failed",
+            "message": "Failed to delete workforce",
+        }
+    }
+    assert "cleanup failed" not in response.text
+    assert any(
+        record.name == "xagent.web.api.workforces"
+        and record.getMessage() == f"Failed to delete workforce {workforce_id}"
+        and record.exc_info is not None
+        for record in caplog.records
+    )
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+        assert db.get(Agent, manager_id) is not None
+    finally:
+        db.close()
 
 
 def test_discard_draft_deletes_graph_and_exclusive_generated_manager() -> None:

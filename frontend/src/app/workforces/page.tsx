@@ -2,14 +2,23 @@
 
 import Link from "next/link"
 import React, { useCallback, useEffect, useState } from "react"
-import { ChevronLeft, ChevronRight, Play, Plus, Users, Zap, GitBranch, ShieldCheck, Pencil, Rocket } from "lucide-react"
+import { ChevronLeft, ChevronRight, Play, Plus, Users, Zap, GitBranch, ShieldCheck, Pencil, Rocket, Trash2, ArchiveRestore, Archive, Globe, MoreVertical } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { SearchInput } from "@/components/ui/search-input"
 import { PageHeader } from "@/components/ui/page-header"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useRouter } from "next/navigation"
-import { listWorkforces } from "@/lib/workforces-api"
+import {
+  archiveWorkforce,
+  deleteWorkforcePermanently,
+  listWorkforces,
+  publishWorkforce,
+  unarchiveWorkforce,
+  unpublishWorkforce,
+} from "@/lib/workforces-api"
 import { formatTime } from "@/lib/time-utils"
 import type { WorkforceListItem } from "@/types/workforce"
 import { getDeployDisabledReason, getRunDisabledReason } from "./workforce-ui-state"
@@ -44,6 +53,11 @@ export default function WorkforcesPage() {
   const [deployItem, setDeployItem] = useState<WorkforceListItem | null>(null)
   const [deployView, setDeployView] = useState<DeployView | null>(null)
   const [triggersItem, setTriggersItem] = useState<WorkforceListItem | null>(null)
+  const [deleteItem, setDeleteItem] = useState<WorkforceListItem | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [unarchivingId, setUnarchivingId] = useState<number | null>(null)
+  const [archivingId, setArchivingId] = useState<number | null>(null)
+  const [publishingId, setPublishingId] = useState<number | null>(null)
 
   const closeDeploy = () => {
     setDeployItem(null)
@@ -71,6 +85,87 @@ export default function WorkforcesPage() {
   useEffect(() => {
     void load(page, search)
   }, [load, page, search])
+
+  const handlePublish = async (item: WorkforceListItem) => {
+    try {
+      setPublishingId(item.id)
+      await publishWorkforce(item.id)
+      toast.success(t("workforces.messages.published"))
+      void load(page, search)
+    } catch (err) {
+      const nextError = err instanceof Error ? err.message : t("workforces.errors.publish")
+      toast.error(nextError)
+    } finally {
+      setPublishingId(null)
+    }
+  }
+
+  const handleUnpublish = async (item: WorkforceListItem) => {
+    try {
+      setPublishingId(item.id)
+      await unpublishWorkforce(item.id)
+      toast.success(t("workforces.messages.unpublished"))
+      void load(page, search)
+    } catch (err) {
+      const nextError = err instanceof Error ? err.message : t("workforces.errors.unpublish")
+      toast.error(nextError)
+    } finally {
+      setPublishingId(null)
+    }
+  }
+
+  const handleArchive = async (item: WorkforceListItem) => {
+    try {
+      setArchivingId(item.id)
+      await archiveWorkforce(item.id)
+      toast.success(t("workforces.messages.archived"))
+      void load(page, search)
+    } catch (err) {
+      const nextError = err instanceof Error ? err.message : t("workforces.errors.archive")
+      toast.error(nextError)
+    } finally {
+      setArchivingId(null)
+    }
+  }
+
+  const handleUnarchive = async (item: WorkforceListItem) => {
+    try {
+      setUnarchivingId(item.id)
+      await unarchiveWorkforce(item.id)
+      toast.success(t("workforces.messages.unarchived"))
+      void load(page, search)
+    } catch (err) {
+      const nextError = err instanceof Error ? err.message : t("workforces.errors.unarchive")
+      toast.error(nextError)
+    } finally {
+      setUnarchivingId(null)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!deleteItem) return
+    try {
+      setDeleting(true)
+      await deleteWorkforcePermanently(deleteItem.id)
+      toast.success(t("workforces.messages.deleted"))
+      setDeleteItem(null)
+      if (items.length === 1 && page > 1) {
+        // Deleting the last card of the last page would otherwise reload an
+        // out-of-range page: the backend returns zero items for it, which
+        // renders as the "no workforces" empty state with the pagination
+        // controls hidden (pages shrank to exclude the stale page value).
+        // Stepping back re-triggers the load effect with a valid page.
+        setPage(page - 1)
+      } else {
+        void load(page, search)
+      }
+    } catch (err) {
+      const nextError = err instanceof Error ? err.message : t("workforces.errors.delete")
+      toast.error(nextError)
+    } finally {
+      setDeleting(false)
+    }
+  }
 
   if (view === "create") {
     return (
@@ -165,26 +260,96 @@ export default function WorkforcesPage() {
                   const runDisabledReason = getRunDisabledReason(item.status, t)
                   const deployDisabledReason = getDeployDisabledReason(item.status, t)
                   return (
-                    <Card key={item.id} className="overflow-hidden flex flex-col h-full hover:shadow-md transition-shadow">
+                    <Card key={item.id} className="relative overflow-hidden flex flex-col h-full hover:shadow-md transition-shadow">
                       <CardContent className="flex flex-col h-full">
                         <div className="flex items-start gap-3 mb-4">
                           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-white">
                             <Users className="h-5 w-5" />
                           </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center justify-between gap-2">
-                              <Link
-                                href={`/workforces/${item.id}`}
-                                className="text-base font-semibold truncate hover:underline"
-                              >
-                                {item.name}
-                              </Link>
+                          <div className="flex-1 min-w-0 pr-6">
+                            <Link
+                              href={`/workforces/${item.id}`}
+                              className="text-base font-semibold truncate hover:underline block"
+                            >
+                              {item.name}
+                            </Link>
+                            <div className="mt-1">
                               <WorkforceStatusBadge status={item.status} />
                             </div>
-                            <div className="text-xs text-muted-foreground truncate mt-0.5">
+                            <div className="text-xs text-muted-foreground truncate mt-1">
                               {t("workforces.list.manager", { name: item.manager?.name })}
                             </div>
                           </div>
+                        </div>
+
+                        <div className="absolute right-3 top-3">
+                          <Popover>
+                            <PopoverTrigger asChild>
+                              <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">
+                                <MoreVertical className="h-4 w-4" />
+                              </Button>
+                            </PopoverTrigger>
+                            <PopoverContent align="end" className="w-40 p-1">
+                              <div className="flex flex-col">
+                                {item.status !== "archived" && (
+                                  <>
+                                    {item.status === "active" ? (
+                                      <Button
+                                        variant="ghost"
+                                        className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
+                                        disabled={publishingId === item.id}
+                                        onClick={() => handleUnpublish(item)}
+                                      >
+                                        <Globe className="mr-2 h-4 w-4" />
+                                        {t("workforces.actions.unpublish")}
+                                      </Button>
+                                    ) : (
+                                      <Button
+                                        variant="ghost"
+                                        className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
+                                        disabled={publishingId === item.id}
+                                        onClick={() => handlePublish(item)}
+                                      >
+                                        <Globe className="mr-2 h-4 w-4" />
+                                        {t("workforces.actions.publish")}
+                                      </Button>
+                                    )}
+                                    <div className="h-px bg-border my-1 mx-1" />
+                                  </>
+                                )}
+                                {item.status === "archived" ? (
+                                  <Button
+                                    variant="ghost"
+                                    className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
+                                    disabled={unarchivingId === item.id}
+                                    onClick={() => handleUnarchive(item)}
+                                  >
+                                    <ArchiveRestore className="mr-2 h-4 w-4" />
+                                    {t("workforces.actions.unarchive")}
+                                  </Button>
+                                ) : (
+                                  <Button
+                                    variant="ghost"
+                                    className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
+                                    disabled={archivingId === item.id}
+                                    onClick={() => handleArchive(item)}
+                                  >
+                                    <Archive className="mr-2 h-4 w-4" />
+                                    {t("workforces.actions.archive")}
+                                  </Button>
+                                )}
+                                <div className="h-px bg-border my-1 mx-1" />
+                                <Button
+                                  variant="ghost"
+                                  className="justify-start px-2 py-1.5 h-auto font-normal text-sm text-destructive hover:text-destructive hover:bg-destructive/10"
+                                  onClick={() => setDeleteItem(item)}
+                                >
+                                  <Trash2 className="mr-2 h-4 w-4" />
+                                  {t("workforces.actions.delete")}
+                                </Button>
+                              </div>
+                            </PopoverContent>
+                          </Popover>
                         </div>
 
                         <div className="flex-1">
@@ -330,6 +495,15 @@ export default function WorkforcesPage() {
         agentName={triggersItem?.name}
         open={!!triggersItem}
         onOpenChange={(open) => { if (!open) setTriggersItem(null) }}
+      />
+      <ConfirmDialog
+        isOpen={!!deleteItem}
+        onOpenChange={(open) => { if (!open) setDeleteItem(null) }}
+        onConfirm={handleDelete}
+        isLoading={deleting}
+        title={t("workforces.delete.confirmTitle")}
+        description={t("workforces.delete.confirmDescription", { name: deleteItem?.name ?? "" })}
+        confirmText={t("workforces.delete.confirmAction")}
       />
     </div>
   )

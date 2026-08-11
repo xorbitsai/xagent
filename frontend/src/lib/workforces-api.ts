@@ -167,6 +167,30 @@ export async function archiveWorkforce(
   return response.json()
 }
 
+export async function unarchiveWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/unarchive`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to unarchive workforce")
+  }
+  return response.json()
+}
+
+export async function deleteWorkforcePermanently(
+  workforceId: number | string,
+): Promise<void> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}?permanent=true`,
+    { method: "DELETE" },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to delete workforce")
+  }
+}
+
 export async function discardWorkforce(
   workforceId: number | string,
   fallbackErrorMessage: string,

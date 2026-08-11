@@ -801,6 +801,34 @@ def _unregister_trigger_binding(
     _run_provider_coro(provider.unregister(db, trigger, config))
 
 
+def unregister_deleted_trigger_bindings(
+    db: Session,
+    teardowns: list[tuple[AgentTrigger, str, dict[str, Any]]],
+) -> None:
+    """Best-effort provider teardown for trigger rows deleted outside the
+    trigger CRUD path (workforce hard delete cascades them away).
+
+    Mirrors ``_delete_trigger``'s tail: the rows are already gone and
+    committed, so a teardown failure is logged and rolled back rather than
+    surfaced -- it must not turn an already-successful delete into an error.
+    Each ``(trigger, trigger_type, config)`` tuple must have been captured
+    BEFORE the delete committed (the detached rows' attributes are expired).
+    """
+    for trigger, trigger_type, config in teardowns:
+        try:
+            _unregister_trigger_binding(
+                db, trigger, trigger_type=trigger_type, config=config
+            )
+        except Exception:
+            logger.exception(
+                "Failed to unregister binding for cascade-deleted trigger; "
+                "the trigger row is gone but its provider-side binding may "
+                "be leaked (type=%s)",
+                trigger_type,
+            )
+            db.rollback()
+
+
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
     # Workforce-generated manager agents are private implementation details;
     # they must not be addressable through trigger management, matching the

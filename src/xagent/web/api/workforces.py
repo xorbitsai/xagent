@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -38,6 +39,7 @@ from ..services.deployments import (
     new_widget_key,
 )
 from ..services.trace_message_storage import decode_trace_events_data
+from ..services.triggers import unregister_deleted_trigger_bindings
 from ..services.workforce_access import (
     can_create_workforce,
     can_edit_workforce,
@@ -49,6 +51,7 @@ from ..services.workforce_access import (
 from ..services.workforce_creator import create_workforce_from_prompt
 from ..services.workforce_lifecycle import (
     acquire_workforce_lifecycle_fence,
+    delete_workforce_permanently,
     discard_draft_workforce,
 )
 from ..services.workforce_names import workforce_name_exists
@@ -802,11 +805,42 @@ async def update_workforce(
 
 
 @router.delete("/{workforce_id}")
-async def archive_workforce(
+async def archive_or_delete_workforce(
     workforce_id: int,
+    permanent: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
+    if permanent:
+        try:
+            pause_targets, trigger_teardowns = delete_workforce_permanently(
+                db, user, _load_workforce(db, workforce_id)
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Failed to delete workforce %s", workforce_id)
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "workforce_delete_failed",
+                    "message": "Failed to delete workforce",
+                },
+            ) from None
+        await pause_workforce_tasks_after_archive(pause_targets)
+        if trigger_teardowns:
+            # Provider unregister (e.g. releasing a Gmail watch) can do real
+            # network I/O; this route is `async def` so FastAPI runs it
+            # directly on the event loop thread -- offload to a worker
+            # thread instead of blocking every other concurrent request on
+            # it, same as delete_workforce_trigger_route already does for a
+            # single trigger delete.
+            await asyncio.to_thread(
+                unregister_deleted_trigger_bindings, db, trigger_teardowns
+            )
+        return {"id": workforce_id, "status": "deleted"}
+
     workforce = ensure_workforce_access(
         db,
         user,
@@ -832,6 +866,42 @@ async def archive_workforce(
     db.commit()
     await pause_workforce_tasks_after_archive(pause_targets)
     return {"id": workforce.id, "status": workforce.status}
+
+
+@router.post("/{workforce_id}/unarchive")
+async def unarchive_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    # Not ensure_workforce_access(..., action="edit"): that helper's archived
+    # -> 409 guard exists precisely to keep archived workforces read-only, so
+    # it would reject the one workforce this route is meant to act on. Check
+    # the underlying edit permission directly instead.
+    workforce = _load_workforce(db, workforce_id)
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    if not can_edit_workforce(db, user, workforce):
+        raise HTTPException(status_code=403, detail="Access denied")
+    workforce_id_value = int(workforce.id)
+    # Same lifecycle fence as archive: serializes against a concurrent
+    # archive/delete so the status check below reads committed state instead
+    # of racing the other transaction's flip.
+    if acquire_workforce_lifecycle_fence(db, workforce_id_value) is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    if workforce.status != "archived":
+        raise HTTPException(
+            status_code=409,
+            detail="Only archived workforces can be unarchived",
+        )
+    # Restore to draft, not active: runs were cancelled at archive time and
+    # the config may have gone stale, so re-activation stays an explicit
+    # publish step that re-runs validation.
+    cast(Any, workforce).status = "draft"
+    db.commit()
+    return _serialize_workforce_detail(
+        _reload_workforce(db, workforce), user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.post("/{workforce_id}/discard", status_code=204)

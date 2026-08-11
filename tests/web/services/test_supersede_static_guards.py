@@ -1,10 +1,10 @@
 """Static guards for the legacy-question supersede helper.
 
 Four independent, source-level checks, kept in one file because each is a
-single reduced-density cell rather than a full behavior suite:
+small, focused test rather than a full behavior suite:
 
-* single-row delete ban on ``TaskChatMessage`` (the transcript-invariance
-  cell's static half) -- the only sanctioned write shapes are the bulk
+* single-row delete ban on ``TaskChatMessage`` (the static half of the
+  transcript-invariance test) -- the only sanctioned write shapes are the bulk
   ``.update()`` in ``mark_user_message_delivery`` /
   ``supersede_legacy_question_rows`` and the bulk account-purge
   ``.delete()`` in ``admin_users.py``; a single-row delete would silently
@@ -233,10 +233,19 @@ def reverse_supersede_writes(source: str) -> list[int]:
       call inline in the same receiver chain as the mutating call, the
       same by-name (not full dataflow) limit the delete guard above notes
       for its own carrier tracing.
-    * a constant-composed literal -- ``TARGET = "question"`` bound once,
-      then ``.update({TaskChatMessage.message_type: TARGET})`` -- invisible
-      because the walk only recognizes an inline ``ast.Constant`` value,
-      not a ``Name`` resolved back to one.
+    * a constant-composed literal -- a ``Name`` resolved back to a
+      constant, e.g. ``.update({TaskChatMessage.message_type:
+      QUESTION_MESSAGE_TYPE})`` -- invisible because the walk only
+      recognizes an inline ``ast.Constant`` value, not a ``Name``. This
+      is not a hypothetical shape: ``chat_history_service.py`` exports
+      both ``QUESTION_MESSAGE_TYPE`` and ``SUPERSEDED_MESSAGE_TYPE`` as
+      public constants, so a revert helper written with the same style
+      the forward write already uses -- ``.filter(message_type ==
+      SUPERSEDED_MESSAGE_TYPE).update({message_type:
+      QUESTION_MESSAGE_TYPE})`` -- returns zero findings from this walk
+      (probe-verified). Disclosed rather than closed only because no
+      such revert helper exists yet to trigger it, not because closing
+      it would be expensive.
     * a negated comparison -- ``.filter(message_type != "question")``
       selecting everything that is not already ``"question"`` -- invisible
       because ``_filters_message_type_equal`` only matches ``ast.Eq``, not
@@ -245,10 +254,19 @@ def reverse_supersede_writes(source: str) -> list[int]:
       because ``_filters_message_type_equal`` only matches an ``ast.Compare``
       node, and ``.in_(...)`` parses as an ``ast.Call``.
 
-    Closing these would need the same dataflow-sensitive analysis the
-    checkpoint-pointer pairing guard explicitly declines for its own ``**``
-    carriers, for the same cost/benefit reason: a materially more
-    expensive walk to close gaps with no live instance in this repo today.
+    Closing the remaining shapes would need the same dataflow-sensitive
+    analysis the checkpoint-pointer pairing guard explicitly declines for
+    its own ``**`` carriers, for the same cost/benefit reason: a
+    materially more expensive walk to close gaps with no live instance
+    in this repo today.
+
+    Separately: the caller of this function (below) only scans a source
+    file at all if the literal substring ``"question_superseded"``
+    appears in its text. A file that imports and uses only
+    ``SUPERSEDED_MESSAGE_TYPE`` / ``QUESTION_MESSAGE_TYPE`` by name, with
+    that literal string appearing nowhere in its own source, is skipped
+    by that prefilter entirely and never reaches this walk
+    (probe-verified).
     """
     tree = ast.parse(source)
     findings: list[int] = []
@@ -282,6 +300,12 @@ def reverse_supersede_writes(source: str) -> list[int]:
 
 
 def test_nothing_writes_message_type_back_to_question() -> None:
+    """The ``"question_superseded" not in source`` line below is a
+    prefilter, not a full scan: a file using only the imported
+    ``SUPERSEDED_MESSAGE_TYPE`` / ``QUESTION_MESSAGE_TYPE`` names, with
+    that literal string appearing nowhere in its own text, is skipped
+    and never reaches ``reverse_supersede_writes`` (see that function's
+    docstring for the probe that confirms this)."""
     findings: list[tuple[str, list[int]]] = []
     for path in _iter_source_files():
         source = path.read_text()
@@ -423,7 +447,17 @@ def mid_turn_functions_writing_superseded_literal(
     actually defines -- tracked separately from ``hits`` so a caller can
     tell "neither function writes the literal" apart from "neither
     function exists here anymore" (e.g. after a rename); a check would be
-    vacuously green in that second case without this."""
+    vacuously green in that second case without this.
+
+    Known blind spot: this only recognizes an inline ``ast.Constant``
+    equal to ``"question_superseded"``, not a ``Name`` resolved back to
+    one. ``chat_history_service.py`` exports ``SUPERSEDED_MESSAGE_TYPE``
+    as a public constant, so a mid-turn write spelled as
+    ``message_type = SUPERSEDED_MESSAGE_TYPE`` instead of the bare
+    literal produces zero hits from this walk even though ``found``
+    correctly reports the function as present -- the vacuousness check
+    above does not cover this gap (probe-verified).
+    """
     tree = ast.parse(source)
     hits: list[str] = []
     found: set[str] = set()

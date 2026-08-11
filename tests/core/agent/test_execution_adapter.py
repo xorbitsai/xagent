@@ -488,6 +488,51 @@ async def test_execution_adapter_omits_clarification_draft_key_when_not_waiting(
     assert "clarification_draft" not in result
 
 
+def test_execution_adapter_surfaces_superseded_step_ids_at_top_level() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="dag",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    with_losers = adapter._normalize_result(
+        result={
+            "status": "waiting_for_user",
+            "success": False,
+            "message": "Pick one",
+            "clarification_superseded_step_ids": ["ask_b"],
+        },
+        execution_type="agent_dag",
+        execution_id="dag-superseded-exec",
+    )
+    assert with_losers["clarification_superseded_step_ids"] == ["ask_b"]
+
+    without_losers = adapter._normalize_result(
+        result={
+            "status": "waiting_for_user",
+            "success": False,
+            "message": "Pick one",
+        },
+        execution_type="agent_dag",
+        execution_id="dag-no-superseded-exec",
+    )
+    assert without_losers["clarification_superseded_step_ids"] == []
+
+    not_waiting = adapter._normalize_result(
+        result={
+            "status": "completed",
+            "success": True,
+            "output": "done",
+        },
+        execution_type="agent_dag",
+        execution_id="dag-completed-exec",
+    )
+    assert "clarification_superseded_step_ids" not in not_waiting
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_includes_persisted_conversation_history() -> None:
     llm = FakeLLM(["generated"])

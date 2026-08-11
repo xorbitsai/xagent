@@ -405,6 +405,13 @@ class AgentExecutionAdapter:
                     # carry the same draft too, but callers should not dig
                     # it out from there.
                     "clarification_draft": result.get("clarification_draft"),
+                    # Empty list rather than ``None`` so a reader only ever
+                    # needs one check (``if superseded:``) instead of also
+                    # distinguishing "key absent" from "key present but
+                    # empty".
+                    "clarification_superseded_step_ids": (
+                        result.get("clarification_superseded_step_ids") or []
+                    ),
                 }
             )
         return normalized

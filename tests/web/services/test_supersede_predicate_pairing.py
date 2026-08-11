@@ -24,6 +24,12 @@ method call such as ``.isnot(None)``) is invisible to this walk on
 whichever side carries it -- that is a real blind spot, not a caught case:
 if one side alone grows a non-``==``-shaped leg, this guard stays green.
 It only catches drift in the shape both functions are written in.
+
+Known false-positive mode: a pure identifier rename on either side (e.g.
+renaming the ``task_id`` parameter to ``target_task_id`` with no change
+in behavior) flips this guard red, because comparison values are read as
+literal names, not resolved through binding -- a cosmetic rename reads
+the same as a real predicate change.
 """
 
 from __future__ import annotations
@@ -45,7 +51,27 @@ def _predicate_value(node: ast.expr) -> str:
     return ast.dump(node)
 
 
-def _first_filter_call(func: ast.FunctionDef) -> ast.Call | None:
+def _first_filter_chain_calls(func: ast.FunctionDef) -> list[ast.Call]:
+    """Return every ``.filter(...)`` call belonging to the *first* filter
+    chain in ``func``.
+
+    An ``ast.Call`` node's ``(lineno, col_offset)`` is the position of
+    the whole call expression, which for a chained call is the position
+    of the receiver the chain starts from -- so every ``.filter(...)``
+    call in one ``db.query(...).filter(a).filter(b)`` chain shares the
+    *same* ``(lineno, col_offset)``, no matter how many legs it has.
+    Picking a single node with ``min()`` over all filter calls therefore
+    does not select "the earliest filter call": on a tie it falls back to
+    ``ast.walk``'s BFS order, which visits the outermost node first --
+    and the outermost node in a chain is the *last*-written ``.filter()``
+    call, not the first. That silently drops every earlier leg.
+
+    Grouping by the shared ``(lineno, col_offset)`` key and returning
+    every call in the minimal-key group recovers the whole chain, while
+    a second, later filter chain in the same function -- which starts
+    from a different receiver and so carries a different, larger key --
+    is correctly excluded from the group.
+    """
     calls = [
         node
         for node in ast.walk(func)
@@ -54,24 +80,23 @@ def _first_filter_call(func: ast.FunctionDef) -> ast.Call | None:
         and node.func.attr == "filter"
     ]
     if not calls:
-        return None
-    return min(calls, key=lambda call: (call.lineno, call.col_offset))
+        return []
+    min_key = min((call.lineno, call.col_offset) for call in calls)
+    return [call for call in calls if (call.lineno, call.col_offset) == min_key]
 
 
 def _filter_predicate_set(func: ast.FunctionDef) -> frozenset[tuple[str, str]]:
-    call = _first_filter_call(func)
-    if call is None:
-        return frozenset()
     predicates: set[tuple[str, str]] = set()
-    for arg in call.args:
-        if (
-            isinstance(arg, ast.Compare)
-            and len(arg.ops) == 1
-            and isinstance(arg.ops[0], ast.Eq)
-            and isinstance(arg.left, ast.Attribute)
-            and len(arg.comparators) == 1
-        ):
-            predicates.add((arg.left.attr, _predicate_value(arg.comparators[0])))
+    for call in _first_filter_chain_calls(func):
+        for arg in call.args:
+            if (
+                isinstance(arg, ast.Compare)
+                and len(arg.ops) == 1
+                and isinstance(arg.ops[0], ast.Eq)
+                and isinstance(arg.left, ast.Attribute)
+                and len(arg.comparators) == 1
+            ):
+                predicates.add((arg.left.attr, _predicate_value(arg.comparators[0])))
     return frozenset(predicates)
 
 
@@ -137,6 +162,68 @@ def supersede_legacy_question_rows(db, *, task_id):
 """
     reader_predicates, writer_predicates = predicate_sets(source)
     assert reader_predicates != writer_predicates
+
+
+def test_chained_filter_calls_union_into_every_leg_of_the_first_chain() -> None:
+    """A reader written as ``.filter(a).filter(b).filter(c)`` -- three
+    separate ``.filter()`` calls chained instead of one call with three
+    positional args -- must still yield the union of all three legs.
+    This is the exact shape a bare ``min()`` over filter-call nodes gets
+    wrong: every call in the chain shares the same
+    ``(lineno, col_offset)``, so tie-breaking by AST walk order picks
+    only the outermost (last-written) call and silently drops the
+    earlier two."""
+    source = """
+def get_latest_waiting_question(db, task_id):
+    return (
+        db.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task_id)
+        .filter(TaskChatMessage.role == "assistant")
+        .filter(TaskChatMessage.message_type == "question")
+        .order_by(TaskChatMessage.id.desc())
+        .first()
+    )
+"""
+    reader_predicates, _writer_predicates = predicate_sets(source)
+    assert reader_predicates == frozenset(
+        {
+            ("task_id", "name:task_id"),
+            ("role", "'assistant'"),
+            ("message_type", "'question'"),
+        }
+    )
+
+
+def test_chained_filter_calls_ignore_a_second_later_chain() -> None:
+    """A second, positionally distinct ``.filter(...)`` chain later in the
+    same function -- e.g. a second, unrelated query -- must not
+    contribute any predicates. Only the first chain's legs count; this
+    is what keeps the guard's scope to "the reader's first pass" (see
+    the module docstring) even once chain grouping recovers multi-leg
+    chains."""
+    source = """
+def get_latest_waiting_question(db, task_id):
+    first = (
+        db.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task_id)
+        .filter(TaskChatMessage.role == "assistant")
+        .first()
+    )
+    second = (
+        db.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task_id)
+        .filter(TaskChatMessage.role == "user")
+        .first()
+    )
+    return first
+"""
+    reader_predicates, _writer_predicates = predicate_sets(source)
+    assert reader_predicates == frozenset(
+        {
+            ("task_id", "name:task_id"),
+            ("role", "'assistant'"),
+        }
+    )
 
 
 def test_pairing_flags_a_writer_that_drifts_ahead_of_the_reader() -> None:

@@ -80,6 +80,77 @@ def test_association_listing_uses_the_longer_timeout(monkeypatch):
     )
 
 
+def test_url_path_id_percent_encodes_path_and_query_metacharacters():
+    """Percent-encoding, not a blocklist, is what actually prevents an id
+    from escaping its intended URL path segment."""
+    assert (
+        hubspot._url_path_id("x?limit=1&foo=/reports/metrics", "campaign_id")
+        == "x%3Flimit%3D1%26foo%3D%2Freports%2Fmetrics"
+    )
+
+
+def test_url_path_id_rejects_whitespace_padded_value():
+    with pytest.raises(ValueError, match="contact_id"):
+        hubspot._url_path_id(" c1 ", "contact_id")
+
+
+def test_get_contact_encodes_and_fetches_by_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "c1"}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_contact("c1/../2"))
+
+    assert result == {"status": "success", "contact": {"id": "c1"}}
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/crm/v3/objects/contacts/c1%2F..%2F2"
+    )
+
+
+def test_get_contact_rejects_whitespace_padded_contact_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_contact(" c1 "))
+
+    assert result["status"] == "error"
+    assert "contact_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_company_encodes_company_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "co1"}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_update_company("co 1/2", '{"name": "Acme"}'))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/crm/v3/objects/companies/co%201%2F2"
+    )
+
+
+def test_update_company_rejects_whitespace_padded_company_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_update_company(" co1 ", '{"name": "Acme"}'))
+
+    assert result["status"] == "error"
+    assert "company_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_contact_deals_rejects_whitespace_padded_contact_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_contact_deals(" c1 "))
+
+    assert result["status"] == "error"
+    assert "contact_id" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_create_note_assembles_associations(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": "note-1"}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
@@ -261,6 +332,50 @@ def test_list_forms_caps_output_size(monkeypatch):
     assert len(json.dumps(result)) <= 2000 + 200  # last halving step can overshoot
 
 
+def test_paged_list_truncates_to_empty_when_single_item_still_oversized(monkeypatch):
+    """Regression for an off-by-one in the halving loop: a page that
+    shrinks to exactly one item which is STILL over budget on its own must
+    still truncate down to zero items with truncated=True, not silently
+    return the oversized single item untouched (a `len(items) > 1` guard
+    would stop shrinking right before this point)."""
+    huge_form = {"id": "f1", "name": "x" * 5000}
+    mock_request = Mock(return_value=MockResponse(json_data={"results": [huge_form]}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 200)
+
+    result = json.loads(hubspot.hubspot_list_forms(limit=1))
+
+    assert result["status"] == "success"
+    assert result["forms"] == []
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+
+
+def test_paged_list_reports_input_after_not_next_after_when_truncated(monkeypatch):
+    """A truncated page must report ITS OWN input cursor, not the server's
+    next-page cursor: the server already considers the full page consumed,
+    so advancing to its next page would permanently skip whatever this
+    page didn't return for space reasons."""
+    forms = [{"id": str(i), "name": "x" * 200} for i in range(4)]
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": forms,
+                "paging": {"next": {"after": "server-next-cursor"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 500)
+
+    result = json.loads(hubspot.hubspot_list_forms(after="caller-input-cursor"))
+
+    assert result["truncated"] is True
+    assert 0 < len(result["forms"]) < 4
+    assert result["has_more"] is True
+    assert result["after"] == "caller-input-cursor"
+
+
 def test_list_forms_clamps_limit_to_valid_range(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
@@ -321,6 +436,28 @@ def test_get_form_submissions_reports_has_more(monkeypatch):
     assert result["after"] == "cursor-1"
     assert mock_request.call_args.kwargs["url"].endswith(
         "/form-integrations/v1/submissions/forms/form-1"
+    )
+
+
+def test_get_form_submissions_clamps_limit_to_valid_range(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_get_form_submissions("form-1", limit=0)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 1
+
+    hubspot.hubspot_get_form_submissions("form-1", limit=1000)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 50
+
+
+def test_get_form_submissions_encodes_special_characters_in_form_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_get_form_submissions("form/1?x=1")
+
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/form-integrations/v1/submissions/forms/form%2F1%3Fx%3D1"
     )
 
 
@@ -439,7 +576,11 @@ def test_get_analytics_report_passes_date_range(monkeypatch):
         )
     )
 
-    assert result == {"status": "success", "report": {"totals": {}}}
+    assert result == {
+        "status": "success",
+        "report": {"totals": {}},
+        "truncated": False,
+    }
     assert mock_request.call_args.kwargs["url"].endswith(
         "/analytics/v2/reports/sources/daily"
     )
@@ -462,6 +603,58 @@ def test_get_analytics_report_wraps_request_errors(monkeypatch):
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
+
+
+def test_get_analytics_report_rejects_wrong_date_format(monkeypatch):
+    """The analytics API wants YYYYMMDD; the campaign-metrics API wants
+    YYYY-MM-DD. Mixing them up must produce a message naming the fix, not
+    an opaque upstream 400."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "2026-01-01", "2026-01-31")
+    )
+
+    assert result["status"] == "error"
+    assert "YYYYMMDD" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_analytics_report_caps_output_size(monkeypatch):
+    """A "daily" breakdown over a wide date range is keyed by date at the
+    top level - many buckets, each with a nested per-dimension breakdown -
+    so the cap must halve top-level keys, not assume a flat object."""
+    report = {f"202601{day:02d}": {"sources": "x" * 200} for day in range(1, 29)}
+    mock_request = Mock(return_value=MockResponse(json_data=report))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report(
+            "sources", "20260101", "20260131", breakdown="daily"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert 0 < len(result["report"]) < len(report)
+    assert len(json.dumps(result)) <= 2000 + 200  # last halving step can overshoot
+
+
+def test_get_analytics_report_does_not_truncate_a_small_response(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"totals": {"visits": 1}}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "20260101", "20260131")
+    )
+
+    assert result == {
+        "status": "success",
+        "report": {"totals": {"visits": 1}},
+        "truncated": False,
+    }
 
 
 def test_list_marketing_emails_projects_summary_fields(monkeypatch):
@@ -560,6 +753,7 @@ def test_get_marketing_email_statistics_passes_email_ids(monkeypatch):
     assert result == {
         "status": "success",
         "statistics": {"results": [{"id": "e1"}]},
+        "truncated": False,
     }
     assert mock_request.call_args.kwargs["params"] == {"emailIds": ["e1", "e2"]}
     assert mock_request.call_args.kwargs["method"] == "GET"
@@ -612,6 +806,17 @@ def test_get_marketing_email_statistics_rejects_too_many_ids(monkeypatch):
     assert result["status"] == "error"
     assert "at most 100 ids" in result["message"]
     mock_request.assert_not_called()
+
+
+def test_get_marketing_email_statistics_accepts_exactly_the_id_cap(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    exactly_100 = ",".join(str(i) for i in range(100))
+    result = json.loads(hubspot.hubspot_get_marketing_email_statistics(exactly_100))
+
+    assert result["status"] == "success"
+    assert len(mock_request.call_args.kwargs["params"]["emailIds"]) == 100
 
 
 def test_get_marketing_email_statistics_wraps_request_errors(monkeypatch):
@@ -710,7 +915,11 @@ def test_get_campaign_metrics_passes_date_range(monkeypatch):
         )
     )
 
-    assert result == {"status": "success", "metrics": {"sessions": 10}}
+    assert result == {
+        "status": "success",
+        "metrics": {"sessions": 10},
+        "truncated": False,
+    }
     assert mock_request.call_args.kwargs["url"].endswith(
         "/marketing/v3/campaigns/campaign-1/reports/metrics"
     )
@@ -728,6 +937,46 @@ def test_get_campaign_metrics_rejects_whitespace_padded_campaign_id(monkeypatch)
 
     assert result["status"] == "error"
     assert "campaign_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_campaign_metrics_rejects_wrong_date_format(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_campaign_metrics("campaign-1", start_date="20260101")
+    )
+
+    assert result["status"] == "error"
+    assert "YYYY-MM-DD" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_note_treats_empty_string_id_as_not_provided(monkeypatch):
+    """An empty-string id keeps its pre-existing meaning of "not provided"
+    (an LLM caller often sends "" instead of omitting the param); only a
+    non-empty id gets whitespace validation."""
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "note-1"}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_create_note("summary", contact_id="", deal_id="d1")
+    )
+
+    assert result["status"] == "success"
+    associations = mock_request.call_args.kwargs["json"]["associations"]
+    assert [a["to"]["id"] for a in associations] == ["d1"]
+
+
+def test_create_note_rejects_whitespace_padded_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_create_note("summary", contact_id=" c1 "))
+
+    assert result["status"] == "error"
+    assert "contact_id" in result["message"]
     mock_request.assert_not_called()
 
 

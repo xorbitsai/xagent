@@ -1195,9 +1195,9 @@ def generic_oauth_login(
 
     if app_id:
         app_info = get_app_by_id(db, app_id)
-        if app_info and "oauth_scopes" in app_info:
-            app_scopes = app_info["oauth_scopes"]
         if app_info:
+            if "oauth_scopes" in app_info:
+                app_scopes = app_info["oauth_scopes"]
             app_optional_scopes = app_info.get("optional_oauth_scopes") or []
 
     scopes = _merge_oauth_scopes(db_provider.default_scopes or [], app_scopes)
@@ -1206,8 +1206,10 @@ def generic_oauth_login(
     # get_builtin_optional_oauth_scopes) rather than merged into `scopes`
     # above: a scope tier-gated on the connected account's plan would
     # otherwise block the whole authorization if the account can't grant it.
+    # dict.fromkeys dedupes while keeping sorted() deterministic even if a
+    # future app_id row lists the same scope twice.
     optional_scope_str = _oauth_scope_separator(provider).join(
-        sorted(scope for scope in app_optional_scopes if scope)
+        sorted(dict.fromkeys(scope for scope in app_optional_scopes if scope))
     )
 
     from urllib.parse import urlencode

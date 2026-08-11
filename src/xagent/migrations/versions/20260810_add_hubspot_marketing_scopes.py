@@ -65,6 +65,23 @@ CURRENT_DESCRIPTION = (
 )
 
 
+def _columns_present(
+    bind: sa.engine.Connection, table_name: str, required_columns: set[str]
+) -> bool:
+    """Whether ``table_name`` exists and has all of ``required_columns``.
+
+    Shared by every guard below: this migration must be a no-op (not an
+    error) against a database mid-way through a schema this old, or an
+    admin's reduced-schema table, rather than assume a table shape that
+    matches only the current model.
+    """
+    inspector = sa.inspect(bind)
+    if table_name not in set(inspector.get_table_names()):
+        return False
+    columns = {c["name"] for c in inspector.get_columns(table_name)}
+    return required_columns.issubset(columns)
+
+
 def _set_hubspot_scopes(bind: sa.engine.Connection, scopes: list[str]) -> None:
     """Keep the persisted row in sync with the code registry's canonical value.
 
@@ -77,12 +94,7 @@ def _set_hubspot_scopes(bind: sa.engine.Connection, scopes: list[str]) -> None:
     _BUILTIN_PROTECTED_FIELDS, so an operator can never have customized it
     via the admin PATCH endpoint — safe to overwrite unconditionally.
     """
-    inspector = sa.inspect(bind)
-    if "public_mcp_apps" not in set(inspector.get_table_names()):
-        return
-
-    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    if not {"app_id", "oauth_scopes"}.issubset(columns):
+    if not _columns_present(bind, "public_mcp_apps", {"app_id", "oauth_scopes"}):
         return
 
     bind.execute(
@@ -104,12 +116,7 @@ def _set_hubspot_description_if_unchanged(
     customized); an edited value matches neither PREVIOUS_DESCRIPTION nor
     CURRENT_DESCRIPTION and is left alone in either direction.
     """
-    inspector = sa.inspect(bind)
-    if "public_mcp_apps" not in set(inspector.get_table_names()):
-        return
-
-    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    if not {"app_id", "description"}.issubset(columns):
+    if not _columns_present(bind, "public_mcp_apps", {"app_id", "description"}):
         return
 
     bind.execute(
@@ -142,14 +149,10 @@ def _invalidate_existing_hubspot_grants(bind: sa.engine.Connection) -> None:
     scope set) on the next tool call. Meta has no such path; its refresh
     exchanges the access token itself, which clearing already breaks.
     """
-    inspector = sa.inspect(bind)
-    if "user_oauth" not in set(inspector.get_table_names()):
+    if not _columns_present(bind, "user_oauth", {"provider", "access_token"}):
         return
 
-    columns = {c["name"] for c in inspector.get_columns("user_oauth")}
-    if not {"provider", "access_token"}.issubset(columns):
-        return
-
+    columns = {c["name"] for c in sa.inspect(bind).get_columns("user_oauth")}
     values: dict[str, object] = {"access_token": ""}
     if "refresh_token" in columns:
         values["refresh_token"] = None

@@ -274,6 +274,48 @@ def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
     assert qs["optional_scope"] == ["business-intelligence marketing-email"]
 
 
+def test_non_hubspot_app_sends_no_optional_scope_param(db_session, monkeypatch):
+    """optional_oauth_scopes is a HubSpot-specific registry field today; a
+    builtin app that doesn't set it must not get a stray optional_scope
+    param on a provider whose authorize endpoint doesn't expect one."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.delenv("META_LOGIN_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "optional_scope" not in qs
+
+
 def test_meta_login_uses_config_id_without_scope_when_configured(
     db_session, monkeypatch
 ):

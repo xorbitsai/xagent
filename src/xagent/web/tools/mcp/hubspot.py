@@ -1,8 +1,11 @@
 import json
 import logging
 import os
+import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -100,30 +103,87 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _success_with_capped_list(list_field: str, items: list[Any], **rest: Any) -> str:
-    """Build a success payload, halving ``items`` until it fits the
-    platform's output limit.
+def _paged_list(
+    path: str,
+    list_field: str,
+    *,
+    params: dict[str, Any],
+    after: str | None,
+    project: Callable[[list[Any]], list[Any]] = lambda items: items,
+) -> str:
+    """Fetch one page from a HubSpot cursor-paginated list endpoint, project
+    its items, and halve them until the response fits the platform's
+    output limit.
 
     Unprojected HubSpot objects (full property maps) can serialize past the
     output filter's threshold and get hard-truncated into broken JSON, the
-    same failure mode documented in google_analytics.py's list/report tools.
-    Halving (rather than a fixed slice) keeps the cap adaptive to whatever
-    property payload size a given portal's objects happen to have.
+    same failure mode documented in google_analytics.py's list/report
+    tools. Halving (rather than a fixed slice) keeps the cap adaptive to
+    whatever property payload size a given portal's objects happen to
+    have, and continues down to zero items - a single oversized item must
+    still be capped, not silently returned whole because there's nothing
+    left to halve away from it.
 
-    ``truncated`` reports only this in-page trimming; the caller's
-    cursor-derived ``has_more``/``after`` (already in ``rest``) pass through
-    untouched, still describing whether the *server* has another page. A
-    trimmed page must be re-fetched with a smaller ``limit`` - advancing
-    ``after`` past it would silently skip the trimmed entries.
+    On truncation, the returned ``after`` is deliberately this call's own
+    input cursor, not the server's next-page cursor: the server already
+    considers the full (untruncated) page consumed, so advancing to its
+    next page would permanently skip whatever this page didn't return for
+    space reasons. Retrying with the same ``after`` and a smaller ``limit``
+    is what actually surfaces the trimmed entries.
+    """
+    result = _request("GET", path, params=params)
+    next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+    items = project(result.get("results", []))
+
+    max_output_length = get_tool_max_output_length()
+    truncated = False
+    payload = {
+        list_field: items,
+        "truncated": truncated,
+        "has_more": bool(next_after),
+        "after": next_after,
+    }
+    response = _success(**payload)
+    while len(response) > max_output_length and items:
+        items = items[: len(items) // 2]
+        truncated = True
+        payload = {
+            list_field: items,
+            "truncated": truncated,
+            "has_more": True,
+            "after": after,
+        }
+        response = _success(**payload)
+    return response
+
+
+def _success_with_capped_dict(field_name: str, data: Any, **rest: Any) -> str:
+    """Build a success payload, halving a dict's top-level keys until the
+    response fits the platform's output limit.
+
+    HubSpot's analytics/statistics/metrics responses are dicts keyed by
+    date, dimension, or id depending on the endpoint and parameters (e.g.
+    one key per day for a "daily" analytics breakdown over a wide date
+    range) rather than a single flat list, so this halves top-level keys
+    instead of list items - same adaptive-halving reasoning as
+    _paged_list, applied to the shape these tools actually return. When
+    ``data`` isn't a dict, there is nothing generically safe to trim
+    without guessing at a shape this function doesn't know, so it is
+    returned as-is (``truncated`` stays False - it reports content this
+    function removed, and here nothing was).
     """
     max_output_length = get_tool_max_output_length()
     truncated = False
-    payload = {list_field: items, "truncated": truncated, **rest}
+    payload = {field_name: data, "truncated": truncated, **rest}
     response = _success(**payload)
-    while len(response) > max_output_length and len(items) > 1:
-        items = items[: len(items) // 2]
+    if not isinstance(data, dict):
+        return response
+    keys = list(data.keys())
+    while len(response) > max_output_length and keys:
+        keys = keys[: len(keys) // 2]
+        data = {key: data[key] for key in keys}
         truncated = True
-        payload = {list_field: items, "truncated": truncated, **rest}
+        payload = {field_name: data, "truncated": truncated, **rest}
         response = _success(**payload)
     return response
 
@@ -134,11 +194,40 @@ def _require_clean_identifier(value: str, field_name: str) -> str:
     An id copy-pasted or concatenated by a caller with accidental whitespace
     is more likely a bug worth surfacing than a value to repair - repairing
     it would mask the bug and could send a query for a different object.
+    Use this for ids that go into a JSON request body; for ids interpolated
+    into a URL path, use _url_path_id instead - encoding (not just
+    rejecting whitespace) is what actually closes path/query injection.
     """
     if not value or value.strip() != value:
         raise ValueError(
             f"{field_name} must be a non-empty id with no surrounding whitespace"
         )
+    return value
+
+
+def _url_path_id(value: str, field_name: str) -> str:
+    """Validate then percent-encode an id for safe interpolation into a URL
+    path segment.
+
+    Percent-encoding - not a blocklist of "/", "?", "#", or ".." - is what
+    actually prevents a value like "x?limit=1&foo=/reports/metrics" from
+    escaping its intended path segment: any character that could do that
+    gets encoded regardless of which one it is, rather than relying on an
+    enumeration that could miss one.
+    """
+    _require_clean_identifier(value, field_name)
+    return quote(value, safe="")
+
+
+def _require_date_format(value: str, pattern: str, field_name: str, label: str) -> str:
+    """Reject a date that doesn't match the endpoint's expected format.
+
+    The two campaign/analytics HubSpot APIs use different date formats
+    (YYYYMMDD vs YYYY-MM-DD); an LLM caller mixing them up would otherwise
+    get an opaque upstream 400 instead of a message naming the fix.
+    """
+    if not re.fullmatch(pattern, value):
+        raise ValueError(f"{field_name} must be a {label} date string")
     return value
 
 
@@ -258,6 +347,7 @@ def hubspot_get_contact(contact_id: str) -> str:
     Get a HubSpot contact by id, including associated company and deal ids.
     """
     try:
+        contact_id = _url_path_id(contact_id, "contact_id")
         contact = _request(
             "GET",
             f"/crm/v3/objects/contacts/{contact_id}",
@@ -298,6 +388,7 @@ def hubspot_update_contact(contact_id: str, properties_json: str) -> str:
     properties_json is a JSON object of the properties to change.
     """
     try:
+        contact_id = _url_path_id(contact_id, "contact_id")
         contact = _request(
             "PATCH",
             f"/crm/v3/objects/contacts/{contact_id}",
@@ -348,6 +439,7 @@ def hubspot_update_company(company_id: str, properties_json: str) -> str:
     properties_json is a JSON object of the properties to change.
     """
     try:
+        company_id = _url_path_id(company_id, "company_id")
         company = _request(
             "PATCH",
             f"/crm/v3/objects/companies/{company_id}",
@@ -367,6 +459,7 @@ def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
     `has_more` is true when the contact has additional deals beyond the result.
     """
     try:
+        contact_id = _url_path_id(contact_id, "contact_id")
         deal_ids, has_more = _list_association_ids(
             f"/crm/v3/objects/contacts/{contact_id}/associations/deals",
             max(1, min(limit, 100)),
@@ -402,6 +495,7 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
     (max 100); `has_more` is true when the contact has additional notes.
     """
     try:
+        contact_id = _url_path_id(contact_id, "contact_id")
         note_ids, has_more = _list_association_ids(
             f"/crm/v3/objects/contacts/{contact_id}/associations/notes",
             max(1, min(limit, 100)),
@@ -442,7 +536,18 @@ def hubspot_create_note(
     At least one of contact_id, company_id, or deal_id must be provided.
     """
     try:
-        targets = {"contact": contact_id, "company": company_id, "deal": deal_id}
+        # Truthiness (not `is not None`) keeps an empty string meaning
+        # "not provided", matching the association filter below - only a
+        # non-empty id gets validated for stray whitespace.
+        targets = {
+            "contact": _require_clean_identifier(contact_id, "contact_id")
+            if contact_id
+            else None,
+            "company": _require_clean_identifier(company_id, "company_id")
+            if company_id
+            else None,
+            "deal": _require_clean_identifier(deal_id, "deal_id") if deal_id else None,
+        }
         associations = [
             {
                 "to": {"id": object_id},
@@ -514,11 +619,12 @@ def hubspot_list_forms(limit: int = 20, after: str | None = None) -> str:
         params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
         if after:
             params["after"] = after
-        result = _request("GET", "/marketing/v3/forms", params=params)
-        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
-        forms = _project_fields(result.get("results", []), _FORM_SUMMARY_FIELDS)
-        return _success_with_capped_list(
-            "forms", forms, has_more=bool(next_after), after=next_after
+        return _paged_list(
+            "/marketing/v3/forms",
+            "forms",
+            params=params,
+            after=after,
+            project=lambda items: _project_fields(items, _FORM_SUMMARY_FIELDS),
         )
     except Exception as e:
         logger.error(f"Error listing forms: {e}")
@@ -539,19 +645,15 @@ def hubspot_get_form_submissions(
     entries.
     """
     try:
-        form_id = _require_clean_identifier(form_id, "form_id")
+        form_id = _url_path_id(form_id, "form_id")
         params: dict[str, Any] = {"limit": max(1, min(limit, 50))}
         if after:
             params["after"] = after
-        result = _request(
-            "GET", f"/form-integrations/v1/submissions/forms/{form_id}", params=params
-        )
-        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
-        return _success_with_capped_list(
+        return _paged_list(
+            f"/form-integrations/v1/submissions/forms/{form_id}",
             "submissions",
-            result.get("results", []),
-            has_more=bool(next_after),
-            after=next_after,
+            params=params,
+            after=after,
         )
     except Exception as e:
         logger.error(f"Error getting form submissions: {e}")
@@ -593,12 +695,14 @@ def hubspot_get_analytics_report(
             raise ValueError(
                 f"breakdown must be one of {sorted(_VALID_ANALYTICS_BREAKDOWNS)}"
             )
+        _require_date_format(start_date, r"\d{8}", "start_date", "YYYYMMDD")
+        _require_date_format(end_date, r"\d{8}", "end_date", "YYYYMMDD")
         result = _request(
             "GET",
             f"/analytics/v2/reports/{normalized_report_type}/{normalized_breakdown}",
             params={"start": start_date, "end": end_date},
         )
-        return _success(report=result)
+        return _success_with_capped_dict("report", result)
     except Exception as e:
         logger.error(f"Error getting analytics report: {e}")
         return _error(str(e))
@@ -626,11 +730,12 @@ def hubspot_list_marketing_emails(limit: int = 20, after: str | None = None) -> 
         params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
         if after:
             params["after"] = after
-        result = _request("GET", "/marketing/v3/emails", params=params)
-        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
-        emails = _project_fields(result.get("results", []), _EMAIL_SUMMARY_FIELDS)
-        return _success_with_capped_list(
-            "emails", emails, has_more=bool(next_after), after=next_after
+        return _paged_list(
+            "/marketing/v3/emails",
+            "emails",
+            params=params,
+            after=after,
+            project=lambda items: _project_fields(items, _EMAIL_SUMMARY_FIELDS),
         )
     except Exception as e:
         logger.error(f"Error listing marketing emails: {e}")
@@ -677,7 +782,7 @@ def hubspot_get_marketing_email_statistics(
         if end_date:
             params["endTimestamp"] = end_date
         result = _request("GET", "/marketing/v3/emails/statistics/list", params=params)
-        return _success(statistics=result)
+        return _success_with_capped_dict("statistics", result)
     except Exception as e:
         logger.error(f"Error getting marketing email statistics: {e}")
         return _error(str(e))
@@ -702,14 +807,15 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
         }
         if after:
             params["after"] = after
-        result = _request("GET", "/marketing/v3/campaigns", params=params)
-        next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
-        campaigns = [
-            {"id": item.get("id"), "properties": item.get("properties", {})}
-            for item in result.get("results", [])
-        ]
-        return _success_with_capped_list(
-            "campaigns", campaigns, has_more=bool(next_after), after=next_after
+        return _paged_list(
+            "/marketing/v3/campaigns",
+            "campaigns",
+            params=params,
+            after=after,
+            project=lambda items: [
+                {"id": item.get("id"), "properties": item.get("properties", {})}
+                for item in items
+            ],
         )
     except Exception as e:
         logger.error(f"Error listing campaigns: {e}")
@@ -730,18 +836,22 @@ def hubspot_get_campaign_metrics(
     newer HubSpot API) that limit the reporting window.
     """
     try:
-        campaign_id = _require_clean_identifier(campaign_id, "campaign_id")
+        campaign_id = _url_path_id(campaign_id, "campaign_id")
         params: dict[str, Any] = {}
         if start_date:
-            params["startDate"] = start_date
+            params["startDate"] = _require_date_format(
+                start_date, r"\d{4}-\d{2}-\d{2}", "start_date", "YYYY-MM-DD"
+            )
         if end_date:
-            params["endDate"] = end_date
+            params["endDate"] = _require_date_format(
+                end_date, r"\d{4}-\d{2}-\d{2}", "end_date", "YYYY-MM-DD"
+            )
         result = _request(
             "GET",
             f"/marketing/v3/campaigns/{campaign_id}/reports/metrics",
             params=params,
         )
-        return _success(metrics=result)
+        return _success_with_capped_dict("metrics", result)
     except Exception as e:
         logger.error(f"Error getting campaign metrics: {e}")
         return _error(str(e))

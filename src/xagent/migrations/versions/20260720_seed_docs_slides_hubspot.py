@@ -132,6 +132,11 @@ def _new_app_rows() -> list[dict[str, object]]:
                 "forms",
                 "marketing.campaigns.read",
             ],
+            # Not a public_mcp_apps column - _filter_row strips this before
+            # any insert, so it never reaches the DB. Present purely so this
+            # snapshot's dict equals the live registry row's dict, which is
+            # what tests/alembic/test_20260720_seed_docs_slides_hubspot.py's
+            # test_seed_rows_match_registry asserts.
             "optional_oauth_scopes": ["business-intelligence", "marketing-email"],
             "is_visible_in_connector": True,
             "launch_config": {

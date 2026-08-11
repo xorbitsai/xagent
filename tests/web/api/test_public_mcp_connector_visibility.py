@@ -909,6 +909,48 @@ def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() ->
     assert get_builtin_execution_fields("gmail") == expected_execution_fields
 
 
+def test_get_builtin_optional_oauth_scopes() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_optional_oauth_scopes
+
+    assert get_builtin_optional_oauth_scopes("hubspot") == [
+        "business-intelligence",
+        "marketing-email",
+    ]
+    # Most builtin apps have no optional_oauth_scopes key at all.
+    assert get_builtin_optional_oauth_scopes("gmail") == []
+    assert get_builtin_optional_oauth_scopes("unknown-app") == []
+
+
+def test_app_to_dict_exposes_optional_oauth_scopes_for_builtin_and_custom_apps() -> (
+    None
+):
+    from xagent.web.mcp_apps import _app_to_dict
+    from xagent.web.models.public_mcp import PublicMCPApp
+
+    hubspot_app = PublicMCPApp(
+        app_id="hubspot",
+        name="HubSpot",
+        transport="oauth",
+        provider_name="hubspot",
+        oauth_scopes=["crm.objects.contacts.read"],
+        launch_config={},
+    )
+    assert _app_to_dict(hubspot_app)["optional_oauth_scopes"] == [
+        "business-intelligence",
+        "marketing-email",
+    ]
+
+    custom_app = PublicMCPApp(
+        app_id="some-custom-app",
+        name="Custom",
+        transport="oauth",
+        provider_name="custom",
+        oauth_scopes=["custom.scope"],
+        launch_config={},
+    )
+    assert _app_to_dict(custom_app)["optional_oauth_scopes"] == []
+
+
 def test_builtin_registry_drift_validation_reports_safe_read_only_summaries() -> None:
     from xagent.web.builtin_mcp_registry import validate_builtin_public_mcp_apps
 

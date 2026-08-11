@@ -11,9 +11,18 @@ transaction they run inside. This module's answering seam is the opposite
 shape on every one of those points -- it owns its own session and its own
 commit, and it does not nest inside anyone else's savepoint. Putting it in
 the same file would make that staging module's merge-reason docstring false
-the day this file lands. What this module reuses instead of duplicating is
-narrow: the staging module's exception base class and its anchor
-self-consistency check, imported by name, not copied.
+the day this file lands. What this delivery reuses from the staging module
+instead of duplicating is narrow and one-directional: the private kind
+vocabulary (``_KIND_VOCABULARY``), imported by name. ``create()`` never
+calls ``stage_interaction_request`` in this delivery and therefore never
+raises or catches any of that module's nine exception classes, and this
+module's own read-direction anchor resolver validates a real
+``trace_events`` row against a stored interaction row's fields -- a
+different check from the staging module's ``_validate_anchor_fields``,
+which validates an ``InteractionAnchor`` value object before an INSERT --
+so it is not reused here either. See ``create()``'s own docstring for the
+exception-family accounting, and ``_resolve_read_direction_anchor``'s for
+the anchor-check distinction.
 
 Concurrency precondition, stated once here because every rowcount-based
 branch this service will grow depends on it: every rowcount-based branch

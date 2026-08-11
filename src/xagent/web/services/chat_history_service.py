@@ -354,11 +354,22 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     A green unit test against SQLite does not exercise the PostgreSQL row
     lock.
 
-    Callers must place the call site outside the ``interaction_handoff``
-    with-block (or inside it without issuing their own commit); on the
-    path that follows ``persist_assistant_message_no_commit``, callers
-    must issue an explicit ``db.flush()`` afterward rather than relying on
-    autoflush to make the pending row visible to this update.
+    Once ``interaction_handoff`` exists (planned staging infrastructure —
+    see ``task_interaction.py``), a call site sitting inside its
+    with-block must sit outside that block instead, or stay inside it
+    without issuing its own commit. On the path that follows
+    ``persist_assistant_message_no_commit``, callers must issue an
+    explicit ``db.flush()`` afterward rather than relying on autoflush to
+    make the pending row visible to this update.
+
+    This UPDATE runs with ``synchronize_session=False``: a
+    ``TaskChatMessage`` object already loaded into the caller's session
+    keeps its stale ``message_type`` in memory until the caller calls
+    ``refresh()`` or ``expire()`` on it, even if the caller runs a fresh
+    query afterward in the same session that returns that same
+    identity-mapped object — SQLAlchemy's identity map hands back the
+    in-memory object as-is rather than re-reading the row, so the fresh
+    query does not pick up the UPDATE either.
 
     Returns the number of rows updated. The return value exists only for
     logging; callers must not branch on it.

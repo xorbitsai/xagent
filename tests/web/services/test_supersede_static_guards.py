@@ -286,6 +286,14 @@ def revert(db, task_id):
 # ---------------------------------------------------------------------------
 # T-S-13: chat_history_service.py imports nothing from the native-rollout
 # module (A-group import ban).
+#
+# This guard exists so chat_history_service.py does not become the first
+# module to import rollout controls: the supersede helper is unconditional
+# by contract and must never branch on rollout mode. It is written as a
+# source-import scan rather than a runtime check precisely so it keeps
+# working once that module lands -- today it cannot flag any real code,
+# because the rollout module does not exist yet; that is known and
+# accepted, not an oversight.
 # ---------------------------------------------------------------------------
 
 _BANNED_ROLLOUT_NAMES = frozenset(
@@ -377,14 +385,27 @@ def test_rollout_import_guard_ignores_an_unrelated_name_containing_the_substring
 MID_TURN_FUNCTIONS = ("_persist_agent_outbound_event", "make_agent_outbound_handler")
 
 
-def mid_turn_functions_writing_superseded_literal(source: str) -> list[str]:
+def mid_turn_functions_writing_superseded_literal(
+    source: str,
+) -> tuple[list[str], set[str]]:
+    """Return (hit function names, found function names).
+
+    ``found`` is every name out of ``MID_TURN_FUNCTIONS`` that this source
+    actually defines -- tracked separately from ``hits`` so a caller can
+    tell "neither function writes the literal" apart from "neither
+    function exists here anymore" (e.g. after a rename), the same
+    non-vacuousness check ``test_supersede_predicate_pairing.py`` runs on
+    its own reader/writer predicate sets before trusting an equality on
+    them."""
     tree = ast.parse(source)
     hits: list[str] = []
+    found: set[str] = set()
     for node in ast.walk(tree):
         if (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name in MID_TURN_FUNCTIONS
         ):
+            found.add(node.name)
             for inner in ast.walk(node):
                 if (
                     isinstance(inner, ast.Constant)
@@ -392,12 +413,19 @@ def mid_turn_functions_writing_superseded_literal(source: str) -> list[str]:
                 ):
                     hits.append(node.name)
                     break
-    return hits
+    return hits, found
 
 
 def test_mid_turn_websocket_path_never_writes_the_superseded_literal() -> None:
     source = Path(websocket.__file__).read_text()
-    assert mid_turn_functions_writing_superseded_literal(source) == []
+    hits, found = mid_turn_functions_writing_superseded_literal(source)
+
+    # Sanity: both tracked functions actually exist in this source -- an
+    # empty or partial `found` set would make the hits == [] assertion
+    # below vacuous (a renamed or removed function trivially "writes
+    # nothing" because this guard never sees it at all).
+    assert found == set(MID_TURN_FUNCTIONS)
+    assert hits == []
 
 
 def test_mid_turn_guard_flags_a_literal_write_in_an_async_def_shape() -> None:
@@ -410,7 +438,7 @@ async def _persist_agent_outbound_event(task_id, event):
     message_type = "question_superseded"
     return message_type
 """
-    hits = mid_turn_functions_writing_superseded_literal(fixture)
+    hits, _found = mid_turn_functions_writing_superseded_literal(fixture)
     assert hits == ["_persist_agent_outbound_event"]
 
 
@@ -426,5 +454,5 @@ def make_agent_outbound_handler(task_id):
         return "question_superseded"
     return handle_outbound_message
 """
-    hits = mid_turn_functions_writing_superseded_literal(fixture)
+    hits, _found = mid_turn_functions_writing_superseded_literal(fixture)
     assert set(hits) == {"_persist_agent_outbound_event", "make_agent_outbound_handler"}

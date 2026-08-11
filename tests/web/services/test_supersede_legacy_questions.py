@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.exc import InvalidRequestError, OperationalError
-from sqlalchemy.orm import Query, sessionmaker
+from sqlalchemy.orm import Query, Session, sessionmaker
 
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
@@ -388,5 +388,42 @@ def test_supersede_touches_only_the_message_type_column():
         assert row.turn_id == before["turn_id"]
         assert row.user_id == before["user_id"]
         assert row.created_at == before["created_at"]
+    finally:
+        db.close()
+
+
+def test_supersede_opens_a_savepoint(monkeypatch):
+    """The helper actually issues ``db.begin_nested()`` -- not just "some
+    update inside a try/except" that happens to work on SQLite without a
+    savepoint. Distinct from the PostgreSQL-only cell in
+    ``test_supersede_savepoint_postgresql.py``, which proves the
+    savepoint is *necessary* (a failed statement without one poisons the
+    caller's transaction); this cell proves it is *present* at all, and
+    that is provable on SQLite because it only needs to observe the call,
+    not depend on SQLite reproducing PostgreSQL's abort-the-transaction
+    behavior."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        calls = {"n": 0}
+        real_begin_nested = Session.begin_nested
+
+        def spy_begin_nested(self, *args, **kwargs):
+            calls["n"] += 1
+            return real_begin_nested(self, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "begin_nested", spy_begin_nested)
+        updated = supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert updated == 1
+        assert calls["n"] == 1
     finally:
         db.close()

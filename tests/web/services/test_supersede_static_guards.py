@@ -12,7 +12,7 @@ single reduced-density cell rather than a full behavior suite:
 * monotonicity: nothing in the tree writes ``message_type`` back from
   ``"question_superseded"`` to ``"question"``.
 * import ban: ``chat_history_service.py`` does not import anything from
-  the not-yet-existing native-rollout module.
+  the native-rollout module.
 * mid-turn marker-write ban: the WebSocket mid-turn persistence path never
   writes the ``"question_superseded"`` literal itself -- that is this
   helper's only sanctioned write site.
@@ -123,7 +123,10 @@ def test_no_single_row_delete_of_task_chat_message_rows_anywhere_in_src() -> Non
             continue
         for _lineno, func_name in single_row_task_chat_message_deletes(source):
             findings.append((str(path.relative_to(SRC_ROOT)), func_name))
-    assert findings == []
+    assert findings == [], (
+        "single-row delete(s) of a TaskChatMessage instance found outside "
+        f"the sanctioned bulk-update paths: {findings}"
+    )
 
 
 def test_admin_users_bulk_purge_is_not_flagged_as_a_single_row_delete() -> None:
@@ -133,7 +136,10 @@ def test_admin_users_bulk_purge_is_not_flagged_as_a_single_row_delete() -> None:
     to this repo's real shape, not just to a fixture."""
     source = Path(admin_users.__file__).read_text()
     findings = single_row_task_chat_message_deletes(source)
-    assert findings == []
+    assert findings == [], (
+        "admin_users.py's bulk purge was misread as a single-row "
+        f"TaskChatMessage delete: {findings}"
+    )
 
 
 def test_single_row_delete_guard_flags_a_row_level_delete() -> None:
@@ -269,7 +275,10 @@ def test_nothing_writes_message_type_back_to_question() -> None:
         hits = reverse_supersede_writes(source)
         if hits:
             findings.append((str(path.relative_to(SRC_ROOT)), hits))
-    assert findings == []
+    assert findings == [], (
+        "message_type written back from question_superseded to question "
+        f"(monotonicity violation): {findings}"
+    )
 
 
 def test_monotonicity_guard_flags_a_reverse_assignment() -> None:
@@ -287,13 +296,12 @@ def revert(db, task_id):
 # T-S-13: chat_history_service.py imports nothing from the native-rollout
 # module (A-group import ban).
 #
-# This guard exists so chat_history_service.py does not become the first
-# module to import rollout controls: the supersede helper is unconditional
-# by contract and must never branch on rollout mode. It is written as a
-# source-import scan rather than a runtime check precisely so it keeps
-# working once that module lands -- today it cannot flag any real code,
-# because the rollout module does not exist yet; that is known and
-# accepted, not an oversight.
+# This guard exists so chat_history_service.py never becomes a module
+# that imports rollout controls: the supersede helper is unconditional by
+# contract and must never branch on rollout mode. The rollout module
+# (``interaction_rollout.py``) exists on main as of this test's base --
+# this guard is what keeps this service module from ever importing it,
+# and it now flags real code, not a hypothetical future import.
 # ---------------------------------------------------------------------------
 
 _BANNED_ROLLOUT_NAMES = frozenset(
@@ -339,7 +347,11 @@ def banned_rollout_imports(source: str) -> list[str]:
 
 def test_chat_history_service_imports_nothing_from_native_rollout() -> None:
     source = Path(chat_history_service.__file__).read_text()
-    assert banned_rollout_imports(source) == []
+    hits = banned_rollout_imports(source)
+    assert hits == [], (
+        f"chat_history_service.py imports from the banned native-rollout "
+        f"module (supersede must stay unconditional): {hits}"
+    )
 
 
 def test_rollout_import_guard_flags_a_module_import() -> None:
@@ -374,7 +386,10 @@ def test_rollout_import_guard_ignores_an_unrelated_name_containing_the_substring
     that module or one of the banned symbols, must not be flagged --
     otherwise a coincidentally similar identifier becomes unusable."""
     fixture = "from xagent.web.services import interaction_rollout_helper\n"
-    assert banned_rollout_imports(fixture) == []
+    hits = banned_rollout_imports(fixture)
+    assert hits == [], (
+        f"rollout import guard false-positived on an unrelated substring match: {hits}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +440,10 @@ def test_mid_turn_websocket_path_never_writes_the_superseded_literal() -> None:
     # below vacuous (a renamed or removed function trivially "writes
     # nothing" because this guard never sees it at all).
     assert found == set(MID_TURN_FUNCTIONS)
-    assert hits == []
+    assert hits == [], (
+        f"mid-turn websocket path writes the question_superseded literal "
+        f"outside its one sanctioned site: {hits}"
+    )
 
 
 def test_mid_turn_guard_flags_a_literal_write_in_an_async_def_shape() -> None:

@@ -1,7 +1,9 @@
 """Savepoint necessity for ``supersede_legacy_question_rows`` (PostgreSQL half).
 
-The one cell of the eight (T-S-7c) that cannot be proven on SQLite. The
-reason is a real, already-documented backend difference, not a hypothesis:
+The one property of the helper that cannot be proven on SQLite: that the
+savepoint is actually necessary, i.e. that a failed statement without it
+would poison the caller's transaction. The reason is a real,
+already-documented backend difference, not a hypothesis:
 ``test_task_status_storage_postgresql.py``'s module docstring records that
 once a statement fails, "PostgreSQL marks the transaction failed and every
 further statement on the same connection raises InFailedSqlTransaction

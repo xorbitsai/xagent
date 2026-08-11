@@ -31,7 +31,6 @@ from xagent.web.api import admin_users, websocket
 from xagent.web.services import chat_history_service
 
 SRC_ROOT = Path(chat_history_service.__file__).resolve().parents[2]
-assert SRC_ROOT.name == "xagent", SRC_ROOT
 
 
 def _iter_source_files():
@@ -39,12 +38,22 @@ def _iter_source_files():
         yield path
 
 
+def test_src_root_is_resolvable() -> None:
+    """``SRC_ROOT`` is computed at import time and every other guard in
+    this file depends on it pointing at the right directory. Pinning the
+    check in a test function -- rather than a module-scope ``assert`` --
+    means a wrong path fails as one ordinary test failure instead of an
+    uncollectable module that takes the rest of this file's guards down
+    with it."""
+    assert SRC_ROOT.name == "xagent", SRC_ROOT
+
+
 def _mentions_name(node: ast.AST, name: str) -> bool:
     return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
 
 
 # ---------------------------------------------------------------------------
-# T-S-10 static half: no single-row delete of a TaskChatMessage row.
+# No single-row delete of a TaskChatMessage row anywhere in src/.
 # ---------------------------------------------------------------------------
 
 
@@ -153,7 +162,7 @@ def purge_one(db, message_id):
 
 
 # ---------------------------------------------------------------------------
-# T-S-12: message_type never writes 'question_superseded' -> 'question'.
+# message_type never writes 'question_superseded' -> 'question' (monotonicity).
 # ---------------------------------------------------------------------------
 
 
@@ -210,9 +219,8 @@ def reverse_supersede_writes(source: str) -> list[int]:
     the same calls.
 
     Five shapes are known blind spots, disclosed rather than caught,
-    matching the disclosure style the single-row-delete guard in this
-    file and the pairing guard in test_supersede_predicate_pairing.py
-    already use for their own known gaps:
+    matching the disclosure style the single-row-delete guard above in
+    this file already uses for its own known gaps:
 
     * per-row attribute assignment -- ``msg.message_type = "question"``
       on an ORM instance fetched via ``message_type == "question_superseded"``
@@ -300,8 +308,7 @@ def revert(db, task_id):
 
 
 # ---------------------------------------------------------------------------
-# T-S-13: chat_history_service.py imports nothing from the native-rollout
-# module (A-group import ban).
+# chat_history_service.py imports nothing from the native-rollout module.
 #
 # This guard exists so chat_history_service.py never becomes a module
 # that imports rollout controls: the supersede helper is unconditional by
@@ -400,8 +407,8 @@ def test_rollout_import_guard_ignores_an_unrelated_name_containing_the_substring
 
 
 # ---------------------------------------------------------------------------
-# Obligation 10, second half: the mid-turn WebSocket path never writes the
-# "question_superseded" literal -- that is this helper's only site.
+# The mid-turn WebSocket path never writes the "question_superseded"
+# literal itself -- that is this helper's only sanctioned write site.
 # ---------------------------------------------------------------------------
 
 MID_TURN_FUNCTIONS = ("_persist_agent_outbound_event", "make_agent_outbound_handler")
@@ -415,10 +422,8 @@ def mid_turn_functions_writing_superseded_literal(
     ``found`` is every name out of ``MID_TURN_FUNCTIONS`` that this source
     actually defines -- tracked separately from ``hits`` so a caller can
     tell "neither function writes the literal" apart from "neither
-    function exists here anymore" (e.g. after a rename), the same
-    non-vacuousness check ``test_supersede_predicate_pairing.py`` runs on
-    its own reader/writer predicate sets before trusting an equality on
-    them."""
+    function exists here anymore" (e.g. after a rename); a check would be
+    vacuously green in that second case without this."""
     tree = ast.parse(source)
     hits: list[str] = []
     found: set[str] = set()

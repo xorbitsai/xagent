@@ -95,6 +95,11 @@ class Task(Base):  # type: ignore
         # CHECK, so the constraint's behaviour stays covered by tests. The
         # asymmetry is asserted as expected, not merely left uncovered -- see
         # tests/migrations/test_task_interaction_protocol_version_parity.py.
+        #
+        # Unlike task_interaction_requests' floor-plus-active-pin split
+        # (which lets terminated rows carry future versions), this is a
+        # single mutable current-wait pointer with no historical rows, so an
+        # unconditional NULL-or-1 pin is the whole contract.
         CheckConstraint(
             "interaction_protocol_version IS NULL OR interaction_protocol_version = 1",
             name="ck_tasks_interaction_protocol_version",
@@ -166,13 +171,31 @@ class Task(Base):  # type: ignore
     # compare in Python -- so an index would be pure write cost.
     lease_attempt_id = Column(String(64), nullable=True)
 
-    # Protocol version of the interaction row that backs this task's current
-    # wait. Written by the three wait finalizers (1 when a row was staged,
-    # NULL when staging degraded) and cleared by the three legacy-resume
-    # injection sites. Readers must gate on status == WAITING_FOR_USER first:
-    # a task that left the waiting state by a path with no injection site
-    # (cancel, delete, failure, TTL reclaim, admin cleanup) can still carry a
-    # stale 1, and the next wait overwrites it either way.
+    # Protocol version of the interaction row that will back this task's
+    # current wait. Each of its two writer groups is spoken for, and none of
+    # those writers exists yet: the three wait finalizers will write it (1
+    # when a row was staged, NULL when staging degraded), and the three
+    # legacy-resume injection sites will clear it. Readers will need to gate
+    # on status == WAITING_FOR_USER first: a task that left the waiting
+    # state by a path with no injection site (cancel, delete, failure, TTL
+    # reclaim, admin cleanup) will be able to carry a stale 1, and the next
+    # wait will overwrite it either way.
+    #
+    # Why a column on tasks rather than an EXISTS over
+    # task_interaction_requests: the read surface's first check is
+    # "interaction_protocol_version != 1 -> legacy path, ask the interaction
+    # table nothing". All four waiting-question consumers already hold a
+    # loaded Task row when they need the answer, so that check is a free
+    # attribute access -- while an EXISTS derivation would cost one
+    # cross-table query per waiting-status read, on paths that include the
+    # websocket's synchronous snapshot. While every waiting task predates
+    # the native protocol (and during any rollback), the marker is NULL for
+    # all of them and the interaction table receives zero queries from the
+    # read path. The marker only ever decides priority, never whether the
+    # legacy fallback exists: readers fall back unconditionally when no
+    # active row matches, so a stale marker degrades to the legacy question
+    # rather than corrupting anything. Re-examine the status coupling when
+    # the first writer lands.
     interaction_protocol_version = Column(Integer, nullable=True)
 
     # Model configuration

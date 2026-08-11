@@ -1,6 +1,5 @@
 """Tests for the tasks.interaction_protocol_version migration."""
 
-import importlib.util
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,7 +9,10 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-from tests.shared.postgres_disposable import disposable_database_factory
+from tests.shared.postgres_disposable import (
+    disposable_database_factory,
+    load_migration_module,
+)
 from tests.web.services.checkpoint_anchor_shared import (
     reset_checkpoint_anchor_fk_create_rule,
 )
@@ -23,16 +25,6 @@ MIGRATION_PATH = (
 TABLE = "tasks"
 COLUMN = "interaction_protocol_version"
 CONSTRAINT_NAME = "ck_tasks_interaction_protocol_version"
-
-
-def _migration_module():
-    spec = importlib.util.spec_from_file_location(
-        "task_interaction_protocol_version_migration", MIGRATION_PATH
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _operations(connection: sa.Connection) -> Operations:
@@ -77,7 +69,7 @@ def _check_constraint_names(connection) -> set[str]:
 
 
 def test_offline_upgrade_postgresql_emits_add_column_and_check() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     with patch.object(
         migration.sa,
@@ -94,7 +86,7 @@ def test_offline_upgrade_postgresql_emits_add_column_and_check() -> None:
 
 
 def test_offline_upgrade_sqlite_emits_add_column_only() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     with patch.object(
         migration.sa,
@@ -112,7 +104,7 @@ def test_offline_upgrade_sqlite_emits_add_column_only() -> None:
 
 
 def test_offline_downgrade_postgresql_drops_constraint_before_column() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     with patch.object(
         migration.sa,
@@ -129,7 +121,7 @@ def test_offline_downgrade_postgresql_drops_constraint_before_column() -> None:
 
 
 def test_offline_downgrade_sqlite_only_drops_column() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     with patch.object(
         migration.sa,
@@ -147,7 +139,7 @@ def test_offline_downgrade_sqlite_only_drops_column() -> None:
 
 @pytest.mark.parametrize("dialect_name", ["sqlite", "postgresql"])
 def test_offline_sql_carries_no_bind_parameters(dialect_name) -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     upgrade_sql = _offline_sql(migration, dialect_name, "upgrade")
     downgrade_sql = _offline_sql(migration, dialect_name, "downgrade")
@@ -163,7 +155,7 @@ def test_offline_sql_carries_no_bind_parameters(dialect_name) -> None:
 @pytest.mark.parametrize("dialect_name", ["sqlite", "postgresql"])
 @pytest.mark.parametrize("operation", ["upgrade", "downgrade"])
 def test_offline_branch_does_not_reflect(dialect_name, operation) -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     with patch.object(
         migration.sa,
@@ -181,7 +173,7 @@ def test_offline_branch_does_not_reflect(dialect_name, operation) -> None:
 def test_online_sqlite_upgrade_adds_column_without_check_and_downgrade_removes_it() -> (
     None
 ):
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     engine = sa.create_engine("sqlite:///:memory:")
 
     with engine.begin() as connection:
@@ -205,7 +197,7 @@ def test_online_sqlite_upgrade_adds_column_without_check_and_downgrade_removes_i
 def test_online_postgresql_upgrade_adds_column_and_check_and_downgrade_removes_both() -> (
     None
 ):
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     with disposable_database_factory("xagent_w1_migration") as make_database:
         engine = make_database("upgrade_downgrade")
@@ -252,13 +244,13 @@ def _assert_idempotent_upgrade(migration, engine) -> None:
 
 
 def test_online_upgrade_is_idempotent_sqlite() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     _assert_idempotent_upgrade(migration, sa.create_engine("sqlite:///:memory:"))
 
 
 @pytest.mark.postgresql
 def test_online_upgrade_is_idempotent_postgresql() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     with disposable_database_factory("xagent_w1_migration") as make_database:
         _assert_idempotent_upgrade(migration, make_database("idempotent_upgrade"))
 
@@ -277,7 +269,7 @@ def _assert_idempotent_downgrade_when_absent(migration, engine) -> None:
 
 
 def test_online_downgrade_is_idempotent_when_column_is_absent_sqlite() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     _assert_idempotent_downgrade_when_absent(
         migration, sa.create_engine("sqlite:///:memory:")
     )
@@ -285,7 +277,7 @@ def test_online_downgrade_is_idempotent_when_column_is_absent_sqlite() -> None:
 
 @pytest.mark.postgresql
 def test_online_downgrade_is_idempotent_when_column_is_absent_postgresql() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     with disposable_database_factory("xagent_w1_migration") as make_database:
         _assert_idempotent_downgrade_when_absent(
             migration, make_database("idempotent_downgrade")
@@ -296,7 +288,7 @@ def test_online_downgrade_is_idempotent_when_column_is_absent_postgresql() -> No
 
 
 def test_online_upgrade_and_downgrade_noop_without_the_tasks_table() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     engine = sa.create_engine("sqlite:///:memory:")
 
     with engine.begin() as connection:
@@ -325,7 +317,7 @@ def _assert_create_all_then_upgrade_is_noop(migration, engine) -> None:
 
 
 def test_create_all_then_upgrade_is_noop_sqlite() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     _assert_create_all_then_upgrade_is_noop(
         migration, sa.create_engine("sqlite:///:memory:")
     )
@@ -333,7 +325,7 @@ def test_create_all_then_upgrade_is_noop_sqlite() -> None:
 
 @pytest.mark.postgresql
 def test_create_all_then_upgrade_is_noop_postgresql() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     with disposable_database_factory("xagent_w1_migration") as make_database:
         _assert_create_all_then_upgrade_is_noop(
             migration, make_database("create_all_then_upgrade")
@@ -366,7 +358,7 @@ def _assert_check_constraint_semantics(engine, extra_columns: dict) -> None:
 
 @pytest.mark.postgresql
 def test_check_constraint_semantics_on_an_online_migrated_postgresql_database() -> None:
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     with disposable_database_factory("xagent_w1_migration") as make_database:
         engine = make_database("check_semantics")
         with engine.begin() as connection:
@@ -395,7 +387,7 @@ def test_target_schema_resolves_the_visible_tasks_relation() -> None:
     current_schema() is merely the first search_path entry, so neither
     identifies the relation the unqualified DDL resolves to."""
 
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
     sql = str(migration.POSTGRES_VISIBLE_TABLE_SCHEMA_SQL)
 
     assert "to_regclass" in sql
@@ -415,7 +407,7 @@ def test_target_schema_uses_the_catalog_answer_on_postgresql() -> None:
     only falls back to the version table's configured schema when the
     catalog has nothing to say (e.g. the relation is not visible yet)."""
 
-    migration = _migration_module()
+    migration = load_migration_module(MIGRATION_PATH)
 
     resolving_op = MagicMock()
     resolving_op.get_bind.return_value.dialect.name = "postgresql"

@@ -46,6 +46,7 @@ from tests.web.services.checkpoint_anchor_shared import (
     reset_checkpoint_anchor_fk_create_rule,
 )
 from xagent.web.models.database import Base
+from xagent.web.models.task import Task
 
 MIGRATION_PATH = (
     Path(__file__).parent.parent.parent
@@ -70,6 +71,25 @@ _CHECK_CLAUSE = re.compile(
 
 def _operations(connection: sa.Connection) -> Operations:
     return Operations(MigrationContext.configure(connection))
+
+
+# ---- backend-free: the model and the migration agree on the CHECK text ----
+
+
+def test_model_and_migration_constraint_texts_are_identical() -> None:
+    """The model's CheckConstraint and the migration's CONSTRAINT_CONDITION
+    are two copies of one contract; today they agree purely by discipline.
+    This needs no backend: a one-character divergence fails here before any
+    database ever sees either copy."""
+    model_conditions = {
+        item.name: str(item.sqltext)
+        for item in Task.__table_args__
+        if type(item).__name__ == "CheckConstraint"
+    }
+
+    migration = load_migration_module(MIGRATION_PATH)
+
+    assert model_conditions[CONSTRAINT_NAME] == migration.CONSTRAINT_CONDITION
 
 
 def _column_names(connection) -> set[str]:

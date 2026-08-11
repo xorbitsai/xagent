@@ -371,13 +371,27 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     A green unit test against SQLite does not exercise the PostgreSQL row
     lock.
 
-    Once ``interaction_handoff`` exists (planned staging infrastructure —
-    see ``task_interaction.py``), a call site sitting inside its
-    with-block must sit outside that block instead, or stay inside it
-    without issuing its own commit. On the path that follows
-    ``persist_assistant_message_no_commit``, callers must issue an
+    ``interaction_handoff`` (``task_interaction_staging.py``) is a
+    context manager whose own with-block must be the transaction's last
+    word before the caller commits — no other write may run inside it. A
+    call site sitting inside that with-block must sit outside it instead,
+    or stay inside it without issuing its own commit. On the path that
+    follows ``persist_assistant_message_no_commit``, callers must issue an
     explicit ``db.flush()`` afterward rather than relying on autoflush to
     make the pending row visible to this update.
+
+    That ordering is deliberate, and it means this update supersedes the
+    very row the flush just made visible. That is the intended outcome,
+    not a side effect of the unbounded predicate: on that path the caller
+    has already staged a structured interaction row for the same turn,
+    and the structured row — not the transcript row — is the question the
+    reader is meant to serve, because the reader consults the task's
+    protocol-version marker before it ever reaches this table. The
+    transcript row keeps its ``content`` and ``interactions`` untouched
+    and stays in the history; what it loses is only its standing as the
+    *pending* question. A caller that stages a transcript question row
+    meant to remain answerable must not call this function in the same
+    transaction — no predicate here will spare that row.
 
     This UPDATE runs with ``synchronize_session=False``: a
     ``TaskChatMessage`` object already loaded into the caller's session

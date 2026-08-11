@@ -209,7 +209,7 @@ def reverse_supersede_writes(source: str) -> list[int]:
     ``.update(...)``/``.values(...)``, and a ``message_type=`` keyword on
     the same calls.
 
-    Three shapes are known blind spots, disclosed rather than caught,
+    Five shapes are known blind spots, disclosed rather than caught,
     matching the disclosure style the single-row-delete guard in this
     file and the pairing guard in test_supersede_predicate_pairing.py
     already use for their own known gaps:
@@ -229,6 +229,13 @@ def reverse_supersede_writes(source: str) -> list[int]:
       then ``.update({TaskChatMessage.message_type: TARGET})`` -- invisible
       because the walk only recognizes an inline ``ast.Constant`` value,
       not a ``Name`` resolved back to one.
+    * a negated comparison -- ``.filter(message_type != "question")``
+      selecting everything that is not already ``"question"`` -- invisible
+      because ``_filters_message_type_equal`` only matches ``ast.Eq``, not
+      ``ast.NotEq``.
+    * a membership test -- ``.filter(message_type.in_([...]))`` -- invisible
+      because ``_filters_message_type_equal`` only matches an ``ast.Compare``
+      node, and ``.in_(...)`` parses as an ``ast.Call``.
 
     Closing these would need the same dataflow-sensitive analysis the
     checkpoint-pointer pairing guard explicitly declines for its own ``**``

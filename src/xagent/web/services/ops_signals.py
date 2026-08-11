@@ -46,6 +46,8 @@ INTERACTION_HANDOFF_DEGRADED = "interaction_handoff_degraded"
 INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
     "interaction_run_partition_mismatch_degraded"
 )
+# Set by the supersede helper's degrade path; cleared on the next
+# successful supersede for any task.
 CLARIFICATION_LEGACY_SUPERSEDE_FAILED = "clarification_legacy_supersede_failed"
 
 _signals: dict[str, str] = {}

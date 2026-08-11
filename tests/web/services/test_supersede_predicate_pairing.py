@@ -26,8 +26,16 @@ if one side alone grows a non-``==``-shaped leg, this guard stays green.
 The same applies to statement-split accumulation (``q = q.filter(...)``
 across several statements): each re-assignment starts a new chain at a
 new position, so those legs fall outside the first chain this guard
-compares. A single side rewritten that way fails loudly (the extracted
-sets stop matching); only a symmetric rewrite of both sides goes silent.
+compares. What that costs is the opposite of what it sounds like. A side
+that *gains* a leg this way -- reader or writer, either one alone -- keeps
+an unchanged extracted set, so the two sets still match and this guard
+stays green while the real predicates have diverged: single-side drift of
+that shape goes silent. A side that merely *moves* an existing leg out of
+the first chain, changing nothing about which rows match, drops it from
+the extracted set and turns this guard red -- a false positive on a
+behavior-preserving refactor. Of the two statement-split shapes, this
+guard is blind to the one that changes behavior and noisy about the one
+that does not.
 It only catches drift in the shape both functions are written in.
 
 Known false-positive mode: a pure identifier rename on either side (e.g.

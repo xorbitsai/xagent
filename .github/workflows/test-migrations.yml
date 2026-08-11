@@ -24,6 +24,8 @@ on:
       - 'tests/web/api/test_monitor_postgresql.py'
       - 'src/xagent/web/services/task_interaction_staging.py'
       - 'tests/web/services/test_interaction_staging_postgresql.py'
+      - 'src/xagent/web/services/task_interaction_service.py'
+      - 'tests/web/services/test_task_interaction_service_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -79,6 +81,8 @@ jobs:
             tests/web/api/test_monitor_postgresql.py
             src/xagent/web/services/task_interaction_staging.py
             tests/web/services/test_interaction_staging_postgresql.py
+            src/xagent/web/services/task_interaction_service.py
+            tests/web/services/test_task_interaction_service_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -296,6 +300,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/migrations/test_task_interaction_protocol_version_parity.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test interaction lifecycle service compatibility view (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_interaction_service_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

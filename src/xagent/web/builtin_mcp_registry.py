@@ -328,10 +328,23 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
                 "forms",
-                "business-intelligence",
-                "marketing-email",
                 "marketing.campaigns.read",
             ],
+            # Both scopes are tier-gated (business-intelligence: Marketing
+            # Hub Basic+; marketing-email: Enterprise or the transactional
+            # email add-on); requesting them as required scopes would block
+            # the whole OAuth authorization (and therefore every CRM tool
+            # too) for portals below those tiers. Sent
+            # via the authorize request's optional_scope parameter instead
+            # (see api/auth.py) so those portals still connect successfully
+            # and only hubspot_get_analytics_report /
+            # hubspot_list_marketing_emails / hubspot_get_marketing_email_statistics
+            # fail at call time if the tier doesn't grant them. This pairing
+            # must also be reflected in this app's scope configuration in the
+            # HubSpot Developer Dashboard - HubSpot blocks installation if a
+            # scope's required/optional designation there disagrees with
+            # which parameter it arrives in.
+            "optional_oauth_scopes": ["business-intelligence", "marketing-email"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -670,6 +683,22 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
     )
+
+
+def get_builtin_optional_oauth_scopes(app_id: str) -> list[str]:
+    """OAuth scopes requested via the authorize request's optional_scope
+    parameter rather than its required scope parameter (see api/auth.py).
+
+    Deliberately not in _BUILTIN_EXECUTION_FIELD_NAMES: unlike oauth_scopes,
+    there is no legacy persisted-row state to drift-check against for a
+    field this new, so this reads straight from the row rather than going
+    through the DB-column drift-tracking machinery. Most builtin apps have
+    no optional scopes at all, hence the plain ``.get`` default.
+    """
+    row = get_builtin_public_mcp_app(app_id)
+    if row is None:
+        return []
+    return list(row.get("optional_oauth_scopes", []))
 
 
 def _safe_configuration_hash(values: dict[str, Any]) -> str:

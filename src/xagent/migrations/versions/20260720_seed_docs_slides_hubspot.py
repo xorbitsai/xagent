@@ -130,10 +130,9 @@ def _new_app_rows() -> list[dict[str, object]]:
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
                 "forms",
-                "business-intelligence",
-                "marketing-email",
                 "marketing.campaigns.read",
             ],
+            "optional_oauth_scopes": ["business-intelligence", "marketing-email"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",

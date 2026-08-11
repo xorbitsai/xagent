@@ -152,6 +152,44 @@ def test_downgrade_restores_previous_scopes_and_description(tmp_path):
         assert scopes == migration.PREVIOUS_SCOPES
 
 
+def test_upgrade_downgrade_upgrade_round_trip(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+        description, scopes = _row(connection)
+        assert description == migration.CURRENT_DESCRIPTION
+        assert scopes == migration.CURRENT_SCOPES
+
+
+def test_upgrade_preserves_customized_description_already_at_current_scopes(tmp_path):
+    """A row already migrated once (CURRENT_SCOPES) with a since-customized
+    description must not have that customization overwritten on a repeat
+    upgrade (e.g. a second alembic run, or upgrade-downgrade-upgrade landing
+    back on CURRENT_SCOPES with the customization still in place)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            connection.execute(
+                text(
+                    "UPDATE public_mcp_apps SET description = :d "
+                    "WHERE app_id = 'hubspot'"
+                ),
+                {"d": "Our internal HubSpot connector"},
+            )
+            migration.upgrade()
+        description, scopes = _row(connection)
+        assert description == "Our internal HubSpot connector"
+        assert scopes == migration.CURRENT_SCOPES
+
+
 def test_upgrade_preserves_admin_customized_description(tmp_path):
     """description is not in _BUILTIN_PROTECTED_FIELDS (admin_mcp.py), so an
     operator can have edited it via the admin PATCH endpoint. The migration

@@ -231,6 +231,49 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     ]
 
 
+def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
+    """business-intelligence and marketing-email are gated on Marketing Hub
+    Basic/Pro/Enterprise - requesting them as required scopes would block
+    the whole authorization for Free/CRM-only portals. They must arrive via
+    optional_scope, not merged into the required scope param."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="hubspot",
+            name="HubSpot",
+            description="HubSpot connector",
+            transport="oauth",
+            provider_name="hubspot",
+            category="CRM",
+            oauth_scopes=["crm.objects.contacts.read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://app.hubspot.com/oauth/authorize",
+        default_scopes=["oauth"],
+        redirect_uri="https://app.example.com/api/auth/hubspot/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="hubspot",
+        token=token,
+        app_id="hubspot",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "business-intelligence" not in qs["scope"][0]
+    assert "marketing-email" not in qs["scope"][0]
+    assert qs["optional_scope"] == ["business-intelligence marketing-email"]
+
+
 def test_meta_login_uses_config_id_without_scope_when_configured(
     db_session, monkeypatch
 ):

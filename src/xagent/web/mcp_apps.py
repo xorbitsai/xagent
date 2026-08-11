@@ -10,7 +10,10 @@ from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session
 
-from .builtin_mcp_registry import get_builtin_execution_fields
+from .builtin_mcp_registry import (
+    get_builtin_execution_fields,
+    get_builtin_optional_oauth_scopes,
+)
 from .models.public_mcp import PublicMCPApp
 
 # Apps that must not be satisfied by a bare provider-level OAuth grant (one
@@ -152,6 +155,10 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
         "provider": execution_fields["provider_name"],
         "category": app.category,
         "oauth_scopes": deepcopy(execution_fields["oauth_scopes"]),
+        # Only builtin apps can declare these today (see
+        # get_builtin_optional_oauth_scopes) - a custom admin-created app
+        # has no column for it and always gets [].
+        "optional_oauth_scopes": get_builtin_optional_oauth_scopes(app.app_id),
         "is_visible_in_connector": bool(app.is_visible_in_connector),
         "launch_config": launch_config,
         "auth_type": classify_app_auth(transport, launch_config),

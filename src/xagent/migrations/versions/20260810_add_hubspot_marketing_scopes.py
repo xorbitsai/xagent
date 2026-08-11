@@ -43,10 +43,15 @@ PREVIOUS_SCOPES = [
 CURRENT_SCOPES = [
     *PREVIOUS_SCOPES,
     "forms",
-    "business-intelligence",
-    "marketing-email",
     "marketing.campaigns.read",
 ]
+# business-intelligence and marketing-email are requested separately via the
+# authorize request's optional_scope parameter (see api/auth.py and
+# get_builtin_optional_oauth_scopes) - not part of oauth_scopes at all, so
+# not persisted here. Both are tier-gated (business-intelligence: Marketing
+# Hub Basic+; marketing-email: Enterprise or the transactional email
+# add-on); requesting them as required scopes would block reconnection
+# entirely for portals below those tiers.
 
 PREVIOUS_DESCRIPTION = (
     "Connect to HubSpot CRM to search, create, and update contacts and "

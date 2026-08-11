@@ -299,7 +299,7 @@ def revert(db, task_id):
 # This guard exists so chat_history_service.py never becomes a module
 # that imports rollout controls: the supersede helper is unconditional by
 # contract and must never branch on rollout mode. The rollout module
-# (``interaction_rollout.py``) exists on main as of this test's base --
+# (``interaction_rollout.py``) exists in this repository --
 # this guard is what keeps this service module from ever importing it,
 # and it now flags real code, not a hypothetical future import.
 # ---------------------------------------------------------------------------

@@ -282,6 +282,10 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_interaction_staging_postgresql.py -m postgresql -q
+      # This step's fixture runs Base.metadata.drop_all against the shared
+      # job database (see test_supersede_savepoint_postgresql.py). It must
+      # stay the last step in this job -- any step appended after it would
+      # run against tables this one just dropped.
       - name: Test legacy-question supersede savepoint isolation (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

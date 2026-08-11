@@ -23,6 +23,11 @@ any other way (``.filter_by(...)``, a compound ``and_()``, a comparison
 method call such as ``.isnot(None)``) is invisible to this walk on
 whichever side carries it -- that is a real blind spot, not a caught case:
 if one side alone grows a non-``==``-shaped leg, this guard stays green.
+The same applies to statement-split accumulation (``q = q.filter(...)``
+across several statements): each re-assignment starts a new chain at a
+new position, so those legs fall outside the first chain this guard
+compares. A single side rewritten that way fails loudly (the extracted
+sets stop matching); only a symmetric rewrite of both sides goes silent.
 It only catches drift in the shape both functions are written in.
 
 Known false-positive mode: a pure identifier rename on either side (e.g.

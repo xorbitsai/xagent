@@ -17,21 +17,26 @@ DDL against this disposable database -- rather than a mocked exception, so
 the transaction is actually left aborted by PostgreSQL itself when the
 savepoint is missing.
 
-Requires ``XAGENT_TEST_POSTGRES_URL`` pointed at a disposable database;
-skipped otherwise. The fixture below runs ``Base.metadata.drop_all`` on
-setup and teardown against whatever that URL names -- never point it at a
-database you care about.
+Requires ``XAGENT_TEST_POSTGRES_URL`` pointed at any reachable PostgreSQL
+server; skipped otherwise. The fixture below follows the same pattern as
+test_interaction_staging_postgresql.py: it creates a disposable,
+uniquely-named schema (``CREATE SCHEMA`` / ``DROP SCHEMA ... CASCADE``) for
+each test run rather than touching the server's default schema, so it never
+drops or creates tables anyone else's session might be relying on.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import text
+from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import ops_signals
@@ -39,22 +44,37 @@ from xagent.web.services.chat_history_service import supersede_legacy_question_r
 
 
 @pytest.fixture()
-def db_session():
-    """Isolated tables in a real, disposable PostgreSQL database."""
+def engine():
     url = os.getenv("XAGENT_TEST_POSTGRES_URL")
     if not url:
         pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
-    init_db(db_url=url)
-    engine = get_engine()
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-    db = next(get_db())
+    schema = "supersede_savepoint_" + uuid.uuid4().hex[:8]
+    admin_engine = sa.create_engine(url)
+    with admin_engine.begin() as conn:
+        conn.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+    admin_engine.dispose()
+
+    eng = sa.create_engine(url, connect_args={"options": f"-csearch_path={schema}"})
+    Base.metadata.create_all(bind=eng)
+    yield eng
+    eng.dispose()
+
+    admin_engine = sa.create_engine(url)
+    with admin_engine.begin() as conn:
+        conn.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+    admin_engine.dispose()
+
+
+@pytest.fixture()
+def db_session(engine):
+    """Isolated tables in a disposable PostgreSQL schema."""
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
     try:
         yield db
     finally:
         db.rollback()
         db.close()
-        Base.metadata.drop_all(bind=engine)
 
 
 @pytest.fixture(autouse=True)

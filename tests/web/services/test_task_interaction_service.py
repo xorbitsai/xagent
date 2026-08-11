@@ -683,3 +683,38 @@ def test_get_scopes_by_task_id_not_by_interaction_id_alone(
     assert svc.get(db, task_id=task_a, interaction_id=row.id) is not None
     assert svc.get(db, task_id=task_b, interaction_id=row.id) is None
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# Structural guards: raw SQL and the _rowcount idiom.
+# ---------------------------------------------------------------------------
+
+
+def test_module_issues_zero_sa_text_calls() -> None:
+    """Every statement in this module goes through Core/ORM query-building
+    (``db.query(...)``, ``db.get(...)``), never a raw ``sa.text(...)``
+    string. AST-based rather than a source-text grep, for the same reason
+    the production-caller gate is AST-based: a substring scan would also
+    match this assertion's own docstring and any future prose mention of
+    ``sa.text`` in a comment.
+
+    This module does not perform any rowcount-based writes in this
+    delivery (create() validates and returns; it does not stage a row), so
+    there is no ``_rowcount``-idiom call to guard here yet -- that
+    obligation applies once a write path lands."""
+
+    import ast
+    import inspect
+
+    source = inspect.getsource(svc)
+    tree = ast.parse(source)
+    text_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "text":
+            text_calls.append(node)
+        elif isinstance(func, ast.Attribute) and func.attr == "text":
+            text_calls.append(node)
+    assert text_calls == []

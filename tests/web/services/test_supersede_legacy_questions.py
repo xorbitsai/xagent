@@ -1,24 +1,27 @@
 """Behavior tests for ``supersede_legacy_question_rows``.
 
 Covers everything about the helper that is provable on SQLite: whole-set
-rewrite semantics with negative controls (role and cross-task isolation),
-idempotency, the degrade/propagate split on the catch clause, signal
-pairing, and transcript-field invariance. One property is not provable
-here -- that the savepoint is actually necessary, i.e. that a failed
-statement without it would poison the caller's transaction. SQLite does
-not abort an open transaction after a failed statement the way
-PostgreSQL does, so that specific mutation cannot be made to fail on
-this backend; it is covered instead in
-``test_supersede_savepoint_postgresql.py`` (see that file's module
-docstring).
+rewrite semantics with negative controls (role, message_type, a
+different task, and a nonexistent task_id), idempotency, the
+degrade/propagate split on the catch clause, signal pairing, and
+transcript-field invariance. One property is not provable here -- that
+the savepoint is actually necessary, i.e. that a failed statement
+without it would poison the caller's transaction. SQLite does not abort
+an open transaction after a failed statement the way PostgreSQL does, so
+that specific mutation cannot be made to fail on this backend; it is
+covered instead in ``test_supersede_savepoint_postgresql.py`` (see that
+file's module docstring).
 """
 
 from __future__ import annotations
+
+import logging
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.exc import InvalidRequestError, OperationalError
 from sqlalchemy.orm import Query, Session, sessionmaker
+from sqlalchemy.orm.session import SessionTransaction
 
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
@@ -26,6 +29,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import ops_signals
 from xagent.web.services.chat_history_service import (
+    QUESTION_MESSAGE_TYPE,
     SUPERSEDED_MESSAGE_TYPE,
     get_latest_waiting_question,
     persist_assistant_message,
@@ -63,6 +67,15 @@ def _clean_signal():
     ops_signals.clear_degradation(ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED)
     yield
     ops_signals.clear_degradation(ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED)
+
+
+def test_message_type_constants_have_their_documented_values():
+    # The admin transcript export (conversation_logs.py) passes
+    # message_type straight through, making "question_superseded" a de
+    # facto external contract -- this is what reds if anyone edits
+    # either value.
+    assert QUESTION_MESSAGE_TYPE == "question"
+    assert SUPERSEDED_MESSAGE_TYPE == "question_superseded"
 
 
 def test_supersede_zeroes_the_whole_waiting_set_with_negative_controls():
@@ -189,7 +202,7 @@ def test_supersede_degrades_on_dbapi_error_and_lets_the_caller_commit(monkeypatc
     (DBAPIError degrades) and the signal path -- it does not by itself
     prove the savepoint is necessary, since SQLite does not poison the
     enclosing transaction on a failed statement the way PostgreSQL does.
-    The savepoint's necessity is proven by the PostgreSQL-only cell in
+    The savepoint's necessity is proven by the PostgreSQL-only test in
     ``test_supersede_savepoint_postgresql.py``."""
     db = _create_db_session()
     try:
@@ -230,12 +243,77 @@ def test_supersede_degrades_on_dbapi_error_and_lets_the_caller_commit(monkeypatc
         # This confirms the caller's transaction is still usable after the
         # swallow -- it does not by itself prove the savepoint caused
         # that; on SQLite the commit succeeds even without one (see the
-        # module docstring and the PostgreSQL-only cell, which is what
+        # module docstring and the PostgreSQL-only test, which is what
         # actually proves the savepoint's necessity).
         db.commit()
 
         db.refresh(row)
         assert row.message_type == "question"
+    finally:
+        db.close()
+
+
+def test_supersede_distinguishes_a_savepoint_exit_failure_from_a_statement_failure(
+    monkeypatch, caplog
+):
+    """A DBAPIError raised by the UPDATE itself and a DBAPIError raised
+    by the SAVEPOINT's own RELEASE on the way out of the ``with`` block
+    both degrade the same way (return 0, register the signal) -- but
+    they are not the same failure, and the log line must say which one
+    happened instead of silently discarding a rowcount that was, in this
+    second case, real.
+
+    Patches ``SessionTransaction.__exit__`` (the class the ``with
+    db.begin_nested():`` block's context manager protocol actually
+    dispatches to -- an instance-level patch would not be seen by the
+    ``with`` statement) so it raises only on a clean exit, i.e. only
+    after the UPDATE inside the block has already run successfully."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        real_exit = SessionTransaction.__exit__
+
+        def failing_release_exit(self, exc_type, exc_val, exc_tb):
+            # Let the real RELEASE happen and finish cleanly first --
+            # this test's own DB session must stay usable afterward --
+            # then synthesize the exit-time DBAPIError on top of that
+            # otherwise-successful exit, so the helper sees exactly the
+            # "statement succeeded, then something failed on the way
+            # out" shape without leaving the session wedged.
+            result = real_exit(self, exc_type, exc_val, exc_tb)
+            if exc_type is None:
+                raise OperationalError(
+                    "RELEASE SAVEPOINT", {}, Exception("release failed")
+                )
+            return result
+
+        monkeypatch.setattr(SessionTransaction, "__exit__", failing_release_exit)
+
+        with caplog.at_level(logging.ERROR):
+            result = supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert result == 0
+        signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
+        assert signal_name in ops_signals.active_degradations()
+
+        exit_failure_logs = [
+            record
+            for record in caplog.records
+            if "Savepoint exit failed after superseding" in record.message
+        ]
+        assert len(exit_failure_logs) == 1
+        # The real rowcount (1 row matched and updated before RELEASE
+        # failed) made it into the log line -- not discarded, and not
+        # reported as the generic "0 rows, statement itself failed" case.
+        assert "1 legacy question" in exit_failure_logs[0].message
     finally:
         db.close()
 
@@ -440,10 +518,10 @@ def test_supersede_touches_only_the_message_type_column():
 def test_supersede_opens_a_savepoint(monkeypatch):
     """The helper actually issues ``db.begin_nested()`` -- not just "some
     update inside a try/except" that happens to work on SQLite without a
-    savepoint. Distinct from the PostgreSQL-only cell in
+    savepoint. Distinct from the PostgreSQL-only test in
     ``test_supersede_savepoint_postgresql.py``, which proves the
     savepoint is *necessary* (a failed statement without one poisons the
-    caller's transaction); this cell proves it is *present* at all, and
+    caller's transaction); this test proves it is *present* at all, and
     that is provable on SQLite because it only needs to observe the call,
     not depend on SQLite reproducing PostgreSQL's abort-the-transaction
     behavior."""

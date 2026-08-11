@@ -44,9 +44,21 @@ from .database import Base
 # lowercased there. Do not unify the two -- each rule is pinned by its own
 # tests and guards a different kind of input.
 # ---------------------------------------------------------------------------
-INTERACTION_ORIGIN_VOCABULARY = frozenset(
-    {"internal", "sdk", "a2a", "trigger", "widget", "shared_link"}
+# The one literal list. Ordered: the ``ck_task_interaction_requests_origin``
+# CHECK below renders its IN-list from this tuple, and offline SQL must be
+# byte-deterministic, so order is part of the contract. Every other surface
+# -- the two frozenset views below and the staging primitive's Python-side
+# validation -- derives from this tuple, so no second hand-written copy can
+# drift.
+ORIGIN_VALUES: tuple[str, ...] = (
+    "internal",
+    "sdk",
+    "a2a",
+    "trigger",
+    "widget",
+    "shared_link",
 )
+INTERACTION_ORIGIN_VOCABULARY = frozenset(ORIGIN_VALUES)
 INTERACTION_PROTOCOL_VERSION = 1
 
 # ``Task.source`` literals actually written by producers today -- a proper
@@ -85,22 +97,10 @@ def normalize_interaction_origin(source: str | None) -> str | None:
     return None
 
 
-# The single source of truth for the origin vocabulary: both the CHECK
-# constraint's IN-list below and the staging primitive's own Python-side
-# validation (``_ORIGIN_VOCABULARY`` in task_interaction_staging.py) derive
-# from this tuple, so the two can never drift apart the way two
-# independently hand-written copies could. Order is preserved in
-# ORIGIN_VALUES for the CHECK's rendered SQL; ORIGIN_VOCABULARY is the
-# frozenset membership tests actually want.
-ORIGIN_VALUES: tuple[str, ...] = (
-    "internal",
-    "sdk",
-    "a2a",
-    "trigger",
-    "widget",
-    "shared_link",
-)
-ORIGIN_VOCABULARY = frozenset(ORIGIN_VALUES)
+# Alias imported by the staging primitive's Python-side validation
+# (``_ORIGIN_VOCABULARY`` in task_interaction_staging.py). A view over
+# ``ORIGIN_VALUES`` above, same object as INTERACTION_ORIGIN_VOCABULARY.
+ORIGIN_VOCABULARY = INTERACTION_ORIGIN_VOCABULARY
 
 
 class TaskInteractionRequest(Base):  # type: ignore

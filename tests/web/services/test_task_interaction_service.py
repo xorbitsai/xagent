@@ -54,6 +54,7 @@ labor:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -155,6 +156,60 @@ def test_locator_mismatch_reason_constant_does_not_exist_in_source() -> None:
 
     source = inspect.getsource(svc)
     assert "locator_mismatch" not in source
+
+
+# ---------------------------------------------------------------------------
+# build_v1_request_payload(): closes the §R1-2 obligation -- its output must
+# always pass the identical JSON-serializability probe
+# stage_interaction_request runs before its own INSERT.
+# ---------------------------------------------------------------------------
+
+
+def test_build_v1_request_payload_output_passes_the_json_serializability_probe() -> (
+    None
+):
+    parsed = svc.parse_v1_request_payload(_valid_values())
+    payload = svc.build_v1_request_payload(parsed)
+    # The identical probe stage_interaction_request runs; does not raise.
+    json.dumps(payload, allow_nan=False)
+
+
+def test_build_v1_request_payload_rejects_nan_default_value() -> None:
+    values = {
+        "message": "Pick a number",
+        "interactions": [
+            {
+                "type": "number_input",
+                "field": "n",
+                "label": "N",
+                "default_value": float("nan"),
+            }
+        ],
+    }
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(ValueError):
+        svc.build_v1_request_payload(parsed)
+
+
+def test_create_rejects_nan_default_value_as_invalid_values(
+    _db: Session, _seeded_task: int
+) -> None:
+    values = {
+        "message": "Pick a number",
+        "interactions": [
+            {
+                "type": "number_input",
+                "field": "n",
+                "label": "N",
+                "default_value": float("inf"),
+            }
+        ],
+    }
+    envelope = _valid_envelope(values=values)
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +406,193 @@ def test_create_never_touches_staging_or_stages_a_row(
     assert _db.query(TaskInteractionRequest).count() == 0
 
 
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(7, id="int"),
+        pytest.param(b"create-key-1", id="bytes"),
+    ],
+)
+def test_cv2_non_string_idempotency_key_is_rejected_without_raising(
+    _db: Session, _seeded_task: int, bad_key: Any
+) -> None:
+    """A non-string request_idempotency_key must be caught by the isinstance
+    guard before _normalize_command_id is ever called -- none of these three
+    types would raise ValueError from that function (None/int/bytes each
+    fail differently, some not at all: _normalize_command_id calls
+    .strip() then a regex fullmatch, and a bytes object has its own
+    .strip() that would not raise), so relying on a broadened except clause
+    to catch them would either miss some or swallow unrelated bugs. All
+    three must produce the same typed rejection with no exception
+    escaping."""
+
+    envelope = _valid_envelope(request_idempotency_key=bad_key)
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="malformed_idempotency_key")
+
+
+# ---------------------------------------------------------------------------
+# Guest-principal authorization coverage for create()'s CA1 branch. The
+# "user" kind is covered above (test_ca1_principal_not_owning_the_task_is_
+# unauthorized); these cover the "guest" branch and the two fail-closed
+# branches (a malformed principal, and an unrecognized kind) that branch
+# sits between.
+# ---------------------------------------------------------------------------
+
+
+def _widget_workforce_task(db: Session, *, user_id: int, workforce_id: int) -> int:
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.agent_config = {
+        "auth_mode": "widget",
+        "guest_id": "guest-1",
+        "widget_workforce_id": workforce_id,
+    }
+    db.commit()
+    return task_id
+
+
+def _widget_workforce_guest_principal(
+    *, user_id: int, workforce_id: int, guest_id: str = "guest-1"
+) -> svc.InteractionPrincipal:
+    return svc.InteractionPrincipal(
+        kind="guest",
+        user_id=user_id,
+        is_admin=False,
+        channel_id=None,
+        auth_mode="widget",
+        widget_workforce_id=workforce_id,
+        guest_id=guest_id,
+    )
+
+
+def test_ca1_guest_principal_is_authorized_on_its_own_task(
+    _db: Session, _session_factory
+) -> None:
+    db = _session_factory()
+    user_id = make_user(db)
+    task_id = _widget_workforce_task(db, user_id=user_id, workforce_id=9)
+    db.close()
+
+    principal = _widget_workforce_guest_principal(user_id=user_id, workforce_id=9)
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+    assert isinstance(outcome, svc.CreateNotWired)
+
+
+def test_ca1_guest_principal_is_rejected_on_a_non_matching_task(
+    _db: Session, _session_factory
+) -> None:
+    db = _session_factory()
+    user_id = make_user(db)
+    task_id = _widget_workforce_task(db, user_id=user_id, workforce_id=9)
+    db.close()
+
+    # Same owner, same auth_mode, but a different workforce_id -- the
+    # entity-binding conjunct must reject this, not the (correctly
+    # matching) owner or auth_mode conjuncts.
+    principal = _widget_workforce_guest_principal(user_id=user_id, workforce_id=999)
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_raised(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A malformed principal that populates more than one of the four
+    entity-binding fields makes task_is_owned_by_public_principal raise
+    ValueError; create() must catch exactly that and translate it to
+    Unauthorized(not_task_principal), not let it escape as an unhandled
+    exception."""
+
+    principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=1,
+        is_admin=False,
+        channel_id=None,
+        auth_mode="widget",
+        widget_agent_id=1,
+        widget_workforce_id=1,
+        guest_id="guest-1",
+    )
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca1_guest_principal_with_zero_populated_directions_is_unauthorized_not_raised(
+    _db: Session, _seeded_task: int
+) -> None:
+    principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=1,
+        is_admin=False,
+        channel_id=None,
+        auth_mode="widget",
+        guest_id="guest-1",
+    )
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca1_unknown_principal_kind_is_always_unauthorized(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A principal.kind that is neither "user" nor "guest" must be
+    rejected -- there is no third branch that defaults to allow."""
+
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    principal = svc.InteractionPrincipal(
+        kind="robot",
+        user_id=task.user_id,
+        is_admin=True,
+        channel_id=None,
+        auth_mode=None,
+    )
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca1_entity_binding_with_non_int_convertible_config_value_is_rejected_not_raised(
+    _db: Session, _session_factory
+) -> None:
+    """agent_config is untrusted JSON another writer controls. A
+    non-int-convertible widget_workforce_id (a non-numeric string here)
+    must make the entity-binding conjunct fail closed, not raise -- the
+    old int(x or 0) shape this replaces would raise ValueError on this
+    exact input, since "not-a-number" is truthy and int("not-a-number")
+    is not a valid conversion."""
+
+    db = _session_factory()
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.agent_config = {
+        "auth_mode": "widget",
+        "guest_id": "guest-1",
+        "widget_workforce_id": "not-a-number",
+    }
+    db.commit()
+    db.close()
+
+    principal = _widget_workforce_guest_principal(user_id=user_id, workforce_id=9)
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
 # ---------------------------------------------------------------------------
 # materialize_compatibility_view(): the three-tier compatibility read.
 # ---------------------------------------------------------------------------
@@ -397,6 +639,7 @@ def _make_active_interaction_row(
     resume_run_partition: str = "run-a",
     resume_execution_id: str = "exec-1",
     protocol_version: int = 1,
+    request_payload: dict[str, Any] | None = None,
 ) -> TaskInteractionRequest:
     now = _now()
     row = TaskInteractionRequest(
@@ -407,7 +650,9 @@ def _make_active_interaction_row(
         status="active",
         active_slot=1,
         origin="internal",
-        request_payload={
+        request_payload=request_payload
+        if request_payload is not None
+        else {
             "message": "Which environment?",
             "interactions": [
                 {"type": "text_input", "field": "env", "label": "Environment"}
@@ -495,6 +740,27 @@ def test_t1_falls_back_to_legacy_when_protocol_version_is_unrecognized(
         return row
 
     monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "legacy"
+
+
+def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The active row's request_payload is a JSON column with no
+    AskUserQuestionArgs-shape CHECK -- a row can carry any JSON dict
+    that satisfies NOT NULL, so this branch is reachable through a real
+    write, unlike the protocol_version branch above. A missing "message"
+    field is enough to fail parse_v1_request_payload's pydantic
+    validation."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        request_payload={"not": "a valid v1 payload"},
+    )
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier == "legacy"
 
@@ -614,6 +880,32 @@ def test_t3_does_not_fall_back_to_legacy(_db: Session, _seeded_task: int) -> Non
     _force_dangling_pointer(_db, interaction_id=row.id)
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier != "legacy"
+
+
+def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3's second reason: the anchor row fetch itself raises (a session
+    or query-layer failure), distinct from anchor_dangling -- that reason
+    covers the pointer naming a missing or invalid row, not the read
+    infrastructure failing before it can even answer that question."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    real_get = _db.get
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent:
+            raise RuntimeError("simulated session failure")
+        return real_get(model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
 
 
 def test_stale_run_active_row_is_invisible(_db: Session, _session_factory) -> None:

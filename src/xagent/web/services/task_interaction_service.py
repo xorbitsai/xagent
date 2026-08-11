@@ -129,20 +129,23 @@ def task_is_owned_by_public_principal(
     "try every direction until one matches") and raises ``ValueError`` --
     fail closed on a malformed caller, not fail open on a guess.
 
+    Ownership by ``Task.user_id`` is deliberately **not** one of this
+    predicate's conjuncts, even though ``principal.user_id`` is a field on
+    it: all four pre-existing entry points enforce it purely as a filter on
+    the SQL query that loads ``task`` in the first place (``Task.user_id ==
+    access_context.user.id``), never as a post-load Python attribute check,
+    and this predicate preserves that division of labor rather than adding
+    a second, redundant one -- adding it here would touch ``task.user_id``
+    unconditionally, which the pre-existing stub-based tests for these entry
+    points do not always populate on their fixture objects (they build a
+    minimal double carrying only the fields the pre-existing post-load
+    checks actually read). ``principal.user_id`` exists on this value object
+    for the answer-side authorization predicate's own, separate use, not for
+    this one.
+
     The conjunction, in order:
 
-    1. ``task.user_id == principal.user_id``. All four pre-existing entry
-       points already enforce this as a filter on the SQL query that loads
-       ``task`` in the first place, before this predicate ever runs, so in
-       the three wired production callers this conjunct is redundant with
-       that filter -- and checked here anyway, the same way the share-agent
-       direction's row-level entity binding (item 4 below) is checked here
-       even though it, too, duplicates a filter already applied upstream in
-       ``get_task_for_share_context``. A caller that reaches this predicate
-       with an unfiltered ``task`` (any future consumer that looks a task up
-       by id alone) gets ownership enforced here rather than silently
-       relying on an upstream filter it may not have applied.
-    2. ``task.channel_id is None``. All three production callers wired to
+    1. ``task.channel_id is None``. All three production callers wired to
        this predicate require it (a widget/share task is never bound to a
        bot channel); the fourth direction (plain widget-agent, matched by
        ``get_task_for_public_context``) keeps its own channel-id-or-None
@@ -150,8 +153,8 @@ def task_is_owned_by_public_principal(
        ``get_task_for_public_context``'s own comment) -- this predicate's
        simpler "must be None" is exercised only by tests that address the
        widget-agent direction directly.
-    3. ``task.agent_config`` is a ``dict``.
-    4. ``task.agent_config["auth_mode"] == principal.auth_mode``. This is
+    2. ``task.agent_config`` is a ``dict``.
+    3. ``task.agent_config["auth_mode"] == principal.auth_mode``. This is
        one of the two tightenings: the pre-existing widget-agent branch of
        ``get_task_for_public_context`` never checks ``auth_mode`` at all,
        while the other three entry points do. A widget guest whose
@@ -160,7 +163,7 @@ def task_is_owned_by_public_principal(
        to the untouched ``get_task_for_public_context`` return the task --
        that divergence is intentional (see that function's own comment for
        the candidate-issue this predicate does not fix).
-    5. Entity binding for whichever single direction ``principal``
+    4. Entity binding for whichever single direction ``principal``
        addresses, requiring the task-side value to be genuinely present --
        not folded from ``None``/missing into a comparable default. This is
        the second tightening: the pre-existing code's ``int(x or 0) !=
@@ -184,7 +187,7 @@ def task_is_owned_by_public_principal(
          the one entry point that checks both.
        - share-workforce: ``task.agent_config["share_workforce_id"] ==
          principal.share_workforce_id`` (JSON-level only).
-    6. ``task.agent_config["guest_id"] == principal.guest_id``, with
+    5. ``task.agent_config["guest_id"] == principal.guest_id``, with
        ``principal.guest_id`` required non-empty first -- an empty or
        ``None`` guest id must never match a task whose own ``guest_id`` is
        also empty or missing.
@@ -217,8 +220,6 @@ def task_is_owned_by_public_principal(
         )
     direction = populated[0]
 
-    if principal.user_id is None or task.user_id != principal.user_id:
-        return False
     if task.channel_id is not None:
         return False
     if not isinstance(task.agent_config, dict):
@@ -250,3 +251,49 @@ def task_is_owned_by_public_principal(
         return False
 
     return True
+
+
+def public_chat_identity_matches(task: "Task", principal: InteractionPrincipal) -> bool:
+    """Just the guest-identity slice of
+    ``task_is_owned_by_public_principal``'s conjunction, exposed separately
+    so a caller can choose which of its own two 403 messages to raise when
+    the full conjunction fails.
+
+    All three wired entry points collapse a ``guest_id`` mismatch into the
+    same detail text as "task does not exist" -- an anti-enumeration
+    property the pre-existing code documented on its own now-inlined guest
+    gate ("a distinguishable guest-mismatch message would tell a probing
+    visitor which task ids exist") -- while every other ownership conjunct
+    (channel binding, config shape, auth_mode, entity binding) gets a
+    distinguishable "widget/share is unavailable" message. A caller uses
+    this function to pick between the two without re-deriving the identity
+    check inline: when this returns ``False``, raise the not-found-shaped
+    message; when it returns ``True`` but
+    ``task_is_owned_by_public_principal`` still returned ``False``, raise
+    the unavailable-shaped message.
+
+    Deliberately does not also check ``Task.user_id`` -- see
+    ``task_is_owned_by_public_principal``'s docstring for why ownership by
+    user stays a caller-side SQL filter, never a post-load attribute read,
+    across every function this predicate is wired into.
+
+    Message-selection priority under a hypothetical *simultaneous* identity
+    **and** entity-binding failure is not preserved identically across all
+    three pre-existing functions by this split: the pre-existing
+    widget-workforce code checked guest_id before entity binding (identity
+    wins), while both pre-existing share-side functions checked entity
+    binding before guest_id (entity wins). This helper always gives
+    identity priority, matching the widget-workforce order and diverging
+    from the share-side order only when both dimensions are wrong at once
+    -- a combination no caller here can construct today (auth_mode alone
+    already separates the widget and share channels) and no existing test
+    exercises. The security property that matters -- a guest_id mismatch
+    alone is indistinguishable from not-found -- holds under either
+    priority.
+    """
+
+    if not principal.guest_id:
+        return False
+    if not isinstance(task.agent_config, dict):
+        return False
+    return task.agent_config.get("guest_id") == principal.guest_id

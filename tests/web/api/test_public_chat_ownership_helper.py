@@ -17,6 +17,7 @@ import pytest
 from xagent.web.models.task import Task
 from xagent.web.services.task_interaction_service import (
     InteractionPrincipal,
+    public_chat_identity_matches,
     task_is_owned_by_public_principal,
 )
 
@@ -156,17 +157,22 @@ def test_same_guest_id_but_task_bound_to_a_different_workforce_is_rejected() -> 
     )
 
 
-def test_same_guest_id_but_task_owned_by_a_different_user_is_rejected() -> None:
-    """A3: the guest_id conjunct alone is not ownership -- the task must
-    also belong to the same owner. The three wired production callers
-    already filter on Task.user_id before this predicate ever runs, so this
-    conjunct is redundant there; it is checked here anyway, the same way
-    the share-agent direction's row-level entity binding is checked here
-    even though ``get_task_for_share_context`` also filters on it upstream."""
+def test_predicate_alone_does_not_enforce_task_owner_by_design() -> None:
+    """A3 (same guest_id, another owner -> reject) holds end-to-end, but not
+    from this predicate alone: ownership by ``Task.user_id`` stays a
+    caller-side SQL filter in every one of the three wired entry points
+    (see ``task_is_owned_by_public_principal``'s docstring), so a ``task``
+    this predicate is handed with every *other* conjunct satisfied passes
+    regardless of ``task.user_id`` -- the production A3 rejection comes from
+    the caller's query never loading such a task in the first place (pinned
+    by ``test_share_guest_isolation.py`` and ``test_workforce_widget.py``,
+    which exercise the real query path end to end). This test documents
+    that division of labor rather than re-asserting A3 at a layer that does
+    not own it."""
 
     task = _task(user_id=999, agent_id=5)
     principal = _widget_agent_principal()
-    assert task_is_owned_by_public_principal(task, principal) is False
+    assert task_is_owned_by_public_principal(task, principal) is True
 
 
 def test_widget_principal_against_a_share_task_with_matching_guest_id_is_rejected() -> (
@@ -284,3 +290,41 @@ def test_identity_string_for_user_principal() -> None:
         auth_mode=None,
     )
     assert principal.identity_string() == "user:42"
+
+
+# ---------------------------------------------------------------------------
+# public_chat_identity_matches: the message-selection slice used by Phase 2
+# ---------------------------------------------------------------------------
+
+
+def test_identity_matches_when_guest_id_agrees() -> None:
+    task = _task(agent_config={"guest_id": "g-1"})
+    assert public_chat_identity_matches(task, _widget_agent_principal()) is True
+
+
+def test_identity_does_not_match_on_guest_id_mismatch() -> None:
+    task = _task(agent_config={"guest_id": "someone-else"})
+    assert public_chat_identity_matches(task, _widget_agent_principal()) is False
+
+
+def test_identity_does_not_match_when_principal_guest_id_is_empty() -> None:
+    task = _task(agent_config={"guest_id": ""})
+    principal = _widget_agent_principal(guest_id="")
+    assert public_chat_identity_matches(task, principal) is False
+
+
+def test_identity_does_not_match_when_agent_config_is_not_a_dict() -> None:
+    task = _task(agent_config=None)
+    assert public_chat_identity_matches(task, _widget_agent_principal()) is False
+
+
+def test_identity_match_does_not_read_task_user_id() -> None:
+    """Deliberate: a stub task lacking ``user_id`` entirely (as some
+    pre-existing public_chat_access tests construct) must not raise --
+    ownership by user stays the caller's SQL-filter responsibility, never a
+    post-load attribute read here."""
+
+    from types import SimpleNamespace
+
+    stub = SimpleNamespace(agent_config={"guest_id": "g-1"})
+    assert public_chat_identity_matches(stub, _widget_agent_principal()) is True

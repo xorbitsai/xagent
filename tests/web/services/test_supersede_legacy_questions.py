@@ -23,6 +23,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import ops_signals
 from xagent.web.services.chat_history_service import (
+    get_latest_waiting_question,
     persist_assistant_message,
     supersede_legacy_question_rows,
 )
@@ -146,10 +147,14 @@ def test_supersede_is_idempotent_on_a_second_call():
 
 
 def test_supersede_degrades_on_dbapi_error_and_lets_the_caller_commit(monkeypatch):
-    """A DBAPIError inside the savepoint is swallowed: the helper returns
-    0, registers the degradation signal, the legacy row is left exactly
-    as it was, and -- the point of the savepoint -- the caller's own
-    transaction can still commit afterward."""
+    """A DBAPIError raised inside the update is swallowed: the helper
+    returns 0, registers the degradation signal, and the legacy row is
+    left exactly as it was. This proves the exception classification
+    (DBAPIError degrades) and the signal path -- it does not by itself
+    prove the savepoint is necessary, since SQLite does not poison the
+    enclosing transaction on a failed statement the way PostgreSQL does.
+    The savepoint's necessity is proven by the PostgreSQL-only cell in
+    ``test_supersede_savepoint_postgresql.py``."""
     db = _create_db_session()
     try:
         task = _create_task(db)
@@ -186,8 +191,11 @@ def test_supersede_degrades_on_dbapi_error_and_lets_the_caller_commit(monkeypatc
             == f"task {task.id}: legacy question supersede failed (OperationalError)"
         )
 
-        # The point of the savepoint: the caller's transaction is still
-        # usable and can commit after the swallow.
+        # This confirms the caller's transaction is still usable after the
+        # swallow -- it does not by itself prove the savepoint caused
+        # that; on SQLite the commit succeeds even without one (see the
+        # module docstring and the PostgreSQL-only cell, which is what
+        # actually proves the savepoint's necessity).
         db.commit()
 
         db.refresh(row)
@@ -425,5 +433,30 @@ def test_supersede_opens_a_savepoint(monkeypatch):
 
         assert updated == 1
         assert calls["n"] == 1
+    finally:
+        db.close()
+
+
+def test_supersede_end_to_end_with_the_reader():
+    """Persist a waiting question, confirm the reader sees it, supersede
+    it, then confirm the reader sees nothing -- proving the two functions
+    agree end-to-end, not just on the statically extracted predicate sets
+    ``test_supersede_predicate_pairing.py`` checks."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        task.status = TaskStatus.WAITING_FOR_USER
+        db.commit()
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        assert get_latest_waiting_question(db, int(task.id))[0] == "A question"
+        supersede_legacy_question_rows(db, task_id=int(task.id))
+        assert get_latest_waiting_question(db, int(task.id)) == (None, None)
     finally:
         db.close()

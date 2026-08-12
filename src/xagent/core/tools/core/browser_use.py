@@ -66,7 +66,6 @@ class BrowserSession:
         session_id: str,
         headless: bool = True,
         locale: Optional[str] = None,
-        timezone_id: Optional[str] = None,
     ):
         """
         Initialize a browser session.
@@ -77,14 +76,14 @@ class BrowserSession:
             locale: Playwright context locale (e.g. "en-US"). Falls back to
                 the deployment default (see get_browser_tool_default_locale)
                 when not supplied by the caller.
-            timezone_id: Playwright context timezone (e.g. "America/New_York").
-                Falls back to the deployment default, or the host's own
-                system timezone when neither is configured.
         """
         self.session_id = session_id
         self.headless = headless
         self.locale = locale or get_browser_tool_default_locale()
-        self.timezone_id = timezone_id or get_browser_tool_default_timezone()
+        # No caller ever supplies a per-request timezone (no tool schema
+        # exposes it, and _with_default_session only injects locale) -- this
+        # is deployment-configured only, unlike locale.
+        self.timezone_id = get_browser_tool_default_timezone()
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
@@ -124,12 +123,12 @@ class BrowserSession:
                 ],
             )
 
-            # Create context with realistic settings. locale/timezone_id come
-            # from the caller (ultimately the requesting user/task's own
-            # language), falling back to the deployment default -- previously
-            # this was hardcoded to zh-CN/Asia/Shanghai, which forced every
-            # automated session to request Chinese-localized pages regardless
-            # of who asked.
+            # Create context with realistic settings. locale comes from the
+            # caller (ultimately the requesting user/task's own language);
+            # timezone_id is deployment-configured only. Both fall back to
+            # the deployment default -- previously hardcoded to
+            # zh-CN/Asia/Shanghai, which forced every automated session to
+            # request Chinese-localized pages regardless of who asked.
             self._context = await self._browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -255,7 +254,6 @@ class BrowserSessionManager:
         session_id: str,
         headless: bool = False,
         locale: Optional[str] = None,
-        timezone_id: Optional[str] = None,
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -264,7 +262,6 @@ class BrowserSessionManager:
             session_id: Unique session identifier
             headless: Whether to use headless mode (only used when creating new session)
             locale: Playwright context locale (only used when creating new session)
-            timezone_id: Playwright context timezone (only used when creating new session)
 
         Returns:
             BrowserSession instance
@@ -277,20 +274,15 @@ class BrowserSessionManager:
             # Check if session already exists
             if session_id in self._sessions:
                 # Update last used time and return existing session
-                # Ignore headless/locale/timezone_id for existing sessions
-                # (none of these can change after creation)
+                # Ignore headless/locale for existing sessions (can't change
+                # after creation)
                 existing = self._sessions[session_id]
-                for attr_name, requested, current in (
-                    ("locale", locale, existing.locale),
-                    ("timezone_id", timezone_id, existing.timezone_id),
-                ):
-                    if requested and current != requested:
-                        logger.warning(
-                            f"Browser session {session_id!r} already exists with "
-                            f"{attr_name} {current!r}; requested {attr_name} "
-                            f"{requested!r} ignored (a session's {attr_name} is "
-                            "frozen at creation)"
-                        )
+                if locale and existing.locale != locale:
+                    logger.warning(
+                        f"Browser session {session_id!r} already exists with locale "
+                        f"{existing.locale!r}; requested locale {locale!r} ignored "
+                        "(a session's locale is frozen at creation)"
+                    )
                 existing._last_used = datetime.now()
                 return existing
 
@@ -298,13 +290,10 @@ class BrowserSessionManager:
             if self._cleanup_task is None:
                 self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
-            logger.info(
-                f"Creating browser session {session_id!r} "
-                f"(locale={locale!r}, timezone_id={timezone_id!r})"
-            )
+            logger.info(f"Creating browser session {session_id!r} (locale={locale!r})")
             # Create new session with specified settings
             self._sessions[session_id] = BrowserSession(
-                session_id, headless, locale=locale, timezone_id=timezone_id
+                session_id, headless, locale=locale
             )
             self._sessions[session_id]._last_used = datetime.now()
             return self._sessions[session_id]
@@ -398,8 +387,6 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         wait_until: Wait condition (default: "networkidle")
         locale: Playwright context locale (only applied when the session is
             first created); falls back to the deployment default
-        timezone_id: Playwright context timezone (only applied when the
-            session is first created); falls back to the deployment default
 
     Returns:
         Dictionary with navigation result including URL, page title, and success status
@@ -419,7 +406,6 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
     headless = kwargs.get("headless", False)
     wait_until = kwargs.get("wait_until", "networkidle")
     locale = kwargs.get("locale")
-    timezone_id = kwargs.get("timezone_id")
 
     if not PLAYWRIGHT_AVAILABLE:
         return {
@@ -432,9 +418,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(
-        session_id, headless, locale=locale, timezone_id=timezone_id
-    )
+    session = await manager.get_or_create(session_id, headless, locale=locale)
     page = await session.get_page()
 
     try:

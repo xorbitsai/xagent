@@ -705,8 +705,10 @@ def get_browser_tool_default_locale() -> str:
 
     Raises:
         ValueError: if the env var is set but isn't a plausible BCP-47 tag
-            (e.g. "en-US"), so a typo fails loudly at read time instead of
-            surfacing as an opaque Playwright error at session creation.
+            (e.g. "en-US"). This getter is called lazily, from
+            BrowserSession.__init__ on first browser tool use rather than at
+            process startup, so a typo still fails as a clean tool-call
+            error instead of an opaque Playwright error at session creation.
     """
     configured = os.getenv(BROWSER_TOOL_DEFAULT_LOCALE, "").strip()
     if not configured:
@@ -728,9 +730,9 @@ def get_browser_tool_default_timezone() -> str | None:
 
     Raises:
         ValueError: if the env var is set but isn't a recognized IANA
-            timezone name (e.g. "Asia/Shanghai"), so a typo fails loudly at
-            read time instead of surfacing as an opaque Playwright error at
-            session creation.
+            timezone name (e.g. "Asia/Shanghai"). Like
+            get_browser_tool_default_locale, this is read lazily on first
+            browser tool use, not at process startup.
     """
     configured = os.getenv(BROWSER_TOOL_DEFAULT_TIMEZONE, "").strip()
     if not configured:

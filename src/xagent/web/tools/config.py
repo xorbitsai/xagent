@@ -1322,6 +1322,16 @@ class WebToolConfig(BaseToolConfig):
 
         Uses ``getattr`` so a minimal request object (e.g. one carrying only a
         user id) doesn't trip the broad ``except`` and log a spurious warning.
+
+        Only safe as long as ``request`` never reaches here as a real
+        Starlette ``Request``/``HTTPConnection`` without ``AuthenticationMiddleware``
+        installed (which this app never installs): accessing ``.user`` on one
+        raises ``AssertionError``, not ``AttributeError``, so ``getattr``'s
+        default would not save it. Currently unreachable because
+        ``create_default_tools`` always passes an explicit ``user=``/``is_admin=``
+        (this path only runs when ``is_admin`` is left unset), but a future
+        caller that omits both and passes a real ``Request`` here would crash
+        instead of defaulting to ``False``.
         """
         user = getattr(request, "user", None)
         return bool(getattr(user, "is_admin", False)) if user is not None else False
@@ -1812,6 +1822,13 @@ class WebToolConfig(BaseToolConfig):
         exact ``"en"``/``"zh"`` the frontend writes today (see
         ``frontend/src/contexts/i18n-context.tsx``), instead of only matching
         those two literal strings.
+
+        Primary-subtag-only means ``zh-TW``/``zh-HK`` would also map to the
+        Simplified ``zh-CN`` in ``_APP_LOCALE_TO_BROWSER_LOCALE`` rather than
+        a Traditional-Chinese locale -- harmless today since the frontend's
+        ``Locale`` type is a hard ``"en" | "zh"`` union with no way to write
+        those values, but revisit this if a Traditional-Chinese UI locale is
+        ever added.
         """
         if not isinstance(app_locale, str) or not app_locale:
             return None

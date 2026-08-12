@@ -352,11 +352,18 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 # NativeBrowserEnvironment) drives the user's own already-running
                 # browser and has no `locale`/`**kwargs` parameter, so passing it
                 # there would raise TypeError instead of silently doing nothing.
-                if (
-                    self._locale
-                    and self._environment_factory is BrowserComputerEnvironment
-                ):
-                    factory_kwargs["locale"] = self._locale
+                if self._locale:
+                    if self._environment_factory is BrowserComputerEnvironment:
+                        factory_kwargs["locale"] = self._locale
+                    else:
+                        logger.debug(
+                            "Dropping resolved locale %r for computer tool "
+                            "session %r: environment factory %r doesn't accept "
+                            "a locale kwarg",
+                            self._locale,
+                            session_id,
+                            self._environment_factory,
+                        )
                 environment = self._environment_factory(**factory_kwargs)
                 self._environments[session_id] = environment
             current = environment.current_observation

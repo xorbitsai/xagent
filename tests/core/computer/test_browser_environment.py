@@ -157,7 +157,6 @@ class FakeManager:
         session_id: str,
         headless: bool,
         locale: str | None = None,
-        timezone_id: str | None = None,
     ) -> FakeSession:
         self.calls.append((session_id, headless, locale))
         return self.session

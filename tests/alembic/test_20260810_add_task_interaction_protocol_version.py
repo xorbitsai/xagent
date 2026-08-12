@@ -208,7 +208,9 @@ def test_online_postgresql_upgrade_adds_column_and_check_and_downgrade_removes_b
 ):
     migration = load_migration_module(MIGRATION_PATH)
 
-    with disposable_database_factory("xagent_w1_migration") as make_database:
+    with disposable_database_factory(
+        "xagent_protocol_marker_migration"
+    ) as make_database:
         engine = make_database("upgrade_downgrade")
 
         with engine.begin() as connection:
@@ -260,7 +262,9 @@ def test_online_upgrade_is_idempotent_sqlite() -> None:
 @pytest.mark.postgresql
 def test_online_upgrade_is_idempotent_postgresql() -> None:
     migration = load_migration_module(MIGRATION_PATH)
-    with disposable_database_factory("xagent_w1_migration") as make_database:
+    with disposable_database_factory(
+        "xagent_protocol_marker_migration"
+    ) as make_database:
         _assert_idempotent_upgrade(migration, make_database("idempotent_upgrade"))
 
 
@@ -287,7 +291,9 @@ def test_online_downgrade_is_idempotent_when_column_is_absent_sqlite() -> None:
 @pytest.mark.postgresql
 def test_online_downgrade_is_idempotent_when_column_is_absent_postgresql() -> None:
     migration = load_migration_module(MIGRATION_PATH)
-    with disposable_database_factory("xagent_w1_migration") as make_database:
+    with disposable_database_factory(
+        "xagent_protocol_marker_migration"
+    ) as make_database:
         _assert_idempotent_downgrade_when_absent(
             migration, make_database("idempotent_downgrade")
         )
@@ -335,7 +341,9 @@ def test_create_all_then_upgrade_is_noop_sqlite() -> None:
 @pytest.mark.postgresql
 def test_create_all_then_upgrade_is_noop_postgresql() -> None:
     migration = load_migration_module(MIGRATION_PATH)
-    with disposable_database_factory("xagent_w1_migration") as make_database:
+    with disposable_database_factory(
+        "xagent_protocol_marker_migration"
+    ) as make_database:
         _assert_create_all_then_upgrade_is_noop(
             migration, make_database("create_all_then_upgrade")
         )
@@ -368,7 +376,9 @@ def _assert_check_constraint_semantics(engine, extra_columns: dict) -> None:
 @pytest.mark.postgresql
 def test_check_constraint_semantics_on_an_online_migrated_postgresql_database() -> None:
     migration = load_migration_module(MIGRATION_PATH)
-    with disposable_database_factory("xagent_w1_migration") as make_database:
+    with disposable_database_factory(
+        "xagent_protocol_marker_migration"
+    ) as make_database:
         engine = make_database("check_semantics")
         with engine.begin() as connection:
             _legacy_tasks_table(connection)

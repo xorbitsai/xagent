@@ -817,7 +817,7 @@ class DAGPattern(AgentPattern):
                     )
 
                     if superseded_step_ids:
-                        logger.error(
+                        logger.warning(
                             "Multiple concurrent DAG steps completed with a "
                             "pending user question in the same batch; only "
                             "%s's question is delivered, the rest are "

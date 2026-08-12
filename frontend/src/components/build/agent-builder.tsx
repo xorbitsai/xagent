@@ -50,7 +50,7 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
-import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches } from "@/lib/mcp-lookup"
+import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches, resolveMcpToolSelector } from "@/lib/mcp-lookup"
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
@@ -1125,17 +1125,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }
 
       const finalToolCategories = [...selectedToolCategories]
-      // Same resolution as handleCreate below: selectedMcpServers holds
-      // whatever string the connect flow stored (often the app's display
-      // name), but the backend matches mcp:<selector> against the actual
-      // MCP server row name, which is the catalog app_id for a
-      // shared-server catalog app -- not its display name. Pushing the raw
-      // value broke Chrome (app_id "chrome-devtools" vs. display name
-      // "Chrome"), the first app where the two deliberately differ.
+      // Resolve each selection to the real, connected MCPServer row's name
+      // (see resolveMcpToolSelector for why a name/id fallback alone isn't
+      // enough -- the backend uses either convention depending on app
+      // type). Depends on mcpServers/officialApps having loaded; if a
+      // preview message is sent before they do, this falls back to the raw
+      // selector for every MCP tool (matching pre-existing behavior for
+      // this call site, not just this connector).
       selectedMcpServers.forEach(server => {
-        const connectedServer = findMatchingMcpServer(mcpServers, server)
-        const connectedApp = findMatchingMcpApp(officialApps, server)
-        finalToolCategories.push(`mcp:${connectedServer?.name || connectedApp?.id || server}`)
+        finalToolCategories.push(`mcp:${resolveMcpToolSelector(server, mcpServers, officialApps)}`)
       })
       if (hasSshBindings && !finalToolCategories.includes("ssh")) {
         finalToolCategories.push("ssh")
@@ -1456,22 +1454,16 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       finalToolCategories.push("ssh")
     }
 
-    // Add selected MCP servers back into tool_categories
+    // Add selected MCP servers back into tool_categories. See
+    // resolveMcpToolSelector: the backend names a catalog app's MCPServer
+    // row after either its app_id or its display name depending on app
+    // type, so this resolves the real connected row rather than guessing
+    // at a single fallback (a guess broke Chrome, app_id "chrome-devtools"
+    // vs. display name "Chrome", with the pre-existing "prefer name"
+    // fallback; the reverse "prefer id" fallback breaks Facebook, app_id
+    // "facebook" vs. display name "Facebook Pages", the other direction).
     selectedMcpServers.forEach(server => {
-      const connectedServer = findMatchingMcpServer(mcpServers, server)
-      const connectedApp = findMatchingMcpApp(officialApps, server)
-      // connectedApp?.id (the catalog app_id), not connectedApp?.name (its
-      // display name): for a shared-server catalog app, the backend names
-      // the actual MCP server row after the app_id
-      // (_ensure_catalog_app_server / _ensure_catalog_mcp_oauth_server), not
-      // the display name. Every pre-existing app's id and name normalize to
-      // the same backend key, so this was previously masked -- Chrome is
-      // the first app where they deliberately differ (app_id
-      // "chrome-devtools" vs. display name "Chrome"), and pushing the name
-      // here sent the backend an mcp:Chrome selector matching no loaded
-      // server, silently loading zero tools (backend log:
-      // reason="no_tools_returned").
-      finalToolCategories.push(`mcp:${connectedServer?.name || connectedApp?.id || server}`)
+      finalToolCategories.push(`mcp:${resolveMcpToolSelector(server, mcpServers, officialApps)}`)
     })
 
     setIsCreating(true)

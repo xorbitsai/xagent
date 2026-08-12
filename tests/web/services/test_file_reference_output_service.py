@@ -1,3 +1,4 @@
+import time
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
@@ -1066,6 +1067,195 @@ def test_reconcile_repairs_invented_id_from_label_when_title_names_a_different_f
         )
 
         assert content == '[report.mp4](file:real-id "My yearly report")'
+    finally:
+        db.close()
+
+
+def test_reconcile_keeps_junk_untouched_when_id_does_not_resolve():
+    # Regression: the junk fallback used to be applied unconditionally --
+    # even when the id it was attached to didn't resolve to any record, the
+    # match still collapsed to the bare label, permanently deleting the
+    # junk text (ordinary trailing prose the model wrote) from the
+    # persisted transcript. No record is registered here at all, so the id
+    # can never resolve or be repaired; the whole match must survive as-is.
+    db, user, task = _create_context()
+    try:
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="Check [the docs](file:nonexistent for more details) later",
+        )
+
+        assert content == "Check [the docs](file:nonexistent for more details) later"
+    finally:
+        db.close()
+
+
+def test_reconcile_keeps_junk_untouched_when_stored_file_id_is_invalid():
+    # Same guard as above, at the second (build_file_id_ref) failure point.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="invalid/id", filename="report.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[report.mp4](file:invalid/id has more text) tail",
+        )
+
+        assert content == "[report.mp4](file:invalid/id has more text) tail"
+    finally:
+        db.close()
+
+
+def test_reconcile_still_drops_recoverable_junk_when_id_resolves():
+    # Contrast with the two tests above: when the id *does* resolve, junk
+    # attached to it is still ordinary discardable trailing text, not
+    # something this fix should start preserving. Uses a non-media
+    # extension so the assertion isn't entangled with title injection.
+    db, user, task = _create_context()
+    try:
+        _add_file(
+            db,
+            user,
+            task,
+            file_id="real-id",
+            filename="report.pdf",
+            mime_type="application/pdf",
+        )
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="Check [the docs](file:real-id for more details) later",
+        )
+
+        assert content == "Check [the docs](file:real-id) later"
+    finally:
+        db.close()
+
+
+def test_reconcile_does_not_let_a_title_span_a_blank_line():
+    # A title clause separated from the target by a blank line renders as
+    # two independent, inert literal paragraphs to any real CommonMark
+    # parser. \s+/\s* around the title forms would match across that blank
+    # line and silently merge the two paragraphs into one live link,
+    # discarding the second paragraph's text. This function never itself
+    # emits a title separated from the target by anything but a single
+    # space, so the whole construct must simply fail to match -- identical
+    # to this regex's pre-title behavior for any other unparsable input.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="real-id", filename="stale.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[a](file:real-id\n\n"stale.mp4")',
+        )
+
+        assert content == '[a](file:real-id\n\n"stale.mp4")'
+    finally:
+        db.close()
+
+
+def test_reconcile_leaves_single_newline_titled_reference_untouched():
+    # CommonMark permits one line ending between destination and title
+    # (still a single link when rendered), but the horizontal-only
+    # whitespace that keeps a title clause from spanning a blank line (see
+    # the blank-line test above) declines this shape too. Pinned: the
+    # reference is left byte-for-byte untouched -- not validated, but not
+    # mangled either -- matching the regex's fallback for every other
+    # shape it can't safely parse.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="real-id", filename="clip.mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content='[a](file:real-id\n"clip.mp4")',
+        )
+
+        assert content == '[a](file:real-id\n"clip.mp4")'
+    finally:
+        db.close()
+
+
+def test_reconcile_falls_back_to_label_rewrite_for_paren_in_filename():
+    # A real filename containing ")" can't safely become this function's
+    # own title syntax (see the _UNSAFE_TITLE_RE comment for why that's an
+    # implementation constraint, not a CommonMark one) -- it must still
+    # fall back to the older label-rewrite mechanism rather than leaving
+    # the reference undetectable.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="real-id", filename="video (1).mp4")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[clip](file:real-id)",
+        )
+
+        assert content == "[video (1).mp4](file:real-id)"
+    finally:
+        db.close()
+
+
+def test_reconcile_stays_fast_on_a_large_unresolvable_reference():
+    # Regression guard for quadratic backtracking between the atomic-group
+    # target and the junk alternative when a huge target has no closing
+    # paren anywhere: this used to take several seconds per call at ~32KB
+    # and scale quadratically, on a function that reruns on every read of
+    # attacker-influenceable chat history. Generous bound (real fix runs in
+    # well under a second even at far larger sizes) to avoid environment
+    # flakiness while still catching a real regression.
+    db, user, task = _create_context()
+    try:
+        content = "[x](file:" + "a" * 100_000
+        start = time.monotonic()
+        result = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content=content,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result == content
+        assert elapsed < 2.0
+    finally:
+        db.close()
+
+
+def test_reconcile_does_not_repair_via_whitespace_only_title_or_label():
+    # Path("   ".strip()).name is "" -- without an explicit guard, a
+    # whitespace-only title/label would look up the empty-string filename
+    # key (records_by_filename keys are the raw, unstripped
+    # str(filename).casefold()) and could match a record whose own filename
+    # is literally empty, silently repairing an invented id to the wrong
+    # file. Internal record construction doesn't validate filenames the way
+    # the HTTP upload endpoints do, so an empty-filename record is a real
+    # (if unusual) possibility, not a hypothetical.
+    db, user, task = _create_context()
+    try:
+        _add_file(db, user, task, file_id="empty-name-id", filename="")
+
+        content = reconcile_assistant_file_references(
+            db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content="[  ](file:invented-id)",
+        )
+
+        assert content == "  "
     finally:
         db.close()
 

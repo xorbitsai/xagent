@@ -256,6 +256,21 @@ describe('MarkdownRenderer', () => {
     expect(handleFileClick).toHaveBeenCalledWith('/tmp/test.txt', 'open file')
   })
 
+  it('passes the model label, not the title, to onFileClick for a non-previewable file link', () => {
+    // "notes.txt" isn't a previewable kind, so resolvePreviewableFileLink
+    // returns null and this falls to the plain-anchor branch below --
+    // the filename handed to onFileClick must still be linkText-first,
+    // matching every other display path in this component.
+    const handleFileClick = vi.fn()
+    const content = '[Open Notes](file:some-id "notes.txt")'
+
+    render(<MarkdownRenderer content={content} onFileClick={handleFileClick} />)
+
+    fireEvent.click(screen.getByText('Open Notes'))
+
+    expect(handleFileClick).toHaveBeenCalledWith('some-id', 'Open Notes')
+  })
+
   it('renders file links and images as inert text when files are disabled', () => {
     const handleFileClick = vi.fn()
     const content = [
@@ -946,6 +961,28 @@ describe('MarkdownRenderer', () => {
     expect(screen.getByText('下载报告')).toBeInTheDocument()
     expect(screen.queryByText('annual_report_2024.pdf')).not.toBeInTheDocument()
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it('lets a title that classifies differently than the label win detection', async () => {
+    // resolvePreviewableFileLink tries title first and stops at the first
+    // candidate that classifies to any previewable kind -- it does not
+    // compare title's and visibleText's kinds and prefer whichever the
+    // label reveals. The backend's own gate never produces this shape (it
+    // only writes a title when the label doesn't already reveal a type),
+    // so this only arises for a hand-authored or otherwise unusual
+    // reference; pinning it here documents the actual (title-wins)
+    // behavior rather than the label-aware guarantee the code comment used
+    // to (incorrectly) claim.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([65, 66]).buffer,
+    })
+    const content = '[report.mp4](file:doc-file-id "notes.docx")'
+
+    render(<MarkdownRenderer content={content} />)
+
+    expect(await screen.findByTestId('docx-preview')).toBeInTheDocument()
+    expect(screen.queryByLabelText('report.mp4')).not.toBeInTheDocument()
   })
 
   it('renders file links as image previews when the path has an image extension', async () => {

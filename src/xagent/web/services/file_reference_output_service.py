@@ -37,8 +37,24 @@ logger = logging.getLogger(__name__)
 # - Control characters block the same paragraph-splitting hazard as
 #   ``_UNSAFE_LABEL_RE``/``_UNSAFE_TITLE_RE`` below.
 #
+# The whitespace immediately around a title clause is deliberately ``[ \t]``
+# (horizontal only), not ``\s`` -- ``\s`` includes newlines, which would let
+# a title clause span a CommonMark blank line, e.g.
+# ``[a](file:id\n\n"stale.mp4")`` renders as two independent, inert literal
+# paragraphs to any real CommonMark parser, but ``\s+``/``\s*`` here would
+# greedily match across that blank line and emit one live link, silently
+# merging (and mis-rendering) two paragraphs. Known cost: CommonMark also
+# permits a *single* line ending between destination and title (still one
+# link when rendered), and horizontal-only whitespace declines to match
+# that shape too -- such a reference is left byte-for-byte untouched (see
+# test_reconcile_leaves_single_newline_titled_reference_untouched), the
+# same non-destructive fallback as any other unparsable input, rather than
+# validated. Accepted: this function only ever emits a single space there,
+# so the shape is model-authored and rare, and distinguishing one newline
+# from two would complicate exactly the machinery this pass is shrinking.
+#
 # A title clause that doesn't parse as any of the three forms (duplicated,
-# unterminated, mismatched delimiters) falls through to the "junk"
+# unterminated, mismatched delimiters) falls through to the named ``junk``
 # alternative, which discards it as unstructured trailing content up to the
 # next ``)`` -- the reference is still validated, just without a title. A
 # deliberate side effect: an input like ``[x](file:id not a title)``, which
@@ -55,13 +71,32 @@ logger = logging.getLogger(__name__)
 # persisted transcript). Excluding ``(`` means this and similar malformed
 # inputs simply fail to match at all -- identical to this regex's pre-title
 # behavior of leaving an unparsable reference completely untouched, which
-# is the correct, non-destructive fallback.
+# is the correct, non-destructive fallback. But matching non-trivial junk is
+# not by itself a guarantee the reference is safe to normalize: if the id
+# turns out not to resolve to any record, ``replacement()`` below returns
+# the entire original match unchanged rather than collapsing to the bare
+# label -- otherwise the junk text (ordinary trailing prose the model wrote,
+# not link syntax) would be permanently deleted from the persisted
+# transcript alongside the invalid reference.
 #
 # Each title form also tolerates trailing whitespace before the closing
-# ``)`` (``\s*`` after the delimiter closes) -- otherwise
+# ``)`` (``[ \t]*`` after the delimiter closes) -- otherwise
 # ``[a](file:id "t.mp4"  )`` would fail title-form and fall through to junk,
 # which has no notion of title syntax and would silently discard the title
 # text with no re-injection for non-media files.
+#
+# ``target`` and ``label`` are each wrapped in an atomic group
+# (``(?>...)``, Python 3.11+). Both character classes already stop at the
+# first disallowed character, so a successful match never needs to
+# backtrack into either group -- the only case that would is an unmatchable
+# input (e.g. no ``)`` anywhere in the whole remaining string), where
+# ``target``'s ``+`` and the ``junk`` alternative's ``*`` can otherwise trade
+# an overlapping character back and forth one at a time, producing quadratic
+# blowup on attacker-influenceable content this function re-runs on every
+# read (measured: ~3.5s to fail a single ~32KB unclosed reference without
+# the atomic group; sub-millisecond with it, at 6x that size). The atomic
+# group cannot change any successful match's result, only how fast an
+# unmatchable one fails.
 #
 # This is the canonical parser for this ``[label](file:id ["title"])``
 # format -- ``reconcile_assistant_file_references`` is what actually
@@ -73,15 +108,15 @@ logger = logging.getLogger(__name__)
 # to match this pattern (or route through a shared parsing helper) rather
 # than silently mis-parsing a title clause as part of the id/label.
 _MARKDOWN_FILE_REFERENCE_RE = re.compile(
-    r"(?P<image>!)?\[(?P<label>[^\]]*)\]\("
-    r"(?P<target>file:[^)\s]+)"
+    r"(?P<image>!)?\[(?P<label>(?>[^\]]*))\]\("
+    r"(?P<target>(?>file:[^)\s]+))"
     r"(?:"
-    r"(?:\s+"
+    r"(?:[ \t]+"
     r'(?:"(?P<dtitle>(?:[^"\\)[\x00-\x1f\x7f]|\\.)*)"'
     r"|'(?P<stitle>(?:[^'\\)[\x00-\x1f\x7f]|\\.)*)'"
     r"|\((?P<ptitle>(?:[^()\\[\x00-\x1f\x7f]|\\.)*)\))"
-    r"\s*)?"
-    r"|[^()[\x00-\x1f\x7f]*"
+    r"[ \t]*)?"
+    r"|(?P<junk>[^()[\x00-\x1f\x7f]*)"
     r")"
     r"\)"
 )
@@ -164,6 +199,21 @@ _UNSAFE_LABEL_RE = re.compile(r"[\[\]\\\x00-\x1f\x7f]")
 #     raw would defeat that on the very next reconcile pass.
 #   - Control characters are unsafe for the same paragraph-splitting reason
 #     as ``_UNSAFE_LABEL_RE``.
+#
+# The ``)``/``[`` exclusions are an implementation constraint of this
+# module's own re-parse requirement, not a CommonMark rule -- CommonMark
+# itself permits an unescaped ``)`` inside a double-quoted title. A real
+# filename containing one, e.g. ``video (1).mp4``, is therefore denied a
+# title here and falls back to the pre-title mechanism instead (overwriting
+# the label directly, see below) -- media type detection still works, just
+# via the older, more destructive path. Escaping ``)``/``[`` on emission
+# (the regex's ``\\.`` alternative already accepts an escaped one) would
+# close this gap, but titles round-trip through several call sites that
+# compare the raw parsed value against the filename (self-healing, the
+# repair heuristic above) -- escaping would need a matching unescape step
+# at every one of them to stay correct, which is a larger, separate change
+# from the narrow fixes in this pass. See
+# test_reconcile_falls_back_to_label_rewrite_for_paren_in_filename.
 _UNSAFE_TITLE_RE = re.compile(r'["\\[)\x00-\x1f\x7f]')
 
 
@@ -231,6 +281,15 @@ def reconcile_assistant_file_references(
         referenced_id = parse_file_id_ref(target)
         record = records_by_id.get(referenced_id or "")
 
+        # Non-whitespace junk (see the "junk" alternative's comment above)
+        # was ordinary trailing prose the model wrote, not link syntax the
+        # regex is entitled to discard. If the reference turns out to be
+        # unrecoverable below, giving up must mean "leave the original text
+        # exactly as written" -- never "keep the junk's surrounding syntax
+        # but delete the junk itself".
+        junk = match.group("junk")
+        unrecoverable_fallback = match.group(0) if junk and junk.strip() else label
+
         if record is None:
             # Try the title before the label, but fall through to the label
             # if the title doesn't resolve to exactly one record -- not just
@@ -248,6 +307,12 @@ def reconcile_assistant_file_references(
                 if not filename_source:
                     continue
                 filename = Path(filename_source.strip()).name
+                if not filename:
+                    # filename_source was whitespace-only (or otherwise
+                    # stripped to nothing) -- skip it rather than looking up
+                    # the empty-string key, which could otherwise match a
+                    # record whose own filename is empty/whitespace-only.
+                    continue
                 filename_key = filename.casefold()
                 candidates = task_records_by_filename.get(filename_key, [])
                 if not candidates:
@@ -269,7 +334,7 @@ def reconcile_assistant_file_references(
                 referenced_id or target,
                 task_id,
             )
-            return label
+            return unrecoverable_fallback
 
         try:
             canonical_ref = build_file_id_ref(str(record.file_id))
@@ -281,7 +346,7 @@ def reconcile_assistant_file_references(
                 task_id,
                 record.file_id,
             )
-            return label
+            return unrecoverable_fallback
 
         display_label = label
         display_title = parsed_title

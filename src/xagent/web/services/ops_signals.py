@@ -66,6 +66,17 @@ INTERACTION_ANCHOR_CORRUPT = "interaction_anchor_corrupt"
 # working, not whether a particular task has been repaired.
 CLARIFICATION_LEGACY_SUPERSEDE_FAILED = "clarification_legacy_supersede_failed"
 
+# Set when a legacy-resume interaction close (task_interaction_close.py)
+# matches more than one active row for a single task -- structurally
+# impossible under uq_task_interaction_active_slot unless that constraint
+# has already been violated. Not paired with a clear_degradation() call,
+# like INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE above: it reports evidence
+# that a uniqueness constraint was already broken, a schema fact this
+# module has no way to observe being fixed.
+INTERACTION_LEGACY_RESUME_CLOSE_ROWCOUNT_ANOMALY = (
+    "interaction_legacy_resume_close_rowcount_anomaly"
+)
+
 # task_clarification_draft.py registers this when a waiting run's result
 # carries no clarification draft to publish, and clears it the next time a
 # draft is successfully resolved to a publishable payload.

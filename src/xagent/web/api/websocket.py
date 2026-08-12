@@ -150,6 +150,7 @@ from ..services.task_execution_controller import (
     task_control_snapshot,
     task_execution_controller,
 )
+from ..services.task_interaction_close import close_legacy_resume_interaction_sync
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -3248,6 +3249,44 @@ async def execute_resume_background(
                     "checkpoint became available."
                 )
             delivery_was_dispatched = True
+            # Unconditional and not nested inside the delivery_turn_id branch
+            # below: retiring this run's active interaction row and clearing
+            # the task's protocol marker has nothing to do with whether a
+            # delivery-ack turn id is present. Borrowing that condition would
+            # give the close a gate it has no reason to have. Bound to a
+            # plain local first, not read from lease inside the lambda below:
+            # a narrowing assert on an enclosing-scope variable does not
+            # apply inside a nested closure.
+            assert lease.run_id is not None
+            close_run_id = lease.run_id
+            try:
+                await run_db_io_cancellation_safe(
+                    lambda: close_legacy_resume_interaction_sync(
+                        task_id,
+                        close_run_id,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "legacy resume interaction close failed after deferred "
+                    "message seal for task %s run %s",
+                    task_id,
+                    close_run_id,
+                    exc_info=True,
+                )
+            except asyncio.CancelledError:
+                # See run_db_io_cancellation_safe's docstring: it drains its
+                # worker to completion before propagating a cancellation
+                # raised while awaiting it, so the close-and-clear
+                # transaction has already committed or failed by the time
+                # this branch runs. Only the log statement was interrupted.
+                logger.warning(
+                    "legacy resume interaction close was cancelled after "
+                    "deferred message seal for task %s run %s; continuing "
+                    "resume",
+                    task_id,
+                    close_run_id,
+                )
             if delivery_turn_id is not None:
                 try:
                     await run_db_io_cancellation_safe(
@@ -5993,6 +6032,56 @@ async def _handle_chat_message_unserialized(
                                 task_id,
                                 turn_id,
                                 exc_info=True,
+                            )
+                        # This call posted the durable message directly into a
+                        # live checkpoint instead of going through the native
+                        # interaction protocol's answer path, so any question
+                        # this run had open under that protocol is answered by
+                        # other means now. Retire it and clear the task's
+                        # marker in the same short transaction. The run fence
+                        # is live_task_lease.run_id, not task_run_id: posted
+                        # being true only happens by way of the
+                        # live_task_lease is not None branch above, which is
+                        # what makes this attribute access safe. Bound to a
+                        # plain local first, not read from live_task_lease
+                        # inside the lambda below: a narrowing assert on an
+                        # enclosing-scope variable does not apply inside a
+                        # nested closure.
+                        assert live_task_lease is not None
+                        assert live_task_lease.run_id is not None
+                        close_run_id = live_task_lease.run_id
+                        try:
+                            await run_db_io_cancellation_safe(
+                                lambda: close_legacy_resume_interaction_sync(
+                                    task_id,
+                                    close_run_id,
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "legacy resume interaction close failed after "
+                                "registered resume handoff for task %s run %s",
+                                task_id,
+                                close_run_id,
+                                exc_info=True,
+                            )
+                        except asyncio.CancelledError:
+                            # run_db_io_cancellation_safe drains its worker
+                            # thread to completion before propagating a
+                            # cancellation raised while awaiting it, so by the
+                            # time this branch runs the close-and-clear
+                            # transaction has already committed or failed on
+                            # its own; there is nothing left in flight to
+                            # protect. This only logs the interruption instead
+                            # of letting it escape as an unhandled
+                            # cancellation. Unlike the delivery marker above,
+                            # this branch is deliberate, not a gap to copy.
+                            logger.warning(
+                                "legacy resume interaction close was cancelled "
+                                "for task %s run %s; the resume proceeds "
+                                "unaffected",
+                                task_id,
+                                close_run_id,
                             )
                 except BaseException:
                     if bg_task is not None and not handoff_registered:

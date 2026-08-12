@@ -2662,6 +2662,45 @@ def test_dag_pattern_select_winner_orders_a_scrambled_batch() -> None:
     ]
 
 
+def test_dag_pattern_select_winner_ranks_an_unknown_status_last(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unrecognized result status is a bug worth surfacing, not a
+    reason to crash the whole batch: _select_winner() runs inside the
+    asyncio.wait() loop in _execute_ready_steps(), where an uncaught
+    exception would propagate through the BaseException cancellation
+    handler and fail every step in the batch over one unexpected status
+    string. It ranks last instead, behind both known ranks, and logs an
+    error so the unrecognized status does not go unnoticed."""
+
+    pattern = DAGPattern(lambda **_: None)
+
+    task_unknown, task_interrupt, task_wait = object(), object(), object()
+    completed_results: list[tuple[Any, dict[str, Any]]] = [
+        (task_unknown, {"status": "some_new_status"}),
+        (task_wait, {"status": "waiting_for_user"}),
+        (task_interrupt, {"status": "interrupted"}),
+    ]
+    step_ids_by_task = {
+        task_unknown: "c_unknown",
+        task_interrupt: "a_interrupt",
+        task_wait: "b_wait",
+    }
+
+    winner_task, _ = pattern._select_winner(
+        completed_results, step_ids_by_task=step_ids_by_task
+    )
+
+    assert winner_task is task_interrupt
+    assert [step_ids_by_task[task] for task, _ in completed_results] == [
+        "a_interrupt",
+        "b_wait",
+        "c_unknown",
+    ]
+    assert "unranked result status" in caplog.text
+    assert "c_unknown" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_dag_pattern_delivered_result_outranks_pending_replan_in_same_batch() -> (
     None

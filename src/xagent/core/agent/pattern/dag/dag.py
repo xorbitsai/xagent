@@ -45,6 +45,16 @@ logger = logging.getLogger(__name__)
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
+# Precedence for _select_winner()'s ranking of a same-wakeup completed
+# batch: lower rank wins. A status not listed here (only "interrupted"
+# and "waiting_for_user" are expected -- every other completed result
+# status the codebase produces is a terminal one that never reaches
+# this sort) ranks after both via dict.get()'s default in the sort key.
+_COMPLETED_RESULT_RANK: dict[str, int] = {
+    "interrupted": 0,
+    "waiting_for_user": 1,
+}
+
 
 @dataclass
 class DAGCompletionAssessment:
@@ -1959,10 +1969,15 @@ class DAGPattern(AgentPattern):
            batch (handled by the caller before this method is even
            reached: a doomed DAG must not ask a question or report an
            interrupt in place of the failure).
-        2. Among completed results, an interrupted one outranks a
-           waiting one -- an interrupt is a control instruction, not a
-           workflow question the user can be asked to sit through.
-        3. Within the same kind, the lexicographically first step id
+        2. Among completed results, rank comes from
+           ``_COMPLETED_RESULT_RANK``: "interrupted" outranks
+           "waiting_for_user" -- an interrupt is a control instruction,
+           not a workflow question the user can be asked to sit
+           through. A result status the table does not know sorts last
+           instead of raising (see ``rank()`` below for why), and is
+           logged loudly since an unranked status is itself worth
+           investigating.
+        3. Within the same rank, the lexicographically first step id
            wins, for a deterministic pick regardless of which task an
            ``asyncio.wait()`` wakeup or set iteration happens to surface
            first.
@@ -1979,12 +1994,36 @@ class DAGPattern(AgentPattern):
         Callers needing the losers read ``completed_results[1:]`` after
         this call.
         """
-        completed_results.sort(
-            key=lambda item: (
-                0 if item[1].get("status") != "waiting_for_user" else 1,
-                step_ids_by_task[item[0]],
+
+        def rank(
+            item: tuple[asyncio.Task[Any], dict[str, Any]],
+        ) -> tuple[int, str]:
+            task, result = item
+            status = result.get("status")
+            # dict.get()'s key must be `str`; a missing or non-string
+            # status (both otherwise valid at this untyped result-dict
+            # boundary) stringifies to something that is never a table
+            # key, which is exactly the "unranked" case below.
+            status_key = str(status)
+            if status_key not in _COMPLETED_RESULT_RANK:
+                # This runs inside the asyncio.wait() loop in
+                # _execute_ready_steps(); raising here would propagate
+                # through the BaseException cancellation handler and fail
+                # the entire batch over one unrecognized status string.
+                # Sorting it last instead preserves the invariant that a
+                # question already asked is delivered whenever possible.
+                logger.error(
+                    "Completed DAG step %s has an unranked result status "
+                    "%r; ranking it last in this batch instead of raising.",
+                    step_ids_by_task[task],
+                    status,
+                )
+            return (
+                _COMPLETED_RESULT_RANK.get(status_key, len(_COMPLETED_RESULT_RANK)),
+                step_ids_by_task[task],
             )
-        )
+
+        completed_results.sort(key=rank)
         return completed_results[0]
 
     def _invalidate_batch_siblings(
@@ -2037,7 +2076,7 @@ class DAGPattern(AgentPattern):
                 # "pending", so it waits for the next wakeup's readiness
                 # check before it reruns.
                 sibling_step.status = "clarification_invalidated"
-            invalidated_step_ids.append(sibling_step_id)
+                invalidated_step_ids.append(sibling_step_id)
         return invalidated_step_ids
 
     async def _cancel_pending_steps(

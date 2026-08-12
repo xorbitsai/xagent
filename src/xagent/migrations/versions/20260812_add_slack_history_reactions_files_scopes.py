@@ -27,6 +27,12 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("oauth_scopes", sa.JSON),
 )
 
+OAUTH_PROVIDERS_TABLE = sa.table(
+    "oauth_providers",
+    sa.column("provider_name", sa.String),
+    sa.column("default_scopes", sa.JSON),
+)
+
 USER_OAUTH_TABLE = sa.table(
     "user_oauth",
     sa.column("provider", sa.String),
@@ -35,6 +41,7 @@ USER_OAUTH_TABLE = sa.table(
 )
 
 APP_ID = "slack"
+PROVIDER_NAME = "slack"
 
 PREVIOUS_SCOPES = ["chat:write", "chat:write.public", "channels:read"]
 CURRENT_SCOPES = [
@@ -97,6 +104,37 @@ def _set_slack_scopes(bind: sa.engine.Connection, scopes: list[str]) -> None:
         sa.update(PUBLIC_MCP_APPS_TABLE)
         .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
         .values(oauth_scopes=scopes)
+    )
+
+
+def _set_slack_provider_default_scopes(
+    bind: sa.engine.Connection, scopes: list[str]
+) -> None:
+    """Keep oauth_providers.default_scopes for provider "slack" in sync too.
+
+    Unlike public_mcp_apps.oauth_scopes, this one DOES drive live behavior:
+    the app-id-less authorize path (``GET /api/auth/{provider}/login`` with
+    no ``app_id``) merges only ``db_provider.default_scopes`` (see
+    ``_merge_oauth_scopes`` in api/auth.py) — it never reads the app's own
+    oauth_scopes, which is sourced live from the code registry and would
+    otherwise mask this exact staleness. Left unpatched, an already-seeded
+    row stays pinned at the original 3 scopes forever and that path keeps
+    minting under-scoped tokens after this migration. The app-scoped
+    connect flow is unaffected either way, since it unions this value with
+    the app's own (always-current) oauth_scopes.
+
+    No other app_id shares provider_name "slack" today, so this update
+    cannot affect an unrelated app's authorize request.
+    """
+    if not _columns_present(
+        bind, "oauth_providers", {"provider_name", "default_scopes"}
+    ):
+        return
+
+    bind.execute(
+        sa.update(OAUTH_PROVIDERS_TABLE)
+        .where(OAUTH_PROVIDERS_TABLE.c.provider_name == PROVIDER_NAME)
+        .values(default_scopes=scopes)
     )
 
 
@@ -165,6 +203,7 @@ def _invalidate_existing_slack_grants(bind: sa.engine.Connection) -> None:
 def upgrade() -> None:
     bind = op.get_bind()
     _set_slack_scopes(bind, CURRENT_SCOPES)
+    _set_slack_provider_default_scopes(bind, CURRENT_SCOPES)
     _set_slack_description_if_unchanged(bind, PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION)
     _invalidate_existing_slack_grants(bind)
 
@@ -174,4 +213,5 @@ def downgrade() -> None:
     # reconnect); there is nothing meaningful to restore for user_oauth here.
     bind = op.get_bind()
     _set_slack_scopes(bind, PREVIOUS_SCOPES)
+    _set_slack_provider_default_scopes(bind, PREVIOUS_SCOPES)
     _set_slack_description_if_unchanged(bind, CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION)

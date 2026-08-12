@@ -2918,6 +2918,7 @@ class WebToolConfig(BaseToolConfig):
             allowed_file_dirs = self._build_mcp_file_allowed_dirs()
             if allowed_file_dirs:
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
             transport_config["env"] = env
             return transport_config
 

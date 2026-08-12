@@ -303,3 +303,111 @@ def test_migration_fields_match_registry():
     )
     assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
     assert migration.CURRENT_DESCRIPTION == registry_row["description"]
+
+
+# ---------------------------------------------------------------------------
+# oauth_providers.default_scopes — the app-id-less authorize path
+# (GET /api/auth/{provider}/login with no app_id) merges only this column,
+# never the app's own oauth_scopes, so it must be kept in sync too or that
+# path keeps minting under-scoped tokens forever on an already-seeded row.
+# ---------------------------------------------------------------------------
+
+
+def _create_oauth_providers_table(connection, default_scopes: list[str]):
+    connection.execute(
+        text(
+            """
+            CREATE TABLE oauth_providers (
+                id INTEGER PRIMARY KEY,
+                provider_name VARCHAR(50) NOT NULL UNIQUE,
+                default_scopes JSON
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO oauth_providers (provider_name, default_scopes) "
+            "VALUES ('slack', :scopes), ('hubspot', :other_scopes)"
+        ),
+        {
+            "scopes": json.dumps(default_scopes),
+            "other_scopes": json.dumps(["oauth"]),
+        },
+    )
+
+
+def _provider_default_scopes(connection, provider_name: str):
+    scopes = connection.execute(
+        text("SELECT default_scopes FROM oauth_providers WHERE provider_name = :p"),
+        {"p": provider_name},
+    ).scalar()
+    return json.loads(scopes) if isinstance(scopes, str) else scopes
+
+
+def test_upgrade_updates_provider_default_scopes(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        _create_oauth_providers_table(connection, migration.PREVIOUS_SCOPES)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _provider_default_scopes(connection, "slack") == migration.CURRENT_SCOPES
+        # A different provider row must be untouched.
+        assert _provider_default_scopes(connection, "hubspot") == ["oauth"]
+
+
+def test_downgrade_restores_provider_default_scopes(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        _create_oauth_providers_table(connection, migration.PREVIOUS_SCOPES)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert (
+            _provider_default_scopes(connection, "slack") == migration.PREVIOUS_SCOPES
+        )
+
+
+def test_upgrade_without_oauth_providers_table_is_a_noop(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise when oauth_providers is missing
+
+
+def test_upgrade_without_default_scopes_column_is_a_noop(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE
+                )
+                """
+            )
+        )
+        connection.execute(
+            text("INSERT INTO oauth_providers (provider_name) VALUES ('slack')")
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise when default_scopes is missing
+
+
+def test_provider_default_scopes_match_registry():
+    from xagent.web.builtin_mcp_registry import get_builtin_oauth_provider_rows
+
+    migration = _load_migration_module()
+    registry_provider = next(
+        r for r in get_builtin_oauth_provider_rows() if r["provider_name"] == "slack"
+    )
+    assert migration.CURRENT_SCOPES == registry_provider["default_scopes"]

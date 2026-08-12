@@ -31,10 +31,15 @@ MAX_RETRY_AFTER_SECONDS = 30
 # and each one is a separate conversations.replies call.
 MAX_SEARCH_THREADS = 20
 
-# Slack channel/user/group ids are uppercase alphanumerics with a letter
-# prefix; channel *names* are forced lowercase by Slack, so this can't
-# misclassify a name as an id.
-_SLACK_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{5,}$")
+# Slack conversation ids are uppercase alphanumerics prefixed by their
+# conversation type: "C" (public channel), "G" (private channel or
+# multi-party DM), "D" (1:1 DM). Restricted to those three prefixes — rather
+# than any letter — so a user id ("U...") or bot id ("B...") passed by
+# mistake (e.g. copied from slack_list_direct_messages' "user" field) is
+# rejected up front instead of being misclassified as an already-resolved
+# conversation id. Channel *names* are forced lowercase by Slack, so this
+# can't misclassify a name as an id either way.
+_SLACK_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,}$")
 
 
 def _success(**payload: Any) -> str:
@@ -105,9 +110,9 @@ def _allowed_file_dirs() -> list[Path]:
     if not raw_dirs.strip():
         return [Path.cwd().resolve()]
     return [
-        Path(raw_dir).expanduser().resolve()
+        Path(stripped).expanduser().resolve()
         for raw_dir in raw_dirs.split(",")
-        if raw_dir.strip()
+        if (stripped := raw_dir.strip())
     ]
 
 
@@ -129,9 +134,18 @@ def _resolve_allowed_file_path(file_path: str) -> Path:
         if local_path == allowed_dir or local_path.is_relative_to(allowed_dir):
             return local_path
 
-    allowed_dirs_str = ", ".join(str(path) for path in allowed_dirs)
+    # The absolute host path is deliberately kept out of the raised message:
+    # it reaches the caller/LLM unfiltered via _error(str(e)), and host
+    # filesystem layout has no business in a model transcript. Full detail
+    # (including the allowed directories) is logged server-side instead.
+    logger.warning(
+        "Rejected slack_upload_file path %s outside allowed directories: %s",
+        local_path,
+        ", ".join(str(path) for path in allowed_dirs),
+    )
     raise PermissionError(
-        f"File path {file_path} is outside allowed directories: {allowed_dirs_str}"
+        "file_path is outside the allowed upload directories; ask the user "
+        "for a file inside the task workspace or another allowed location"
     )
 
 
@@ -299,8 +313,11 @@ def slack_get_channel_history(
 ) -> str:
     """
     Fetch recent messages from a channel, private channel, or DM.
-    channel: a channel/DM id, or a public/private channel name (with or
-    without "#") — names are resolved to an id first via slack_list_channels.
+    channel: a channel/DM id, or a channel name (with or without "#") —
+    names, including private channels, are resolved to an id internally.
+    slack_list_channels only lists public channels; for a private channel
+    or DM either pass its id directly, or look it up via
+    slack_list_direct_messages (DMs).
     limit: max messages to return in this page (Slack caps at 1000).
     oldest/latest: optional Slack message timestamps (e.g.
     "1710000000.000100") to bound the time range.
@@ -426,6 +443,7 @@ def slack_list_direct_messages(limit: int = 200) -> str:
     max_conversations = max(1, min(int(limit), MAX_CHANNELS))
     cursor: str | None = None
     truncated = False
+    pages_scanned = 0
     try:
         for _ in range(MAX_PAGES):
             params: dict[str, Any] = {
@@ -435,7 +453,19 @@ def slack_list_direct_messages(limit: int = 200) -> str:
             }
             if cursor:
                 params["cursor"] = cursor
-            result = _request("GET", "conversations.list", params=params)
+            try:
+                result = _request("GET", "conversations.list", params=params)
+            except Exception as page_exc:
+                if not pages_scanned:
+                    raise
+                # Mirrors slack_list_channels: a mid-pagination failure (e.g.
+                # a rate limit that outlived the single retry) must not
+                # discard the pages already fetched.
+                logger.warning(f"Slack DM pagination stopped early: {page_exc}")
+                return _success(
+                    conversations=conversations, truncated=True, error=str(page_exc)
+                )
+            pages_scanned += 1
             raw_conversations = result.get("channels") or []
             for index, conv in enumerate(raw_conversations):
                 entry: dict[str, Any] = {
@@ -491,7 +521,7 @@ def slack_search_messages(
     try:
         channel_id = _resolve_channel_id(channel)
         max_scan = max(1, min(int(scan_limit), 1000))
-        max_matches = max(1, int(limit))
+        max_matches = max(1, min(int(limit), 1000))
         matches: list[dict[str, Any]] = []
         threaded_parents: list[dict[str, Any]] = []
         scanned = 0
@@ -519,11 +549,19 @@ def slack_search_messages(
                 break
 
         threads_scanned = 0
+        thread_fetch_failed = False
         if include_thread_replies:
             for parent in threaded_parents:
                 if threads_scanned >= MAX_SEARCH_THREADS or len(matches) >= max_matches:
                     break
                 thread_ts = parent.get("thread_ts") or parent.get("ts")
+                # Counted before the request, not after a successful one: a
+                # failing conversations.replies call (rate limit, permission
+                # error) must still consume the budget, or a heavily
+                # threaded/rate-limited channel could retry far past
+                # MAX_SEARCH_THREADS attempts with no caller-side bound on
+                # total wall time.
+                threads_scanned += 1
                 try:
                     replies_result = _request(
                         "GET",
@@ -534,8 +572,13 @@ def slack_search_messages(
                     logger.warning(
                         f"Slack thread search failed for {thread_ts}: {thread_exc}"
                     )
+                    # An attempted-but-failed thread is a genuine coverage
+                    # gap distinct from threads never attempted at all
+                    # (below) — it must still flag truncated even though
+                    # threads_scanned already counts the attempt for budget
+                    # purposes.
+                    thread_fetch_failed = True
                     continue
-                threads_scanned += 1
                 for reply in replies_result.get("messages") or []:
                     if reply.get("ts") == thread_ts:
                         continue  # already scanned as the thread's parent message
@@ -550,17 +593,40 @@ def slack_search_messages(
                             }
                         )
 
-        # Unscanned threads only count as truncation when thread search was
-        # requested — with include_thread_replies=False the caller opted out,
-        # so leftover threaded parents are not missing coverage.
+        # Unscanned/failed threads only count as truncation when thread
+        # search was requested — with include_thread_replies=False the
+        # caller opted out, so leftover threaded parents are not missing
+        # coverage.
         truncated = (
             len(matches) > max_matches
             or bool(cursor)
-            or (include_thread_replies and len(threaded_parents) > threads_scanned)
+            or (
+                include_thread_replies
+                and (thread_fetch_failed or len(threaded_parents) > threads_scanned)
+            )
         )
         return _success(matches=matches[:max_matches], truncated=truncated)
     except Exception as e:
         logger.error(f"Error searching Slack messages in {channel}: {e}")
+        return _error(str(e))
+
+
+def _set_reaction(action: str, channel: str, timestamp: str, emoji_name: str) -> str:
+    """Shared body for slack_add_reaction/slack_remove_reaction.
+    action: the Slack API method suffix — "add" or "remove"."""
+    name = emoji_name.strip().strip(":")
+    try:
+        channel_id = _resolve_channel_id(channel)
+        _request(
+            "POST",
+            f"reactions.{action}",
+            json_data={"channel": channel_id, "timestamp": timestamp, "name": name},
+        )
+        return _success(channel=channel_id, timestamp=timestamp, emoji_name=name)
+    except Exception as e:
+        logger.error(
+            f"Error setting Slack reaction ({action}) on {channel}:{timestamp}: {e}"
+        )
         return _error(str(e))
 
 
@@ -574,18 +640,7 @@ def slack_add_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     emoji_name: the emoji short name, with or without colons (e.g.
     "thumbsup" or ":thumbsup:").
     """
-    name = emoji_name.strip().strip(":")
-    try:
-        channel_id = _resolve_channel_id(channel)
-        _request(
-            "POST",
-            "reactions.add",
-            json_data={"channel": channel_id, "timestamp": timestamp, "name": name},
-        )
-        return _success(channel=channel_id, timestamp=timestamp, emoji_name=name)
-    except Exception as e:
-        logger.error(f"Error adding Slack reaction to {channel}:{timestamp}: {e}")
-        return _error(str(e))
+    return _set_reaction("add", channel, timestamp, emoji_name)
 
 
 @mcp.tool()
@@ -594,18 +649,7 @@ def slack_remove_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     Remove an emoji reaction the bot previously added from a message.
     Same arguments as slack_add_reaction.
     """
-    name = emoji_name.strip().strip(":")
-    try:
-        channel_id = _resolve_channel_id(channel)
-        _request(
-            "POST",
-            "reactions.remove",
-            json_data={"channel": channel_id, "timestamp": timestamp, "name": name},
-        )
-        return _success(channel=channel_id, timestamp=timestamp, emoji_name=name)
-    except Exception as e:
-        logger.error(f"Error removing Slack reaction from {channel}:{timestamp}: {e}")
-        return _error(str(e))
+    return _set_reaction("remove", channel, timestamp, emoji_name)
 
 
 @mcp.tool()
@@ -633,24 +677,30 @@ def slack_upload_file(
         channel_id = _resolve_channel_id(channel)
         resolved_filename = filename.strip() or local_path.name
 
-        init_result = _request(
-            "GET",
-            "files.getUploadURLExternal",
-            params={
-                "filename": resolved_filename,
-                "length": local_path.stat().st_size,
-            },
-        )
-        upload_url = init_result.get("upload_url")
-        file_id = init_result.get("file_id")
-        if not upload_url or not file_id:
-            raise ValueError("Slack did not return an upload URL")
-
-        # Per Slack's files.completeUploadExternal migration guide, the
-        # returned upload_url is a pre-authenticated endpoint that takes the
-        # raw file as multipart form data under the "file" field — no bearer
-        # token needed (or accepted) on this leg.
+        # Size and upload both read from the same open handle (rather than a
+        # separate local_path.stat() call before opening) so the file that
+        # was allowlist-checked is the exact file read from — a fresh
+        # by-path stat/open after the check would reopen a window for a
+        # symlink swapped in between the two.
         with local_path.open("rb") as fh:
+            file_size = os.fstat(fh.fileno()).st_size
+            if file_size == 0:
+                raise ValueError(f"File is empty: {file_path}")
+
+            init_result = _request(
+                "GET",
+                "files.getUploadURLExternal",
+                params={"filename": resolved_filename, "length": file_size},
+            )
+            upload_url = init_result.get("upload_url")
+            file_id = init_result.get("file_id")
+            if not upload_url or not file_id:
+                raise ValueError("Slack did not return an upload URL")
+
+            # Per Slack's files.completeUploadExternal migration guide, the
+            # returned upload_url is a pre-authenticated endpoint that takes
+            # the raw file as multipart form data under the "file" field —
+            # no bearer token needed (or accepted) on this leg.
             upload_response = requests.post(
                 upload_url,
                 files={"file": (resolved_filename, fh)},

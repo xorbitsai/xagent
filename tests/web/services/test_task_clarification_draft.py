@@ -3,11 +3,14 @@
 Pure-function coverage (guard order, payload construction, idempotency key
 derivation) needs no database at all: every argument
 ``resolve_publishable_clarification`` takes is an in-memory value the
-caller already holds. The one exception is the cross-run anchor scenario,
-which stages a real interaction row through ``interaction_handoff`` to
-confirm the downstream primitive -- not this module -- is what degrades a
-cross-run mismatch; that one test opens a private SQLite database the same
-way the interaction-staging suite does.
+caller already holds. Two tests are the exceptions, each opening a private
+SQLite database the same way the interaction-staging suite does: the
+cross-run anchor scenario, which stages a real interaction row through
+``interaction_handoff`` to confirm the downstream primitive -- not this
+module -- is what degrades a cross-run mismatch; and the payload/legacy-
+reader shape comparison, which calls the real
+``get_latest_waiting_question`` against a persisted chat message rather
+than checking this module's own output against itself.
 """
 
 from __future__ import annotations
@@ -28,9 +31,11 @@ from tests.web.services.task_interaction_schema_shared import (
 from xagent.core.agent import clarification as clarification_module
 from xagent.core.agent.clarification import ClarificationDraft, ClarificationRequestItem
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.services import ops_signals
+from xagent.web.services.chat_history_service import get_latest_waiting_question
 from xagent.web.services.task_clarification_draft import (
     CLARIFICATION_REQUEST_TTL,
     FailClosed,
@@ -260,20 +265,62 @@ def test_cross_run_anchor_mismatch_still_resolves_as_publishable() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_payload_round_trip_matches_the_legacy_reader_shape() -> None:
-    """``parse_clarification_payload`` must return the exact
-    ``(str | None, list[dict] | None)`` shape
-    ``get_latest_waiting_question`` (``chat_history_service.py``) already
-    returns for the legacy transcript path -- the two readers must be
-    interchangeable from a caller's point of view."""
+def test_payload_round_trip_matches_the_legacy_reader_shape(tmp_path: Path) -> None:
+    """``parse_clarification_payload`` must return the exact shape the real
+    ``get_latest_waiting_question`` (``chat_history_service.py``) returns
+    for the legacy transcript path -- checked against that real function,
+    not against this module's own return-type promise. A version of the
+    legacy reader that returned, say, a dict instead of a list for
+    interactions would be caught here because both readers' actual return
+    values are compared to each other, not merely each checked in
+    isolation against a type it is guaranteed to satisfy by construction."""
 
-    draft = _draft(interactions=({"prompt": "pick one"},))
-    payload = build_clarification_payload(draft)
-    question, interactions = parse_clarification_payload(payload)
-    assert question == draft.message
-    assert interactions == [{"prompt": "pick one"}]
-    assert isinstance(question, (str, type(None)))
-    assert isinstance(interactions, (list, type(None)))
+    engine = _engine(tmp_path)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+
+        # No question persisted yet: the legacy reader's "nothing found"
+        # branch must agree in shape with the parser's "empty payload"
+        # branch.
+        no_question = get_latest_waiting_question(db, task_id)
+        empty_payload_result = parse_clarification_payload({})
+        assert no_question == (None, None)
+        assert empty_payload_result == (None, None)
+        assert type(no_question[0]) is type(empty_payload_result[0])
+        assert type(no_question[1]) is type(empty_payload_result[1])
+
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=user_id,
+                role="assistant",
+                content="pick one",
+                message_type="question",
+                interactions=[{"prompt": "pick one"}],
+            )
+        )
+        db.commit()
+
+        real_question, real_interactions = get_latest_waiting_question(db, task_id)
+
+        draft = _draft(message="pick one", interactions=({"prompt": "pick one"},))
+        payload = build_clarification_payload(draft)
+        parsed_question, parsed_interactions = parse_clarification_payload(payload)
+
+        assert type(real_question) is type(parsed_question)
+        assert type(real_interactions) is type(parsed_interactions)
+        assert isinstance(real_question, str) and isinstance(parsed_question, str)
+        assert isinstance(real_interactions, list) and isinstance(
+            parsed_interactions, list
+        )
+        assert all(isinstance(item, dict) for item in real_interactions)
+        assert all(isinstance(item, dict) for item in parsed_interactions)
+    finally:
+        db.close()
+        engine.dispose()
 
 
 def test_idempotency_key_matches_the_command_id_pattern() -> None:

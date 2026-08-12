@@ -17,10 +17,16 @@ row? The answer is one of three outcomes, never folded into a boolean:
   publishable payload (no resume anchor, or the payload could not be shaped
   within the size and character limits below). The caller's own settlement
   proceeds exactly as it would have before this module existed.
-* :class:`FailClosed` -- the caller must discard this round's settlement
-  wholesale, the same way it already discards a late, no-longer-owned
-  result. This happens only when the lease that produced the result can no
-  longer be trusted to speak for the task row.
+* :class:`FailClosed` -- carries one of five reason strings that split into
+  two different consequences, not one. Two of them (from the guard that
+  pairs waiting status against draft presence) do not discard the round at
+  all: no structured row is written, but the finalizer's existing path for
+  that status proceeds unchanged. The other three (an unfenced lease, a
+  task row no longer owned by the lease that produced this result, or an
+  attempt that is no longer current) do mean the caller must discard this
+  round's settlement wholesale, the same way it already discards a late,
+  no-longer-owned result. See :class:`FailClosed` itself for which reason
+  is which.
 
 Guard order is a contract: the checks inside :func:`resolve_publishable_clarification`
 run in a fixed sequence, most specific and least data-exposing failure
@@ -41,6 +47,16 @@ This module is also the only place allowed to construct or parse the JSON
 shape a published row's ``request_payload`` carries -- see
 :func:`build_clarification_payload` and :func:`parse_clarification_payload`
 for the pairing rule and the version-evolution promise that comes with it.
+
+Two of that payload's fields, ``source`` and ``requests``, have no reader
+anywhere in this delivery. They are there for whichever change adds the
+response-routing path that answers a multi-tool waiting turn: that reader
+needs to know which source produced the draft and which pending tool call
+each answer belongs to, and once this payload is published, it is the only
+place that information still lives. Do not remove either field for being
+unread today -- removing them now would trade the free "add an optional
+field" path above for a version bump later, to add back exactly what was
+just deleted.
 
 An application-layer invariant worth stating plainly: a task can have at
 most one *active* interaction row at a time (the database enforces this
@@ -94,8 +110,12 @@ CLARIFICATION_REQUEST_TTL = timedelta(hours=24)
 # byte-for-byte identical to ``xagent.core.agent.clarification``'s
 # ``_marker_clean`` whitelist. That module cannot import this one (core
 # layer never imports web layer), so the two copies cannot share code --
-# only this comment, on both sides, keeps them from drifting apart. If one
-# domain ever changes, change the other in the same commit.
+# ``_marker_clean``'s own docstring enumerates this copy among its five.
+# What actually pins the two domains against drifting apart is
+# ``test_character_domain_matches_the_marker_cleaning_domain`` in
+# ``tests/web/services/test_task_clarification_draft.py``, which calls the
+# real ``_marker_clean`` and compares it against this filter directly. If
+# one domain ever changes, that test is what will turn red.
 _CONTROL_CHAR_KEEP = "\n\r\t"
 
 # Three independent size ceilings, checked in this order because each one
@@ -175,10 +195,22 @@ class NotApplicable:
 
 @dataclass(frozen=True)
 class FailClosed:
-    """This round's settlement must be discarded wholesale: whatever the
-    caller already does for a late, no-longer-owned result is what must
-    happen here too, via that caller's own existing exit -- this module
-    adds no new one."""
+    """No structured row is published this round. What the caller must do
+    about the *round itself* depends on which guard produced ``reason`` --
+    the five values split into two different consequences, not one.
+
+    ``"missing_draft"`` and ``"draft_status_mismatch"`` come from guard 1
+    (the waiting-status/draft-presence pairing) and do not discard the
+    round: no structured row is written and a stray draft is dropped, but
+    the finalizer's existing path for that status proceeds exactly as it
+    already does today.
+
+    ``"unfenced_lease"``, ``"ownership_changed"``, and ``"attempt_mismatch"``
+    come from guards 2 through 4 and mean the opposite: this round's
+    settlement must be discarded wholesale, the same way the caller already
+    discards a late, no-longer-owned result, via that caller's own existing
+    late-result exit -- this module adds no new one.
+    """
 
     reason: str
 
@@ -295,7 +327,11 @@ def parse_clarification_payload(
     interactions)`` shape ``get_latest_waiting_question``
     (``chat_history_service.py``) already returns for the legacy transcript
     path -- a cross-module contract with no shared base class to enforce it,
-    pinned only by the test that compares the two shapes directly.
+    pinned by ``test_payload_round_trip_matches_the_legacy_reader_shape`` in
+    ``tests/web/services/test_task_clarification_draft.py``, which calls
+    the real ``get_latest_waiting_question`` and compares its return shape
+    against this function's, rather than re-deriving the expectation from
+    this function's own return type.
 
     This is the one place allowed to know what a payload's version implies:
     a reader elsewhere in the codebase must call this function rather than

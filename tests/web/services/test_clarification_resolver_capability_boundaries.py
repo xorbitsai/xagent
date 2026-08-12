@@ -229,10 +229,21 @@ def _save_trace_event(self, db, event):
 def _imports_ops_signals(source: str) -> bool:
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == (
-            "ops_signals"
-        ):
-            return True
+        if isinstance(node, ast.ImportFrom):
+            # Two independent forms, neither implying the other:
+            # ``from ...services.ops_signals import X`` (the module path
+            # itself ends with "ops_signals") versus
+            # ``from ...services import ops_signals`` (the module name is
+            # imported as a name, from its *parent* package -- checking
+            # only ``node.module`` would never catch this shape, since the
+            # parent package's own path does not end with "ops_signals").
+            # Three real occurrences of this second form exist in the
+            # repo today, and a detector that only checks ``node.module``
+            # misses every one of them.
+            if (node.module or "").split(".")[-1] == "ops_signals":
+                return True
+            if any(alias.name == "ops_signals" for alias in node.names):
+                return True
         if isinstance(node, ast.Import) and any(
             alias.name.split(".")[-1] == "ops_signals" for alias in node.names
         ):
@@ -256,6 +267,17 @@ def test_import_detector_catches_a_synthetic_offender() -> None:
     """Positive control for the detector itself."""
 
     source = "from xagent.web.services.ops_signals import register_degradation\n"
+    assert _imports_ops_signals(source) is True
+
+
+def test_import_detector_catches_the_parent_package_import_form() -> None:
+    """The other import shape the detector must catch: the module name
+    imported from its parent package rather than named directly in the
+    module path. Three real call sites in this repo use this form today
+    (all in test modules), and a detector that only checks the module
+    path misses every one of them."""
+
+    source = "from xagent.web.services import ops_signals\n"
     assert _imports_ops_signals(source) is True
 
 

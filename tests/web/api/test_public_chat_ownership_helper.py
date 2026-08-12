@@ -285,6 +285,29 @@ def test_share_workforce_binding_rejects_a_true_config_value_against_id_one() ->
     assert task_is_owned_by_public_principal(task, principal) is False
 
 
+def test_widget_workforce_binding_rejects_a_true_principal_value_against_config_one() -> (
+    None
+):
+    """The predicate's boolean rejection must hold on the principal side
+    too, not only on the task's config side. In production a boolean can
+    only reach ``principal.widget_workforce_id`` if something upstream of
+    this predicate fails to screen it first, but this predicate does not
+    get to assume that screening always happened -- it pins its own
+    guarantee independently of whatever the caller does before reaching
+    it."""
+
+    task = _task(
+        agent_id=None,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "g-1",
+            "widget_workforce_id": 1,
+        },
+    )
+    principal = _widget_workforce_principal(widget_workforce_id=True)
+    assert task_is_owned_by_public_principal(task, principal) is False
+
+
 def test_share_agent_binding_rejects_when_config_key_is_missing_even_if_row_level_matches() -> (
     None
 ):

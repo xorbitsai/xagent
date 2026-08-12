@@ -82,11 +82,12 @@ def test_offline_upgrade_postgresql_emits_add_column_and_check() -> None:
     ):
         sql = _offline_sql(migration, "postgresql", "upgrade")
 
-    assert f"ALTER TABLE {TABLE} ADD COLUMN {COLUMN} INTEGER" in sql
-    assert (
+    add_column_at = sql.index(f"ALTER TABLE {TABLE} ADD COLUMN {COLUMN} INTEGER")
+    add_constraint_at = sql.index(
         f"ALTER TABLE {TABLE} ADD CONSTRAINT {CONSTRAINT_NAME} CHECK "
         f"({migration.CONSTRAINT_CONDITION})"
-    ) in sql
+    )
+    assert add_column_at < add_constraint_at
 
 
 def test_offline_upgrade_sqlite_emits_add_column_only() -> None:

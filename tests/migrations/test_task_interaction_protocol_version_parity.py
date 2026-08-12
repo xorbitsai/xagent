@@ -63,6 +63,16 @@ CONSTRAINT_NAME = "ck_tasks_interaction_protocol_version"
 # technique as reset_checkpoint_anchor_fk_create_rule's sibling helper in
 # tests/web/services/checkpoint_anchor_shared.py, extended to also drop a
 # column rather than just one FK clause.
+#
+# Both patterns assume today's exact column/constraint shape and fail
+# differently if it changes. _COLUMN_CLAUSE requires a trailing comma, so a
+# column rendered last in CREATE TABLE (no comma after it) stops matching --
+# the hit-count assertion below catches that loudly (0 hits instead of 1).
+# _CHECK_CLAUSE's `\([^)]*\)` stops at the first closing paren, so a CHECK
+# condition with a nested parenthesised expression truncates instead of
+# matching the whole clause; the hit count stays 1, so that assertion does
+# NOT catch it, and the stripped SQL is left with an orphan `)` that only
+# fails later, when connection.execute(sa.text(...)) hits a syntax error.
 _COLUMN_CLAUSE = re.compile(r"\s*interaction_protocol_version INTEGER,\s*")
 _CHECK_CLAUSE = re.compile(
     r",\s*CONSTRAINT ck_tasks_interaction_protocol_version CHECK \([^)]*\)"

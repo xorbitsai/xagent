@@ -19,8 +19,8 @@ at all: its production call body arrives with the change that wires
 interaction creation end-to-end and fills in
 ``stage_interaction_request``'s caller obligations -- the change
 that deletes this gate file must add a replacement guard that locks
-``create()`` alone, or the seam stops being provably a seam the moment this
-file goes away.
+``create()`` alone, or the seam stops being a statically enforced seam the moment
+this file goes away.
 
 AST-based, module-qualified matching -- not a bare-name or substring scan.
 ``create`` and ``respond`` are ordinary English verbs already used as method
@@ -57,6 +57,13 @@ class of gaps for the same reason):
 (d) The scan root is ``xagent.__path__`` (``src/xagent``), not the
     repository root -- a caller under the top-level ``scripts/`` directory
     (outside that tree) is invisible to this gate entirely.
+(e) A gated name used in value position rather than called directly --
+    passed as an argument (``Depends(create)``,
+    ``functools.partial(create, ...)``), a decorator reference, or a
+    dict value -- is invisible to this gate. The walk below only inspects
+    ``ast.Call.func`` on each ``Call`` node it visits; it never inspects a
+    call's ``args``/``keywords``, so a gated name reachable only as an
+    argument is never counted.
 """
 
 from __future__ import annotations

@@ -130,6 +130,16 @@ class InteractionPrincipal:
     ``widget_workforce_id`` / ``share_agent_id`` / ``share_workforce_id`` is
     populated for a guest principal, none for a ``"user"`` principal.
 
+    ``channel_id`` on this object is carried for parity with
+    ``PublicChatAccessContext`` only -- channel ownership is decided
+    entirely on the ``task`` side (``task_is_owned_by_public_principal``'s
+    first conjunct reads ``task.channel_id``), so this field does not
+    itself feed any predicate in this module. The two share-side
+    construction points in ``public_chat_access.py`` pass
+    ``channel_id=None`` because ``ShareChatAccessContext`` has no channel
+    field to read from, not because a real value is being discarded; the
+    widget-workforce construction point passes the real channel id.
+
     ``identity_string`` produces the same ``"user:{id}"`` / ``"guest:{gid}"``
     namespacing the ``responder_identity`` column comment documents
     (``models/task_interaction.py``): the prefix is a namespace, not
@@ -298,8 +308,13 @@ def task_is_owned_by_public_principal(
        - share-agent: **both** ``task.agent_id ==
          principal.share_agent_id`` (row-level) **and**
          ``task.agent_config["share_agent_id"] == principal.share_agent_id``
-         (JSON-level) -- the pre-existing ``get_task_for_share_context`` is
-         the one entry point that checks both.
+         (JSON-level). The row-level half is, in the pre-existing
+         ``get_task_for_share_context``, only a SQL ``WHERE`` filter on the
+         query that loads ``task`` -- the same category of check as
+         ``Task.user_id`` above. This predicate is what turns it into a
+         post-load Python check for the first time; that is a choice to
+         duplicate one pre-existing filter and not the other, not a
+         contradiction of the ``Task.user_id`` exclusion above.
        - share-workforce: ``task.agent_config["share_workforce_id"] ==
          principal.share_workforce_id`` (JSON-level only).
     5. ``task.agent_config["guest_id"] == principal.guest_id``, with
@@ -417,14 +432,22 @@ def public_chat_identity_matches(task: "Task", principal: InteractionPrincipal) 
     message depending on which check happened to run first for that
     specific function. Routing every combined failure through identity
     first collapses that per-function variance into one rule. Verified
-    against the full input space per entry point (every combination of
-    the five boolean criteria this conjunction and this identity check
-    together decide): a majority of the combined-failure cells -- on the
-    order of 31-35 of the 55 enumerated input cells (54 of which deny), per entry
-    point -- now return the not-found text where the pre-existing,
-    per-function order would have returned the unavailable text for that
-    same input. The allow/deny decision itself is unchanged for every
-    cell; only which of the two denial messages a combined failure gets
+    against the full input space per entry point: 55 = 1 (a non-``dict``
+    ``agent_config`` collapses every other input into a single cell:
+    both this predicate and the identity check return ``False`` on a
+    non-``dict`` config, so no other axis can change the decision or
+    the message) + 2 x 3 x 3 x 3
+    (``channel_id``'s two values, crossed with the three-valued
+    ``auth_mode``, entity-binding, and ``guest_id`` judgments). This
+    enumeration does not vary the share-agent direction's row-level
+    ``agent_id`` half -- that value is pinned by the SQL ``WHERE`` filter
+    at its entry point before this predicate ever runs, per the
+    share-agent bullet above. A majority of the combined-failure cells --
+    on the order of 31-35 of the 55 enumerated input cells (54 of which
+    deny), per entry point -- now return the not-found text where the
+    pre-existing, per-function order would have returned the unavailable
+    text for that same input. The allow/deny decision itself is unchanged
+    for every cell; only which of the two denial messages a combined failure gets
     can differ, and only in the direction of revealing less: the
     not-found message is the one that tells a probing visitor nothing
     about which criterion failed, so this shift narrows the information a

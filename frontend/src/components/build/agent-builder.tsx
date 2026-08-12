@@ -148,17 +148,12 @@ interface TemplateRequirements {
 // instead (issue #802), and `other` is an internal fallback bucket.
 const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
 
-// Round-2 review of #1280: selectedMcpServers must be re-seeded from a
-// save's resolved tool_categories the same way loadAgent seeds it from a
-// fetched agent's tool_categories -- otherwise it keeps holding whatever
-// (often unresolved, e.g. a display name) value the user picked, while
-// originalData.tool_categories now holds resolveMcpToolSelector's
-// authoritative resolved name. isDirty's comparison of the two is a plain
-// string compare with no name/id normalization, so a resolved value that
-// differs from the display name (Chrome: "chrome-devtools" vs. "Chrome")
-// left isDirty permanently true after a successful save, with no further
-// action from the user, until a full page reload re-seeded it correctly
-// via loadAgent.
+// The single extraction every tool_categories -> selectedMcpServers site
+// must share: isDirty compares selectedMcpServers against this same
+// extraction applied to originalData.tool_categories with a plain string
+// compare, no name/id normalization -- so a caller that inlines its own
+// copy and drifts from this one silently reintroduces a permanently-dirty
+// isDirty state.
 function mcpServerNamesFromToolCategories(categories: string[]): string[] {
   return categories
     .filter((c) => c.startsWith('mcp:'))
@@ -876,7 +871,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // never show or round-trip it.
           const rawToolCategories = agent.tool_categories || []
           setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
-          setSelectedMcpServers(rawToolCategories.filter((c: string) => c.startsWith('mcp:')).map((c: string) => c.replace('mcp:', '')))
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(rawToolCategories))
           // Seed the SSH auto-category from the saved config so a failed
           // bindings-load (which never fires onCount) can't leave "ssh" unset
           // at save time. A successful load overwrites this with the live count.
@@ -963,9 +958,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const allCategories = template.agent_config?.tool_categories || []
           setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
 
-          const explicitlyConfiguredMcps = allCategories
-            .filter((c: string) => c.startsWith('mcp:'))
-            .map((c: string) => c.replace('mcp:', ''))
+          const explicitlyConfiguredMcps = mcpServerNamesFromToolCategories(allCategories)
 
           // _enrich_template merges connections into tool_categories as mcp: entries, so
           // iterating both explicitlyConfiguredMcps and connections would add each
@@ -1142,16 +1135,24 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }
 
       const finalToolCategories = [...selectedToolCategories]
+      // Match handleCreate below: a preview session with a knowledge base
+      // selected must include "knowledge" too, or it runs with different
+      // categories than the agent it's a preview of.
+      if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
+        finalToolCategories.push("knowledge")
+      }
       // Resolve each selection to the real, connected MCPServer row's name
       // (see resolveMcpToolSelector for why a name/id fallback alone isn't
       // enough -- the backend uses either convention depending on app
       // type). Depends on mcpServers/officialApps having loaded; if a
       // preview message is sent before they do, this falls back to the raw
       // selector for every MCP tool (matching pre-existing behavior for
-      // this call site, not just this connector).
-      selectedMcpServers.forEach(server => {
-        finalToolCategories.push(`mcp:${resolveMcpToolSelector(server, mcpServers, officialApps)}`)
-      })
+      // this call site, not just this connector). Deduped: two distinct
+      // selectedMcpServers entries can resolve to the same real row.
+      const resolvedMcpSelectors = new Set(
+        selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
+      )
+      resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
       if (hasSshBindings && !finalToolCategories.includes("ssh")) {
         finalToolCategories.push("ssh")
       }
@@ -1300,9 +1301,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if (normalize(selectedSkills) !== normalize(originalData.skills)) return true
 
     // Check MCP servers by extracting them from originalData.tool_categories
-    const originalMcpServers = (originalData.tool_categories || [])
-      .filter((c: string) => c.startsWith('mcp:'))
-      .map((c: string) => c.replace('mcp:', ''))
+    const originalMcpServers = mcpServerNamesFromToolCategories(originalData.tool_categories || [])
     if (normalize(selectedMcpServers) !== normalize(originalMcpServers)) return true
 
     // Check non-MCP tool categories
@@ -1473,10 +1472,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
     // Add selected MCP servers back into tool_categories, resolved to the
     // real connected MCPServer row's name -- see resolveMcpToolSelector for
-    // why a hard-coded id/name fallback can't work for every app.
-    selectedMcpServers.forEach(server => {
-      finalToolCategories.push(`mcp:${resolveMcpToolSelector(server, mcpServers, officialApps)}`)
-    })
+    // why a hard-coded id/name fallback can't work for every app. Deduped:
+    // two distinct selectedMcpServers entries can resolve to the same real
+    // row, and the backend persists tool_categories verbatim (agents.py),
+    // so an unresolved duplicate here lands in the DB and stays there.
+    const resolvedMcpSelectors = new Set(
+      selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
+    )
+    resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
 
     setIsCreating(true)
 
@@ -1593,11 +1596,16 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           // Newly created agents are always personal; promote if the user chose Team.
           const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
-          setOriginalData({ ...newAgent, ...(ownershipResult ?? {}) })
+          // tool_categories: finalToolCategories explicitly, not whatever
+          // newAgent.tool_categories echoes back -- matches the edit-mode
+          // branch above, which sources both originalData and the reseed
+          // below from the same local value rather than mixing a server
+          // response with a local one.
+          setOriginalData({ ...newAgent, tool_categories: finalToolCategories, ...(ownershipResult ?? {}) })
           // Same re-seed as the edit-mode branch above, and for the same
-          // reason: newAgent.tool_categories echoes back the resolved
-          // selectors this request submitted (finalToolCategories), not
-          // the possibly-unresolved values selectedMcpServers still holds.
+          // reason: selectedMcpServers must hold the resolved selectors
+          // this request submitted, not the possibly-unresolved values it
+          // still held from before save.
           setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
           // Only confirm success once ownership resolved. If a promote was blocked
           // (the share-connectors dialog opened, ownershipResult is null), don't
@@ -1891,7 +1899,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       selectedMcpServers.map((serverName) => {
         const connectedServer = findMatchingMcpServer(mcpServers, serverName)
         const matchingApp = findMatchingMcpApp(officialApps, serverName)
-        return connectedServer?.name || matchingApp?.name || serverName
+        // matchingApp?.name (the catalog display name, e.g. "Chrome") first,
+        // not connectedServer?.name (the real MCPServer row name, e.g.
+        // "chrome-devtools"): this is a *display* label. Preferring the row
+        // name here made the chip flip from "Chrome" to "chrome-devtools"
+        // the instant selectedMcpServers gets re-seeded with the resolved
+        // name after a save (see mcpServerNamesFromToolCategories).
+        return matchingApp?.name || connectedServer?.name || serverName
       }),
     [selectedMcpServers, mcpServers, officialApps],
   )
@@ -2656,7 +2670,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 statusDesc = t("tools.mcp.notSupported")
               }
 
-              const server = { name: connectedServer?.name || matchingApp?.name || serverName, description: statusDesc }
+              // Display label: matchingApp?.name first, same reasoning as
+              // connectorDisplayNames above.
+              const server = { name: matchingApp?.name || connectedServer?.name || serverName, description: statusDesc }
               const icon = getAppIcon(server.name)
               return (
                 <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && "opacity-50 bg-muted/50")}>

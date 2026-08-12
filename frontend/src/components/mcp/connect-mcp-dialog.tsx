@@ -914,9 +914,18 @@ export function ConnectMcpDialog({
 
   const handleCardClick = (app: AppIntegration, isGloballyConnected: boolean) => {
     if (isSelectMode && isGloballyConnected) {
+      // Match isSelected's own check (id OR name) below, not just name: a
+      // consumer (e.g. agent-builder.tsx re-seeding after save) can store
+      // this connector's id instead of its display name once resolved to
+      // its real server row. Toggling off by name only left an id-only
+      // selection un-removable -- the card looked selected, clicking it
+      // matched neither branch's name-only check, so it appended the name
+      // instead of removing the id, leaving both present (duplicated,
+      // still selected, and clicking again just oscillated between the two
+      // states without ever reaching "deselected").
       setLocalSelectedServers(prev =>
-        prev.includes(app.name)
-          ? prev.filter(name => name !== app.name)
+        prev.some(name => name === app.id || name === app.name)
+          ? prev.filter(name => name !== app.id && name !== app.name)
           : [...prev, app.name]
       );
     } else {

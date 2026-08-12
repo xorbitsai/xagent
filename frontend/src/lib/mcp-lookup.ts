@@ -76,11 +76,20 @@ export const findMatchingMcpApp = <T extends McpLookupReference>(
 // So: resolve the actual connected MCPServer row and use its real name --
 // find the catalog app the selector refers to, then look up a server row
 // by that app's id, then by its name, covering both conventions regardless
-// of which one applies to this app. Only when no server row can be found
-// at all does this return the incoming selector completely unchanged
-// (never a guessed id or name) -- if it was already correct, it stays
-// correct; if the app genuinely isn't connected, there's nothing better to
-// substitute.
+// of which one applies to this app. This falls through to returning the
+// incoming selector completely unchanged (never a guessed id or name) in
+// two cases: no server row can be found at all, or a matched row's `name`
+// is empty/whitespace -- narrow (every known write path already requires a
+// non-blank name), but a row *was* found there, it just had nothing usable
+// to return. Either way, if the incoming selector was already correct, it
+// stays correct; if the app genuinely isn't connected, there's nothing
+// better to substitute.
+//
+// A caller that gets the unresolved input back has no signal of *why* --
+// only that this selector may load zero tools once persisted. Logged here
+// rather than surfaced as a user-facing warning: deciding the right UX for
+// that (a toast? which flows?) is a separate, larger call than this helper
+// should make on its own.
 export const resolveMcpToolSelector = <
   S extends McpLookupReference,
   A extends McpLookupReference
@@ -100,8 +109,13 @@ export const resolveMcpToolSelector = <
       ? findMatchingMcpServer(mcpServers, connectedApp.name)
       : undefined)
 
-  if (typeof connectedServer?.name === "string" && connectedServer.name) {
+  if (typeof connectedServer?.name === "string" && connectedServer.name.trim()) {
     return connectedServer.name
+  }
+  if (server) {
+    console.warn(
+      `resolveMcpToolSelector: could not resolve "${server}" to a connected MCP server row; persisting it unchanged, which may load zero tools for this connector.`
+    )
   }
   return server
 }

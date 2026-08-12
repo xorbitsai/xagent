@@ -94,16 +94,27 @@ describe("resolveMcpToolSelector", () => {
     ).toBe("chrome-devtools")
   })
 
-  it("preserves the raw selector unchanged when the app is known but no server row is connected yet", () => {
-    // Round-2 review: guessing connectedApp.id here was itself a
-    // wrong-convention guess for builtin_oauth apps (facebook), and,
-    // regardless of app type, risked overwriting an already-correct
-    // selector for a row this viewer simply can't currently see (a stale
-    // fetch, or a row query-restricted to this viewer) with a guessed one.
-    // Preserving the input unchanged is strictly safer than guessing.
+  it("preserves the raw selector unchanged -- never a guessed id or name -- when the app is known but no server row is connected yet", () => {
+    // Locks in the invariant: whatever the app type or naming convention,
+    // an unresolvable selector always comes back exactly as given, never
+    // substituted with a guess. That's what makes it safe to call on a
+    // selector that may already be correct for a row this viewer simply
+    // can't currently see.
     expect(resolveMcpToolSelector("Chrome", [], [chromeApp])).toBe("Chrome")
     expect(resolveMcpToolSelector("Facebook Pages", [], [facebookApp])).toBe(
       "Facebook Pages"
+    )
+  })
+
+  it("preserves the raw selector unchanged when a matched row's name is blank", () => {
+    // A row *is* found here (by app_id) -- unlike the no-row-at-all case
+    // above, this exercises the other unresolved path: a found row with
+    // nothing usable to return. Whitespace-only is deliberately included:
+    // "   " is truthy in JS, so this also pins that it's rejected by an
+    // explicit trim-and-check, not just a falsy check.
+    const mcpServers = [{ name: "   ", app_id: "facebook" }]
+    expect(resolveMcpToolSelector("facebook", mcpServers, [facebookApp])).toBe(
+      "facebook"
     )
   })
 

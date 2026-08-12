@@ -1786,15 +1786,19 @@ class WebToolConfig(BaseToolConfig):
         return self._browser_tools_enabled
 
     def get_browser_locale(self) -> Optional[str]:
-        """Derive a browser-automation locale from the account's own
-        ``app_locale`` setting (the language picked via xagent's UI
-        language switcher; see frontend/src/contexts/i18n-context.tsx),
-        so a task's Playwright sessions request pages in the language the
-        account actually chose to work in, rather than a single locale
-        hardcoded for every deployment or the browser's own
-        Accept-Language header (which reflects OS/browser settings, not a
-        deliberate account choice, and does not necessarily match what
-        language the account works in).
+        """Derive a browser-automation locale from the ``app_locale``
+        cookie the web UI's language switcher sets (see
+        frontend/src/contexts/i18n-context.tsx), so a task's Playwright
+        sessions request pages in the language the browser is currently
+        set to, rather than a single locale hardcoded for every
+        deployment or the browser's own Accept-Language header (which
+        reflects OS/browser settings, not a deliberate in-app choice, and
+        does not necessarily match the language the UI is displaying).
+
+        This is a browser cookie, not a persisted account attribute: there
+        is no ``locale`` column on ``User`` and no ``locale`` field on
+        ``TaskCreateRequest``. It's device- and browser-scoped, lost when
+        cookies are cleared, and not synced across a user's sessions.
 
         ``None`` (no request, no cookie, or an unrecognized value) lets the
         browser tool fall back to its own deployment default.

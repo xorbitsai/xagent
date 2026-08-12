@@ -290,13 +290,18 @@ class BrowserSessionManager:
             if self._cleanup_task is None:
                 self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
-            logger.info(f"Creating browser session {session_id!r} (locale={locale!r})")
             # Create new session with specified settings
-            self._sessions[session_id] = BrowserSession(
-                session_id, headless, locale=locale
+            new_session = BrowserSession(session_id, headless, locale=locale)
+            self._sessions[session_id] = new_session
+            new_session._last_used = datetime.now()
+            # Log the resolved locale (falls back to the deployment default
+            # when `locale` is None), not the raw argument -- otherwise the
+            # one case an operator most wants visible here, the deployment
+            # default kicking in, would read as "locale=None".
+            logger.info(
+                f"Creating browser session {session_id!r} (locale={new_session.locale!r})"
             )
-            self._sessions[session_id]._last_used = datetime.now()
-            return self._sessions[session_id]
+            return new_session
 
     async def close(self, session_id: str) -> None:
         """

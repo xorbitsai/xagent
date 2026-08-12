@@ -196,6 +196,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         *,
         task_id: str | None = None,
         workspace: TaskWorkspace | None = None,
+        locale: str | None = None,
         environment_factory: ComputerEnvironmentFactory = BrowserComputerEnvironment,
         environment_instructions: str | None = None,
         environment_label: str = "browser",
@@ -208,6 +209,7 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
         self._workspace = workspace
+        self._locale = locale
         self._environment_factory = environment_factory
         self._environment_label = environment_label.strip() or "computer"
         self._perception_mode = ComputerPerceptionMode(perception_mode)

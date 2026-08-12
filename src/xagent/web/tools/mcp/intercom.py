@@ -24,7 +24,11 @@ INTERCOM_BASE_URL = "https://api.intercom.io"
 INTERCOM_API_VERSION = "2.11"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-_admin_id_cache: str | None = None
+# Keyed by access token, not a single process-global value: this module is
+# imported once per subprocess, but nothing guarantees a subprocess is never
+# reused across a different user/token, and a bare global would leak one
+# user's admin identity into another user's replies in that case.
+_admin_id_cache: dict[str, str] = {}
 
 
 def _success(**payload: Any) -> str:
@@ -77,20 +81,22 @@ def _request(
 
 
 def _current_admin_id() -> str:
-    """Resolve the admin id behind the connected access token, cached per process.
+    """Resolve the admin id behind the connected access token, cached per token.
 
     Replying to a conversation as an admin requires an admin_id, but the OAuth
     connection only gives us a token -- not the identity it was created for.
     """
-    global _admin_id_cache
-    if _admin_id_cache:
-        return _admin_id_cache
+    token = os.environ.get("INTERCOM_ACCESS_TOKEN")
+    if not token:
+        raise ValueError("INTERCOM_ACCESS_TOKEN environment variable is missing")
+    if token in _admin_id_cache:
+        return _admin_id_cache[token]
     me = _request("GET", "/me")
     admin_id = me.get("id")
     if not admin_id:
         raise RuntimeError("Could not resolve the Intercom admin id for this token")
-    _admin_id_cache = str(admin_id)
-    return _admin_id_cache
+    _admin_id_cache[token] = str(admin_id)
+    return _admin_id_cache[token]
 
 
 def _contact_summary(contact: dict[str, Any]) -> dict[str, Any]:

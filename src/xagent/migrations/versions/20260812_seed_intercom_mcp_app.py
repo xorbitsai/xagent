@@ -1,7 +1,7 @@
 """seed built-in Intercom (OAuth) MCP connector
 
 Revision ID: 20260812_seed_intercom_mcp_app
-Revises: 20260809_add_task_interaction_requests
+Revises: 20260810_add_task_interaction_protocol_version
 Create Date: 2026-08-12 00:00:00.000000
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260812_seed_intercom_mcp_app"
-down_revision: Union[str, None] = "20260809_add_task_interaction_requests"
+down_revision: Union[str, None] = "20260810_add_task_interaction_protocol_version"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

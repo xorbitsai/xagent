@@ -459,7 +459,10 @@ class TaskInfoResponse(BaseModel):
     )
     status: str = Field(
         ...,
-        description="One of: pending / running / paused / completed / failed.",
+        description=(
+            "One of: pending / running / paused / waiting_for_user / "
+            "completed / failed."
+        ),
     )
     run_id: Optional[str] = Field(None, description="Current execution run identity.")
     state_version: int = Field(

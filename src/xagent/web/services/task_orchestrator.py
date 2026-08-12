@@ -102,7 +102,9 @@ logger = logging.getLogger(__name__)
 # Statuses for the "can a user message start the next turn?" check. A
 # task in any of these is eligible for ``TurnKind.APPEND``. PENDING is
 # claimed by ``CREATE``; RUNNING is still busy; WAITING_FOR_USER is an
-# answer to an explicit pending agent question and resumes that execution.
+# answer to a pending agent question and is handled by the dedicated
+# reply endpoint instead, which resumes the existing run rather than
+# claiming a new turn.
 _APPENDABLE_STATUSES = (
     TaskStatus.COMPLETED,
     TaskStatus.FAILED,

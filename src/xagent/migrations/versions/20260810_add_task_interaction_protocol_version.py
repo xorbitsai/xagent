@@ -83,8 +83,8 @@ def upgrade() -> None:
     # requirement -- so only PostgreSQL gets the constraint here. Online,
     # batch_alter_table could add the CHECK to an existing SQLite table the
     # same way downgrade() already removes it; that convergence is
-    # deliberately deferred to the first production writer of this column
-    # (see the model's __table_args__ comment and
+    # deliberately deferred to the first production writer of this column,
+    # tracked in #1290 (see the model's __table_args__ comment and
     # test_sqlite_check_asymmetry_is_expected in
     # tests/migrations/test_task_interaction_protocol_version_parity.py).
     if context.as_sql:

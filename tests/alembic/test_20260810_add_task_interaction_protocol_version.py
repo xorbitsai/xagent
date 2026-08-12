@@ -403,7 +403,7 @@ def test_sqlite_create_all_downgrade_upgrade_round_trip_loses_the_check() -> Non
     into the migration shape (which never has it on SQLite), and nothing
     restores it afterwards. The convergence that would restore the CHECK
     belongs to the change that lands this column's first production writer,
-    not to this migration.
+    not to this migration (tracked in #1290).
     """
     migration = load_migration_module(MIGRATION_PATH)
     reset_checkpoint_anchor_fk_create_rule()

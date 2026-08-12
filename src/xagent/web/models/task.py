@@ -95,7 +95,8 @@ class Task(Base):  # type: ignore
         # SQLite there. Online, batch_alter_table could add the CHECK to
         # an existing SQLite table the same way downgrade() already
         # removes it; that convergence is deliberately deferred to the
-        # first production writer of this column rather than done now.
+        # first production writer of this column rather than done now,
+        # tracked in #1290.
         # SQLite is the default self-hosted backend (get_database_url()
         # falls back to it when DATABASE_URL is unset); PostgreSQL is the
         # recommended backend at production scale. A fresh SQLite install

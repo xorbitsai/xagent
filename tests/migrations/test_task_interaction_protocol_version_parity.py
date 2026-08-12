@@ -243,8 +243,8 @@ def test_sqlite_check_asymmetry_is_expected() -> None:
     batch_alter_table could add the CHECK to an existing SQLite table the
     same way downgrade() already removes it -- upgrade() does not do that
     today; that convergence is deliberately deferred to the first
-    production writer of this column (see the migration and the model's
-    __table_args__ comment). Concretely: inserting
+    production writer of this column, tracked in #1290 (see the migration
+    and the model's __table_args__ comment). Concretely: inserting
     interaction_protocol_version=2 succeeds on the chain-walked shape and
     raises IntegrityError on the fresh-install shape.
     This asymmetry is expected today because the column has zero writers --

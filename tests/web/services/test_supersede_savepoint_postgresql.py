@@ -44,6 +44,8 @@ from xagent.web.models.user import User
 from xagent.web.services import ops_signals
 from xagent.web.services.chat_history_service import supersede_legacy_question_rows
 
+pytestmark = pytest.mark.postgresql
+
 
 @pytest.fixture()
 def engine():
@@ -114,7 +116,6 @@ def _create_task_with_question_row(db) -> tuple[int, int]:
     return int(task.id), int(row.id)
 
 
-@pytest.mark.postgresql
 def test_supersede_savepoint_absorbs_a_real_check_violation_and_the_caller_still_commits(
     db_session,
 ) -> None:

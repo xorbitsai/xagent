@@ -769,6 +769,22 @@ class DAGPattern(AgentPattern):
                     None,
                 )
                 if failed_step is not None:
+                    # A completed sibling in this same wakeup (e.g. one that
+                    # reached waiting_for_user or got interrupted) is never
+                    # coming back for its own turn -- the batch is failing
+                    # regardless -- so its active-step bookkeeping must be
+                    # cleared here too, not just the still-pending ones
+                    # cancel_all() below handles. Every completed sibling is
+                    # cleared unconditionally (clear_all_bookkeeping=True),
+                    # unlike the winner path below, which only clears a
+                    # "waiting_for_user" loser -- there is no winner here to
+                    # spare an "interrupted" sibling's bookkeeping for.
+                    self._invalidate_batch_siblings(
+                        completed_results,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                        clear_all_bookkeeping=True,
+                    )
                     await cancel_all()
                     return await self._fail(
                         context=root_context,
@@ -1939,23 +1955,41 @@ class DAGPattern(AgentPattern):
         *,
         step_ids_by_task: dict[asyncio.Task[Any], str],
         steps_by_id: dict[str, PlanStep],
+        clear_all_bookkeeping: bool = False,
     ) -> list[str]:
-        """Clear active-step bookkeeping and flip status on every
-        completed sibling result passed in that is still holding a live
-        "waiting_for_user" result -- that status is reserved for a step
-        whose question was live and never reached the user. Any other
-        sibling (e.g. one that lost an id tie-break between two
-        "interrupted" results) is left completely alone, bookkeeping
-        included: this is byte-for-byte the inline loop this method was
-        extracted from, just given a name. Returns the ids that got the
-        clarification_invalidated flip, in input order.
+        """Invalidate the losers of a same-wakeup completed batch.
+
+        By default (the winner path) a sibling is only touched at all if
+        its result is "waiting_for_user": its active-step bookkeeping is
+        cleared and its step is flipped to "clarification_invalidated".
+        Any other sibling -- e.g. one that lost an id tie-break between
+        two "interrupted" results -- is left completely alone,
+        bookkeeping included; that tie is not this method's problem to
+        solve.
+
+        Pass clear_all_bookkeeping=True (the failure fast-path) to
+        instead clear every sibling's bookkeeping unconditionally: the
+        whole batch is terminating there, so no sibling's active-step
+        registration should survive into the dag_failed checkpoint
+        regardless of what status it completed with. The
+        clarification_invalidated flip still only ever applies to a
+        "waiting_for_user" result, since that status is reserved for a
+        step whose question was live and never reached the user -- an
+        "interrupted" sibling caught up in a failure is not that step,
+        so it only loses its bookkeeping, not its status.
+
+        Returns the ids that got the clarification_invalidated flip, in
+        input order.
         """
         invalidated_step_ids: list[str] = []
         for sibling_task, sibling_result in siblings:
-            if sibling_result.get("status") != "waiting_for_user":
+            is_waiting = sibling_result.get("status") == "waiting_for_user"
+            if not is_waiting and not clear_all_bookkeeping:
                 continue
             sibling_step_id = step_ids_by_task[sibling_task]
             self._clear_active_step(sibling_step_id)
+            if not is_waiting:
+                continue
             sibling_step = steps_by_id.get(sibling_step_id)
             if sibling_step is not None:
                 # Non-terminal, and not picked up by the same-wakeup

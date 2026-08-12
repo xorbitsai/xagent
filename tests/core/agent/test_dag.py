@@ -1733,12 +1733,13 @@ async def test_dag_pattern_failed_step_wins_over_waiting_sibling_in_same_batch()
     )
     pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
 
+    runtime = PatternRuntime(execution_id="dag-failed-vs-waiting")
     run_task = asyncio.create_task(
         pattern.run(
             context=ExecutionContext(execution_id="dag-failed-vs-waiting"),
             tools=[],
             llm=object(),
-            runtime=PatternRuntime(execution_id="dag-failed-vs-waiting"),
+            runtime=runtime,
         )
     )
     await asyncio.wait_for(
@@ -1756,6 +1757,19 @@ async def test_dag_pattern_failed_step_wins_over_waiting_sibling_in_same_batch()
     assert result["failed_step_id"] == "fail_step"
     assert "message" not in result
     assert "clarification_draft" not in result
+
+    # The waiting sibling never gets its own turn -- the batch is failing
+    # regardless -- so its active-step bookkeeping must not be left behind.
+    assert pattern.active_step_ids == []
+    assert pattern.active_step_pattern_states == {}
+    assert pattern.active_step_contexts == {}
+
+    checkpoint = runtime.checkpoints[-1]
+    assert checkpoint["label"] == "dag_failed"
+    checkpoint_state = checkpoint["pattern_state"]
+    assert checkpoint_state["active_step_ids"] == []
+    assert checkpoint_state["active_step_pattern_states"] == {}
+    assert checkpoint_state["active_step_contexts"] == {}
 
 
 @pytest.mark.asyncio
@@ -1802,12 +1816,13 @@ async def test_dag_pattern_failed_step_wins_over_interrupted_sibling_in_same_bat
     )
     pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
 
+    runtime = PatternRuntime(execution_id="dag-failed-vs-interrupted")
     run_task = asyncio.create_task(
         pattern.run(
             context=ExecutionContext(execution_id="dag-failed-vs-interrupted"),
             tools=[],
             llm=object(),
-            runtime=PatternRuntime(execution_id="dag-failed-vs-interrupted"),
+            runtime=runtime,
         )
     )
     await asyncio.wait_for(
@@ -1824,6 +1839,23 @@ async def test_dag_pattern_failed_step_wins_over_interrupted_sibling_in_same_bat
     assert result["status"] != "interrupted"
     assert result["failure_reason"] == "step_failed"
     assert result["failed_step_id"] == "fail_step"
+
+    # The interrupted sibling never gets its own turn -- the batch is
+    # failing regardless -- so its active-step bookkeeping must not be
+    # left behind. It is not the step whose question got superseded, so
+    # its status stays "interrupted" rather than being relabeled.
+    assert pattern.active_step_ids == []
+    assert pattern.active_step_pattern_states == {}
+    assert pattern.active_step_contexts == {}
+    steps_by_id = {step.id: step for step in pattern.plan.steps}
+    assert steps_by_id["interrupt_step"].status == "interrupted"
+
+    checkpoint = runtime.checkpoints[-1]
+    assert checkpoint["label"] == "dag_failed"
+    checkpoint_state = checkpoint["pattern_state"]
+    assert checkpoint_state["active_step_ids"] == []
+    assert checkpoint_state["active_step_pattern_states"] == {}
+    assert checkpoint_state["active_step_contexts"] == {}
 
 
 @pytest.mark.asyncio

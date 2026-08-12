@@ -9,22 +9,26 @@ small, focused test rather than a full behavior suite:
   ``supersede_legacy_question_rows`` and the bulk account-purge
   ``.delete()`` in ``admin_users.py``; a single-row delete would silently
   destroy transcript history instead of relabeling it.
-* monotonicity: nothing in the tree writes ``message_type`` back from
-  ``"question_superseded"`` to ``"question"``.
+* monotonicity: nothing in the tree writes message_type back from the
+  superseded value to the question value, in any spelling those two public
+  constants have.
 * import ban: ``chat_history_service.py`` does not import anything from
   the native-rollout module.
 * mid-turn marker-write ban: the WebSocket mid-turn persistence path never
-  writes the ``"question_superseded"`` literal itself -- that is this
+  writes the superseded marker itself, literal or constant -- that is this
   helper's only sanctioned write site.
 
 Each check operates on parsed source text (``ast.parse``), not on a live
 import of every module in the tree -- module-level side effects on import
-are out of scope for what these guards need to prove.
+are out of scope for what these guards need to prove. The two tree-wide
+checks share one parse of ``src/`` (the ``parsed_src_files`` fixture); the
+two single-file checks parse their one module directly.
 """
 
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -70,6 +74,14 @@ def test_src_root_is_resolvable() -> None:
     uncollectable module that takes the rest of this file's guards down
     with it."""
     assert SRC_ROOT.name == "xagent", SRC_ROOT
+
+
+def test_the_shared_source_pass_covers_every_file_in_src(parsed_src_files) -> None:
+    """The substring prefilter is gone, so this fixture must really be
+    every file, not a filtered subset."""
+    on_disk = {str(p.relative_to(SRC_ROOT)) for p in SRC_ROOT.rglob("*.py")}
+    assert {rel for rel, _source, _tree in parsed_src_files} == on_disk
+    assert len(on_disk) > 1
 
 
 def _mentions_name(node: ast.AST, name: str) -> bool:
@@ -197,10 +209,12 @@ def test_no_single_row_delete_of_task_chat_message_rows_anywhere_in_src(
     for rel_path, source, tree in parsed_src_files:
         # Exactly implied by what the walk can match: every finding needs
         # an ``ast.Name`` whose id is ``TaskChatMessage``, which cannot
-        # exist unless that name appears verbatim in the text. A skip on
-        # ``".delete("`` would not be exactly implied -- ``ast`` does not
-        # care about the whitespace between the attribute and the paren --
-        # so it is not used.
+        # exist unless that name appears verbatim in the text. Unlike the
+        # value-matching the monotonicity guard does, no constant or alias
+        # can route around an identifier the guard matches by id. A skip
+        # on ``".delete("`` would not be exactly implied -- ``ast`` does
+        # not care about the whitespace between the attribute and the
+        # paren -- so it is not used.
         if "TaskChatMessage" not in source:
             continue
         for _lineno, func_name in single_row_task_chat_message_deletes(tree):
@@ -287,7 +301,139 @@ def outer(db):
 # ---------------------------------------------------------------------------
 
 
-def _writes_message_type_to(node: ast.Call, value: str) -> bool:
+# The two message-type values, taken from the module that owns them rather
+# than respelled here, so a guard can never end up hunting for a value the
+# service no longer uses. ``test_message_type_constants_have_their_documented_values``
+# in the behavior suite is what pins the values themselves.
+_MESSAGE_TYPE_CONSTANTS = {
+    "QUESTION_MESSAGE_TYPE": chat_history_service.QUESTION_MESSAGE_TYPE,
+    "SUPERSEDED_MESSAGE_TYPE": chat_history_service.SUPERSEDED_MESSAGE_TYPE,
+}
+
+
+def _module_level_statements(tree: ast.Module):
+    """Statements in module scope, descending through module-level ``if``
+    and ``try`` blocks -- a constant defined under ``if TYPE_CHECKING:``
+    or in a ``try``/``except ImportError`` fallback is still a
+    module-scope binding. Function and class bodies are deliberately not
+    descended into: a local ``x = "question"`` in some unrelated function
+    must not make every ``x`` in the file resolve to that value.
+    """
+    pending = list(tree.body)
+    while pending:
+        node = pending.pop()
+        yield node
+        if isinstance(node, ast.If):
+            pending.extend(node.body)
+            pending.extend(node.orelse)
+        elif isinstance(node, (ast.Try, ast.TryStar)):
+            pending.extend(node.body)
+            pending.extend(node.orelse)
+            pending.extend(node.finalbody)
+            for handler in node.handlers:
+                pending.extend(handler.body)
+
+
+def _string_constant_bindings(tree: ast.Module) -> dict[str, set[str]]:
+    """Module-scope names mapped to every string value they are ever bound
+    to, so a guard can recognize ``.update({message_type: SUPERSEDED})``
+    as the same write as ``.update({message_type: "question_superseded"})``.
+
+    Four carrier shapes are resolved:
+
+    * a module-scope assignment to a string literal, plain or annotated
+      (``S = "question_superseded"``, ``S: str = "question_superseded"``);
+    * ``from ... import SUPERSEDED_MESSAGE_TYPE``, including
+      ``... as S`` -- the imported name takes the value the owning module
+      actually holds (``_MESSAGE_TYPE_CONSTANTS``), not a respelling;
+    * a module-scope assignment from an attribute of one of those
+      constants (``S = chat_history_service.SUPERSEDED_MESSAGE_TYPE``);
+    * a chain of module-scope name-to-name assignments over any of the
+      above (``A = S``; ``B = A``), resolved to a fixed point. Value sets
+      only grow and the name set is finite, so a cycle (``A = B``;
+      ``B = A``) terminates instead of looping.
+
+    A name rebound at module scope keeps *every* value it was ever bound
+    to rather than only the last one. "The last one" is not a defined
+    notion here: ``_module_level_statements`` drains its work list with
+    ``pop()``, so statements arrive last-in-first-out and not in source
+    order. Keeping the union is the only well-defined answer, and it is
+    also the safe one for something that feeds a ban.
+
+    Shapes this does not resolve. Values built by anything other than a
+    plain literal or one of the forms above -- an f-string,
+    ``.format()``, ``"".join(...)``, an augmented assignment
+    (``B += "..."``), ``getattr(module, "NAME")`` -- plus tuple-unpacking
+    targets (``A, B = "x", "y"``), names arriving through
+    ``from ... import *``, imports made inside a module-level ``with``
+    block, constants defined in a class body, and a value reaching the
+    write as a dict key or ``**`` carrier rather than as the mapped
+    value. None of these is resolved; the table therefore stays a ban on
+    the spellings it can see, not a proof that no other spelling exists.
+    """
+    bindings: dict[str, set[str]] = {}
+    aliases: list[tuple[str, str]] = []
+
+    def bind(name: str, value: str) -> None:
+        bindings.setdefault(name, set()).add(value)
+
+    for node in _module_level_statements(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in _MESSAGE_TYPE_CONSTANTS:
+                    bind(
+                        alias.asname or alias.name, _MESSAGE_TYPE_CONSTANTS[alias.name]
+                    )
+            continue
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if node.value is None:
+            continue
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if not names:
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            for name in names:
+                bind(name, value.value)
+        elif isinstance(value, ast.Name):
+            aliases.extend((name, value.id) for name in names)
+        elif isinstance(value, ast.Attribute) and value.attr in _MESSAGE_TYPE_CONSTANTS:
+            for name in names:
+                bind(name, _MESSAGE_TYPE_CONSTANTS[value.attr])
+
+    changed = True
+    while changed:
+        changed = False
+        for target, source in aliases:
+            values = bindings.get(source)
+            if values and not values <= bindings.get(target, set()):
+                bindings.setdefault(target, set()).update(values)
+                changed = True
+    return bindings
+
+
+def _string_values(node: ast.AST, bindings: dict[str, set[str]]) -> set[str]:
+    """Every string value this expression can denote: an inline literal, a
+    module-scope name bound to one, or ``<module>.NAME`` for one of the
+    message-type constants. Anything else resolves to nothing, so a guard
+    built on this stays a ban on known values rather than a guess."""
+    if isinstance(node, ast.Constant):
+        return {node.value} if isinstance(node.value, str) else set()
+    if isinstance(node, ast.Name):
+        return set(bindings.get(node.id, ()))
+    if isinstance(node, ast.Attribute) and node.attr in _MESSAGE_TYPE_CONSTANTS:
+        return {_MESSAGE_TYPE_CONSTANTS[node.attr]}
+    return set()
+
+
+def _writes_message_type_to(
+    node: ast.Call, value: str, bindings: dict[str, set[str]]
+) -> bool:
     for arg in node.args:
         if isinstance(arg, ast.Dict):
             for key, val in zip(arg.keys, arg.values):
@@ -296,23 +442,19 @@ def _writes_message_type_to(node: ast.Call, value: str) -> bool:
                     if isinstance(key, ast.Attribute)
                     else (key.value if isinstance(key, ast.Constant) else None)
                 )
-                if (
-                    key_name == "message_type"
-                    and isinstance(val, ast.Constant)
-                    and val.value == value
+                if key_name == "message_type" and value in _string_values(
+                    val, bindings
                 ):
                     return True
     for kw in node.keywords:
-        if (
-            kw.arg == "message_type"
-            and isinstance(kw.value, ast.Constant)
-            and kw.value.value == value
-        ):
+        if kw.arg == "message_type" and value in _string_values(kw.value, bindings):
             return True
     return False
 
 
-def _filters_message_type_equal(node: ast.Call, value: str) -> bool:
+def _filters_message_type_equal(
+    node: ast.Call, value: str, bindings: dict[str, set[str]]
+) -> bool:
     for arg in node.args:
         if (
             isinstance(arg, ast.Compare)
@@ -321,32 +463,41 @@ def _filters_message_type_equal(node: ast.Call, value: str) -> bool:
             and isinstance(arg.left, ast.Attribute)
             and arg.left.attr == "message_type"
             and len(arg.comparators) == 1
-            and isinstance(arg.comparators[0], ast.Constant)
-            and arg.comparators[0].value == value
+            and value in _string_values(arg.comparators[0], bindings)
         ):
             return True
     return False
 
 
 def reverse_supersede_writes(tree: ast.Module) -> list[int]:
-    """Statement sites that write ``message_type='question'`` on rows
-    selected via ``message_type == 'question_superseded'`` -- the mirror
-    image of what ``supersede_legacy_question_rows`` does, and the shape
-    a hypothetical revert helper built by copy-and-flip would take.
+    """Statement sites that write ``message_type`` back to the question
+    value on rows selected by the superseded value -- the mirror image of
+    what ``supersede_legacy_question_rows`` does, and the shape a
+    hypothetical revert helper built by copy-and-flip would take.
 
     Two mutation carrier forms are checked, matching the two forms this
     repo's ORM bulk writes actually use: a dict-literal passed to
     ``.update(...)``/``.values(...)``, and a ``message_type=`` keyword on
-    the same calls.
+    the same calls. Both the written value and the filtered value are
+    resolved through ``_string_constant_bindings``, so the constant
+    spelling (``SUPERSEDED_MESSAGE_TYPE``, an aliased import of it, or
+    ``chat_history_service.SUPERSEDED_MESSAGE_TYPE``) is caught alongside
+    the bare literal. That matters because ``chat_history_service.py``
+    exports both constants publicly, making the constant spelling the
+    likelier one for a real revert helper. Which spellings that
+    resolution does and does not cover is listed in
+    ``_string_constant_bindings``; a value it cannot resolve is a blind
+    spot of this guard too.
 
-    Five shapes are known blind spots, disclosed rather than caught,
-    matching the disclosure style the single-row-delete guard above in
-    this file already uses for its own known gaps:
+    Three further shapes are known blind spots of the walk itself,
+    disclosed rather than caught, matching the disclosure style the
+    single-row-delete guard above in this file already uses for its own
+    known gaps:
 
     * per-row attribute assignment -- ``msg.message_type = "question"``
-      on an ORM instance fetched via ``message_type == "question_superseded"``
-      -- invisible because this walk only inspects ``.update()``/
-      ``.values()`` calls, not plain attribute assignment.
+      on an ORM instance fetched via the superseded value -- invisible
+      because this walk only inspects ``.update()``/``.values()`` calls,
+      not plain attribute assignment.
     * a filter and its mutating call split across two statements --
       ``q = db.query(TaskChatMessage).filter(...)`` bound to a name in
       one statement, ``q.update(...)`` called on that name in a later
@@ -354,41 +505,18 @@ def reverse_supersede_writes(tree: ast.Module) -> list[int]:
       call inline in the same receiver chain as the mutating call, the
       same by-name (not full dataflow) limit the delete guard above notes
       for its own carrier tracing.
-    * a constant-composed literal -- a ``Name`` resolved back to a
-      constant, e.g. ``.update({TaskChatMessage.message_type:
-      QUESTION_MESSAGE_TYPE})`` -- invisible because the walk only
-      recognizes an inline ``ast.Constant`` value, not a ``Name``. This
-      is not a hypothetical shape: ``chat_history_service.py`` exports
-      both ``QUESTION_MESSAGE_TYPE`` and ``SUPERSEDED_MESSAGE_TYPE`` as
-      public constants, so a revert helper written with the same style
-      the forward write already uses -- ``.filter(message_type ==
-      SUPERSEDED_MESSAGE_TYPE).update({message_type:
-      QUESTION_MESSAGE_TYPE})`` -- returns zero findings from this walk
-      (probe-verified). Disclosed rather than closed only because no
-      such revert helper exists yet to trigger it, not because closing
-      it would be expensive.
-    * a negated comparison -- ``.filter(message_type != "question")``
-      selecting everything that is not already ``"question"`` -- invisible
-      because ``_filters_message_type_equal`` only matches ``ast.Eq``, not
-      ``ast.NotEq``.
-    * a membership test -- ``.filter(message_type.in_([...]))`` -- invisible
-      because ``_filters_message_type_equal`` only matches an ``ast.Compare``
-      node, and ``.in_(...)`` parses as an ``ast.Call``.
+    * a comparison that is not an equality against a known value --
+      ``.filter(message_type != "question")`` or
+      ``.filter(message_type.in_([...]))`` -- invisible because
+      ``_filters_message_type_equal`` matches only an ``ast.Compare``
+      with a single ``ast.Eq``.
 
     Closing the remaining shapes would need the same dataflow-sensitive
     analysis the checkpoint-pointer pairing guard explicitly declines for
-    its own ``**`` carriers, for the same cost/benefit reason: a
-    materially more expensive walk to close gaps with no live instance
-    in this repo today.
-
-    Separately: the caller of this function (below) only scans a source
-    file at all if the literal substring ``"question_superseded"``
-    appears in its text. A file that imports and uses only
-    ``SUPERSEDED_MESSAGE_TYPE`` / ``QUESTION_MESSAGE_TYPE`` by name, with
-    that literal string appearing nowhere in its own source, is skipped
-    by that prefilter entirely and never reaches this walk
-    (probe-verified).
+    its own ``**`` carriers, and for the same reason: a materially more
+    expensive walk than what these shapes are worth guarding against.
     """
+    bindings = _string_constant_bindings(tree)
     findings: list[int] = []
     for node in ast.walk(tree):
         if not (
@@ -397,7 +525,9 @@ def reverse_supersede_writes(tree: ast.Module) -> list[int]:
             and node.func.attr in {"update", "values"}
         ):
             continue
-        if not _writes_message_type_to(node, "question"):
+        if not _writes_message_type_to(
+            node, chat_history_service.QUESTION_MESSAGE_TYPE, bindings
+        ):
             continue
         receiver = node.func.value
         reads_superseded = False
@@ -405,7 +535,9 @@ def reverse_supersede_writes(tree: ast.Module) -> list[int]:
             if (
                 isinstance(receiver.func, ast.Attribute)
                 and receiver.func.attr == "filter"
-                and _filters_message_type_equal(receiver, "question_superseded")
+                and _filters_message_type_equal(
+                    receiver, chat_history_service.SUPERSEDED_MESSAGE_TYPE, bindings
+                )
             ):
                 reads_superseded = True
                 break
@@ -419,24 +551,60 @@ def reverse_supersede_writes(tree: ast.Module) -> list[int]:
     return findings
 
 
-def test_nothing_writes_message_type_back_to_question(parsed_src_files) -> None:
-    """The ``"question_superseded" not in source`` line below is a
-    prefilter, not a full scan: a file using only the imported
-    ``SUPERSEDED_MESSAGE_TYPE`` / ``QUESTION_MESSAGE_TYPE`` names, with
-    that literal string appearing nowhere in its own text, is skipped
-    and never reaches ``reverse_supersede_writes`` (see that function's
-    docstring for the probe that confirms this)."""
+def files_with_reverse_supersede_writes(
+    files: Iterable[tuple[str, str, ast.Module]],
+) -> list[tuple[str, list[int]]]:
+    """Run the monotonicity guard over a sequence of
+    ``(path, source, tree)`` triples and return the offending files.
+
+    Split out from the test below so the sweep can be exercised against
+    synthetic triples as well as against the real tree -- a guard that is
+    only ever run over a tree with zero violations in it has never been
+    shown to report one. No prefilter: the guard resolves the constants
+    by name, so a file that imports ``SUPERSEDED_MESSAGE_TYPE`` and never
+    spells the literal is precisely the file that must be scanned.
+    """
     findings: list[tuple[str, list[int]]] = []
-    for rel_path, source, tree in parsed_src_files:
-        if "question_superseded" not in source:
-            continue
+    for rel_path, _source, tree in files:
         hits = reverse_supersede_writes(tree)
         if hits:
             findings.append((rel_path, hits))
+    return findings
+
+
+def test_nothing_writes_message_type_back_to_question(parsed_src_files) -> None:
+    findings = files_with_reverse_supersede_writes(parsed_src_files)
     assert findings == [], (
         "message_type written back from question_superseded to question "
         f"(monotonicity violation): {findings}"
     )
+
+
+def test_the_monotonicity_sweep_reports_a_file_that_only_imports_the_constant() -> None:
+    """The sweep itself, against a file shaped like the one the deleted
+    substring prefilter used to skip: it imports the constants and the
+    literal ``"question_superseded"`` appears nowhere in its text. Run in
+    memory over a synthetic triple -- nothing is written into ``src/``.
+    """
+    source = """
+from xagent.web.services.chat_history_service import (
+    QUESTION_MESSAGE_TYPE,
+    SUPERSEDED_MESSAGE_TYPE,
+)
+
+
+def revert(db, task_id):
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.message_type == SUPERSEDED_MESSAGE_TYPE,
+    ).update({TaskChatMessage.message_type: QUESTION_MESSAGE_TYPE})
+"""
+    assert "question_superseded" not in source
+    findings = files_with_reverse_supersede_writes(
+        [("web/services/revert_helper.py", source, ast.parse(source))]
+    )
+    assert [rel_path for rel_path, _hits in findings] == [
+        "web/services/revert_helper.py"
+    ]
 
 
 def test_monotonicity_guard_flags_a_reverse_assignment() -> None:
@@ -448,6 +616,141 @@ def revert(db, task_id):
     ).update({TaskChatMessage.message_type: "question"}, synchronize_session=False)
 """
     assert len(reverse_supersede_writes(ast.parse(fixture))) == 1
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        # module-scope constants, the shape chat_history_service.py itself uses
+        """
+QUESTION_MESSAGE_TYPE = "question"
+SUPERSEDED_MESSAGE_TYPE = "question_superseded"
+
+def revert(db, task_id):
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.message_type == SUPERSEDED_MESSAGE_TYPE,
+    ).update({TaskChatMessage.message_type: QUESTION_MESSAGE_TYPE})
+""",
+        # imported by name
+        """
+from xagent.web.services.chat_history_service import (
+    QUESTION_MESSAGE_TYPE,
+    SUPERSEDED_MESSAGE_TYPE,
+)
+
+def revert(db, task_id):
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.message_type == SUPERSEDED_MESSAGE_TYPE,
+    ).update({TaskChatMessage.message_type: QUESTION_MESSAGE_TYPE})
+""",
+        # imported under an alias
+        """
+from xagent.web.services.chat_history_service import QUESTION_MESSAGE_TYPE as Q
+from xagent.web.services.chat_history_service import SUPERSEDED_MESSAGE_TYPE as S
+
+def revert(db, task_id):
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.message_type == S,
+    ).update({TaskChatMessage.message_type: Q})
+""",
+        # reached through the owning module
+        """
+from xagent.web.services import chat_history_service
+
+def revert(db, task_id):
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.message_type
+        == chat_history_service.SUPERSEDED_MESSAGE_TYPE,
+    ).update({TaskChatMessage.message_type: chat_history_service.QUESTION_MESSAGE_TYPE})
+""",
+    ],
+    ids=["module-constant", "imported", "aliased-import", "module-attribute"],
+)
+def test_monotonicity_guard_flags_a_constant_spelled_revert(fixture: str) -> None:
+    """The reverse write is the same violation whether the values are
+    spelled as literals or as the public constants; a revert helper
+    written in the same style as the forward write is the likelier
+    shape."""
+    assert len(reverse_supersede_writes(ast.parse(fixture))) == 1
+
+
+def test_monotonicity_guard_resolves_a_module_level_alias_chain() -> None:
+    fixture = """
+from xagent.web.services.chat_history_service import SUPERSEDED_MESSAGE_TYPE as S
+FIRST = S
+SECOND = FIRST
+QUESTION = "question"
+
+def revert(db, task_id):
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.message_type == SECOND,
+    ).update({TaskChatMessage.message_type: QUESTION})
+"""
+    assert len(reverse_supersede_writes(ast.parse(fixture))) == 1
+
+
+def test_monotonicity_guard_ignores_a_function_local_binding() -> None:
+    """Negative control: only module-scope bindings resolve. A local
+    ``x = "question"`` in an unrelated function must not make every ``x``
+    in the file read as that value -- that would false-positive on
+    ordinary code."""
+    fixture = """
+def unrelated():
+    x = "question"
+    return x
+
+def revert(db, task_id):
+    db.query(TaskChatMessage).filter(
+        TaskChatMessage.message_type == "question_superseded",
+    ).update({TaskChatMessage.message_type: x})
+"""
+    assert reverse_supersede_writes(ast.parse(fixture)) == []
+
+
+def test_constant_bindings_record_every_module_scope_string_shape() -> None:
+    """One exact-dict assertion over all the module-scope shapes at once:
+    a plain literal, an annotated literal, a rebound name keeping both
+    values, and the four shapes that resolve to nothing."""
+    fixture = """
+PLAIN = "question"
+ANNOTATED: str = "question_superseded"
+REBOUND = "question"
+REBOUND = "something else"
+NUMBER = 3
+PAIR = ("a", "b")
+BUILT = "que"
+BUILT += "stion"
+DECLARED_ONLY: str
+"""
+    assert _string_constant_bindings(ast.parse(fixture)) == {
+        "PLAIN": {"question"},
+        "ANNOTATED": {"question_superseded"},
+        "REBOUND": {"question", "something else"},
+        "BUILT": {"que"},
+    }
+
+
+def test_constant_bindings_terminate_on_a_cyclic_alias_chain() -> None:
+    """The fixed-point loop must not hang on ``A = B``/``B = A``: value
+    sets only grow over a finite name set, so it settles at empty."""
+    assert _string_constant_bindings(ast.parse("A = B\nB = A\n")) == {}
+
+
+def test_constant_bindings_reach_module_level_if_and_try_blocks() -> None:
+    fixture = """
+import typing
+
+if typing.TYPE_CHECKING:
+    UNDER_IF = "question_superseded"
+
+try:
+    UNDER_TRY = "question"
+except ImportError:
+    UNDER_TRY = "question"
+"""
+    bindings = _string_constant_bindings(ast.parse(fixture))
+    assert bindings["UNDER_IF"] == {"question_superseded"}
+    assert bindings["UNDER_TRY"] == {"question"}
 
 
 # ---------------------------------------------------------------------------
@@ -567,15 +870,16 @@ def mid_turn_functions_writing_superseded_literal(
     function exists here anymore" (e.g. after a rename); a check would be
     vacuously green in that second case without this.
 
-    Known blind spot: this only recognizes an inline ``ast.Constant``
-    equal to ``"question_superseded"``, not a ``Name`` resolved back to
-    one. ``chat_history_service.py`` exports ``SUPERSEDED_MESSAGE_TYPE``
-    as a public constant, so a mid-turn write spelled as
-    ``message_type = SUPERSEDED_MESSAGE_TYPE`` instead of the bare
-    literal produces zero hits from this walk even though ``found``
-    correctly reports the function as present -- the vacuousness check
-    above does not cover this gap (probe-verified).
+    The superseded value is recognized in any of the spellings
+    ``_string_constant_bindings`` resolves -- the bare literal, a
+    module-scope constant, an imported or aliased
+    ``SUPERSEDED_MESSAGE_TYPE``, or ``<module>.SUPERSEDED_MESSAGE_TYPE``
+    -- not only as an inline ``ast.Constant``. That function lists the
+    spellings it cannot resolve; each of them is a blind spot of this
+    guard too.
     """
+    bindings = _string_constant_bindings(tree)
+    superseded = chat_history_service.SUPERSEDED_MESSAGE_TYPE
     hits: list[str] = []
     found: set[str] = set()
     for node in ast.walk(tree):
@@ -585,10 +889,7 @@ def mid_turn_functions_writing_superseded_literal(
         ):
             found.add(node.name)
             for inner in ast.walk(node):
-                if (
-                    isinstance(inner, ast.Constant)
-                    and inner.value == "question_superseded"
-                ):
+                if superseded in _string_values(inner, bindings):
                     hits.append(node.name)
                     break
     return hits, found
@@ -637,3 +938,37 @@ def make_agent_outbound_handler(task_id):
 """
     hits, _found = mid_turn_functions_writing_superseded_literal(ast.parse(fixture))
     assert set(hits) == {"_persist_agent_outbound_event", "make_agent_outbound_handler"}
+
+
+@pytest.mark.parametrize(
+    "fixture,expected",
+    [
+        (
+            """
+from xagent.web.services.chat_history_service import SUPERSEDED_MESSAGE_TYPE
+
+def _persist_agent_outbound_event(task_id, event):
+    message_type = SUPERSEDED_MESSAGE_TYPE
+    return message_type
+""",
+            ["_persist_agent_outbound_event"],
+        ),
+        (
+            """
+from xagent.web.services.chat_history_service import SUPERSEDED_MESSAGE_TYPE as SUP
+
+def make_agent_outbound_handler(task_id):
+    async def handle_outbound_message(payload):
+        return SUP
+    return handle_outbound_message
+""",
+            ["make_agent_outbound_handler"],
+        ),
+    ],
+    ids=["imported", "aliased-import"],
+)
+def test_mid_turn_guard_flags_a_constant_spelled_write(
+    fixture: str, expected: list[str]
+) -> None:
+    hits, _found = mid_turn_functions_writing_superseded_literal(ast.parse(fixture))
+    assert hits == expected

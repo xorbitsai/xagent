@@ -2619,6 +2619,49 @@ async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting(
     assert "'s question is delivered" not in caplog.text
 
 
+def test_dag_pattern_select_winner_orders_a_scrambled_batch() -> None:
+    """_select_winner() is a pure sort over (task, result) pairs; drive it
+    directly instead of through the full asyncio.wait() event loop.
+    completed_results is built out of id order and mixes interrupted and
+    waiting results, and the tasks are plain object() placeholders since
+    the sort never touches the task itself, only the dict it maps to in
+    step_ids_by_task."""
+
+    pattern = DAGPattern(lambda **_: None)
+
+    task_z_wait, task_m_interrupt, task_a_wait, task_b_interrupt = (
+        object(),
+        object(),
+        object(),
+        object(),
+    )
+    completed_results: list[tuple[Any, dict[str, Any]]] = [
+        (task_z_wait, {"status": "waiting_for_user"}),
+        (task_m_interrupt, {"status": "interrupted"}),
+        (task_a_wait, {"status": "waiting_for_user"}),
+        (task_b_interrupt, {"status": "interrupted"}),
+    ]
+    step_ids_by_task = {
+        task_z_wait: "z_wait",
+        task_m_interrupt: "m_interrupt",
+        task_a_wait: "a_wait",
+        task_b_interrupt: "b_interrupt",
+    }
+
+    winner_task, winner_result = pattern._select_winner(
+        completed_results, step_ids_by_task=step_ids_by_task
+    )
+
+    assert winner_task is task_b_interrupt
+    assert winner_result == {"status": "interrupted"}
+    assert [step_ids_by_task[task] for task, _ in completed_results] == [
+        "b_interrupt",
+        "m_interrupt",
+        "a_wait",
+        "z_wait",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_dag_pattern_delivered_result_outranks_pending_replan_in_same_batch() -> (
     None

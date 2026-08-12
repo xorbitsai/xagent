@@ -709,44 +709,15 @@ def _reader_and_writer_where_clauses(db, task_id: int) -> tuple[str, str]:
     return _rendered_where(bind, selects[0]), _rendered_where(bind, updates[0])
 
 
-def test_reader_and_writer_compile_the_same_where_clause():
-    """#1263's drift check, at runtime rather than over the source text:
-    compile what the reader and the writer actually send and require the
-    two WHERE clauses to be identical, so the two cannot silently
-    diverge. The end-to-end test above cannot do this: its single fixture
-    row satisfies both predicates even after one of them loses a
-    condition.
-
-    What this does not check is that both functions still call
-    ``_waiting_question_filters``. A function that inlined the identical
-    three conditions in the identical order would render the identical
-    clause and pass -- correctly, since nothing has diverged. Keeping the
-    single definition is a readability and maintenance property, and it is
-    visible in the source, not in the emitted SQL.
-    """
-    db = _create_db_session()
-    try:
-        task = _create_task(db)
-        persist_assistant_message(
-            db,
-            int(task.id),
-            int(task.user_id),
-            "A question",
-            message_type="question",
-        )
-
-        read_where, write_where = _reader_and_writer_where_clauses(db, int(task.id))
-
-        assert read_where == write_where
-    finally:
-        db.close()
-
-
 def test_the_shared_where_clause_still_has_all_three_legs():
-    """The equality above holds by construction while both sides splat the
-    same helper, so it alone would stay green if a condition were dropped
-    from the helper itself. This pins what the shared predicate compiles
-    to: task, assistant role, question message_type -- and nothing else.
+    """Pins what the shared predicate compiles to: task, assistant role,
+    question message_type -- and nothing else. This is the runtime
+    SQL-equality check #1263 asks for: both sides are captured from the
+    statements the production reader and writer actually emit, and each is
+    required to equal the same fixed string, so it catches both kinds of
+    drift -- one side diverging from the other, and a condition
+    disappearing from the shared helper, which moves both sides together
+    and would keep a bare equality check green.
     """
     db = _create_db_session()
     try:

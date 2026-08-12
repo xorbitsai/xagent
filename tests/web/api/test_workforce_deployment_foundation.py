@@ -642,6 +642,67 @@ def test_archive_cancels_active_runs_and_keeps_terminal_ones() -> None:
         db.close()
 
 
+def test_permanent_delete_cancels_active_runs_and_dispatches_pause() -> None:
+    """Permanent-delete counterpart of
+    test_archive_cancels_active_runs_and_keeps_terminal_ones -- every
+    existing permanent-delete test in test_workforces_api.py only ever
+    creates a "completed" run, which ACTIVE_WORKFORCE_RUN_STATUSES excludes,
+    so cancel_active_workforce_runs and the PAUSE dispatch had zero coverage
+    on this path before this test."""
+    workforce_id = _create_active_workforce("Permanent Delete Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    running_task_id, running_run_id = _create_workforce_task_and_run(
+        workforce_id,
+        snapshot=snapshot,
+        task_status=TaskStatus.RUNNING,
+        run_status="running",
+    )
+    completed_task_id, completed_run_id = _create_workforce_task_and_run(
+        workforce_id, snapshot=snapshot, run_status="completed"
+    )
+
+    deleted = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=_admin_headers()
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"id": workforce_id, "status": "deleted"}
+
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        # Unlike archive, the run rows themselves are cascade-deleted --
+        # nothing left to assert "cancelled" status on.
+        assert db.query(WorkforceRun).filter_by(id=running_run_id).first() is None
+        assert db.query(WorkforceRun).filter_by(id=completed_run_id).first() is None
+
+        # The live task still received a durable PAUSE command, keyed on
+        # run_id exactly like archive's dispatch.
+        command = (
+            db.query(TaskExecutionCommand)
+            .filter(
+                TaskExecutionCommand.task_id == running_task_id,
+                TaskExecutionCommand.command_id == f"workforce-pause-{running_run_id}",
+            )
+            .first()
+        )
+        assert command is not None
+        assert str(command.kind) == "pause"
+
+        # Tasks are never hard-deleted (other subsystems key off the task
+        # id), but a "permanently deleted" workforce's conversations must
+        # stop surfacing in history/search.
+        running_task = db.query(Task).filter(Task.id == running_task_id).one()
+        assert running_task.is_visible is False
+        completed_task = db.query(Task).filter(Task.id == completed_task_id).one()
+        assert completed_task.is_visible is False
+
+        # A late task-status projection (the PAUSE landing) has nothing left
+        # to resurrect -- the run row is gone, not just cancelled.
+        assert sync_workforce_run_status(db, running_task, TaskStatus.PAUSED) is False
+    finally:
+        db.close()
+
+
 async def test_pause_dispatch_dedupes_when_archive_and_reap_race_the_same_run() -> None:
     """Self-review follow-up on F5: widening the stale-preview-run reaper's
     filter to ``is_preview IS TRUE`` means it can now select an edit-mode

@@ -804,7 +804,7 @@ async def update_workforce(
     )
 
 
-@router.delete("/{workforce_id}")
+@router.delete("/{workforce_id}", operation_id="archive_workforce")
 async def archive_or_delete_workforce(
     workforce_id: int,
     permanent: bool = False,
@@ -828,7 +828,7 @@ async def archive_or_delete_workforce(
                     "message": "Failed to delete workforce",
                 },
             ) from None
-        await pause_workforce_tasks_after_archive(pause_targets)
+        await pause_workforce_tasks_after_archive(pause_targets, reason="delete")
         if trigger_teardowns:
             # Provider unregister (e.g. releasing a Gmail watch) can do real
             # network I/O; offload to a worker thread instead of blocking

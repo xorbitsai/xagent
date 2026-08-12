@@ -141,6 +141,26 @@ vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
 }))
 
+vi.mock("@/components/ui/confirm-dialog", () => ({
+  ConfirmDialog: ({
+    isOpen,
+    onConfirm,
+  }: {
+    isOpen: boolean
+    onConfirm: () => void
+  }) => (isOpen ? <button onClick={onConfirm}>confirm-delete</button> : null),
+}))
+
+// Same simplification as build/page.test.tsx's Popover mock: render every
+// menu item unconditionally rather than driving Radix's real open/close
+// state, so tests can click a menu action directly instead of simulating
+// a trigger click + portal + floating-ui positioning first.
+vi.mock("@/components/ui/popover", () => ({
+  Popover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  PopoverTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  PopoverContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+}))
+
 vi.mock("@/lib/workforces-api", () => ({
   addWorkforceAgent: addWorkforceAgentMock,
   archiveWorkforce: archiveWorkforceMock,
@@ -605,6 +625,94 @@ describe("workforce route entry points", () => {
     // confusing on a button that mints API keys / configures webhooks.
     const deployButton = screen.getByTitle("workforces.deploy.inactiveDisabled")
     expect(deployButton).toBeDisabled()
+  })
+
+  it("unarchives a workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+    unarchiveWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "draft" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.unarchive" }))
+
+    await waitFor(() => {
+      expect(unarchiveWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    // Reloads the list after a successful unarchive, same as archive/publish.
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it("deletes a workforce from the list card's three-dot menu through the confirm dialog", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse)
+    deleteWorkforcePermanentlyMock.mockResolvedValueOnce(undefined)
+    listWorkforcesMock.mockResolvedValueOnce({ ...listResponse, items: [], total: 0, pages: 0 })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    // ConfirmDialog is mocked to a plain button once open -- the Delete menu
+    // item only opens it, the actual deleteWorkforcePermanently call is
+    // gated behind this second click.
+    expect(deleteWorkforcePermanentlyMock).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(deleteWorkforcePermanentlyMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it("steps pagination back when deleting the last card on a page beyond the first (page.tsx:143-152)", async () => {
+    // Regression coverage for the out-of-range-page fix: deleting the only
+    // item on page 2 must not reload page 2 as-is (the backend would return
+    // zero items for it, rendering the "no workforces" empty state with
+    // pagination hidden since `pages` shrank below the stale page value).
+    listWorkforcesMock
+      // Initial page-1 load: pages > 1 so the Next button renders.
+      .mockResolvedValueOnce({ ...listResponse, pages: 2, total: 11 })
+      // After clicking Next: a single item on page 2.
+      .mockResolvedValueOnce({
+        ...listResponse,
+        items: [{ ...listResponse.items[0], id: 99, name: "Only Item On Page Two" }],
+        pages: 2,
+        total: 11,
+      })
+    deleteWorkforcePermanentlyMock.mockResolvedValueOnce(undefined)
+    // Reload after the step-back: back to the normal page-1 fixture.
+    listWorkforcesMock.mockResolvedValueOnce({ ...listResponse, pages: 1, total: 10 })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.pagination.next" }))
+
+    expect(await screen.findByText("Only Item On Page Two")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(deleteWorkforcePermanentlyMock).toHaveBeenCalledWith(99)
+    })
+    // The reload after stepping back must have been for page 1, not a
+    // re-fetch of the now out-of-range page 2.
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ page: 1 }),
+      )
+    })
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
   })
 
   it("runs an active workforce and opens the created task", async () => {

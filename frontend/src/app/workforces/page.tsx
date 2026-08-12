@@ -58,6 +58,16 @@ export default function WorkforcesPage() {
   const [unarchivingId, setUnarchivingId] = useState<number | null>(null)
   const [archivingId, setArchivingId] = useState<number | null>(null)
   const [publishingId, setPublishingId] = useState<number | null>(null)
+  // The three-dot menu is uncontrolled-by-default in Radix (stays open
+  // after an item click), but the Publish/Unpublish row is conditionally
+  // rendered on item.status -- so once an action's load() resolves and the
+  // list re-renders with a new status, the menu item list at the same
+  // on-screen position can be a different action than what was there when
+  // the menu opened. Tracked as a single id (not per-item local state)
+  // since only one card's menu is ever meaningfully open at a time; closed
+  // eagerly on every action click below rather than waiting for load() to
+  // settle.
+  const [openMenuId, setOpenMenuId] = useState<number | null>(null)
 
   const closeDeploy = () => {
     setDeployItem(null)
@@ -88,6 +98,7 @@ export default function WorkforcesPage() {
 
   const createPublishHandler = (publish: boolean) => async (item: WorkforceListItem) => {
     const apiCall = publish ? publishWorkforce : unpublishWorkforce
+    setOpenMenuId(null)
     try {
       setPublishingId(item.id)
       await apiCall(item.id)
@@ -106,6 +117,7 @@ export default function WorkforcesPage() {
   const handleUnpublish = createPublishHandler(false)
 
   const handleArchive = async (item: WorkforceListItem) => {
+    setOpenMenuId(null)
     try {
       setArchivingId(item.id)
       await archiveWorkforce(item.id)
@@ -120,6 +132,7 @@ export default function WorkforcesPage() {
   }
 
   const handleUnarchive = async (item: WorkforceListItem) => {
+    setOpenMenuId(null)
     try {
       setUnarchivingId(item.id)
       await unarchiveWorkforce(item.id)
@@ -274,9 +287,17 @@ export default function WorkforcesPage() {
                         </div>
 
                         <div className="absolute right-3 top-3">
-                          <Popover>
+                          <Popover
+                            open={openMenuId === item.id}
+                            onOpenChange={(open) => setOpenMenuId(open ? item.id : null)}
+                          >
                             <PopoverTrigger asChild>
-                              <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                aria-label={t("workforces.actions.moreActions")}
+                              >
                                 <MoreVertical className="h-4 w-4" />
                               </Button>
                             </PopoverTrigger>
@@ -333,7 +354,10 @@ export default function WorkforcesPage() {
                                 <Button
                                   variant="ghost"
                                   className="justify-start px-2 py-1.5 h-auto font-normal text-sm text-destructive hover:text-destructive hover:bg-destructive/10"
-                                  onClick={() => setDeleteItem(item)}
+                                  onClick={() => {
+                                    setOpenMenuId(null)
+                                    setDeleteItem(item)
+                                  }}
                                 >
                                   <Trash2 className="mr-2 h-4 w-4" />
                                   {t("workforces.actions.delete")}

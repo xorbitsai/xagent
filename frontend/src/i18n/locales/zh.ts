@@ -3958,6 +3958,7 @@ const zh = {
       archive: "归档",
       unarchive: "取消归档",
       delete: "删除",
+      moreActions: "更多操作",
       deploy: "部署",
       triggers: "触发器",
       share: "分享",

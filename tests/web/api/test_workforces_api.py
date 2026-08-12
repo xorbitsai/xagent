@@ -1085,9 +1085,17 @@ def test_permanent_delete_removes_workforce_regardless_of_status(
         db.close()
 
 
-def test_permanent_delete_preserves_reusable_manager() -> None:
+def test_permanent_delete_skips_non_generated_manager() -> None:
+    """_create_workforce's default manager is plain USER-origin (never
+    workforce-generated), so this only exercises _lock_generated_manager's
+    early short-circuit -- not the exclusive-ownership/shared-manager logic
+    that test_permanent_delete_keeps_unsafe_shared_generated_manager and
+    test_permanent_delete_removes_workforce_regardless_of_status (which
+    marks the manager generated-and-exclusive) actually cover."""
     headers = _admin_headers()
-    workforce = _create_workforce(headers, name="Delete Reusable Manager Workforce")
+    workforce = _create_workforce(
+        headers, name="Delete Non-Generated Manager Workforce"
+    )
     workforce_id = int(workforce["id"])
     manager_id = int(workforce["manager"]["id"])
 
@@ -1204,6 +1212,89 @@ def test_permanent_delete_unregisters_cascade_deleted_trigger_bindings(
     try:
         assert db.get(Workforce, workforce_id) is None
         assert db.get(AgentTrigger, trigger_id) is None
+    finally:
+        db.close()
+
+
+def test_unregister_deleted_trigger_bindings_isolates_per_trigger_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The previous trigger-teardown test monkeypatches
+    unregister_deleted_trigger_bindings itself, so the function body added
+    in 5c412ed5 (get_session_local, the per-trigger `with SessionLocal()`
+    isolation, and the per-item exception swallow) was never actually
+    executed by any test. This exercises the real function -- stubbing only
+    the provider's unregister -- with two triggers, one of which raises, to
+    confirm one binding's failure doesn't block the other's teardown."""
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Isolate Trigger Teardown Workforce")
+    workforce_id = int(workforce["id"])
+
+    db = _direct_db_session()
+    try:
+        ok_trigger = AgentTrigger(
+            user_id=owner_id,
+            workforce_id=workforce_id,
+            type="webhook",
+            name="ok webhook trigger",
+            enabled=True,
+            config={"marker": "ok-trigger"},
+            webhook_token="wf-isolate-ok-token",
+            secret_hash="$2b$hidden",
+        )
+        failing_trigger = AgentTrigger(
+            user_id=owner_id,
+            workforce_id=workforce_id,
+            type="webhook",
+            name="failing webhook trigger",
+            enabled=True,
+            config={"marker": "failing-trigger"},
+            webhook_token="wf-isolate-failing-token",
+            secret_hash="$2b$hidden",
+        )
+        db.add(ok_trigger)
+        db.add(failing_trigger)
+        db.commit()
+        ok_trigger_id = int(ok_trigger.id)
+        failing_trigger_id = int(failing_trigger.id)
+    finally:
+        db.close()
+
+    calls: list[dict[str, Any]] = []
+
+    class _StubProvider:
+        async def unregister(
+            self, db: Any, trigger: Any, config: dict[str, Any]
+        ) -> None:
+            del db, trigger
+            calls.append(dict(config))
+            if config.get("marker") == "failing-trigger":
+                raise RuntimeError("boom")
+
+    stub_provider = _StubProvider()
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.maybe_get_trigger_provider",
+        lambda name: stub_provider if name == "webhook" else None,
+    )
+
+    response = client.delete(
+        f"/api/workforces/{workforce_id}?permanent=true", headers=headers
+    )
+
+    # Best-effort: a provider teardown failure must not surface as a failed
+    # delete -- the workforce and both trigger rows are already gone.
+    assert response.status_code == 200, response.text
+    assert {frozenset(call.items()) for call in calls} == {
+        frozenset({"marker": "ok-trigger"}.items()),
+        frozenset({"marker": "failing-trigger"}.items()),
+    }
+
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(AgentTrigger, ok_trigger_id) is None
+        assert db.get(AgentTrigger, failing_trigger_id) is None
     finally:
         db.close()
 

@@ -12,6 +12,7 @@ from xagent.web.models.agent import Agent, is_workforce_generated_manager_agent
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.database import release_db_connection_if_clean
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
+from xagent.web.models.task import Task
 from xagent.web.models.trigger import AgentTrigger
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
@@ -267,20 +268,36 @@ def delete_workforce_permanently(
         ):
             trigger_type = str(trigger.type)
             config = dict(trigger.config or {})
-            # Expunge now, before this session's cascade-delete and commit
-            # expire every instance it still tracks: an expunged object
-            # keeps its already-loaded column values in memory and is never
-            # touched by this session again, so it stays safely readable
-            # from the background thread that runs the actual provider
-            # teardown post-commit -- accessing an attribute on a still-
-            # tracked, expired, deleted-row instance there would raise
-            # DetachedInstanceError/ObjectDeletedError instead. Cascade
-            # delete is unaffected: Workforce.triggers hasn't been loaded
-            # yet (the fence's expire_all() above cleared any earlier
-            # load), so flush resolves it with its own fresh query,
-            # independent of this separately-queried, now-detached copy.
+            # Expunge now, before this session's cascade-delete and commit:
+            # not required for safety on the pinned SQLAlchemy version -- a
+            # deleted-and-committed instance goes `detached` while keeping
+            # its already-loaded values, so a plain attribute read on it
+            # from the background thread would not itself raise -- but
+            # expunging removes any dependency on that behavior and on
+            # Workforce.triggers staying unloaded through this point (today
+            # true because the fence's expire_all() above cleared any
+            # earlier load, together with _load_workforce's eager-load set
+            # not including .triggers), so a later change to either can't
+            # quietly reintroduce a footgun here.
             db.expunge(trigger)
             trigger_teardowns.append((trigger, trigger_type, config))
+
+        # WorkforceRun.task_id is ondelete="SET NULL" with a non-cascading
+        # Task relationship, and workforce-run tasks default to
+        # is_visible=True -- so without this, the conversations/traces a
+        # "permanent delete" promises to remove would stay fully visible in
+        # history/search after the workforce and its runs are gone. Hiding
+        # rather than deleting the Task rows mirrors stage_delete_agent's
+        # own tasks cleanup (detach/hide, never hard-delete a Task), since
+        # other subsystems (trace storage, workspace files) still key off
+        # the task id.
+        task_ids_query = db.query(WorkforceRun.task_id).filter(
+            WorkforceRun.workforce_id == workforce_id,
+            WorkforceRun.task_id.isnot(None),
+        )
+        db.query(Task).filter(Task.id.in_(task_ids_query)).update(
+            {Task.is_visible: False}, synchronize_session=False
+        )
 
         # Neither table is reachable through the ORM cascades on Workforce,
         # and SQLite runs without foreign-key enforcement, so the DB-level

@@ -807,18 +807,24 @@ def unregister_deleted_trigger_bindings(
     """Best-effort provider teardown for trigger rows deleted outside the
     trigger CRUD path (workforce hard delete cascades them away).
 
-    Runs on its own session(s) rather than accepting one from the caller:
-    this is invoked via ``asyncio.to_thread`` from an async route, and the
-    caller's request-scoped ``Session`` is not safe to hand to a background
-    thread -- same reasoning as ``pause_workforce_tasks_after_archive``,
-    which this mirrors by opening a fresh session per item so one binding's
-    failure can't roll back another's still-pending work.
+    Runs each item on its own session and its own worker thread, in
+    parallel: this whole function is already invoked via a single
+    ``asyncio.to_thread`` from an async route, and a caller with N triggers
+    (e.g. N Gmail watches) would otherwise pay N sequential provider
+    round-trips serialized on that one thread before the response can
+    return. A fresh session per item also means one binding's failure can't
+    roll back another's still-pending work -- same reasoning
+    ``pause_workforce_tasks_after_archive`` already applies per pause
+    target, just fanned out across threads here instead of processed
+    one-by-one on the single thread the caller already offloaded to.
 
     Mirrors ``_delete_trigger``'s tail otherwise: the rows are already gone
     and committed, so a teardown failure is logged rather than surfaced -- it
     must not turn an already-successful delete into an error. Each
     ``(trigger, trigger_type, config)`` tuple must have been captured BEFORE
-    the delete committed (the detached rows' attributes are expired).
+    the delete committed, with ``trigger`` expunged from the capturing
+    session so it stays a plain, already-hydrated object safe to read from
+    any of these worker threads.
     """
     if not teardowns:
         return
@@ -826,7 +832,9 @@ def unregister_deleted_trigger_bindings(
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
-    for trigger, trigger_type, config in teardowns:
+
+    def _teardown_one(item: tuple[AgentTrigger, str, dict[str, Any]]) -> None:
+        trigger, trigger_type, config = item
         try:
             with SessionLocal() as db:
                 _unregister_trigger_binding(
@@ -839,6 +847,12 @@ def unregister_deleted_trigger_bindings(
                 "be leaked (type=%s)",
                 trigger_type,
             )
+
+    with ThreadPoolExecutor(max_workers=min(len(teardowns), 8)) as pool:
+        # Consume the map() iterator so we actually wait for every worker to
+        # finish before returning -- _teardown_one already swallows its own
+        # exceptions, so this never raises.
+        list(pool.map(_teardown_one, teardowns))
 
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:

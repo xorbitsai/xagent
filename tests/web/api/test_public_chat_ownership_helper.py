@@ -1,19 +1,22 @@
 """Unit coverage for ``task_is_owned_by_public_principal``, the shared
 ownership predicate extracted from ``public_chat_access.py``'s four
 widget/share entry points (see that predicate's own docstring for the exact
-conjunction and the two deliberate tightenings over the pre-existing code).
+conjunction and the three deliberate tightenings over the pre-existing code).
 
 Pure-Python unit tests against unpersisted ``Task`` instances -- the
 predicate never issues SQL, so no database fixture is needed here. Phase 2
 of this delivery is what proves the three wired entry points still make
-the same allow/deny decision after routing through this predicate (via the
-existing, unmodified ``public_chat_access`` test suites, which pass with
-the same count before and after). That is narrower than "behave
-identically": for a combined-failure input (identity wrong and something
-else also wrong), which of the two denial messages comes back can differ
-from the pre-existing per-function order -- see
-``public_chat_identity_matches``'s own docstring for the precedence rule
-and why the change only narrows what a denied response reveals.
+the same allow/deny decision after routing through this predicate, for
+every input the pre-existing per-function checks were ever actually fed
+(via the existing, unmodified ``public_chat_access`` test suites, which
+pass with the same count before and after) -- the documented deliberate
+tightenings are the exception, changing the decision on inputs (such as a
+boolean entity-binding value) those checks never needed to classify. That
+is narrower than "behave identically": for a combined-failure input
+(identity wrong and something else also wrong), which of the two denial
+messages comes back can differ from the pre-existing per-function order --
+see ``public_chat_identity_matches``'s own docstring for the precedence
+rule and why the change only narrows what a denied response reveals.
 """
 
 from __future__ import annotations
@@ -242,6 +245,44 @@ def test_widget_workforce_binding_rejects_non_int_convertible_value_without_rais
     assert (
         task_is_owned_by_public_principal(task, _widget_workforce_principal()) is False
     )
+
+
+def test_widget_workforce_binding_rejects_a_true_config_value_against_id_one() -> None:
+    """A JSON ``true`` deserializes to Python's ``True``, and Python's
+    ``bool`` is an ``int`` subclass, so ``int(True) == 1``. Without an
+    explicit rejection, a task whose ``widget_workforce_id`` config value
+    is ``True`` would match a principal addressing workforce id ``1``,
+    admitting a guest into a task that was never actually bound to that
+    workforce. The predicate must treat this the same as any other
+    non-matching value."""
+
+    task = _task(
+        agent_id=None,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "g-1",
+            "widget_workforce_id": True,
+        },
+    )
+    principal = _widget_workforce_principal(widget_workforce_id=1)
+    assert task_is_owned_by_public_principal(task, principal) is False
+
+
+def test_share_workforce_binding_rejects_a_true_config_value_against_id_one() -> None:
+    """Same boolean-folding hazard as the widget-workforce case above, for
+    the share-workforce direction: a config value of ``True`` must not be
+    treated as matching a principal addressing workforce id ``1``."""
+
+    task = _task(
+        agent_id=None,
+        agent_config={
+            "auth_mode": "share",
+            "guest_id": "g-1",
+            "share_workforce_id": True,
+        },
+    )
+    principal = _share_workforce_principal(share_workforce_id=1)
+    assert task_is_owned_by_public_principal(task, principal) is False
 
 
 def test_share_agent_binding_rejects_when_config_key_is_missing_even_if_row_level_matches() -> (

@@ -175,9 +175,34 @@ def _json_entity_binding_matches(config_value: Any, expected: int) -> bool:
     non-empty dict) is new ground neither shape ever needed to cover
     safely until this predicate started being called with untrusted JSON
     it does not otherwise validate the shape of.
+
+    ``bool`` values are excluded before the ``int(...)`` conversion even
+    runs, for either argument. ``bool`` is a subclass of ``int`` in Python,
+    so ``int(True)`` folds to ``1`` and ``int(False)`` folds to ``0`` --
+    without this exclusion, a JSON ``true``/``false`` entity-binding value
+    would silently compare equal to entity id ``1``/``0``. This one *is* a
+    behavior change from the pre-existing ``int(x or 0) != expected``
+    shape: that shape had no notion of "not an int" at all, so a
+    ``config_value`` of ``True`` folded to ``1`` and matched an
+    ``expected`` of ``1`` the same as a genuine id would. This predicate
+    treats that fold as a bug, not a feature, and rejects it.
     """
 
     if config_value is None:
+        return False
+    # ``bool`` is a subclass of ``int``, so ``int(True)`` folds to ``1`` and
+    # would compare equal to an entity id of ``1``. Two existing guards on
+    # this authorization chain already reject booleans for that reason:
+    # ``_is_strict_int`` in ``web/api/public_chat_access.py`` screens the
+    # JWT claim before it reaches ``expected`` here, and
+    # ``_coerce_optional_entity_id`` in ``web/api/chat.py`` screens
+    # ``agent_config`` reads on a separate path. The ``expected`` side is
+    # therefore already pre-screened by the time it gets here -- the
+    # ``isinstance(expected, bool)`` check is a second line of defense, not
+    # this predicate's only one. ``config_value`` has no such upstream
+    # guard, since it is read straight off ``task.agent_config``, so this
+    # predicate applies the same judgement to both sides itself.
+    if isinstance(config_value, bool) or isinstance(expected, bool):
         return False
     try:
         return int(config_value) == expected
@@ -191,7 +216,7 @@ def task_is_owned_by_public_principal(
     """The shared conjunction extracted from ``public_chat_access.py``'s
     four widget/share ownership checks (``_get_task_for_workforce_widget_context``,
     ``get_task_for_public_context``, ``_get_task_for_workforce_share_context``,
-    ``get_task_for_share_context``), plus two deliberate tightenings over
+    ``get_task_for_share_context``), plus three deliberate tightenings over
     that pre-existing code.
 
     Direction is inferred from which single entity-binding field is
@@ -229,7 +254,7 @@ def task_is_owned_by_public_principal(
        widget-agent direction directly.
     2. ``task.agent_config`` is a ``dict``.
     3. ``task.agent_config["auth_mode"] == principal.auth_mode``. This is
-       one of the two tightenings: the pre-existing widget-agent branch of
+       the first of the three tightenings: the pre-existing widget-agent branch of
        ``get_task_for_public_context`` never checks ``auth_mode`` at all,
        while the other three entry points do. A widget guest whose
        self-chosen ``guest_id`` happens to equal a share guest's
@@ -254,6 +279,14 @@ def task_is_owned_by_public_principal(
        dict) as not matching rather than letting ``int(...)`` raise -- see
        that function's own docstring for why this is not a behavior change
        from the pre-existing shape for the inputs that shape actually saw.
+       The third tightening lives in that same helper: a ``config_value``
+       or ``expected`` of ``True``/``False`` is rejected outright before
+       the ``int(...)`` conversion runs, because ``bool`` is a subclass of
+       ``int`` and would otherwise fold to ``1``/``0`` and match a genuine
+       entity id of ``1``/``0`` -- unlike the previous two, this one *is* a
+       behavior change from the pre-existing ``int(x or 0)`` shape, which
+       had no way to distinguish a boolean from a real id and would have
+       accepted the fold.
        - widget-agent: ``task.agent_id == principal.widget_agent_id``
          (row-level only; the pre-existing code has no JSON-level widget
          entity binding to mirror -- see the candidate issue below).

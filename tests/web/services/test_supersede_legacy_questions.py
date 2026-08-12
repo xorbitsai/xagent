@@ -19,7 +19,7 @@ import logging
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.exc import InvalidRequestError, OperationalError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
 from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.orm.session import SessionTransaction
 
@@ -548,6 +548,55 @@ def test_supersede_opens_a_savepoint(monkeypatch):
 
         assert updated == 1
         assert calls["n"] == 1
+    finally:
+        db.close()
+
+
+def test_supersede_lets_a_callers_pending_write_failure_reach_the_caller():
+    """``Session.begin_nested()`` flushes the session on entry, so a
+    constraint violation among rows the *caller* staged and has not
+    flushed would fire inside this helper. It must not be absorbed by the
+    helper's own ``except DBAPIError``: the failure is the caller's, the
+    UPDATE never ran, and reporting it as a supersede failure would send
+    whoever reads the ops signal to the wrong function while the caller
+    is left with an opaque ``PendingRollbackError`` at commit.
+
+    The pending row here violates a real ``NOT NULL`` constraint at the
+    database layer rather than through a patched method, so the failure
+    is the one production would raise.
+    """
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        question = persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+        question_id = int(question.id)
+
+        # The caller's own staged, unflushed, constraint-violating row.
+        db.add(
+            TaskChatMessage(
+                task_id=int(task.id),
+                user_id=int(task.user_id),
+                role="assistant",
+                content=None,
+                message_type="assistant_message",
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
+        assert signal_name not in ops_signals.active_degradations()
+
+        db.rollback()
+        row = db.query(TaskChatMessage).filter(TaskChatMessage.id == question_id).one()
+        assert row.message_type == QUESTION_MESSAGE_TYPE
     finally:
         db.close()
 

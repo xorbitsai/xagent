@@ -369,6 +369,26 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     transition, while this one is a best-effort cleanup sweep that can
     safely no-op and retry on a later call.
 
+    ``Session.begin_nested()`` flushes the whole session before it issues
+    the SAVEPOINT, and does so unconditionally: the flush is gated on
+    transaction origin, not on ``autoflush``, so the production session's
+    ``autoflush=False`` (``models/database.py``) does not suppress it.
+    This function therefore calls ``db.flush()`` itself, outside the
+    ``try``, before opening the savepoint. Without that, a constraint
+    violation among the caller's *own* pending rows raises
+    ``IntegrityError`` — a ``DBAPIError`` subclass — from inside
+    ``begin_nested()`` before the UPDATE runs, and the catch absorbs it:
+    the caller's failure gets reported as a legacy question supersede
+    failure, and the caller meets an opaque ``PendingRollbackError`` at
+    commit with nothing pointing at the real cause. With the flush first,
+    that failure leaves this function on the line that caused it and the
+    catch covers only the UPDATE and its savepoint. This function adds
+    nothing to the session, so a flush failure here is always the
+    caller's, never this helper's, and is left to propagate unchanged.
+    ``interaction_handoff`` (``task_interaction_staging.py``) takes the
+    same position on the same SQLAlchemy behavior, translating it into
+    ``InteractionOwnerStateError`` rather than swallowing it.
+
     Serializing this against a concurrent ``respond()`` call on the same
     task is not this function's job — it relies on the caller's
     transaction already holding the task locked (a real row lock on
@@ -377,19 +397,27 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
 
     This function has no caller in ``src/`` yet. The intended call site
     sits inside ``interaction_handoff`` (``task_interaction_staging.py``),
-    after ``persist_assistant_message_no_commit`` and an explicit
-    ``db.flush()``, and would supersede the very transcript row that
-    flush just made visible — on purpose, because the structured
-    interaction row staged in the same turn is meant to become the
-    question a future protocol-version-gated reader serves instead. That
+    after ``persist_assistant_message_no_commit``, and would supersede
+    the very transcript row that call staged — on purpose, because the
+    structured interaction row staged in the same turn is meant to become
+    the question a future protocol-version-gated reader serves instead.
+    Making that pending row visible to the UPDATE is the flush above, so
+    it is this function's own job and not a call-site obligation. That
     reader gate does not exist yet: ``get_latest_waiting_question`` gates
     on ``task_id``/``role``/``message_type`` only, nothing about protocol
     version. This paragraph is therefore a contract on the follow-up that
     introduces both the caller and that reader gate, not a description of
     current behavior — the wiring change's acceptance criteria carry the
-    full call-site obligations (ordering, the explicit flush, never
-    calling this on a transcript question meant to remain answerable).
+    remaining call-site obligations (ordering, and never calling this on
+    a transcript question meant to remain answerable).
     """
+
+    # ``Session.begin_nested()`` flushes the whole session before issuing the
+    # SAVEPOINT, so that flush -- and any constraint violation among the
+    # caller's own pending rows -- would otherwise happen inside the try below
+    # and be caught as if this UPDATE had failed. Flushing here, outside the
+    # try, keeps a caller-originated failure attributed to the caller.
+    db.flush()
 
     updated = 0
     statement_succeeded = False

@@ -54,7 +54,10 @@ answer fence, the compatibility seam into the existing resume coordinator,
 and any new counter. Those land with later changes; this module's own
 zero-production-caller gate
 (``tests/web/services/test_task_interaction_service_production_gate.py``)
-is what keeps that boundary enforced rather than aspirational.
+gives that boundary a regression guard against import bindings, not an
+absolute one -- the gate's own docstring lists what it cannot see
+(dynamic access, alias/re-export chains, filename-stem exclusion, and
+code outside the scanned package tree).
 """
 
 from __future__ import annotations
@@ -806,12 +809,20 @@ def create(
     not this one.
 
     Validation order, each step short-circuiting on the first failure:
-    ``kind`` and ``protocol_version`` against the v1 vocabulary and
-    version, ``request_idempotency_key`` against ``str`` first (a non-string
-    value -- ``None``, an ``int``, ``bytes`` -- is rejected before the
-    normalizer is ever called, not caught as a side effect of whatever
-    ``TypeError``/``AttributeError`` a non-string would raise inside it)
-    and then ``COMMAND_ID_PATTERN`` (via ``task_command_transport``'s own
+    ``kind`` against ``str`` first (a non-string value -- a ``list``, a
+    ``dict`` -- is rejected before the ``in _KIND_VOCABULARY`` membership
+    test ever runs, not caught as a side effect of the ``TypeError:
+    unhashable type`` that test would otherwise raise for an unhashable
+    value) and then against the v1 vocabulary, ``protocol_version``
+    against ``int`` first excluding ``bool`` (``True`` and ``1.0`` both
+    equal ``1`` in Python, so the type check has to run before the
+    version comparison, not instead of it) and then against the v1
+    version, ``request_idempotency_key`` against ``str`` first (a
+    non-string value -- ``None``, an ``int``, ``bytes`` -- is rejected
+    before the normalizer is ever called, not caught as a side effect of
+    whatever ``TypeError``/``AttributeError`` a non-string would raise
+    inside it) and then ``COMMAND_ID_PATTERN`` (via
+    ``task_command_transport``'s own
     normalizer, not a copy of its regex), ``values`` against the v1
     ``request_payload`` contract (shape, via ``parse_v1_request_payload``,
     then JSON-serializability with ``allow_nan=False``, via

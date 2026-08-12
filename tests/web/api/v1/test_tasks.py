@@ -2753,6 +2753,73 @@ def test_append_message_to_running_task_returns_409(mock_start_task):
     assert mock_start_task.call_count == 0
 
 
+def test_append_message_to_waiting_task_returns_interaction_response_required(
+    mock_start_task,
+):
+    """Appending to a waiting_for_user task is rejected with the
+    dedicated code (not task_busy), points at reply, and leaves the task
+    completely untouched -- no new transcript row, same status, same
+    run_id, no new background kickoff."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+    db = _direct_db_session()
+    try:
+        before = db.query(Task).filter(Task.id == task_id).one()
+        run_id_before = before.run_id
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_before = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+    finally:
+        db.close()
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_response_required"
+    assert "reply" in resp.json()["error"]["message"]
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        after = db.query(Task).filter(Task.id == task_id).one()
+        assert after.status == TaskStatus.WAITING_FOR_USER
+        assert after.run_id == run_id_before
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_after = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+        assert message_count_after == message_count_before
+    finally:
+        db.close()
+
+
+def test_append_message_to_running_task_still_returns_task_busy(mock_start_task):
+    """The new waiting-specific code must not leak onto the
+    unrelated RUNNING rejection -- RUNNING keeps plain task_busy."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.RUNNING)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "task_busy"
+    assert mock_start_task.call_count == 0
+
+
 def test_append_message_claims_slot_atomically(mock_start_task):
     """Successful append flips task.status to RUNNING in the same
     transaction as the input write, so a concurrent POST can't pass

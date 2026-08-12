@@ -987,12 +987,14 @@ def _claim_turn_no_commit(
     )
     if claimed == 0:
         owned = (
-            db.query(Task.id)
+            db.query(Task.id, Task.status)
             .filter(Task.id == task_id, Task.user_id == task_owner_user_id)
             .first()
         )
         if owned is None:
             raise TaskTurnNotFoundError(task_id)
+        if owned.status == TaskStatus.WAITING_FOR_USER:
+            raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
 
     task_lease = acquire_task_lease_no_commit(

@@ -958,12 +958,13 @@ async def append_message_to_task(
          provided with a workforce key, must match the bound workforce
          (404 ``workforce_not_found`` otherwise).
       3. Rejects the call with 409 ``task_busy`` if the task is
-         currently ``RUNNING`` -- the SDK client should poll
-         ``GET /v1/chat/tasks/{id}`` until status leaves RUNNING and
-         retry. Workforce turn rejections map to their own stable
-         codes (``workforce_archived`` / ``workforce_config_changed``,
-         409 -- NOT retryable) so clients aren't told to retry a
-         permanently-rejected conversation.
+         currently ``RUNNING``, or 409 ``interaction_response_required``
+         if it is ``WAITING_FOR_USER`` -- that status answers a pending
+         agent question and is handled by
+         ``POST /v1/chat/tasks/{id}/reply`` instead. Workforce turn
+         rejections map to their own stable codes (``workforce_archived``
+         / ``workforce_config_changed``, 409 -- NOT retryable) so clients
+         aren't told to retry a permanently-rejected conversation.
       4. Otherwise persists the new user message to
          ``task_chat_messages``, updates ``task.input`` to record
          this turn's input, and kicks off the next background turn
@@ -983,8 +984,9 @@ async def append_message_to_task(
         V1ApiError 404: task not found OR not owned by the key OR
             body.agent_id / body.workforce_id doesn't match the bound
             owner.
-        V1ApiError 409: ``task_busy`` (retryable) or a workforce
-            rejection code (not retryable).
+        V1ApiError 409: ``task_busy`` (retryable), a workforce rejection
+            code (not retryable), or ``interaction_response_required``
+            (use ``reply`` instead).
         500: any other unexpected error (V1 envelope via global handler).
     """
     actor_user_id = principal.owner_user_id

@@ -414,6 +414,18 @@ class AgentExecutionAdapter:
                     ),
                 }
             )
+        if status == "interrupted":
+            # A losing waiting step can still be superseded in a batch whose
+            # winner is an interrupt rather than a question (the DAG ranks
+            # an interrupt ahead of a waiting result within the same
+            # wakeup), so this key must reach the top level here too --
+            # otherwise a reader has no way to tell "no sibling was
+            # superseded" apart from "this status never carries the key".
+            # Same empty-list default as the waiting branch above, for the
+            # same reason: one ``if superseded:`` check covers both.
+            normalized["clarification_superseded_step_ids"] = (
+                result.get("clarification_superseded_step_ids") or []
+            )
         return normalized
 
     def _latest_assistant_message(self, context: Any) -> str | None:

@@ -60,11 +60,17 @@ def _intercom_provider_row() -> dict[str, object]:
         "name": "Intercom",
         "client_id": os.environ.get("INTERCOM_CLIENT_ID", ""),
         "client_secret": os.environ.get("INTERCOM_CLIENT_SECRET", ""),
-        # Single global authorize host: once a public app clears Intercom App
-        # Review, Intercom replicates it across US/EU/AU automatically.
+        # Single global authorize host: per Intercom's community answer
+        # (community.intercom.com/api-webhooks-23/do-we-need-to-create
+        # -multiple-oauth-apps-per-data-region-2522), a public app is
+        # replicated across US/EU/AU automatically once it clears Intercom
+        # App Review. See builtin_mcp_registry.py's intercom provider row for
+        # the full citation and the caveat that this is a community answer,
+        # not primary docs, unverified against a live non-US workspace.
         "auth_url": "https://app.intercom.com/oauth",
         # No region prefix: api.intercom.io auto-routes to the workspace's
-        # actual hosting region (US/EU/AU), unlike Intercom's hosted MCP
+        # actual hosting region (US/EU/AU) -- this part is documented in
+        # Intercom's primary REST API reference, unlike Intercom's hosted MCP
         # server (mcp.intercom.com / mcp.eu.intercom.com) which has separate
         # per-region endpoints and does not support AU workspaces at all.
         "token_url": "https://api.intercom.io/auth/eagle/token",
@@ -89,7 +95,10 @@ def _intercom_app_row() -> dict[str, object]:
         "provider_name": "intercom",
         "category": "Support",
         "oauth_scopes": [],
-        "is_visible_in_connector": True,
+        # Hidden until manually verified against a live workspace -- see
+        # builtin_mcp_registry.py's intercom app row for the full rationale
+        # (this ships customer-facing write tools: reply/note/close).
+        "is_visible_in_connector": False,
         "launch_config": {
             "command": "python",
             "args": ["-m", "xagent.web.tools.mcp.intercom"],
@@ -159,13 +168,20 @@ def downgrade() -> None:
         if remaining_intercom_apps:
             return
 
-    # Delete unconditionally by provider_name, matching the sibling seed
-    # migrations (slack, meta, google-maps). A shape-matching guard would
-    # protect the wrong thing: an admin recreating the *real* Intercom
-    # provider enters Intercom's canonical URLs, which would match the guard
-    # and be deleted anyway -- only a differently-shaped row would survive.
+    # Only delete the provider row when it still matches the static shape this
+    # migration seeded, so an admin-created "intercom" provider (via
+    # POST /admin/mcp/providers) is preserved -- same guard as the zoom seed
+    # migration, and for the same reason: unlike slack/meta/google-maps (whose
+    # downgrades delete unconditionally), a differently-shaped custom row here
+    # must survive. client_id/client_secret are env-dependent and
+    # intentionally not part of the guard. name/auth_url/token_url are NOT
+    # NULL core columns present since the table's creation, so they can be
+    # matched unconditionally.
+    seeded_provider = _intercom_provider_row()
     bind.execute(
-        sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
-            FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "intercom"
-        )
+        sa.delete(FULL_OAUTH_PROVIDERS_TABLE)
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "intercom")
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.name == seeded_provider["name"])
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.auth_url == seeded_provider["auth_url"])
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.token_url == seeded_provider["token_url"])
     )

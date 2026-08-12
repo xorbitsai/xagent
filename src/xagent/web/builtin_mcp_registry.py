@@ -170,17 +170,27 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "name": "Intercom",
             "client_id": os.environ.get("INTERCOM_CLIENT_ID", ""),
             "client_secret": os.environ.get("INTERCOM_CLIENT_SECRET", ""),
-            # The single "app.intercom.com" authorize host serves every
-            # region: once a public app clears Intercom App Review, Intercom
-            # replicates it across US/EU/AU automatically, so there is no
-            # per-region app or authorize URL to manage.
+            # The single "app.intercom.com" authorize host is claimed to serve
+            # every region: per Intercom's community answer to this exact
+            # question (community.intercom.com/api-webhooks-23/do-we-need-to
+            # -create-multiple-oauth-apps-per-data-region-2522), a public app
+            # is replicated across US/EU/AU automatically once it clears
+            # Intercom App Review, so there is no per-region app or authorize
+            # URL to manage. This is a community answer, not primary API
+            # reference docs, and has not been verified end-to-end against a
+            # live non-US workspace -- if it turns out to be wrong, EU/AU
+            # connects would need their own provider row instead of sharing
+            # this one.
             "auth_url": "https://app.intercom.com/oauth",
-            # "api.intercom.io" (no region prefix) auto-routes each request
-            # to the workspace's actual hosting region (US/EU/AU) based on
-            # the token/workspace being acted on -- this is what lets one
-            # provider row, unlike the hosted MCP server's separate
-            # mcp.intercom.com / mcp.eu.intercom.com endpoints (which don't
-            # support AU workspaces at all), cover all three regions.
+            # "api.intercom.io" (no region prefix) auto-routes each request to
+            # the workspace's actual hosting region (US/EU/AU) based on the
+            # token/workspace being acted on -- this part IS documented in
+            # Intercom's primary REST API reference (developers.intercom.com/
+            # docs/build-an-integration/learn-more/rest-apis, "About our REST
+            # API"). Combined with the authorize-host claim above, this is
+            # what lets one provider row, unlike the hosted MCP server's
+            # separate mcp.intercom.com / mcp.eu.intercom.com endpoints (which
+            # don't support AU workspaces at all), cover all three regions.
             "token_url": "https://api.intercom.io/auth/eagle/token",
             "redirect_uri": os.environ.get("INTERCOM_REDIRECT_URI", ""),
             "userinfo_url": "https://api.intercom.io/me",
@@ -735,12 +745,20 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": "intercom",
             "category": "Support",
             "oauth_scopes": [],
-            "is_visible_in_connector": True,
+            # Hidden until manually verified against a live workspace (all
+            # three regions, ideally), same precedent as the chrome row
+            # above: it ships customer-facing *write* tools (reply/note/
+            # close) discoverable by every user the moment it's visible, and
+            # that hasn't happened yet. Flip to True via a follow-up once
+            # that verification is done -- no redeploy needed, per the chrome
+            # row's note (is_visible_in_connector is not builtin-protected).
+            "is_visible_in_connector": False,
             # A local FastMCP module talking to Intercom's REST API directly,
             # not Intercom's hosted MCP server (mcp.intercom.com) -- that
             # hosted server does not support AU-hosted workspaces, while the
             # underlying REST API and OAuth (api.intercom.io, auto-routed)
-            # do, which this connector needs for AU customers.
+            # do, which this connector needs for AU customers. See the
+            # oauth_providers row above for the region-coverage citation.
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.intercom"],

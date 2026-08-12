@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import time
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -20,14 +22,24 @@ mcp = FastMCP("intercom-mcp")
 # host covers every region without per-region configuration.
 INTERCOM_BASE_URL = "https://api.intercom.io"
 # Pinned so a future default-version bump on Intercom's side can't silently
-# change response shapes underneath these tools.
+# change response shapes underneath these tools. Re-check this against
+# Intercom's API changelog (developers.intercom.com/docs/references) whenever
+# 2.11 is scheduled for deprecation, and bump deliberately rather than
+# reactively once a version stops resolving.
 INTERCOM_API_VERSION = "2.11"
 DEFAULT_TIMEOUT_SECONDS = 30
+# Conversation/contact endpoints are rate-limited per-app; on a 429 with a
+# small Retry-After we wait once and retry rather than failing outright,
+# mirroring the same bounded-retry policy as the Slack sibling module.
+MAX_RETRY_AFTER_SECONDS = 30
 
-# Keyed by access token, not a single process-global value: this module is
-# imported once per subprocess, but nothing guarantees a subprocess is never
-# reused across a different user/token, and a bare global would leak one
-# user's admin identity into another user's replies in that case.
+# Keyed by access token, defense-in-depth rather than an active optimization:
+# every MCP tool call currently spawns and tears down a fresh subprocess
+# (mcp_adapter._execute_mcp_call -> create_session), so in practice a process
+# only ever sees one token and this dict never holds more than one entry.
+# Keying by token still costs nothing and keeps this safe against a future
+# pooled/reused-subprocess architecture, where a bare global would leak one
+# user's admin identity into another user's replies.
 _admin_id_cache: dict[str, str] = {}
 
 
@@ -58,14 +70,25 @@ def _request(
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
 ) -> Any:
-    response = requests.request(
-        method=method,
-        url=f"{INTERCOM_BASE_URL}{path}",
-        headers=_headers(),
-        params=params,
-        json=body,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-    )
+    for attempt in (0, 1):
+        response = requests.request(
+            method=method,
+            url=f"{INTERCOM_BASE_URL}{path}",
+            headers=_headers(),
+            params=params,
+            json=body,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 429 and attempt == 0:
+            try:
+                retry_after = int(response.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after = 0
+            if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
+                time.sleep(retry_after)
+                continue
+        break
+
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -155,7 +178,7 @@ def intercom_get_contact(contact_id: str) -> str:
     Get an Intercom contact by id.
     """
     try:
-        contact = _request("GET", f"/contacts/{contact_id}")
+        contact = _request("GET", f"/contacts/{quote(contact_id, safe='')}")
         return _success(contact=contact)
     except Exception as e:
         logger.error(f"Error getting contact: {e}")
@@ -173,12 +196,25 @@ def intercom_list_conversations(state: str = "open", limit: int = 20) -> str:
         if state not in valid_states:
             raise ValueError(f"state must be one of {sorted(valid_states)}")
 
+        # `query` is a required field on /conversations/search (unlike
+        # GET /conversations, which has no filter and a different
+        # pagination/response shape) -- for "all" we still filter, on a
+        # predicate every real conversation satisfies, rather than switch
+        # endpoints just to express "no filter".
+        if state == "all":
+            query: dict[str, Any] = {
+                "field": "created_at",
+                "operator": ">",
+                "value": 0,
+            }
+        else:
+            query = {"field": "state", "operator": "=", "value": state}
+
         body: dict[str, Any] = {
+            "query": query,
             "pagination": {"per_page": max(1, min(limit, 100))},
             "sort": {"field": "updated_at", "order": "descending"},
         }
-        if state != "all":
-            body["query"] = {"field": "state", "operator": "=", "value": state}
 
         result = _request("POST", "/conversations/search", body=body)
         conversations = [
@@ -197,7 +233,9 @@ def intercom_get_conversation(conversation_id: str) -> str:
     (conversation_parts).
     """
     try:
-        conversation = _request("GET", f"/conversations/{conversation_id}")
+        conversation = _request(
+            "GET", f"/conversations/{quote(conversation_id, safe='')}"
+        )
         parts = (conversation.get("conversation_parts") or {}).get(
             "conversation_parts", []
         )
@@ -226,7 +264,7 @@ def intercom_reply_to_conversation(conversation_id: str, body: str) -> str:
     try:
         reply = _request(
             "POST",
-            f"/conversations/{conversation_id}/reply",
+            f"/conversations/{quote(conversation_id, safe='')}/reply",
             body={
                 "message_type": "comment",
                 "type": "admin",
@@ -249,7 +287,7 @@ def intercom_add_internal_note(conversation_id: str, body: str) -> str:
     try:
         reply = _request(
             "POST",
-            f"/conversations/{conversation_id}/reply",
+            f"/conversations/{quote(conversation_id, safe='')}/reply",
             body={
                 "message_type": "note",
                 "type": "admin",
@@ -271,7 +309,7 @@ def intercom_close_conversation(conversation_id: str) -> str:
     try:
         conversation = _request(
             "POST",
-            f"/conversations/{conversation_id}/parts",
+            f"/conversations/{quote(conversation_id, safe='')}/parts",
             body={
                 "message_type": "close",
                 "type": "admin",

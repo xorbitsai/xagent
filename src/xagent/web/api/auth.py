@@ -1470,6 +1470,24 @@ def generic_oauth_callback(
         token_data = _normalize_intercom_token_response(provider, token_data)
         access_token = token_data.get("access_token")
 
+        if not access_token:
+            # Without this, a token response that slips past the "error" in
+            # token_data check above (e.g. Intercom's error.list envelope,
+            # which doesn't use that key) would fall through to the
+            # persistence block below with access_token=None, hit
+            # UserOAuth.access_token's NOT NULL constraint, and surface as a
+            # raw SQLAlchemy IntegrityError message through the generic
+            # exception handler instead of a clear, actionable error.
+            import html
+
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an access token.</p>"
+                ),
+                status_code=400,
+            )
+
         provider_user_id = None
         email = None
 

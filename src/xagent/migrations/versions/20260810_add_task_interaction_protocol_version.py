@@ -50,26 +50,26 @@ def _target_schema() -> str | None:
     return str(schema) if schema else None
 
 
-def _online_columns(schema: str | None) -> set[str]:
+def _online_inventory(schema: str | None) -> tuple[set[str], set[str]] | None:
+    """One inspector, one table-names fetch: the tasks columns and the names
+    of its ck_ CHECK constraints, or None when tasks does not exist. No
+    branch in this migration creates or drops tasks -- only columns and
+    constraints on it -- so a single fetch cannot go stale. Do not reuse the
+    returned sets after a DDL statement: they are a snapshot, and the
+    inspector behind them caches.
+    """
     inspector = sa.inspect(op.get_bind())
     if TABLE not in inspector.get_table_names(schema=schema):
-        return set()
-    return {str(item["name"]) for item in inspector.get_columns(TABLE, schema=schema)}
-
-
-def _online_table_exists(schema: str | None) -> bool:
-    return TABLE in sa.inspect(op.get_bind()).get_table_names(schema=schema)
-
-
-def _online_check_constraints(schema: str | None) -> set[str]:
-    inspector = sa.inspect(op.get_bind())
-    if TABLE not in inspector.get_table_names(schema=schema):
-        return set()
-    return {
+        return None
+    columns = {
+        str(item["name"]) for item in inspector.get_columns(TABLE, schema=schema)
+    }
+    checks = {
         str(item["name"])
         for item in inspector.get_check_constraints(TABLE, schema=schema)
         if item.get("name")
     }
+    return columns, checks
 
 
 def upgrade() -> None:
@@ -97,10 +97,12 @@ def upgrade() -> None:
     # DDL can never diverge onto different schemas.
     schema = _target_schema()
 
-    if not _online_table_exists(schema):
+    inventory = _online_inventory(schema)
+    if inventory is None:
         return
+    columns, checks = inventory
 
-    if COLUMN not in _online_columns(schema):
+    if COLUMN not in columns:
         op.add_column(
             TABLE,
             sa.Column(COLUMN, sa.Integer(), nullable=True),
@@ -122,7 +124,7 @@ def upgrade() -> None:
     # cannot fail -- but on a large deployment, a NOT VALID constraint
     # followed by a separate VALIDATE CONSTRAINT would move validation out
     # of the lock window if that ever becomes a concern.
-    if CONSTRAINT_NAME not in _online_check_constraints(schema):
+    if CONSTRAINT_NAME not in checks:
         op.create_check_constraint(
             CONSTRAINT_NAME, TABLE, CONSTRAINT_CONDITION, schema=schema
         )
@@ -166,14 +168,16 @@ def downgrade() -> None:
 
     schema = _target_schema()
 
-    if not _online_table_exists(schema):
+    inventory = _online_inventory(schema)
+    if inventory is None:
         return
+    columns, checks = inventory
 
     if context.dialect.name == "postgresql":
-        if CONSTRAINT_NAME in _online_check_constraints(schema):
+        if CONSTRAINT_NAME in checks:
             op.drop_constraint(CONSTRAINT_NAME, TABLE, type_="check", schema=schema)
 
-        if COLUMN in _online_columns(schema):
+        if COLUMN in columns:
             op.drop_column(TABLE, COLUMN, schema=schema)
         return
 
@@ -188,8 +192,8 @@ def downgrade() -> None:
     # a plain drop_column() breaks on that shape. batch_alter_table rebuilds
     # the table (copy/rename/drop) instead, which drops the constraint and
     # the column together regardless of which shape this database has.
-    if COLUMN in _online_columns(schema):
-        constraint_present = CONSTRAINT_NAME in _online_check_constraints(schema)
+    if COLUMN in columns:
+        constraint_present = CONSTRAINT_NAME in checks
         with op.batch_alter_table(TABLE, schema=schema) as batch_op:
             if constraint_present:
                 batch_op.drop_constraint(CONSTRAINT_NAME, type_="check")

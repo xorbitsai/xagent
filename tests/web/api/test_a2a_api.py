@@ -22,6 +22,7 @@ from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services.a2a_protocol import (
     A2A_MAX_MESSAGE_TEXT_LENGTH,
     A2AApiError,
@@ -84,6 +85,47 @@ def _create_published_agent_with_key() -> tuple[int, str]:
     key_response = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
     assert key_response.status_code == 200, key_response.text
     return agent_id, key_response.json()["full_key"]
+
+
+def _seed_active_interaction_row(
+    db: Session, *, task_id: int, run_id: str, idempotency_key: str
+) -> int:
+    """One legal active TaskInteractionRequest row, for the legacy resume
+    close/compensation tests below. Not the interaction staging primitive's
+    fixture builder (tests/web/services/task_interaction_schema_shared.py)
+    -- this file has no other reason to depend on that directory, so this
+    stays a small, local, single-purpose row builder instead."""
+    anchor = TraceEvent(
+        task_id=task_id,
+        event_id=f"anchor-{idempotency_key}",
+        event_type="agent_execution_checkpoint",
+        timestamp=datetime.now(UTC),
+        data={},
+    )
+    db.add(anchor)
+    db.flush()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id=run_id,
+        kind="clarification",
+        protocol_version=1,
+        status="active",
+        active_slot=1,
+        origin="a2a",
+        request_payload={"prompt": "example"},
+        request_idempotency_key=idempotency_key,
+        resume_trace_event_id=int(anchor.id),
+        resume_event_id="resume-event-1",
+        resume_execution_id="resume-execution-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition=run_id,
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return int(row.id)
 
 
 def test_agent_card_exposes_published_agent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -748,6 +790,72 @@ def test_checkpoint_resume_schedule_failure_exactly_restores_waiting_task() -> N
         assert restored.run_id == "run-a"
         assert restored.runner_id is None
         assert restored.lease_expires_at is None
+    finally:
+        db.close()
+
+
+def test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence() -> (
+    None
+):
+    """The fence UPDATE and the legacy resume interaction close are one
+    atomic write: a fence miss (ownership changed under this lease) must
+    roll back both together, not close the row while rejecting the input.
+
+    What this actually pins is that the close must never commit
+    independently of the host transaction -- reordering the two statements
+    within that same transaction changes nothing observable, because a
+    rollback undoes every statement issued since the last commit regardless
+    of program order. Turning this red needs two changes at once: the close
+    must move ahead of the fence's early return (unreachable there today,
+    since a fence miss returns before the close ever runs) and it must
+    commit independently of this function's session -- either change alone
+    leaves this cell green, verified directly.
+    """
+    db = _direct_db_session()
+    try:
+        agent_id, _full_key = _create_published_agent_with_key()
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="atomicity",
+            status=TaskStatus.RUNNING,
+            runner_id="current-runner",
+            run_id="run-atomicity",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db, task_id=task_id, run_id="run-atomicity", idempotency_key="atomicity-q1"
+        )
+    finally:
+        db.close()
+
+    # A different runner_id than the row's current one: the fence's WHERE
+    # clause requires an exact match, so this lease has already lost the
+    # race by the time the write is attempted.
+    stale_lease = TaskLease(
+        task_id=task_id, runner_id="a-different-runner", run_id="run-atomicity"
+    )
+    updated = a2a_api._update_a2a_resume_input_sync(stale_lease, "attempted text")
+
+    assert updated is False
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version == 1
+        assert refreshed.input is None
     finally:
         db.close()
 

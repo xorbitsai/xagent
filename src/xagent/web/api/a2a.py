@@ -61,6 +61,8 @@ from ..services.task_execution_controller import (
     TaskControlState,
     task_execution_controller,
 )
+from ..services.task_interaction_close import close_legacy_resume_interaction
+from ..services.task_interaction_schema import interaction_requests_table_exists
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -311,6 +313,30 @@ def _update_a2a_resume_input_sync(
         if updated != 1:
             db.rollback()
             return False
+        # This update() call is the fence above, not a new transaction: a
+        # rollback here would undo it together with the input write, which
+        # is the point -- ownership and the interaction close are one
+        # atomic fact. No run_db_io_cancellation_safe wrap: the caller
+        # already wraps this whole function in one. No lock read either --
+        # the fence UPDATE above writes only non-key columns (input,
+        # output, error_message) and is already the first statement this
+        # transaction directs at tasks or task_interaction_requests, so it
+        # satisfies the same ordering and strength obligation a dedicated
+        # lock read would. If a future change adds a key column (or any
+        # column covered by a unique index) to that UPDATE's values, this
+        # judgment call must be redone -- the lock strength that UPDATE
+        # takes would change.
+        #
+        # The table-presence gate sits here, immediately before the close
+        # call and after the fence UPDATE, not at the top of the function:
+        # the gate only inspects the catalog and takes no row lock, so it
+        # does not count as preceding the fence UPDATE in the sense the
+        # ordering obligation above means.
+        assert task_lease.run_id is not None
+        if interaction_requests_table_exists(db):
+            close_legacy_resume_interaction(
+                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+            )
         db.commit()
         return True
 

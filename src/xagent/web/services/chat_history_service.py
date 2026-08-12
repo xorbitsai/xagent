@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -336,6 +337,15 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     hold a lock on the task's ``tasks`` row (see the concurrency
     paragraph below).
 
+    Holding that no-commit promise on SQLite takes one extra statement: a
+    no-op ``UPDATE`` issued before the savepoint opens, purely to get a
+    transaction started, because pysqlite would otherwise let the
+    savepoint's release commit the relabel. It is a self-assignment on a
+    row id that cannot exist, so it writes nothing -- but it does take
+    SQLite's write lock for the rest of the caller's transaction, which a
+    zero-row call would not otherwise have taken. PostgreSQL needs none of
+    this and does not get it.
+
     The update is deliberately whole-set and unordered rather than
     ``ORDER BY id DESC LIMIT 1``: under two simultaneously waiting
     questions, an ordered pick would relabel only the winner and leave
@@ -421,6 +431,49 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     # and be caught as if this UPDATE had failed. Flushing here, outside the
     # try, keeps a caller-originated failure attributed to the caller.
     db.flush()
+
+    # SQLite only: make sure a real transaction is open before the SAVEPOINT.
+    # pysqlite in legacy mode emits its implicit BEGIN only ahead of
+    # INSERT/UPDATE/DELETE, never ahead of SAVEPOINT or SELECT. With a clean
+    # session (no DML yet in this transaction) the SAVEPOINT below would run in
+    # autocommit, SQLite would open a transaction at that statement, and the
+    # matching RELEASE would commit it -- so the relabel would survive the
+    # caller's later rollback, the opposite of the contract stated above. The
+    # same problem, the same fix and the reasons the engine-level recipe was
+    # rejected are all recorded at task_interaction_staging.py:1474-1546.
+    #
+    # The flush directly above does not help: on a clean session it emits no
+    # SQL at all, so it triggers no implicit BEGIN (measured). Nor is there
+    # anything to make this conditional on -- with the DBAPI connection in
+    # autocommit, both Session.in_transaction() and Connection.in_transaction()
+    # still report True (measured), so the guard is on the dialect only.
+    #
+    # Raw text rather than sa.update(TaskChatMessage), for three reasons, the
+    # first of which is load-bearing for this file's own tests: a Core update
+    # is emitted as an Update construct, and the statement-capture helper in
+    # test_supersede_legacy_questions.py requires exactly one Update in the
+    # writer's window -- a Core dummy write makes it two and turns the
+    # predicate-drift tests red (measured). Second, "SET id = id" is a
+    # self-assignment, so it cannot alter a row even if the WHERE clause ever
+    # matched, whereas .values(id=-1) would write a real value into the primary
+    # key. Third, the no-.values() Core form compiles to a SET clause naming
+    # all 11 mapped columns; .values(id=-1) does narrow to one column on this
+    # table today, but only because task_chat_messages carries no onupdate=
+    # column -- add one and Core appends it, silently widening the SET clause
+    # to a real data column, which is the trap the sibling site documents for
+    # tasks.updated_at. Do not swap this for any Core form.
+    #
+    # This statement is outside the try below, deliberately. If it fails, the
+    # failure is not a failed supersede: nothing has been relabelled, so it
+    # propagates to the caller rather than being folded into the degrade
+    # signal, exactly like the flush above it. A DBAPIError raised here
+    # therefore reaches the caller unwrapped and registers nothing (measured).
+    # Moving it inside the try would restore the misattribution the flush
+    # placement exists to prevent.
+    if db.get_bind(TaskChatMessage).dialect.name == "sqlite":
+        db.execute(
+            text(f"UPDATE {TaskChatMessage.__tablename__} SET id = id WHERE id = -1")
+        )
 
     updated = 0
     statement_succeeded = False

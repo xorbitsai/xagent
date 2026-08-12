@@ -397,26 +397,28 @@ def test_supersede_never_commits_and_the_caller_can_still_roll_back(monkeypatch)
     UPDATE inside the caller's own open transaction, inside its own
     SAVEPOINT, and leaves committing to the caller.
 
-    Proven two ways: a commit spy on the session records zero calls
-    during a successful supersede, and a second write the caller stages
+    Proven three ways: a commit spy on the session records zero calls
+    during a successful supersede; a second write the caller stages
     *after* calling the helper can still be rolled back cleanly
-    afterward -- proving the helper left the session as a normal, live,
+    afterward, proving the helper left the session as a normal, live,
     abortable transaction rather than doing anything (an early commit, a
     wedged connection) that would have taken that ability away from the
-    caller.
+    caller; and the superseded row itself is re-read after the caller's
+    rollback and must be back to ``"question"``.
 
-    That second write is a fresh row, not the supersede's own row, and
-    that is deliberate. On real ACID PostgreSQL a caller-issued
-    ``db.rollback()`` after this point would, in principle, undo the
-    supersede's own UPDATE too, since a released SAVEPOINT only discards
-    the ability to roll back *to* that point -- it does not commit
-    anything. That narrower claim -- that the supersede's own row reverts
-    under a later top-level rollback -- is not asserted anywhere in this
-    suite, not on SQLite and not on PostgreSQL:
-    ``test_supersede_savepoint_postgresql.py`` proves a different
-    property (a CHECK-constraint failure inside the savepoint not
-    poisoning the outer transaction), not rollback survival. What this
-    test proves is narrower and does not depend on that unasserted claim:
+    That last assertion is the one that exercises the savepoint rather
+    than the session bookkeeping around it. A released SAVEPOINT only
+    discards the ability to roll back *to* that point -- it does not
+    commit anything -- so the caller's rollback has to undo the relabel
+    too. Reaching the case where that can fail needs the helper to run
+    with nothing pending in the session, which is what happens here:
+    ``persist_assistant_message`` above commits, so the helper starts from
+    a clean session. The sentinel row cannot cover this, because staging
+    it is itself DML and forces a real transaction either way.
+    ``test_supersede_savepoint_postgresql.py`` proves a different property
+    again (a CHECK-constraint failure inside the savepoint not poisoning
+    the outer transaction), not rollback survival. What the spy and the
+    sentinel add on top is narrower:
     the helper never commits or rolls back on its own, shown by the
     commit spy recording zero calls and by the fresh sentinel row above
     still being cleanly removable by the caller's own explicit rollback
@@ -425,13 +427,14 @@ def test_supersede_never_commits_and_the_caller_can_still_roll_back(monkeypatch)
     db = _create_db_session()
     try:
         task = _create_task(db)
-        persist_assistant_message(
+        question = persist_assistant_message(
             db,
             int(task.id),
             int(task.user_id),
             "A question",
             message_type="question",
         )
+        question_id = int(question.id)
 
         commit_calls = 0
         original_commit = db.commit
@@ -474,6 +477,19 @@ def test_supersede_never_commits_and_the_caller_can_still_roll_back(monkeypatch)
         assert (
             db.query(TaskChatMessage).filter(TaskChatMessage.id == sentinel_id).first()
             is None
+        )
+
+        # The superseded row itself, not a sentinel staged afterwards. This is
+        # the assertion that actually exercises the savepoint: the relabel must
+        # be gone after the caller's rollback. It reaches the case the sentinel
+        # cannot, because persist_assistant_message above commits, leaving the
+        # session with no pending DML when the helper runs.
+        assert (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.id == question_id)
+            .one()
+            .message_type
+            == QUESTION_MESSAGE_TYPE
         )
     finally:
         db.close()

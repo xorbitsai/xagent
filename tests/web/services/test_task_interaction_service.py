@@ -315,6 +315,58 @@ def test_cv1_unknown_kind_or_protocol_version_is_rejected(
     assert outcome.reason == expected
 
 
+@pytest.mark.parametrize(
+    "bad_kind",
+    [
+        pytest.param(["clarification"], id="list"),
+        pytest.param({"clarification": True}, id="dict"),
+    ],
+)
+def test_cv1_unhashable_kind_is_rejected_without_raising(
+    _db: Session, _seeded_task: int, bad_kind: Any
+) -> None:
+    """A ``kind`` that is not a str -- in particular one that is unhashable,
+    like a list or a dict -- must be caught by an isinstance guard before the
+    ``in _KIND_VOCABULARY`` membership check ever runs. ``_KIND_VOCABULARY``
+    is a frozenset, so testing membership of an unhashable value raises
+    ``TypeError: unhashable type``, not a typed outcome. (A bare ``set`` is
+    deliberately not used here: CPython's set/frozenset ``__contains__`` has
+    a special case for a set-typed probe value and hashes it as if it were a
+    frozenset instead of raising, so it would not reproduce the bug this
+    test pins.) This mirrors the isinstance-first discipline
+    ``request_idempotency_key`` already gets (see
+    ``test_cv2_non_string_idempotency_key_is_rejected_without_raising``
+    above)."""
+    envelope = _valid_envelope(kind=bad_kind)
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="unknown_kind")
+
+
+@pytest.mark.parametrize(
+    "bad_version",
+    [
+        pytest.param(True, id="bool_true_equals_one"),
+        pytest.param(1.0, id="float_equals_one"),
+    ],
+)
+def test_cv1_protocol_version_type_confusable_values_are_rejected(
+    _db: Session, _seeded_task: int, bad_version: Any
+) -> None:
+    """``protocol_version != INTERACTION_PROTOCOL_VERSION`` alone is not
+    enough: ``True == 1`` and ``1.0 == 1`` both hold in Python, so a bare
+    ``!=`` check lets a bool or a float through as if it were the int ``1``.
+    The check must reject any non-``int`` (bools included, since ``bool`` is
+    a subclass of ``int``) the same way the existing ``ttl_seconds`` check a
+    few lines below already does."""
+    envelope = _valid_envelope(protocol_version=bad_version)
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="unknown_protocol_version")
+
+
 def test_cv2_malformed_idempotency_key_is_rejected(
     _db: Session, _seeded_task: int
 ) -> None:

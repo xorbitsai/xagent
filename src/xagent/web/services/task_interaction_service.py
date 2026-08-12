@@ -861,9 +861,13 @@ def create(
     ``stage_interaction_request``.
     """
 
-    if envelope.kind not in _KIND_VOCABULARY:
+    if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:
         return CreateValidationRejected(reason="unknown_kind")
-    if envelope.protocol_version != INTERACTION_PROTOCOL_VERSION:
+    if (
+        not isinstance(envelope.protocol_version, int)
+        or isinstance(envelope.protocol_version, bool)
+        or envelope.protocol_version != INTERACTION_PROTOCOL_VERSION
+    ):
         return CreateValidationRejected(reason="unknown_protocol_version")
     if not isinstance(envelope.request_idempotency_key, str):
         return CreateValidationRejected(reason="malformed_idempotency_key")

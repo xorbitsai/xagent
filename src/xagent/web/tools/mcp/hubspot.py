@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -74,7 +73,20 @@ _NOTE_ASSOCIATION_TYPE_IDS = {"contact": 202, "company": 190, "deal": 214}
 
 _ASSOCIATION_PAGE_SIZE = 100
 
-_VALID_ANALYTICS_BREAKDOWNS = {"total", "daily", "weekly", "monthly"}
+# Per HubSpot's OpenAPI spec for this endpoint, time_period also accepts a
+# "summarize/{period}" form - a portal-wide summary across all breakdown_by
+# values rather than one row per value. The plain forms below stay listed
+# separately (not built by string-formatting a period) so a typo in one
+# doesn't silently produce a still-valid "summarize/<typo>" value.
+_VALID_ANALYTICS_BREAKDOWNS = {
+    "total",
+    "daily",
+    "weekly",
+    "monthly",
+    "summarize/daily",
+    "summarize/weekly",
+    "summarize/monthly",
+}
 # Union of the two documented /analytics/v2/reports variants: breakdowns
 # (totals, sessions, sources, ...) and content object types (forms, pages,
 # ...). Both share the same URL shape.
@@ -153,6 +165,19 @@ def _paged_list(
             "has_more": True,
             "after": after,
         }
+        response = _success(**payload)
+    if truncated and not items:
+        # Collapsing all the way to zero means even the single largest
+        # remaining record didn't fit alone - "retry with a smaller limit"
+        # (the general truncated-page guidance) isn't guaranteed to help
+        # here, so say so plainly instead of implying a fix that may not
+        # exist.
+        payload["message"] = (
+            "Every record in this page was individually too large to fit "
+            "the output size limit, so none could be returned. Retrying "
+            "with a smaller `limit` may surface different records if more "
+            "exist, but cannot shrink an individually oversized record."
+        )
         response = _success(**payload)
     return response
 
@@ -249,16 +274,42 @@ def _url_path_id(value: str, field_name: str) -> str:
     return quote(value, safe="")
 
 
-def _require_date_format(value: str, pattern: str, field_name: str, label: str) -> str:
-    """Reject a date that doesn't match the endpoint's expected format.
+def _require_date_format(
+    value: str, strptime_format: str, field_name: str, label: str
+) -> datetime:
+    """Reject a value that isn't a real calendar date in the endpoint's
+    expected format, and return the parsed date for a caller that also
+    needs to check ordering.
 
-    The two campaign/analytics HubSpot APIs use different date formats
-    (YYYYMMDD vs YYYY-MM-DD); an LLM caller mixing them up would otherwise
-    get an opaque upstream 400 instead of a message naming the fix.
+    A shape-only regex (matching digit positions but not their range) would
+    accept "20261332" or "2026-13-32" as syntactically fine and only fail
+    once the request reaches HubSpot; strptime rejects both. But strptime
+    alone is *more* lenient than a regex in the other direction: %m/%d
+    accept non-zero-padded values, and %Y will happily consume fewer than 4
+    digits if the remaining directives can still find something to match
+    (datetime.strptime("202611", "%Y%m%d") silently parses as 2026-01-01,
+    not a rejection) - so a genuinely malformed value could parse into the
+    *wrong* date instead of failing. Reformatting the parsed result and
+    comparing it back to the original string catches both failure modes.
+    The three HubSpot APIs this connector calls use three different date
+    formats (YYYYMMDD, YYYY-MM-DD, and YYYY-MM-DDTHH:MM:SSZ); an LLM caller
+    mixing them up would otherwise get an opaque upstream 400 instead of a
+    message naming the fix.
     """
-    if not re.fullmatch(pattern, value):
+    try:
+        parsed = datetime.strptime(value, strptime_format)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.strftime(strptime_format) != value:
         raise ValueError(f"{field_name} must be a {label} date string")
-    return value
+    return parsed
+
+
+def _require_date_range_order(
+    start: datetime | None, end: datetime | None, start_field: str, end_field: str
+) -> None:
+    if start is not None and end is not None and start > end:
+        raise ValueError(f"{start_field} must not be after {end_field}")
 
 
 def _headers() -> dict[str, str]:
@@ -704,9 +755,11 @@ def hubspot_get_analytics_report(
     "utm-contents", "utm-mediums", "utm-sources", "utm-terms",
     "event-completions", "forms", "pages", or "social-assists".
     `breakdown` selects the time granularity within that window: "total"
-    (one summed value), "daily", "weekly", or "monthly". `start_date` and
-    `end_date` are required "YYYYMMDD" strings (a "daily" breakdown spans
-    at most 500 days).
+    (one summed value), "daily", "weekly", "monthly", or a
+    "summarize/daily", "summarize/weekly", "summarize/monthly" variant
+    (a portal-wide summary across all `report_type` values instead of one
+    row per value). `start_date` and `end_date` are required "YYYYMMDD"
+    strings; a "daily" breakdown spans at most 500 days.
 
     Note: this covers HubSpot's traffic/analytics dimensions, not
     custom reports or dashboards built in the HubSpot report editor -
@@ -725,8 +778,14 @@ def hubspot_get_analytics_report(
             raise ValueError(
                 f"breakdown must be one of {sorted(_VALID_ANALYTICS_BREAKDOWNS)}"
             )
-        _require_date_format(start_date, r"\d{8}", "start_date", "YYYYMMDD")
-        _require_date_format(end_date, r"\d{8}", "end_date", "YYYYMMDD")
+        start_dt = _require_date_format(start_date, "%Y%m%d", "start_date", "YYYYMMDD")
+        end_dt = _require_date_format(end_date, "%Y%m%d", "end_date", "YYYYMMDD")
+        _require_date_range_order(start_dt, end_dt, "start_date", "end_date")
+        if normalized_breakdown == "daily" and (end_dt - start_dt).days > 500:
+            raise ValueError(
+                "start_date and end_date must not span more than 500 days "
+                'for a "daily" breakdown'
+            )
         result = _request(
             "GET",
             f"/analytics/v2/reports/{normalized_report_type}/{normalized_breakdown}",
@@ -807,20 +866,18 @@ def hubspot_get_marketing_email_statistics(
             # shape rather than a single comma-joined value.
             "emailIds": ids
         }
+        start_dt = end_dt = None
         if start_date:
-            params["startTimestamp"] = _require_date_format(
-                start_date,
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
-                "start_date",
-                "YYYY-MM-DDTHH:MM:SSZ",
+            start_dt = _require_date_format(
+                start_date, "%Y-%m-%dT%H:%M:%SZ", "start_date", "YYYY-MM-DDTHH:MM:SSZ"
             )
+            params["startTimestamp"] = start_date
         if end_date:
-            params["endTimestamp"] = _require_date_format(
-                end_date,
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
-                "end_date",
-                "YYYY-MM-DDTHH:MM:SSZ",
+            end_dt = _require_date_format(
+                end_date, "%Y-%m-%dT%H:%M:%SZ", "end_date", "YYYY-MM-DDTHH:MM:SSZ"
             )
+            params["endTimestamp"] = end_date
+        _require_date_range_order(start_dt, end_dt, "start_date", "end_date")
         result = _request("GET", "/marketing/v3/emails/statistics/list", params=params)
         return _success_with_capped_dict("statistics", result)
     except Exception as e:
@@ -860,6 +917,7 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
             project=lambda items: [
                 {"id": item.get("id"), "properties": item.get("properties", {})}
                 for item in items
+                if isinstance(item, dict)
             ],
         )
     except Exception as e:
@@ -888,14 +946,18 @@ def hubspot_get_campaign_metrics(
     try:
         campaign_id = _url_path_id(campaign_id, "campaign_id")
         params: dict[str, Any] = {}
+        start_dt = end_dt = None
         if start_date:
-            params["startDate"] = _require_date_format(
-                start_date, r"\d{4}-\d{2}-\d{2}", "start_date", "YYYY-MM-DD"
+            start_dt = _require_date_format(
+                start_date, "%Y-%m-%d", "start_date", "YYYY-MM-DD"
             )
+            params["startDate"] = start_date
         if end_date:
-            params["endDate"] = _require_date_format(
-                end_date, r"\d{4}-\d{2}-\d{2}", "end_date", "YYYY-MM-DD"
+            end_dt = _require_date_format(
+                end_date, "%Y-%m-%d", "end_date", "YYYY-MM-DD"
             )
+            params["endDate"] = end_date
+        _require_date_range_order(start_dt, end_dt, "start_date", "end_date")
         result = _request(
             "GET",
             f"/marketing/v3/campaigns/{campaign_id}/reports/metrics",

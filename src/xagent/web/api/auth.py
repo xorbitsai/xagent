@@ -1203,13 +1203,24 @@ def generic_oauth_login(
     scopes = _merge_oauth_scopes(db_provider.default_scopes or [], app_scopes)
     scope_str = _oauth_scope_separator(provider).join(scopes)
     # Sent via the authorize request's own optional_scope parameter (see
-    # get_builtin_optional_oauth_scopes) rather than merged into `scopes`
-    # above: a scope tier-gated on the connected account's plan would
-    # otherwise block the whole authorization if the account can't grant it.
-    # dict.fromkeys dedupes while keeping sorted() deterministic even if a
-    # future app_id row lists the same scope twice.
+    # get_builtin_execution_fields_and_optional_scopes) rather than merged
+    # into `scopes` above: a scope tier-gated on the connected account's
+    # plan would otherwise block the whole authorization if the account
+    # can't grant it. Scopes already in the required set are dropped here
+    # too - not just a duplicate-avoidance nicety, but correctness: HubSpot
+    # blocks installation outright if the same scope appears in both `scope`
+    # and `optional_scope` on one authorize request. dict.fromkeys then
+    # dedupes what's left before joining, in case the registry ever lists a
+    # scope twice within optional_oauth_scopes itself.
+    required_scopes = set(scopes)
     optional_scope_str = _oauth_scope_separator(provider).join(
-        sorted(dict.fromkeys(scope for scope in app_optional_scopes if scope))
+        sorted(
+            dict.fromkeys(
+                scope
+                for scope in app_optional_scopes
+                if scope and scope not in required_scopes
+            )
+        )
     )
 
     from urllib.parse import urlencode

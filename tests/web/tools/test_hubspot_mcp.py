@@ -351,6 +351,22 @@ def test_paged_list_truncates_to_empty_when_single_item_still_oversized(monkeypa
     assert result["has_more"] is True
 
 
+def test_paged_list_explains_the_dead_end_when_collapsed_to_empty(monkeypatch):
+    """has_more=true with no cursor and an empty page (the collapse case
+    above) is otherwise a dead end for the caller - a smaller `limit` than
+    1 doesn't exist, and there's no cursor to retry a different page with.
+    An explicit message must say so instead of leaving that implicit."""
+    huge_form = {"id": "f1", "name": "x" * 5000}
+    mock_request = Mock(return_value=MockResponse(json_data={"results": [huge_form]}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 200)
+
+    result = json.loads(hubspot.hubspot_list_forms(limit=1))
+
+    assert "message" in result
+    assert "too large" in result["message"]
+
+
 def test_paged_list_reports_input_after_not_next_after_when_truncated(monkeypatch):
     """A truncated page must report ITS OWN input cursor, not the server's
     next-page cursor: the server already considers the full page consumed,
@@ -637,6 +653,80 @@ def test_get_analytics_report_rejects_bad_end_date_with_valid_start_date(monkeyp
     mock_request.assert_not_called()
 
 
+def test_get_analytics_report_rejects_non_calendar_date(monkeypatch):
+    """ "20261332" matches a digit-position-only regex but isn't a real
+    date - month 13, day 32."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "20261332", "20261332")
+    )
+
+    assert result["status"] == "error"
+    assert "start_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_analytics_report_rejects_start_after_end(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "20260201", "20260101")
+    )
+
+    assert result["status"] == "error"
+    assert "start_date must not be after end_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_analytics_report_rejects_daily_span_over_500_days(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report(
+            "sources", "20250101", "20260601", breakdown="daily"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "500 days" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_analytics_report_allows_a_wide_span_for_non_daily_breakdown(monkeypatch):
+    """The 500-day cap is documented for "daily" specifically; the same
+    span must not be rejected for "monthly"."""
+    mock_request = Mock(return_value=MockResponse(json_data={"totals": {}}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report(
+            "sources", "20250101", "20260601", breakdown="monthly"
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_get_analytics_report_accepts_summarize_breakdown_variants(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"totals": {}}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report(
+            "sources", "20260101", "20260131", breakdown="summarize/daily"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/analytics/v2/reports/sources/summarize/daily"
+    )
+
+
 def test_get_analytics_report_caps_output_preserving_scalar_keys(monkeypatch):
     """The cap must shrink the CONTENTS of the largest nested list/dict
     value, not drop whole top-level keys - dropping keys could discard a
@@ -701,6 +791,17 @@ def test_get_analytics_report_does_not_truncate_a_small_response(monkeypatch):
         "report": {"totals": {"visits": 1}},
         "truncated": False,
     }
+
+
+def test_get_analytics_report_passes_through_a_non_dict_body(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data=[1, 2, 3]))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "20260101", "20260131")
+    )
+
+    assert result == {"status": "success", "report": [1, 2, 3], "truncated": False}
 
 
 def test_list_marketing_emails_projects_summary_fields(monkeypatch):
@@ -1046,6 +1147,91 @@ def test_get_campaign_metrics_rejects_bad_end_date_with_valid_start_date(monkeyp
     assert result["status"] == "error"
     assert "end_date" in result["message"]
     mock_request.assert_not_called()
+
+
+def test_get_campaign_metrics_rejects_non_calendar_date(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_campaign_metrics("campaign-1", start_date="2026-02-30")
+    )
+
+    assert result["status"] == "error"
+    assert "start_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_campaign_metrics_rejects_non_zero_padded_date(monkeypatch):
+    """Regression: datetime.strptime's %m/%d accept non-zero-padded values
+    (and %Y can under-consume digits when the remaining format directives
+    still find something to match), so a strptime-only check would parse
+    "2026-1-1" or the 6-digit "202611" into a DIFFERENT, wrong date instead
+    of rejecting it - not just be more lenient, but silently misparse."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_campaign_metrics("campaign-1", start_date="2026-1-1")
+    )
+
+    assert result["status"] == "error"
+    assert "start_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_analytics_report_rejects_short_yyyymmdd(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_analytics_report("sources", "202611", "20260131")
+    )
+
+    assert result["status"] == "error"
+    assert "start_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_campaign_metrics_rejects_start_after_end(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_get_campaign_metrics(
+            "campaign-1", start_date="2026-02-01", end_date="2026-01-01"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_date must not be after end_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_campaign_metrics_passes_through_a_non_dict_body(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data=[1, 2, 3]))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_campaign_metrics("campaign-1"))
+
+    assert result == {"status": "success", "metrics": [1, 2, 3], "truncated": False}
+
+
+def test_list_campaigns_skips_non_dict_items(monkeypatch):
+    """A non-dict item in the results (a malformed/unexpected upstream
+    shape) must be dropped rather than crash the whole page, matching the
+    guard _project_fields already applies for forms/emails."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": ["not-a-dict", {"id": "c1", "properties": {}}]}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_campaigns())
+
+    assert result["status"] == "success"
+    assert result["campaigns"] == [{"id": "c1", "properties": {}}]
 
 
 def test_create_note_treats_empty_string_id_as_not_provided(monkeypatch):

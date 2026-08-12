@@ -6,10 +6,13 @@ Create Date: 2026-08-10
 
 """
 
+import logging
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+
+logger = logging.getLogger(__name__)
 
 revision: str = "20260810_add_hubspot_marketing_scopes"
 down_revision: Union[str, None] = "20260809_add_task_interaction_requests"
@@ -46,11 +49,11 @@ CURRENT_SCOPES = [
 ]
 # business-intelligence, marketing-email, and marketing.campaigns.read are
 # requested separately via the authorize request's optional_scope parameter
-# (see api/auth.py and get_builtin_optional_oauth_scopes) - not part of
-# oauth_scopes at all, so not persisted here. All three are tier-gated
-# (business-intelligence: Marketing Hub Basic+; marketing-email: Enterprise
-# or the transactional email add-on; marketing.campaigns.read: the
-# Campaigns API itself requires Marketing Hub Professional+); requesting
+# (see api/auth.py and get_builtin_execution_fields_and_optional_scopes) -
+# not part of oauth_scopes at all, so not persisted here. All three are
+# tier-gated (business-intelligence: Marketing Hub Basic+; marketing-email:
+# Enterprise or the transactional email add-on; marketing.campaigns.read:
+# the Campaigns API itself requires Marketing Hub Professional+); requesting
 # any of them as required scopes would block reconnection entirely for
 # portals below those tiers.
 
@@ -162,11 +165,20 @@ def _invalidate_existing_hubspot_grants(bind: sa.engine.Connection) -> None:
     if "refresh_token" in columns:
         values["refresh_token"] = None
 
-    bind.execute(
+    result = bind.execute(
         sa.update(USER_OAUTH_TABLE)
         .where(USER_OAUTH_TABLE.c.provider == APP_ID)
         .values(**values)
     )
+    if result.rowcount:
+        logger.warning(
+            "Disconnected %d existing HubSpot grant(s) for the new required "
+            "'forms' scope (business-intelligence, marketing-email, and "
+            "marketing.campaigns.read are requested as optional and do not "
+            "require reconnection on their own). Affected users must "
+            "reconnect the HubSpot connector.",
+            result.rowcount,
+        )
 
 
 def upgrade() -> None:

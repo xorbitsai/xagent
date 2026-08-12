@@ -909,37 +909,33 @@ def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() ->
     assert get_builtin_execution_fields("gmail") == expected_execution_fields
 
 
-def test_get_builtin_optional_oauth_scopes() -> None:
-    from xagent.web.builtin_mcp_registry import get_builtin_optional_oauth_scopes
+def test_get_builtin_execution_fields_and_optional_scopes() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_execution_fields,
+        get_builtin_execution_fields_and_optional_scopes,
+    )
 
-    assert get_builtin_optional_oauth_scopes("hubspot") == [
+    execution_fields, optional_scopes = (
+        get_builtin_execution_fields_and_optional_scopes("hubspot")
+    )
+    assert execution_fields == get_builtin_execution_fields("hubspot")
+    assert optional_scopes == [
         "business-intelligence",
         "marketing-email",
         "marketing.campaigns.read",
     ]
+
     # Most builtin apps have no optional_oauth_scopes key at all.
-    assert get_builtin_optional_oauth_scopes("gmail") == []
-    assert get_builtin_optional_oauth_scopes("unknown-app") == []
-
-
-def test_get_builtin_execution_fields_and_optional_scopes_matches_separate_calls() -> (
-    None
-):
-    """The combined single-scan accessor _app_to_dict uses on the
-    connector-listing path must agree with calling the two separate
-    (double-scanning) accessors it replaces there."""
-    from xagent.web.builtin_mcp_registry import (
-        get_builtin_execution_fields,
-        get_builtin_execution_fields_and_optional_scopes,
-        get_builtin_optional_oauth_scopes,
+    gmail_fields, gmail_optional = get_builtin_execution_fields_and_optional_scopes(
+        "gmail"
     )
+    assert gmail_fields == get_builtin_execution_fields("gmail")
+    assert gmail_optional == []
 
-    for app_id in ("hubspot", "gmail", "unknown-app"):
-        execution_fields, optional_scopes = (
-            get_builtin_execution_fields_and_optional_scopes(app_id)
-        )
-        assert execution_fields == get_builtin_execution_fields(app_id)
-        assert optional_scopes == get_builtin_optional_oauth_scopes(app_id)
+    assert get_builtin_execution_fields_and_optional_scopes("unknown-app") == (
+        None,
+        [],
+    )
 
 
 def test_app_to_dict_exposes_optional_oauth_scopes_for_builtin_and_custom_apps() -> (

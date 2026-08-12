@@ -273,6 +273,31 @@ def test_upgrade_invalidates_existing_hubspot_grant_only(tmp_path):
         assert refresh_tokens["salesforce"] == "old-salesforce-refresh"
 
 
+def test_upgrade_logs_a_warning_when_grants_are_disconnected(tmp_path, caplog):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        _create_user_oauth_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            with caplog.at_level("WARNING", logger=migration.logger.name):
+                migration.upgrade()
+    assert any(
+        "Disconnected" in r.message and "forms" in r.message for r in caplog.records
+    )
+
+
+def test_upgrade_does_not_log_when_no_grants_exist(tmp_path, caplog):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            with caplog.at_level("WARNING", logger=migration.logger.name):
+                migration.upgrade()  # no user_oauth table at all
+    assert caplog.records == []
+
+
 def test_upgrade_clears_access_token_without_refresh_token_column(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

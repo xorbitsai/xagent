@@ -329,13 +329,23 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "crm.objects.deals.read",
                 "forms",
             ],
-            # All three are tier-gated (business-intelligence: Marketing Hub
-            # Basic+; marketing-email: Enterprise or the transactional email
-            # add-on; marketing.campaigns.read: the Campaigns API itself
-            # requires Marketing Hub Professional+, confirmed against
-            # HubSpot's Campaigns API docs); requesting any of them as
-            # required scopes would block the whole OAuth authorization (and
-            # therefore every CRM tool too) for portals below those tiers.
+            # All three are tier-gated, each confirmed against HubSpot's own
+            # docs: business-intelligence requires Marketing Hub Basic+ (the
+            # traffic analytics tool isn't available on Free/Starter);
+            # marketing-email requires Enterprise or the transactional email
+            # add-on; marketing.campaigns.read requires Professional+ (the
+            # Campaigns API docs state this explicitly). Requesting any of
+            # them as required scopes would block the whole OAuth
+            # authorization (and therefore every CRM tool too) for portals
+            # below those tiers. Separately: GET /marketing/v3/emails (used
+            # by hubspot_list_marketing_emails and
+            # hubspot_get_marketing_email_statistics) accepts marketing-email
+            # OR content OR transactional-email - marketing-email is used
+            # here as the most narrowly-scoped of the three that still
+            # covers both read calls; content is broader (also grants
+            # pages/blog/campaigns access this connector doesn't use) and
+            # transactional-email's applicability to non-transactional
+            # marketing emails is unconfirmed.
             # Sent via the authorize request's optional_scope parameter
             # instead (see api/auth.py) so those portals still connect
             # successfully and only hubspot_get_analytics_report /
@@ -691,33 +701,24 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     )
 
 
-def get_builtin_optional_oauth_scopes(app_id: str) -> list[str]:
-    """OAuth scopes requested via the authorize request's optional_scope
-    parameter rather than its required scope parameter (see api/auth.py).
-
-    Deliberately not in _BUILTIN_EXECUTION_FIELD_NAMES: unlike oauth_scopes,
-    there is no legacy persisted-row state to drift-check against for a
-    field this new, so this reads straight from the row rather than going
-    through the DB-column drift-tracking machinery. Most builtin apps have
-    no optional scopes at all, hence the plain ``.get`` default.
-    """
-    row = get_builtin_public_mcp_app(app_id)
-    if row is None:
-        return []
-    return list(row.get("optional_oauth_scopes", []))
-
-
 def get_builtin_execution_fields_and_optional_scopes(
     app_id: str,
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    """Single-scan equivalent of calling get_builtin_execution_fields and
-    get_builtin_optional_oauth_scopes separately.
+    """The app's execution fields, plus OAuth scopes requested via the
+    authorize request's optional_scope parameter rather than its required
+    scope parameter (see api/auth.py).
 
-    Each of those does its own linear scan of the registry plus a deepcopy
-    of the full matched row; a caller needing both (as _app_to_dict does
-    for every app on a listing path) would otherwise pay for that scan
-    twice per app. This does it once and derives both results from the
-    same row.
+    A single registry scan (plus one deepcopy of the matched row) serving
+    both needs: _app_to_dict wants both for every app on a listing path,
+    and scanning + deepcopying the full row twice per app to get them
+    separately would be wasted work.
+
+    optional_oauth_scopes is deliberately not in
+    _BUILTIN_EXECUTION_FIELD_NAMES: unlike oauth_scopes, there is no legacy
+    persisted-row state to drift-check against for a field this new, so
+    this reads straight from the row rather than going through the
+    DB-column drift-tracking machinery. Most builtin apps have no optional
+    scopes at all, hence the plain ``.get`` default.
     """
     row = get_builtin_public_mcp_app(app_id)
     if row is None:

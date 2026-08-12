@@ -61,7 +61,10 @@ from ..services.task_execution_controller import (
     TaskControlState,
     task_execution_controller,
 )
-from ..services.task_interaction_close import close_legacy_resume_interaction
+from ..services.task_interaction_close import (
+    clear_interaction_marker_if_unpaired,
+    close_legacy_resume_interaction,
+)
 from ..services.task_interaction_schema import interaction_requests_table_exists
 from ..services.task_lease_service import (
     TaskLease,
@@ -256,6 +259,14 @@ def _restore_a2a_resume_prelease_sync(
     retry with the same A2A message id is idempotent at the runner boundary.
     If ownership changed, no row is mutated and the current owner remains the
     sole lifecycle authority.
+
+    Two callers reach this today: the isolated wrapper right below, used by
+    the no-checkpoint and checkpoint-read-error fallbacks; and the cancel
+    settlement callback ``acquire_task_lease_cancellation_safe`` passes to
+    ``_resume_input_required_a2a_task``'s lease acquisition, which fires on
+    a cancellation with no ``posted`` outcome to consult at all -- the
+    marker clear below has to hold on that path too, not only on the two
+    ``posted``-gated fallbacks.
     """
 
     SessionLocal = get_session_local()
@@ -266,6 +277,18 @@ def _restore_a2a_resume_prelease_sync(
             status=status,
         )
         if restored:
+            # Mirror of the WebSocket lease restore: this is an abandoned
+            # resume, not a completed one, so only the marker may need
+            # reconciling -- see clear_interaction_marker_if_unpaired's
+            # docstring for the NOT EXISTS semantics. No lock read precedes
+            # this statement; release_task_lease_no_commit's own tasks
+            # UPDATE writes only non-key columns and is already the first
+            # statement this transaction directs at tasks or
+            # task_interaction_requests.
+            assert task_lease.run_id is not None
+            clear_interaction_marker_if_unpaired(
+                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+            )
             db.commit()
         else:
             db.rollback()

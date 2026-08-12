@@ -39,6 +39,7 @@ from xagent.web.api.websocket import (
     _handle_chat_message_unserialized,
     _handle_pause_task_unserialized,
     _handle_resume_task_unserialized,
+    _restore_resumed_task_lease_to_prior_status,
     _waiting_or_paused_event_fields,
     background_task_manager,
     execute_resume_background,
@@ -1757,6 +1758,58 @@ async def test_live_close_cancellation_does_not_abort_registered_handoff(
         if call.args[0].get("type") == "message_accepted"
     ]
     assert len(accepted) == 1
+
+
+def test_lease_restore_fence_miss_leaves_the_marker_untouched(db_session) -> None:
+    """When the exact-lease fence excludes every row (this call lost the
+    race for the row), the marker clear must not run at all -- not even
+    the no-op form. Flipping the ``if restored:`` guard to unconditional
+    would clear a marker this call never had authority to touch.
+    """
+    owner = _user(db_session, "restore-fence-miss-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.runner_id = "current-runner"
+    task.run_id = "run-fence-miss"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+
+    stale_lease = TaskLease(
+        task_id=int(task.id), runner_id="a-different-runner", run_id="run-fence-miss"
+    )
+    restored = _restore_resumed_task_lease_to_prior_status(
+        stale_lease, status=TaskStatus.WAITING_FOR_USER
+    )
+
+    assert restored is False
+    db_session.expire_all()
+    refreshed = db_session.query(Task).filter(Task.id == task.id).one()
+    assert refreshed.interaction_protocol_version == 1
+
+
+def test_lease_restore_clears_the_marker_once_no_active_row_remains(
+    db_session,
+) -> None:
+    """The mirror case: the fence matches (this call owns the row) and no
+    active interaction row remains, so the marker is stale and gets
+    zeroed."""
+    owner = _user(db_session, "restore-clears-marker-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.WAITING_FOR_USER)
+    task.runner_id = "current-runner"
+    task.run_id = "run-clears-marker"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+
+    lease = TaskLease(
+        task_id=int(task.id), runner_id="current-runner", run_id="run-clears-marker"
+    )
+    restored = _restore_resumed_task_lease_to_prior_status(
+        lease, status=TaskStatus.WAITING_FOR_USER
+    )
+
+    assert restored is True
+    db_session.expire_all()
+    refreshed = db_session.query(Task).filter(Task.id == task.id).one()
+    assert refreshed.interaction_protocol_version is None
 
 
 def test_live_claim_unique_loser_returns_the_committed_winner(

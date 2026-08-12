@@ -150,7 +150,10 @@ from ..services.task_execution_controller import (
     task_control_snapshot,
     task_execution_controller,
 )
-from ..services.task_interaction_close import close_legacy_resume_interaction_sync
+from ..services.task_interaction_close import (
+    clear_interaction_marker_if_unpaired,
+    close_legacy_resume_interaction_sync,
+)
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -2830,11 +2833,29 @@ def _restore_resumed_task_lease_to_prior_status(
     affects zero rows instead of double-releasing. The commit below is
     unconditional, unlike the A2A prelease restore: when the fence excludes
     every row, the UPDATE affects zero rows and this commits that no-op
-    rather than rolling back.
+    rather than rolling back. That unconditional commit is unrelated to the
+    protocol-marker clear below, which is conditioned on ``restored``: a
+    fence miss means this call lost the race for the row and must not touch
+    a marker some other winner now owns.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         restored = release_task_lease_no_commit(db, lease, status=status)
+        if restored:
+            # This is a resume abandonment, not a completion: no injection
+            # ran, so there is no interaction row to close here, only a
+            # marker to reconcile if it no longer names an active row. See
+            # clear_interaction_marker_if_unpaired's docstring for the
+            # NOT EXISTS semantics. No lock read precedes this statement --
+            # release_task_lease_no_commit's own tasks UPDATE writes only
+            # non-key columns and is already the first statement this
+            # transaction directs at tasks or task_interaction_requests, so
+            # it already satisfies the ordering and strength obligation a
+            # dedicated lock read would.
+            assert lease.run_id is not None
+            clear_interaction_marker_if_unpaired(
+                db, task_id=lease.task_id, run_id=lease.run_id
+            )
         db.commit()
         return restored
 

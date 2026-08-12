@@ -1,13 +1,16 @@
-"""Pin the retirement statements a legacy resume path issues on injection.
+"""Pin the retirement and marker-clear statements a legacy resume path issues.
 
 ``close_legacy_resume_interaction`` (and its short-transaction wrapper
-``close_legacy_resume_interaction_sync``) are exercised directly here at
-the database level: rowcount classification across every input shape the
-close statement can see, the no-op behavior on a deployment without the
-interaction table, and a staging-primitive interaction proving the close
-is a real behavior change, not a no-op. The two WebSocket injection sites
-that wire this into production are covered separately in
-tests/web/api/test_websocket_owner_actor.py.
+``close_legacy_resume_interaction_sync``) and
+``clear_interaction_marker_if_unpaired`` are exercised directly here at the
+database level: rowcount classification across every input shape the close
+statement can see, the no-op behavior on a deployment without the
+interaction table, the ``NOT EXISTS`` guard the two marker-clear-only call
+sites depend on, and a staging-primitive interaction proving the close is a
+real behavior change, not a no-op. The production call sites that wire
+these functions into the WebSocket and A2A resume paths are covered
+separately in tests/web/api/test_websocket_owner_actor.py and
+tests/web/api/test_a2a_api.py.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services.task_interaction_close import (
+    clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction,
     close_legacy_resume_interaction_sync,
 )
@@ -245,6 +249,70 @@ def test_close_no_ops_when_the_interaction_table_does_not_exist(
         db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
         == 1
     )
+
+
+def test_clear_marker_if_unpaired_no_ops_when_the_interaction_table_does_not_exist(
+    db_without_interaction_table,
+) -> None:
+    db = db_without_interaction_table
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    db.query(Task).filter(Task.id == task_id).update(
+        {Task.run_id: "run-a", Task.interaction_protocol_version: 1}
+    )
+    db.commit()
+
+    clear_interaction_marker_if_unpaired(db, task_id=task_id, run_id="run-a")
+    db.commit()
+
+    db.expire_all()
+    assert (
+        db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
+        == 1
+    )
+
+
+# --------------------------------------------------------------------------
+# Compensation clear -- the NOT EXISTS guard.
+# --------------------------------------------------------------------------
+
+
+def test_clear_marker_if_unpaired_zeroes_a_marker_with_no_active_row(db) -> None:
+    """Sequence 'close already committed, then a compensation path runs'.
+
+    The row is already terminated (the close already ran); a marker left
+    at 1 -- however that happened -- has nothing to protect and is zeroed.
+    """
+    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
+    anchor_id = make_trace_event(db, task_id=task_id)
+    row = TaskInteractionRequest(
+        **make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            run_id="run-a",
+            status="terminated",
+        )
+    )
+    db.add(row)
+    db.commit()
+
+    clear_interaction_marker_if_unpaired(db, task_id=task_id, run_id="run-a")
+    db.commit()
+
+    assert _task_marker(db, task_id) is None
+
+
+def test_clear_marker_if_unpaired_leaves_a_still_active_row_untouched(db) -> None:
+    """This is the mutation-testable half: removing the NOT EXISTS guard
+    would zero a marker that still names a live question."""
+    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = _seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    clear_interaction_marker_if_unpaired(db, task_id=task_id, run_id="run-a")
+    db.commit()
+
+    assert _task_marker(db, task_id) == 1
+    assert _row_state(db, row_id).status == "active"
 
 
 # --------------------------------------------------------------------------

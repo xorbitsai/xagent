@@ -12,6 +12,14 @@ transaction as that retirement -- otherwise a stale marker would keep
 pointing a reader at a question the legacy path already answered by other
 means.
 
+Two resume-abandonment paths (the WebSocket lease restore and the A2A
+prelease restore) do the mirror-image cleanup when a resume is undone
+instead of completed: if the marker no longer corresponds to any active
+row, clear it. That clear is conditioned on ``NOT EXISTS`` rather than
+unconditional, because an abandonment can also race a resume that never
+even reached the injection call -- clearing unconditionally there would
+erase a marker that is still correct for a question that is still active.
+
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens
 (``_classify_close_rowcount``): exactly one row closed is the expected
@@ -169,3 +177,57 @@ def close_legacy_resume_interaction_sync(task_id: int, run_id: str) -> int:
         rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id=run_id)
         db.commit()
         return rowcount
+
+
+def clear_interaction_marker_if_unpaired(
+    db: Session,
+    *,
+    task_id: int,
+    run_id: str,
+) -> None:
+    """Zero the protocol marker if it no longer names any active row.
+
+    Used by the two resume-abandonment paths (the WebSocket lease restore
+    and the A2A prelease restore) instead of
+    ``close_legacy_resume_interaction``: an abandonment can happen before
+    the injection call ever ran, so there is no row to close here -- only
+    a marker to reconcile.
+
+    The semantics are not "clear the marker" but "if the marker no longer
+    corresponds to any active row, zero it": the UPDATE below only matches
+    when NOT EXISTS an active row for this exact (task_id, run_id) pair,
+    so a marker that still names a live question survives untouched.
+
+    Caller obligations: the caller owns the transaction (this function
+    never commits or rolls back) and has already confirmed the resume is
+    actually being abandoned (e.g. the lease restore's own ``restored``
+    flag) before calling this. No lock read precedes this statement --
+    unlike the close path, the caller's own non-key-column ``tasks`` UPDATE
+    (``release_task_lease_no_commit``) already is the first statement this
+    transaction directs at ``tasks`` or ``task_interaction_requests``, and
+    it satisfies the same ordering and strength obligation a dedicated
+    lock read would.
+
+    Skipped entirely when ``task_interaction_requests`` does not exist.
+    """
+    if not interaction_requests_table_exists(db):
+        return
+    still_active = (
+        sa.select(sa.literal(1))
+        .where(
+            TaskInteractionRequest.task_id == task_id,
+            TaskInteractionRequest.run_id == run_id,
+            TaskInteractionRequest.status == "active",
+            TaskInteractionRequest.active_slot.isnot(None),
+        )
+        .exists()
+    )
+    db.execute(
+        sa.update(Task)
+        .where(
+            Task.id == task_id,
+            Task.run_id == run_id,
+            ~still_active,
+        )
+        .values(interaction_protocol_version=None)
+    )

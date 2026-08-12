@@ -1196,6 +1196,149 @@ def test_failed_follow_up_restores_input_required_status() -> None:
         db.close()
 
 
+def test_failed_follow_up_leaves_a_still_active_question_and_marker_untouched() -> None:
+    """Injection never happened here (post_user_message returned False), so
+    the prelease restore's marker-clear compensation must not fire: the
+    active interaction row and the protocol marker are both untouched.
+
+    Deleting the NOT EXISTS guard from clear_interaction_marker_if_unpaired
+    would turn this red -- the marker would be zeroed out from under a
+    question that is still active.
+    """
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="waiting with an open question",
+            status=TaskStatus.WAITING_FOR_USER,
+            run_id="run-not-posted",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-not-posted"},
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id="run-not-posted",
+            idempotency_key="not-posted-q1",
+        )
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=False)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-not-posted",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "no checkpoint available"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+        assert recovered.interaction_protocol_version == 1
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+    finally:
+        db.close()
+
+
+def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched() -> (
+    None
+):
+    """``_restore_a2a_resume_prelease_sync`` is also the cleanup callback
+    ``acquire_task_lease_cancellation_safe`` invokes directly when the
+    acquisition committed a prelease but the caller was then cancelled --
+    no ``post_user_message`` outcome participates in that path at all.
+    Called here exactly as that callback calls it: with a live active
+    interaction row still in place, the marker must survive.
+
+    Deleting the NOT EXISTS guard would turn this red the same way it does
+    for the ``if not posted`` path above -- both routes converge on the
+    same shared clear_interaction_marker_if_unpaired call.
+    """
+    agent_id, _full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="prelease acquired then cancelled",
+            status=TaskStatus.RUNNING,
+            runner_id="cancelled-acquire-runner",
+            run_id="run-cancelled-acquire",
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id="run-cancelled-acquire",
+            idempotency_key="cancelled-acquire-q1",
+        )
+    finally:
+        db.close()
+
+    acquired_lease = TaskLease(
+        task_id=task_id,
+        runner_id="cancelled-acquire-runner",
+        run_id="run-cancelled-acquire",
+    )
+    restored = a2a_api._restore_a2a_resume_prelease_sync(
+        acquired_lease, status=TaskStatus.WAITING_FOR_USER
+    )
+
+    assert restored is True
+    db = _direct_db_session()
+    try:
+        recovered = db.query(Task).filter(Task.id == task_id).one()
+        assert recovered.status == TaskStatus.WAITING_FOR_USER
+        assert recovered.interaction_protocol_version == 1
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+    finally:
+        db.close()
+
+
 def test_checkpoint_resume_exception_restores_input_required_status() -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
